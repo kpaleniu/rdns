@@ -40,6 +40,8 @@ https-path = "/dns-query"
 tls-cert = "/etc/rdns/tls/fullchain.pem"
 tls-key = "/etc/rdns/tls/privkey.pem"   # mode 0600, checked
 transfer-tls-ca = "/etc/rdns/xot-ca.pem"  # anchors for XoT masters (RFC 9103)
+transfer-tls-cert = "/etc/rdns/client.pem"  # what to present if a master asks (§7.5)
+transfer-tls-key = "/etc/rdns/client.key"   # both or neither, mode-checked
 transfer-tls-only = false     # true: refuse a transfer not over TLS 1.3
 control-socket = "/run/rdns/rdnsd.sock"
 allow-partial-load = false
@@ -109,6 +111,9 @@ Rules the schema encodes:
 - `+tls=` needs `server.transfer-tls-ca`, and the name after it is not optional:
   RFC 9103 §7.5 has the client authenticate the master, so there is no spelling
   of "encrypt but do not check".
+- `server.transfer-tls-cert` and `server.transfer-tls-key` are both or neither,
+  and need `transfer-tls-ca`: they are the identity presented when this server
+  *fetches* a zone, so without anchors nothing would ever present them.
 
 ### Secret files
 

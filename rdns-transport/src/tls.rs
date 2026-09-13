@@ -29,14 +29,16 @@
 //! **No client certificates.** RFC 8310 §8.2 describes mutual TLS for DoT and
 //! it authenticates a *client*, which is not a thing an authoritative server or
 //! an open resolver has an opinion about. TSIG is how this tree says who a peer
-//! is, and it works on every transport rather than one.
+//! is, and it works on every transport rather than one. A *transfer* is the one
+//! case where RFC 9103 §7.5 names mTLS as an alternative, and asking for a
+//! client certificate here would ask every DoT querier for one as well: the
+//! server half of that is `TODO.md` #59, and `rdns::xot` is the client half.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::{anyhow, Context, Result};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::ServerConfig;
@@ -45,6 +47,7 @@ use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
 use rdns::shutdown::{Busy, Stop};
+use rdns::tls_identity::TlsIdentity;
 
 use crate::tcp::{Handler, RateLimit, SplitStream};
 use crate::TransportLimits;
@@ -153,8 +156,8 @@ impl ResolvesServerCert for CertificateStore {
 
 /// Load a certificate chain and its key, and check they go together.
 fn read_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<CertifiedKey>> {
-    let certs = read_certs(cert_path)?;
-    let key = read_key(key_path)?;
+    let (certs, key) =
+        TlsIdentity::from_files(cert_path, key_path, "the TLS certificate")?.into_parts();
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|e| {
         anyhow!(
             "{}: the private key is not one this build can sign with: {e}",
@@ -173,35 +176,6 @@ fn read_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<Certified
         )
     })?;
     Ok(Arc::new(certified))
-}
-
-fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    use rustls::pki_types::pem::PemObject;
-    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
-        .with_context(|| format!("reading the TLS certificate {}", path.display()))?
-        .collect::<std::result::Result<_, _>>()
-        .with_context(|| format!("parsing the TLS certificate {}", path.display()))?;
-    if certs.is_empty() {
-        return Err(anyhow!(
-            "{} holds no CERTIFICATE block: an empty chain loads and then fails \
-             every handshake",
-            path.display()
-        ));
-    }
-    Ok(certs)
-}
-
-fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    use rustls::pki_types::pem::PemObject;
-    // The same check the DNSSEC key loader and the TSIG secret file make
-    // (`CLAUDE.md` §15): a key directory restored from backup as 0644, or
-    // `chmod -R`'d by a deploy script, is the ordinary way a private key stops
-    // being private. Unix only, and the doc comment on `ensure_private` says so
-    // rather than letting "the permissions were checked" be a claim that is true
-    // on one platform.
-    rdns::persist::ensure_private(path, "a TLS private key")?;
-    PrivateKeyDer::from_pem_file(path)
-        .with_context(|| format!("reading the TLS private key {}", path.display()))
 }
 
 /// The rustls configuration a DoT listener serves under.
@@ -444,7 +418,7 @@ mod tests {
     fn client_config(server_der: &[u8]) -> Arc<rustls::ClientConfig> {
         let mut roots = rustls::RootCertStore::empty();
         roots
-            .add(CertificateDer::from(server_der.to_vec()))
+            .add(rustls::pki_types::CertificateDer::from(server_der.to_vec()))
             .expect("the self-signed certificate is a valid root");
         Arc::new(
             rustls::ClientConfig::builder()

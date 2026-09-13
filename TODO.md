@@ -37,9 +37,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#51**, **#54**, **#55**, **#56**, **#57**, **#58** and **#21**, as of
-2026-09-13. **#44 and #45 are both closed in full, and so are #48, #49 and
-#53**, which is everything 44a and #50 left.
+**#54**, **#55**, **#56**, **#57**, **#58**, **#59**, **#60** and **#21**, as
+of 2026-09-13. **#44 and #45 are both closed in full, and so are #48, #49, #51
+and #53**, which is everything 44a and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
 which closed the same day carrying two MUSTs it had been filed as not
 breaking: RFC 6891 §6.1.1's OPT in a response to a request that had one, and
@@ -48,9 +48,11 @@ as "not a defect" because its own row read §6.1.1 as "asks for", and the sectio
 says what the difference cost. Of what is left, #50 was the live one, and
 closing it is what added #53 — a zone this server signed itself verified again
 at every load — which closed the same day it was taken.
-#51 is what 44d left, #54 what 44g left, #55 what 44f left, #56 and #57 what
-45a left and #58 what 45b left; and #21 is an inventory of deliberate
-deviations rather than a queue. Everything else numbered is closed; the table
+#54 is what 44g left, #55 what 44f left, #56 and #57 what 45a left, #58 what
+45b left, #59 what #51 left and #60 what #51 turned up on the way; and #21 is
+an inventory of deliberate deviations rather than a queue. **#59 is behind
+#54** — the identity of a TLS peer reaches the answer path by the same route
+"which transport" would, and two answers to one question is `CLAUDE.md` §7. Everything else numbered is closed; the table
 under "Closed work" says which, when, and where the reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
@@ -830,7 +832,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#51**, **#54**, **#55**, **#56**, **#57** and **#58**, plus
+**#54**, **#55**, **#56**, **#57**, **#58**, **#59** and **#60**, plus
 **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
@@ -1080,38 +1082,92 @@ Three things to settle, and the first is a measurement:
 
 ---
 
-### 51. XoT authorizes its client by ACL and TSIG, never by certificate — **filed 2026-09-12**
+### 59. Nothing here demands a client certificate for a transfer — **filed 2026-09-13**
 
-Left behind by 44d, with a number because the alternative is a sentence in a
-doc comment (`CLAUDE.md` §18).
+The server half of #51, which closed the client half. RFC 9103 §7.5 gives a
+primary two ways to decide a transfer client is allowed: "mutual TLS (mTLS)" or
+"an IP-based ACL (which can be either per message or per connection) combined
+with a valid TSIG/SIG(0) signature on the XFR request", and adds "If only one
+method is selected, then mTLS is preferred". This tree does the second, and has
+since `security::TransferAcl` and #16. So this is not a conformance gap — one of
+the two is what the section asks for — it is the half an operator who has
+standardized on mTLS cannot use.
 
-RFC 9103 §7.5 gives a server two ways to decide a transfer client is allowed:
-"mutual TLS (mTLS)" or "an IP-based ACL (which can be either per message or per
-connection) combined with a valid TSIG/SIG(0) signature on the XFR request".
-This tree does the second and has done since `security::TransferAcl` and #16;
-§7.5 adds "If only one method is selected, then mTLS is preferred".
+**It is two problems stacked, and the lower one has a number already.**
 
-So the gap is not conformance — one of the two is what the RFC asks for — it is
-**interoperability in one direction**: a primary configured to demand a client
-certificate cannot be replicated from here, because `xot::client_config` calls
-`with_no_client_auth()`.
+- **The plumbing is #54's.** A certificate's identity has to reach
+  `answer_transfer`, and what reaches it is `validation::Privacy` — `Clear`,
+  `Tls13`, `TlsOlder` — which says what a connection hid and nothing about who
+  was on it. `tls::serve_one_tls` reads the protocol version off the finished
+  handshake and passes it into `tcp::serve_one`; a peer certificate would take
+  the same channel, and `tokio_rustls` exposes it there
+  (`stream.get_ref().1.peer_certificates()`). That is #54's
+  `Arrival { privacy, protocol }` with a third field, and #54 has already
+  measured what it touches: 6 `Handler::handle` impls, 5 sites that supply the
+  value, 30 `Privacy` sites of which 19 are test call sites. **#54 first, or the
+  two grow separate answers to one question** (`CLAUDE.md` §7).
+- **The decision is #16 again.** `WebPkiClientVerifier` answers "is this
+  certificate one we trust", which is authentication; which zones that client
+  may transfer is authorization, and a verified certificate says nothing about
+  it (`CLAUDE.md` §16). `answer_transfer` authorizes against the *apex* through
+  a `TsigSession`, and a certificate is not one. What a certificate maps to is
+  the thing to settle before any of it: a subject name matched against a
+  per-zone list, or a certificate that stands for a TSIG key's scope.
 
-Two halves, and they are not the same size:
+**And a third thing, which is why it cannot simply be switched on.** The DoT
+listener is one `rustls::ServerConfig` shared with DoQ and DoH
+(`tls::config_with_alpn`), so a client-certificate verifier on it asks *every*
+querier for one, not only the ones asking for a transfer. RFC 8310 §8.2's mTLS
+for DoT is a different relationship from RFC 9103's, and `tls.rs`'s header says
+so. This needs either a second listener, or a verifier that allows an
+unauthenticated client with the transfer path refusing what arrived without one
+— which is the shape to build, and the one to measure against a DoT stub
+resolver that offers no certificate.
 
-- **The client half is small.** Two flags for a certificate and key, and
-  `with_client_auth_cert` in place of `with_no_client_auth`. The mode check
-  `persist::ensure_private` already exists for the DoT key.
-- **The server half is #16 again.** `WebPkiClientVerifier` answers "is this
-  certificate one of ours", which is authentication; deciding *which zones* that
-  client may transfer is authorization, and a verified certificate says nothing
-  about it. The question to settle first is what a certificate maps to — a
-  subject name matched against a per-zone list, or a certificate that stands for
-  a TSIG key's scope — because `answer_transfer` authorizes against the apex
-  through a `TsigSession` and a client certificate is not one.
+**What would refute the value of it** (§19): that a peer exists which will not
+transfer to us over TSIG. None does today — #43's harness uses TSIG for every
+transfer including 43g's over TLS, against BIND, Knot and NSD — so this is an
+interoperability gap with no known peer on the other side of it, which is why it
+is filed rather than taken.
 
-Not urgent, and the reason is the same one that makes it legal: every peer this
-tree talks to accepts TSIG, and #43's harness uses it for every transfer
-including 43g's over TLS.
+---
+
+### 60. A string continuation flattened into spaces is an operator-facing defect — **filed 2026-09-13**
+
+Found while writing four of them into #51 and then reading the message back off
+the binary. A `\` at the end of a line inside a Rust string literal
+continues it and eats the next line's indentation; a rewrite that loses the
+backslash turns that indentation into the message. `rdnsd --transfer-tls-cert`
+with no `--transfer-tls-ca` printed fourteen spaces mid-sentence before it was
+fixed.
+
+**Counted before fixing one** (§18): **21 sites** across 12 files —
+`rdnsd/src/config.rs` 5, `rdnsd/src/main.rs` 4, `rdnsd/src/catalog.rs` 3, and one
+each in `rdns/src/endpoint.rs`, `notify.rs`, `transfer.rs`, `zone_signer.rs`,
+`rdnsd/src/control.rs`, `dispatch.rs`, `replication.rs`, `zones.rs` and
+`rdnsr/src/main.rs`. The widest gap is 34 spaces (`config.rs:566`); most are 14
+to 26. The four this session introduced are already fixed and are not in that
+count.
+
+Cosmetic in that nothing behaves differently, and not cosmetic in the way that
+matters: these are `bail!` and `serving_error!` strings, which is to say the
+sentences an operator reads when something is wrong, and several are the startup
+refusals that exist so a misconfiguration is a sentence rather than a silence
+(`CLAUDE.md` §15).
+
+Three things to settle:
+
+- **A detector, first.** A regex over source lines is what produced the 21 and
+  it is crude — it looks only at a literal that opens and closes on one line,
+  and it cannot tell a deliberate run of spaces (a table in a `println!`) from a
+  flattened one. `rdns/examples/request_size_probe.rs` has a real one. Whatever
+  finds them has to be runnable again, or the count is a one-off.
+- **Then whether it is a lint.** Clippy has nothing for this. A test that greps
+  the tree is the cheap version and is a test that fails on somebody's
+  legitimate table; a `#[test]` over the *rendered* messages would be better and
+  there is no list of them to render.
+- **And it is its own commit** (§12): a mechanical rewrite of 21 literals mixed
+  into a behaviour change makes both unreviewable.
 
 ---
 
@@ -1156,11 +1212,21 @@ Two shapes, and §19 says build them rather than argue:
 - a small `Arrival { privacy, protocol }` passed where `privacy` is now, which
   is the grouping done deliberately and touches the same 11 sites.
 
-Not urgent, and the reason is that the field is optional and the two transports
+~~Not urgent, and the reason is that the field is optional and the two transports
 an authoritative server mostly answers on are the two that already work. It
 becomes worth doing when somebody runs this behind DoH and wants to see it in
 the stream — or when a second consumer of "which transport" appears, which is
-the point at which the absence stops being one row's problem.
+the point at which the absence stops being one row's problem.~~
+
+**The second consumer appeared on 2026-09-13 and the sentence above named it
+exactly.** #59 — demanding a client certificate for a transfer — needs the same
+thing to travel the same channel: `tls::serve_one_tls` reads the negotiated
+version off the finished handshake and passes it into `tcp::serve_one`, and a
+peer certificate is beside it (`stream.get_ref().1.peer_certificates()`). So the
+grouping this row measured is now a prerequisite rather than a tidy-up, and the
+`Arrival` shape it drew takes a third field. **Do this before #59**, or the two
+grow separate answers to one question (`CLAUDE.md` §7). The measurements below
+are unchanged and are what either would start from.
 
 ---
 
@@ -1344,6 +1410,7 @@ the week; the record is under "How the queue kept going stale" in
 | **43** | nothing here had ever answered another implementation | **filed 2026-09-11, closed 2026-09-12.** `tests/interop/` — one `docker compose` network, `run.sh all`. 112 assertions against BIND 9.20.27, Knot 3.6.0, NSD 4.12.0, Unbound 1.23.1 and ldns 1.8.4; 0 failures. **Neither of the two things the filing predicted happened**: the IXFR is a real delta in both directions and every NSEC3 shape validates. Found one gap, in NOTIFY, which no row had named — **#46**. Three of the first five apparent findings were the harness, and the section says what each was, because that ratio is the lesson |
 | **50** | verifying a signed zone at load was quadratic in the zone | **filed and closed 2026-09-12**, found by 44c's measurement rather than by reading the code. `validate_response` collected every DNSKEY and every RRSIG in the zone on every call and `verify_rrset` then scanned what it collected, so `verify_zones` — which runs at startup, on SIGHUP, on `rdnsctl reload`, on the re-signing tick and inside `--check-config` — cost the square of the zone. **20,006 RRsets: 112.68 s before, 0.65 s after**, and a million-record zone goes from days of arithmetic to a measured 76 s. The fix is a `ZoneKeys` the caller hoists and a signature lookup through the zone's own owner index; the guard is an allocation count (34 either side of a fifty-fold zone, 217 against 6,101 with the scan) plus a ratio test in `rdnsd`. Filed **#53** on the way out |
 | **53** | a zone was verified at load even when this server had just signed it | **filed 2026-09-12, closed 2026-09-13**, left behind by #50 and only visible once #50 stopped hiding it. The row proposed "verify what we signed once, at startup"; what landed is **once per zone per set of signing keys**, which costs the same and has neither of that rule's two holes — a zone appearing after a SIGHUP was never at a startup, and #44f made a key crossing its Activate change the output with the zone file unchanged, so a rollover publishes signatures nothing has checked. `ZoneSigning::apply` returns what it signed with which key tags; the proof is recorded **after** the zone verifies, because recording first lets the next reload install what this one refused (§4), and that is a test. Startup and `--check-config` still check everything. Worth 76 s of a re-signing tick on a million-record zone, asserted as a count (`Checked { zones: 0, rrsets: 0, skipped: 1 }`) rather than a clock. The number the row said would decide it — how long a fleet's tick may take — was not needed. Nothing filed on the way out |
+| **51** | XoT authorized its client by ACL and TSIG, never by certificate | **filed 2026-09-12, closed 2026-09-13**, the client half — which is the gap the row was filed for: a primary demanding mTLS could not be replicated from. `--transfer-tls-cert`/`--transfer-tls-key`, both or neither and only with `--transfer-tls-ca`. Two things the row did not have: rustls runs `keys_match` inside `with_client_auth_cert`, so a mismatched pair is a startup error for free; and `XotTrust::anchor_count` had **no callers** — written "for the startup banner" and the banner never added (§18), which is where "a certificate is loaded" is now said, since a certificate is offered only if a master asks and "mTLS is in force" is not a claim this end can make. One PEM loader now, `rdns::tls_identity::TlsIdentity`, which is what `rdns-transport`'s `read_certs`/`read_key` became (§7). The negative control corrected the guess (§19): a master that demands a certificate and gets none fails on the **read**, not the handshake — TLS 1.3 lets the client finish first — so what the operator sees is `CertificateRequired` under the transfer. Filed **#59** (the server half: #54's plumbing under #16's question) and **#60** |
 | **40** | the internal APIs, asked whether they fit each other | **filed and closed 2026-09-10 → 2026-09-11**, six items. A pass over the *joints* rather than the modules, filed as "nothing here is a live defect" — and two of the six turned out to carry one. 40f's measurement found the UDP request cap refusing what every reply's OPT advertises, so a legitimate signed UPDATE was dropped in silence; 40d's second half deleted six silent `continue`s by typing a map key. 40b's filing was wrong and its row says why. Filed **#41** on the way out. |
 | **52** | a rate-limit test is a coin toss at a second boundary | **filed and closed 2026-09-12**, one commit. Not a defect in the server, and the filing undercounted it by 23: the shape is a test that reads the wall clock at a limiter call, and there were **43 such call sites across 24 tests**, six of them assertions a refill actually breaks. Both buckets refill by whole seconds, so the verdict depended on whether two reads straddled one. 41 sites needed nothing but one `let now` per test, because `should_allow` has taken the instant as a parameter since #28a; the two that read the clock inside the loop under test — `tcp::serve`'s per-connection charge and `rdnsr`'s UDP loop — got `rdns::clock::Clock` on `ServeContext`. The test now asserts the refill as well as the refusal, which is the half that says the connection was charged rather than never admitted |
 | **47** | a NOTIFY reply carried no OPT record | **filed and closed 2026-09-12**, one commit, and it was a defect after all: the row read RFC 6891 §6.1.1 as "asks for" where it is "if an OPT record is present in a received **request**, compliant responders MUST include an OPT record in their respective responses" — a NOTIFY is a request. Counting the shape (§18) found a second site and a second MUST: `transfer::Envelopes` built the first AXFR envelope's OPT from `has_edns()` and a fresh `Edns`, which drops DO, against RFC 3225 §3's unconditional "the DO bit of the query MUST be copied in the response". Nothing tested either. The three NOTIFY refusals now carry three different EDEs, because "you are not one of my masters" and "I am that zone's primary" are one RCODE and two operator problems. `ClientEdns::mirror_with` became total on the way, so the `Err` all three callers answered identically is one doc comment rather than four. The EDE half is a reading rather than a quotation and the peers were asked: BIND 9.20 and Knot 3.6 mirror the OPT and DO and send no EDE, NSD 4.12 answers NXDOMAIN with QDCOUNT=0 and no OPT. Nine new assertions in the interop harness, 29 passed 0 failed in 43e |

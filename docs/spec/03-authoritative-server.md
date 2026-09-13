@@ -359,7 +359,9 @@ the same zone for more masters. Requires `--zone-dir`.
 `+tls=name` is RFC 9103's XFR-over-TLS: the SOA probe and the transfer both go
 over TLS 1.3 (§7.2) with ALPN `dot` (§7.1), to port 853 unless a port is stated
 (§7.3), and the master's certificate must carry `name` and chain to
-`--transfer-tls-ca` (§7.5). There is no opportunistic mode. A catalog's member
+`--transfer-tls-ca` (§7.5), and presenting `--transfer-tls-cert`/`-key` if the
+master asks for one (§7.5's mTLS, client side only — see `TODO.md` #59 for the
+server side). There is no opportunistic mode. A catalog's member
 inherits its catalog's spec whole, `+tls=` included.
 
 ### The refresh loop (one task per `(zone, master)` pair)

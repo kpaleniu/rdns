@@ -52,6 +52,7 @@ mod test_records;
 /// Scratch directories, for tests only.
 #[cfg(test)]
 mod testutil;
+pub mod tls_identity;
 pub mod transfer;
 pub mod tsig;
 pub mod update;

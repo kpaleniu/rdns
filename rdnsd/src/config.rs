@@ -116,6 +116,11 @@ pub struct Server {
     /// Separate settings because they are separate directions: a server can be
     /// a secondary over XoT, a primary that insists on it, or both.
     pub transfer_tls_ca: Option<PathBuf>,
+    /// The certificate this server presents to a master that asks for one
+    /// (RFC 9103 §7.5's mutual TLS). Both keys or neither; `check` says so,
+    /// because a chain with no key cannot be presented.
+    pub transfer_tls_cert: Option<PathBuf>,
+    pub transfer_tls_key: Option<PathBuf>,
     #[serde(default)]
     pub transfer_tls_only: bool,
     /// Where `rdnsctl` reaches this server. Unix only, and refused at startup
@@ -159,6 +164,8 @@ impl Default for Server {
             tls_cert: None,
             tls_key: None,
             transfer_tls_ca: None,
+            transfer_tls_cert: None,
+            transfer_tls_key: None,
             transfer_tls_only: false,
             control_socket: None,
             allow_partial_load: false,
@@ -456,6 +463,27 @@ impl Config {
                  1 is the smallest server"
             );
         }
+        // Both or neither, and only where something fetches a zone over TLS.
+        // The flags get this from clap's `requires`, which a file has no
+        // equivalent of (`CLAUDE.md` §15).
+        match (
+            &self.server.transfer_tls_cert,
+            &self.server.transfer_tls_key,
+        ) {
+            (Some(_), Some(_)) | (None, None) => {}
+            _ => bail!(
+                "server.transfer-tls-cert and server.transfer-tls-key go together: a chain \
+                 with no key cannot be presented, and a key with no chain is not \
+                 an identity (RFC 9103 §7.5)"
+            ),
+        }
+        if self.server.transfer_tls_cert.is_some() && self.server.transfer_tls_ca.is_none() {
+            bail!(
+                "server.transfer-tls-cert is the certificate this server presents when it \
+                 *fetches* a zone over TLS, and server.transfer-tls-ca names no \
+                 anchors, so nothing here fetches one"
+            );
+        }
         for (name, key) in &self.keys {
             match (&key.secret, &key.secret_file) {
                 (Some(_), Some(_)) => bail!(
@@ -651,6 +679,8 @@ impl Config {
         cli.tls_cert = self.server.tls_cert.clone();
         cli.tls_key = self.server.tls_key.clone();
         cli.transfer_tls_ca = self.server.transfer_tls_ca.clone();
+        cli.transfer_tls_cert = self.server.transfer_tls_cert.clone();
+        cli.transfer_tls_key = self.server.transfer_tls_key.clone();
         cli.transfer_tls_only = self.server.transfer_tls_only;
         cli.control_socket = self.server.control_socket.clone();
         cli.allow_partial_load = self.server.allow_partial_load;
@@ -1183,6 +1213,44 @@ masters = ["192.0.2.1#k.+tls=ns1.example.net."]
         assert_eq!(
             config.server.transfer_tls_ca.as_deref(),
             Some(std::path::Path::new("/etc/rdns/anchors.pem"))
+        );
+    }
+
+    /// A client certificate needs its key, and clap's `requires` says so for
+    /// the flags. The file has no such mechanism, so `check` does
+    /// (`CLAUDE.md` §15).
+    #[test]
+    fn a_transfer_client_certificate_without_its_key_is_refused() {
+        let err = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+transfer-tls-ca = "/etc/rdns/anchors.pem"
+transfer-tls-cert = "/etc/rdns/client.pem"
+"#,
+        )
+        .expect_err("half an identity");
+        assert!(err.to_string().contains("go together"), "{err}");
+    }
+
+    /// And it is the certificate presented when this server *fetches* a zone,
+    /// so without anchors there is nothing to present it to. Silence here would
+    /// be an operator believing mTLS is configured on a server that never makes
+    /// an outgoing TLS connection at all (`CLAUDE.md` §4).
+    #[test]
+    fn a_transfer_client_certificate_with_no_anchors_is_refused() {
+        let err = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+transfer-tls-cert = "/etc/rdns/client.pem"
+transfer-tls-key = "/etc/rdns/client.key"
+"#,
+        )
+        .expect_err("nothing fetches over TLS");
+        assert!(
+            err.to_string().contains("nothing here fetches one"),
+            "{err}"
         );
     }
 

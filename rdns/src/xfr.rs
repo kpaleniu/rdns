@@ -1421,6 +1421,22 @@ mod tests {
     }
 
     async fn spawn_tls_master(zone: Zone, name: &str) -> TlsMaster {
+        spawn_tls_master_inner(zone, name, None).await
+    }
+
+    /// The same master, demanding a client certificate that chains to
+    /// `client_root` — RFC 9103 §7.5's mTLS, from the side this tree does not
+    /// implement as a *server* (`TODO.md` #59). Written here because the client
+    /// half has to be provable against something that actually asks.
+    ///
+    /// One function with a parameter rather than two spawners (`CLAUDE.md` §7):
+    /// everything but the verifier is the same, and a second copy is where the
+    /// ALPN token or the TLS version would come to differ.
+    async fn spawn_tls_master_inner(
+        zone: Zone,
+        name: &str,
+        client_root: Option<rustls::pki_types::CertificateDer<'static>>,
+    ) -> TlsMaster {
         use rustls::pki_types::pem::PemObject;
         use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
@@ -1436,8 +1452,19 @@ mod tests {
         let cert = CertificateDer::from(issued.cert.der().to_vec());
         let key = PrivateKeyDer::from_pem_slice(issued.signing_key.serialize_pem().as_bytes())
             .expect("the key");
-        let mut config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
+        let builder = match client_root {
+            Some(root) => {
+                let mut roots = rustls::RootCertStore::empty();
+                roots.add(root).expect("a client root");
+                let verifier =
+                    rustls::server::WebPkiClientVerifier::builder(std::sync::Arc::new(roots))
+                        .build()
+                        .expect("a client verifier");
+                rustls::ServerConfig::builder().with_client_cert_verifier(verifier)
+            }
+            None => rustls::ServerConfig::builder().with_no_client_auth(),
+        };
+        let mut config = builder
             .with_single_cert(vec![cert], key)
             .expect("a server config");
         // What RFC 9103 §7.1 says a client MUST select. Advertised here so the
@@ -1468,7 +1495,7 @@ mod tests {
     }
 
     fn xot_master(master: &TlsMaster, name: &str) -> Master {
-        let trust = crate::xot::XotTrust::from_ca_file(&master.anchors).expect("anchors");
+        let trust = crate::xot::XotTrust::from_ca_file(&master.anchors, None).expect("anchors");
         Master::over_tls(
             master.addr,
             crate::xot::XotClient::new(trust, crate::xot::XotName::parse(name).expect("a name")),
@@ -1526,7 +1553,7 @@ mod tests {
 
         // The addresses are the first master's; the anchors are the second's,
         // which issued a different self-signed certificate for the same name.
-        let trust = crate::xot::XotTrust::from_ca_file(&stranger.anchors).expect("anchors");
+        let trust = crate::xot::XotTrust::from_ca_file(&stranger.anchors, None).expect("anchors");
         let wrong = Master::over_tls(
             master.addr,
             crate::xot::XotClient::new(
@@ -1539,6 +1566,76 @@ mod tests {
             .expect_err("an issuer we do not trust");
         assert!(
             err.to_string().contains("invalid peer certificate"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// RFC 9103 §7.5's mutual TLS, end to end and from the client side: a
+    /// master that demands a certificate, and a secondary that presents one.
+    ///
+    /// The negative control is in the same test, and is the half that matters:
+    /// without it, "the transfer worked" is equally consistent with a master
+    /// that never asked. Same master, a client with no identity, and the
+    /// handshake is refused.
+    #[tokio::test]
+    async fn a_transfer_completes_against_a_master_that_demands_a_client_certificate() {
+        let source = source_zone();
+        let client = rcgen::generate_simple_self_signed(vec!["secondary.test".to_string()])
+            .expect("a client certificate");
+        let client_root =
+            rustls::pki_types::CertificateDer::from(client.cert.der().to_vec()).into_owned();
+        let master = spawn_tls_master_inner(source.clone(), "master.test", Some(client_root)).await;
+
+        let dir = master.dir.join("client");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let cert_path = dir.join("client.pem");
+        let key_path = dir.join("client.key");
+        std::fs::write(&cert_path, client.cert.pem()).expect("write");
+        std::fs::write(&key_path, client.signing_key.serialize_pem()).expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod");
+        }
+
+        let identity = crate::tls_identity::TlsIdentity::from_files(
+            &cert_path,
+            &key_path,
+            "the transfer client certificate",
+        )
+        .expect("a pair");
+        let trust =
+            crate::xot::XotTrust::from_ca_file(&master.anchors, Some(identity)).expect("anchors");
+        let with_cert = Master::over_tls(
+            master.addr,
+            crate::xot::XotClient::new(
+                trust,
+                crate::xot::XotName::parse("master.test").expect("a name"),
+            ),
+        );
+        let received = fetch_zone(&with_cert, nm("example.com.").as_ref(), None)
+            .await
+            .expect("mutual TLS");
+        assert_eq!(received.records().len(), source.records().len());
+
+        // And without one. The failure does *not* come back from the handshake:
+        // TLS 1.3 has the client finish and send application data in the same
+        // flight, so `connect` returns `Ok` and the master's
+        // `CertificateRequired` alert arrives on the first read. Asserted as
+        // measured rather than as expected — this is the message an operator
+        // whose master started demanding a certificate actually sees, and it is
+        // under "transferring example.com. from ..." rather than under a
+        // handshake error.
+        let err = fetch_zone(
+            &xot_master(&master, "master.test"),
+            nm("example.com.").as_ref(),
+            None,
+        )
+        .await
+        .expect_err("the master asked for a certificate and got none");
+        assert!(
+            err.to_string().contains("CertificateRequired"),
             "unexpected error: {err}"
         );
     }

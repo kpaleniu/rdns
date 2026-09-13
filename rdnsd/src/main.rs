@@ -53,6 +53,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use rdns::clock::Clock;
 use rdns::compression::NameCompressor;
+use rdns::tls_identity::TlsIdentity;
 use rdns::xot::XotTrust;
 use rdns::{
     dnssec::{DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE},
@@ -481,6 +482,32 @@ struct Cli {
     /// system bundle, which is a PEM file like any other.
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     transfer_tls_ca: Option<PathBuf>,
+    /// PEM certificate chain this server presents to a master that asks for one
+    /// (RFC 9103 §7.5's mutual TLS).
+    ///
+    /// Optional, and needed only when the master is configured to demand it —
+    /// §7.5's other method is the address ACL plus TSIG, which every peer here
+    /// speaks. Offered only if the master asks: a certificate configured for a
+    /// master that never sends a CertificateRequest is never sent, so the
+    /// startup banner says one is loaded rather than that mTLS is in force.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "transfer_tls_key",
+        conflicts_with = "config"
+    )]
+    transfer_tls_cert: Option<PathBuf>,
+    /// The PEM private key for --transfer-tls-cert.
+    ///
+    /// Refused if it is readable by its group or by everybody, the same check
+    /// --tls-key gets. Unix only; Windows has no equivalent.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "transfer_tls_cert",
+        conflicts_with = "config"
+    )]
+    transfer_tls_key: Option<PathBuf>,
     /// Refuse a zone transfer that did not arrive over an encrypted transport.
     ///
     /// The other half of RFC 9103: §11 says an individual transfer "is not
@@ -1901,10 +1928,52 @@ async fn main() -> Result<()> {
     // resolution above and for the same reason: `--check-config` has to reach
     // it, and "no anchors" is a startup failure rather than a transfer that
     // goes out in clear months later (`CLAUDE.md` §4).
+    // Both or neither: clap's `requires` says so for the flags, and the config
+    // file has no equivalent, so `Config::check` says it there.
+    let transfer_identity = match (&cli.transfer_tls_cert, &cli.transfer_tls_key) {
+        (Some(cert), Some(key)) => Some(TlsIdentity::from_files(
+            cert,
+            key,
+            "the transfer client certificate",
+        )?),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                "--transfer-tls-cert and --transfer-tls-key go together: a chain with \
+                 no key cannot be presented, and a key with no chain is not an \
+                 identity (RFC 9103 §7.5)"
+            ))
+        }
+    };
+    if transfer_identity.is_some() && cli.transfer_tls_ca.is_none() {
+        return Err(anyhow!(
+            "--transfer-tls-cert is the certificate this server presents when it \
+             *fetches* a zone over TLS, and --transfer-tls-ca names no anchors, \
+             so nothing here fetches one"
+        ));
+    }
     let xot = match &cli.transfer_tls_ca {
-        Some(path) => Some(XotTrust::from_ca_file(path)?),
+        Some(path) => Some(XotTrust::from_ca_file(path, transfer_identity)?),
         None => None,
     };
+    // What the outgoing half of RFC 9103 is configured to do, where the two
+    // facts an operator cannot otherwise see are the anchor count and whether a
+    // client certificate is loaded. A certificate is offered only when a master
+    // sends a CertificateRequest, so "mTLS is in force" is not a claim this end
+    // can make; what it can say is what it holds (`CLAUDE.md` §4). This is also
+    // `XotTrust::anchor_count`'s first caller — it was written for a banner
+    // that was never added (`CLAUDE.md` §18).
+    if let Some(xot) = &xot {
+        tracing::info!(
+            "zone transfers fetched over TLS: {} trust anchor(s), client certificate {}",
+            xot.anchor_count(),
+            if xot.presents_a_certificate() {
+                "loaded, offered if a master asks (RFC 9103 §7.5 mTLS)"
+            } else {
+                "none (--transfer-tls-cert); masters authorize by address and TSIG"
+            }
+        );
+    }
     if xot.is_none() {
         if let Some(spec) = secondary_specs.iter().find(|spec| spec.tls.is_some()) {
             return Err(anyhow!(

@@ -7931,3 +7931,100 @@ Verified: 1,114 tests on Windows and 1,134 on Linux, clippy clean on both,
 `cargo doc` clean.
 
 ---
+
+### 51. XoT authorizes its client by ACL and TSIG, never by certificate — ~~**filed 2026-09-12**~~ **closed 2026-09-13**
+
+Left behind by 44d, with a number because the alternative is a sentence in a
+doc comment (`CLAUDE.md` §18).
+
+RFC 9103 §7.5 gives a server two ways to decide a transfer client is allowed:
+"mutual TLS (mTLS)" or "an IP-based ACL (which can be either per message or per
+connection) combined with a valid TSIG/SIG(0) signature on the XFR request".
+This tree does the second and has done since `security::TransferAcl` and #16;
+§7.5 adds "If only one method is selected, then mTLS is preferred".
+
+So the gap is not conformance — one of the two is what the RFC asks for — it is
+**interoperability in one direction**: a primary configured to demand a client
+certificate cannot be replicated from here, because `xot::client_config` calls
+`with_no_client_auth()`.
+
+Two halves, and they are not the same size:
+
+- **The client half is small.** Two flags for a certificate and key, and
+  `with_client_auth_cert` in place of `with_no_client_auth`. The mode check
+  `persist::ensure_private` already exists for the DoT key.
+- **The server half is #16 again.** `WebPkiClientVerifier` answers "is this
+  certificate one of ours", which is authentication; deciding *which zones* that
+  client may transfer is authorization, and a verified certificate says nothing
+  about it. The question to settle first is what a certificate maps to — a
+  subject name matched against a per-zone list, or a certificate that stands for
+  a TSIG key's scope — because `answer_transfer` authorizes against the apex
+  through a `TsigSession` and a client certificate is not one.
+
+Not urgent, and the reason is the same one that makes it legal: every peer this
+tree talks to accepts TSIG, and #43's harness uses it for every transfer
+including 43g's over TLS.
+
+---
+
+**Done 2026-09-13**, the client half, and the row's two sizes held: the client
+half was two flags and one rustls call, and the server half turned out to be
+larger than "#16 again" — it is filed as **#59** with the measurement below.
+
+**The client half.** `--transfer-tls-cert` and `--transfer-tls-key`, both or
+neither and only alongside `--transfer-tls-ca`, plus the same pair in the config
+file. `xot::client_config` takes an `Option<TlsIdentity>` and calls
+`with_client_auth_cert` when there is one.
+
+- **rustls checks the pair for us.** `with_client_auth_cert` runs
+  `CertifiedKey::from_der`, which loads the key and runs `keys_match`, so a
+  chain and key that do not go together is a sentence at startup. The row
+  guessed the mode check was the thing already in place; it is, and so is this.
+- **One PEM loader, not two.** `rdns::tls_identity::TlsIdentity` is new and is
+  what `rdns_transport::tls`'s `read_certs`/`read_key` became: an empty chain,
+  an unreadable key and the mode check are one implementation now rather than
+  the second copy that drifts (`CLAUDE.md` §7). The pair is the type, because a
+  chain with no key is not a thing a caller can do anything with.
+- **`XotTrust::anchor_count` had no callers.** It was written "for the startup
+  banner" and the banner was never added — dead code documenting somebody's
+  intent (§18). The line exists now and carries both facts an operator cannot
+  otherwise see: how many anchors loaded, and whether a client certificate is
+  held.
+- **"mTLS is in force" is not a claim this end can make**, so the line does not
+  make it. A certificate is offered only in response to a CertificateRequest, so
+  a master that stops asking silently stops requiring it; what the line says is
+  that one is loaded and will be offered if asked (§4).
+
+**What the measurement corrected** (§19). The negative control — the same master
+demanding a certificate, a client with none — was written expecting a handshake
+error. It is not one: TLS 1.3 lets the client finish and send its first flight,
+so `connect` returns `Ok` and the master's `CertificateRequired` alert arrives on
+the *read*. The test asserts what was measured, and the comment says why, because
+that is the message an operator sees when a master starts demanding a certificate
+they have not configured — filed under "transferring example.com. from ..."
+rather than under a handshake failure.
+
+**What is left, and why it is not this number.** The server half — demanding a
+certificate from a transfer client — needs the certificate's identity to reach
+`answer_transfer`, and what reaches it today is `validation::Privacy`, which is
+`Clear`/`Tls13`/`TlsOlder` and carries nothing about a peer. `serve_one_tls`
+reads the protocol version off the finished handshake and passes it into
+`tcp::serve_one`; a subject name would travel the same channel, which is exactly
+the parameter grouping **#54** already measured (6 `Handler::handle` impls, 5
+supply sites, 30 `Privacy` sites). So the server half is #16's authorization
+question *on top of* #54's plumbing, and filing it as a continuation of this row
+would have understated it by a whole number. It is **#59**.
+
+**Also filed: #60**, found while fixing four of my own — 21 string literals in
+the tree whose `\` continuations were flattened into runs of up to 34 spaces,
+several of them operator-facing error messages.
+
+Verified: an end-to-end test in `rdns::xfr` against a master built with
+`WebPkiClientVerifier` — the transfer completes with a certificate and is
+refused without one; two in `rdns::xot` (loaded and reported; a mismatched pair
+refused at startup); two in `rdns::tls_identity`; two in `rdnsd::config` for the
+file's half of the both-or-neither rule. Both refusals and the banner were run
+against the built binary. 1,121 tests on Windows and 1,141 on Linux, clippy
+clean on both, `cargo doc` clean.
+
+---

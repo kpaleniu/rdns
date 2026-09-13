@@ -203,10 +203,13 @@ requires the master's certificate to carry `NAME`:
 - the anchors come from `--transfer-tls-ca`, which startup insists on;
 - it goes last, after `#KEY`. The other order is refused rather than guessed at.
 
-This server does not present a client certificate. RFC 9103 §7.5 lets a primary
-authorize its client by mutual TLS *or* by "an IP-based ACL ... combined with a
-valid TSIG/SIG(0) signature", and this is the second — so a primary that demands
-mTLS cannot be replicated from (`TODO.md` #51).
+RFC 9103 §7.5 lets a primary authorize its client by mutual TLS *or* by "an
+IP-based ACL ... combined with a valid TSIG/SIG(0) signature". This server
+offers both directions of the first only as a *client*: give
+`--transfer-tls-cert` and `--transfer-tls-key` and it presents a certificate
+when a master asks for one. As a primary it authorizes by the ACL and TSIG,
+so a client certificate offered to *this* server is not looked at
+(`TODO.md` #59).
 
 ```bash
 # Two masters for one zone; either can answer, both may NOTIFY.
@@ -654,6 +657,30 @@ There is no default and no system trust store: the masters a server replicates
 from are usually its own operator's, with a private CA. Pointing this at
 `/etc/ssl/certs/ca-certificates.crt` is how a publicly issued certificate is
 trusted — it is a PEM bundle like any other.
+
+### `--transfer-tls-cert <PATH>`, `--transfer-tls-key <PATH>`
+
+The certificate this server presents when a master asks for one — RFC 9103
+§7.5's mutual TLS, from the client side. Both or neither, and only alongside
+`--transfer-tls-ca`, since this is the identity used when *fetching* a zone.
+
+Optional, because §7.5's other method is the address ACL plus TSIG and every
+peer speaks that; §7.5 adds "If only one method is selected, then mTLS is
+preferred", so a master that has chosen mTLS needs this to be replicated from.
+
+The key is refused if its group or everybody can read it, the same check
+`--tls-key` and a TSIG `secret-file` get (Unix only). A certificate and key that
+are not a pair are refused at startup rather than at the first transfer.
+
+The certificate is sent **only if the master asks for it**: TLS offers a client
+certificate in response to a CertificateRequest and not otherwise, so the
+startup line says one is loaded rather than that mTLS is in force. A master that
+asks and gets nothing answers `CertificateRequired`, which arrives as a transfer
+failure rather than a handshake one — TLS 1.3 lets the client finish first.
+
+```bash
+rdnsd --zone-dir ./zones   --secondary example.com@192.0.2.1+tls=ns1.example.net   --transfer-tls-ca /etc/rdns/anchors.pem   --transfer-tls-cert /etc/rdns/client.pem   --transfer-tls-key /etc/rdns/client.key
+```
 
 ### `--also-notify <ADDR[:PORT][#KEY]>`
 

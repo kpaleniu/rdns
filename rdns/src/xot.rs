@@ -38,11 +38,23 @@
 //! a publicly issued certificate points `--transfer-tls-ca` at the system
 //! bundle, which is a PEM file like any other.
 //!
-//! **No client certificate.** §7.5 lets a server validate its client by "mutual
-//! TLS (mTLS)" or by "an IP-based ACL ... combined with a valid TSIG/SIG(0)
-//! signature", and this tree does the second — it has had both halves of it
-//! since `security::TransferAcl` and `TODO.md` #16. The consequence is an
-//! interop limit rather than a conformance one, and it is `TODO.md` #51.
+//! **A client certificate is optional and off by default.** §7.5 lets a server
+//! validate its client by "mutual TLS (mTLS)" or by "an IP-based ACL ...
+//! combined with a valid TSIG/SIG(0) signature", and adds "If only one method
+//! is selected, then mTLS is preferred". As a *server* this tree does the
+//! second and has since `security::TransferAcl` and `TODO.md` #16; as a
+//! *client* it will now present a certificate when the operator names one
+//! (`--transfer-tls-cert`/`--transfer-tls-key`), which is what replicating from
+//! a primary that demands mTLS needs. Off by default because a certificate sent
+//! to a master that did not ask for one is not sent at all — rustls offers it
+//! only in response to a CertificateRequest — but configuring one that does not
+//! exist should be a sentence at startup rather than a handshake failure later
+//! (`CLAUDE.md` §15).
+//!
+//! The mirror image — *this* server demanding a certificate from a transfer
+//! client — is `TODO.md` #59, and is not the same size: verifying a certificate
+//! answers who a peer is and says nothing about which zones it may take
+//! (`CLAUDE.md` §16).
 
 use std::io;
 use std::net::SocketAddr;
@@ -56,6 +68,7 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use crate::error::{ConfigError, ConfigResult, TransferError, TransferResult};
+use crate::tls_identity::TlsIdentity;
 
 /// The port RFC 9103 §7.3 says an XoT connection SHOULD use, which is
 /// RFC 7858's.
@@ -114,6 +127,10 @@ impl std::fmt::Display for XotName {
 #[derive(Clone, Debug)]
 pub struct XotTrust {
     config: Arc<ClientConfig>,
+    /// Whether an identity was configured. Read back from the configuration
+    /// would be better, and rustls hands back a `ResolvesClientCert` that
+    /// cannot answer it without a `ClientHello` to ask about.
+    presenting: bool,
     /// Kept beside the configuration because rustls does not hand the root
     /// store back once the verifier has it, and the banner should say how many
     /// anchors an operator actually loaded.
@@ -124,10 +141,14 @@ impl XotTrust {
     /// Read a PEM bundle of certificate authorities and build the client
     /// configuration from it.
     ///
+    /// `identity` is the certificate this server presents when a master asks
+    /// for one (§7.5's mTLS); `None` is the ordinary case and means the master
+    /// authorizes by address and TSIG.
+    ///
     /// An empty file is refused rather than loaded: a `RootCertStore` with
     /// nothing in it verifies nothing, so it would start, and then fail every
     /// handshake with a message about the master (`CLAUDE.md` §4).
-    pub fn from_ca_file(path: &Path) -> ConfigResult<Self> {
+    pub fn from_ca_file(path: &Path, identity: Option<TlsIdentity>) -> ConfigResult<Self> {
         use rustls::pki_types::pem::PemObject;
 
         let mut roots = RootCertStore::empty();
@@ -159,9 +180,11 @@ impl XotTrust {
             )));
         }
         let anchors = roots.len();
+        let presenting = identity.is_some();
         Ok(XotTrust {
-            config: Arc::new(client_config(roots)),
+            config: Arc::new(client_config(roots, identity)?),
             anchors,
+            presenting,
         })
     }
 
@@ -169,22 +192,50 @@ impl XotTrust {
     pub fn anchor_count(&self) -> usize {
         self.anchors
     }
+
+    /// Whether a client certificate will be offered, for the startup banner.
+    ///
+    /// Said out loud because a master that stops asking for one, or never asked,
+    /// makes mTLS silently not in force — a policy the operator believes is
+    /// applied and is not (`CLAUDE.md` §4). What this claims is only that a
+    /// certificate is loaded and will be offered if asked.
+    pub fn presents_a_certificate(&self) -> bool {
+        self.presenting
+    }
 }
 
-/// TLS 1.3 and nothing else (§7.2), ALPN `dot` (§7.1), and the operator's
-/// anchors (§7.5).
-fn client_config(roots: RootCertStore) -> ClientConfig {
+/// TLS 1.3 and nothing else (§7.2), ALPN `dot` (§7.1), the operator's anchors
+/// and, when one is configured, the certificate this client presents (§7.5).
+fn client_config(
+    roots: RootCertStore,
+    identity: Option<TlsIdentity>,
+) -> ConfigResult<ClientConfig> {
     // `builder_with_protocol_versions` rather than `builder`: the workspace
     // turns rustls's `tls12` feature on for the DoT *listener*, where RFC 7858
     // still allows 1.2 and a stub resolver in the field may offer nothing else.
     // A transfer is the other case, and §7.2 is a MUST.
-    let mut config = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
-        .with_root_certificates(roots)
-        // §7.5's other authorization method is mTLS; this tree uses the IP ACL
-        // and TSIG it names beside it. See the module docs and `TODO.md` #51.
-        .with_no_client_auth();
+    let builder = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots);
+    let mut config = match identity {
+        // Fallible, and the failures are worth catching at startup: rustls
+        // loads the key here and runs `keys_match` against the chain, so a pair
+        // that does not go together, or a key this build cannot sign with, is a
+        // sentence on stderr rather than every transfer failing on a timer.
+        Some(identity) => {
+            let (chain, key) = identity.into_parts();
+            builder.with_client_auth_cert(chain, key).map_err(|e| {
+                ConfigError::new(format!(
+                    "the transfer client certificate and its key cannot be used together: {e}"
+                ))
+            })?
+        }
+        // §7.5's other authorization method is mTLS; a master that does not ask
+        // for a certificate authorizes by the IP ACL and TSIG it names beside
+        // it. See the module docs.
+        None => builder.with_no_client_auth(),
+    };
     config.alpn_protocols = vec![ALPN_DOT.to_vec()];
-    config
+    Ok(config)
 }
 
 /// One master reached over TLS: the anchors, and the name its certificate must
@@ -275,7 +326,7 @@ mod tests {
             line!()
         ));
         std::fs::write(&path, "# no certificates here\n").expect("write");
-        let err = XotTrust::from_ca_file(&path).expect_err("an empty bundle");
+        let err = XotTrust::from_ca_file(&path, None).expect_err("an empty bundle");
         assert!(
             err.to_string().contains("no CERTIFICATE block"),
             "unexpected error: {err}"
@@ -283,11 +334,64 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A pair, on disk, with the key at the mode `ensure_private` insists on.
+    fn issued(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("rdns-xot-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let issued =
+            rcgen::generate_simple_self_signed(vec!["ns1.example.com".to_string()]).expect("cert");
+        let cert = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+        std::fs::write(&cert, issued.cert.pem()).expect("write cert");
+        std::fs::write(&key, issued.signing_key.serialize_pem()).expect("write key");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+        (cert, key)
+    }
+
+    /// The client half of RFC 9103 §7.5's mTLS: a certificate is configured,
+    /// loads, and is what the banner reports.
+    #[test]
+    fn a_client_certificate_is_loaded_and_said_out_loud() {
+        let (cert, key) = issued("mtls");
+        let identity =
+            TlsIdentity::from_files(&cert, &key, "the transfer client certificate").expect("pair");
+        // The same self-signed certificate doubles as the anchor file: what is
+        // under test is the client identity, not who the master is.
+        let trust = XotTrust::from_ca_file(&cert, Some(identity)).expect("anchors and identity");
+        assert!(trust.presents_a_certificate());
+        assert_eq!(trust.anchor_count(), 1);
+
+        let without = XotTrust::from_ca_file(&cert, None).expect("anchors");
+        assert!(!without.presents_a_certificate());
+    }
+
+    /// A chain and a key that are not a pair load happily on their own and then
+    /// fail every handshake. rustls runs `keys_match` inside
+    /// `with_client_auth_cert`, so the failure is at startup — which is the
+    /// whole reason the identity is built there rather than per connection.
+    #[test]
+    fn a_certificate_and_a_key_that_are_not_a_pair_are_refused_at_startup() {
+        let (cert, _) = issued("mismatch-a");
+        let (_, other_key) = issued("mismatch-b");
+        let identity =
+            TlsIdentity::from_files(&cert, &other_key, "the transfer client certificate")
+                .expect("both files read");
+        let err = XotTrust::from_ca_file(&cert, Some(identity)).expect_err("not a pair");
+        assert!(
+            err.to_string().contains("cannot be used together"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn a_missing_anchor_file_names_the_path() {
         let path = std::env::temp_dir().join("rdns-xot-nonexistent.pem");
         let _ = std::fs::remove_file(&path);
-        let err = XotTrust::from_ca_file(&path).expect_err("no such file");
+        let err = XotTrust::from_ca_file(&path, None).expect_err("no such file");
         assert!(
             err.to_string().contains("rdns-xot-nonexistent.pem"),
             "unexpected error: {err}"
