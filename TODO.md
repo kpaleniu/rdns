@@ -1078,7 +1078,7 @@ Three things to settle, and the first is a measurement:
 
 ---
 
-### 48. A catalog's `group` property is read and not acted on — **filed 2026-09-12**
+### 48. A catalog's `group` property is read and not acted on — ~~**filed 2026-09-12**~~ **closed 2026-09-13**
 
 Left behind by 44a, with a number because 44a's own row would otherwise be the
 only place it is written down (`CLAUDE.md` §18).
@@ -1129,6 +1129,41 @@ Three things to settle before writing it, none of which 44a had to:
 
 Not urgent: a fleet with one class of member zone — which is the ordinary case
 and the one 44a's row was about — never writes a group at all.
+
+---
+
+**Done 2026-09-13**, in the shape the row drew: `[zones."$CATZ".groups."value"]`
+with a `masters` list, per catalog zone. All three things the row said to settle
+were settled as it proposed, and one of them was not the hard part.
+
+- **Several groups on one member** is a conflict only when they name *different*
+  masters — two labels for one arrangement is the ordinary way a producer uses
+  §4.3.2's "MAY assign more than one group property". A real conflict refuses the
+  member; a member that is *already* held and becomes conflicted is left exactly
+  as it is, which the row did not consider and which §5.1 decides: an instruction
+  that cannot be followed must not remove or reconfigure anything.
+- **Octets, not text**: the TOML key's UTF-8 encoding is the needle, and the
+  sidecar's third field is RFC 1035 §5.1 escaping with spaces as `\032`, since
+  the row is whitespace-separated. Every byte round-trips, `-` included, which is
+  a test.
+- **A group change under an unchanged node label** replaces the refresh task and
+  keeps the zone file and the transfer state. What the row did not name is what
+  that costs: the copy on disk was fetched from the *old* master, so
+  `withdraw_unvouched_zones` takes the zone out of service until the new one
+  answers — the same rule a configured secondary gets when its `masters` change,
+  and the same one the §4.3.1 handover path has always had. The test asserts the
+  withdrawal rather than the serving, and the log line says it.
+
+**Scope taken, and the part of the row's own sentence that was declined.** The
+row said a group is how a producer says "a different master or key, whether to
+sign it, what to NOTIFY about it". Masters carry the key and the TLS name, so
+that is one setting and not two. The other two are not a consumer's to decide: a
+secondary does not sign a zone it replicates, and NOTIFY targets are
+`server.also-notify`'s, which a member inherits like any other zone. A setting
+whose effect here would be nothing is worse than its absence (`CLAUDE.md` §14).
+
+**Two tests changed**, and they encoded the old sidecar format rather than a
+behaviour: the third field is new, so the lines they assert gained a `-`.
 
 ---
 

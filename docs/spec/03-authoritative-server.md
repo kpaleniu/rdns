@@ -545,7 +545,7 @@ how it arrives. `--catalog` adds the reading, and adds nothing to the transfer.
 |---|---|---|
 | `version.$CATZ` | TXT | schema version; exactly one RR, value `"2"` (§4.2.1) |
 | `<unique-N>.zones.$CATZ` | PTR | a member zone; exactly one RR (§4.1) |
-| `group.<unique-N>.zones.$CATZ` | TXT | group values, read and not acted on (§4.3.2) |
+| `group.<unique-N>.zones.$CATZ` | TXT | group values; each one maps onto a `[zones."$CATZ".groups."…"]` table if the configuration has one (§4.3.2) |
 | `coo.<unique-N>.zones.$CATZ` | PTR | change of ownership; exactly one RR (§4.3.1) |
 | anything else | — | ignored (§3), including `*.ext` custom properties (§4.4) |
 
@@ -570,6 +570,9 @@ reconcile is a lookup and nothing else.
 | the catalog says | this server does | RFC |
 |---|---|---|
 | a member it has not got | replicate it from the catalog's master, with the catalog's key | §5.1 |
+| a member carrying a configured group value | replicate it from that group's masters instead | §4.3.2 |
+| a member carrying two configured groups that disagree | do not provision it, log an error; if it is already held, leave it exactly as it is | §4.3.2, §5.1 |
+| a member whose group changed under an unchanged `<unique-N>` | replace its refresh task, keep its zone file and its transfer state | §4.3.2 |
 | a member under a new `<unique-N>` | remove, state and all, then immediately re-add | §5.4 |
 | a member the configuration names, or another catalog holds | ignore it, log an error | §5.2 |
 | a member another catalog hands over with `coo` | take it, keeping its state if the node label matches | §4.3.1 |
@@ -579,12 +582,52 @@ A removal is logged at WARN, and `dns_catalog_members{catalog="..."}` is the
 gauge to alert on — §6's failure mode is a producer emptying a catalog and
 taking every member off a fleet within seconds.
 
+### Group configuration (§4.3.2)
+
+`[zones."$CATZ".groups."<value>"]` with a `masters` list, per catalog zone and
+not globally — §4.3.2's own shape: "Implementations MAY facilitate mapping of a
+specific group value to a specific configuration configurable on a per catalog
+zone basis", because a producer may publish one catalog to several consumer
+operators who each agreed different values.
+
+```toml
+[zones."catalog.invalid."]
+masters = ["192.0.2.1#transfer.key"]
+catalog = true
+[zones."catalog.invalid.".groups."operator-x-signed"]
+masters = ["192.0.2.9#other.key"]
+```
+
+- `masters` and nothing else. A group is the producer saying how a member should
+  be treated, and the only part of that a consumer of somebody else's zone
+  decides is where it is fetched from and with which key: a secondary does not
+  sign what it replicates, and NOTIFY targets are `server.also-notify`'s.
+- The comparison is on octets. A group value is a TXT record's RDATA, so the
+  TOML key's UTF-8 encoding is the needle and a lossy conversion would merge two
+  values that differ.
+- Several group values on one member are legal (§4.3.2, "The producer MAY assign
+  more than one group property to one member zone") and are only a conflict when
+  they name *different* masters. Then the member is refused, because §4.3.2 has
+  no rule for choosing and picking the first would be a silent decision about
+  what is being served.
+- A group table on a zone that is not a catalog, and a group naming no masters,
+  are both refused at startup.
+
 ### The membership sidecar
 
 `rdnsd.catalog`, beside `rdnsd.state` in `--zone-dir`. One line per member: the
-zone, then the member node it came from (`<unique-N>.zones.$CATZ`, which carries
-both the label §5.4 turns on and the catalog §5.3 turns on). Presentation form,
-so whatever octets a producer chose for `<unique-N>` survive.
+zone, the member node it came from (`<unique-N>.zones.$CATZ`, which carries both
+the label §5.4 turns on and the catalog §5.3 turns on), then the group value in
+force or `-`. The names are in presentation form, so whatever octets a producer
+chose for `<unique-N>` survive; the group is RFC 1035 §5.1's character-string
+escaping with spaces as `\032`, since the row is whitespace-separated.
+
+The group is recorded rather than re-derived because §5.4's reset is about the
+member *node* label: a group changing under an unchanged label means the same
+zone fetched from somewhere else, and without the record the change is invisible
+to the next reconcile. A two-field row — what a build older than `TODO.md` #48
+wrote — reads as "no group", which is what that build did; the reverse is not
+true, so a downgrade costs one reconcile's worth of removals going unnoticed.
 
 It is the only record of which catalog a zone came from, and losing it is not
 fatal: a member whose row is gone reads as a zone nothing claims, so it is left
@@ -601,9 +644,8 @@ the catalog takes the zone out of service — REFUSED, and the gauge at 0.
 
 ### What is not implemented
 
-- Group properties are read, logged and not acted on. §4.3.2 leaves their
-  handling to the consumer, and there is no per-group configuration here to map
-  them onto. `TODO.md` #48.
+- Nothing on the control socket says which catalog a zone came from, which
+  RFC 9432 §6 asks for. `TODO.md` #49.
 - The producer side needs no code: a catalog zone is an ordinary zone, so
   `rdnsd` already serves and transfers one written by hand or by a script.
 

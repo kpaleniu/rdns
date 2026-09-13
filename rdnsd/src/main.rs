@@ -2074,6 +2074,7 @@ async fn main() -> Result<()> {
             held,
             &zone_dir,
             secondaries.clone(),
+            &per_zone.groups,
         )?;
 
         let replication = ReplicationContext {
@@ -3946,6 +3947,7 @@ mod tests {
             Vec::new(),
             Path::new("."),
             Arc::new(Secondaries::default()),
+            &std::collections::BTreeMap::new(),
         )
         .expect("no specs, nothing to resolve")
     }

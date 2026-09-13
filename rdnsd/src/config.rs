@@ -294,6 +294,19 @@ pub struct ZoneConfig {
     /// away.
     #[serde(default)]
     pub catalog: bool,
+    /// Members of this catalog carrying one of these group values are fetched
+    /// differently (RFC 9432 §4.3.2), keyed by the group value.
+    ///
+    /// `[zones."catalog.invalid.".groups."operator-x"]`. Per catalog zone and
+    /// not globally, which is the shape §4.3.2 names: "Implementations MAY
+    /// facilitate mapping of a specific group value to a specific configuration
+    /// configurable on a per catalog zone basis" — a producer may publish one
+    /// catalog to several consumer operators who each agreed different values.
+    ///
+    /// Only on a `catalog = true` zone; a group on anything else is refused,
+    /// because nothing would ever read it.
+    #[serde(default)]
+    pub groups: BTreeMap<String, GroupConfig>,
     /// Per-zone signing overrides. Absent means "use `[signing]`".
     #[serde(default)]
     pub nsec3: Option<bool>,
@@ -305,6 +318,23 @@ pub struct ZoneConfig {
     /// `local`, which is every ordinary zone.
     #[serde(default)]
     pub dnskey_rrsig: Option<DnskeyRrsig>,
+}
+
+/// What a catalog group value maps onto (RFC 9432 §4.3.2).
+///
+/// Masters and nothing else, deliberately. A group is the producer saying *how*
+/// a member should be treated, and the only part of that this consumer decides
+/// is where the member is fetched from and with which key — a secondary does
+/// not sign a zone it replicates, and who to NOTIFY is `server.also-notify`'s,
+/// which a member inherits like any other zone. A setting whose effect is
+/// "nothing, here" is worse than its absence (`CLAUDE.md` §14).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct GroupConfig {
+    /// Where a member of this group is replicated from, in `--secondary`'s
+    /// spelling after the `zone@`. Required: a group table that changes nothing
+    /// is a mapping the operator believes is in force.
+    pub masters: Vec<String>,
 }
 
 /// Who signs a zone's apex DNSKEY RRset.
@@ -337,6 +367,26 @@ pub struct PerZone {
     pub notify: BTreeMap<String, Vec<String>>,
     /// Signing settings that differ from `[signing]`.
     pub signing: BTreeMap<String, ZoneSigningOverride>,
+    /// Per-catalog group rules (RFC 9432 §4.3.2), by catalog zone: the group
+    /// value, and the masters a member carrying it is fetched from.
+    ///
+    /// A `Vec` rather than a map, in the config file's own order, so that two
+    /// groups matching one member are refused with the same message every time
+    /// — a conflict reported in hash order is one an operator cannot reproduce.
+    pub groups: BTreeMap<String, Vec<GroupRule>>,
+}
+
+/// One catalog group value, and what it maps onto.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupRule {
+    /// The group value as it appears in the catalog: octets, because that is
+    /// what a TXT record's character-string is. The config key's UTF-8 encoding
+    /// is the needle (`TODO.md` #48).
+    pub value: Vec<u8>,
+    /// The config key as written, for the log line and the error message.
+    pub name: String,
+    /// `--secondary`-shaped, less the `zone@`.
+    pub masters: Vec<String>,
 }
 
 /// One zone's departures from the global signing policy.
@@ -463,6 +513,38 @@ impl Config {
             }
             if settings.nsec3_opt_out == Some(true) && settings.nsec3 == Some(false) {
                 bail!("zone {zone:?} asks for nsec3-opt-out with nsec3 off");
+            }
+            for (group, rules) in &settings.groups {
+                if !settings.catalog {
+                    bail!(
+                        "zone {zone:?} defines a group {group:?} and is not a catalog:                          a group value comes from a catalog's member node (RFC 9432                          §4.3.2), so nothing would ever match it"
+                    );
+                }
+                if rules.masters.is_empty() {
+                    bail!(
+                        "zone {zone:?}: group {group:?} names no masters, so it would                          map its members onto the catalog's own configuration — which                          is what leaving the group out does"
+                    );
+                }
+                // The same parser the zone's own masters go through, for the
+                // same reason: the endpoint syntax is one thing's to know.
+                for master in &rules.masters {
+                    let spec = rdns::secondary::MasterSpec::parse(&format!("{zone}@{master}"))
+                        .map_err(|e| anyhow::anyhow!("zone {zone:?}, group {group:?}: {e}"))?;
+                    if let Some(key) = &spec.key_name {
+                        if !self.keys.contains_key(key)
+                            && !self.keys.keys().any(|k| k.eq_ignore_ascii_case(key))
+                        {
+                            bail!(
+                                "zone {zone:?}, group {group:?}: no [keys.{key:?}] defines                                  the key {master:?} names"
+                            );
+                        }
+                    }
+                    if spec.tls.is_some() && self.server.transfer_tls_ca.is_none() {
+                        bail!(
+                            "zone {zone:?}, group {group:?}: {master:?} transfers over TLS                              and server.transfer-tls-ca names no trust anchors (RFC 9103                              §7.5)"
+                        );
+                    }
+                }
             }
             if settings.catalog && settings.masters.is_empty() {
                 bail!(
@@ -607,6 +689,20 @@ impl Config {
                     .notify
                     .insert(origin.clone(), settings.also_notify.clone());
             }
+            if !settings.groups.is_empty() {
+                per_zone.groups.insert(
+                    origin.clone(),
+                    settings
+                        .groups
+                        .iter()
+                        .map(|(name, rules)| GroupRule {
+                            value: name.as_bytes().to_vec(),
+                            name: name.clone(),
+                            masters: rules.masters.clone(),
+                        })
+                        .collect(),
+                );
+            }
             let overrides = ZoneSigningOverride {
                 nsec3: settings.nsec3,
                 nsec3_opt_out: settings.nsec3_opt_out,
@@ -678,6 +774,7 @@ fn read_secret_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     fn parse(text: &str) -> Result<Config> {
         let config: Config = toml::from_str(text)?;
@@ -894,6 +991,91 @@ secret = "AAECAwQFBgcICQoLDA0ODw=="
         let specs = config.tsig_specs().expect("specs");
         assert_eq!(specs[0].split(':').count(), 3, "got {:?}", specs[0]);
         rdns::tsig::TsigKey::parse(&specs[0]).expect("and parses");
+    }
+
+    /// A group table reaches `PerZone` keyed by the absolute zone, with the
+    /// TOML key's octets as the value to match a catalog's group property
+    /// against (RFC 9432 §4.3.2, `TODO.md` #48).
+    #[test]
+    fn a_catalog_group_reaches_per_zone_as_octets() {
+        let config = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+[zones."catalog.invalid."]
+masters = ["192.0.2.1"]
+catalog = true
+[zones."catalog.invalid.".groups."operator-x"]
+masters = ["192.0.2.9"]
+"#,
+        )
+        .expect("a catalog with one group rule");
+        let mut cli = Cli::parse_from(["rdnsd"]);
+        let per_zone = config.apply(&mut cli).expect("applies");
+        assert_eq!(
+            per_zone.groups.get("catalog.invalid."),
+            Some(&vec![GroupRule {
+                value: b"operator-x".to_vec(),
+                name: "operator-x".to_string(),
+                masters: vec!["192.0.2.9".to_string()],
+            }])
+        );
+    }
+
+    /// A group on a zone that is not a catalog can never match anything, so it
+    /// is refused rather than ignored: a mapping the operator believes is in
+    /// force and is not is what `CLAUDE.md` §15 is about.
+    #[test]
+    fn a_group_on_a_zone_that_is_not_a_catalog_is_refused() {
+        let err = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+[zones."example.com."]
+masters = ["192.0.2.1"]
+[zones."example.com.".groups."operator-x"]
+masters = ["192.0.2.9"]
+"#,
+        )
+        .expect_err("a group without a catalog");
+        assert!(err.to_string().contains("is not a catalog"), "{err}");
+    }
+
+    /// And one that names no masters maps its members onto the catalog's own
+    /// configuration, which is what leaving the table out does.
+    #[test]
+    fn a_group_that_changes_nothing_is_refused() {
+        let err = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+[zones."catalog.invalid."]
+masters = ["192.0.2.1"]
+catalog = true
+[zones."catalog.invalid.".groups."operator-x"]
+masters = []
+"#,
+        )
+        .expect_err("a group with no masters");
+        assert!(err.to_string().contains("names no masters"), "{err}");
+    }
+
+    /// The key a group's master names has to exist, like every other master's.
+    #[test]
+    fn a_group_naming_an_undefined_key_is_refused() {
+        let err = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+[zones."catalog.invalid."]
+masters = ["192.0.2.1"]
+catalog = true
+[zones."catalog.invalid.".groups."operator-x"]
+masters = ["192.0.2.9#nobody.key."]
+"#,
+        )
+        .expect_err("a group naming a key nothing defines");
+        assert!(err.to_string().contains("nobody.key."), "{err}");
     }
 
     /// A catalog zone is in the catalog list and *not* in the secondary list:
