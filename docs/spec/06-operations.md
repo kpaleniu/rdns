@@ -218,14 +218,18 @@ invisible on the wire (see `05-resolver.md` §5.5-§5.7):
 | `dns_stale_answers_total` | answers served from expired cache because a refresh failed (RFC 8767) |
 | `dns_prefetches_total` | names re-resolved before expiry; against `dns_cache_hits_total` it says whether `--prefetch` is paying for itself |
 | `dns_synthesized_total` | AAAA records DNS64 built from an A record; it does not fall to zero on its own when a NAT64 is retired |
+| `dns_slow_resolutions_total{outcome=...}` | recursions that ran past RFC 8767 §4's 1.8 s client response timer, split `completed`/`failed` — `completed` is the case a second stale timer would serve early, `failed` is one the timer already in place covers (`TODO.md` #58) |
 
 > Gap G-3 — fixed 2026-08-03. ~~Those three counters are exported by `rdnsd` and
 > nothing increments them.~~ See `07-rfc-conformance.md`.
 
 ### Histogram
 
-`dns_answer_latency_seconds` — base units, with buckets sized for an in-memory
-zone lookup (tens of microseconds).
+`dns_answer_latency_seconds` — base units. Eleven bounds, 1 µs to 5 s,
+because one histogram serves both daemons: an in-memory zone lookup is tens of
+microseconds and a recursion is tens of milliseconds to seconds. `le="1.8"` is
+RFC 8767 §4's client response timer, so that bound against `+Inf` counts the
+resolutions a second stale timer could cut short (`TODO.md` #58).
 
 ### Per-zone gauges
 

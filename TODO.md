@@ -79,7 +79,13 @@ by a NOTIFY from a listed address. What is left is the transfer itself (57d) and
 the IXFR question, and the measurements in the row say the transfer is decided
 by memory rather than by time. #58 is what 45b left, #59 what #51 left and #60
 what #51 turned up on the way; and #21 is an inventory of deliberate deviations
-rather than a queue. **#59's prerequisite is gone**: #54
+rather than a queue. **#58 is lettered now and 58a is closed**: the latency
+histogram reaches seconds instead of 50 ms, and the split it needed turned out
+not to be a bucket at all — `dns_slow_resolutions_total` tells a slow
+resolution that answered from one that failed, because the second serves stale
+today and only the first is the feature's case. The row's own remedy was the
+wrong one, which is the mistake `CLAUDE.md` §18 names. 58b and 58c wait on the
+number, and the number wants a deployment. **#59's prerequisite is gone**: #54
 was it, and closing it put `validation::Arrival` where a peer certificate can
 hang off the two TLS variants and nowhere else. Everything else numbered is closed; the table
 under "Closed work" says which, when, and where the reasoning went.
@@ -1258,18 +1264,55 @@ lifetime is not.
 
 Three things to settle, and the first is a measurement:
 
-- **How often would it fire?** A resolution that takes over 1.8 s and then
-  succeeds is the only case this helps. `LatencyTimer` already feeds the latency
-  histogram, whose buckets stop at 50 ms — so the number is not currently
-  measurable and the first step is a bucket that reaches seconds. Filing the
-  feature before that number is the mistake §19 is about.
-- **What stops a flood of detached resolutions?** The in-flight semaphore bounds
-  tasks *per datagram*; a resolution that outlives its datagram is outside that
-  bound. It needs one of its own, or the permit has to be handed to the task.
-- **Does the early answer suppress the second client's?** Two clients asking the
-  same slow name should not start two resolutions. That is a de-duplicating
-  in-flight table, which this resolver does not have and which is worth more
-  than the timer on its own.
+- **58a. How often would it fire?** ~~A resolution that takes over 1.8 s and
+  then succeeds is the only case this helps. `LatencyTimer` already feeds the
+  latency histogram, whose buckets stop at 50 ms — so the number is not
+  currently measurable and the first step is a bucket that reaches seconds.~~
+  **The instrument is in as of 2026-09-14 and both halves of that were wrong.**
+
+  The bucket was necessary and is not the measurement. The histogram counts
+  *answers*, and an answer is a cache hit at 1 µs or a recursion at 2 s with no
+  way to tell them apart, and it carries no outcome — so `le="1.8"` against
+  `+Inf` says how many answers were slow and nothing about whether a stale
+  reply would have been the better one. The remedy the row named would have
+  been filed as the number and was not one (`CLAUDE.md` §18).
+
+  And "the only case this helps" is not right either. A resolution that runs
+  long and then *fails* serves stale today — the query resolution timer does
+  it — so the client response timer buys it the seconds in between, not the
+  answer. The two cases are worth different amounts, which is why the
+  measurement is a split and not a total.
+
+  What landed: eleven bucket bounds instead of eight, reaching 5 s, with
+  `le="1.8"` on RFC 8767 §4's number and `le="5"` on `timeout_ms`'s default;
+  `rdns::cache::CLIENT_RESPONSE_TIMER` as the one place 1.8 s is written, which
+  is the flag's default when the feature lands; and
+  `dns_slow_resolutions_total{outcome="completed"|"failed"}`, counted at the one
+  recursion a client waits on. `completed` is the feature's whole case.
+
+  Verified by provoking it rather than by reading the diff (`CLAUDE.md` §4):
+  two tests drive `handle_query` against a forwarder that sleeps 1.9 s and
+  against a black hole, and both fail with the count on the wrong side of the
+  split as well as with it removed. The timing is real — `LatencyTimer` is
+  `std::time::Instant`, which neither this crate's test clock nor tokio's
+  paused timer moves — so the pair costs 2.0 s of suite time. Scraped off a
+  running `rdnsr` as well: one forwarded query rendered
+  `dns_answer_latency_seconds_sum 0.028286` into `le="0.05"`, which the old
+  top bound of 50 ms could not tell from a ten-second answer.
+
+  **The number is still not taken.** An instrument is not a measurement: these
+  counters have to run somewhere with real traffic, and recursion cannot be
+  verified here (see "Verifying"), so the scrape above is a *forwarded* query
+  and not the case 58 is about. Until `completed` has been read off a
+  deployment, 58b and 58c are not worth starting.
+- **58b. What stops a flood of detached resolutions?** The in-flight semaphore
+  bounds tasks *per datagram*; a resolution that outlives its datagram is
+  outside that bound. It needs one of its own, or the permit has to be handed
+  to the task.
+- **58c. Does the early answer suppress the second client's?** Two clients
+  asking the same slow name should not start two resolutions. That is a
+  de-duplicating in-flight table, which this resolver does not have and which
+  is worth more than the timer on its own.
 
 ---
 

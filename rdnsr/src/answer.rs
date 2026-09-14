@@ -427,12 +427,27 @@ pub(crate) async fn handle_query(
         let watch = policy
             .watches_delegations()
             .then(|| policy.at_delegations(query.qname.as_ref(), query.qtype));
+        // Not `timer`: that one started at the datagram and this has to
+        // measure the recursion alone, which is the only part RFC 8767 §4's
+        // client response timer could cut short.
+        let walk = LatencyTimer::new();
         // Async: each upstream round trip is an await, so this yields the
         // task rather than holding a thread.
-        match resolver
+        let resolved = resolver
             .resolve_validated(&query, watch.as_ref().map(|w| w as &dyn NameserverPolicy))
-            .await
-        {
+            .await;
+        // Here and not at either arm's end: the arms build replies, apply
+        // policy and return early, so a count at the end of one is a count the
+        // other loses (`CLAUDE.md` §7).
+        if u128::from(walk.elapsed_us()) > rdns::cache::CLIENT_RESPONSE_TIMER.as_micros() {
+            let m = &ctx.metrics;
+            m.count(if resolved.is_ok() {
+                &m.slow_resolutions_completed
+            } else {
+                &m.slow_resolutions_failed
+            });
+        }
+        match resolved {
             Ok((mut upstream, state)) => {
                 // The resolver used its own random id; the reply must echo
                 // the client's and advertise recursion.
@@ -2209,6 +2224,124 @@ mod tests {
                 )
                 .is_none(),
             "a resolution that never finished has nothing to cache"
+        );
+    }
+
+    /// The measurement `TODO.md` #58 is blocked on. A resolution slower than
+    /// RFC 8767 §4's client response timer that then *answers* is the case the
+    /// second timer exists for; one that takes just as long and fails serves
+    /// stale today, so summing the two would credit the feature with work the
+    /// query resolution timer already does (`CLAUDE.md` §19).
+    ///
+    /// Slow for real, and 1.9 s of it. `LatencyTimer` is `std::time::Instant`,
+    /// which neither this crate's test clock nor tokio's paused timer moves —
+    /// a threshold measured against a clock a test can wind is a threshold the
+    /// test is not measuring.
+    #[tokio::test]
+    async fn a_slow_resolution_that_answers_counts_as_completed() {
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind a slow forwarder");
+        let addr = upstream.local_addr().expect("addr");
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, peer)) = upstream.recv_from(&mut buf).await {
+                let Ok(mut resp) = DnsMessage::try_from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                // Past the 1.8 s bound with enough margin that a loaded
+                // machine cannot land the sample on the wrong side of it.
+                tokio::time::sleep(std::time::Duration::from_millis(1_900)).await;
+                resp.response = true;
+                resp.recursion_ok = true;
+                resp.answers = vec![a_record(&nm("slow.example.com."), 300)];
+                let mut out = vec![0u8; 1500];
+                if let Ok(len) = resp.to_bytes(&mut out) {
+                    let _ = upstream.send_to(&out[..len], peer).await;
+                }
+            }
+        });
+
+        let resolver = Arc::new(Resolver::new(rdns::resolver::ResolverConfig {
+            mode: rdns::resolver::ResolverMode::Forward,
+            upstream_servers: vec![addr],
+            ..Default::default()
+        }));
+        let serving = serving(resolver, test_shell(), PolicyZones::default());
+
+        let bytes = handle_query(
+            query_for("slow.example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers.len(), 1, "the forwarder did answer");
+
+        let m = &serving.ctx.metrics;
+        assert_eq!(
+            m.slow_resolutions_completed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            m.slow_resolutions_failed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "an answer is not a failure however long it took"
+        );
+    }
+
+    /// The other side of the split, and the one that must not be read as
+    /// demand for #58: this resolution would have been served stale anyway.
+    ///
+    /// A black hole plus a 4 s per-query timeout, so the elapsed time is the
+    /// timeout and not a sleep. **4 s, not 2**: `recurse::query_server` waits
+    /// `timeout_ms / 2` on the read, so a 2 s config gives up at 1 s and this
+    /// test passed with the counter at zero until that was opened
+    /// (`CLAUDE.md` §4).
+    #[tokio::test]
+    async fn a_slow_resolution_that_fails_counts_as_failed() {
+        let black_hole = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = black_hole.local_addr().expect("addr");
+        let resolver = Arc::new(Resolver::new(rdns::resolver::ResolverConfig {
+            mode: rdns::resolver::ResolverMode::Forward,
+            upstream_servers: vec![addr],
+            timeout_ms: 4_000,
+            ..Default::default()
+        }));
+        let serving = serving(resolver, test_shell(), PolicyZones::default());
+
+        let bytes = handle_query(
+            query_for("dead.example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::ServerFailure);
+
+        let m = &serving.ctx.metrics;
+        assert_eq!(
+            m.slow_resolutions_failed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            m.slow_resolutions_completed
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
         );
     }
 

@@ -36,6 +36,7 @@ use crate::Qtype;
 use crate::ResourceRecord;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The longest anything is cached, whatever the record says (RFC 8767 §4).
 ///
@@ -65,6 +66,22 @@ pub struct StalePolicy {
 /// refuse to cache at all and which would make every client re-ask at once, on
 /// exactly the resolution path that is already failing.
 pub const STALE_ANSWER_TTL: u32 = 30;
+
+/// How long a client waits before RFC 8767 §4's *client response timer* gives
+/// it what this resolver last knew and lets the resolution finish behind it
+/// (§4, recommended 1.8 seconds).
+///
+/// Nothing answers on this yet — `TODO.md` #58 is the feature, and the reason
+/// it is a constant here first is that the number it needs is "how often would
+/// this fire", which cannot be asked without a threshold to ask it about. It is
+/// the bound of one latency bucket ([`crate::metrics`]) and the comparison
+/// behind `dns_slow_resolutions_total`; when #58 lands it is the default of the
+/// flag, in one place rather than three (`CLAUDE.md` §7).
+///
+/// Distinct from the *query resolution* timer, which is the one already in
+/// place: that one answers from the stale window after a resolution has failed,
+/// and this one answers while it is still running.
+pub const CLIENT_RESPONSE_TIMER: Duration = Duration::from_millis(1800);
 
 impl StalePolicy {
     /// Serve nothing stale. The default, and what `--serve-stale 0` means.

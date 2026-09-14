@@ -27,7 +27,20 @@ use crate::ResponseCode;
 /// 1 and 10 µs. These bounds ran 50 µs to 100 ms before, which put every
 /// answer a healthy server gives into the first bucket — the same defect §14
 /// records at one decimal higher, where the floor was 5 ms.
-const LATENCY_BUCKETS_US: [u64; 8] = [1, 2, 5, 10, 50, 500, 5_000, 50_000];
+///
+/// The top of the range is the same defect from the other end, and one
+/// histogram serves both daemons. It stopped at 50 ms, so every answer `rdnsr`
+/// gives that cost a recursion — a walk from the root is tens to hundreds of
+/// milliseconds before anything goes wrong — was `+Inf` and the tail had no
+/// shape at all. The three added bounds are each a number something already
+/// decides on: 0.5 s is a slow recursion that still finished, **1.8 s is
+/// RFC 8767 §4's recommended client response timer**, so `le="1.8"` against
+/// `+Inf` is how often that timer would fire (`TODO.md` #58), and 5 s is
+/// [`crate::resolver::ResolverConfig::timeout_ms`]'s default, so past it at
+/// least one upstream round trip has already timed out.
+const LATENCY_BUCKETS_US: [u64; 11] = [
+    1, 2, 5, 10, 50, 500, 5_000, 50_000, 500_000, 1_800_000, 5_000_000,
+];
 
 /// Escape a label value for the Prometheus text format: backslash, double quote
 /// and newline.
@@ -156,6 +169,29 @@ pub struct Counters {
     /// whether prefetching is paying for itself.
     pub prefetches: AtomicU64,
 
+    /// Resolutions that ran past RFC 8767 §4's client response timer, by what
+    /// they did next (`TODO.md` #58).
+    ///
+    /// The pair, not the sum, because the two say different things about
+    /// whether the second timer is worth building. **`completed`** is a client
+    /// that waited over [`crate::cache::CLIENT_RESPONSE_TIMER`] for an answer
+    /// this resolver could have had from the stale window immediately; every
+    /// one of those is the timer's whole case. **`failed`** is a resolution
+    /// that was going to serve stale anyway — the *query resolution* timer
+    /// already covers it — so the second timer buys only the seconds between
+    /// the two, and summing the pair would credit the feature with work it
+    /// does not do (`CLAUDE.md` §19).
+    ///
+    /// A completed resolution whose answer was refused as bogus counts as
+    /// completed: what this measures is whether the walk would have finished
+    /// into the cache behind an early reply, which it would.
+    ///
+    /// Only the answer path counts. A prefetch and DNS64's A query resolve with
+    /// no client waiting, and a timer about what a client waits for has nothing
+    /// to say about them.
+    pub slow_resolutions_completed: AtomicU64,
+    pub slow_resolutions_failed: AtomicU64,
+
     /// Answers served from expired cache because a refresh failed (RFC 8767).
     ///
     /// The number an operator watches during somebody else's outage, and the
@@ -175,7 +211,11 @@ pub struct Counters {
     pub dnstap_dropped: AtomicU64,
 
     // Cumulative buckets plus count and sum: what `histogram_quantile()` needs.
-    latency_buckets: [AtomicU64; 8],
+    //
+    // Length from the bounds, not repeated: the two were `8` twice, and a bound
+    // added without the counter is a scrape that silently stops at the old top
+    // (`CLAUDE.md` §17).
+    latency_buckets: [AtomicU64; LATENCY_BUCKETS_US.len()],
     latency_count: AtomicU64,
     /// Microseconds, integer, so the sum needs no float atomic.
     latency_sum_us: AtomicU64,
@@ -228,6 +268,8 @@ impl DnsMetrics {
             synthesized: AtomicU64::new(0),
             prefetches: AtomicU64::new(0),
             stale_answers: AtomicU64::new(0),
+            slow_resolutions_completed: AtomicU64::new(0),
+            slow_resolutions_failed: AtomicU64::new(0),
             policy_rewrites: AtomicU64::new(0),
             policy_drops: AtomicU64::new(0),
             dnstap_frames: AtomicU64::new(0),
@@ -473,6 +515,20 @@ impl DnsMetrics {
         output.push_str(&format!(
             "dns_stale_answers_total {}\n",
             self.stale_answers.load(Ordering::Relaxed)
+        ));
+
+        output.push_str(
+            "# HELP dns_slow_resolutions_total \
+Resolutions past RFC 8767's client response timer\n",
+        );
+        output.push_str("# TYPE dns_slow_resolutions_total counter\n");
+        output.push_str(&format!(
+            "dns_slow_resolutions_total{{outcome=\"completed\"}} {}\n",
+            self.slow_resolutions_completed.load(Ordering::Relaxed)
+        ));
+        output.push_str(&format!(
+            "dns_slow_resolutions_total{{outcome=\"failed\"}} {}\n",
+            self.slow_resolutions_failed.load(Ordering::Relaxed)
         ));
 
         output.push_str(
@@ -858,8 +914,10 @@ mod zone_gauge_tests {
     #[test]
     fn the_latency_histogram_renders_cumulative_buckets() {
         let metrics = DnsMetrics::new();
-        // One in the first bucket, one exactly on a bound, one past every bound.
-        for us in [1, 5, 1_000_000] {
+        // One in the first bucket; one exactly on a bound; one exactly on the
+        // 1.8 s bound, which is the one `TODO.md` #58 reads; one past every
+        // bound.
+        for us in [1, 5, 1_800_000, 6_000_000] {
             metrics.observe_latency_us(us);
         }
 
@@ -875,9 +933,12 @@ mod zone_gauge_tests {
                 "dns_answer_latency_seconds_bucket{le=\"0.0005\"} 2",
                 "dns_answer_latency_seconds_bucket{le=\"0.005\"} 2",
                 "dns_answer_latency_seconds_bucket{le=\"0.05\"} 2",
-                "dns_answer_latency_seconds_bucket{le=\"+Inf\"} 3",
-                "dns_answer_latency_seconds_sum 1.000006",
-                "dns_answer_latency_seconds_count 3",
+                "dns_answer_latency_seconds_bucket{le=\"0.5\"} 2",
+                "dns_answer_latency_seconds_bucket{le=\"1.8\"} 3",
+                "dns_answer_latency_seconds_bucket{le=\"5\"} 3",
+                "dns_answer_latency_seconds_bucket{le=\"+Inf\"} 4",
+                "dns_answer_latency_seconds_sum 7.800006",
+                "dns_answer_latency_seconds_count 4",
             ]
         );
     }
@@ -885,15 +946,19 @@ mod zone_gauge_tests {
     /// A sample past the last bound has no bucket of its own — `+Inf` is the
     /// count — and must still reach the count and the sum. An `unwrap` on the
     /// bucket index would panic here, and a `min` would put it in the last
-    /// bucket and claim a 1-second answer took under 50 ms.
+    /// bucket and claim a 10-second answer took under 5 s.
+    ///
+    /// The sample moved with the bounds: 60 µs past the old 50 ms top is an
+    /// ordinary recursion under the new one, so left alone this test would have
+    /// gone on passing while testing nothing (`CLAUDE.md` §1).
     #[test]
     fn a_latency_past_every_bound_lands_only_in_inf() {
         let metrics = DnsMetrics::new();
-        metrics.observe_latency_us(60_000);
+        metrics.observe_latency_us(10_000_000);
         let rendered = lines(&metrics, "dns_answer_latency_seconds");
         assert!(
-            rendered.iter().all(|line| !line.contains("le=\"0.05\"} 1")),
-            "60 ms must not be counted under the 50 ms bound: {rendered:?}"
+            rendered.iter().all(|line| !line.contains("le=\"5\"} 1")),
+            "10 s must not be counted under the 5 s bound: {rendered:?}"
         );
         assert!(rendered.contains(&"dns_answer_latency_seconds_bucket{le=\"+Inf\"} 1".to_string()));
         assert!(rendered.contains(&"dns_answer_latency_seconds_count 1".to_string()));
@@ -993,5 +1058,36 @@ mod tests {
         let counted = metrics.to_prometheus_format();
         assert!(counted.contains("dns_quic_handshakes_total 3"));
         assert!(counted.contains("dns_tls_handshake_failures_total 7"));
+    }
+
+    /// One family, two label values, one HELP and one TYPE between them — a
+    /// second TYPE line for the same family makes a scrape unparseable.
+    ///
+    /// Both series at zero on a server that has never been slow: the absence of
+    /// `completed` is the answer `TODO.md` #58 is asking for, and an absent
+    /// series cannot say it (`CLAUDE.md` §14).
+    #[test]
+    fn both_halves_of_the_slow_resolution_split_reach_the_scrape() {
+        let metrics = DnsMetrics::new();
+        metrics
+            .slow_resolutions_completed
+            .fetch_add(2, Ordering::Relaxed);
+        let rendered = metrics.to_prometheus_format();
+        assert!(rendered.contains("dns_slow_resolutions_total{outcome=\"completed\"} 2"));
+        assert!(rendered.contains("dns_slow_resolutions_total{outcome=\"failed\"} 0"));
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|l| l.starts_with("# TYPE dns_slow_resolutions_total"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rendered
+                .lines()
+                .filter(|l| l.starts_with("# HELP dns_slow_resolutions_total"))
+                .count(),
+            1
+        );
     }
 }
