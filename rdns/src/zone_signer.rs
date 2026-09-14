@@ -492,7 +492,12 @@ impl PreviousSignatures {
         key_tags: &[u16],
         signed_at: u64,
     ) -> Option<&[CarriedSignature]> {
-        let (was_ttl, was) = self.rrsets.get(&(name.folded().into_owned(), rtype))?;
+        // One folded key for both maps rather than two: this runs once per
+        // RRset, so the second allocation was two million of them. The signing
+        // loop went 2 318 ms -> 2 235 ms at that size, three runs each side
+        // (`TODO.md` #64e).
+        let probe = (name.folded().into_owned(), rtype);
+        let (was_ttl, was) = self.rrsets.get(&probe)?;
         if *was_ttl != ttl || was.len() != rdatas.len() {
             return None;
         }
@@ -500,7 +505,7 @@ impl PreviousSignatures {
             return None;
         }
 
-        let carried = self.signatures.get(&(name.folded().into_owned(), rtype))?;
+        let carried = self.signatures.get(&probe)?;
         if carried.is_empty() {
             return None;
         }
@@ -1145,36 +1150,14 @@ fn nsec3param_rdata(salt: &[u8], iterations: u16) -> RecordData {
 /// value because a `Name` has no `Ord`.
 type Rrsets = BTreeMap<(CanonicalKey, Rtype), (Name, Ttl, Vec<RecordData>)>;
 
-fn sign_everything(
-    layout: &Layout,
-    keys: &[SigningKey],
-    policy: &SigningPolicy,
-    previous: Option<&PreviousSignatures>,
-    signed: &mut Zone,
-) -> Result<()> {
-    // The key the parent's DS points at signs only the DNSKEY RRset; a separate
-    // key signs the data. Not required — one key does both when only one is
-    // present — but it lets the data key roll without involving the parent.
-    let now = policy.signed_at;
-    let active = active_signing_keys(keys, now);
-    let sep: Vec<&SigningKey> = active.iter().copied().filter(|k| k.is_sep()).collect();
-    let rest: Vec<&SigningKey> = active.iter().copied().filter(|k| !k.is_sep()).collect();
-    let all: Vec<&SigningKey> = active.clone();
-    let dnskey_signers = if sep.is_empty() { &all } else { &sep };
-    let data_signers = if rest.is_empty() { &all } else { &rest };
-    if data_signers.is_empty() {
-        // Every key inactive at once. Publishing a zone whose DNSKEY RRset
-        // promises DNSSEC and whose data carries no signature is bogus at every
-        // validator, so this is a failed run and not a zone served bare
-        // (`CLAUDE.md` §4). The usual cause is an `Inactive` in the past with no
-        // successor activated.
-        return Err(DnssecError::signing(format!(
-            "no key is active at {now} to sign {} with — every key this zone has is \
-             before its Activate or past its Inactive (RFC 6781 §4.1.1.1)",
-            layout.origin,
-        )));
-    }
-
+/// The RRsets of `signed`, in RFC 4034 §6.1 order.
+///
+/// Its own function because it is an O(zone) pass with an allocation per
+/// record and it was inside the one that looked like the signing step
+/// (`TODO.md` #64e). A `BTreeMap` rather than a sort at the end: the key is
+/// already [`canonical_sort_key`], and the chain built above it is in that
+/// order too.
+fn rrsets_of(signed: &Zone) -> Rrsets {
     // (owner, type) -> the RDATA of that RRset, in the order they were added.
     let mut rrsets: Rrsets = BTreeMap::new();
     for record in signed.records() {
@@ -1184,7 +1167,22 @@ fn sign_everything(
             .or_insert_with(|| (record.name.clone(), record.ttl, Vec::new()));
         entry.2.push(record.rdata.clone());
     }
+    rrsets
+}
 
+/// An RRSIG for every RRset this zone is authoritative for, reusing a
+/// signature from `previous` wherever one still covers exactly what it covered.
+///
+/// Takes `rrsets` by value: the RDATA in it is what gets signed, and a caller
+/// has no use for the map afterwards.
+fn signatures_for(
+    rrsets: Rrsets,
+    layout: &Layout,
+    policy: &SigningPolicy,
+    previous: Option<&PreviousSignatures>,
+    dnskey_signers: &[&SigningKey],
+    data_signers: &[&SigningKey],
+) -> Result<Vec<ZoneRecord>> {
     let mut signatures = Vec::new();
     for ((_, rtype), (name, ttl, rdatas)) in rrsets {
         let entry = layout.entry(name.as_ref());
@@ -1262,7 +1260,53 @@ fn sign_everything(
             });
         }
     }
+    Ok(signatures)
+}
 
+/// Three O(zone) passes, and the split is where it is because #64e measured
+/// them: assembling the RRsets, signing them, and filing the signatures back
+/// into the zone's index.
+fn sign_everything(
+    layout: &Layout,
+    keys: &[SigningKey],
+    policy: &SigningPolicy,
+    previous: Option<&PreviousSignatures>,
+    signed: &mut Zone,
+) -> Result<()> {
+    // The key the parent's DS points at signs only the DNSKEY RRset; a separate
+    // key signs the data. Not required — one key does both when only one is
+    // present — but it lets the data key roll without involving the parent.
+    let now = policy.signed_at;
+    let active = active_signing_keys(keys, now);
+    let sep: Vec<&SigningKey> = active.iter().copied().filter(|k| k.is_sep()).collect();
+    let rest: Vec<&SigningKey> = active.iter().copied().filter(|k| !k.is_sep()).collect();
+    let all: Vec<&SigningKey> = active.clone();
+    let dnskey_signers = if sep.is_empty() { &all } else { &sep };
+    let data_signers = if rest.is_empty() { &all } else { &rest };
+    if data_signers.is_empty() {
+        // Every key inactive at once. Publishing a zone whose DNSKEY RRset
+        // promises DNSSEC and whose data carries no signature is bogus at every
+        // validator, so this is a failed run and not a zone served bare
+        // (`CLAUDE.md` §4). The usual cause is an `Inactive` in the past with no
+        // successor activated.
+        return Err(DnssecError::signing(format!(
+            "no key is active at {now} to sign {} with — every key this zone has is \
+             before its Activate or past its Inactive (RFC 6781 §4.1.1.1)",
+            layout.origin,
+        )));
+    }
+
+    // After the check above, so a zone with no active key fails without paying
+    // for a pass it throws away.
+    let rrsets = rrsets_of(signed);
+    let signatures = signatures_for(
+        rrsets,
+        layout,
+        policy,
+        previous,
+        dnskey_signers,
+        data_signers,
+    )?;
     for signature in signatures {
         signed.add_record(signature);
     }
@@ -3137,11 +3181,14 @@ a\.b    IN A   192.0.2.50
     /// crypto, and this splits it.
     ///
     /// ```text
-    ///   records  incremental previous-sigs carry-over    layout nsec-chain sign-everything     free
-    ///     10000       53.5ms        11.8ms      4.8ms     3.0ms      8.3ms          20.9ms    2.3ms
-    ///    100000      748.5ms       151.7ms     60.2ms    34.9ms     94.8ms         324.0ms   70.6ms
-    ///   1000000     9331.0ms      1833.1ms   1054.7ms   509.4ms   1483.0ms        3630.4ms 1105.0ms
+    ///   records  incremental previous-sigs carry-over    layout nsec-chain sign-everything     free  build-rrsets sign-rrsets   file-sigs
+    ///     10000       50.6ms        10.8ms      4.7ms     3.0ms      8.2ms          20.8ms    2.2ms        5.6ms      12.9ms       2.3ms
+    ///    100000      735.5ms       150.6ms     60.6ms    37.2ms     97.6ms         313.3ms   67.8ms       69.5ms     209.7ms      34.1ms
+    ///   1000000     9397.4ms      1816.8ms   1104.9ms   512.8ms   1519.2ms        3627.7ms 1092.2ms      980.8ms    2221.5ms     425.4ms
     /// ```
+    ///
+    /// The last three columns are `sign-everything` split again, and sum to
+    /// it. The others sum to `incremental`.
     ///
     /// **Six passes, not the four #64e names.** The two it does not: the
     /// largest column, `sign_everything` at 39%, and `free` at 12%, which is
@@ -3149,19 +3196,30 @@ a\.b    IN A   192.0.2.50
     /// `sign_zone_incrementally` after every other timer has stopped, and it
     /// is the whole of the 11% the split was short before it was measured.
     ///
-    /// So the carry-forward index costs **2.9 s of 9.3 s, 31%**, to build and
+    /// So the carry-forward index costs **2.9 s of 9.4 s, 31%**, to build and
     /// free. It buys 64d's 16.6 s of ECDSA, so it is still 5.6x its price —
     /// but it is a third of the bill and the row had it as one of four equals.
     ///
     /// And the NSEC chain that `sign_zone_incrementally`'s header defends
     /// building in full is 16%, not the term to argue about.
     ///
-    /// **A negative result** (`CLAUDE.md` §10): `Zone::reserve` on the output
-    /// buys nothing. The signed zone ends at ~4x the input's records, and
-    /// reserving at 1x and at 4x both read 9.4-9.5 s, inside the run-to-run
-    /// spread. #61's 320 ms of rehashing was a load whose per-record work is
-    /// an index insert; here it is an index insert behind a fold, a chain key
-    /// and an RDATA clone.
+    /// **Inside `sign_everything`, the signing loop is 61% of it and 24% of
+    /// everything** — with four ECDSA operations in it. What it does two
+    /// million times is `Layout::entry`, which clones a `NameEntry`;
+    /// `PreviousSignatures::reuse`, which folds a key, probes two `BTreeMap`s
+    /// and compares the RDATA; and a `ZoneRecord` per carried signature,
+    /// cloning the name and the RDATA. `build-rrsets` is 27% and `file-sigs`
+    /// — two million `Zone::add_record` calls — is 12%, which is the smallest
+    /// of the three and was the one that looked expensive.
+    ///
+    /// **Two negative results** (`CLAUDE.md` §10). `Zone::reserve` on the
+    /// output buys nothing: the signed zone ends at ~4x the input's records
+    /// and reserving at 1x and at 4x both read 9.4-9.5 s, inside the
+    /// run-to-run spread. #61's 320 ms of rehashing was a load whose
+    /// per-record work is an index insert; here it is an index insert behind a
+    /// fold, a chain key and an RDATA clone. And splitting `sign_everything`
+    /// into the three functions this times is free: three runs each side read
+    /// 9 392 ms against 9 364 ms, which overlap.
     ///
     /// A test inside this module rather than beside `scale.rs`, because every
     /// pass but the whole is private; the parts run in `sign_zone_inner`'s
@@ -3171,11 +3229,8 @@ a\.b    IN A   192.0.2.50
     ///
     /// NSEC, one ECDSA P-256 KSK and one ZSK — 64d's shape, so these columns
     /// are comparable with its table. Three warm runs on the development
-    /// machine, Windows, discarding the first after a rebuild — 9457.6 ms,
-    /// above all three. The 1M row's spread is
-    /// 1.5% on the total and under 4.5% on every column but `free`, which is
-    /// 6.1%: it is a deallocation, and the allocator's state is the one thing
-    /// a run does not reset.
+    /// machine, Windows, discarding the first after a rebuild; the 1M row's
+    /// spread is 2.3% on the total and under 2.5% on every column.
     ///
     /// ```sh
     /// cargo test -p rdns --release incremental_sign_cost -- --ignored --nocapture
@@ -3196,7 +3251,7 @@ a\.b    IN A   192.0.2.50
         let keys = signing_keys(ORIGIN);
         let policy = policy(DenialChain::Nsec);
         println!(
-            "{:>9}  {:>11} {:>13} {:>10} {:>9} {:>10} {:>15} {:>8}",
+            "{:>9}  {:>11} {:>13} {:>10} {:>9} {:>10} {:>15} {:>8}  {:>11} {:>11} {:>11}",
             "records",
             "incremental",
             "previous-sigs",
@@ -3205,6 +3260,9 @@ a\.b    IN A   192.0.2.50
             "nsec-chain",
             "sign-everything",
             "free",
+            "build-rrsets",
+            "sign-rrsets",
+            "file-sigs",
         );
         for records in [10_000usize, 100_000, 1_000_000] {
             let mut text = String::from("$ORIGIN example.com.\n$TTL 3600\n");
@@ -3273,10 +3331,25 @@ a\.b    IN A   192.0.2.50
             build_nsec_chain(&layout, Ttl::from_secs(minimum), &mut signed).expect("the chain");
             let nsec_chain = start.elapsed();
 
+            // `sign_everything`'s own three, since it is the largest column
+            // and the row's next step. Its key selection is O(keys) and is not
+            // timed.
+            let active = active_signing_keys(&keys, policy.signed_at);
+            let sep: Vec<&SigningKey> = active.iter().copied().filter(|k| k.is_sep()).collect();
+            let rest: Vec<&SigningKey> = active.iter().copied().filter(|k| !k.is_sep()).collect();
             let start = Instant::now();
-            sign_everything(&layout, &keys, &policy, Some(&carried), &mut signed)
+            let rrsets = rrsets_of(&signed);
+            let build_rrsets = start.elapsed();
+            let start = Instant::now();
+            let signatures = signatures_for(rrsets, &layout, &policy, Some(&carried), &sep, &rest)
                 .expect("the signatures");
-            let sign_everything_time = start.elapsed();
+            let sign_rrsets = start.elapsed();
+            let start = Instant::now();
+            for signature in signatures {
+                signed.add_record(signature);
+            }
+            let file_signatures = start.elapsed();
+            let sign_everything_time = build_rrsets + sign_rrsets + file_signatures;
 
             // Freeing the index is a pass too, and it is the one the split
             // would otherwise miss: `carried` dies inside
@@ -3307,7 +3380,7 @@ a\.b    IN A   192.0.2.50
                  what `sign_zone_inner` runs",
             );
             println!(
-                "{records:>9}  {:>9.1}ms {:>11.1}ms {:>8.1}ms {:>7.1}ms {:>8.1}ms {:>13.1}ms {:>6.1}ms",
+                "{records:>9}  {:>9.1}ms {:>11.1}ms {:>8.1}ms {:>7.1}ms {:>8.1}ms {:>13.1}ms {:>6.1}ms  {:>9.1}ms {:>9.1}ms {:>9.1}ms",
                 incremental.as_secs_f64() * 1000.0,
                 previous_sigs.as_secs_f64() * 1000.0,
                 carry_over.as_secs_f64() * 1000.0,
@@ -3315,6 +3388,9 @@ a\.b    IN A   192.0.2.50
                 nsec_chain.as_secs_f64() * 1000.0,
                 sign_everything_time.as_secs_f64() * 1000.0,
                 free_carried.as_secs_f64() * 1000.0,
+                build_rrsets.as_secs_f64() * 1000.0,
+                sign_rrsets.as_secs_f64() * 1000.0,
+                file_signatures.as_secs_f64() * 1000.0,
             );
         }
     }
