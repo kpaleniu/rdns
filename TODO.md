@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#60**, **#62**, **#63** and **#21**, as of
-2026-09-14.
+**#57**, **#58**, **#59**, **#60**, **#62**, **#63**, **#64** and **#21**, as
+of 2026-09-14.
 **#61 closed the day it was filed**: the reload is 3.76x faster and holds
 68 MB less per million rules, and rayon was measured and declined. Of #62,
 62a and 62b are closed and **62c is what is left** — a top-level `$ORIGIN`
@@ -50,6 +50,11 @@ was measurably the wrong structure.
 prose: `rdnsr` has no config file, so there is nowhere to write a per-zone
 anything. It does not wait on 57d — `--rpz-policy` has wanted the same file
 since before 57 existed.
+**#64 came out of asking 57d's question of `rdnsd`**: if a zone file is both
+the interchange format and the store, what does mutating it cost? One UPDATE is
+five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
+lock. The row was filed with the measurement that refuted the fix it was going
+to propose.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -850,7 +855,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59**, **#60**, **62c** and **#63**, plus
+**#57**, **#58**, **#59**, **#60**, **62c**, **#63** and **#64**, plus
 **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
@@ -1651,6 +1656,86 @@ once this exists, and #57d's option C stays unbeaten until somebody shows it is
 not — this row does not decide that and must not be read as doing so. What it
 does decide is that the *reason* 57d cannot be taken is not a fact about
 transfers.
+
+---
+
+### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14**
+
+Filed with the measurement that **refuted the reason it was going to be filed**.
+The finding on the way in was "the UPDATE path re-reads the zone file, so an
+update is O(zone)", with the fix named as skipping the re-read. The re-read is
+25% of it. §19, working as advertised.
+
+`cargo test -p rdnsd --release update_cost -- --ignored --nocapture`, which is
+`dispatch::tests::update_cost_against_zone_size`, `#[ignore]`d and refused in
+debug. One record added to a zone of N, unsigned, on the development machine:
+
+| records | total | re-read | apply | to_string | write | clone |
+|---|---|---|---|---|---|---|
+| 10 000 | 20.6 ms | 13.9 | 1.8 | 5.9 | 6.0 | 0.76 |
+| 100 000 | 159.2 ms | 41.2 | 19.8 | 61.2 | 46.8 | 9.2 |
+| **1 000 000** | **1.8 s** | **451** | **380** | **621** | **136** | **159** |
+
+Linear, ~1.8 µs a record, and **five separate O(zone) steps for a one-record
+change**. The largest is `zone_to_string` at 35%, not the re-read at 25%.
+
+**And it is not one client's latency.** `UpdateHandling::applying` is a
+`tokio::Mutex` held across the whole read-modify-write, and its doc says why:
+"One lock for all zones rather than one per zone: two concurrent UPDATEs is not
+a workload this has." So 1.8 s is the *server's* update throughput at that
+size, for every zone at once — about one every two seconds.
+
+- **64a. A clone nothing reads.** With no signing configured
+  `apply_update_to_file` returns `applied.zone.clone()`, and the original dies
+  inside the `Applied` it also returns — whose `zone` field no caller touches,
+  checked: `answer_update` reads only `changed` and `ignored`. **159 ms at 1M
+  records, 9%**, for a copy that is dropped unread. The only item here that is
+  pure waste rather than a design consequence, and the only one with no
+  decision attached.
+- **64b. The re-read, which is a policy wearing a cost.** `parse_zone_file_at`
+  per update, under "so an edit since the last load is not silently reverted" —
+  **451 ms, 25%**. The rule is defensible; paying it unconditionally is the
+  part that is not. Whether an mtime check is enough depends on a question
+  nobody has asked: what an operator editing a file under a server taking
+  dynamic updates is entitled to.
+- **64c. The file is the authority, and that is the other 42%.** `to_string`
+  plus `write` — 621 + 136 ms — exist because the update must reach the file:
+  `UpdateHandling`'s doc says the re-signing timer reloads every zone from its
+  file, so an in-memory-only edit is discarded within one re-signing interval
+  with nothing logged. **Making the file a checkpoint rather than the authority
+  removes 64b and 64c together: 1 228 ms of 1 800, 68%.** It is also much the
+  largest of these, and the invoice is in the next paragraph rather than in a
+  remedy this row names.
+- **64d. The signed path is not measured.** These numbers are an unsigned zone.
+  `sign_one_incrementally` is not in them. #44c's 28 s is a *full* sign of a
+  million-record zone and is an upper bound that does not apply. Whether
+  signing swamps all five steps is the measurement that decides whether any of
+  this matters for a signed deployment, and it wants signing keys on disk,
+  which is why it is a row and not a footnote.
+
+**What 64c would actually cost, since "add a WAL" is the wrong description.**
+The journal is already where a write-ahead log sits — `zones.rs` writes it
+before installing, under one guard, and `persist::write_atomically_str` fsyncs
+it. Four properties stop it being one, each of them a deliberate decision with
+a comment on it: it is **regenerated whole on every change** ("safe to delete"),
+so a commit is O(history) and not O(change); it is **bounded at
+`MAX_DELTAS_PER_ZONE = 32` and drops the oldest**, where a log may be truncated
+at a checkpoint and not one record sooner; it is **explicitly best-effort** ("a
+journal that will not read is not fatal"), where a log's failed write is a
+failed commit; and its contents are **RFC 1995 difference sequences chosen for
+secondaries**, not a redo record. All four would have to change, and there is
+no recovery path at all today.
+
+**And the narrowing that keeps this honest:** `persist::write_atomically` means
+the zone file is never half-written, so unlike a database there is no torn-write
+problem here to solve. 64c buys latency, not durability. Pricing it as
+durability work is how it would get over-built.
+
+**Not filed: a database, or a binary zone format.** #61's ablation settles it on
+this tree's own numbers — at 1M records, parsing text was ~25% of a load and
+building the index ~73%. A format that hands back records still to be indexed
+buys the 25%. The post-#61 breakdown has not been taken, so that share today is
+unknown, and taking it is the thing that would reopen this.
 
 ---
 

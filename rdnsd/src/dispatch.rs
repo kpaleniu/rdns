@@ -1306,6 +1306,130 @@ mod tests {
     use rdns::UdpSizes;
     use std::collections::HashMap;
 
+    /// What one dynamic UPDATE costs as the zone grows (`TODO.md` #64).
+    ///
+    /// `#[ignore]`d and refused in debug, as `rdns/tests/scale.rs` is: it
+    /// builds zone files of up to a million records, and the question is what
+    /// a deployment pays.
+    ///
+    /// ```text
+    ///   records      total   re-read     apply to_string     write     clone
+    ///     10000     20.6ms    13.9ms     1.8ms     5.9ms     6.0ms   763.7µs
+    ///    100000    159.2ms    41.2ms    19.8ms    61.2ms    46.8ms     9.2ms
+    ///   1000000       1.8s   451.3ms   379.8ms   621.4ms   135.7ms   158.7ms
+    /// ```
+    ///
+    /// Linear in the zone, at about 1.8 µs a record, and **five separate
+    /// O(zone) steps for a one-record change**. The re-read is 25% of it and
+    /// not the dominant term — `zone_to_string` is, at 35%. `clone` is the
+    /// only one nothing reads: with no signing configured the zone is cloned
+    /// for the caller and the original dies inside an `Applied` whose `zone`
+    /// field no caller touches.
+    ///
+    /// Unsigned. `sign_one_incrementally` is not in these numbers and has not
+    /// been measured; #44c's 28 s is a *full* sign of a zone this size and is
+    /// an upper bound that does not apply.
+    ///
+    /// All of it runs under `UpdateHandling::applying`, which is one lock for
+    /// the whole process — so this is the server's update throughput, not one
+    /// client's latency.
+    #[test]
+    #[ignore]
+    fn update_cost_against_zone_size() {
+        use std::time::Instant;
+
+        if cfg!(debug_assertions) {
+            panic!(
+                "this would measure the debug build. Run:\n  \
+                 cargo test -p rdnsd --release update_cost -- --ignored --nocapture"
+            );
+        }
+
+        fn zone_text(records: usize) -> String {
+            let mut text = String::new();
+            text.push_str("$TTL 3600\n");
+            text.push_str(
+                "@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n",
+            );
+            text.push_str("@ IN NS ns.example.com.\n");
+            text.push_str("ns IN A 192.0.2.1\n");
+            for i in 0..records {
+                let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
+                text.push_str(&format!("h{i} IN A 10.{a}.{b}.{c}\n"));
+            }
+            text
+        }
+
+        let dir = std::env::temp_dir().join(format!("rdns-update-cost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        println!(
+            "{:>9}  {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}  {:>8}",
+            "records", "total", "re-read", "apply", "to_string", "write", "clone", "file"
+        );
+        for records in [10_000usize, 100_000, 1_000_000] {
+            let text = zone_text(records);
+            let bytes = text.len();
+            let path = dir.join("example.com.zone");
+            std::fs::write(&path, &text).expect("write the fixture");
+
+            let previous = parse_zone_file_at(&path, "example.com.").expect("the fixture parses");
+            let change = update::Change::Add(rdns::ResourceRecord {
+                name: nm("added.example.com."),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(3600),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    std::net::Ipv4Addr::new(198, 51, 100, 1),
+                ))
+                .expect("the rdata builds"),
+            });
+
+            // The whole path, as `answer_update` calls it on its blocking task.
+            let start = Instant::now();
+            let (installed, applied) = apply_update_to_file(
+                &path,
+                "example.com.",
+                &previous,
+                &[],
+                std::slice::from_ref(&change),
+                None,
+            )
+            .unwrap_or_else(|_| panic!("the update applies at {records}"));
+            let total = start.elapsed();
+            assert_eq!(applied.changed, 1, "one record added at {records}");
+            assert!(installed.is_some(), "a changed zone is installed");
+
+            // The same three O(zone) steps, timed apart. Restore the file
+            // first: the call above already added the record to it.
+            std::fs::write(&path, &text).expect("restore the fixture");
+            let start = Instant::now();
+            let source = parse_zone_file_at(&path, "example.com.").expect("parses");
+            let reread = start.elapsed();
+            let start = Instant::now();
+            let applied = update::apply(&source, std::slice::from_ref(&change));
+            let apply = start.elapsed();
+            let start = Instant::now();
+            let out = rdns::zone_writer::zone_to_string(&applied.zone).expect("writes");
+            let to_string = start.elapsed();
+            let start = Instant::now();
+            rdns::persist::write_atomically_str(&path, &out).expect("persists");
+            let write = start.elapsed();
+            // The fifth O(zone) step, and the one nothing reads: with no
+            // signing configured `apply_update_to_file` hands back
+            // `applied.zone.clone()`, and the original dies inside the
+            // `Applied` the caller only asks `changed` and `ignored` of.
+            let start = Instant::now();
+            let clone = applied.zone.clone();
+            let cloned = start.elapsed();
+            std::hint::black_box(&clone);
+
+            println!(
+                "{records:>9}  {total:>9.1?} {reread:>9.1?} {apply:>9.1?} {to_string:>9.1?} {write:>9.1?} {cloned:>9.1?}  {:>6} KB",
+                bytes / 1024
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every encrypted transport gets its own dnstap label.
     ///
     /// `TODO.md` #54: the dispatcher was told [`Privacy`], which is `Clear`,
