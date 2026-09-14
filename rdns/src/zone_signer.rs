@@ -3127,4 +3127,195 @@ a\.b    IN A   192.0.2.50
         .unwrap_err();
         assert!(err.to_string().contains("RFC 9276"), "{err}");
     }
+
+    /// Where an incremental sign spends its time (`TODO.md` #64e).
+    ///
+    /// 64d timed `sign_one_incrementally` as one column, because its question
+    /// was whether signing swamps the four unsigned O(zone) steps. It does —
+    /// 10.3 s of an 11.7 s update at a million records — and it does it with
+    /// **four ECDSA operations**. So the bill is passes over the zone, not
+    /// crypto, and this splits it.
+    ///
+    /// ```text
+    ///   records  incremental previous-sigs carry-over    layout nsec-chain sign-everything     free
+    ///     10000       53.5ms        11.8ms      4.8ms     3.0ms      8.3ms          20.9ms    2.3ms
+    ///    100000      748.5ms       151.7ms     60.2ms    34.9ms     94.8ms         324.0ms   70.6ms
+    ///   1000000     9331.0ms      1833.1ms   1054.7ms   509.4ms   1483.0ms        3630.4ms 1105.0ms
+    /// ```
+    ///
+    /// **Six passes, not the four #64e names.** The two it does not: the
+    /// largest column, `sign_everything` at 39%, and `free` at 12%, which is
+    /// dropping [`PreviousSignatures`] — it dies inside
+    /// `sign_zone_incrementally` after every other timer has stopped, and it
+    /// is the whole of the 11% the split was short before it was measured.
+    ///
+    /// So the carry-forward index costs **2.9 s of 9.3 s, 31%**, to build and
+    /// free. It buys 64d's 16.6 s of ECDSA, so it is still 5.6x its price —
+    /// but it is a third of the bill and the row had it as one of four equals.
+    ///
+    /// And the NSEC chain that `sign_zone_incrementally`'s header defends
+    /// building in full is 16%, not the term to argue about.
+    ///
+    /// **A negative result** (`CLAUDE.md` §10): `Zone::reserve` on the output
+    /// buys nothing. The signed zone ends at ~4x the input's records, and
+    /// reserving at 1x and at 4x both read 9.4-9.5 s, inside the run-to-run
+    /// spread. #61's 320 ms of rehashing was a load whose per-record work is
+    /// an index insert; here it is an index insert behind a fold, a chain key
+    /// and an RDATA clone.
+    ///
+    /// A test inside this module rather than beside `scale.rs`, because every
+    /// pass but the whole is private; the parts run in `sign_zone_inner`'s
+    /// order from its own arguments and the sum is asserted against the whole,
+    /// so the split cannot drift from the function it describes
+    /// (`CLAUDE.md` §7).
+    ///
+    /// NSEC, one ECDSA P-256 KSK and one ZSK — 64d's shape, so these columns
+    /// are comparable with its table. Three warm runs on the development
+    /// machine, Windows, discarding the first after a rebuild — 9457.6 ms,
+    /// above all three. The 1M row's spread is
+    /// 1.5% on the total and under 4.5% on every column but `free`, which is
+    /// 6.1%: it is a deallocation, and the allocator's state is the one thing
+    /// a run does not reset.
+    ///
+    /// ```sh
+    /// cargo test -p rdns --release incremental_sign_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn incremental_sign_cost_by_pass() {
+        use crate::update;
+        use std::time::Instant;
+
+        if cfg!(debug_assertions) {
+            panic!(
+                "this would measure the debug build. Run:\n  \
+                 cargo test -p rdns --release incremental_sign_cost -- --ignored --nocapture"
+            );
+        }
+
+        let keys = signing_keys(ORIGIN);
+        let policy = policy(DenialChain::Nsec);
+        println!(
+            "{:>9}  {:>11} {:>13} {:>10} {:>9} {:>10} {:>15} {:>8}",
+            "records",
+            "incremental",
+            "previous-sigs",
+            "carry-over",
+            "layout",
+            "nsec-chain",
+            "sign-everything",
+            "free",
+        );
+        for records in [10_000usize, 100_000, 1_000_000] {
+            let mut text = String::from("$ORIGIN example.com.\n$TTL 3600\n");
+            text.push_str(
+                "@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n",
+            );
+            text.push_str("@ IN NS ns.example.com.\n");
+            text.push_str("ns IN A 192.0.2.1\n");
+            for i in 0..records {
+                let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
+                text.push_str(&format!("h{i} IN A 10.{a}.{b}.{c}\n"));
+            }
+            let source = parse_zone_file(&text, ORIGIN).expect("the fixture parses");
+            let previous = sign_zone(&source, &keys, &policy).expect("the fixture signs");
+            let change = update::Change::Add(ResourceRecord {
+                name: nm("added.example.com."),
+                class: Class::new(1),
+                ttl: Ttl::from_secs(3600),
+                rdata: RecordData::from_parsed(&ParsedRecord::A(std::net::Ipv4Addr::new(
+                    198, 51, 100, 1,
+                )))
+                .expect("the rdata builds"),
+            });
+            let zone = update::apply(&source, std::slice::from_ref(&change)).zone;
+            drop(source);
+
+            // The whole first, so the parts below are not the ones paying for
+            // whatever it warms.
+            let start = Instant::now();
+            let whole = sign_zone_incrementally(&previous, &zone, &keys, &policy).expect("signs");
+            let incremental = start.elapsed();
+
+            // `sign_zone_inner`'s body, its own arguments, its own order.
+            let origin = zone.origin().to_folded();
+            let start = Instant::now();
+            let carried = PreviousSignatures::of(&previous);
+            let previous_sigs = start.elapsed();
+
+            let mut signed = Zone::new(origin.clone());
+            let start = Instant::now();
+            let (soa_ttl, minimum) =
+                carry_over_records(&zone, origin.as_ref(), &policy, &mut signed)
+                    .expect("the records carry over");
+            let carry_over = start.elapsed();
+            let dnskey_ttl = publish_dnskeys(
+                &keys,
+                origin.as_ref(),
+                soa_ttl,
+                policy.signed_at,
+                &mut signed,
+            );
+            publish_sync_records(
+                &keys,
+                origin.as_ref(),
+                dnskey_ttl,
+                policy.signed_at,
+                &mut signed,
+            )
+            .expect("the sync records publish");
+
+            let start = Instant::now();
+            let layout = Layout::of(&signed, origin.as_ref());
+            let layout_time = start.elapsed();
+
+            let start = Instant::now();
+            build_nsec_chain(&layout, Ttl::from_secs(minimum), &mut signed).expect("the chain");
+            let nsec_chain = start.elapsed();
+
+            let start = Instant::now();
+            sign_everything(&layout, &keys, &policy, Some(&carried), &mut signed)
+                .expect("the signatures");
+            let sign_everything_time = start.elapsed();
+
+            // Freeing the index is a pass too, and it is the one the split
+            // would otherwise miss: `carried` dies inside
+            // `sign_zone_incrementally` and outlives every timer above.
+            let start = Instant::now();
+            drop(carried);
+            let free_carried = start.elapsed();
+
+            // The split is the function or it is fiction: the same zone out,
+            // and the parts within 0.8x-1.25x of the whole. Wide on the high
+            // side because the parts pay a cold allocator that the whole,
+            // running first, has already warmed.
+            assert_eq!(
+                signed.records().len(),
+                whole.records().len(),
+                "the split built a different zone at {records}",
+            );
+            let parts = previous_sigs
+                + carry_over
+                + layout_time
+                + nsec_chain
+                + sign_everything_time
+                + free_carried;
+            let drift = parts.as_secs_f64() / incremental.as_secs_f64();
+            assert!(
+                (0.8..1.25).contains(&drift),
+                "the parts sum to {drift:.2} of the whole at {records}: they are no longer \
+                 what `sign_zone_inner` runs",
+            );
+            println!(
+                "{records:>9}  {:>9.1}ms {:>11.1}ms {:>8.1}ms {:>7.1}ms {:>8.1}ms {:>13.1}ms {:>6.1}ms",
+                incremental.as_secs_f64() * 1000.0,
+                previous_sigs.as_secs_f64() * 1000.0,
+                carry_over.as_secs_f64() * 1000.0,
+                layout_time.as_secs_f64() * 1000.0,
+                nsec_chain.as_secs_f64() * 1000.0,
+                sign_everything_time.as_secs_f64() * 1000.0,
+                free_carried.as_secs_f64() * 1000.0,
+            );
+        }
+    }
 }

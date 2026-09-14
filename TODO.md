@@ -62,8 +62,11 @@ clones and not the one the row named. **64d is closed and answered the question
 the other two were waiting on**: signing is 88% of a signed update, so 64b and
 64c together are worth 10% of one rather than the 68% they are of an unsigned
 one — and the measurement filed **64e**, which is that carrying every signature
-forward still costs four O(zone) passes and 10.3 s at a million records. 64b,
-64c and 64e are what is left, and none of them names a remedy yet.
+forward still costs 10.3 s at a million records with no crypto in it. **64e's
+own first step is taken**: six passes and not the four it named, of which
+`sign_everything` is 39% and freeing the carry-forward index 12%, so the index
+that saves 16.6 s of ECDSA costs 31% of what is left. 64b, 64c and 64e are what
+is left, and none of them names a remedy yet.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -1915,7 +1918,11 @@ it is one every twelve** (64d).
   records**, against 26.9 s for a full sign. The 16.6 s difference is the ECDSA
   the carry-forward saves; the 10.3 s that remains is `PreviousSignatures::of`
   over the served zone, `carry_over_records`, `Layout::of` and a full NSEC
-  chain, four O(zone) passes with no crypto in them.
+  chain, ~~four O(zone) passes with no crypto in them~~ — **six**, measured
+  below the same day. What the four have in common and the two missing ones do
+  not is that each is a loop over `zone.records()`: `sign_everything` loops
+  over a `BTreeMap` it builds from the zone first, and the sixth is a
+  destructor.
 
   **No remedy named, on purpose** (§18: a row naming a wrong remedy costs more
   than one naming none). The obvious one — rebuild only the part of the chain
@@ -1929,9 +1936,57 @@ it is one every twelve** (64d).
   is 88% of what a dynamic UPDATE now costs, which is a fact about the *update*
   path that nothing about the *load* path implied.
 
-  The measurement that would let somebody start: the four passes above, timed
+  ~~The measurement that would let somebody start: the four passes above, timed
   apart. 64d times the signing as one column because that is what its question
-  needed, and splitting it is this row's first step rather than its conclusion.
+  needed, and splitting it is this row's first step rather than its
+  conclusion.~~ **Taken 2026-09-14, and there are six passes, not four.**
+  `zone_signer::tests::incremental_sign_cost_by_pass`, inside the module
+  because every pass but the whole is private:
+
+  ```sh
+  cargo test -p rdns --release incremental_sign_cost -- --ignored --nocapture
+  ```
+
+  | records | incremental | previous-sigs | carry-over | layout | nsec-chain | sign-everything | free |
+  |---|---|---|---|---|---|---|---|
+  | 10 000 | 53.5 ms | 11.8 | 4.8 | 3.0 | 8.3 | 20.9 | 2.3 |
+  | 100 000 | 748.5 ms | 151.7 | 60.2 | 34.9 | 94.8 | 324.0 | 70.6 |
+  | **1 000 000** | **9 331 ms** | **1 833** | **1 055** | **509** | **1 483** | **3 630** | **1 105** |
+
+  Three warm runs on the development machine, Windows, discarding the first
+  after a rebuild; spread 1.5% on the total and under 4.5% on every column but
+  `free`. The parts are asserted to sum within a fifth of the whole, so the
+  split cannot drift from `sign_zone_inner` without the test saying so — the
+  band is 0.8x to 1.25x, wide on the high side because the parts pay a cold
+  allocator that the whole, running first, has already warmed.
+
+  **The two passes the row did not name are 51% of it.** `sign_everything` is
+  the largest column at **39%** — it assembles every RRset in the zone into a
+  `BTreeMap`, cloning each RDATA, *then* asks the carried set about each one,
+  and adds two million RRSIG records to the output zone. And `free`, **12%**,
+  is dropping `PreviousSignatures`: it dies inside `sign_zone_incrementally`
+  after the last of the other timers has stopped, and it was exactly the 11%
+  the split was short of the whole before it was measured.
+
+  **So the carry-forward index is 2.9 s of 9.3 s, 31%, to build and to free.**
+  It buys 64d's 16.6 s of ECDSA, so it is still 5.6x its own price and the
+  decision stands — but the row had it as one of four equals and it is a third
+  of the bill. The NSEC chain that `sign_zone_incrementally`'s header defends
+  building in full is 16%, which is not the term to argue about either.
+
+  **A negative result, recorded rather than dropped** (`CLAUDE.md` §10):
+  `Zone::reserve` on the output buys nothing. The signed zone ends at ~4x the
+  input's record count and `Zone::new` grows from empty, so #61's 320 ms of
+  index rehashing looked like free money; reserving at 1x and at 4x both read
+  9.4-9.5 s, inside the run-to-run spread. #61's load has an index insert as
+  its per-record work, and here that insert is behind a fold, a chain key and
+  an RDATA clone.
+
+  **Still no remedy named**, and the split narrows where one would go rather
+  than supplying it: `sign_everything`'s own interior, which is one map build,
+  one lookup per RRset and two million `add_record` calls, has not been timed
+  apart. That is this row's next step and it needs the instrumentation to move
+  inside the function, which the split above deliberately did not do.
 
 **What 64c would actually cost, since "add a WAL" is the wrong description.**
 The journal is already where a write-ahead log sits — `zones.rs` writes it
