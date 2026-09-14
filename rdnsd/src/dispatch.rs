@@ -875,11 +875,14 @@ impl Server {
         // path's REFUSED, because an UPDATE names the zone and asks whether we
         // are its authority.
         //
-        // Cloned, not merely tested for, and in the one read guard: "do we serve
-        // it" and the copy the signer works against must be the same version.
+        // Taken, not merely tested for, and in the one read guard: "do we serve
+        // it" and the version the signer works against must be the same one.
+        // `snapshot` rather than `matching(..).cloned()` — the map holds
+        // `Arc<Zone>`, so this is a refcount and not a copy of the whole zone,
+        // which was 150 ms at a million records (`TODO.md` #64a).
         let previous = {
             let zones = self.zone_map.read().await;
-            zones.matching(zone_name.as_ref()).cloned()
+            zones.snapshot(zone_name.as_ref())
         };
         let Some(previous) = previous else {
             tracing::info!(peer = %ip, "UPDATE of {zone_name}: NOTAUTH (not a zone served here)");
@@ -1191,7 +1194,7 @@ fn apply_update_to_file(
     prerequisites: &[update::Prerequisite],
     changes: &[update::Change],
     signing: Option<&ZoneSigning>,
-) -> Result<(Option<Zone>, update::Applied), UpdateFailure> {
+) -> Result<(Option<Zone>, UpdateReport), UpdateFailure> {
     // The zone as the file has it: unsigned, on the operator's serial. Re-read
     // rather than taken from the served copy, so an edit since the last load is
     // not silently reverted.
@@ -1203,12 +1206,17 @@ fn apply_update_to_file(
     // otherwise assert on this server's signing configuration.
     update::check_prerequisites(&source, prerequisites).map_err(UpdateFailure::Prerequisite)?;
 
-    let applied = update::apply(&source, changes);
-    if applied.changed == 0 {
-        return Ok((None, applied));
+    let update::Applied {
+        zone,
+        changed,
+        ignored,
+    } = update::apply(&source, changes);
+    let report = UpdateReport { changed, ignored };
+    if changed == 0 {
+        return Ok((None, report));
     }
 
-    rdns::zone_writer::write_zone_file(&applied.zone, path)
+    rdns::zone_writer::write_zone_file(&zone, path)
         .with_context(|| format!("writing {} back after an update", path.display()))
         .map_err(UpdateFailure::System)?;
 
@@ -1218,11 +1226,22 @@ fn apply_update_to_file(
     // the next IXFR delta.
     let installed = match signing {
         Some(signing) => signing
-            .sign_one_incrementally(previous, &applied.zone)
+            .sign_one_incrementally(previous, zone)
             .map_err(UpdateFailure::System)?,
-        None => applied.zone.clone(),
+        None => zone,
     };
-    Ok((Some(installed), applied))
+    Ok((Some(installed), report))
+}
+
+/// What an UPDATE did, for the log line: the counts, without the zone.
+///
+/// `update::Applied` owns the zone it produced, and the unsigned path installs
+/// that same zone — returning both meant cloning one of them, 9% of a
+/// million-record update for a copy nobody read (`TODO.md` #64a). Splitting the
+/// counts off is what makes the clone unavailable rather than merely unwise.
+struct UpdateReport {
+    changed: usize,
+    ignored: Vec<update::Ignored>,
 }
 
 /// An empty TC=1 answer to `request`: the question echoed, no records.
@@ -1313,18 +1332,26 @@ mod tests {
     /// a deployment pays.
     ///
     /// ```text
-    ///   records      total   re-read     apply to_string     write     clone
-    ///     10000     20.6ms    13.9ms     1.8ms     5.9ms     6.0ms   763.7µs
-    ///    100000    159.2ms    41.2ms    19.8ms    61.2ms    46.8ms     9.2ms
-    ///   1000000       1.8s   451.3ms   379.8ms   621.4ms   135.7ms   158.7ms
+    ///   records      total   re-read     apply to_string     write
+    ///     10000     18.4ms    14.5ms     2.1ms     6.1ms     7.5ms
+    ///    100000    150.0ms    41.2ms    22.1ms    64.3ms    19.5ms
+    ///   1000000    1713.0ms   452.6ms   361.8ms   637.5ms   140.1ms
     /// ```
     ///
-    /// Linear in the zone, at about 1.8 µs a record, and **five separate
-    /// O(zone) steps for a one-record change**. The re-read is 25% of it and
-    /// not the dominant term — `zone_to_string` is, at 35%. `clone` is the
-    /// only one nothing reads: with no signing configured the zone is cloned
-    /// for the caller and the original dies inside an `Applied` whose `zone`
-    /// field no caller touches.
+    /// Linear in the zone, at about 1.7 µs a record, and **four separate
+    /// O(zone) steps for a one-record change**. The re-read is 26% of it and
+    /// not the dominant term — `zone_to_string` is, at 37%.
+    ///
+    /// A fifth step, a `Zone::clone` nothing read, was 150.7 ms before #64a:
+    /// `apply_update_to_file` returned the installed zone beside an
+    /// `update::Applied` that owned another copy of it. [`UpdateReport`] has
+    /// no zone, so there is no column to time.
+    ///
+    /// The total is printed in milliseconds because `{:.1?}` past a second is
+    /// one significant figure, and both sides of that fix read "1.8s". Putting
+    /// the `clone()` back separates them: **1907–1947 ms against 1694–1731**,
+    /// six warm runs against five. Discard the first run after a rebuild — one
+    /// read 1983.9 ms, 270 ms above the five that followed it.
     ///
     /// Unsigned. `sign_one_incrementally` is not in these numbers and has not
     /// been measured; #44c's 28 s is a *full* sign of a zone this size and is
@@ -1363,8 +1390,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rdns-update-cost-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         println!(
-            "{:>9}  {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}  {:>8}",
-            "records", "total", "re-read", "apply", "to_string", "write", "clone", "file"
+            "{:>9}  {:>9} {:>9} {:>9} {:>9} {:>9}  {:>8}",
+            "records", "total", "re-read", "apply", "to_string", "write", "file"
         );
         for records in [10_000usize, 100_000, 1_000_000] {
             let text = zone_text(records);
@@ -1413,17 +1440,12 @@ mod tests {
             let start = Instant::now();
             rdns::persist::write_atomically_str(&path, &out).expect("persists");
             let write = start.elapsed();
-            // The fifth O(zone) step, and the one nothing reads: with no
-            // signing configured `apply_update_to_file` hands back
-            // `applied.zone.clone()`, and the original dies inside the
-            // `Applied` the caller only asks `changed` and `ignored` of.
-            let start = Instant::now();
-            let clone = applied.zone.clone();
-            let cloned = start.elapsed();
-            std::hint::black_box(&clone);
-
+            // Total in milliseconds whatever its size: `{:.1?}` switches to
+            // seconds past 1 s, and one significant figure there is coarser
+            // than the run-to-run spread of the columns it sums.
             println!(
-                "{records:>9}  {total:>9.1?} {reread:>9.1?} {apply:>9.1?} {to_string:>9.1?} {write:>9.1?} {cloned:>9.1?}  {:>6} KB",
+                "{records:>9}  {:>7.1}ms {reread:>9.1?} {apply:>9.1?} {to_string:>9.1?} {write:>9.1?}  {:>6} KB",
+                total.as_secs_f64() * 1000.0,
                 bytes / 1024
             );
         }

@@ -776,14 +776,15 @@ impl ZoneSigning {
     /// there is no previous version to carry forward from and
     /// [`ZoneSigning::apply`] is the right call.
     ///
-    /// A zone with no key is returned unchanged, exactly as `apply` skips it.
-    pub(crate) fn sign_one_incrementally(&self, previous: &Zone, zone: &Zone) -> Result<Zone> {
+    /// A zone with no key is returned unchanged, exactly as `apply` skips it —
+    /// by value, so that case costs no copy of the zone (`TODO.md` #64a).
+    pub(crate) fn sign_one_incrementally(&self, previous: &Zone, zone: Zone) -> Result<Zone> {
         let Some(keys) = self.keys.get(&zone.origin().to_owned()) else {
-            return Ok(zone.clone());
+            return Ok(zone);
         };
         let origin = zone.origin().to_string();
         let policy = self.policy_for(&origin, current_unix_timestamp());
-        sign_zone_incrementally(previous, zone, keys, &policy)
+        sign_zone_incrementally(previous, &zone, keys, &policy)
             .with_context(|| format!("re-signing {origin} after an update"))
     }
 

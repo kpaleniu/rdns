@@ -51,10 +51,11 @@ prose: `rdnsr` has no config file, so there is nowhere to write a per-zone
 anything. It does not wait on 57d — `--rpz-policy` has wanted the same file
 since before 57 existed.
 **#64 came out of asking 57d's question of `rdnsd`**: if a zone file is both
-the interchange format and the store, what does mutating it cost? One UPDATE is
+the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
 lock. The row was filed with the measurement that refuted the fix it was going
-to propose.
+to propose. **64a is fixed** — four passes and 1.7 s — and 64b, 64c and 64d
+are the three that carry decisions.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -1685,13 +1686,43 @@ change**. The largest is `zone_to_string` at 35%, not the re-read at 25%.
 a workload this has." So 1.8 s is the *server's* update throughput at that
 size, for every zone at once — about one every two seconds.
 
-- **64a. A clone nothing reads.** With no signing configured
-  `apply_update_to_file` returns `applied.zone.clone()`, and the original dies
-  inside the `Applied` it also returns — whose `zone` field no caller touches,
-  checked: `answer_update` reads only `changed` and `ignored`. **159 ms at 1M
-  records, 9%**, for a copy that is dropped unread. The only item here that is
-  pure waste rather than a design consequence, and the only one with no
-  decision attached.
+- **64a. A clone nothing reads. — fixed 2026-09-14.** With no signing
+  configured `apply_update_to_file` returned `applied.zone.clone()`, and the
+  original died inside the `Applied` it also returns — whose `zone` field no
+  caller touches, checked: `answer_update` reads only `changed` and `ignored`.
+  **159 ms at 1M records, 9%**, for a copy that is dropped unread. The only
+  item here that is pure waste rather than a design consequence, and the only
+  one with no decision attached.
+
+  Fixed in the type rather than at the call site (`CLAUDE.md` §17): the
+  function now returns `UpdateReport`, which is `changed` and `ignored` and no
+  zone, so the zone `update::apply` produced is *moved* into the installed copy
+  and there is no second one to clone. The benchmark's `clone` column is gone
+  because the type no longer admits the column.
+
+  **Three instances, not one** (§18), all found by counting the shape before
+  fixing the one the row named. `ZoneSigning::sign_one_incrementally` returned
+  `zone.clone()` for a zone with no key — the same copy, on the *signed* path,
+  for any zone the keyring does not cover; it takes the zone by value now. And
+  `answer_update` took `previous` as `matching(..).cloned()`, a whole-zone copy
+  of the served version that only the signer reads: `ZoneMap` holds
+  `Arc<Zone>`, and `ZoneMap::snapshot` already existed for "a caller that
+  cannot finish under the lock", so that one is a refcount. **The conditional
+  clone written before that grep was the wrong fix** — an `Option<Option<Zone>>`
+  and a `(signer, previous)` pair to make "cloned for nobody" unrepresentable,
+  all of it unnecessary because the copy need never have been one. §19, and the
+  refuting evidence was the declaration of the map.
+
+  **The measurement that could have refuted it.** A single run does not show
+  this: the total at 1M records read "1.8s" either way, because `{:.1?}` past a
+  second is coarser than the spread of the columns it sums. The benchmark
+  prints the total in milliseconds now, and putting the `clone()` back
+  separates the two without overlap — **1907–1947 ms against 1694–1731**, six
+  warm runs against five, on the development machine, Windows. The first run
+  after a rebuild is cold and must be discarded: one read 1983.9 ms, 270 ms
+  above the five that followed it, and it was *inside* the unfixed band. The
+  four remaining steps are unmoved. **Four O(zone) passes now, not five**; the
+  section heading is the shape at filing and is left as the identifier it is.
 - **64b. The re-read, which is a policy wearing a cost.** `parse_zone_file_at`
   per update, under "so an edit since the last load is not silently reverted" —
   **451 ms, 25%**. The rule is defensible; paying it unconditionally is the
