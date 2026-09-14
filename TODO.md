@@ -1066,6 +1066,11 @@ Five items. 57a-c are done; 57d and 57e are what is left.
   reload, and above one core it cost 1/N of capacity. The work is now on
   `spawn_blocking`.
 
+  **The two bold rows are the length of a reload, and #61 made a reload
+  shorter** — 2.74 s to 0.952 s at a million rules. The probe has not been
+  re-run, so no number here is restated; what the table still shows correctly is
+  the *shape*, which is what it was taken for and which no speed-up removes.
+
   The last row is the one that gated 57c: four concurrent reloads stalled every
   task for 3.53 s and took 4.50 s to do 2.70 s of work. Reloads are therefore
   serialised — one task, awaiting each — and requests coalesce onto a single
@@ -1156,6 +1161,24 @@ Five items. 57a-c are done; 57d and 57e are what is left.
   should not cost a gigabyte, so if the million-rule feed is a real target the
   incremental path is required — and IXFR has nothing to apply a delta to
   without 57d. 57e therefore does not precede 57d; it is an argument for it.
+
+  **#61 moved all three of those figures the next day**, and the paragraph above
+  is kept as 57b's because the reasoning is unchanged — only the code under it
+  is. Current, from #61f's table: `PolicyStore::reload` **0.952 s** at a million
+  rules and **71 ms** at a hundred thousand, **339.4 bytes per rule held** and a
+  **758.8** peak, so a million-rule feed holds 339 MB and peaks at **759 MB**.
+  The series is no longer flat at 2.7 µs a rule either — 0.95 µs at a million
+  against 0.71 at a hundred thousand, the residual drift being the 2M-entry
+  index table's cache behaviour, which #61 records as inherent. **A thousand
+  rules was not re-measured**, so 57b's 1.5 ms is the only figure there is for
+  that size and it is now an upper bound rather than a reading.
+
+  None of that weakens the argument. Applying a forty-record delta should not
+  cost three-quarters of a gigabyte any more than it should cost one, and
+  **#61's own closing note says the 2x reload peak does not go away**: per-zone
+  build-then-swap buys nothing with one big feed, because "old zone + new zone"
+  *is* "old set + new set", and it would only help a set of many zones by giving
+  up the all-or-nothing property that is the point (§4).
 
 ---
 
