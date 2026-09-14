@@ -98,6 +98,65 @@ fn admission_limits(udp: UdpSizes, max_udp: u16, max_tcp: u16) -> AdmissionLimit
     AdmissionLimits::new(max_udp.max(udp.advertised()) as usize, max_tcp as usize)
 }
 
+// The daemon's defaults, in one place because each is spelled twice: `Cli`
+// takes them through `default_value_t` and the config file's `[server]` and
+// `[signing]` tables through `#[serde(default = "crate::...")]`. Sixteen had a
+// literal on each side and nothing comparing them (`TODO.md` #63e);
+// `default_udp_workers` is the one that did not, and is the shape.
+//
+// Here and not in `config`, because a flag's default is the daemon's and the
+// file inherits it — and an item private in the crate root is visible to every
+// module under it, which is all `config` needs (`CLAUDE.md` §17).
+
+fn default_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_port() -> u16 {
+    53
+}
+fn default_response_rate() -> u32 {
+    8192
+}
+fn default_query_rate() -> u32 {
+    1000
+}
+fn default_query_burst() -> u32 {
+    200
+}
+fn default_max_udp_request() -> u16 {
+    4096
+}
+fn default_max_tcp_request() -> u16 {
+    16 * 1024
+}
+fn default_udp_payload_size() -> u16 {
+    rdns::FLAG_DAY_UDP_SIZE
+}
+fn default_max_udp_response() -> u16 {
+    rdns::FLAG_DAY_UDP_SIZE
+}
+fn default_anomaly_interval() -> u64 {
+    60
+}
+fn default_anomaly_query_rate() -> f64 {
+    50.0
+}
+fn default_anomaly_error_percent() -> f64 {
+    10.0
+}
+fn default_anomaly_source_queries() -> u64 {
+    100
+}
+fn default_anomaly_source_refusals() -> u64 {
+    5
+}
+fn default_dnstap_max_bytes() -> u64 {
+    1_073_741_824
+}
+fn default_validity_days() -> u32 {
+    30
+}
+
 /// Default for `--udp-workers`: the machine's parallelism, clamped to 2..=32.
 ///
 /// A worker spends microseconds of CPU per datagram, so useful parallelism is
@@ -157,10 +216,10 @@ use dispatch::Wire;
 #[command(version = rdns::VERSION, about, long_about = None)]
 struct Cli {
     /// Address to listen on, for both transports.
-    #[arg(long, default_value = "0.0.0.0", conflicts_with = "config")]
+    #[arg(long, default_value_t = default_host(), conflicts_with = "config")]
     host: String,
     /// Port to listen on, for both transports.
-    #[arg(long, default_value = "53", conflicts_with = "config")]
+    #[arg(long, default_value_t = default_port(), conflicts_with = "config")]
     port: u16,
     /// A single zone file. The origin comes from the file name.
     #[arg(long, conflicts_with = "config")]
@@ -226,7 +285,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "DAYS",
-        default_value = "30",
+        default_value_t = default_validity_days(),
         conflicts_with = "config"
     )]
     signature_validity: u32,
@@ -271,7 +330,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "BYTES_PER_SEC",
-        default_value = "8192",
+        default_value_t = default_response_rate(),
         conflicts_with = "config"
     )]
     response_rate: u32,
@@ -288,7 +347,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "OCTETS",
-        default_value = "4096",
+        default_value_t = default_max_udp_request(),
         conflicts_with = "config"
     )]
     max_udp_request: u16,
@@ -302,7 +361,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "OCTETS",
-        default_value = "1232",
+        default_value_t = default_udp_payload_size(),
         conflicts_with = "config"
     )]
     udp_payload_size: u16,
@@ -318,7 +377,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "OCTETS",
-        default_value = "1232",
+        default_value_t = default_max_udp_response(),
         conflicts_with = "config"
     )]
     max_udp_response: u16,
@@ -330,7 +389,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "OCTETS",
-        default_value = "16384",
+        default_value_t = default_max_tcp_request(),
         conflicts_with = "config"
     )]
     max_tcp_request: u16,
@@ -342,7 +401,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "QUERIES_PER_SEC",
-        default_value = "1000",
+        default_value_t = default_query_rate(),
         conflicts_with = "config"
     )]
     query_rate: u32,
@@ -353,7 +412,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "QUERIES",
-        default_value = "200",
+        default_value_t = default_query_burst(),
         conflicts_with = "config"
     )]
     query_burst: u32,
@@ -373,7 +432,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "SECONDS",
-        default_value = "60",
+        default_value_t = default_anomaly_interval(),
         conflicts_with = "config"
     )]
     anomaly_interval: u64,
@@ -381,7 +440,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "QUERIES_PER_SEC",
-        default_value = "50",
+        default_value_t = default_anomaly_query_rate(),
         conflicts_with = "config"
     )]
     anomaly_query_rate: f64,
@@ -390,7 +449,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "PERCENT",
-        default_value = "10",
+        default_value_t = default_anomaly_error_percent(),
         conflicts_with = "config"
     )]
     anomaly_error_percent: f64,
@@ -403,7 +462,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "QUERIES",
-        default_value = "100",
+        default_value_t = default_anomaly_source_queries(),
         conflicts_with = "config"
     )]
     anomaly_source_queries: u64,
@@ -412,7 +471,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "REFUSALS",
-        default_value = "5",
+        default_value_t = default_anomaly_source_refusals(),
         conflicts_with = "config"
     )]
     anomaly_source_refusals: u64,
@@ -547,10 +606,9 @@ struct Cli {
     /// dropped. Ignored for a `tcp:` target, where the collector owns the
     /// storage.
     ///
-    /// The config file's `server.dnstap-max-bytes` is the same setting and the
-    /// same default, which `config::default_dnstap_max_bytes` holds so the two
-    /// cannot drift.
-    #[arg(long, value_name = "OCTETS", default_value = "1073741824")]
+    /// The config file's `server.dnstap-max-bytes` is the same setting, and
+    /// takes its default from the same [`default_dnstap_max_bytes`].
+    #[arg(long, value_name = "OCTETS", default_value_t = default_dnstap_max_bytes())]
     dnstap_max_bytes: u64,
     /// Serve Prometheus metrics and a liveness probe on this address.
     ///

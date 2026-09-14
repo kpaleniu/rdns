@@ -55,10 +55,11 @@ anything. It does not wait on 57d — `--rpz-policy` has wanted the same file
 since before 57 existed. **63a is answered**: the split is about **18** items
 and not the 84 the row counted, measured by sealing the file and letting the
 compiler name what `rdnsd` could not do without. On the way it found **63e**,
-sixteen settings whose default is written once in `config.rs` and again as a
-clap literal with nothing tying them, under two doc comments each claiming the
-other holds it — and **63f**, the same bare-`pub` sweep for the `cfg(unix)`
-file Windows cannot compile.
+sixteen settings whose default was written once in `config.rs` and again as a
+clap literal with nothing tying them, under three comments naming the hazard
+and none holding it — **closed the same day**, both sides reading one function
+now — and **63f**, the same bare-`pub` sweep for the `cfg(unix)` file Windows
+cannot compile.
 **#64 came out of asking 57d's question of `rdnsd`**: if a zone file is both
 the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
@@ -1748,7 +1749,7 @@ next caller is told the cost rather than finding it.
 
 ---
 
-### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a answered, 63e-f filed**
+### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a answered, 63e closed, 63f open**
 
 Filed out of 57d, which cannot be decided without it: a transfer spec is per
 zone, and there is nowhere to write one. Filed as its own number rather than
@@ -1820,16 +1821,16 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   a `[zones.*]` section means *inherit*, which is exactly what a per-zone
   `rpz-policy` needs.
 
-- **63e. Sixteen settings have their default written twice — filed 2026-09-14,
-  found while taking 63a.** Not the parsers, the *defaults*.
-  `rdnsd/src/config.rs` has 17 `default_*` functions for `#[serde(default)]`,
-  and 16 of them restate a number that `rdnsd/src/main.rs` already writes as a
-  clap `default_value` literal: `host`, `port`, `response-rate`, `query-rate`,
+- **63e. Sixteen settings had their default written twice — filed and closed
+  2026-09-14**, found while taking 63a. Not the parsers, the *defaults*.
+  `rdnsd/src/config.rs` had 17 `default_*` functions for `#[serde(default)]`,
+  and 16 of them restated a number `rdnsd/src/main.rs` already wrote as a clap
+  `default_value` literal: `host`, `port`, `response-rate`, `query-rate`,
   `query-burst`, `max-udp-request`, `max-tcp-request`, `udp-payload-size`,
   `max-udp-response`, all five anomaly thresholds, `dnstap-max-bytes` and
-  `validity-days`. Nothing ties any pair, and no test compares them.
+  `validity-days`. Nothing tied any pair and no test compared them.
 
-  **Why it is silent rather than merely untidy.** `Config::apply` overwrites
+  **Why it was silent rather than merely untidy.** `Config::apply` overwrites
   `cli` field by field, so the two sets are never both in force: an operator
   with a config file gets config's number and one with flags gets clap's, and
   a pair that disagreed would look correct from either side. That is §15's
@@ -1837,31 +1838,42 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   *refusing* `--config` with `--port` — applied to the default instead of to
   the value.
 
-  **The claim that made it visible was false.** `main.rs`'s
-  `--dnstap-max-bytes` doc says the config file "is the same setting and the
+  **Three comments named the hazard and none of them held it.** `main.rs`'s
+  `--dnstap-max-bytes` doc said the config file "is the same setting and the
   same default, which `config::default_dnstap_max_bytes` holds so the two
-  cannot drift". It holds one of them; clap holds `"1073741824"` beside it.
-  `default_dnstap_max_bytes`'s own doc says the same thing from the other end
-  ("the two spellings of one setting must not disagree, `CLAUDE.md` §15"). Two
-  comments asserting an invariant that nothing checks (§4), and the test
-  beside it asserts the serde default against the function that produces it,
-  which is §1's test agreeing with the code.
+  cannot drift" — it held one; clap held `"1073741824"` beside it.
+  `default_dnstap_max_bytes`'s own doc said the same thing from the other end,
+  and a third, over the anomaly block, said "the same numbers as the flags'
+  defaults, which is the only place they may disagree". §4's claim to verify,
+  three times, and the test beside the first asserted the serde default against
+  the function that produces it — §1's test agreeing with the code.
 
-  **The shape is already in the file.** `--udp-workers` is
-  `default_value_t = default_udp_workers()`, one flag of twenty doing it right,
-  so this is a sweep and not a design question. Two of the sixteen are worse
-  than duplicated: `udp-payload-size` and `max-udp-response` cite
-  `rdns::FLAG_DAY_UDP_SIZE` on the config side and write `"1232"` on the flag
-  side, so the named constant exists and one of the three sites uses it.
+  **Fixed where the shape already existed.** Two settings were already right
+  and both point the same way: `--udp-workers` is
+  `default_value_t = default_udp_workers()` with `config` citing
+  `crate::default_udp_workers`, and `https-path` is a shared const. So the 16
+  functions moved to the crate root beside `default_udp_workers`, `config`
+  cites them as `crate::default_*`, and every flag is `default_value_t`. A
+  flag's default is the daemon's and the file inherits it; an item private in
+  the crate root is visible to every module under it (§17), so this adds no
+  `pub` and does not reopen 63a's sealing.
 
-  Not taken with 63a, because it moves in the opposite direction: the fix makes
-  up to 16 of the 66 items 63a just sealed `pub(crate)` again, which is right —
-  they *would* be named by a second consumer — but it is a different change
-  with a different reason, and merging them makes one diff nobody can review.
+  **`--help` is byte-identical** on all 23 rendered defaults, which is the
+  check that the `default_value` → `default_value_t` conversion changed
+  nothing: `Display` for `f64` 50.0 is `50`, as the literal was.
 
-  The seventeenth, `default_algorithm`, is not one of these: it spells the
-  algorithm into the spec string `TsigKey::parse` reads, so §15's "reuse the
-  parser the flags use" is working there and there is no second default.
+  **The test is a tripwire, not a regression test** (§10): all sixteen pairs
+  agreed when they were counted, so nothing here was a wrong value.
+  `a_minimal_config_changes_no_flag_default` applies a minimal config to a
+  default `Cli` and asserts the sixteen fields are unmoved, which catches the
+  *seventeenth* setting added with a fresh literal on each side. Run against
+  the shape it forbids — a `query-burst` serde default of 201 — it fails
+  naming `server.query-burst`.
+
+  The seventeenth existing one, `default_algorithm`, is not one of these: it
+  spells the algorithm into the spec string `TsigKey::parse` reads, so §15's
+  "reuse the parser the flags use" is working there and there is no second
+  default.
 - **63f. `control.rs`'s nine bare `pub`s — filed 2026-09-14.** The rest of
   63a's sweep. `config.rs` and `control.rs` were the only two of `rdnsd`'s
   eleven modules using a bare `pub`; `config.rs` is done and this is the other

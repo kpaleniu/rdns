@@ -43,9 +43,9 @@ pub(crate) struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct Server {
-    #[serde(default = "default_host")]
+    #[serde(default = "crate::default_host")]
     host: String,
-    #[serde(default = "default_port")]
+    #[serde(default = "crate::default_port")]
     port: u16,
     /// A directory of `.zone` files. Zones named in `[zones.*]` may add to or
     /// override what is found here.
@@ -54,38 +54,38 @@ struct Server {
     allow_transfer: Vec<String>,
     #[serde(default)]
     also_notify: Vec<String>,
-    #[serde(default = "default_response_rate")]
+    #[serde(default = "crate::default_response_rate")]
     response_rate: u32,
-    #[serde(default = "default_query_rate")]
+    #[serde(default = "crate::default_query_rate")]
     query_rate: u32,
-    #[serde(default = "default_query_burst")]
+    #[serde(default = "crate::default_query_burst")]
     query_burst: u32,
     #[serde(default)]
     query_rate_exempt: Vec<String>,
     /// Largest request accepted, per transport, in octets. The UDP one is
     /// floored at the advertised payload size — see `crate::admission_limits`.
-    #[serde(default = "default_max_udp_request")]
+    #[serde(default = "crate::default_max_udp_request")]
     max_udp_request: u16,
-    #[serde(default = "default_max_tcp_request")]
+    #[serde(default = "crate::default_max_tcp_request")]
     max_tcp_request: u16,
     /// What every reply's OPT advertises this server can reassemble, and the
     /// largest UDP reply it will send. Both floored at 512 — see
     /// `rdns::UdpSizes`.
-    #[serde(default = "default_udp_payload_size")]
+    #[serde(default = "crate::default_udp_payload_size")]
     udp_payload_size: u16,
-    #[serde(default = "default_max_udp_response")]
+    #[serde(default = "crate::default_max_udp_response")]
     max_udp_response: u16,
     /// How often the anomaly warnings run, in seconds; 0 is off. The four
     /// thresholds below are per interval.
-    #[serde(default = "default_anomaly_interval")]
+    #[serde(default = "crate::default_anomaly_interval")]
     anomaly_interval: u64,
-    #[serde(default = "default_anomaly_query_rate")]
+    #[serde(default = "crate::default_anomaly_query_rate")]
     anomaly_query_rate: f64,
-    #[serde(default = "default_anomaly_error_percent")]
+    #[serde(default = "crate::default_anomaly_error_percent")]
     anomaly_error_percent: f64,
-    #[serde(default = "default_anomaly_source_queries")]
+    #[serde(default = "crate::default_anomaly_source_queries")]
     anomaly_source_queries: u64,
-    #[serde(default = "default_anomaly_source_refusals")]
+    #[serde(default = "crate::default_anomaly_source_refusals")]
     anomaly_source_refusals: u64,
     /// Concurrent UDP answers, which is also the number of tasks sharing the
     /// socket. Defaults to the machine's parallelism — see
@@ -99,7 +99,7 @@ struct Server {
     dnstap: Option<String>,
     /// How large a dnstap *capture file* may grow before the writing stops.
     /// 0 is no limit; ignored for a `tcp:` target.
-    #[serde(default = "default_dnstap_max_bytes")]
+    #[serde(default = "crate::default_dnstap_max_bytes")]
     dnstap_max_bytes: u64,
     /// Where to answer DNS over TLS (RFC 7858), and with what. All three or
     /// none: `apply` refuses a listener with no certificate, because the
@@ -135,28 +135,28 @@ struct Server {
 impl Default for Server {
     fn default() -> Self {
         Server {
-            host: default_host(),
-            port: default_port(),
+            host: crate::default_host(),
+            port: crate::default_port(),
             zone_dir: None,
             allow_transfer: Vec::new(),
             also_notify: Vec::new(),
-            response_rate: default_response_rate(),
-            query_rate: default_query_rate(),
-            query_burst: default_query_burst(),
+            response_rate: crate::default_response_rate(),
+            query_rate: crate::default_query_rate(),
+            query_burst: crate::default_query_burst(),
             query_rate_exempt: Vec::new(),
-            max_udp_request: default_max_udp_request(),
-            max_tcp_request: default_max_tcp_request(),
-            udp_payload_size: default_udp_payload_size(),
-            max_udp_response: default_max_udp_response(),
-            anomaly_interval: default_anomaly_interval(),
-            anomaly_query_rate: default_anomaly_query_rate(),
-            anomaly_error_percent: default_anomaly_error_percent(),
-            anomaly_source_queries: default_anomaly_source_queries(),
-            anomaly_source_refusals: default_anomaly_source_refusals(),
+            max_udp_request: crate::default_max_udp_request(),
+            max_tcp_request: crate::default_max_tcp_request(),
+            udp_payload_size: crate::default_udp_payload_size(),
+            max_udp_response: crate::default_max_udp_response(),
+            anomaly_interval: crate::default_anomaly_interval(),
+            anomaly_query_rate: crate::default_anomaly_query_rate(),
+            anomaly_error_percent: crate::default_anomaly_error_percent(),
+            anomaly_source_queries: crate::default_anomaly_source_queries(),
+            anomaly_source_refusals: crate::default_anomaly_source_refusals(),
             udp_workers: crate::default_udp_workers(),
             metrics_listen: None,
             dnstap: None,
-            dnstap_max_bytes: default_dnstap_max_bytes(),
+            dnstap_max_bytes: crate::default_dnstap_max_bytes(),
             tls_listen: None,
             quic_listen: None,
             https_listen: None,
@@ -173,57 +173,12 @@ impl Default for Server {
     }
 }
 
-fn default_host() -> String {
-    "0.0.0.0".to_string()
-}
-fn default_port() -> u16 {
-    53
-}
-fn default_response_rate() -> u32 {
-    8192
-}
-fn default_query_rate() -> u32 {
-    1000
-}
-fn default_query_burst() -> u32 {
-    200
-}
-fn default_max_udp_request() -> u16 {
-    4096
-}
-fn default_max_tcp_request() -> u16 {
-    16 * 1024
-}
-fn default_udp_payload_size() -> u16 {
-    rdns::FLAG_DAY_UDP_SIZE
-}
-fn default_max_udp_response() -> u16 {
-    rdns::FLAG_DAY_UDP_SIZE
-}
-// The same numbers as the flags' defaults, which is the only place they may
-// disagree — `--help` prints one and the file falls back to the other.
-fn default_anomaly_interval() -> u64 {
-    60
-}
-fn default_anomaly_query_rate() -> f64 {
-    50.0
-}
-fn default_anomaly_error_percent() -> f64 {
-    10.0
-}
-fn default_anomaly_source_queries() -> u64 {
-    100
-}
-fn default_anomaly_source_refusals() -> u64 {
-    5
-}
-
 /// Signing defaults, which a `[zones.*]` table may override per zone.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct Signing {
     key_dir: PathBuf,
-    #[serde(default = "default_validity_days")]
+    #[serde(default = "crate::default_validity_days")]
     validity_days: u32,
     #[serde(default)]
     nsec3: bool,
@@ -231,16 +186,6 @@ struct Signing {
     nsec3_opt_out: bool,
     #[serde(default)]
     require_signed: bool,
-}
-
-/// One gibibyte, the same number `--dnstap-max-bytes` defaults to: the two
-/// spellings of one setting must not disagree (`CLAUDE.md` §15).
-fn default_dnstap_max_bytes() -> u64 {
-    1_073_741_824
-}
-
-fn default_validity_days() -> u32 {
-    30
 }
 
 /// One TSIG key.
@@ -826,6 +771,61 @@ mod tests {
 zone-dir = "./zones"
 "#;
 
+    /// A config file that sets only what it must changes no default
+    /// (`TODO.md` #63e).
+    ///
+    /// The two spellings of one setting are a flag and a `[server]` or
+    /// `[signing]` key, and `Config::apply` overwrites `cli` field by field —
+    /// so they are never both in force and a pair that disagreed would look
+    /// correct from either side. Sixteen of them had a literal on each side
+    /// and nothing comparing them; both sides now read one function in the
+    /// crate root, which is what makes this pass by construction rather than
+    /// by luck.
+    ///
+    /// **A tripwire, not a regression test** (`CLAUDE.md` §10). Nothing here
+    /// was wrong: all sixteen pairs agreed when they were counted. What it
+    /// catches is the seventeenth, added with a fresh literal on each side —
+    /// run against a `default_query_burst` of 201, it fails naming
+    /// `query-burst`.
+    #[test]
+    fn a_minimal_config_changes_no_flag_default() {
+        let mut cli = Cli::parse_from(["rdnsd"]);
+        let defaults = Cli::parse_from(["rdnsd"]);
+        parse(MINIMAL)
+            .expect("the minimal config parses")
+            .apply(&mut cli)
+            .expect("and applies");
+
+        // Every setting with a default on both sides. `zone_dir` is not one:
+        // the file must name it and no flag defaults to anything.
+        macro_rules! same {
+            ($($field:ident => $key:literal),* $(,)?) => {$(
+                assert_eq!(
+                    cli.$field, defaults.$field,
+                    concat!("`", $key, "` and its flag default disagree"),
+                );
+            )*};
+        }
+        same! {
+            host => "server.host",
+            port => "server.port",
+            response_rate => "server.response-rate",
+            query_rate => "server.query-rate",
+            query_burst => "server.query-burst",
+            max_udp_request => "server.max-udp-request",
+            max_tcp_request => "server.max-tcp-request",
+            udp_payload_size => "server.udp-payload-size",
+            max_udp_response => "server.max-udp-response",
+            anomaly_interval => "server.anomaly-interval",
+            anomaly_query_rate => "server.anomaly-query-rate",
+            anomaly_error_percent => "server.anomaly-error-percent",
+            anomaly_source_queries => "server.anomaly-source-queries",
+            anomaly_source_refusals => "server.anomaly-source-refusals",
+            dnstap_max_bytes => "server.dnstap-max-bytes",
+            signature_validity => "signing.validity-days",
+        }
+    }
+
     #[test]
     fn a_minimal_config_takes_the_same_defaults_as_the_flags() {
         let config = parse(MINIMAL).expect("parses");
@@ -1356,7 +1356,7 @@ dnstap = "tcp:127.0.0.1:6000"
         assert_eq!(config.server.dnstap.as_deref(), Some("tcp:127.0.0.1:6000"));
         assert_eq!(
             config.server.dnstap_max_bytes,
-            default_dnstap_max_bytes(),
+            crate::default_dnstap_max_bytes(),
             "absent means the same bound the flag defaults to"
         );
 
