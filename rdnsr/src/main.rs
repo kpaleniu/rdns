@@ -344,7 +344,9 @@ struct Cli {
     /// changes nothing, which is how a new feed is measured before it is
     /// enforced; `disabled` keeps the configuration and matches nothing.
     /// Applies to every `--rpz` zone: a per-zone policy wants a config file,
-    /// and this daemon has flags.
+    /// and this daemon has flags (`TODO.md` #63). That is the wrong shape for
+    /// the one use `passthru` has — a new feed is measured before it is
+    /// enforced, and here that means measuring every feed at once.
     #[arg(long, value_name = "POLICY", default_value = "given")]
     rpz_policy: rdns::rpz::PolicyOverride,
     /// Addresses that may send a NOTIFY asking for the `--rpz` files to be

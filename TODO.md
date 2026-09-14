@@ -37,7 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#60**, **#62** and **#21**, as of 2026-09-14.
+**#57**, **#58**, **#59**, **#60**, **#62**, **#63** and **#21**, as of
+2026-09-14.
 **#61 closed the day it was filed**: the reload is 3.76x faster and holds
 68 MB less per million rules, and rayon was measured and declined. Of #62,
 62a and 62b are closed and **62c is what is left** — a top-level `$ORIGIN`
@@ -45,6 +46,10 @@ reindexing the whole zone, which is a startup hang rather than a query cost.
 62a was the one on the answer path: a 50 000-rule feed cost 144.6 us a query
 and costs 7 ns, and the structure the row would have named had it named one
 was measurably the wrong structure.
+**#63 was filed out of 57d** and is the prerequisite 57d had been naming in
+prose: `rdnsr` has no config file, so there is nowhere to write a per-zone
+anything. It does not wait on 57d — `--rpz-policy` has wanted the same file
+since before 57 existed.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -845,7 +850,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59**, **#60** and **62c**, plus
+**#57**, **#58**, **#59**, **#60**, **62c** and **#63**, plus
 **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
@@ -1142,6 +1147,35 @@ Five items. 57a-c are done; 57d and 57e are what is left.
   has 39 flags and no config file, and `--rpz-policy`'s own doc comment already
   concedes the point for a smaller thing. So 57d is a decision about `rdnsr`
   config before it is a decision about transfers.
+
+  **That prerequisite is #63 since 2026-09-14**, because naming it here and
+  nowhere else is how it stayed unscheduled (§18). #63 also checked the thing
+  this paragraph assumes and found it too weak: the `--rpz-policy` concession is
+  not "a smaller thing", it is a second and older demand for the same file,
+  live in the tree with no 57d near it. So #63 does not depend on 57d being
+  taken, and 57d is not the argument for it.
+
+  **The three shapes, if it is ever taken** — read off the code rather than
+  guessed, and none of them built, so this is an inventory and not a
+  recommendation. **A**: transfer, write the zone file, let the existing reload
+  re-read it; nothing in `rdns::rpz` or the answer path changes, and it pays
+  `PolicyZones::load` at 0.633 s per refresh at a million rules, plus a
+  serialization nothing has measured, to reparse what it just held. **B**:
+  transfer straight into `PolicyZone::new`, which is 41 ms on that feed — but
+  `PolicyStore` is paths-or-nothing today (`paths: Vec<PathBuf>`, and
+  `in_memory` hardcodes an empty one, so `is_configured()` is false and
+  `reload()` re-reads nothing), so a set mixing file feeds with transferred ones
+  does not fit at all and the type has to become a list of *sources*. **C**:
+  decline, which is what is shipped. B is the only one 57e is worth anything
+  under, because `fetch_changes` takes a `&Zone` base and A throws that base to
+  disk.
+
+  **One consequence none of the above had noticed.** `rdnsr` passes
+  `Readiness::ready()` under a comment saying "a resolver has nothing to wait
+  for". Under 57d it would have something: a resolver enforcing a blocklist it
+  has not transferred yet is answering with the policy not in force. That is
+  `rdnsd`'s `/readyz` latch arriving at `rdnsr`, and it argues for A — a file on
+  disk means a restart begins with the last feed rather than none.
 
   With 57c shipped, the two-process arrangement — `rdnsd` replicates, `rdnsr`
   reads, a NOTIFY joins them — needs no operator cron job and no new code on
@@ -1554,6 +1588,69 @@ the worst case rather than reading the loop".
 Not measured, stated as a code fact only: `reindex` is also the only caller that
 makes `set_origin` O(n), and whether any caller needs `set_origin` to be cheap
 has not been checked.
+
+---
+
+### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14**
+
+Filed out of 57d, which cannot be decided without it: a transfer spec is per
+zone, and there is nowhere to write one. Filed as its own number rather than
+left in 57d's prose because **a prerequisite named in prose is a prerequisite
+nobody schedules** (§18), which is precisely what 57d's paragraph has been
+doing since it was written.
+
+**The sentence that would make this row wrong** (§19), written down first and
+then checked: *"only 57d wants this, and 57d may be declined — option C is
+unbeaten, so the config file buys nothing."* **It is false.** `--rpz-policy`'s
+own doc comment already concedes the point, in the tree, today, with no 57d
+anywhere near it: *"Applies to every `--rpz` zone: a per-zone policy wants a
+config file, and this daemon has flags."* A resolver measuring a new feed in
+`passthru` before enforcing it must do so to **every** feed at once — which is
+the opposite of how a feed is introduced. So there are two independent demands,
+and the older one is live. That doc comment is itself §18's "a sentence naming
+remaining work is a `TODO.md` item, or it is deleted", found by going to look.
+
+- **63a. Where the parser lives is the question, and it is unmeasured.**
+  `rdnsd/src/config.rs` is **1,402 lines and 84 `pub` items**, and it is a
+  module of a *binary*, so those 84 are public only to `rdnsd`. Moving it into
+  `rdns` makes all 84 genuine public API. **#37's rule is that the measurement
+  for a split is visibility, not line count, and that measurement has not been
+  taken** — how many of the 84 a second consumer would actually name is the
+  number that decides this, and counting it is the first hour of the work.
+  Writing a second parser instead is the other shape, and its cost is measured
+  below rather than guessed.
+- **63b. A second parser would duplicate 22 keys.** Counted, not estimated:
+  `rdnsd`'s `[server]` table has **34 keys, and 22 of them are already `rdnsr`
+  flags under the same name** — `host`, `port`, both rate knobs and the exempt
+  list, all five anomaly thresholds, all four request/response size caps, the
+  three listener addresses and `https-path`, `tls-cert`, `tls-key`,
+  `metrics-listen`. That is §7's case with a number on it: two parsers for one
+  setting is how `[zones."x"].also-notify` came to be parsed into a field read
+  by nothing (#46c).
+- **63c. What `rdnsr` has no flag for at all.** A TSIG keyring, a zone
+  directory, and the three `transfer-tls-*` keys — which are, measurably, three
+  of the twelve `[server]` keys `rdnsd` has and `rdnsr` does not. 57d needs all
+  of them plus a per-zone spec; `MasterSpec::parse` and `rdns::endpoint` already
+  parse the spec itself, so this is where to put it and not how to read it.
+- **63d. Two rules this inherits already decided, so they are not open
+  questions.** §15's "two sources for one setting is an error, not a precedence
+  rule" — `--config` with `--port` is refused in `rdnsd` and must be in `rdnsr`.
+  And §15's "`Option` per field for an override, not a whole struct": absent in
+  a `[zones.*]` section means *inherit*, which is exactly what a per-zone
+  `rpz-policy` needs.
+
+**The dependency objection is already answered, measured rather than argued**
+(§15's "pay for a parser; do not pay for a stub"). `toml` + `serde` is **nine
+packages** — `serde`, `serde_core`, `serde_derive`, `serde_spanned`, `toml`,
+`toml_datetime`, `toml_parser`, `toml_writer`, `winnow` — and `rdnsd` already
+pays for every one of them, so a config file for `rdnsr` adds **0 packages to
+`Cargo.lock`** and takes `rdnsr`'s own tree from **104 to 113**.
+
+**What it unblocks, and what it does not.** 57d becomes an ordinary decision
+once this exists, and #57d's option C stays unbeaten until somebody shows it is
+not — this row does not decide that and must not be read as doing so. What it
+does decide is that the *reason* 57d cannot be taken is not a fact about
+transfers.
 
 ---
 
