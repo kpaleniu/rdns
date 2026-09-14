@@ -91,6 +91,12 @@ two million ECDSA signatures, so a remedy in the structures is capped at 16%
 there. What the measurement found instead is that `ZoneSigning::apply` re-signs
 every zone from scratch at **every** load — a SIGHUP included — and the
 carry-forward that already runs per UPDATE does the same work in 9.4 s.
+**65b is measured and confirms it**: editing or adding a tenth of a
+million-record zone in one go still saves 54-60%, so there is no edit size at
+which re-signing from scratch is the right call. What is left of 65a is not
+whether it is worth doing but *which runs may* carry forward, since
+`reuse` refuses only an already-expired signature and the re-signing tick has
+to go on refreshing.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -2232,7 +2238,7 @@ unknown, and taking it is the thing that would reopen this.
 
 ---
 
-### 65. Every load re-signs every zone from scratch — **filed 2026-09-14**
+### 65. Every load re-signs every zone from scratch — **filed 2026-09-14, 65b measured**
 
 Filed out of 64e, which measured the dynamic-UPDATE path and could not speak
 for this one. Two of 64e's six passes — building the carry-forward index and
@@ -2295,19 +2301,53 @@ one. Same code, same zone, same absolute cost; only the denominator moves.
   the served zones. `ZoneMap::snapshot` exists for "a caller that cannot finish
   under the lock" (#64a) and is the shape, but nothing hands it down today.
 
-- **65b. And whether carrying forward at a reload is *safe* is unanswered**,
-  which is why no remedy is named (§18). `PreviousSignatures::reuse` refuses a
-  signature only once `expiration <= signed_at` — already expired, not close to
-  it. A zone reloaded often enough would therefore keep its signatures until
-  they lapse rather than being refreshed a third of the way through the
-  validity, which is `resign_after`'s whole job. So the question is not "can a
-  reload carry forward" but "which runs are allowed to", and the answer has to
-  leave the re-signing tick refreshing. Nobody has asked it.
+- **65b. Whether carrying forward at a reload is *safe* is the open half; what
+  it is *worth* is measured — 2026-09-14.**
 
-  The measurement that would let somebody start: how much of a reload's 27 s a
-  carry-forward actually saves for a zone whose file *did* change, which is the
-  ordinary reason to reload. 64d's `carried` column is the shape of that count,
-  and this one has not been taken.
+  ~~The measurement that would let somebody start: how much of a reload's 27 s
+  a carry-forward actually saves for a zone whose file *did* change, which is
+  the ordinary reason to reload. 64d's `carried` column is the shape of that
+  count, and this one has not been taken.~~ **Taken**, and it confirms 65a
+  rather than refuting it. `zone_signer::tests::reload_carry_forward_saving_by_change_size`:
+
+  ```sh
+  cargo test -p rdns --release reload_carry_forward -- --ignored --nocapture
+  ```
+
+  | edit | records | incremental | full | saved | fresh sigs |
+  |---|---|---|---|---|---|
+  | in place | 1 | 9 685 ms | 27 610 | 64.9% | 1 |
+  | in place | 1 000 | 10 090 ms | 27 610 | 63.5% | 1 000 |
+  | in place | 10 000 | 10 115 ms | 27 610 | 63.4% | 10 000 |
+  | in place | 100 000 | 10 956 ms | 27 610 | 60.3% | 100 000 |
+  | add | 1 | 9 831 ms | 27 610 | 64.4% | 3 |
+  | add | 1 000 | 9 799 ms | 27 610 | 64.5% | 2 001 |
+  | add | 10 000 | 10 260 ms | 27 610 | 62.8% | 20 001 |
+  | add | 100 000 | 12 824 ms | 27 610 | 53.6% | 200 001 |
+
+  **Editing or adding a tenth of a million-record zone in one go still saves
+  54-60%**, because #64e's fixed passes are 9.4 s of it and a fresh signature
+  is ~15-25 µs. Extrapolated, the carry-forward stops paying only when
+  something like a third of the zone's two million RRsets change at once. So
+  there is no edit size at which the present behaviour is the right one.
+
+  **Both directions, because they are not one question** (§19). Editing RDATA
+  in place is the cheap end and flatters the carry-forward: no name enters or
+  leaves, the NSEC chain is unmoved, only the edited RRsets re-sign. Adding
+  names moves each new name's predecessor too (RFC 4034 §4.1.1) — `fresh sigs`
+  is 2n+1 against n — and is the case that could have refuted the row. It does
+  not: 53.6% at the largest size measured.
+
+  **The safety question is still open and still the reason no remedy is
+  named** (§18). `PreviousSignatures::reuse` refuses a signature only once
+  `expiration <= signed_at` — already expired, not close to it. A zone reloaded
+  often would therefore keep its signatures until they lapse instead of being
+  refreshed a third of the way through the validity, which is `resign_after`'s
+  whole job. The question is not "can a reload carry forward" but **"which runs
+  may"**, and the answer has to leave the re-signing tick refreshing. Note the
+  shape is already in the tree on the other side: #53 made *verification* skip
+  a zone this process signed with the same keys, keyed on `SigningRun`, and
+  what that keys on is the thing this would need too.
 
 **Not filed: making the five shared passes cheaper.** 16% of a full sign and
 48% of an incremental one, and 64e already owns the incremental side of it.

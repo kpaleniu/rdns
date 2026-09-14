@@ -3462,6 +3462,142 @@ a\.b    IN A   192.0.2.50
         }
     }
 
+    /// What a carry-forward saves at a *reload*, where the file has changed —
+    /// `TODO.md` #65b.
+    ///
+    /// 65a observes that `ZoneSigning::apply` re-signs every zone from scratch
+    /// at every load, a SIGHUP included, and that the served version is a
+    /// previous version to carry forward from. 64d measured the saving for a
+    /// change of one record, which is a dynamic UPDATE. A reload's change is
+    /// whatever an operator edited, so the question is where the saving stops
+    /// paying — and **it does not, within any edit worth the name**.
+    ///
+    /// ```text
+    ///   edit   records   incremental       full    saved  fresh sigs
+    /// in place         1      9685.3ms  27610.2ms    64.9%           1
+    /// in place      1000     10089.5ms  27610.2ms    63.5%        1000
+    /// in place     10000     10115.4ms  27610.2ms    63.4%       10000
+    /// in place    100000     10955.7ms  27610.2ms    60.3%      100000
+    ///    add         1      9831.3ms  27610.2ms    64.4%           3
+    ///    add      1000      9798.5ms  27610.2ms    64.5%        2001
+    ///    add     10000     10260.0ms  27610.2ms    62.8%       20001
+    ///    add    100000     12824.2ms  27610.2ms    53.6%      200001
+    /// ```
+    ///
+    /// A million records, NSEC, one ECDSA P-256 KSK and one ZSK; `previous` is
+    /// the signed unchanged zone, built once. **Editing or adding a tenth of
+    /// the zone in one go still saves 54-60%**, because the fixed passes #64e
+    /// splits are 9.4 s of it and a fresh signature is ~15-25 µs. Extrapolated,
+    /// the carry-forward stops paying only when something like a third of the
+    /// zone's two million RRsets change in one edit.
+    ///
+    /// Both directions, because they are not one question. In place is the
+    /// cheap end and flatters the carry-forward: no name enters or leaves, so
+    /// the NSEC chain is unmoved and only the edited RRsets re-sign. Adding
+    /// moves each new name's predecessor too (RFC 4034 §4.1.1) — visible in
+    /// `fresh sigs`, which is 2n+1 against n — and is the case that could have
+    /// refuted the row (`CLAUDE.md` §19). It does not.
+    ///
+    /// `add 1` makes 3 where 64d's UPDATE made 4: the new A, its NSEC and its
+    /// predecessor's. 64d's fourth was the SOA, which a dynamic UPDATE bumps
+    /// and a reload at the same `signed_at` does not.
+    ///
+    /// ```sh
+    /// cargo test -p rdns --release reload_carry_forward -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn reload_carry_forward_saving_by_change_size() {
+        use std::time::Instant;
+
+        refuse_debug("reload_carry_forward");
+
+        const RECORDS: usize = 1_000_000;
+        let keys = signing_keys(ORIGIN);
+        let policy = policy(DenialChain::Nsec);
+        let source = cost_fixture(RECORDS);
+        let previous = sign_zone(&source, &keys, &policy).expect("the fixture signs");
+
+        // One full sign of a changed zone, for the column every row compares
+        // against. The change does not move it: a full sign signs everything
+        // whatever moved.
+        let start = Instant::now();
+        let full = sign_zone(&source, &keys, &policy).expect("signs");
+        let full_time = start.elapsed();
+        drop(full);
+
+        let rrsig = crate::record_types::RRSIG;
+        let was: std::collections::HashSet<(&Name, &[u8])> = previous
+            .records()
+            .iter()
+            .filter(|r| r.rdata.rtype() == rrsig)
+            .map(|r| (&r.name, r.rdata.bytes()))
+            .collect();
+
+        println!(
+            "{:>6} {:>9}  {:>12} {:>10} {:>8}  {:>10}",
+            "edit", "records", "incremental", "full", "saved", "fresh sigs"
+        );
+        // Both directions, because they are not the same question. Editing
+        // RDATA in place leaves every name where it was, so the NSEC chain is
+        // unmoved and only the edited RRsets re-sign: the cheap end, and the
+        // one that flatters a carry-forward. Adding names moves each new name's
+        // predecessor as well (RFC 4034 §4.1.1), so it is the case that could
+        // refute the row (§19).
+        for adding in [false, true] {
+            for changed in [1usize, 1_000, 10_000, 100_000] {
+                let mut edited = Zone::new(source.origin().to_folded());
+                for (i, record) in source.records().iter().enumerate() {
+                    let mut record = record.clone();
+                    if !adding && i >= source.records().len() - changed {
+                        record.rdata = RecordData::from_parsed(&ParsedRecord::A(
+                            std::net::Ipv4Addr::new(198, 51, 100, 2),
+                        ))
+                        .expect("the rdata builds");
+                    }
+                    edited.add_record(record);
+                }
+                if adding {
+                    for i in 0..changed {
+                        edited.add_record(ZoneRecord {
+                            name: nm(&format!("new{i}.example.com.")),
+                            ttl: Ttl::from_secs(3600),
+                            class: Class::new(1),
+                            rdata: RecordData::from_parsed(&ParsedRecord::A(
+                                std::net::Ipv4Addr::new(198, 51, 100, 3),
+                            ))
+                            .expect("the rdata builds"),
+                        });
+                    }
+                }
+
+                let start = Instant::now();
+                let signed =
+                    sign_zone_incrementally(&previous, &edited, &keys, &policy).expect("signs");
+                let incremental = start.elapsed();
+
+                let fresh = signed
+                    .records()
+                    .iter()
+                    .filter(|r| r.rdata.rtype() == rrsig)
+                    .filter(|r| !was.contains(&(&r.name, r.rdata.bytes())))
+                    .count();
+                println!(
+                    "{:>6} {changed:>9}  {:>10.1}ms {:>8.1}ms {:>7.1}% {:>11}",
+                    if adding { "add" } else { "in place" },
+                    incremental.as_secs_f64() * 1000.0,
+                    full_time.as_secs_f64() * 1000.0,
+                    100.0 - 100.0 * incremental.as_secs_f64() / full_time.as_secs_f64(),
+                    fresh,
+                );
+                assert!(
+                    fresh >= changed,
+                    "changing {changed} records made only {fresh} fresh signatures",
+                );
+            }
+        }
+    }
+
     /// The same split for a *full* sign — `TODO.md` #65.
     ///
     /// #64e's table is the dynamic-UPDATE path, and two of its six passes
