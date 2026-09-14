@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#63**, **#64** and **#21**, as
+**#57**, **#58**, **#59**, **#63**, **#64**, **#65** and **#21**, as
 of 2026-09-14.
 **#61 closed the day it was filed**: the reload is 3.76x faster and holds
 68 MB less per million rules, and rayon was measured and declined.
@@ -70,6 +70,13 @@ address is now a number — 31% to build and free the carry-forward index, 24%
 to probe it and `Layout` once per RRset — and it is the two maps keyed by a
 name, not the chain and not the crypto. 64b, 64c and 64e are what is left, and
 none of them names a remedy yet.
+**#65 came out of asking 64e's question of the load path**, and the answer
+refuted the reason for asking: the four passes a full sign shares with an
+incremental one cost the same 4.4 s, but a full sign is 27 s and 84% of it is
+two million ECDSA signatures, so a remedy in the structures is capped at 16%
+there. What the measurement found instead is that `ZoneSigning::apply` re-signs
+every zone from scratch at **every** load — a SIGHUP included — and the
+carry-forward that already runs per UPDATE does the same work in 9.4 s.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -881,8 +888,9 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59**, **#63** and **#64**, plus **#21** — see "What is
-open" above, which is the same list and the only place it is written down.
+**#57**, **#58**, **#59**, **#63**, **#64** and **#65**, plus **#21** — see
+"What is open" above, which is the same list and the only place it is written
+down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
 numbers are stable identifiers referenced from the code, so they move rather
 than being renumbered.
@@ -2023,6 +2031,13 @@ it is one every twelve** (64d).
   about the crypto — and #40's rule applies to it, since what decides a key's
   shape is what each probe has in hand.
 
+  **Half of that is this row's and half is not, and #65 is the half that is
+  not.** `PreviousSignatures` is built by `sign_zone_incrementally` alone,
+  which reaches only the UPDATE path; the four passes around it are
+  `sign_zone_inner`'s and a full sign pays them too, at the same 4.4 s. Filing
+  the shared half here would schedule load-path work against an UPDATE's
+  measurement.
+
 **What 64c would actually cost, since "add a WAL" is the wrong description.**
 The journal is already where a write-ahead log sits — `zones.rs` writes it
 before installing, under one guard, and `persist::write_atomically_str` fsyncs
@@ -2046,6 +2061,89 @@ this tree's own numbers — at 1M records, parsing text was ~25% of a load and
 building the index ~73%. A format that hands back records still to be indexed
 buys the 25%. The post-#61 breakdown has not been taken, so that share today is
 unknown, and taking it is the thing that would reopen this.
+
+---
+
+### 65. Every load re-signs every zone from scratch — **filed 2026-09-14**
+
+Filed out of 64e, which measured the dynamic-UPDATE path and could not speak
+for this one. Two of 64e's six passes — building the carry-forward index and
+freeing it — exist only on the UPDATE path: `sign_zone_incrementally` has one
+non-test caller, `ZoneSigning::sign_one_incrementally` (`rdnsd/src/zones.rs`),
+whose own doc says it is "the dynamic-UPDATE path, not the load path". The
+other four are `sign_zone_inner`'s, and `sign_zone` pays them too.
+
+`zone_signer::tests::full_sign_cost_by_pass`, the same split with
+`previous: None`:
+
+```sh
+cargo test -p rdns --release full_sign_cost -- --ignored --nocapture
+```
+
+| records | full | carry-over | layout | nsec-chain | sign-everything | build-rrsets | sign-rrsets | file-sigs |
+|---|---|---|---|---|---|---|---|---|
+| 10 000 | 249.6 ms | 5.0 | 3.3 | 8.3 | 231.8 | 5.4 | 223.0 | 3.4 |
+| 100 000 | 2 547.5 ms | 64.0 | 39.8 | 107.0 | 2 418.3 | 79.7 | 2 299.5 | 39.1 |
+| **1 000 000** | **27 140 ms** | **1 131** | **520** | **1 437** | **24 218** | **885** | **22 919** | **414** |
+
+Three warm runs on the development machine, Windows, discarding the first
+after a rebuild; the 1M total spans 27.1-28.4 s, 4.5%. It reproduces #44c's
+28 s and 64d's 26.9 s for a third time, by a third route.
+
+**The sentence that would make this row wrong** (§19), written down first:
+*"the shared passes are the thing to fix, so this is 64e's remedy with a wider
+scope."* **It is false, and the table is why.** The signing loop is **84%** of
+a full sign and here it really is the crypto — two million ECDSA signatures
+against the four an incremental sign makes. The five passes outside it are
+**4.4 s, 16%**, and that is the ceiling on any remedy in the structures. Making
+them free would leave 23 s.
+
+What the two tables do say together is that those five passes cost **the same
+4.4-4.5 s either way** — 48% of 64e's 9.4 s incremental sign and 16% of this
+one. Same code, same zone, same absolute cost; only the denominator moves.
+
+- **65a. The bigger question the measurement turned up is not a pass at all.**
+  `ZoneSigning::apply` signs **every zone, unconditionally, at every load** —
+  no check of whether the zone moved and none of whether its signatures are
+  still fresh. There is a precedent for asking: `SigningRun` exists so #53 can
+  skip *verification* for a zone this process just signed with the same keys.
+  Nothing analogous exists for signing.
+
+  And a load is not only startup. `Reloading::load_blocking` (`rdnsd/src/main.rs`)
+  calls `apply` too, so a SIGHUP, an `rdnsctl reload` or a catalog change costs
+  a full sign of every signed zone — 27 s at a million records. It is on
+  `spawn_blocking` and the old zones keep serving, so this is latency to effect
+  rather than an outage.
+
+  **The reason the code states, and the answer to it** (§19).
+  `sign_one_incrementally`'s doc says "At load there is no previous version to
+  carry forward from and `ZoneSigning::apply` is the right call." That is true
+  at startup and not at a reload, where the served `ZoneMap` is exactly such a
+  version — and the measured difference is 9.4 s against 27.1 s at a million
+  records, the same carry-forward that already runs per UPDATE.
+
+  **The prerequisite, which is why this is a row and not a fix.** `Reloading`
+  holds `secondaries`, `zone_dir`, `signing`, `validator` and `proved` — not
+  the served zones. `ZoneMap::snapshot` exists for "a caller that cannot finish
+  under the lock" (#64a) and is the shape, but nothing hands it down today.
+
+- **65b. And whether carrying forward at a reload is *safe* is unanswered**,
+  which is why no remedy is named (§18). `PreviousSignatures::reuse` refuses a
+  signature only once `expiration <= signed_at` — already expired, not close to
+  it. A zone reloaded often enough would therefore keep its signatures until
+  they lapse rather than being refreshed a third of the way through the
+  validity, which is `resign_after`'s whole job. So the question is not "can a
+  reload carry forward" but "which runs are allowed to", and the answer has to
+  leave the re-signing tick refreshing. Nobody has asked it.
+
+  The measurement that would let somebody start: how much of a reload's 27 s a
+  carry-forward actually saves for a zone whose file *did* change, which is the
+  ordinary reason to reload. 64d's `carried` column is the shape of that count,
+  and this one has not been taken.
+
+**Not filed: making the five shared passes cheaper.** 16% of a full sign and
+48% of an incremental one, and 64e already owns the incremental side of it.
+Splitting the same work across two numbers is how both get half-done.
 
 ---
 
