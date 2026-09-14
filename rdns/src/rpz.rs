@@ -44,7 +44,6 @@
 use crate::error::{ConfigError, ConfigResult};
 use crate::record_types as rt;
 use crate::resolver::NameserverPolicy;
-use crate::security::prefix_matches;
 use crate::zone::{parse_zone_file_at, Located, NameKind, Zone, ZoneRecord};
 use crate::{Name, NameRef, ParsedRecord, Qtype, ResourceRecord, Serial};
 use std::collections::HashSet;
@@ -189,8 +188,8 @@ impl PolicyOverride {
 /// accident.
 const SPECIAL_LABELS: [&[u8]; 4] = [b"rpz-client-ip", b"rpz-ip", b"rpz-nsdname", b"rpz-nsip"];
 
-/// One address rule: the prefix it covers, and the owner name whose RRset is
-/// the action.
+/// One address rule as it parses: the prefix it covers, and the owner name
+/// whose RRset is the action.
 #[derive(Debug, Clone)]
 struct IpTrigger {
     addr: IpAddr,
@@ -198,15 +197,167 @@ struct IpTrigger {
     owner: Name,
 }
 
+/// A run of addresses one rule owns, the address widened to `u128` for both
+/// families.
+///
+/// One width rather than a `u32` table beside a `u128` one: it measured
+/// *faster* for v4 as well — 9.5 ns against 14.7 at 50 000 rules — and a
+/// second code path here is where the two would drift (§7).
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    lo: u128,
+    hi: u128,
+    /// Into [`IpIndex::owners`]. `usize` costs nothing a `u32` would save:
+    /// the struct is 16-aligned either way.
+    owner: usize,
+}
+
+/// The address triggers of one kind, indexed for longest-prefix match.
+///
+/// Overlapping rules are flattened once, at index time, into disjoint spans in
+/// address order with the winning rule already chosen, so a query is one
+/// binary search. It was a scan of every rule, under a comment calling these
+/// lists "tens of entries": nothing enforced that, and an IP blocklist
+/// delivered as RPZ is all `rpz-ip`. On the miss path every ordinary query
+/// pays, 50 000 rules cost the scan 144.6 µs and cost this 7 ns — against
+/// 522 ns for a whole answer (`TODO.md` #62a).
+#[derive(Debug, Default)]
+struct IpIndex {
+    /// The families never mix, as in [`crate::security::TransferAcl`]: a v4
+    /// rule must not match a v4-mapped v6 peer. Two tables is how that holds
+    /// without a comparison to forget.
+    v4: Vec<Span>,
+    v6: Vec<Span>,
+    /// One entry per rule, so its length is the trigger count the banner
+    /// wants; the spans are more numerous, since nesting splits them.
+    owners: Vec<Name>,
+}
+
+impl IpIndex {
+    fn new(rules: Vec<IpTrigger>) -> IpIndex {
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        let mut owners = Vec::with_capacity(rules.len());
+        for rule in rules {
+            let (bits, addr, table) = match rule.addr {
+                IpAddr::V4(a) => (32u8, u128::from(u32::from(a)), &mut v4),
+                IpAddr::V6(a) => (128u8, u128::from(a), &mut v6),
+            };
+            // The host bits the prefix leaves free. Saturating because a
+            // prefix longer than its family's address is not a rule —
+            // `parse_ip_trigger` refuses one — and if one arrived anyway it
+            // must cover a single address rather than all of them.
+            let free = match bits.saturating_sub(rule.prefix) {
+                0 => 0,
+                // `1 << 128` is not representable, which is why the mask is
+                // shifted down rather than built up.
+                free => u128::MAX >> (128 - u32::from(free)),
+            };
+            let lo = addr & !free;
+            table.push(Span {
+                lo,
+                hi: lo | free,
+                owner: owners.len(),
+            });
+            owners.push(rule.owner);
+        }
+        IpIndex {
+            v4: flatten(v4),
+            v6: flatten(v6),
+            owners,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.owners.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.owners.len()
+    }
+
+    /// The owner name of the longest prefix covering `addr`, if any covers it.
+    fn owner_of(&self, addr: IpAddr) -> Option<NameRef<'_>> {
+        let (table, addr) = match addr {
+            IpAddr::V4(a) => (&self.v4, u128::from(u32::from(a))),
+            IpAddr::V6(a) => (&self.v6, u128::from(a)),
+        };
+        // The spans are disjoint and sorted, so the last one starting at or
+        // below the address is the only one that can hold it.
+        let span = table.get(table.partition_point(|s| s.lo <= addr).checked_sub(1)?)?;
+        (addr <= span.hi).then(|| self.owners[span.owner].as_ref())
+    }
+}
+
+/// Flatten overlapping rules into disjoint spans in address order, each
+/// carrying the rule that wins it: the longest prefix, and at equal prefixes
+/// the one that came first in the zone — which is what the scan this replaced
+/// gave, by sorting on the prefix with a stable sort and taking the first hit.
+///
+/// A stack sweep, because prefixes nest: two of them are either disjoint or
+/// one contains the other, so the innermost rule still open is always the most
+/// specific one covering the cursor.
+fn flatten(mut spans: Vec<Span>) -> Vec<Span> {
+    // A containing span sorts before what it contains, and of two identical
+    // ranges the *later* rule is pushed first so the earlier one ends on top.
+    spans.sort_by(|a, b| {
+        a.lo.cmp(&b.lo)
+            .then(b.hi.cmp(&a.hi))
+            .then(b.owner.cmp(&a.owner))
+    });
+
+    let mut out: Vec<Span> = Vec::new();
+    let mut open: Vec<Span> = Vec::new();
+    let mut cursor = 0u128;
+    // Adjacent runs of one rule are one span: a /24 split by a /32 inside it
+    // is two pieces, not three hundred.
+    let emit = |out: &mut Vec<Span>, lo, hi, owner| match out.last_mut() {
+        Some(last) if last.owner == owner && last.hi.wrapping_add(1) == lo => last.hi = hi,
+        _ => out.push(Span { lo, hi, owner }),
+    };
+
+    for span in spans {
+        while let Some(top) = open.last().copied() {
+            if top.hi >= span.lo {
+                break;
+            }
+            if cursor <= top.hi {
+                emit(&mut out, cursor, top.hi, top.owner);
+                cursor = top.hi + 1;
+            }
+            open.pop();
+        }
+        if cursor < span.lo {
+            if let Some(top) = open.last() {
+                emit(&mut out, cursor, span.lo - 1, top.owner);
+            }
+            cursor = span.lo;
+        }
+        open.push(span);
+    }
+    while let Some(top) = open.pop() {
+        if cursor <= top.hi {
+            emit(&mut out, cursor, top.hi, top.owner);
+            // A rule reaching the end of the space leaves nowhere to advance
+            // to, and `+ 1` there would wrap into the bottom of it.
+            if top.hi == u128::MAX {
+                break;
+            }
+            cursor = top.hi + 1;
+        }
+    }
+    out.shrink_to_fit();
+    out
+}
+
 /// One policy zone, indexed for the three questions a query asks of it.
 #[derive(Debug)]
 pub struct PolicyZone {
     zone: Zone,
     policy: PolicyOverride,
-    /// Longest prefix first, so the first match is the most specific one.
-    client_ip: Vec<IpTrigger>,
-    response_ip: Vec<IpTrigger>,
-    ns_ip: Vec<IpTrigger>,
+    client_ip: IpIndex,
+    response_ip: IpIndex,
+    ns_ip: IpIndex,
     /// `rpz-nsdname.<origin>`, the parent of every NSDNAME trigger name, built
     /// once rather than per delegation.
     nsdname_root: Name,
@@ -287,12 +438,9 @@ impl PolicyZone {
                 _ => response_ip.push(trigger),
             }
         }
-        // Longest prefix wins, which a linear scan gives once the list is in
-        // that order. These lists are tens of entries: a feed's bulk is QNAME
-        // triggers, and those the zone's own index answers.
-        client_ip.sort_by_key(|rule| std::cmp::Reverse(rule.prefix));
-        response_ip.sort_by_key(|rule| std::cmp::Reverse(rule.prefix));
-        ns_ip.sort_by_key(|rule| std::cmp::Reverse(rule.prefix));
+        let client_ip = IpIndex::new(client_ip);
+        let response_ip = IpIndex::new(response_ip);
+        let ns_ip = IpIndex::new(ns_ip);
 
         let nsdname_root = Name::prefixed(b"rpz-nsdname", origin).map_err(|e| {
             ConfigError::new(format!(
@@ -393,13 +541,13 @@ impl PolicyZone {
 
     fn ip_action(
         &self,
-        rules: &[IpTrigger],
+        rules: &IpIndex,
         addr: IpAddr,
         qname: NameRef<'_>,
         qtype: Qtype,
     ) -> Option<Action> {
-        let rule = rules.iter().find(|rule| rule.matches(addr))?;
-        self.action_at(rule.owner.as_ref(), qname, qtype)
+        let owner = rules.owner_of(addr)?;
+        self.action_at(owner, qname, qtype)
     }
 
     /// The RRset at `trigger` read as an action, with this zone's policy
@@ -503,22 +651,6 @@ fn policy_verb(target: NameRef<'_>) -> Option<Action> {
         return Some(Action::TcpOnly);
     }
     None
-}
-
-impl IpTrigger {
-    fn matches(&self, addr: IpAddr) -> bool {
-        match (self.addr, addr) {
-            (IpAddr::V4(rule), IpAddr::V4(peer)) => {
-                prefix_matches(&rule.octets(), &peer.octets(), self.prefix)
-            }
-            (IpAddr::V6(rule), IpAddr::V6(peer)) => {
-                prefix_matches(&rule.octets(), &peer.octets(), self.prefix)
-            }
-            // Families do not mix, as in `security::TransferAcl`: a v4 rule
-            // must not match a v4-mapped v6 address.
-            _ => false,
-        }
-    }
 }
 
 /// `[prefix, part, part, ...]` — the labels of an address trigger, most
@@ -977,6 +1109,74 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
         );
     }
 
+    /// Answering a query must not cost more because the feed is bigger.
+    ///
+    /// A ratio, not a wall-clock floor (`CLAUDE.md` §10): ten times the rules
+    /// must not cost ten times the lookup. The scan this replaced was linear
+    /// in them — 2.81 µs at 1 000 rules, 28.1 µs at 10 000 and 144.6 µs at
+    /// 50 000 in release, on the miss path every ordinary query pays — and
+    /// fails this by an order of magnitude, where the flattened index reads
+    /// 5, 7 and 7 ns (`TODO.md` #62a).
+    #[test]
+    fn a_query_costs_the_same_however_many_address_rules_the_feed_holds() {
+        fn feed(rules: usize) -> String {
+            let mut text = String::from(
+                "$TTL 60\n\
+                 @ IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. 1 3600 600 86400 60\n\
+                 @ IN NS localhost.\n",
+            );
+            for i in 0..rules {
+                let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
+                text.push_str(&format!("32.{c}.{b}.{a}.10.rpz-client-ip IN CNAME .\n"));
+            }
+            text
+        }
+        fn per_lookup(rules: usize) -> std::time::Duration {
+            let zone = parse_zone_file(&feed(rules), ORIGIN).expect("parses");
+            let indexed = PolicyZone::new(zone, PolicyOverride::Given).expect("indexes");
+            assert_eq!(
+                indexed.trigger_counts()[1],
+                rules,
+                "every rule is a trigger"
+            );
+
+            // Addresses no rule covers. The miss is the case to measure: a hit
+            // stops at whichever rule matched, so a scan looks fast whenever
+            // the answer is near the front of it.
+            let miss: Vec<IpAddr> = (0..64)
+                .map(|i| IpAddr::V4(Ipv4Addr::new(203, 0, 113, i)))
+                .collect();
+            let qname = nm("www.example.com.");
+            let qtype = Qtype::of(rt::A);
+            let reps = 200;
+
+            let mut matched = 0usize;
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                for addr in &miss {
+                    let addr = std::hint::black_box(*addr);
+                    if indexed.client_action(addr, qname.as_ref(), qtype).is_some() {
+                        matched += 1;
+                    }
+                }
+            }
+            let took = start.elapsed();
+            assert_eq!(matched, 0, "203.0.113.0/24 is not in the feed");
+            took / (reps * miss.len()) as u32
+        }
+
+        let small = per_lookup(1_000);
+        let large = per_lookup(10_000);
+        // `--nocapture` is how the two figures are read; the assertion is the
+        // ratio, which is the part that does not depend on the machine.
+        println!("client-IP lookup: {small:?} at 1k rules, {large:?} at 10k");
+        assert!(
+            large < small * 4,
+            "ten times the rules must not cost ten times the lookup: \
+             {small:?} at 1k against {large:?} at 10k"
+        );
+    }
+
     fn policy_zones(policy: PolicyOverride) -> PolicyZones {
         let zone = parse_zone_file(POLICY, ORIGIN).expect("the policy zone parses");
         PolicyZones {
@@ -1145,6 +1345,46 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
             Some(Action::Passthru),
             "/32 is more specific than the /8 it sits inside"
         );
+    }
+
+    /// A rule covering the whole address space is legal, and `::/0` is the
+    /// edge the flattening arithmetic has to survive: its span ends at
+    /// `u128::MAX`, where advancing past the last span would wrap to the
+    /// bottom of the space instead.
+    #[test]
+    fn a_rule_covering_every_address_still_yields_to_a_longer_prefix() {
+        const EVERYTHING: &str = "\
+$TTL 60
+@                            IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. 1 3600 600 86400 60
+@                            IN NS  localhost.
+0.0.0.0.0.rpz-client-ip      IN CNAME .
+32.1.0.0.127.rpz-client-ip   IN CNAME rpz-passthru.
+0.zz.rpz-client-ip           IN CNAME .
+64.zz.db8.2001.rpz-client-ip IN CNAME rpz-passthru.
+";
+        let zone = parse_zone_file(EVERYTHING, ORIGIN).expect("the policy zone parses");
+        let zones = PolicyZones {
+            zones: vec![PolicyZone::new(zone, PolicyOverride::Given).expect("it indexes")],
+        };
+        let action = |addr: IpAddr| {
+            zones
+                .before_query(addr, nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .map(|r| r.action)
+        };
+        for (addr, want) in [
+            (IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), Action::Nxdomain),
+            (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), Action::Passthru),
+            (
+                IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 1)),
+                Action::Nxdomain,
+            ),
+            (
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                Action::Passthru,
+            ),
+        ] {
+            assert_eq!(action(addr), Some(want.clone()), "{addr} is {want:?}");
+        }
     }
 
     /// A v4 rule must not match a v4-mapped v6 client, which would be a way

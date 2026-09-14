@@ -40,9 +40,11 @@ every *measurement* and every caveat needed to trust one; those say
 **#57**, **#58**, **#59**, **#60**, **#62** and **#21**, as of 2026-09-14.
 **#61 closed the day it was filed**: the reload is 3.76x faster and holds
 68 MB less per million rules, and rayon was measured and declined. Of #62,
-62b closed with it; **62a is the one that matters and is still open**, because
-it is on the answer path and nothing here has measured what should replace a
-linear scan for longest-prefix match.
+62a and 62b are closed and **62c is what is left** — a top-level `$ORIGIN`
+reindexing the whole zone, which is a startup hang rather than a query cost.
+62a was the one on the answer path: a 50 000-rule feed cost 144.6 us a query
+and costs 7 ns, and the structure the row would have named had it named one
+was measurably the wrong structure.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -843,7 +845,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59** and **#60**, plus
+**#57**, **#58**, **#59**, **#60** and **62c**, plus
 **#21** — see "What is open" above,
 which is the same list and the only place it is written down. Every closed section lives in
 `docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
@@ -1433,7 +1435,7 @@ is *worse*: reserve plus a hand-rolled Fx is 599 ms against reserve alone at
 
 ---
 
-### 62. Three unbounded-input traps behind an assumption nothing enforces — **filed 2026-09-14, 62b closed, 62a and 62c open**
+### 62. Three unbounded-input traps behind an assumption nothing enforces — **filed 2026-09-14, 62a and 62b closed, 62c open**
 
 Found while measuring #61, none of them the thing being looked for. The shape is
 one: a loop written under a stated belief about how big its input is, with
@@ -1443,7 +1445,8 @@ exactly the large ones — so "the operator would not do that" is not the
 reassurance it is elsewhere. `CLAUDE.md` §5's "count the multipliers, and time
 the worst case rather than reading the loop".
 
-- **62a. A per-query linear scan for longest-prefix match.** The worst of the
+- ~~**62a. A per-query linear scan for longest-prefix match.**~~ **Done.**
+  The worst of the
   three, because it is on the answer path. `PolicyZone`'s `client_ip`,
   `response_ip` and `ns_ip` are sorted `Vec`s scanned end to end per query, under
   a comment that says why: *"Longest prefix wins, which a linear scan gives once
@@ -1453,9 +1456,53 @@ the worst case rather than reading the loop".
   pays: **131 ns at 10 rules, 3.00 us at 1 000, 32.1 us at 10 000, 204.6 us at
   50 000** — linear at ~4 ns a rule. `benches/answer_path.rs` reads 522 ns for a
   whole answer and 3.6-4.1 us for one `sendto`+`recvfrom` pair, so at 50k rules
-  the policy scan is ~400x a whole answer. No remedy filed: longest-prefix match
-  wants a different structure, and which one has not been measured here (§18 —
-  a row naming a wrong remedy is worse than one naming none).
+  the policy scan is ~400x a whole answer. ~~No remedy filed: longest-prefix
+  match wants a different structure, and which one has not been measured here
+  (§18 — a row naming a wrong remedy is worse than one naming none).~~ **Three
+  shapes were built and measured before one was kept** (§19), which is what the
+  row was waiting for.
+
+  What landed is `rpz::IpIndex`: the rules are flattened once, at index time,
+  into **disjoint address spans in address order with the winning rule already
+  chosen**, so a query is one binary search. Re-measured in release through
+  `PolicyZone::client_action` on the same miss path, one harness, one machine —
+  **scan 29 ns / 2.81 us / 28.1 us / 144.6 us** against **index 2 / 5 / 7 / 7 ns**
+  at 10 / 1 000 / 10 000 / 50 000 rules. 20 000x at 50k, flat from 10k on, and
+  not slower on the ten-rule feed the old comment assumed.
+
+  **The shape the row would have named was the wrong one.** A hash map per
+  prefix length, probed longest first, is the obvious answer and is what a
+  guess would have filed; the measurement that could refute it (§19) is a feed
+  using every prefix length, which is legal and which nothing enforces either.
+  It reads 10-13 ns on a feed of host rules and 57-60 ns on five lengths, but
+  **1.9-2.3 us when all 129 v6 lengths are present** — it moves the unbounded
+  multiplier from the rule count to the prefix-length count rather than
+  removing it. The span table is 5.7-8.8 ns on that same feed. A trie was not
+  built: its bound is 32 or 128 pointer chases, and the span table is already
+  under 2% of a 522 ns answer, so there is nothing left for one to win.
+
+  Two smaller things the building decided, neither of them arguable beforehand.
+  v4 is widened into the same `u128` arithmetic rather than given a `u32` table
+  of its own — measured **faster** that way (9.5 ns against 14.7 at 50k) as well
+  as being one code path instead of two to drift (§7). And the memory is the
+  price: a span is 48 bytes against the 18 the `(IpAddr, u8)` pair took, spans
+  equal the rule count for a feed of host rules and reached **1.4x** it where
+  prefixes nest, so 50 000 rules cost ~1.5 MB more and ~2.9 MB more in the worst
+  shape measured.
+
+  The guard is a ratio, not a wall-clock floor (§10):
+  `a_query_costs_the_same_however_many_address_rules_the_feed_holds`. Verified
+  failing against the scan at exactly **10.0x** — 14.8 us at 1k against 148.2 us
+  at 10k, in debug — and passing at ~1.4x. A `::/0` rule is a test of its own,
+  because that span ends at `u128::MAX` and advancing past the last one would
+  wrap to the bottom of the space.
+
+  `security::prefix_matches` is private again: `rpz` shared it while its
+  triggers were a list scanned per query, and turns each prefix into a range at
+  load instead. **`TransferAcl` still scans and is left alone deliberately** —
+  every one of its lists comes from `--allow-transfer`, `--query-rate-exempt`,
+  `--rpz-notify-from` or their config equivalents, so it is bounded by what an
+  operator typed, which is the enforcement #62's other two items lack.
 - ~~**62b. `PolicyZone::new` de-duplicates trigger owners quadratically.**~~
   **Done.**
   `seen: Vec<Name>` probed with `seen.iter().any(...)` per record landing in a

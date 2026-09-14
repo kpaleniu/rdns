@@ -486,10 +486,10 @@ impl AclRule {
 
 /// Whether the first `prefix` bits of two addresses agree.
 ///
-/// `pub(crate)` for [`crate::rpz`], whose IP triggers are the same
-/// longest-prefix question asked of an answer rather than of a peer
-/// (`CLAUDE.md` §7).
-pub(crate) fn prefix_matches(rule: &[u8], peer: &[u8], prefix: u8) -> bool {
+/// Private again since `TODO.md` #62a: [`crate::rpz`] shared this while its IP
+/// triggers were a list scanned per query, and now turns each prefix into a
+/// range once at load instead — a different question, asked of a table.
+fn prefix_matches(rule: &[u8], peer: &[u8], prefix: u8) -> bool {
     let whole_bytes = (prefix / 8) as usize;
     if rule[..whole_bytes] != peer[..whole_bytes] {
         return false;
