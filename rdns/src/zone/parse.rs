@@ -275,18 +275,27 @@ fn parse_zone_file_with_base(
         ttl: Ttl::from_secs(3600),
         owner: None,
     };
-    parse_into(&mut zone, content, &mut state, base_dir, 0)?;
+    let mut moved_apex = None;
+    parse_into(&mut zone, content, &mut state, base_dir, 0, &mut moved_apex)?;
+    // The one rebuild a file with a mid-zone `$ORIGIN` owes, paid once.
+    if let Some(apex) = moved_apex {
+        zone.set_origin(apex);
+    }
     check_cname_exclusivity(&zone)?;
     check_dname_rules(&zone)?;
     Ok(zone)
 }
 
+/// `moved_apex` is the last top-level `$ORIGIN` that arrived after a record,
+/// which the caller owes [`Zone::set_origin`] once the file is read. Only
+/// `depth == 0` ever writes it; an `$INCLUDE` cannot move the apex.
 fn parse_into(
     zone: &mut Zone,
     content: &str,
     state: &mut ParseState,
     base_dir: Option<&Path>,
     depth: usize,
+    moved_apex: &mut Option<Name>,
 ) -> Result<(), ZoneError> {
     let lines = logical_lines(content)?;
     // An upper bound on the records this file adds, and the only cheap one
@@ -308,7 +317,20 @@ fn parse_into(
                 // Only the top-level file may move the apex: RFC 1035 §5.1 keeps
                 // an include's origin to the included file.
                 if depth == 0 {
-                    zone.set_origin(state.origin.clone());
+                    if zone.records().is_empty() {
+                        // Where a zone file's `$ORIGIN` usually is, and the
+                        // rebuild is over nothing: take it now and owe nothing.
+                        zone.set_origin(state.origin.clone());
+                        *moved_apex = None;
+                    } else {
+                        // `set_origin` rebuilds the index over every record so
+                        // far, so one `$ORIGIN` per section was
+                        // O(sections x records) — 13.6 s for 16 000 records
+                        // with one before each (`TODO.md` #62c). Only the last
+                        // decides the apex and the rebuild is a clean sweep, so
+                        // the caller does it once at the end instead.
+                        *moved_apex = Some(state.origin.clone());
+                    }
                 }
             }
             continue;
@@ -353,7 +375,14 @@ fn parse_into(
                 ttl: state.ttl,
                 owner: None,
             };
-            parse_into(zone, &included, &mut inner, path.parent(), depth + 1)?;
+            parse_into(
+                zone,
+                &included,
+                &mut inner,
+                path.parent(),
+                depth + 1,
+                moved_apex,
+            )?;
             continue;
         }
 

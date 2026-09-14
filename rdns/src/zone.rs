@@ -156,7 +156,7 @@ pub struct Zone {
 /// Stale in the false direction each one serves a wrong answer: no wildcard
 /// synthesis, no referral — which answers authoritatively for a child's names,
 /// the defect `CLAUDE.md` §8 opens with — and no redirection.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Shortcuts {
     /// Any record owned by a wildcard name. 23% of a miss in a 10k-record zone
     /// with no wildcards.
@@ -297,6 +297,10 @@ impl Zone {
     /// thing before and after. What the reindex rebuilds is the bookkeeping that
     /// is *about* the apex — an NS RRset at the old apex becomes a zone cut
     /// under the new one.
+    ///
+    /// **Costs a pass over every record already loaded**, so a loader that moves
+    /// the apex while filling a zone moves it once, at one end or the other, and
+    /// not per `$ORIGIN` line (`TODO.md` #62c).
     pub fn set_origin(&mut self, origin: Name) {
         self.origin = origin;
         self.reindex();
@@ -785,23 +789,12 @@ impl Zone {
             self.file(key.into_boxed_slice(), position);
         }
 
-        // The chains are keyed by the absolute name too, so moving the origin
-        // moves them.
-        let chain_keys: Vec<Option<ChainKey>> =
-            self.records.iter().map(|r| self.chain_key(r)).collect();
-        self.nsec_chain.clear();
-        self.nsec3_chain.clear();
-        for (position, key) in chain_keys.into_iter().enumerate() {
-            match key {
-                Some(ChainKey::Nsec(k)) => {
-                    self.nsec_chain.insert(k, position);
-                }
-                Some(ChainKey::Nsec3(k)) => {
-                    self.nsec3_chain.insert(k, position);
-                }
-                None => {}
-            }
-        }
+        // The chains are not rebuilt. [`Zone::chain_key`] reads the record's own
+        // owner name and nothing else, and a `Name` is absolute, so every key
+        // and every position is the one already filed: the rebuild here was a
+        // base32 decode per NSEC3 and an n-element `Vec` to arrive at the map
+        // it started from. Its comment said the chains move with the origin
+        // (`CLAUDE.md` §4 — a claim to verify).
     }
 
     /// Whether `record_name` answers `query_name`, wildcards included. The
@@ -1660,6 +1653,115 @@ deep.a.b IN TXT \"x\"
         assert!(zone
             .query(nm("www.other.test.").as_ref(), Qtype::of(rt::A))
             .is_empty());
+    }
+
+    /// The index as a sorted list, for comparing two zones that must be one
+    /// zone. `Slot` is three shapes for one answer, so it is the answer that is
+    /// compared.
+    fn index_of(zone: &Zone) -> Vec<(Vec<u8>, Vec<usize>)> {
+        let mut out: Vec<(Vec<u8>, Vec<usize>)> = zone
+            .index
+            .iter()
+            .map(|(key, slot)| (key.to_vec(), zone.positions(slot).to_vec()))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A top-level `$ORIGIN` after a record leaves the zone that setting the
+    /// apex first would have built — the bookkeeping that is *about* the apex
+    /// included, not merely the records.
+    ///
+    /// The parser reindexed per `$ORIGIN` and now owes one rebuild at the end
+    /// (`TODO.md` #62c), so this is what "the same zone" has to mean. The
+    /// records here are the three things the apex decides: an NS RRset that is
+    /// a delegation under one apex and the apex's own under the other, a
+    /// wildcard, and a name whose ancestors become empty non-terminals only for
+    /// an apex above them.
+    #[test]
+    fn a_late_origin_leaves_the_zone_setting_the_apex_first_would_have() {
+        let text = "ns1.old.test. IN A 192.0.2.1\n\
+                    sub.deep.old.test. IN A 192.0.2.2\n\
+                    *.wild.old.test. IN A 192.0.2.3\n\
+                    child.old.test. IN NS ns1.old.test.\n\
+                    $ORIGIN old.test.\n\
+                    @ IN NS ns1\n\
+                    host IN A 192.0.2.4\n";
+        let parsed = parse_zone_file(text, "example.com.").unwrap();
+        assert_eq!(parsed.origin(), nm("old.test.").as_ref());
+
+        let mut direct = Zone::new(nm("old.test."));
+        for record in parsed.records() {
+            direct.add_record(record.clone());
+        }
+
+        assert_eq!(index_of(&parsed), index_of(&direct), "the same index");
+        assert_eq!(parsed.shortcuts, direct.shortcuts, "the same shortcuts");
+        assert_eq!(
+            parsed.name_kind(nm("deep.old.test.").as_ref()),
+            NameKind::EmptyNonTerminal,
+            "an ancestor inside the new apex is a node of the zone"
+        );
+        assert!(
+            parsed
+                .delegation_for(nm("www.child.old.test.").as_ref())
+                .is_some(),
+            "an NS RRset below the new apex is a zone cut"
+        );
+    }
+
+    /// Moving the apex leaves the denial chains alone: they are keyed by the
+    /// record's own absolute name, which no apex moves (`TODO.md` #62c).
+    #[test]
+    fn set_origin_leaves_the_denial_chains_where_they_are() {
+        let text = "$TTL 3600\n\
+                    @ IN SOA ns1.example.com. admin.example.com. 1 3600 600 86400 3600\n\
+                    @ IN NSEC www.example.com. A SOA RRSIG NSEC\n\
+                    www IN A 192.0.2.1\n\
+                    www IN NSEC example.com. A RRSIG NSEC\n";
+        let mut zone = parse_zone_file(text, "example.com.").unwrap();
+        let covering = |zone: &Zone, name: &str| {
+            zone.nsec_covering(nm(name).as_ref())
+                .map(|r| r.name.clone())
+        };
+        let before = covering(&zone, "mail.example.com.");
+        assert!(before.is_some(), "the chain answers before the move");
+
+        zone.set_origin(nm("com."));
+        assert_eq!(covering(&zone, "mail.example.com."), before);
+        assert!(zone.has_nsec_chain());
+    }
+
+    /// Parsing must not cost more per record because the file has more
+    /// `$ORIGIN` lines.
+    ///
+    /// A ratio, not a wall-clock floor (`CLAUDE.md` §10): doubling a file whose
+    /// every record carries its own `$ORIGIN` must roughly double the work.
+    /// `set_origin` rebuilds the index over every record so far, so calling it
+    /// per line was O(sections x records) — 3.81 s at 8 000 records and 13.64 s
+    /// at 16 000 in release, ~4x per doubling — and fails this at 3x with room
+    /// to spare. Deferring the move to one rebuild reads ~2x.
+    #[test]
+    fn parsing_does_not_cost_more_per_record_when_every_record_moves_the_origin() {
+        fn parse(records: usize) -> std::time::Duration {
+            let mut text = String::from("$TTL 3600\n");
+            for i in 0..records {
+                text.push_str(&format!("$ORIGIN s{i}.example.com.\nhost IN A 192.0.2.1\n"));
+            }
+            let start = std::time::Instant::now();
+            let zone = parse_zone_file(&text, "example.com.").expect("parses");
+            let took = start.elapsed();
+            assert_eq!(zone.records().len(), records);
+            took
+        }
+
+        let small = parse(1_000);
+        let large = parse(2_000);
+        assert!(
+            large < small * 3,
+            "twice the records must not cost four times the work: \
+             {small:?} at 1k against {large:?} at 2k"
+        );
     }
 
     /// `set_origin` moves the apex and nothing else. It re-keyed records while

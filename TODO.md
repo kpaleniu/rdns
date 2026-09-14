@@ -37,15 +37,18 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#62**, **#63**, **#64** and **#21**, as
+**#57**, **#58**, **#59**, **#63**, **#64** and **#21**, as
 of 2026-09-14.
 **#61 closed the day it was filed**: the reload is 3.76x faster and holds
-68 MB less per million rules, and rayon was measured and declined. Of #62,
-62a and 62b are closed and **62c is what is left** — a top-level `$ORIGIN`
-reindexing the whole zone, which is a startup hang rather than a query cost.
-62a was the one on the answer path: a 50 000-rule feed cost 144.6 us a query
-and costs 7 ns, and the structure the row would have named had it named one
-was measurably the wrong structure.
+68 MB less per million rules, and rayon was measured and declined.
+**#62 closed the day after it was filed**, all three rows. 62a was the one on
+the answer path: a 50 000-rule feed cost 144.6 us a query and costs 7 ns, and
+the structure the row would have named had it named one was measurably the wrong
+structure. 62c was the startup hang — a top-level
+`$ORIGIN` per section reindexed the whole zone, 13.64 s for 16 000 records with
+one before each and 12.0 ms now — and it found a second cost nobody had filed:
+`reindex` rebuilt the denial chains under a comment claiming they move with the
+apex, which they do not.
 **#63 was filed out of 57d** and is the prerequisite 57d had been naming in
 prose: `rdnsr` has no config file, so there is nowhere to write a per-zone
 anything. It does not wait on 57d — `--rpz-policy` has wanted the same file
@@ -872,11 +875,11 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59**, **#60**, **62c**, **#63** and **#64**, plus
-**#21** — see "What is open" above,
-which is the same list and the only place it is written down. Every closed section lives in
-`docs/CLOSED_WORK.md` under its own number; the numbers are stable identifiers
-referenced from the code, so they move rather than being renumbered.
+**#57**, **#58**, **#59**, **#63** and **#64**, plus **#21** — see "What is
+open" above, which is the same list and the only place it is written down.
+Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
+numbers are stable identifiers referenced from the code, so they move rather
+than being renumbered.
 
 ### Where to pick up next
 
@@ -1590,7 +1593,7 @@ is *worse*: reserve plus a hand-rolled Fx is 599 ms against reserve alone at
 
 ---
 
-### 62. Three unbounded-input traps behind an assumption nothing enforces — **filed 2026-09-14, 62a and 62b closed, 62c open**
+### 62. Three unbounded-input traps behind an assumption nothing enforces — **filed and closed 2026-09-14**
 
 Found while measuring #61, none of them the thing being looked for. The shape is
 one: a loop written under a stated belief about how big its input is, with
@@ -1673,7 +1676,8 @@ the worst case rather than reading the loop".
   The regression test is a *ratio*, not a wall-clock floor (§10): doubling the
   rules must not quadruple the work. Verified failing against the scan —
   59.5 ms at 8k against 236.8 at 16k, 4x — and passing at ~2x with the set.
-- **62c. A top-level `$ORIGIN` reindexes the whole zone.** `parse.rs` calls
+- ~~**62c. A top-level `$ORIGIN` reindexes the whole zone.**~~ **Done.**
+  `parse.rs` called
   `Zone::set_origin` for each one and `set_origin` calls `reindex()`, which
   rebuilds the index over every record parsed so far — O(sections x records).
   Measured at 40 000 records: **47.6 ms with one `$ORIGIN`, 104.8 with 16, 306.6
@@ -1683,9 +1687,44 @@ the worst case rather than reading the loop".
   parser, since AXFR assembles records directly — but it is a startup or reload
   hang with nothing alerting, from a file somebody else wrote.
 
-Not measured, stated as a code fact only: `reindex` is also the only caller that
-makes `set_origin` O(n), and whether any caller needs `set_origin` to be cheap
-has not been checked.
+  **Only the last `$ORIGIN` decides the apex, and the rebuild is a clean sweep of
+  the whole zone**, so the parser now does it once: a `$ORIGIN` arriving before
+  any record is taken immediately, where the rebuild is over nothing, and one
+  arriving after a record is remembered and applied when the file ends. A file
+  with a single `$ORIGIN` at the top — which is where one usually is — pays
+  nothing at all, and every other file pays one rebuild.
+
+  Re-measured in release, one harness, before and after. It reads lower
+  throughout than the figures above, which were taken with a heavier generator,
+  so the pairs are what to read and not the halves: 40 000 records
+  **18.9 -> 16.9 ms with one `$ORIGIN`, 46.4 -> 19.0 with 16, 136.4 -> 18.9 with
+  64**; an `$ORIGIN` before every record **167.1 ms -> 1.5 at 2k, 801.7 ms -> 3.1
+  at 4k, 3.81 s -> 6.0 ms at 8k, 13.64 s -> 12.0 ms at 16k** — 1 137x, and 2.0x
+  per doubling where it was ~4x.
+
+  **The chains were the other half, and nothing had opened `chain_key`**
+  (`CLAUDE.md` §4). `reindex` cleared and rebuilt `nsec_chain` and `nsec3_chain`
+  under a comment saying they move with the origin. They do not: a chain key is
+  the record's own owner name, absolute, and a position in `records` — both
+  unchanged by an apex that moves, so the rebuild was a base32 decode per NSEC3
+  and an n-element `Vec` to arrive at the map it started from. Moving the apex of
+  a zone holding 20 000 NSEC records: **7.72 -> 3.80 ms**.
+
+  The guard is a ratio, not a wall-clock floor (§10):
+  `parsing_does_not_cost_more_per_record_when_every_record_moves_the_origin`,
+  verified failing against the old parser at **3.18x** — 404.4 ms at 1k records
+  against 1.284 s at 2k, in debug — and passing at ~2x. Beside it,
+  `a_late_origin_leaves_the_zone_setting_the_apex_first_would_have` is the
+  correctness half: deferring the move must leave the same zone, so it compares
+  the whole index and the shortcuts against the same records added to a zone
+  whose apex was right from the start — an NS RRset that is a delegation under
+  one apex and the apex's own under the other, a wildcard, and a name whose
+  ancestors are empty non-terminals only for an apex above them.
+
+**Answered, where the row said it was not measured:** the only caller that needs
+`set_origin` at all is the zone parser, and it now calls it once. `reindex` is
+still what makes it O(records), and `set_origin`'s doc comment says so, so the
+next caller is told the cost rather than finding it.
 
 ---
 
