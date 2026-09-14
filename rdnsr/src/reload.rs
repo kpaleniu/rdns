@@ -3,10 +3,10 @@
 //!
 //! One task, and everything about its shape is a measurement.
 //!
-//! The reads are blocking and slow — a million-rule QNAME feed is 2.7 s to
-//! re-read and peaks at 1.06 GB while both sets are live, since
+//! The reads are blocking and slow — a million-rule QNAME feed is 0.952 s to
+//! re-read and peaks at 759 MB while both sets are live, since
 //! [`rdns::rpz::PolicyStore::reload`] builds the whole new set before
-//! installing any of it.
+//! installing any of it. The 2x peak is inherent and `TODO.md` #61 says why.
 //! They ran on a tokio worker until `TODO.md` #57b, and `#[tokio::main]` gives
 //! one worker per core: measured on a one-worker runtime, a probe asking for
 //! 1 ms ticks saw a 2.715 s gap, which is a resolver answering nothing for the
@@ -16,6 +16,11 @@
 //!
 //! The task is sequential, so two reloads never overlap: four at once on four
 //! workers stalled every task for 3.53 s and took 4.50 s to do 2.70 s of work.
+//!
+//! **The four figures in the two paragraphs above are #57b's**, taken when a
+//! reload was 2.74 s; #61 made one shorter and the probe has not been re-run,
+//! so they are the shape rather than today's clock. Only the first paragraph's
+//! numbers, which are a cost and not a stall, are current.
 //! And [`PolicyReload`]'s single permit collapses a burst of requests into one
 //! queued reload, which is what makes it safe for a NOTIFY — a packet whose
 //! rate a remote party chooses — to ask for one at all (`CLAUDE.md` §5).
