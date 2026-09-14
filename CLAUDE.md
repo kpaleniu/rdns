@@ -40,6 +40,9 @@ as a link — and nine from a public page to a private item, which is the shape
 §37 makes more of. `--no-deps`, because the dependencies' warnings are not ours
 to fix and would bury ours.
 
+Prefer using LSP tools (rust-analyzer) over grep/file search for code navigation,
+finding definitions, and symbol queries in Rust files.
+
 ---
 
 ## 1. A test that agrees with the code is not evidence
