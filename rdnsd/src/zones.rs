@@ -473,6 +473,17 @@ impl Zones {
         self.by_name.get(name.folded().as_ref()).cloned()
     }
 
+    /// Every zone held, as something that outlives the guard.
+    ///
+    /// [`Zones::snapshot`]'s reason, for the caller that wants all of them: a
+    /// reload signs the new zones against the versions being served
+    /// ([`ZoneSigning::apply`]) and cannot do that under the read lock, since
+    /// the signing run is seconds long. `Arc`s, so this is refcounts and not
+    /// zones.
+    pub(crate) fn snapshot_all(&self) -> ZoneMap {
+        self.by_name.clone()
+    }
+
     /// The zone that should answer `qname`: the most specific one the name is at
     /// or under, or `None` if this server holds none.
     ///
@@ -762,19 +773,14 @@ impl ZoneSigning {
         self.shortest_validity() / 86_400
     }
 
-    /// Sign every zone there are keys for, in place.
-    ///
-    /// A zone we hold keys for and cannot sign is an error, not a zone served
-    /// unsigned: its parent's DS points at one of these keys, so the unsigned
-    /// answer is bogus at every validating client rather than unvalidated.
     /// Sign one zone against the version already being served, carrying forward
     /// every signature whose RRset did not move.
     ///
-    /// The dynamic-UPDATE path, not the load path. A full re-sign gives every
-    /// RRSIG a new inception and expiration, so the IXFR delta for a one-record
-    /// update is the whole zone — 52 records out of 53, against 10 here. At load
-    /// there is no previous version to carry forward from and
-    /// [`ZoneSigning::apply`] is the right call.
+    /// The dynamic-UPDATE path. A full re-sign gives every RRSIG a new inception
+    /// and expiration, so the IXFR delta for a one-record update is the whole
+    /// zone — 52 records out of 53, against 10 here.
+    /// [`ZoneSigning::apply`] carries the same thing forward at a reload, and
+    /// takes the whole map because a reload is every zone at once.
     ///
     /// A zone with no key is returned unchanged, exactly as `apply` skips it —
     /// by value, so that case costs no copy of the zone (`TODO.md` #64a).
@@ -788,7 +794,24 @@ impl ZoneSigning {
             .with_context(|| format!("re-signing {origin} after an update"))
     }
 
-    pub(crate) fn apply(&self, zones: &mut ZoneMap) -> Result<SigningRun> {
+    /// Sign every zone there are keys for, in place.
+    ///
+    /// A zone we hold keys for and cannot sign is an error, not a zone served
+    /// unsigned: its parent's DS points at one of these keys, so the unsigned
+    /// answer is bogus at every validating client rather than unvalidated.
+    ///
+    /// `previous` is the version being served, when there is one: a reload that
+    /// was asked for by an operator or a catalog carries every signature whose
+    /// RRset did not move, which is 9.7 s against 27.6 s at a million records
+    /// even when a tenth of the zone changed (`TODO.md` #65b). `None` at
+    /// startup, where there is nothing to carry from, and on the re-signing
+    /// timer, whose whole job is to make the signatures new — see
+    /// [`ZoneSigning::resign_interval`] and #65a.
+    pub(crate) fn apply(
+        &self,
+        zones: &mut ZoneMap,
+        previous: Option<&ZoneMap>,
+    ) -> Result<SigningRun> {
         // One moment for the whole run — see `policy_for`.
         let signed_at = current_unix_timestamp();
         let mut run = SigningRun::default();
@@ -798,11 +821,16 @@ impl ZoneSigning {
                 continue;
             };
             run.record(origin.to_owned(), keys, signed_at);
+            let carried = previous.and_then(|served| served.get(key));
             let origin = origin.to_presentation();
             let policy = self.policy_for(&origin, signed_at);
-            *zone = Arc::new(
-                sign_zone(zone, keys, &policy).with_context(|| format!("signing {origin}"))?,
-            );
+            *zone = Arc::new(match carried {
+                Some(served) => sign_zone_incrementally(served, zone, keys, &policy)
+                    .with_context(|| format!("re-signing {origin}"))?,
+                None => {
+                    sign_zone(zone, keys, &policy).with_context(|| format!("signing {origin}"))?
+                }
+            });
             tracing::info!(
                 "signed {origin} with {} key{}, {} for {} day{}{}",
                 keys.len(),
@@ -1666,7 +1694,7 @@ mod tests {
         let proved = ProvenSigning::default();
 
         let mut zones = unsigned_zone();
-        let run = signing.apply(&mut zones).expect("signs");
+        let run = signing.apply(&mut zones, None).expect("signs");
         let first = verify_zones(&zones, &validator, &run, &proved).expect("verifies");
         assert_eq!(first.zones, 1, "the first load proves it");
         assert!(first.rrsets > 0, "{first:?}");
@@ -1675,7 +1703,7 @@ mod tests {
         // The re-signing tick, which reloads: the same file, signed again by
         // the same keys, with new inceptions and expirations on every RRSIG.
         let mut zones = unsigned_zone();
-        let run = signing.apply(&mut zones).expect("signs");
+        let run = signing.apply(&mut zones, None).expect("signs");
         assert_eq!(
             verify_zones(&zones, &validator, &run, &proved).expect("verifies"),
             Checked {
@@ -1701,13 +1729,13 @@ mod tests {
 
         let signing = signing_with(SigningKey::load_dir(dir.path()).expect("load"));
         let mut zones = unsigned_zone();
-        let run = signing.apply(&mut zones).expect("signs");
+        let run = signing.apply(&mut zones, None).expect("signs");
         verify_zones(&zones, &validator, &run, &proved).expect("verifies");
 
         new_key().write_to_dir(dir.path()).expect("write");
         let signing = signing_with(SigningKey::load_dir(dir.path()).expect("load"));
         let mut zones = unsigned_zone();
-        let run = signing.apply(&mut zones).expect("signs");
+        let run = signing.apply(&mut zones, None).expect("signs");
         let second = verify_zones(&zones, &validator, &run, &proved).expect("verifies");
         assert_eq!(second.skipped, 0, "a key whose output was never checked");
         assert_eq!(second.zones, 1);
@@ -1735,13 +1763,13 @@ mod tests {
 
         let signing = signing_with(SigningKey::load_dir(dir.path()).expect("load"));
         let mut zones = unsigned_zone();
-        let run = signing.apply(&mut zones).expect("signs");
+        let run = signing.apply(&mut zones, None).expect("signs");
         let first = verify_zones(&zones, &validator, &run, &proved).expect("verifies");
         assert_eq!(first.skipped, 0);
 
         // The same keys, the same file, and no window: a repeat.
         let mut zones = unsigned_zone();
-        let run = signing.apply(&mut zones).expect("signs");
+        let run = signing.apply(&mut zones, None).expect("signs");
         assert_eq!(
             verify_zones(&zones, &validator, &run, &proved)
                 .expect("verifies")
@@ -1755,7 +1783,7 @@ mod tests {
         std::fs::write(&path, format!("{text}SyncPublish: 1\n")).expect("write");
         let signing = signing_with(SigningKey::load_dir(dir.path()).expect("reload"));
         let mut zones = unsigned_zone();
-        let run = signing.apply(&mut zones).expect("signs");
+        let run = signing.apply(&mut zones, None).expect("signs");
         let opened = verify_zones(&zones, &validator, &run, &proved).expect("verifies");
         assert_eq!(opened.skipped, 0, "a CDS nothing has checked");
         assert_eq!(opened.zones, 1);
@@ -1772,7 +1800,7 @@ mod tests {
         let proved = ProvenSigning::default();
 
         let mut zones = unsigned_zone();
-        let run = signing.apply(&mut zones).expect("signs");
+        let run = signing.apply(&mut zones, None).expect("signs");
         // Edit one RRset out from under its signature, exactly as an operator
         // editing a pre-signed file does.
         let broken = {

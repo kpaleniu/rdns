@@ -107,6 +107,15 @@ now=$(date +%s)
 #   Delete:   $((now + 172800))
 ```
 
+**Only the timer's reload makes new signatures.** A reload asked for by SIGHUP
+or by `rdnsctl reload` signs each zone against the version already being served
+and carries forward every signature whose RRset has not moved — same TTL, same
+RDATA as a set, same signing keys by tag, and not already expired. The
+re-signing timer carries nothing: it reloads in order to refresh, so everything
+it could keep is what it woke up to replace. Startup has no served version to
+carry from. A million-record zone signs in 27.6 s from scratch and 9.7 s
+carrying forward (`TODO.md` #65).
+
 **The re-signing timer follows the nearest step.** These are read by a signing
 *run*, and the ordinary interval is a third of the signature validity — ten days
 by default — so without this a key activating at noon would wait ten days for a

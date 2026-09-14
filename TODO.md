@@ -37,8 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#63**, **#64**, **#65** and **#21**, as
-of 2026-09-14.
+**#57**, **#58**, **#59**, **#63**, **#64** and **#21**, as of 2026-09-14.
 **#61 closed the day it was filed**: the reload is 3.76x faster and holds
 68 MB less per million rules, and rayon was measured and declined.
 **#62 closed the day after it was filed**, all three rows. 62a was the one on
@@ -84,21 +83,17 @@ address is now a number — 31% to build and free the carry-forward index, 24%
 to probe it and `Layout` once per RRset — and it is the two maps keyed by a
 name, not the chain and not the crypto. 64b, 64c and 64e are what is left, and
 none of them names a remedy yet.
-**#65 came out of asking 64e's question of the load path**, and the answer
-refuted the reason for asking: the four passes a full sign shares with an
-incremental one cost the same 4.4 s, but a full sign is 27 s and 84% of it is
-two million ECDSA signatures, so a remedy in the structures is capped at 16%
-there. What the measurement found instead is that `ZoneSigning::apply` re-signs
-every zone from scratch at **every** load — a SIGHUP included — and the
-carry-forward that already runs per UPDATE does the same work in 9.4 s.
-**65b is measured and confirms it**: editing or adding a tenth of a
-million-record zone in one go still saves 54-60%, so there is no edit size at
-which re-signing from scratch is the right call. What is left of 65a is not
-whether it is worth doing but *which runs may* carry forward, since
-`reuse` refuses only an already-expired signature and the re-signing tick has
-to go on refreshing. **65c inventories the four shapes** — keyed on the
-trigger, on signature age, on whether the file moved, and one the tree already
-declines — none of them built, so the preference in it is provisional.
+**#65 came out of asking 64e's question of the load path and closed the same
+day**, the shapes built and the recommended one declined. The reason for asking
+was refuted first — a full sign is 84% ECDSA, so a remedy in the structures is
+capped at 16% — and what the measurement found instead was that
+`ZoneSigning::apply` re-signed every zone from scratch at **every** load, a
+SIGHUP included. A reload carries forward now, except the re-signing timer's,
+which reloads *in order to* refresh. The option the row recommended was keyed on
+signature age and does not work at all: the expiry spread is a fifth of the
+validity and the interval a third, so every signature crosses any threshold in
+the same tick. Its only remaining half is C, which is #64b's question and is
+filed there.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -910,7 +905,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59**, **#63**, **#64** and **#65**, plus **#21** — see
+**#57**, **#58**, **#59**, **#63** and **#64**, plus **#21** — see
 "What is open" above, which is the same list and the only place it is written
 down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -2051,6 +2046,15 @@ it is one every twelve** (64d).
   part that is not. Whether an mtime check is enough depends on a question
   nobody has asked: what an operator editing a file under a server taking
   dynamic updates is entitled to.
+
+  **The reload path wants the same test, and that is 65c option C — moved here
+  2026-09-14.** With #65a landed a reload signs each zone against the version
+  being served, which is 9.7 s at a million records instead of 27.6; a zone
+  whose file did not move needs neither, and could keep the served `Arc<Zone>`
+  untouched. That is worth 9.7 s per unchanged zone on every SIGHUP, so a
+  hundred-zone server where one file moved pays ninety-nine of them today.
+  Nothing more is needed than the did-the-file-change test above, which is why
+  the two are one row: taking either answers both.
 - **64c. The file is the authority, and that is the other 42%.** `to_string`
   plus `write` — 621 + 136 ms — exist because the update must reach the file:
   `UpdateHandling`'s doc says the re-signing timer reloads every zone from its
@@ -2214,6 +2218,12 @@ it is one every twelve** (64d).
   the shared half here would schedule load-path work against an UPDATE's
   measurement.
 
+  **#65 closed on 2026-09-14 without filing it either**, and said why: the five
+  shared passes are 16% of a full sign against 48% of an incremental one, so
+  splitting one piece of work across two numbers is how both get half-done. It
+  is unowned on purpose and the number to beat is 4.4 s at a million records.
+  Whoever takes it takes both sides.
+
 **What 64c would actually cost, since "add a WAL" is the wrong description.**
 The journal is already where a write-ahead log sits — `zones.rs` writes it
 before installing, under one guard, and `persist::write_atomically_str` fsyncs
@@ -2237,178 +2247,6 @@ this tree's own numbers — at 1M records, parsing text was ~25% of a load and
 building the index ~73%. A format that hands back records still to be indexed
 buys the 25%. The post-#61 breakdown has not been taken, so that share today is
 unknown, and taking it is the thing that would reopen this.
-
----
-
-### 65. Every load re-signs every zone from scratch — **filed 2026-09-14, 65b measured, 65c filed**
-
-Filed out of 64e, which measured the dynamic-UPDATE path and could not speak
-for this one. Two of 64e's six passes — building the carry-forward index and
-freeing it — exist only on the UPDATE path: `sign_zone_incrementally` has one
-non-test caller, `ZoneSigning::sign_one_incrementally` (`rdnsd/src/zones.rs`),
-whose own doc says it is "the dynamic-UPDATE path, not the load path". The
-other four are `sign_zone_inner`'s, and `sign_zone` pays them too.
-
-`zone_signer::tests::full_sign_cost_by_pass`, the same split with
-`previous: None`:
-
-```sh
-cargo test -p rdns --release full_sign_cost -- --ignored --nocapture
-```
-
-| records | full | carry-over | layout | nsec-chain | sign-everything | build-rrsets | sign-rrsets | file-sigs |
-|---|---|---|---|---|---|---|---|---|
-| 10 000 | 249.6 ms | 5.0 | 3.3 | 8.3 | 231.8 | 5.4 | 223.0 | 3.4 |
-| 100 000 | 2 547.5 ms | 64.0 | 39.8 | 107.0 | 2 418.3 | 79.7 | 2 299.5 | 39.1 |
-| **1 000 000** | **27 140 ms** | **1 131** | **520** | **1 437** | **24 218** | **885** | **22 919** | **414** |
-
-Three warm runs on the development machine, Windows, discarding the first
-after a rebuild; the 1M total spans 27.1-28.4 s, 4.5%. It reproduces #44c's
-28 s and 64d's 26.9 s for a third time, by a third route.
-
-**The sentence that would make this row wrong** (§19), written down first:
-*"the shared passes are the thing to fix, so this is 64e's remedy with a wider
-scope."* **It is false, and the table is why.** The signing loop is **84%** of
-a full sign and here it really is the crypto — two million ECDSA signatures
-against the four an incremental sign makes. The five passes outside it are
-**4.4 s, 16%**, and that is the ceiling on any remedy in the structures. Making
-them free would leave 23 s.
-
-What the two tables do say together is that those five passes cost **the same
-4.4-4.5 s either way** — 48% of 64e's 9.4 s incremental sign and 16% of this
-one. Same code, same zone, same absolute cost; only the denominator moves.
-
-- **65a. The bigger question the measurement turned up is not a pass at all.**
-  `ZoneSigning::apply` signs **every zone, unconditionally, at every load** —
-  no check of whether the zone moved and none of whether its signatures are
-  still fresh. There is a precedent for asking: `SigningRun` exists so #53 can
-  skip *verification* for a zone this process just signed with the same keys.
-  Nothing analogous exists for signing.
-
-  And a load is not only startup. `Reloading::load_blocking` (`rdnsd/src/main.rs`)
-  calls `apply` too, so a SIGHUP, an `rdnsctl reload` or a catalog change costs
-  a full sign of every signed zone — 27 s at a million records. It is on
-  `spawn_blocking` and the old zones keep serving, so this is latency to effect
-  rather than an outage.
-
-  **The reason the code states, and the answer to it** (§19).
-  `sign_one_incrementally`'s doc says "At load there is no previous version to
-  carry forward from and `ZoneSigning::apply` is the right call." That is true
-  at startup and not at a reload, where the served `ZoneMap` is exactly such a
-  version — and the measured difference is 9.4 s against 27.1 s at a million
-  records, the same carry-forward that already runs per UPDATE.
-
-  ~~**The prerequisite, which is why this is a row and not a fix.** `Reloading`
-  holds `secondaries`, `zone_dir`, `signing`, `validator` and `proved` — not
-  the served zones. `ZoneMap::snapshot` exists for "a caller that cannot finish
-  under the lock" (#64a) and is the shape, but nothing hands it down today.~~
-
-  **That was wrong about where the served zones are, 2026-09-14.** True of
-  `Reloading`, and the row stopped at the type it had opened. One level up,
-  `reload_once` destructures a `ReloadContext` whose `served: ZoneContext`
-  carries the live `Arc<RwLock<Zones>>`, and `ZoneMap::snapshot` is already
-  there for exactly this. So the prerequisite is passing a snapshot down one
-  level, not plumbing new state — §4's "never state what a function does
-  without opening it", applied to a struct one call up from the one that was
-  opened.
-
-  **The constraint that shapes every remedy**, and the reason none of them is
-  simply "carry forward at a reload": there is **one** reload path with three
-  triggers — `ReloadTrigger::{Signal, Timer, Control}` — and
-  `ZoneSigning::resign_interval`'s doc says the timer refreshes *by reloading*,
-  because the served serial is the file's plus a time term
-  (`zone_signer::signed_serial`) and re-signing the in-memory zone would
-  compound the bump every cycle. The timer's reload **is** the refresh.
-
-- **65b. Whether carrying forward at a reload is *safe* is the open half; what
-  it is *worth* is measured — 2026-09-14.**
-
-  ~~The measurement that would let somebody start: how much of a reload's 27 s
-  a carry-forward actually saves for a zone whose file *did* change, which is
-  the ordinary reason to reload. 64d's `carried` column is the shape of that
-  count, and this one has not been taken.~~ **Taken**, and it confirms 65a
-  rather than refuting it. `zone_signer::tests::reload_carry_forward_saving_by_change_size`:
-
-  ```sh
-  cargo test -p rdns --release reload_carry_forward -- --ignored --nocapture
-  ```
-
-  | edit | records | incremental | full | saved | fresh sigs |
-  |---|---|---|---|---|---|
-  | in place | 1 | 9 685 ms | 27 610 | 64.9% | 1 |
-  | in place | 1 000 | 10 090 ms | 27 610 | 63.5% | 1 000 |
-  | in place | 10 000 | 10 115 ms | 27 610 | 63.4% | 10 000 |
-  | in place | 100 000 | 10 956 ms | 27 610 | 60.3% | 100 000 |
-  | add | 1 | 9 831 ms | 27 610 | 64.4% | 3 |
-  | add | 1 000 | 9 799 ms | 27 610 | 64.5% | 2 001 |
-  | add | 10 000 | 10 260 ms | 27 610 | 62.8% | 20 001 |
-  | add | 100 000 | 12 824 ms | 27 610 | 53.6% | 200 001 |
-
-  **Editing or adding a tenth of a million-record zone in one go still saves
-  54-60%**, because #64e's fixed passes are 9.4 s of it and a fresh signature
-  is ~15-25 µs. Extrapolated, the carry-forward stops paying only when
-  something like a third of the zone's two million RRsets change at once. So
-  there is no edit size at which the present behaviour is the right one.
-
-  **Both directions, because they are not one question** (§19). Editing RDATA
-  in place is the cheap end and flatters the carry-forward: no name enters or
-  leaves, the NSEC chain is unmoved, only the edited RRsets re-sign. Adding
-  names moves each new name's predecessor too (RFC 4034 §4.1.1) — `fresh sigs`
-  is 2n+1 against n — and is the case that could have refuted the row. It does
-  not: 53.6% at the largest size measured.
-
-  **The safety question is still open and still the reason no remedy is
-  named** (§18). `PreviousSignatures::reuse` refuses a signature only once
-  `expiration <= signed_at` — already expired, not close to it. A zone reloaded
-  often would therefore keep its signatures until they lapse instead of being
-  refreshed a third of the way through the validity, which is `resign_after`'s
-  whole job. The question is not "can a reload carry forward" but **"which runs
-  may"**, and the answer has to leave the re-signing tick refreshing. Note the
-  shape is already in the tree on the other side: #53 made *verification* skip
-  a zone this process signed with the same keys, keyed on `SigningRun`, and
-  what that keys on is the thing this would need too.
-
-- **65c. Four options, read off the code and none of them built** — so this is
-  an inventory and the preference at the end is provisional, which is the
-  distinction #57d's own three shapes draw and §19 says to settle by building.
-
-  - **A. Key it on the trigger.** `Timer` full-signs; `Signal` and `Control`
-    carry forward. Cheapest: `ReloadTrigger` already reaches `reload_once` and
-    the served map is already in scope there. Refresh stays correct because the
-    timer is independent of the other two. Rollover is already safe —
-    `PreviousSignatures::reuse` compares the key-tag sets, so a change in the
-    active signers forces a re-sign whatever the trigger. **Weakness**: it keys
-    on *why* rather than on *what is due*, so a timer tick still pays 27 s a
-    zone when every signature is fresh — and #44f shortens that interval for
-    *all* zones whenever any one key transitions.
-  - **B. Key it on signature age.** Give `reuse` a "refresh before" instant
-    instead of its `expiration <= signed_at` test. Trigger-independent, so all
-    three paths get it with nothing to keep in sync (§7), and it makes the
-    *timer* cheap too, which A does not. It also fixes what is actually wrong:
-    `reuse` refuses a signature only once it has **already expired**, and
-    `resign_after` exists to say when one is due, a third of the validity out.
-    `SigningPolicy::expiry_for` already spreads expiry deterministically per
-    (owner, type), so refreshing on the same criterion spreads the work rather
-    than making a cliff — the §8 rule about not giving every RRSIG one
-    expiration, arriving on the refresh side.
-  - **C. Sign nothing when nothing moved.** Compare the parsed zone against the
-    served one; unchanged and nothing due means keeping the served
-    `Arc<Zone>` and not signing at all. Cheaper than B where it applies, but it is
-    B with "zero RRsets due", and it needs a cheap did-the-file-change test —
-    **which is the question #64b already asks for the UPDATE path**. Those two
-    rows are one question in two places, and taking either should answer both.
-  - **D. Give the timer its own in-memory re-sign.** Not available:
-    `resign_interval`'s doc declines it and the reason is the compounding
-    serial above. Written down so the next reader does not re-derive it.
-
-  Provisional preference: **B**, with **C** once #64b settles the file-changed
-  test, and **A** only if B costs more than it looks. What would change that is
-  building them (§19) — and #40a is the precedent for the option recommended
-  before building being the one that measures out as the one to decline.
-
-**Not filed: making the five shared passes cheaper.** 16% of a full sign and
-48% of an incremental one, and 64e already owns the incremental side of it.
-Splitting the same work across two numbers is how both get half-done.
 
 ---
 
@@ -2552,6 +2390,7 @@ the week; the record is under "How the queue kept going stale" in
 | **52** | a rate-limit test is a coin toss at a second boundary | **filed and closed 2026-09-12**, one commit. Not a defect in the server, and the filing undercounted it by 23: the shape is a test that reads the wall clock at a limiter call, and there were **43 such call sites across 24 tests**, six of them assertions a refill actually breaks. Both buckets refill by whole seconds, so the verdict depended on whether two reads straddled one. 41 sites needed nothing but one `let now` per test, because `should_allow` has taken the instant as a parameter since #28a; the two that read the clock inside the loop under test — `tcp::serve`'s per-connection charge and `rdnsr`'s UDP loop — got `rdns::clock::Clock` on `ServeContext`. The test now asserts the refill as well as the refusal, which is the half that says the connection was charged rather than never admitted |
 | **47** | a NOTIFY reply carried no OPT record | **filed and closed 2026-09-12**, one commit, and it was a defect after all: the row read RFC 6891 §6.1.1 as "asks for" where it is "if an OPT record is present in a received **request**, compliant responders MUST include an OPT record in their respective responses" — a NOTIFY is a request. Counting the shape (§18) found a second site and a second MUST: `transfer::Envelopes` built the first AXFR envelope's OPT from `has_edns()` and a fresh `Edns`, which drops DO, against RFC 3225 §3's unconditional "the DO bit of the query MUST be copied in the response". Nothing tested either. The three NOTIFY refusals now carry three different EDEs, because "you are not one of my masters" and "I am that zone's primary" are one RCODE and two operator problems. `ClientEdns::mirror_with` became total on the way, so the `Err` all three callers answered identically is one doc comment rather than four. The EDE half is a reading rather than a quotation and the peers were asked: BIND 9.20 and Knot 3.6 mirror the OPT and DO and send no EDE, NSD 4.12 answers NXDOMAIN with QDCOUNT=0 and no OPT. Nine new assertions in the interop harness, 29 passed 0 failed in 43e |
 | **44** | what an operator would find missing in `rdnsd` | **filed 2026-09-11, closed in full 2026-09-12**, seven rows: catalog zones, EDE, the scale measurement, XoT, multi-signer, rollover and dnstap. Five numbers filed on the way out — #47, #48, #49, #50, #51, #54, #55 — and **0 packages** added by the lot, dnstap's two wire formats included. Every row's closing note says the same thing in its own words: the filing was right about what was missing and wrong about where the work was. 44a missed that provisioning is a diff; 44b's "small" cost a type at 24 sites; 44d's "cheap after 42a" described the half already done; 44e's premise was refuted by one test; 44f's ZSK half needed four numbers in a file and no state machine. Only 44c came out the size it was filed as, and it is the one that found a live defect (**#50**). The preamble's "none of these is a defect" did not survive either: #50 came out of 44c, and #47 — filed by 44b as not a defect — closed carrying two MUSTs |
+| **65** | every load re-signed every zone from scratch | **filed and closed 2026-09-14**, out of 64e. `ZoneSigning::apply` signed unconditionally, so a SIGHUP, an `rdnsctl reload` or a catalog change cost a full sign of every signed zone — 27.6 s at a million records — and moved the RDATA of every RRSIG, which is the whole zone in the next IXFR delta. **The four shapes were built and the recommended one was declined** (§19, #40a's precedent again). What landed is A, keyed on the trigger: the re-signing timer reloads *in order to* refresh, so it is the one reload that may carry nothing forward, and the other two carry everything whose RRset did not move — 9.7 s against 27.6, still 53.6% saved when a tenth of the zone changes (65b). **B is declined on a measurement**: the expiry spread is a fifth of the validity and the re-signing interval a third, so every signature crosses any refresh threshold in the same tick — 0 or all 126 of a fixture's RRSIGs, never between — and the only threshold that saves work hands the refreshing run a signature with four tenths of an interval left, against the 1.4 §8 asks for. The patch was reverted and the finding kept as a tripwire on the two constants. C moved to **#64b**, whose did-the-file-change test it is. The prerequisite the row called plumbing was one four-line method: `Zones::snapshot_all` |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

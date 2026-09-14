@@ -519,7 +519,10 @@ Triggered by SIGHUP (Unix), by `rdnsctl reload`, or by the zone-maintenance time
 
 All or nothing. `Reloading::load` reads every zone, signs every zone that has a
 key, verifies the signatures it has not proved before, and installs the new set
-only if the whole set came through. A failure leaves the previously served zones
+only if the whole set came through. SIGHUP and `rdnsctl reload` sign against the
+zones being served and keep every signature whose RRset has not moved; the
+timer's reload does not, because refreshing them is what it is for
+(`04-dnssec.md` §4.1). A failure leaves the previously served zones
 in place and reports why; `rdnsctl reload` exits 1 with the parse error.
 
 **Which signatures get verified.** A zone this server did not sign is verified

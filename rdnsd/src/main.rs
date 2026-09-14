@@ -1320,19 +1320,19 @@ impl Reloading {
     /// per zone, an ECDSA signing run over every RRset of every signed zone,
     /// then verification — and both callers run while the listeners are live, so
     /// on the runtime this is a worker out of service with queries behind it.
-    async fn load(&self, source: &ZoneSource) -> Result<ZoneMap> {
+    async fn load(&self, source: &ZoneSource, previous: Option<ZoneMap>) -> Result<ZoneMap> {
         let reloading = self.clone();
         let source = source.clone();
-        tokio::task::spawn_blocking(move || reloading.load_blocking(&source))
+        tokio::task::spawn_blocking(move || reloading.load_blocking(&source, previous.as_ref()))
             .await
             .context("the zone-loading task")?
     }
 
     /// The blocking half of [`Reloading::load`], and named so at the call site.
-    fn load_blocking(&self, source: &ZoneSource) -> Result<ZoneMap> {
+    fn load_blocking(&self, source: &ZoneSource, previous: Option<&ZoneMap>) -> Result<ZoneMap> {
         let mut zones = load_zones_from_source(source, self.replicating, self.allow_partial)?;
         let run = match &self.signing {
-            Some(signing) => signing.apply(&mut zones)?,
+            Some(signing) => signing.apply(&mut zones, previous)?,
             None => SigningRun::default(),
         };
         verify_zones(&zones, &self.validator, &run, &self.proved)?;
@@ -1376,6 +1376,19 @@ enum ReloadTrigger {
 }
 
 impl ReloadTrigger {
+    /// Is this the reload whose point is that the signatures come out new?
+    ///
+    /// The re-signing timer refreshes *by reloading*
+    /// ([`ZoneSigning::resign_interval`]), so it is the one trigger that may
+    /// not carry a signature forward — everything it would carry is what it
+    /// woke up to replace. SIGHUP and the control socket are an operator or a
+    /// catalog saying the files moved, and there the served version is a
+    /// previous version in exactly the sense `sign_zone_incrementally` means
+    /// (`TODO.md` #65a).
+    fn refreshes_signatures(&self) -> bool {
+        matches!(self, ReloadTrigger::Timer)
+    }
+
     /// What the log line says this reload was for.
     fn why(&self) -> &'static str {
         match self {
@@ -1435,7 +1448,14 @@ async fn reload_once(
             Err(e) => tracing::warn!("could not re-read the TLS certificate ({why}): {e:#}"),
         }
     }
-    let (announced, outcome) = match reloading.load(source).await {
+    // Under the read lock and nothing else: a `ZoneMap` is `Arc`s, so this is a
+    // hash map's worth of refcount bumps and no query waits on a signing run.
+    let previous = if reloading.signing.is_some() && !trigger.refreshes_signatures() {
+        Some(served.zone_map.read().await.snapshot_all())
+    } else {
+        None
+    };
+    let (announced, outcome) = match reloading.load(source, previous).await {
         Ok(new_zones) => {
             let loaded = new_zones.len();
             // A reload is a version step like any other: the difference from
@@ -2078,7 +2098,9 @@ async fn main() -> Result<()> {
     // result: verifying what we just produced is what catches a canonicalization
     // bug here rather than at every validator on the internet.
     let run = match &signing {
-        Some(signing) => signing.apply(&mut zones)?,
+        // Startup: nothing is being served, so there is nothing to carry
+        // forward from (`ZoneSigning::apply`).
+        Some(signing) => signing.apply(&mut zones, None)?,
         None => SigningRun::default(),
     };
     let mut validator = DnssecValidator::new(cli.require_signed || signing.is_some());
@@ -5592,7 +5614,7 @@ mod tests {
             let (started, has_started) = tokio::sync::oneshot::channel();
             let loader = tokio::spawn(async move {
                 let _ = started.send(());
-                reloading.load(&source).await
+                reloading.load(&source, None).await
             });
             has_started.await.expect("the loader started");
             let before = ticks.load(Ordering::Relaxed);
@@ -6170,7 +6192,7 @@ ns.plain  IN A   192.0.2.30
 
             let mut zones =
                 enumerate_zone_files(dir.path().to_str().unwrap(), false).expect("zones");
-            let run = signing.apply(&mut zones).expect("sign");
+            let run = signing.apply(&mut zones, None).expect("sign");
 
             // Checked with the same validator the server runs before serving.
             let mut validator = DnssecValidator::new(true);
@@ -6267,5 +6289,128 @@ ns.plain  IN A   192.0.2.30
             .unwrap_err();
             assert!(err.to_string().contains("does not verify"), "{err}");
         }
+    }
+
+    /// A reload keeps the signatures it can, and the re-signing timer does not.
+    ///
+    /// `TODO.md` #65a. `ZoneSigning::apply` signed every zone from scratch at
+    /// every load, so a SIGHUP or an `rdnsctl reload` cost a full sign — 27.6 s
+    /// at a million records against 9.7 s (#65b) — and moved the RDATA of every
+    /// RRSIG in the zone, which is the whole zone in the next IXFR delta.
+    ///
+    /// The timer is the exception and has to stay one: it reloads *in order to*
+    /// refresh (`ZoneSigning::resign_interval`), so everything it would carry
+    /// forward is what it woke up to replace.
+    ///
+    /// The discriminator is the expiration, not the signature bytes. The served
+    /// version is signed for 30 days and the reload is configured for 7, so a
+    /// carried signature is one expiring more than a week out — `expiry_for`
+    /// spreads back by a fifth, which leaves the two windows 17 days apart.
+    /// ECDSA would give fresh bytes anyway, since its nonce is random, but a
+    /// test that turns on that is a test passing for a reason unrelated to its
+    /// subject.
+    #[tokio::test]
+    async fn a_reload_carries_signatures_forward_and_the_resigning_timer_does_not() {
+        use clap::Parser;
+        use rdns::dnssec::DNSKEY_FLAG_ZONE;
+        use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
+
+        const ZONE: &str = "example.com.";
+        let dir = ScratchDir::new("reload-carry-forward");
+        let key_dir = dir.path().join("keys");
+        std::fs::create_dir_all(&key_dir).expect("the key directory");
+        let key = SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ZONE, DNSKEY_FLAG_ZONE)
+            .expect("a key");
+        key.write_to_dir(&key_dir).expect("the key file");
+        let text = "$TTL 3600\n\
+                    @ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n\
+                    @ IN NS ns.example.com.\n\
+                    ns IN A 192.0.2.1\n\
+                    www IN A 192.0.2.10\n";
+        std::fs::write(dir.path().join("example.com.zone"), text).expect("the zone file");
+
+        let mut cli = Cli::parse_from(["rdnsd"]);
+        cli.signing_key_dir = Some(key_dir);
+        cli.signature_validity = 7;
+        let signing = ZoneSigning::load(&cli, &BTreeMap::new())
+            .expect("the keys load")
+            .expect("a key directory means signing");
+
+        let zone_map = Arc::new(RwLock::new(Zones::default()));
+        let deltas = Arc::new(RwLock::new(DeltaLog::new()));
+        let ctx = ReloadContext {
+            reloading: Reloading {
+                replicating: false,
+                allow_partial: false,
+                secondaries: Arc::new(Secondaries::default()),
+                zone_dir: None,
+                signing: Some(Arc::new(signing)),
+                validator: Arc::new(DnssecValidator::new(true)),
+                proved: ProvenSigning::default(),
+            },
+            source: ZoneSource::Directory(dir.path().to_string_lossy().to_string()),
+            served: served(&zone_map, &deltas),
+            notify: Arc::new(NotifyPolicy::default()),
+            tls: None,
+        };
+
+        // The version being served when the reload arrives: the same file, signed
+        // for thirty days rather than the seven the daemon is configured for.
+        let long = || {
+            let parsed = rdns::zone::parse_zone_file(text, ZONE).expect("the fixture parses");
+            sign_zone(
+                &parsed,
+                std::slice::from_ref(&key),
+                &SigningPolicy::valid_for(rdns::clock::current_unix_timestamp(), 30 * 86_400)
+                    .with_chain(DenialChain::Nsec),
+            )
+            .expect("the fixture signs")
+        };
+
+        /// How many of the zone's RRSIGs expire more than a week out — which is
+        /// to say, how many came from the served version rather than this run.
+        async fn carried(zone_map: &Arc<RwLock<Zones>>) -> usize {
+            let week = rdns::clock::current_unix_timestamp() + 7 * 86_400;
+            let zones = zone_map.read().await;
+            let zone = zones
+                .matching(nm(ZONE).as_ref())
+                .expect("the zone is served");
+            zone.records()
+                .iter()
+                .filter(|r| r.rdata.rtype() == record_types::RRSIG)
+                .filter(|r| match r.rdata.parse() {
+                    Ok(rdns::ParsedRecord::RRSIG { expiration, .. }) => {
+                        u64::from(expiration) > week
+                    }
+                    _ => false,
+                })
+                .count()
+        }
+
+        let busy = test_shutdown().lifecycle().busy;
+
+        drop(zone_map.write().await.insert(long()));
+        let before = carried(&zone_map).await;
+        assert!(before > 3, "the fixture has signatures to carry: {before}");
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reload_once(&ctx, Vec::new(), &busy, ReloadTrigger::Control(tx)).await;
+        assert_eq!(rx.await.expect("the reload answered"), Ok(1));
+        // All of them, the apex SOA's included: the served serial is the file's
+        // plus a term in *hours* (`zone_signer::signed_serial`), so two runs in
+        // the same hour agree about it and the RRset has not moved either.
+        assert_eq!(
+            carried(&zone_map).await,
+            before,
+            "a control reload carried fewer than all {before} signatures forward",
+        );
+
+        drop(zone_map.write().await.insert(long()));
+        reload_once(&ctx, Vec::new(), &busy, ReloadTrigger::Timer).await;
+        assert_eq!(
+            carried(&zone_map).await,
+            0,
+            "the re-signing timer reloads in order to refresh, so it may carry nothing",
+        );
     }
 }

@@ -3679,4 +3679,84 @@ a\.b    IN A   192.0.2.50
             );
         }
     }
+
+    /// No refresh threshold can spread a re-signing run across ticks, because
+    /// the expiry spread is narrower than the interval.
+    ///
+    /// `TODO.md` #65c option B, built and declined. The proposal was to give
+    /// [`PreviousSignatures::reuse`] a "refresh before" instant instead of its
+    /// already-expired test, so a reload would carry forward what is fresh and
+    /// re-sign what is due — making the re-signing *timer* cheap too, which
+    /// keying on the trigger (#65a, what landed) does not.
+    ///
+    /// It cannot. [`SigningPolicy::expiry_for`] spreads expiry over
+    /// `EXPIRY_JITTER_FRACTION` of the validity and the timer runs every
+    /// `RESIGN_FRACTION` of it — a fifth against a third — so the whole zone's
+    /// expirations sit inside one interval and cross any threshold together.
+    /// The two outcomes are every tick, which is a full sign plus a
+    /// carry-forward index built for nothing, and every other tick, which
+    /// refreshes a signature with 13.5% of its validity left: four tenths of an
+    /// interval, so one failed run expires the zone, against the 1.4 intervals
+    /// a full sign at every tick leaves (`CLAUDE.md` §8's slack).
+    ///
+    /// Arithmetic over `expiry_for` and nothing else, so it is a tripwire on
+    /// the two constants rather than a measurement: widen the spread past the
+    /// interval and B is worth building again.
+    ///
+    /// Signing a real zone on this schedule says the same — 126 RRSIGs, 0 or
+    /// 126 fresh per tick and never between — plus one per tick that is the
+    /// apex SOA's, whose RRset moves for its own reason.
+    #[test]
+    fn a_refresh_threshold_is_all_or_nothing_per_resigning_tick() {
+        const VALIDITY: u64 = 30 * 86_400;
+        let tick = resign_after(VALIDITY);
+        assert!(
+            VALIDITY / EXPIRY_JITTER_FRACTION < tick,
+            "the spread is inside one interval, which is what makes the rest of this true",
+        );
+
+        // One expiry per (owner, type), which is what `expiry_for` keys on.
+        let names: Vec<Name> = (0..200)
+            .map(|i| nm(&format!("h{i}.example.com.")))
+            .collect();
+        let expiries = |at: u64| -> Vec<u32> {
+            let policy = SigningPolicy::valid_for(at, VALIDITY);
+            names
+                .iter()
+                .map(|n| policy.expiry_for(n.as_ref(), rt::A))
+                .collect()
+        };
+
+        for slack in 0..=2u64 {
+            let mut expiry = expiries(NOW);
+            for k in 1..=6u64 {
+                let at = NOW + k * tick;
+                let must_outlive = at + slack * tick;
+                let due = expiry
+                    .iter()
+                    .filter(|e| u64::from(**e) <= must_outlive)
+                    .count();
+                assert!(
+                    due == 0 || due == names.len(),
+                    "tick {k} at slack {slack} refreshed {due} of {} — a partial run means \
+                     the spread has grown past the interval",
+                    names.len(),
+                );
+                if due == 0 {
+                    continue;
+                }
+                // What the run refreshing them had to work with: the life left
+                // on the signature it replaced. A failed run is survivable only
+                // while that is a whole interval or more.
+                let left = u64::from(*expiry.iter().min().expect("expiries")).saturating_sub(at);
+                assert_eq!(
+                    left >= tick,
+                    slack == 2,
+                    "at slack {slack} a refresh happens with {left}s left against a \
+                     {tick}s interval",
+                );
+                expiry = expiries(at);
+            }
+        }
+    }
 }
