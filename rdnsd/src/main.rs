@@ -1889,7 +1889,9 @@ async fn main() -> Result<()> {
     // (`CLAUDE.md` §15).
     if cli.transfer_tls_only && !encrypted {
         return Err(anyhow!(
-            "--transfer-tls-only needs a listener a transfer can arrive on:              --tls-listen, --quic-listen or --https-listen. Without one, every              transfer is refused"
+            "--transfer-tls-only needs a listener a transfer can arrive on: \
+             --tls-listen, --quic-listen or --https-listen. Without one, every \
+             transfer is refused"
         ));
     }
 
@@ -1977,7 +1979,9 @@ async fn main() -> Result<()> {
     if xot.is_none() {
         if let Some(spec) = secondary_specs.iter().find(|spec| spec.tls.is_some()) {
             return Err(anyhow!(
-                "{} is replicated from {} over TLS, and --transfer-tls-ca names                  no trust anchors to check its certificate against                  (RFC 9103 §7.5)",
+                "{} is replicated from {} over TLS, and --transfer-tls-ca names \
+                 no trust anchors to check its certificate against \
+                 (RFC 9103 §7.5)",
                 spec.zone,
                 spec.master
             ));
@@ -2886,7 +2890,8 @@ mod tests {
             };
             assert!(
                 unsigned.len() <= cap && unsigned.len() + overhead > cap,
-                "the zone must answer in the window this is about: {} octets,                  cap {cap}, signature {overhead}",
+                "the zone must answer in the window this is about: {} octets, \
+                 cap {cap}, signature {overhead}",
                 unsigned.len()
             );
             assert!(!rdns::response::is_truncated(&unsigned), "unsigned it fits");
@@ -3735,7 +3740,8 @@ mod tests {
         let udp = UdpSizes::default();
         assert!(
             signed.len() > 512 && signed.len() < udp.advertised() as usize,
-            "the request this is about weighs {} octets: over the old cap, under              what is advertised",
+            "the request this is about weighs {} octets: over the old cap, under \
+             what is advertised",
             signed.len()
         );
 

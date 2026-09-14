@@ -114,7 +114,9 @@ impl CatalogSpec {
                 Some(first) if first.fetches_like(rule) => {}
                 Some(first) => {
                     return Fetch::Ambiguous(format!(
-                        "it carries both group {:?} and group {:?}, which name                          different masters, and RFC 9432 §4.3.2 gives no rule for                          choosing between them",
+                        "it carries both group {:?} and group {:?}, which name \
+                         different masters, and RFC 9432 §4.3.2 gives no rule for \
+                         choosing between them",
                         first.name, rule.name
                     ))
                 }
@@ -1401,7 +1403,8 @@ mod tests {
                 .metrics
                 .to_prometheus_format()
                 .contains("dns_catalog_members{catalog=\"catalog.invalid.\"} 0"),
-            "an emptied catalog reads as zero members, not as an absent gauge:              RFC 9432 §6's failure is the count falling off a cliff"
+            "an emptied catalog reads as zero members, not as an absent gauge: \
+             RFC 9432 §6's failure is the count falling off a cliff"
         );
     }
 

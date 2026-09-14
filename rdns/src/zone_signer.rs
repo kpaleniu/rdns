@@ -377,7 +377,9 @@ fn sign_zone_inner(
         && !has_dnskey_rrsig(&signed, origin.as_ref())
     {
         return Err(DnssecError::signing(format!(
-            "{origin} is configured for an imported DNSKEY signature (RFC 8901 §2.1.1) and its              zone file carries no RRSIG over the apex DNSKEY RRset — signing it here would              publish a key set this server cannot vouch for",
+            "{origin} is configured for an imported DNSKEY signature (RFC 8901 §2.1.1) and its \
+             zone file carries no RRSIG over the apex DNSKEY RRset — signing it here would \
+             publish a key set this server cannot vouch for",
         )));
     }
 
@@ -823,7 +825,9 @@ fn publish_sync_records(
     // (`CLAUDE.md` §4). The operator resolves it by clearing one side.
     if existing.iter().any(is_go_insecure) {
         return Err(DnssecError::signing(format!(
-            "{origin} carries a CDS or CDNSKEY with algorithm 0, which asks the parent to              withdraw the DS (RFC 8078 §4), and {} key(s) are inside a SyncPublish window              asking it to publish one",
+            "{origin} carries a CDS or CDNSKEY with algorithm 0, which asks the parent to \
+             withdraw the DS (RFC 8078 §4), and {} key(s) are inside a SyncPublish window \
+             asking it to publish one",
             wanted.len(),
         )));
     }

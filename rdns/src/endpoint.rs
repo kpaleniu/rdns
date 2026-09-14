@@ -54,7 +54,8 @@ pub(crate) fn parse_endpoint(text: &str, spec: &str) -> ConfigResult<Endpoint> {
         Some((rest, name)) => {
             if name.contains('#') {
                 return Err(ConfigError::new(format!(
-                    "{spec:?}: the key goes before the '+tls=', as                      addr[:port][#key][+tls=name]"
+                    "{spec:?}: the key goes before the '+tls=', as \
+                     addr[:port][#key][+tls=name]"
                 )));
             }
             (

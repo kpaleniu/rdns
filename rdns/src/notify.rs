@@ -48,7 +48,9 @@ impl NotifyTarget {
         // `CLAUDE.md` §15 refuses in a config key.
         if parsed.tls.is_some() {
             return Err(ConfigError::new(format!(
-                "--also-notify {spec:?}: '+tls=' is for --secondary, where it is                  RFC 9103's zone transfer over TLS. A NOTIFY here is sent in                  clear whatever this says, so it is refused rather than ignored"
+                "--also-notify {spec:?}: '+tls=' is for --secondary, where it is \
+                 RFC 9103's zone transfer over TLS. A NOTIFY here is sent in \
+                 clear whatever this says, so it is refused rather than ignored"
             )));
         }
         Ok(NotifyTarget {

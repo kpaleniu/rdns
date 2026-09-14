@@ -515,7 +515,8 @@ impl Server {
             serving_error!(
                 self.ctx.logger,
                 ip,
-                "{kind} of {qname} REFUSED: --transfer-tls-only, and this one                  arrived over {}",
+                "{kind} of {qname} REFUSED: --transfer-tls-only, and this one \
+                 arrived over {}",
                 match privacy {
                     Privacy::Clear => "an unencrypted connection",
                     Privacy::TlsOlder => "TLS older than 1.3 (RFC 9103 §7.2)",
@@ -1638,7 +1639,8 @@ mod tests {
             );
             assert!(
                 made < 16,
-                "a one-record update re-signed {made} RRsets at {records}: the carry-forward                  is what makes incr-sign cheaper than full-sign, so this number is the claim"
+                "a one-record update re-signed {made} RRsets at {records}: the carry-forward \
+                 is what makes incr-sign cheaper than full-sign, so this number is the claim"
             );
         }
         let _ = std::fs::remove_dir_all(&dir);

@@ -545,12 +545,16 @@ impl Config {
             for (group, rules) in &settings.groups {
                 if !settings.catalog {
                     bail!(
-                        "zone {zone:?} defines a group {group:?} and is not a catalog:                          a group value comes from a catalog's member node (RFC 9432                          §4.3.2), so nothing would ever match it"
+                        "zone {zone:?} defines a group {group:?} and is not a catalog: \
+                         a group value comes from a catalog's member node (RFC 9432 \
+                         §4.3.2), so nothing would ever match it"
                     );
                 }
                 if rules.masters.is_empty() {
                     bail!(
-                        "zone {zone:?}: group {group:?} names no masters, so it would                          map its members onto the catalog's own configuration — which                          is what leaving the group out does"
+                        "zone {zone:?}: group {group:?} names no masters, so it would \
+                         map its members onto the catalog's own configuration — which \
+                         is what leaving the group out does"
                     );
                 }
                 // The same parser the zone's own masters go through, for the
@@ -563,20 +567,25 @@ impl Config {
                             && !self.keys.keys().any(|k| k.eq_ignore_ascii_case(key))
                         {
                             bail!(
-                                "zone {zone:?}, group {group:?}: no [keys.{key:?}] defines                                  the key {master:?} names"
+                                "zone {zone:?}, group {group:?}: no [keys.{key:?}] defines \
+                                 the key {master:?} names"
                             );
                         }
                     }
                     if spec.tls.is_some() && self.server.transfer_tls_ca.is_none() {
                         bail!(
-                            "zone {zone:?}, group {group:?}: {master:?} transfers over TLS                              and server.transfer-tls-ca names no trust anchors (RFC 9103                              §7.5)"
+                            "zone {zone:?}, group {group:?}: {master:?} transfers over TLS \
+                             and server.transfer-tls-ca names no trust anchors (RFC 9103 \
+                             §7.5)"
                         );
                     }
                 }
             }
             if settings.catalog && settings.masters.is_empty() {
                 bail!(
-                    "zone {zone:?} is marked catalog but has no masters: a catalog is                      consumed by replicating it, and one served from a local file is                      an ordinary zone this server is the producer of"
+                    "zone {zone:?} is marked catalog but has no masters: a catalog is \
+                     consumed by replicating it, and one served from a local file is \
+                     an ordinary zone this server is the producer of"
                 );
             }
             if settings.file.is_none()

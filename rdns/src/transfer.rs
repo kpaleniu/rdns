@@ -329,7 +329,8 @@ mod tests {
             assert_eq!(
                 opt.udp_payload_size,
                 request.udp_payload_size(),
-                "the client's own size: a transfer is framed by the TCP length                  prefix, so ours says nothing here"
+                "the client's own size: a transfer is framed by the TCP length \
+                 prefix, so ours says nothing here"
             );
         }
 

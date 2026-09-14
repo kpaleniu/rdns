@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#60**, **#62**, **#63**, **#64** and **#21**, as
+**#57**, **#58**, **#59**, **#62**, **#63**, **#64** and **#21**, as
 of 2026-09-14.
 **#61 closed the day it was filed**: the reload is 3.76x faster and holds
 68 MB less per million rules, and rayon was measured and declined. Of #62,
@@ -79,16 +79,21 @@ by a NOTIFY from a listed address. What is left is the transfer itself (57d) and
 the IXFR question, and the measurements in the row say the transfer is decided
 by memory rather than by time. #58 is what 45b left, #59 what #51 left and #60
 what #51 turned up on the way; and #21 is an inventory of deliberate deviations
-rather than a queue. **#58 is lettered now and 58a is closed**: the latency
-histogram reaches seconds instead of 50 ms, and the split it needed turned out
-not to be a bucket at all — `dns_slow_resolutions_total` tells a slow
+rather than a queue. **#60 closed 2026-09-14**: 19 flattened messages put back
+on their `\` continuations and a test that will not let a twentieth in, and the
+row's own count of 21 across 12 files did not reproduce — three of its files
+hold nothing at all, one of them the false positive the row had predicted.
+**#58 is lettered now and 58a is closed**: the latency histogram reaches
+seconds instead of 50 ms, and the split it needed turned out not to be a
+bucket at all — `dns_slow_resolutions_total` tells a slow
 resolution that answered from one that failed, because the second serves stale
 today and only the first is the feature's case. The row's own remedy was the
 wrong one, which is the mistake `CLAUDE.md` §18 names. 58b and 58c wait on the
 number, and the number wants a deployment. **#59's prerequisite is gone**: #54
 was it, and closing it put `validation::Arrival` where a peer certificate can
-hang off the two TLS variants and nowhere else. Everything else numbered is closed; the table
-under "Closed work" says which, when, and where the reasoning went.
+hang off the two TLS variants and nowhere else. Everything else numbered is
+closed; the table under "Closed work" says which, when, and where the
+reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
 by the page's own count, and the record is in `docs/CLOSED_WORK.md` under "How
@@ -1378,7 +1383,7 @@ is filed rather than taken.
 
 ---
 
-### 60. A string continuation flattened into spaces is an operator-facing defect — **filed 2026-09-13**
+### 60. A string continuation flattened into spaces is an operator-facing defect — **filed 2026-09-13, closed 2026-09-14**
 
 Found while writing four of them into #51 and then reading the message back off
 the binary. A `\` at the end of a line inside a Rust string literal
@@ -1387,13 +1392,29 @@ backslash turns that indentation into the message. `rdnsd --transfer-tls-cert`
 with no `--transfer-tls-ca` printed fourteen spaces mid-sentence before it was
 fixed.
 
-**Counted before fixing one** (§18): **21 sites** across 12 files —
+~~**Counted before fixing one** (§18): **21 sites** across 12 files —
 `rdnsd/src/config.rs` 5, `rdnsd/src/main.rs` 4, `rdnsd/src/catalog.rs` 3, and one
 each in `rdns/src/endpoint.rs`, `notify.rs`, `transfer.rs`, `zone_signer.rs`,
 `rdnsd/src/control.rs`, `dispatch.rs`, `replication.rs`, `zones.rs` and
-`rdnsr/src/main.rs`. The widest gap is 34 spaces (`config.rs:566`); most are 14
-to 26. The four this session introduced are already fixed and are not in that
-count.
+`rdnsr/src/main.rs`.~~ **Did not reproduce: 19 literals across 9 files, 30 runs
+between them.** The widest is still 34 spaces (`config.rs:566`) and the rest are
+14 to 30; the four this session introduced were already fixed and are not in
+either count.
+
+Three of the twelve files have nothing at all — `rdnsr/src/main.rs` has no run of
+even three spaces in any literal, `zones.rs` has only a deliberate two-space
+indent in a failure list, and `control.rs` has the aligned `HELP` table, which
+is a correctly `\`-continued multi-line literal and is **exactly the false
+positive the row's own first bullet predicted**. Three others were undercounted:
+`zone_signer.rs`, `dispatch.rs` and `catalog.rs` hold 2, 2 and 2 against the
+row's 1, 1 and 3. The number was filed without the command that produced it, so
+nobody could check it — `CLAUDE.md` §18, and the second time in three rows
+(#59's struck 30 and 19).
+
+**And the 19 are not a sample, they are all of them.** No prose `\` continuation
+survives anywhere in the workspace: every literal that spans source lines is a
+zone-file fixture or an aligned table. So the idiom is not one this tree
+sometimes gets wrong; it is one nothing had kept.
 
 Cosmetic in that nothing behaves differently, and not cosmetic in the way that
 matters: these are `bail!` and `serving_error!` strings, which is to say the
@@ -1401,19 +1422,42 @@ sentences an operator reads when something is wrong, and several are the startup
 refusals that exist so a misconfiguration is a sentence rather than a silence
 (`CLAUDE.md` §15).
 
-Three things to settle:
+Three things to settle, and all three settled:
 
-- **A detector, first.** A regex over source lines is what produced the 21 and
-  it is crude — it looks only at a literal that opens and closes on one line,
-  and it cannot tell a deliberate run of spaces (a table in a `println!`) from a
-  flattened one. `rdns/examples/request_size_probe.rs` has a real one. Whatever
-  finds them has to be runnable again, or the count is a one-off.
-- **Then whether it is a lint.** Clippy has nothing for this. A test that greps
-  the tree is the cheap version and is a test that fails on somebody's
-  legitimate table; a `#[test]` over the *rendered* messages would be better and
-  there is no list of them to render.
-- **And it is its own commit** (§12): a mechanical rewrite of 21 literals mixed
-  into a behaviour change makes both unreviewable.
+- **A detector, first** — `rdns/tests/flattened_messages.rs`. Not a regex: a
+  small state machine over each file that skips comments, char literals and raw
+  strings, so what it measures is string literals and not source lines. It
+  reports the 19 by file, line and run width, which is how the count above was
+  checked.
+- **Then whether it is a lint** — a test, and the worry that it would fail on
+  somebody's legitimate table is answerable rather than arguable (§19). Runs
+  inside a one-source-line literal come in two populations with **nothing
+  between them**: 2 to 5 spaces, every one a `{:>9}` table, a zone-file fixture
+  or the root hints, and 14 to 34, every one a flattened sentence. The
+  threshold is six, in the middle of that gap, and it costs zero false
+  positives today.
+
+  Two exclusions do the rest of the work, and each is a reason rather than a
+  heuristic: a literal written across source lines is using the `\` idiom
+  already, and a literal carrying a `\n` escape is rendered output — a table,
+  a zone file, `--help` — where a run of spaces is the alignment. `control.rs`'s
+  `HELP` is excluded by the first and `metrics_server.rs`'s route list by the
+  second, which are the two the row's bullet was worried about.
+
+  The rejected alternative was the row's own preference, a `#[test]` over the
+  *rendered* messages. There is still no list of them to render, and building
+  one means provoking 19 failures in three binaries to read 19 strings back —
+  more machinery than the defect, and it would miss the twentieth.
+- **And it is its own commit** (§12) — one, with the test in it, because the
+  test fails without the rewrite and a commit that is red is not a commit
+  anybody can bisect through.
+
+Verified by provoking three of them off the built binary rather than by reading
+the diff (§4): the catalog-with-no-masters refusal, `--transfer-tls-only` with no
+TLS listener and a malformed `--also-notify` spec all print as sentences.
+Reverting the nine files makes the new test name all 19. The Rust detector and
+the throwaway Python one that produced the first count agree on the same 19,
+which is the only reason to trust either.
 
 ---
 

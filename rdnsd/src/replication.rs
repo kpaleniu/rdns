@@ -280,7 +280,9 @@ impl ReplicationContext {
                 XotClient::new(trust.clone(), name.clone()),
             )),
             (Some(name), None) => Err(anyhow!(
-                "{} is transferred from {} over TLS as {name}, and no                  --transfer-tls-ca names the anchors to check its certificate                  against (RFC 9103 §7.5)",
+                "{} is transferred from {} over TLS as {name}, and no \
+                 --transfer-tls-ca names the anchors to check its certificate \
+                 against (RFC 9103 §7.5)",
                 spec.zone,
                 spec.master
             )),
