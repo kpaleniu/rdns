@@ -59,7 +59,9 @@ sixteen settings whose default was written once in `config.rs` and again as a
 clap literal with nothing tying them, under three comments naming the hazard
 and none holding it — **closed the same day**, both sides reading one function
 now — and **63f**, the same bare-`pub` sweep for the `cfg(unix)` file Windows
-cannot compile.
+cannot compile, **also closed**, where the same method said 9 of 9 rather than
+18 of 84: `Control` is a struct `main.rs` builds and every field is an
+argument. `rdnsd` has no bare `pub` left.
 **#64 came out of asking 57d's question of `rdnsd`**: if a zone file is both
 the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
@@ -1749,7 +1751,7 @@ next caller is told the cost rather than finding it.
 
 ---
 
-### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a answered, 63e closed, 63f open**
+### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a answered, 63e-f closed**
 
 Filed out of 57d, which cannot be decided without it: a transfer spec is per
 zone, and there is nowhere to write one. Filed as its own number rather than
@@ -1799,8 +1801,8 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   `rdnsd` already uses. **`config.rs` and `control.rs` were the only two of
   eleven modules spelling a bare `pub`** — 93 between them against 111
   `pub(crate)` everywhere else, and `control.rs` is the `cfg(unix)` file
-  Windows never compiles (§1). `control.rs`'s 9 are not swept here and are
-  **63f**.
+  Windows never compiles (§1). `control.rs`'s 9 went as **63f**, which answered
+  9 of 9.
 - **63b. A second parser would duplicate 22 keys.** Counted, not estimated:
   `rdnsd`'s `[server]` table has **34 keys, and 22 of them are already `rdnsr`
   flags under the same name** — `host`, `port`, both rate knobs and the exempt
@@ -1874,14 +1876,27 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   spells the algorithm into the spec string `TsigKey::parse` reads, so §15's
   "reuse the parser the flags use" is working there and there is no second
   default.
-- **63f. `control.rs`'s nine bare `pub`s — filed 2026-09-14.** The rest of
-  63a's sweep. `config.rs` and `control.rs` were the only two of `rdnsd`'s
-  eleven modules using a bare `pub`; `config.rs` is done and this is the other
-  nine, against 111 `pub(crate)` in the remaining nine modules. Filed rather
-  than swept in the same commit for the §1 reason: it is `#[cfg(unix)]`, so
-  the development machine does not compile it and the compiler-driven method
-  63a used — strip every `pub`, let the build name the survivors — has to run
-  on Linux to mean anything.
+- **63f. `control.rs`'s nine bare `pub`s — filed and closed 2026-09-14.** The
+  rest of 63a's sweep, and the measurement came out the other way round.
+  `config.rs` and `control.rs` were the only two of `rdnsd`'s eleven modules
+  using a bare `pub`; the crate has none now.
+
+  **All nine escape: 3 items and 6 fields, 9 of 9**, against `config.rs`'s 18
+  of 84. Same method — strip every `pub`, let the build name the survivors —
+  run on Linux, because the module is `#[cfg(unix)]` and the development
+  machine does not compile it (§1), so the method would have reported
+  everything as unused here.
+
+  Nothing was `pub` by habit, and the reason is visible in the two shapes:
+  `Control` is a struct `main.rs` *builds*, so every field is an argument at a
+  call site outside the module, while `config.rs`'s structs are ones `serde`
+  fills and 34 of `Server`'s fields are read only by `Config::apply` next door.
+  "Who writes the field" is what the visibility follows, which is the thing
+  neither file's bare `pub` said.
+
+  So this is `pub` to `pub(crate)` and no sealing: no API is narrowed, and the
+  value is that `pub` on a binary's module now means what it says everywhere in
+  `rdnsd`.
 
 **The dependency objection is already answered, measured rather than argued**
 (§15's "pay for a parser; do not pay for a stub"). `toml` + `serde` is **nine

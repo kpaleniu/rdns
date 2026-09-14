@@ -34,24 +34,24 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const RELOAD_REPORT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Everything a command needs to answer, so the handlers take one argument.
-pub struct Control {
-    pub served: ZoneContext,
+pub(crate) struct Control {
+    pub(crate) served: ZoneContext,
     /// Zones this server replicates, so `status` can say which are secondary
     /// without inferring it from a timestamp that is also absent on a primary.
-    pub secondaries: Arc<crate::replication::Secondaries>,
+    pub(crate) secondaries: Arc<crate::replication::Secondaries>,
     /// The catalogs this server consumes, so `status` can say where a zone came
     /// from and `catalog` can say what a catalog holds — including the members
     /// it declined, which have no row anywhere else (RFC 9432 §6,
     /// `TODO.md` #49).
-    pub catalogs: Arc<crate::catalog::Catalogs>,
+    pub(crate) catalogs: Arc<crate::catalog::Catalogs>,
     /// Where a `reload` request goes: the same loop SIGHUP and the re-signing
     /// timer feed, so two reloads cannot install two snapshots of one file set.
-    pub reloads: tokio::sync::mpsc::Sender<ReloadTrigger>,
+    pub(crate) reloads: tokio::sync::mpsc::Sender<ReloadTrigger>,
     /// For the uptime line. `Instant`: an interval, and a clock step backwards
     /// must not make the server look newly started.
-    pub started: Instant,
+    pub(crate) started: Instant,
     /// The address the DNS listeners are on, for the header line.
-    pub listen: String,
+    pub(crate) listen: String,
 }
 
 /// Bind the socket, refusing rather than stealing it if a server is already
@@ -63,7 +63,7 @@ pub struct Control {
 /// - Bind under a temporary name, restrict to the owner, rename over the
 ///   target: the mode is in place before the published path exists, and the
 ///   rename leaves no unlink-then-bind gap for a racing process.
-pub fn bind(path: &Path) -> Result<UnixListener> {
+pub(crate) fn bind(path: &Path) -> Result<UnixListener> {
     if let Ok(dir) = path.parent().ok_or(()) {
         if !dir.as_os_str().is_empty() && !dir.is_dir() {
             return Err(anyhow!(
@@ -106,7 +106,7 @@ fn temp_path(path: &Path) -> PathBuf {
 ///
 /// The socket file is removed on the way out: a leftover makes `rdnsctl` say
 /// "connection refused" where "no such file" is the truth.
-pub async fn serve(
+pub(crate) async fn serve(
     listener: UnixListener,
     path: PathBuf,
     control: Arc<Control>,
