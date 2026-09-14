@@ -61,7 +61,12 @@ and none holding it — **closed the same day**, both sides reading one function
 now — and **63f**, the same bare-`pub` sweep for the `cfg(unix)` file Windows
 cannot compile, **also closed**, where the same method said 9 of 9 rather than
 18 of 84: `Control` is a struct `main.rs` builds and every field is an
-argument. `rdnsd` has no bare `pub` left.
+argument. `rdnsd` has no bare `pub` left. **63g is the other half of 63a's
+question** and kills the option 63a was framed around: `rdnsr` would name **0**
+of those 18, because every one is zones, signing or catalogs. What it wants a
+piece of is the private `Server`, 22 of whose 34 keys it already has as flags —
+so the open decision is a second parser against a split `[server]`, and the
+only code genuinely shared is `read_secret_file`.
 **#64 came out of asking 57d's question of `rdnsd`**: if a zone file is both
 the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
@@ -1751,7 +1756,7 @@ next caller is told the cost rather than finding it.
 
 ---
 
-### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a answered, 63e-f closed**
+### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a and 63g answered, 63e-f closed**
 
 Filed out of 57d, which cannot be decided without it: a transfer spec is per
 zone, and there is nowhere to write one. Filed as its own number rather than
@@ -1897,6 +1902,61 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   So this is `pub` to `pub(crate)` and no sealing: no API is narrowed, and the
   value is that `pub` on a binary's module now means what it says everywhere in
   `rdnsd`.
+
+- **63g. What `rdnsr` would name of `rdnsd`'s config: none of it — measured
+  2026-09-14.** 63a counted the surface; this is the other half of #37's
+  question, because a shared module is only shared if a second consumer names
+  something in it.
+
+  **0 of the 18.** Every escaping item is zones, signing or catalogs, and
+  `rdnsr` serves none: `Config` is a top-level with `[signing]`, `[keys]` and
+  `[zones]` in it; `Config::apply` takes `rdnsd`'s `Cli` *by type*; `PerZone`
+  is zone files, NOTIFY targets, signing overrides and RFC 9432 group rules;
+  `GroupRule` is catalogs; `ZoneSigningOverride` and `DnskeyRrsig` are signing.
+  **So moving `config.rs` into `rdns` shares nothing** — it would make 18
+  `rdnsd`-shaped items public API for one consumer. That option is dead, and
+  63a's line count was never going to say so.
+
+  **The type `rdnsr` would want a piece of is `Server`, which is not one of the
+  18** — it is private, and 63a is why that is visible. It holds 34 keys of
+  which 63b counted 22 as `rdnsr` flags already, so sharing it means exporting
+  a type with 12 fields (`tls-cert`, `control-socket`, `dnstap`, the
+  `transfer-tls-*` three, …) a resolver must ignore, or splitting it in two.
+  That is the decision 63 still has to make, and it is between 63b's second
+  parser and a split `[server]`, not between moving the module and not.
+
+  **What is actually shared is one function.** `read_secret_file` and its mode
+  check — §15's "a secret in a file is only better than a secret in `argv` if
+  the file is private" — is the only code in `config.rs` that is about neither
+  zones nor `rdnsd`, and 63c has `rdnsr` needing a TSIG keyring, which needs
+  it. Everything else shared is serde attributes (`deny_unknown_fields`,
+  `rename_all = "kebab-case"`) and a clap one (`conflicts_with = "config"`),
+  which are not code to move.
+
+  **Where the two daemons' defaults already stand**, since a config file for
+  `rdnsr` has to pick a number for each of 63b's 22: of the 16 flag names both
+  binaries default, **13 agree and 3 differ on purpose**. `--host` is
+  `0.0.0.0` against `127.0.0.1` ("Defaults to localhost to avoid an open
+  resolver"), and `--query-rate`/`--query-burst` are 1000/200 against 200/100,
+  which `rdnsr`'s own doc explains: "200 where `rdnsd`'s is 1000: an
+  authoritative server's clients are resolvers, and one resolver behind one
+  address legitimately asks orders of magnitude more than one person does."
+  So the 22 keys are not 22 numbers to unify — they are 19 agreements and 3
+  decisions, all three already taken and written down.
+
+  That doc comment does cite `rdnsd`'s number in prose across a crate
+  boundary, which nothing checks; it is correct today and is the kind of claim
+  §4 is about. Left as prose deliberately: the two numbers must be *allowed* to
+  differ, so there is nothing to make unrepresentable.
+
+  **And the sweep had a remainder, one crate out.** 63e cited
+  `rdns::FLAG_DAY_UDP_SIZE` on `rdnsd`'s `--udp-payload-size` and
+  `--max-udp-response`; `rdnsr` wrote `"1232"` for both, and its doc restated
+  it a third time. Fixed with this row — §18's "count the instances before
+  fixing one", which 63e obeyed within `rdnsd` and not across the workspace.
+  The line it draws: a *protocol* constant belongs in `rdns` and both binaries
+  cite it; a *policy* default like `--query-rate` does not, which is why the
+  other 13 agreements are not a defect to fix.
 
 **The dependency objection is already answered, measured rather than argued**
 (§15's "pay for a parser; do not pay for a stub"). `toml` + `serde` is **nine

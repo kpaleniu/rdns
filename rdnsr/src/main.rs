@@ -190,11 +190,11 @@ struct Cli {
     /// rather than about who is being told, which is how Unbound's
     /// `edns-buffer-size` reads. It also floors `--max-udp-request`.
     ///
-    /// 1232 is the default of BIND's `edns-udp-size`, Knot's `udp-max-payload`,
-    /// NSD's `ipv4-edns-size` and Unbound's `edns-buffer-size` after DNS Flag
-    /// Day 2020. Not the size an upstream answer is read into, which is
+    /// [`rdns::FLAG_DAY_UDP_SIZE`] is the default of BIND's `edns-udp-size`,
+    /// Knot's `udp-max-payload`, NSD's `ipv4-edns-size` and Unbound's
+    /// `edns-buffer-size` after DNS Flag Day 2020. Not the size an upstream answer is read into, which is
     /// separate since `TODO.md` #41c. Floored at 512.
-    #[arg(long, value_name = "OCTETS", default_value = "1232")]
+    #[arg(long, value_name = "OCTETS", default_value_t = rdns::FLAG_DAY_UDP_SIZE)]
     udp_payload_size: u16,
     /// Largest UDP reply this resolver will send, in octets.
     ///
@@ -203,7 +203,7 @@ struct Cli {
     /// cap the reply is an empty TC=1 and the client asks again over TCP, which
     /// is never capped. 65535 is "whatever the client asked for"; floored at
     /// 512.
-    #[arg(long, value_name = "OCTETS", default_value = "1232")]
+    #[arg(long, value_name = "OCTETS", default_value_t = rdns::FLAG_DAY_UDP_SIZE)]
     max_udp_response: u16,
     /// How often to report what the last interval's traffic looked like, in
     /// seconds. 0 turns the anomaly warnings off.
