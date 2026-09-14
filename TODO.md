@@ -37,7 +37,12 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#60** and **#21**, as of 2026-09-13.
+**#57**, **#58**, **#59**, **#60**, **#62** and **#21**, as of 2026-09-14.
+**#61 closed the day it was filed**: the reload is 3.76x faster and holds
+68 MB less per million rules, and rayon was measured and declined. Of #62,
+62b closed with it; **62a is the one that matters and is still open**, because
+it is on the answer path and nothing here has measured what should replace a
+linear scan for longest-prefix match.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -1296,6 +1301,189 @@ Three things to settle:
   there is no list of them to render.
 - **And it is its own commit** (§12): a mechanical rewrite of 21 literals mixed
   into a behaviour change makes both unreviewable.
+
+---
+
+### 61. A million-rule reload spends its time building the index, not parsing — **filed and closed 2026-09-14**
+
+#57b measured the reload from outside (2.74 s at 1M rules, 407 B/rule held,
+1.06 GB peak) and left where it goes unanswered. Answered now, by ablation
+against the real private functions rather than by reading the loop.
+
+**The parse is not the cost.** At 1M rules, of 2298 ms: reading the 38 MB file
+8 ms, `logical_lines` 141, tokenizing 235, owner `Name` 71, RDATA 119 — and then
+`Zone::add_record` **927 ms (40%)** and `check_cname_exclusivity` **755 ms
+(33%)**. `PolicyZone::new` is 41 ms; `trigger_subtree` rejects a QNAME rule and
+the loop moves on.
+
+Inside `add_record`, `note_non_terminals` is the largest single item (cumulative
+sub-ablation: 99 ms for the fold and push, 423 with the index entry, 466 with
+`Shortcuts::note`, **1113 with the non-terminals**).
+
+**The per-rule drift #57b saw and could not explain** — 1.5 µs at 10k against
+2.7 µs at 1M — is two hash tables outgrowing cache, and mostly not in the
+parser. `check_cname_exclusivity` alone goes 685 ns/rule at 100k to 1371 at 1M.
+The zone index reaches **2 M entries for 1M rules**: one per owner and one per
+empty non-terminal, and hashbrown rounds buckets to a power of two, so the ENTs
+double the table as well as the keys.
+
+- ~~**61a. The checks rebuild the index they could have asked.**~~ **Done.** `CLAUDE.md` §13's
+  "a scan beside the index that would have answered it", exactly:
+  `check_cname_exclusivity` built a second `HashMap<Name, (bool, Vec<Rtype>)>`
+  over every record — a `Name` clone and a `Vec` each — when `Zone::index` is
+  already that grouping under the same fold. Asked of the index instead:
+  **1371 ms -> 5.6 ms** at 1M. It is also the *memory* peak: dhat's call-stack
+  profile put the global high-water mark inside it, 196 B/rule of transient,
+  more than the records themselves. **Found independently by two passes, one
+  timing and one allocating, which is the strongest evidence on this page that
+  it is real.**
+- ~~**61b. `Zone::reserve` before the loop.**~~ **Done.** `logical_lines` already knows the
+  record count. Index build **743 -> 423 ms**. The hint is `2 * records` because
+  of the non-terminals; `1 *` buys only 743 -> 678, and the cost of `2 *` is an
+  oversized table for a zone whose names are all apex children.
+- ~~**61c. `note_non_terminals` owned what it walked.**~~ **Done.** A `&mut self` method, so
+  it allocated the origin key and every ancestor to satisfy the borrow checker —
+  four allocations per record. A free function over the index instead:
+  **1078 -> 891 ms**. Modest, and worth recording as such: the allocations were
+  not the bulk.
+- ~~**61d. The lexer copied the file to look at it.**~~ **Done.** `LogicalLine` and each token
+  are `Cow` now, borrowed unless a comment, quote, escape or parenthesis means
+  the token is not a contiguous run of the file. **347 -> 325 ms**, against a
+  measured floor of 22 ms for a bare borrowing split.
+- ~~**61e. The index value is a `Vec` per owner name.**~~ **Done, `Zone::Slot`.**
+  1M heap allocations of one element each, 32 bytes to hold 8.
+  `enum Slot { Ent, One, Spilled }` with the single case handed out through
+  `slice::from_ref`, so it has nothing on the heap and one fewer pointer to
+  chase. **Lookup is not slower** — `Zone::locate` 58/62 ns hit, 65/65 miss,
+  the hit path ~10% *faster*.
+
+  **The `usize` shape shipped, not the `u32` one that measures better.** Both
+  were built (§19): `u32` holds 308 B/rule against `usize`'s ~342, and buys that
+  33.5 MB per million with either an `expect` in `Zone::file` — a panic on a
+  load path, where this codebase wants a typed error (§4) — or a public
+  signature change to make `add_record` fallible. Neither is worth 33 MB, and
+  the row is left here rather than deleted because the number is real and a
+  checked boundary would unlock it.
+- **61f. What landed, measured together.** 61a-e were prototyped in three
+  separate passes and none of them measured the combination; these numbers are
+  the merged tree, taken with the same harness and against the same baseline as
+  #57b's:
+
+  | at 1M rules | before | after | |
+  |---|---|---|---|
+  | `PolicyZones::load` | 2.38 s | **0.633 s** | 3.76x |
+  | `PolicyStore::reload` | 2.74 s | **0.952 s** | 2.88x |
+  | held | 407.3 B/rule | **339.4** | -68 MB |
+  | reload peak | 1061.8 B/rule | **758.8** | -303 MB |
+
+  100k reloads in 71 ms against 170. The residual per-rule drift is the 2M-entry
+  table's cache behaviour and is inherent.
+
+  **Still open, upside measured, risk named:** keying the index by a 64-bit hash
+  would take ~339 -> ~122 B/rule, but a bare hash key is an attacker-findable
+  wrong answer, so it needs a witness record verified on every probe — including
+  the miss path a random-subdomain flood sends — and **that cost has not been
+  measured**. The one proxy attempt returned 4 ns for a random read into 50 MB,
+  which is not credible.
+
+**The 2x reload peak does not go away.** `reload` peak = old held + new load
+peak, exactly. Per-zone build-then-swap buys nothing in the case that matters:
+with one big feed, "old zone + new zone" *is* "old set + new set". It would only
+help a set of many zones, and only by giving up the all-or-nothing property that
+is the whole point (§4).
+
+#### Parallelism and rayon: measured, declined
+
+Recorded so it is not re-derived. `zone/parse.rs` couples every line to its
+predecessors five ways — an omitted owner, `$ORIGIN`, `$TTL`, `$INCLUDE`,
+parentheses — and a sixth that is not obvious: **an explicit per-record TTL
+writes back to the parse state** (RFC 1035 §5.1, "Omitted class and TTL values
+are default to the last explicitly stated values"), so a chunk's entry TTL
+depends on every line above it. The serial state walk is irreducible.
+
+Measured ceiling p ~ 25%, at most 49%; Amdahl at 16 cores 1.29-1.88x. Built
+anyway (§19): a two-pass parser reaches **1.41x at 4 threads**, is **0.68x at
+100k** — slower — and the restructuring alone costs 8% before a thread starts.
+At the size most operators run, a national blocklist of thousands of names, the
+whole parse is 13 ms.
+
+**The refuting measurement, taken first because it was most likely to settle
+it:** with 15 querier tasks on 16 workers, the serial reload costs the answer
+path **0-4%** of query throughput — `spawn_blocking` uses the one spare core —
+and a 16-thread reload costs **17-34%** and roughly triples tail latency. Under
+load the parallel reload **is not faster at all**: 4.37 s against 4.29 s. The
+displaced work is conserved; parallelism only concentrates it into a shorter,
+deeper dip. The one case it wins is an oversubscribed box, paid for in
+throughput.
+
+Across *files* `PolicyZones::load` is a loop with no coupling and parallelises
+near-linearly (9.7x over 16 equal feeds), but it is bounded by the largest file,
+and the realistic shape is one huge commercial feed beside small national lists.
+If it is ever wanted it is ~15 lines of `std::thread::scope` and must collect
+every result and fail on the *path-order* first error, or §4's all-or-nothing
+gets a nondeterministic message.
+
+**rayon specifically: no.** Five packages, and — measured rather than read, which
+is §14's rule — one `par_iter()` call leaves **16 resident OS threads** for the
+life of the daemon. `std::thread::scope` matched it on every timing taken
+(3.69x vs 3.67x, 9.52x vs 9.71x, 1.31x vs 1.29x) and leaves nothing behind.
+There is no measurement in which rayon wins. A faster hasher was built too, and
+is *worse*: reserve plus a hand-rolled Fx is 599 ms against reserve alone at
+423.
+
+---
+
+### 62. Three unbounded-input traps behind an assumption nothing enforces — **filed 2026-09-14, 62b closed, 62a and 62c open**
+
+Found while measuring #61, none of them the thing being looked for. The shape is
+one: a loop written under a stated belief about how big its input is, with
+nothing checking that the belief holds, and the input supplied by a file. For an
+`--rpz` feed that file is a *third party's* — the commercial malware feeds are
+exactly the large ones — so "the operator would not do that" is not the
+reassurance it is elsewhere. `CLAUDE.md` §5's "count the multipliers, and time
+the worst case rather than reading the loop".
+
+- **62a. A per-query linear scan for longest-prefix match.** The worst of the
+  three, because it is on the answer path. `PolicyZone`'s `client_ip`,
+  `response_ip` and `ns_ip` are sorted `Vec`s scanned end to end per query, under
+  a comment that says why: *"Longest prefix wins, which a linear scan gives once
+  the list is in that order. These lists are tens of entries: a feed's bulk is
+  QNAME triggers."* Nothing enforces it, and an IP blocklist delivered as RPZ is
+  all `rpz-ip`. Measured on the miss path, which is what every ordinary query
+  pays: **131 ns at 10 rules, 3.00 us at 1 000, 32.1 us at 10 000, 204.6 us at
+  50 000** — linear at ~4 ns a rule. `benches/answer_path.rs` reads 522 ns for a
+  whole answer and 3.6-4.1 us for one `sendto`+`recvfrom` pair, so at 50k rules
+  the policy scan is ~400x a whole answer. No remedy filed: longest-prefix match
+  wants a different structure, and which one has not been measured here (§18 —
+  a row naming a wrong remedy is worse than one naming none).
+- ~~**62b. `PolicyZone::new` de-duplicates trigger owners quadratically.**~~
+  **Done.**
+  `seen: Vec<Name>` probed with `seen.iter().any(...)` per record landing in a
+  trigger subtree. Zero for a QNAME feed, which is why #61 measured the whole of
+  `PolicyZone::new` at 41 ms and saw nothing. Measured on address triggers:
+  **6.7 / 23.3 / 92.8 / 400.3 ms at 2k / 4k / 8k / 16k**, four times per
+  doubling; the same feed shape reads 114 ms at 10k and 3.73 s at 50k through
+  `PolicyZones::load`. A `HashSet<Name>` — `Name`'s `Hash` is the same RFC 4343
+  fold the scan compared by — takes 16k to **8.5 ms**, linear, with identical
+  `trigger_counts`. Independently reproduced end to end: a 50k-rule feed loads in
+  **53 ms against 3.73 s**, 70x.
+
+  The regression test is a *ratio*, not a wall-clock floor (§10): doubling the
+  rules must not quadruple the work. Verified failing against the scan —
+  59.5 ms at 8k against 236.8 at 16k, 4x — and passing at ~2x with the set.
+- **62c. A top-level `$ORIGIN` reindexes the whole zone.** `parse.rs` calls
+  `Zone::set_origin` for each one and `set_origin` calls `reindex()`, which
+  rebuilds the index over every record parsed so far — O(sections x records).
+  Measured at 40 000 records: **47.6 ms with one `$ORIGIN`, 104.8 with 16, 306.6
+  with 64.** The worst legal shape, an `$ORIGIN` before every record, is
+  ~O(n^2.2): **530 ms at 2k records, 1.90 s at 4k, 8.88 s at 8k, 41.53 s at
+  16k.** Not remote-triggerable — no wire path builds a `Zone` through the text
+  parser, since AXFR assembles records directly — but it is a startup or reload
+  hang with nothing alerting, from a file somebody else wrote.
+
+Not measured, stated as a code fact only: `reindex` is also the only caller that
+makes `set_origin` O(n), and whether any caller needs `set_origin` to be cheap
+has not been checked.
 
 ---
 

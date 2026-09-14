@@ -47,6 +47,7 @@ use crate::resolver::NameserverPolicy;
 use crate::security::prefix_matches;
 use crate::zone::{parse_zone_file_at, Located, NameKind, Zone, ZoneRecord};
 use crate::{Name, NameRef, ParsedRecord, Qtype, ResourceRecord, Serial};
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -243,17 +244,20 @@ impl PolicyZone {
         let mut response_ip = Vec::new();
         let mut ns_ip = Vec::new();
         let mut nsdname = 0;
-        let mut seen: Vec<Name> = Vec::new();
+        // A set, not a `Vec` scanned per record: an IP blocklist delivered as
+        // RPZ is all `rpz-ip` rules and the scan was quadratic in them — 400 ms
+        // to index 16k, four times that per doubling (`TODO.md` #62b). `Name`'s
+        // `Hash` is the ASCII fold (RFC 4343), the comparison the scan made.
+        let mut seen: HashSet<Name> = HashSet::new();
         for record in zone.records() {
             let owner = record.name.as_ref();
             let Some(kind) = trigger_subtree(owner, origin) else {
                 continue;
             };
             // One rule per owner name, however many records sit at it.
-            if seen.iter().any(|s| s.as_ref() == owner) {
+            if !seen.insert(record.name.clone()) {
                 continue;
             }
-            seen.push(record.name.clone());
             // An NSDNAME trigger's labels are a name, not an address; the
             // lookup that matches one is the zone's own, so nothing is indexed
             // here beyond knowing whether to try it at all.
@@ -925,6 +929,53 @@ ns.evil.example.com.rpz-nsdname IN CNAME .
 good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
 32.13.2.0.192.rpz-nsip      IN CNAME .
 ";
+
+    /// Indexing address triggers must not be quadratic in their number.
+    ///
+    /// A ratio, not a wall-clock floor: doubling the rules must roughly double
+    /// the work, which is machine-independent where a time limit is a coin toss
+    /// (`CLAUDE.md` §10). The `Vec` scanned per record read 4x per doubling —
+    /// 92.8 ms at 8k rules and 400.3 ms at 16k — and fails this at 3x with room
+    /// to spare, while the set is at ~2x.
+    ///
+    /// The trigger lists are what the module's own comment calls "tens of
+    /// entries". Nothing enforces that, and an IP blocklist delivered as RPZ is
+    /// all `rpz-ip` (`TODO.md` #62b).
+    #[test]
+    fn indexing_address_triggers_does_not_grow_quadratically() {
+        fn feed(rules: usize) -> String {
+            let mut text = String::from(
+                "$TTL 60\n\
+                 @ IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. 1 3600 600 86400 60\n\
+                 @ IN NS localhost.\n",
+            );
+            for i in 0..rules {
+                let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
+                text.push_str(&format!("32.{c}.{b}.{a}.10.rpz-ip IN CNAME .\n"));
+            }
+            text
+        }
+        fn index(rules: usize) -> std::time::Duration {
+            let zone = parse_zone_file(&feed(rules), ORIGIN).expect("parses");
+            let start = std::time::Instant::now();
+            let indexed = PolicyZone::new(zone, PolicyOverride::Given).expect("indexes");
+            let took = start.elapsed();
+            assert_eq!(
+                indexed.trigger_counts()[2],
+                rules,
+                "every rule is a trigger"
+            );
+            took
+        }
+
+        let small = index(8_000);
+        let large = index(16_000);
+        assert!(
+            large < small * 3,
+            "twice the rules must not cost four times the work: \
+             {small:?} at 8k against {large:?} at 16k"
+        );
+    }
 
     fn policy_zones(policy: PolicyOverride) -> PolicyZones {
         let zone = parse_zone_file(POLICY, ORIGIN).expect("the policy zone parses");
