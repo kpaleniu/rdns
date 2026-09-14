@@ -65,6 +65,31 @@ pub fn origin_from_path(path: &str) -> String {
     }
 }
 
+/// Positions in [`Zone::records`], by the folded wire form of the owner name.
+/// Named so that [`Zone::note_non_terminals`] can take it apart from the rest
+/// of the zone.
+type NameIndex = HashMap<Box<[u8]>, Slot>;
+
+/// Where one owner name's records are.
+///
+/// A `Vec<usize>` per key was 24 bytes in the table plus a 32-byte allocation to
+/// hold a single 8-byte position — and in a policy feed *every* name owns one
+/// record, so that was a million allocations of one element (`TODO.md` #61e).
+/// The single case is handed out through `slice::from_ref`, so it has nothing on
+/// the heap and one fewer pointer to chase.
+#[derive(Debug, Clone)]
+enum Slot {
+    /// An empty non-terminal: a node of the zone with no records of its own
+    /// (RFC 4592 §2.2.2). Distinct from `One`/`Spilled` because "does this name
+    /// exist at all" and "does it have records" are the two halves of
+    /// NXDOMAIN-versus-NODATA and this answers both in one probe.
+    Ent,
+    /// The one record at this name.
+    One(usize),
+    /// More than one: the index into [`Zone::spills`] of the list.
+    Spilled(usize),
+}
+
 /// A single DNS resource record stored in a zone
 #[derive(Debug, Clone)]
 pub struct ZoneRecord {
@@ -100,7 +125,10 @@ pub struct Zone {
     /// through `Borrow` without the `unsafe` cast `str` uses. `Box<[u8]>`
     /// borrows as `[u8]`, so a lookup costs a fold only when the name arrived
     /// in mixed case.
-    index: HashMap<Box<[u8]>, Vec<usize>>,
+    index: NameIndex,
+    /// The position lists of the names that own more than one record. See
+    /// [`Slot`]; a name that owns one keeps its position in the table.
+    spills: Vec<Vec<usize>>,
     /// The NSEC chain, keyed by canonical sort order, and the NSEC3 chain,
     /// keyed by hash — both empty for an unsigned zone.
     ///
@@ -238,6 +266,7 @@ impl Zone {
             origin,
             records: Vec::new(),
             index: HashMap::new(),
+            spills: Vec::new(),
             nsec_chain: BTreeMap::new(),
             nsec3_chain: BTreeMap::new(),
             shortcuts: Shortcuts::default(),
@@ -254,6 +283,14 @@ impl Zone {
         &self.records
     }
 
+    /// The records at each owner name, as positions in [`Zone::records`]: the
+    /// grouping `index` already is, for a zone-wide check that would otherwise
+    /// build a second map to get it (`super::checks`). Empty for an empty
+    /// non-terminal.
+    fn groups(&self) -> impl Iterator<Item = &[usize]> {
+        self.index.values().map(|slot| self.positions(slot))
+    }
+
     /// Move the zone's apex, as a top-level `$ORIGIN` does.
     ///
     /// No record moves: a [`Name`] is absolute, so an owner name means the same
@@ -265,19 +302,34 @@ impl Zone {
         self.reindex();
     }
 
+    /// Room for `records` more records, and for the index entries they bring.
+    ///
+    /// A loader that knows how many records are coming should say so: growing
+    /// the index from empty rehashes every key already in it at each doubling,
+    /// which was 320 ms of a million-rule RPZ load. Twice `records` because an
+    /// owner name below the apex also enters its ancestors
+    /// ([`Zone::note_non_terminals`]) — right for a feed of `<name>.<origin>`
+    /// rules, and one doubling of the table too many for a zone whose names are
+    /// all children of the apex.
+    pub(crate) fn reserve(&mut self, records: usize) {
+        self.records.reserve(records);
+        self.index.reserve(2 * records);
+    }
+
     /// Add a record to the zone
     pub fn add_record(&mut self, record: ZoneRecord) {
         // Owned: the key becomes an index entry, and the statements below need
         // `&mut self`.
         let key = record.name.as_ref().folded().into_owned();
         let position = self.records.len();
-        let at_apex = key == *self.origin_key();
+        // Through the field rather than `origin_key()`, so the borrow is of
+        // `self.origin` alone and `self.index` can be taken mutably beside it.
+        let origin_key = self.origin.as_ref().folded();
+        let at_apex = key == *origin_key;
         self.shortcuts.note(&key, record.rdata.rtype(), at_apex);
-        self.note_non_terminals(&key);
-        self.index
-            .entry(key.into_boxed_slice())
-            .or_default()
-            .push(position);
+        Zone::note_non_terminals(&mut self.index, &key, &origin_key);
+        drop(origin_key);
+        self.file(key.into_boxed_slice(), position);
         match self.chain_key(&record) {
             Some(ChainKey::Nsec(k)) => {
                 self.nsec_chain.insert(k, position);
@@ -303,7 +355,7 @@ impl Zone {
         let mut buf = Vec::new();
         self.index
             .get(name.folded_in(&mut buf).as_wire())
-            .is_some_and(|positions| !positions.is_empty())
+            .is_some_and(|slot| !matches!(slot, Slot::Ent))
     }
 
     pub fn has_nsec_chain(&self) -> bool {
@@ -411,7 +463,7 @@ impl Zone {
         Located {
             zone: self,
             kind,
-            positions: at.map_or(&[][..], Vec::as_slice),
+            positions: at.map_or(&[][..], |slot| self.positions(slot)),
         }
     }
 
@@ -483,8 +535,8 @@ impl Zone {
         // One hash for both questions: present with records is `Exact`, present
         // without is an empty non-terminal (`TODO.md` #22).
         match self.index.get(key.as_wire()) {
-            Some(positions) if !positions.is_empty() => return NameKind::Exact,
-            Some(_) => return NameKind::EmptyNonTerminal,
+            Some(Slot::Ent) => return NameKind::EmptyNonTerminal,
+            Some(_) => return NameKind::Exact,
             None => {}
         }
 
@@ -629,11 +681,44 @@ impl Zone {
     /// is a singleton type (RFC 6672 §2.4), so for that one "the first" is
     /// "the one".
     fn first_of_type(&self, key: NameRef<'_>, rtype: Rtype) -> Option<&ZoneRecord> {
-        self.index
-            .get(key.as_wire())?
+        self.positions(self.index.get(key.as_wire())?)
             .iter()
             .map(|&i| &self.records[i])
             .find(|r| r.rdata.rtype() == rtype)
+    }
+
+    /// File `position` under `key`, spilling at the *second* record.
+    ///
+    /// An owner name with one record keeps its position in the table; the names
+    /// that hold an RRset of several, or several types, get a list. Which way a
+    /// zone leans decides the cost, and a policy feed leans entirely one way.
+    fn file(&mut self, key: Box<[u8]>, position: usize) {
+        match self.index.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(Slot::One(position));
+            }
+            Entry::Occupied(mut slot) => match *slot.get() {
+                // A name noted as an ancestor now has a record of its own.
+                Slot::Ent => {
+                    slot.insert(Slot::One(position));
+                }
+                Slot::One(first) => {
+                    self.spills.push(vec![first, position]);
+                    slot.insert(Slot::Spilled(self.spills.len() - 1));
+                }
+                Slot::Spilled(list) => self.spills[list].push(position),
+            },
+        }
+    }
+
+    /// The positions a slot names, empty for an empty non-terminal — which is
+    /// what lets one probe answer both halves of NXDOMAIN-versus-NODATA.
+    fn positions<'a>(&'a self, slot: &'a Slot) -> &'a [usize] {
+        match slot {
+            Slot::Ent => &[],
+            Slot::One(position) => std::slice::from_ref(position),
+            Slot::Spilled(list) => &self.spills[*list],
+        }
     }
 
     /// Record every ancestor of `key`, up to the apex, as a name that exists.
@@ -645,23 +730,26 @@ impl Zone {
     /// "Known" now includes an ancestor that has records of its own, which is
     /// the same guarantee for the same reason — a record's own insertion noted
     /// *its* ancestors.
-    fn note_non_terminals(&mut self, key: &[u8]) {
-        // Owned: the loop below takes `&mut self`.
-        let origin = self.origin_key().into_owned();
-        let mut name = key.to_vec();
-        while let Some(parent) = parent_key(&name) {
+    /// A free function taking the two fields it needs rather than `&mut self`,
+    /// so the walk can slice `key` in place: owning each ancestor to satisfy one
+    /// `&mut self` cost four allocations per record and 0.65 s of a million-rule
+    /// load.
+    fn note_non_terminals(index: &mut NameIndex, key: &[u8], origin: &[u8]) {
+        let mut name = key;
+        while let Some(parent) = parent_key(name) {
             if parent.len() < origin.len() {
                 // An owner outside the zone — foreign glue, say. Its ancestors
                 // are somebody else's names and do not exist here.
                 return;
             }
-            let parent = parent.to_vec();
-            let reached_apex = parent == origin;
-            match self.index.entry(parent.clone().into_boxed_slice()) {
-                Entry::Occupied(_) => return,
-                Entry::Vacant(slot) => slot.insert(Vec::new()),
-            };
-            if reached_apex {
+            // `contains_key` then `insert` hashes twice on the miss, which is
+            // the one that also allocates; `entry` would hash once and allocate
+            // on the *hit* too, which is the commoner of the two here.
+            if index.contains_key(parent) {
+                return;
+            }
+            index.insert(parent.into(), Slot::Ent);
+            if parent == origin {
                 return;
             }
             name = parent;
@@ -687,16 +775,14 @@ impl Zone {
             })
             .collect();
         self.index.clear();
+        self.spills.clear();
         // Recomputed, not carried: `set_origin` turns an apex NS RRset into a
         // zone cut, and a wildcard at the old apex into one below the new.
         self.shortcuts = Shortcuts::default();
         for (position, (key, rtype, at_apex)) in keys.into_iter().enumerate() {
             self.shortcuts.note(&key, rtype, at_apex);
-            self.note_non_terminals(&key);
-            self.index
-                .entry(key.into_boxed_slice())
-                .or_default()
-                .push(position);
+            Zone::note_non_terminals(&mut self.index, &key, &origin_key);
+            self.file(key.into_boxed_slice(), position);
         }
 
         // The chains are keyed by the absolute name too, so moving the origin
@@ -1670,6 +1756,29 @@ $TTL 3600
         );
     }
 
+    /// `logical_lines` borrows a line that holds no comment, quote, escape or
+    /// parenthesis and copies one that does. The two paths must agree, which is
+    /// what a fast path added for speed can quietly stop doing: a regression
+    /// test for the split, not for any bug.
+    #[test]
+    fn a_trailing_comment_changes_nothing_but_the_path_through_the_lexer() {
+        let bare = "www IN A 192.0.2.1\n   IN A 192.0.2.2\n";
+        let commented = "www IN A 192.0.2.1  ; the first\n   IN A 192.0.2.2 ; and the second\n";
+        let of = |text: &str| -> Vec<(String, Vec<u8>)> {
+            parse_zone_file(text, "example.com.")
+                .unwrap()
+                .records()
+                .iter()
+                .map(|r| (r.name.as_ref().to_presentation(), r.rdata.bytes().to_vec()))
+                .collect()
+        };
+        assert_eq!(of(bare), of(commented));
+        // The owner name carried over from the previous line is the half a
+        // fast path can lose: it is read off the *raw* line's indentation.
+        assert_eq!(of(bare).len(), 2);
+        assert_eq!(of(bare)[1].0, "www.example.com.");
+    }
+
     /// A `;` inside a quoted string is data, not a comment — SPF and DKIM
     /// records are mostly semicolons.
     #[test]
@@ -2030,11 +2139,11 @@ $TTL 3600
     #[test]
     fn the_rdata_half_can_be_tested_without_a_zone_file() {
         let fields = ["10", "mx.example.com."];
-        let text: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
+        let text: Vec<Cow<'_, str>> = fields.iter().map(|s| Cow::Borrowed(*s)).collect();
         let origin = nm("example.com.");
         let mx = rdata_from_fields(
             "MX",
-            "10 mx.example.com.".into(),
+            Cow::Borrowed("10 mx.example.com."),
             &fields,
             &text,
             origin.as_ref(),
@@ -2052,10 +2161,10 @@ $TTL 3600
         // The line number travels with the error: the helpers return a detail
         // and this function attaches the position.
         let bad = ["notanumber", "mx.example.com."];
-        let text: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+        let text: Vec<Cow<'_, str>> = bad.iter().map(|s| Cow::Borrowed(*s)).collect();
         let err = rdata_from_fields(
             "MX",
-            "notanumber mx.example.com.".into(),
+            Cow::Borrowed("notanumber mx.example.com."),
             &bad,
             &text,
             origin.as_ref(),

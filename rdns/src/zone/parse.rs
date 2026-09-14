@@ -16,6 +16,7 @@ use super::rdata::{parse_generic_rdata, rdata_from_fields};
 use super::{Zone, ZoneRecord};
 use crate::error::{WireError, ZoneError};
 use crate::{Class, Name, NameRef, RecordData, Ttl};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 /// A zone-file owner name in absolute form, resolved against `origin`: `@` and
@@ -46,27 +47,52 @@ pub(super) fn name_at(name: &str, origin: NameRef<'_>, ln: usize) -> Result<Name
 }
 
 /// One record or directive, assembled from as many physical lines as it spans.
-struct LogicalLine {
+struct LogicalLine<'a> {
     /// The physical line it started on, so an error still points at the file.
     line_no: usize,
     /// Comments stripped, parentheses removed, continuation lines joined.
-    text: String,
+    ///
+    /// Borrowed from the file when there was nothing to strip and nothing to
+    /// join, which is every line of a blocklist: a `String` per line was 140 ms
+    /// of a million-rule load.
+    text: Cow<'a, str>,
     /// The first physical line began with whitespace, so the record inherits the
     /// previous owner name (RFC 1035 §5.1).
     omits_owner: bool,
+}
+
+/// The five characters that make a physical line anything but its own text:
+/// a comment, a quoted string, an escape, or a parenthesized group.
+fn needs_assembling(raw: &str) -> bool {
+    raw.bytes()
+        .any(|b| matches!(b, b';' | b'"' | b'\\' | b'(' | b')'))
 }
 
 /// Split a zone file into logical lines (RFC 1035 §5.1).
 ///
 /// Not `content.lines()`: parentheses group data across a line boundary, and `;`
 /// begins a comment except inside a quoted string.
-fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, ZoneError> {
-    let mut out: Vec<LogicalLine> = Vec::new();
-    let mut pending: Option<LogicalLine> = None;
+fn logical_lines(content: &str) -> Result<Vec<LogicalLine<'_>>, ZoneError> {
+    let mut out: Vec<LogicalLine<'_>> = Vec::new();
+    let mut pending: Option<LogicalLine<'_>> = None;
     let mut depth = 0usize;
 
     for (idx, raw) in content.lines().enumerate() {
         let ln = idx + 1;
+        // Nothing to strip, nothing open: the line is its own text. The loop
+        // below would copy it character by character to the same result.
+        if depth == 0 && pending.is_none() && !needs_assembling(raw) {
+            let text = raw.trim();
+            if text.is_empty() {
+                continue;
+            }
+            out.push(LogicalLine {
+                line_no: ln,
+                omits_owner: raw.starts_with(|c: char| c.is_whitespace()),
+                text: Cow::Borrowed(text),
+            });
+            continue;
+        }
         let mut text = String::with_capacity(raw.len());
         let mut quoted = false;
         let mut escaped = false;
@@ -110,8 +136,9 @@ fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, ZoneError> {
             Some(open) => {
                 let more = text.trim();
                 if !more.is_empty() {
-                    open.text.push(' ');
-                    open.text.push_str(more);
+                    let joined = open.text.to_mut();
+                    joined.push(' ');
+                    joined.push_str(more);
                 }
             }
             None => {
@@ -124,7 +151,7 @@ fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, ZoneError> {
                 pending = Some(LogicalLine {
                     line_no: ln,
                     omits_owner: text.starts_with(|c: char| c.is_whitespace()),
-                    text: text.trim().to_string(),
+                    text: Cow::Owned(text.trim().to_string()),
                 });
             }
         }
@@ -151,7 +178,13 @@ fn logical_lines(content: &str) -> Result<Vec<LogicalLine>, ZoneError> {
 /// (`""`) is legal — neither survives `split_whitespace`. Escapes are resolved
 /// inside quotes only: a bare `a\.b` is a name, and names are not this
 /// function's business.
-fn tokenize(text: &str) -> Vec<String> {
+///
+/// Borrowed unless a quote or an escape means the token is not a contiguous
+/// run of the input: a `String` per token was 240 ms of a million-rule load.
+fn tokenize(text: &str) -> Vec<Cow<'_, str>> {
+    if !text.bytes().any(|b| matches!(b, b'"' | b'\\')) {
+        return text.split_whitespace().map(Cow::Borrowed).collect();
+    }
     let mut out = Vec::new();
     let mut current = String::new();
     let mut started = false;
@@ -181,7 +214,7 @@ fn tokenize(text: &str) -> Vec<String> {
             }
             c if c.is_whitespace() && !in_quotes => {
                 if started {
-                    out.push(std::mem::take(&mut current));
+                    out.push(Cow::Owned(std::mem::take(&mut current)));
                     started = false;
                 }
             }
@@ -192,7 +225,7 @@ fn tokenize(text: &str) -> Vec<String> {
         }
     }
     if started {
-        out.push(current);
+        out.push(Cow::Owned(current));
     }
     out
 }
@@ -255,12 +288,16 @@ fn parse_into(
     base_dir: Option<&Path>,
     depth: usize,
 ) -> Result<(), ZoneError> {
-    for logical in logical_lines(content)? {
+    let lines = logical_lines(content)?;
+    // An upper bound on the records this file adds, and the only cheap one
+    // there is: directives and blank lines are the slack.
+    zone.reserve(lines.len());
+    for logical in lines {
         let ln = logical.line_no;
         // Quoted strings stay whole; `parts` is the plain view of the same
         // fields, which is all any record but TXT needs.
         let tokens = tokenize(&logical.text);
-        let parts: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let parts: Vec<&str> = tokens.iter().map(Cow::as_ref).collect();
         let Some(&first) = parts.first() else {
             continue;
         };
@@ -384,7 +421,12 @@ fn parse_into(
 
         let record_type = parts[idx].to_uppercase();
         idx += 1;
-        let rdata = parts[idx..].join(" ");
+        // One field is the whole RDATA text, which is most records; joining a
+        // one-element slice copies it for nothing.
+        let rdata: Cow<'_, str> = match &parts[idx..] {
+            [one] => Cow::Borrowed(one),
+            rest => Cow::Owned(rest.join(" ")),
+        };
 
         // RFC 3597 §5's generic form, `\# <length> <hex>`: the only way to write
         // a type with no parser here, and what the zone writer emits when the

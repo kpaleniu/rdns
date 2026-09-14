@@ -743,7 +743,12 @@ fn one_zone_load_and_sign() {
     let (zone, parse_count) = allocations(|| parse_zone_file(ZONE, "example.com.").expect("parse"));
     // Eight records. A ceiling on how much per record, not a claim that a
     // per-record cost is wrong.
-    within("parse an eight-record zone", parse_count, 120..=320);
+    //
+    // Was 120..=320 until the lexer stopped copying: a logical line, a token and
+    // a one-field RDATA text are borrowed from the file unless a comment, a
+    // quote, an escape or a parenthesis means they are not a contiguous run of
+    // it. 89 here, and 325 ms of a million-rule RPZ load.
+    within("parse an eight-record zone", parse_count, 60..=200);
 
     let keys = vec![
         SigningKey::generate(

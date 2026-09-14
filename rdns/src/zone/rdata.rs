@@ -20,6 +20,7 @@ use crate::denial_wire::base32hex_decode;
 use crate::error::ZoneError;
 use crate::record_types as rt;
 use crate::{NameRef, ParsedRecord, RecordData, Serial};
+use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// The small parse helpers below return `Result<_, String>` on purpose: they
@@ -228,9 +229,9 @@ fn split_svcb_head<'a>(
 /// (RFC 1035 §3.3.14).
 pub(super) fn rdata_from_fields(
     record_type: &str,
-    rdata: String,
+    rdata: Cow<'_, str>,
     fields: &[&str],
-    text_fields: &[String],
+    text_fields: &[Cow<'_, str>],
     origin: NameRef<'_>,
     ln: usize,
 ) -> Result<RecordData, ZoneError> {

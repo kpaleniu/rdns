@@ -28,38 +28,40 @@ use super::Zone;
 use crate::error::ZoneError;
 use crate::record_types as rt;
 use crate::{Name, Rtype};
-use std::collections::HashMap;
 
 /// RFC 1034 §3.6.2: a CNAME must be the only type at its owner name. Refused at
 /// load, because there is no correct answer to give at query time.
 ///
 /// RRSIG, NSEC and NSEC3 are excepted — they describe the name rather than name
 /// it (RFC 4035 §2.5).
+///
+/// Asked of `Zone::groups`, the owner-name grouping the index already is: a
+/// second `HashMap<Name, _>` built here cost a `Name` clone and a `Vec` per
+/// record and was a third of a million-rule RPZ load (`CLAUDE.md` §13, "a scan
+/// beside the index that would have answered it").
 pub(super) fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
-    let mut by_name: HashMap<Name, (bool, Vec<Rtype>)> = HashMap::new();
-    for record in zone.records() {
-        let rtype = record.rdata.rtype();
-        if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3) {
+    for positions in zone.groups() {
+        // One record cannot be a CNAME *and* another type, and an empty
+        // non-terminal has none.
+        if positions.len() < 2 {
             continue;
         }
-        let entry = by_name
-            .entry(record.name.clone())
-            .or_insert((false, Vec::new()));
-        if rtype == rt::CNAME {
-            entry.0 = true;
+        let mut has_cname = false;
+        let mut others: Vec<Rtype> = Vec::new();
+        for &position in positions {
+            let rtype = zone.records()[position].rdata.rtype();
+            if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3) {
+                continue;
+            }
+            if rtype == rt::CNAME {
+                has_cname = true;
+            } else if !others.contains(&rtype) {
+                others.push(rtype);
+            }
         }
-        if !entry.1.contains(&rtype) {
-            entry.1.push(rtype);
-        }
-    }
-
-    for (name, (has_cname, types)) in by_name {
-        if has_cname && types.len() > 1 {
-            let others: Vec<String> = types
-                .iter()
-                .filter(|&&t| t != rt::CNAME)
-                .map(|t| t.to_string())
-                .collect();
+        if has_cname && !others.is_empty() {
+            let name = &zone.records()[positions[0]].name;
+            let others: Vec<String> = others.iter().map(Rtype::to_string).collect();
             return Err(ZoneError::invalid(format!(
                 "{name} has a CNAME and also type(s) {} — RFC 1034 §3.6.2 allows a CNAME to be \
                  the only type at a name, and a resolver given both has no way to know which \
