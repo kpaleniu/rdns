@@ -96,7 +96,9 @@ million-record zone in one go still saves 54-60%, so there is no edit size at
 which re-signing from scratch is the right call. What is left of 65a is not
 whether it is worth doing but *which runs may* carry forward, since
 `reuse` refuses only an already-expired signature and the re-signing tick has
-to go on refreshing.
+to go on refreshing. **65c inventories the four shapes** — keyed on the
+trigger, on signature age, on whether the file moved, and one the tree already
+declines — none of them built, so the preference in it is provisional.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -2238,7 +2240,7 @@ unknown, and taking it is the thing that would reopen this.
 
 ---
 
-### 65. Every load re-signs every zone from scratch — **filed 2026-09-14, 65b measured**
+### 65. Every load re-signs every zone from scratch — **filed 2026-09-14, 65b measured, 65c filed**
 
 Filed out of 64e, which measured the dynamic-UPDATE path and could not speak
 for this one. Two of 64e's six passes — building the carry-forward index and
@@ -2296,10 +2298,27 @@ one. Same code, same zone, same absolute cost; only the denominator moves.
   version — and the measured difference is 9.4 s against 27.1 s at a million
   records, the same carry-forward that already runs per UPDATE.
 
-  **The prerequisite, which is why this is a row and not a fix.** `Reloading`
+  ~~**The prerequisite, which is why this is a row and not a fix.** `Reloading`
   holds `secondaries`, `zone_dir`, `signing`, `validator` and `proved` — not
   the served zones. `ZoneMap::snapshot` exists for "a caller that cannot finish
-  under the lock" (#64a) and is the shape, but nothing hands it down today.
+  under the lock" (#64a) and is the shape, but nothing hands it down today.~~
+
+  **That was wrong about where the served zones are, 2026-09-14.** True of
+  `Reloading`, and the row stopped at the type it had opened. One level up,
+  `reload_once` destructures a `ReloadContext` whose `served: ZoneContext`
+  carries the live `Arc<RwLock<Zones>>`, and `ZoneMap::snapshot` is already
+  there for exactly this. So the prerequisite is passing a snapshot down one
+  level, not plumbing new state — §4's "never state what a function does
+  without opening it", applied to a struct one call up from the one that was
+  opened.
+
+  **The constraint that shapes every remedy**, and the reason none of them is
+  simply "carry forward at a reload": there is **one** reload path with three
+  triggers — `ReloadTrigger::{Signal, Timer, Control}` — and
+  `ZoneSigning::resign_interval`'s doc says the timer refreshes *by reloading*,
+  because the served serial is the file's plus a time term
+  (`zone_signer::signed_serial`) and re-signing the in-memory zone would
+  compound the bump every cycle. The timer's reload **is** the refresh.
 
 - **65b. Whether carrying forward at a reload is *safe* is the open half; what
   it is *worth* is measured — 2026-09-14.**
@@ -2348,6 +2367,44 @@ one. Same code, same zone, same absolute cost; only the denominator moves.
   shape is already in the tree on the other side: #53 made *verification* skip
   a zone this process signed with the same keys, keyed on `SigningRun`, and
   what that keys on is the thing this would need too.
+
+- **65c. Four options, read off the code and none of them built** — so this is
+  an inventory and the preference at the end is provisional, which is the
+  distinction #57d's own three shapes draw and §19 says to settle by building.
+
+  - **A. Key it on the trigger.** `Timer` full-signs; `Signal` and `Control`
+    carry forward. Cheapest: `ReloadTrigger` already reaches `reload_once` and
+    the served map is already in scope there. Refresh stays correct because the
+    timer is independent of the other two. Rollover is already safe —
+    `PreviousSignatures::reuse` compares the key-tag sets, so a change in the
+    active signers forces a re-sign whatever the trigger. **Weakness**: it keys
+    on *why* rather than on *what is due*, so a timer tick still pays 27 s a
+    zone when every signature is fresh — and #44f shortens that interval for
+    *all* zones whenever any one key transitions.
+  - **B. Key it on signature age.** Give `reuse` a "refresh before" instant
+    instead of its `expiration <= signed_at` test. Trigger-independent, so all
+    three paths get it with nothing to keep in sync (§7), and it makes the
+    *timer* cheap too, which A does not. It also fixes what is actually wrong:
+    `reuse` refuses a signature only once it has **already expired**, and
+    `resign_after` exists to say when one is due, a third of the validity out.
+    `SigningPolicy::expiry_for` already spreads expiry deterministically per
+    (owner, type), so refreshing on the same criterion spreads the work rather
+    than making a cliff — the §8 rule about not giving every RRSIG one
+    expiration, arriving on the refresh side.
+  - **C. Sign nothing when nothing moved.** Compare the parsed zone against the
+    served one; unchanged and nothing due means keeping the served
+    `Arc<Zone>` and not signing at all. Cheaper than B where it applies, but it is
+    B with "zero RRsets due", and it needs a cheap did-the-file-change test —
+    **which is the question #64b already asks for the UPDATE path**. Those two
+    rows are one question in two places, and taking either should answer both.
+  - **D. Give the timer its own in-memory re-sign.** Not available:
+    `resign_interval`'s doc declines it and the reason is the compounding
+    serial above. Written down so the next reader does not re-derive it.
+
+  Provisional preference: **B**, with **C** once #64b settles the file-changed
+  test, and **A** only if B costs more than it looks. What would change that is
+  building them (§19) — and #40a is the precedent for the option recommended
+  before building being the one that measures out as the one to decline.
 
 **Not filed: making the five shared passes cheaper.** 16% of a full sign and
 48% of an incremental one, and 64e already owns the incremental side of it.
