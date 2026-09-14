@@ -52,7 +52,13 @@ apex, which they do not.
 **#63 was filed out of 57d** and is the prerequisite 57d had been naming in
 prose: `rdnsr` has no config file, so there is nowhere to write a per-zone
 anything. It does not wait on 57d — `--rpz-policy` has wanted the same file
-since before 57 existed.
+since before 57 existed. **63a is answered**: the split is about **18** items
+and not the 84 the row counted, measured by sealing the file and letting the
+compiler name what `rdnsd` could not do without. On the way it found **63e**,
+sixteen settings whose default is written once in `config.rs` and again as a
+clap literal with nothing tying them, under two doc comments each claiming the
+other holds it — and **63f**, the same bare-`pub` sweep for the `cfg(unix)`
+file Windows cannot compile.
 **#64 came out of asking 57d's question of `rdnsd`**: if a zone file is both
 the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
@@ -1742,7 +1748,7 @@ next caller is told the cost rather than finding it.
 
 ---
 
-### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14**
+### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a answered, 63e-f filed**
 
 Filed out of 57d, which cannot be decided without it: a transfer spec is per
 zone, and there is nowhere to write one. Filed as its own number rather than
@@ -1761,15 +1767,39 @@ the opposite of how a feed is introduced. So there are two independent demands,
 and the older one is live. That doc comment is itself §18's "a sentence naming
 remaining work is a `TODO.md` item, or it is deleted", found by going to look.
 
-- **63a. Where the parser lives is the question, and it is unmeasured.**
-  `rdnsd/src/config.rs` is **1,402 lines and 84 `pub` items**, and it is a
+- **63a. Where the parser lives is the question — ~~and it is unmeasured~~
+  answered 2026-09-14.**
+  ~~`rdnsd/src/config.rs` is **1,402 lines and 84 `pub` items**, and it is a
   module of a *binary*, so those 84 are public only to `rdnsd`. Moving it into
   `rdns` makes all 84 genuine public API. **#37's rule is that the measurement
   for a split is visibility, not line count, and that measurement has not been
   taken** — how many of the 84 a second consumer would actually name is the
-  number that decides this, and counting it is the first hour of the work.
-  Writing a second parser instead is the other shape, and its cost is measured
-  below rather than guessed.
+  number that decides this, and counting it is the first hour of the work.~~
+  **Taken 2026-09-14. It is 18, not 84, and the file is sealed to prove it.**
+
+  The 84 reproduce (1,411 lines now) and are **10 types, 5 functions and 69
+  fields**, which is the first thing the row did not say: most of the surface
+  is `serde` deserialization targets spelled `pub` out of habit, and `serde`
+  does not require it.
+
+  Counted by the compiler rather than by grep, because a field read is not a
+  `config::` path and would not have shown up in one: every `pub` in the file
+  was stripped, and what `rdnsd` then failed to compile without is the answer.
+  **18** — 5 types (`Config`, `PerZone`, `GroupRule`, `ZoneSigningOverride`,
+  `DnskeyRrsig`), 2 methods (`Config::load`, `Config::apply`) and 11 fields, on
+  those last three types only. The other 66 never leave the file, including all
+  34 of `Server`'s and all three of `Config`'s other spec-building methods.
+
+  **So the split decision is about 18 items, not 84**, and the line count was
+  never the measurement — #37 said so and this is the number.
+
+  Landed with it, because the measurement is only true once the file says so:
+  the 66 are private and the 18 are `pub(crate)`, which is what the rest of
+  `rdnsd` already uses. **`config.rs` and `control.rs` were the only two of
+  eleven modules spelling a bare `pub`** — 93 between them against 111
+  `pub(crate)` everywhere else, and `control.rs` is the `cfg(unix)` file
+  Windows never compiles (§1). `control.rs`'s 9 are not swept here and are
+  **63f**.
 - **63b. A second parser would duplicate 22 keys.** Counted, not estimated:
   `rdnsd`'s `[server]` table has **34 keys, and 22 of them are already `rdnsr`
   flags under the same name** — `host`, `port`, both rate knobs and the exempt
@@ -1789,6 +1819,57 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   And §15's "`Option` per field for an override, not a whole struct": absent in
   a `[zones.*]` section means *inherit*, which is exactly what a per-zone
   `rpz-policy` needs.
+
+- **63e. Sixteen settings have their default written twice — filed 2026-09-14,
+  found while taking 63a.** Not the parsers, the *defaults*.
+  `rdnsd/src/config.rs` has 17 `default_*` functions for `#[serde(default)]`,
+  and 16 of them restate a number that `rdnsd/src/main.rs` already writes as a
+  clap `default_value` literal: `host`, `port`, `response-rate`, `query-rate`,
+  `query-burst`, `max-udp-request`, `max-tcp-request`, `udp-payload-size`,
+  `max-udp-response`, all five anomaly thresholds, `dnstap-max-bytes` and
+  `validity-days`. Nothing ties any pair, and no test compares them.
+
+  **Why it is silent rather than merely untidy.** `Config::apply` overwrites
+  `cli` field by field, so the two sets are never both in force: an operator
+  with a config file gets config's number and one with flags gets clap's, and
+  a pair that disagreed would look correct from either side. That is §15's
+  "two sources for one setting" — the rule this daemon already enforces by
+  *refusing* `--config` with `--port` — applied to the default instead of to
+  the value.
+
+  **The claim that made it visible was false.** `main.rs`'s
+  `--dnstap-max-bytes` doc says the config file "is the same setting and the
+  same default, which `config::default_dnstap_max_bytes` holds so the two
+  cannot drift". It holds one of them; clap holds `"1073741824"` beside it.
+  `default_dnstap_max_bytes`'s own doc says the same thing from the other end
+  ("the two spellings of one setting must not disagree, `CLAUDE.md` §15"). Two
+  comments asserting an invariant that nothing checks (§4), and the test
+  beside it asserts the serde default against the function that produces it,
+  which is §1's test agreeing with the code.
+
+  **The shape is already in the file.** `--udp-workers` is
+  `default_value_t = default_udp_workers()`, one flag of twenty doing it right,
+  so this is a sweep and not a design question. Two of the sixteen are worse
+  than duplicated: `udp-payload-size` and `max-udp-response` cite
+  `rdns::FLAG_DAY_UDP_SIZE` on the config side and write `"1232"` on the flag
+  side, so the named constant exists and one of the three sites uses it.
+
+  Not taken with 63a, because it moves in the opposite direction: the fix makes
+  up to 16 of the 66 items 63a just sealed `pub(crate)` again, which is right —
+  they *would* be named by a second consumer — but it is a different change
+  with a different reason, and merging them makes one diff nobody can review.
+
+  The seventeenth, `default_algorithm`, is not one of these: it spells the
+  algorithm into the spec string `TsigKey::parse` reads, so §15's "reuse the
+  parser the flags use" is working there and there is no second default.
+- **63f. `control.rs`'s nine bare `pub`s — filed 2026-09-14.** The rest of
+  63a's sweep. `config.rs` and `control.rs` were the only two of `rdnsd`'s
+  eleven modules using a bare `pub`; `config.rs` is done and this is the other
+  nine, against 111 `pub(crate)` in the remaining nine modules. Filed rather
+  than swept in the same commit for the §1 reason: it is `#[cfg(unix)]`, so
+  the development machine does not compile it and the compiler-driven method
+  63a used — strip every `pub`, let the build name the survivors — has to run
+  on Linux to mean anything.
 
 **The dependency objection is already answered, measured rather than argued**
 (§15's "pay for a parser; do not pay for a stub"). `toml` + `serde` is **nine

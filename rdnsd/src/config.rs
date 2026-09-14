@@ -27,109 +27,109 @@ use crate::Cli;
 /// unsigned zones quietly.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct Config {
+pub(crate) struct Config {
     #[serde(default)]
-    pub server: Server,
+    server: Server,
     #[serde(default)]
-    pub signing: Option<Signing>,
+    signing: Option<Signing>,
     /// TSIG keys, by key name. `[keys."transfer.key."]`.
     #[serde(default)]
-    pub keys: BTreeMap<String, Key>,
+    keys: BTreeMap<String, Key>,
     /// Per-zone settings, by zone apex. `[zones."example.com."]`.
     #[serde(default)]
-    pub zones: BTreeMap<String, ZoneConfig>,
+    zones: BTreeMap<String, ZoneConfig>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct Server {
+struct Server {
     #[serde(default = "default_host")]
-    pub host: String,
+    host: String,
     #[serde(default = "default_port")]
-    pub port: u16,
+    port: u16,
     /// A directory of `.zone` files. Zones named in `[zones.*]` may add to or
     /// override what is found here.
-    pub zone_dir: Option<String>,
+    zone_dir: Option<String>,
     #[serde(default)]
-    pub allow_transfer: Vec<String>,
+    allow_transfer: Vec<String>,
     #[serde(default)]
-    pub also_notify: Vec<String>,
+    also_notify: Vec<String>,
     #[serde(default = "default_response_rate")]
-    pub response_rate: u32,
+    response_rate: u32,
     #[serde(default = "default_query_rate")]
-    pub query_rate: u32,
+    query_rate: u32,
     #[serde(default = "default_query_burst")]
-    pub query_burst: u32,
+    query_burst: u32,
     #[serde(default)]
-    pub query_rate_exempt: Vec<String>,
+    query_rate_exempt: Vec<String>,
     /// Largest request accepted, per transport, in octets. The UDP one is
     /// floored at the advertised payload size — see `crate::admission_limits`.
     #[serde(default = "default_max_udp_request")]
-    pub max_udp_request: u16,
+    max_udp_request: u16,
     #[serde(default = "default_max_tcp_request")]
-    pub max_tcp_request: u16,
+    max_tcp_request: u16,
     /// What every reply's OPT advertises this server can reassemble, and the
     /// largest UDP reply it will send. Both floored at 512 — see
     /// `rdns::UdpSizes`.
     #[serde(default = "default_udp_payload_size")]
-    pub udp_payload_size: u16,
+    udp_payload_size: u16,
     #[serde(default = "default_max_udp_response")]
-    pub max_udp_response: u16,
+    max_udp_response: u16,
     /// How often the anomaly warnings run, in seconds; 0 is off. The four
     /// thresholds below are per interval.
     #[serde(default = "default_anomaly_interval")]
-    pub anomaly_interval: u64,
+    anomaly_interval: u64,
     #[serde(default = "default_anomaly_query_rate")]
-    pub anomaly_query_rate: f64,
+    anomaly_query_rate: f64,
     #[serde(default = "default_anomaly_error_percent")]
-    pub anomaly_error_percent: f64,
+    anomaly_error_percent: f64,
     #[serde(default = "default_anomaly_source_queries")]
-    pub anomaly_source_queries: u64,
+    anomaly_source_queries: u64,
     #[serde(default = "default_anomaly_source_refusals")]
-    pub anomaly_source_refusals: u64,
+    anomaly_source_refusals: u64,
     /// Concurrent UDP answers, which is also the number of tasks sharing the
     /// socket. Defaults to the machine's parallelism — see
     /// `crate::default_udp_workers`, which is the same function the flag's
     /// default comes from so the two cannot drift.
     #[serde(default = "crate::default_udp_workers")]
-    pub udp_workers: usize,
-    pub metrics_listen: Option<String>,
+    udp_workers: usize,
+    metrics_listen: Option<String>,
     /// Where the dnstap query stream goes: `tcp:<addr:port>` or `file:<path>`.
     /// Absent is off.
-    pub dnstap: Option<String>,
+    dnstap: Option<String>,
     /// How large a dnstap *capture file* may grow before the writing stops.
     /// 0 is no limit; ignored for a `tcp:` target.
     #[serde(default = "default_dnstap_max_bytes")]
-    pub dnstap_max_bytes: u64,
+    dnstap_max_bytes: u64,
     /// Where to answer DNS over TLS (RFC 7858), and with what. All three or
     /// none: `apply` refuses a listener with no certificate, because the
     /// config file has no equivalent of clap's `requires` and would otherwise
     /// bind 853 with nothing to present on it.
-    pub tls_listen: Option<String>,
-    pub quic_listen: Option<String>,
-    pub https_listen: Option<String>,
-    pub https_path: Option<String>,
-    pub tls_cert: Option<PathBuf>,
-    pub tls_key: Option<PathBuf>,
+    tls_listen: Option<String>,
+    quic_listen: Option<String>,
+    https_listen: Option<String>,
+    https_path: Option<String>,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
     /// Trust anchors for transfers this server *fetches* over TLS
     /// (RFC 9103), and whether one that arrives must have been encrypted.
     /// Separate settings because they are separate directions: a server can be
     /// a secondary over XoT, a primary that insists on it, or both.
-    pub transfer_tls_ca: Option<PathBuf>,
+    transfer_tls_ca: Option<PathBuf>,
     /// The certificate this server presents to a master that asks for one
     /// (RFC 9103 §7.5's mutual TLS). Both keys or neither; `check` says so,
     /// because a chain with no key cannot be presented.
-    pub transfer_tls_cert: Option<PathBuf>,
-    pub transfer_tls_key: Option<PathBuf>,
+    transfer_tls_cert: Option<PathBuf>,
+    transfer_tls_key: Option<PathBuf>,
     #[serde(default)]
-    pub transfer_tls_only: bool,
+    transfer_tls_only: bool,
     /// Where `rdnsctl` reaches this server. Unix only, and refused at startup
     /// on Windows rather than ignored — the field parses everywhere so that one
     /// config file can be read on either platform and fail with a sentence
     /// instead of an unknown-key error.
-    pub control_socket: Option<PathBuf>,
+    control_socket: Option<PathBuf>,
     #[serde(default)]
-    pub allow_partial_load: bool,
+    allow_partial_load: bool,
 }
 
 impl Default for Server {
@@ -221,16 +221,16 @@ fn default_anomaly_source_refusals() -> u64 {
 /// Signing defaults, which a `[zones.*]` table may override per zone.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct Signing {
-    pub key_dir: PathBuf,
+struct Signing {
+    key_dir: PathBuf,
     #[serde(default = "default_validity_days")]
-    pub validity_days: u32,
+    validity_days: u32,
     #[serde(default)]
-    pub nsec3: bool,
+    nsec3: bool,
     #[serde(default)]
-    pub nsec3_opt_out: bool,
+    nsec3_opt_out: bool,
     #[serde(default)]
-    pub require_signed: bool,
+    require_signed: bool,
 }
 
 /// One gibibyte, the same number `--dnstap-max-bytes` defaults to: the two
@@ -246,17 +246,17 @@ fn default_validity_days() -> u32 {
 /// One TSIG key.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct Key {
+struct Key {
     #[serde(default = "default_algorithm")]
-    pub algorithm: String,
+    algorithm: String,
     /// The secret, base64. Mutually exclusive with `secret-file`.
-    pub secret: Option<String>,
+    secret: Option<String>,
     /// A file holding the secret, base64, whitespace trimmed. Mode-checked.
-    pub secret_file: Option<PathBuf>,
+    secret_file: Option<PathBuf>,
     /// The zones this key may transfer. Empty means every zone — see
     /// `rdns::tsig::TsigKey`, where the same default is spelled out and argued.
     #[serde(default)]
-    pub zones: Vec<String>,
+    zones: Vec<String>,
     /// The zones this key may rewrite through dynamic UPDATE (RFC 2136 §3.3).
     ///
     /// Empty means none, which is the opposite of `zones` directly above.
@@ -269,7 +269,7 @@ pub struct Key {
     /// an operator reading this table is deciding both at once, which is where
     /// `CLAUDE.md` §16 says narrowing belongs.
     #[serde(default)]
-    pub update_zones: Vec<String>,
+    update_zones: Vec<String>,
 }
 
 fn default_algorithm() -> String {
@@ -279,19 +279,19 @@ fn default_algorithm() -> String {
 /// One zone's own settings.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct ZoneConfig {
+struct ZoneConfig {
     /// The zone file, if it is not simply `<zone-dir>/<name>.zone`.
-    pub file: Option<String>,
+    file: Option<String>,
     /// Masters to replicate this zone from: `addr[:port][#key-name][+tls=name]`,
     /// the same spelling `--secondary` uses after the `zone@` — one parser, so
     /// the flag and the file cannot disagree (`CLAUDE.md` §15). The `+tls=`
     /// half is RFC 9103's transfer over TLS and needs
     /// `server.transfer-tls-ca`.
     #[serde(default)]
-    pub masters: Vec<String>,
+    masters: Vec<String>,
     /// Who to NOTIFY for *this* zone, in addition to `server.also-notify`.
     #[serde(default)]
-    pub also_notify: Vec<String>,
+    also_notify: Vec<String>,
     /// Whether this zone is a catalog to consume rather than a zone to serve
     /// (RFC 9432): the zones it lists are replicated from the same masters,
     /// with the same key.
@@ -300,7 +300,7 @@ pub struct ZoneConfig {
     /// ordinary zone (§5.1) — so this adds a reading of it, and takes nothing
     /// away.
     #[serde(default)]
-    pub catalog: bool,
+    catalog: bool,
     /// Members of this catalog carrying one of these group values are fetched
     /// differently (RFC 9432 §4.3.2), keyed by the group value.
     ///
@@ -313,18 +313,18 @@ pub struct ZoneConfig {
     /// Only on a `catalog = true` zone; a group on anything else is refused,
     /// because nothing would ever read it.
     #[serde(default)]
-    pub groups: BTreeMap<String, GroupConfig>,
+    groups: BTreeMap<String, GroupConfig>,
     /// Per-zone signing overrides. Absent means "use `[signing]`".
     #[serde(default)]
-    pub nsec3: Option<bool>,
+    nsec3: Option<bool>,
     #[serde(default)]
-    pub nsec3_opt_out: Option<bool>,
+    nsec3_opt_out: Option<bool>,
     #[serde(default)]
-    pub validity_days: Option<u32>,
+    validity_days: Option<u32>,
     /// Where this zone's apex DNSKEY RRset gets its signature. Absent is
     /// `local`, which is every ordinary zone.
     #[serde(default)]
-    pub dnskey_rrsig: Option<DnskeyRrsig>,
+    dnskey_rrsig: Option<DnskeyRrsig>,
 }
 
 /// What a catalog group value maps onto (RFC 9432 §4.3.2).
@@ -337,11 +337,11 @@ pub struct ZoneConfig {
 /// "nothing, here" is worse than its absence (`CLAUDE.md` §14).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct GroupConfig {
+struct GroupConfig {
     /// Where a member of this group is replicated from, in `--secondary`'s
     /// spelling after the `zone@`. Required: a group table that changes nothing
     /// is a mapping the operator believes is in force.
-    pub masters: Vec<String>,
+    masters: Vec<String>,
 }
 
 /// Who signs a zone's apex DNSKEY RRset.
@@ -356,7 +356,7 @@ pub struct GroupConfig {
 /// edit, and the signer has always published a key it did not put there.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
-pub enum DnskeyRrsig {
+pub(crate) enum DnskeyRrsig {
     /// Signed here, by this server's SEP keys.
     Local,
     /// Signed elsewhere; keep what the zone file carries.
@@ -366,34 +366,34 @@ pub enum DnskeyRrsig {
 /// What a config file supplies that no flag can, so it cannot be folded into
 /// [`Cli`]. Keyed by zone apex, absolute.
 #[derive(Debug, Default)]
-pub struct PerZone {
+pub(crate) struct PerZone {
     /// Where this zone's file is, when the zone names it rather than being found
     /// in `server.zone-dir`.
-    pub files: BTreeMap<String, String>,
+    pub(crate) files: BTreeMap<String, String>,
     /// NOTIFY targets for this zone in particular, on top of the global ones.
-    pub notify: BTreeMap<String, Vec<String>>,
+    pub(crate) notify: BTreeMap<String, Vec<String>>,
     /// Signing settings that differ from `[signing]`.
-    pub signing: BTreeMap<String, ZoneSigningOverride>,
+    pub(crate) signing: BTreeMap<String, ZoneSigningOverride>,
     /// Per-catalog group rules (RFC 9432 §4.3.2), by catalog zone: the group
     /// value, and the masters a member carrying it is fetched from.
     ///
     /// A `Vec` rather than a map, in the config file's own order, so that two
     /// groups matching one member are refused with the same message every time
     /// — a conflict reported in hash order is one an operator cannot reproduce.
-    pub groups: BTreeMap<String, Vec<GroupRule>>,
+    pub(crate) groups: BTreeMap<String, Vec<GroupRule>>,
 }
 
 /// One catalog group value, and what it maps onto.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GroupRule {
+pub(crate) struct GroupRule {
     /// The group value as it appears in the catalog: octets, because that is
     /// what a TXT record's character-string is. The config key's UTF-8 encoding
     /// is the needle (`TODO.md` #48).
-    pub value: Vec<u8>,
+    pub(crate) value: Vec<u8>,
     /// The config key as written, for the log line and the error message.
-    pub name: String,
+    pub(crate) name: String,
     /// `--secondary`-shaped, less the `zone@`.
-    pub masters: Vec<String>,
+    pub(crate) masters: Vec<String>,
 }
 
 /// One zone's departures from the global signing policy.
@@ -402,11 +402,11 @@ pub struct GroupRule {
 /// and not "the default". An operator who sets `nsec3 = true` for one zone must
 /// not silently reset that zone's validity to thirty days.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ZoneSigningOverride {
-    pub nsec3: Option<bool>,
-    pub nsec3_opt_out: Option<bool>,
-    pub validity_days: Option<u32>,
-    pub dnskey_rrsig: Option<DnskeyRrsig>,
+pub(crate) struct ZoneSigningOverride {
+    pub(crate) nsec3: Option<bool>,
+    pub(crate) nsec3_opt_out: Option<bool>,
+    pub(crate) validity_days: Option<u32>,
+    pub(crate) dnskey_rrsig: Option<DnskeyRrsig>,
 }
 
 impl ZoneSigningOverride {
@@ -432,7 +432,7 @@ impl Config {
     /// Validation happens here rather than at first use so that `--check-config`
     /// can be a real dry run: everything that can be known without binding a
     /// socket or reading a zone is known by the time this returns.
-    pub fn load(path: &Path) -> Result<Self> {
+    pub(crate) fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading the config file {}", path.display()))?;
         let config: Config = toml::from_str(&text)
@@ -616,7 +616,7 @@ impl Config {
     /// about what a key means, and every rule the parser enforces — the algorithm
     /// must be known, the secret must be non-empty base64, a zone list may not
     /// have an empty entry — applies to both.
-    pub fn tsig_specs(&self) -> Result<Vec<String>> {
+    fn tsig_specs(&self) -> Result<Vec<String>> {
         let mut specs = Vec::new();
         for (name, key) in &self.keys {
             let secret = match (&key.secret, &key.secret_file) {
@@ -654,7 +654,7 @@ impl Config {
     /// produce the same shape, so there is one code path and not two to drift
     /// apart (`CLAUDE.md` §7). It is sound because the two are mutually exclusive
     /// — nothing in `cli` can be an operator's explicit choice here.
-    pub fn apply(&self, cli: &mut Cli) -> Result<PerZone> {
+    pub(crate) fn apply(&self, cli: &mut Cli) -> Result<PerZone> {
         cli.host = self.server.host.clone();
         cli.port = self.server.port;
         cli.zone_dir = self.server.zone_dir.clone();
@@ -768,12 +768,12 @@ impl Config {
     /// startup path adds every catalog to the secondary list itself, and a zone
     /// in both lists would be fetched by two refresh tasks asking one master the
     /// same question on the same timer.
-    pub fn secondary_specs(&self) -> Vec<String> {
+    fn secondary_specs(&self) -> Vec<String> {
         self.zone_specs(false)
     }
 
     /// The `--catalog`-shaped specs this config implies, in the same spelling.
-    pub fn catalog_specs(&self) -> Vec<String> {
+    fn catalog_specs(&self) -> Vec<String> {
         self.zone_specs(true)
     }
 
