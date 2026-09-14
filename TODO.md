@@ -963,7 +963,7 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13, first item closed 2026-09-13**
+### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13, 57a-b closed**
 
 Also left behind by 45a, and the half of its own row that did not survive
 contact with the code. #45a said the pleasing part was the delivery mechanism —
@@ -977,9 +977,9 @@ So `--rpz` takes a path, and a feed is refreshed by whatever writes that path �
 which is how an operator with one feed and a cron job already works, and is not
 how an operator with an hourly-updated blocklist wants to work.
 
-Three things to settle, in this order. The first is done.
+Four items. 57a and 57b are done.
 
-- ~~**Re-read before replicate.**~~ **Done, `rpz::PolicyStore`.** SIGHUP
+- **57a.** ~~**Re-read before replicate.**~~ **Done, `rpz::PolicyStore`.** SIGHUP
   re-reads every `--rpz` file, all-or-nothing, and a feed that will not parse
   leaves the previous set in force with a WARN naming it. The shape is
   `CertificateStore`'s (§7): paths, an `RwLock<Arc<PolicyZones>>`, and a
@@ -1034,7 +1034,46 @@ Three things to settle, in this order. The first is done.
   `tracing::` format string found five, in `rdnsr/src/answer.rs`,
   `rdnsr/src/main.rs`, `rdnsd/src/catalog.rs` and `rdnsd/src/zones.rs` (two);
   all five fixed, seven continuations restored.
-- **Then the transfer**, which is the part with a cost: it means `rdnsr` grows a
+- **57b.** ~~**The reload runs where a query is answered.**~~ **Done,
+  `rdnsr::reload`.** Not part of the row as filed; found by measuring 57a rather
+  than by reading it. `reload_on_signal` called the synchronous `reload_policy`
+  straight from its async task, and `#[tokio::main]` gives one worker per core,
+  so the parse occupied one. Measured on the development machine, release, with
+  a probe asking for 1 ms ticks while a 1M-rule feed reloaded:
+
+  | workers | reloads | worst tick, Linux | worst tick, Windows |
+  |---|---|---|---|
+  | 1 | 0 | 2.17 ms | 15.9 ms |
+  | 2 | 0 | 2.17 ms | 16.3 ms |
+  | **1** | **1** | **2.715 s** | **2.702 s** |
+  | 2 | 1 | 2.28 ms | 16.8 ms |
+  | 4 | 1 | 2.26 ms | 16.7 ms |
+  | **4** | **4** | **3.53 s** | **3.20 s** |
+
+  The no-reload rows are the floor the platform's timer imposes, and are why the
+  Linux column exists: Windows' is ~16 ms, coarse enough to hide the two-worker
+  case entirely. So a single-core resolver answered nothing for the length of a
+  reload, and above one core it cost 1/N of capacity. The work is now on
+  `spawn_blocking`.
+
+  The reload cost itself is linear at ~2.7 µs per rule — 1.5 ms at a thousand
+  rules, 170 ms at a hundred thousand, 2.74 s at a million — and a set is
+  352-407 bytes per rule held. The re-read is all-or-nothing, so both sets are
+  live at once and a million-rule feed peaks at **1.06 GB** to re-read 407 MB.
+  That number is what 57d and the IXFR question below turn on.
+
+  The last row of the table is why the task is sequential: four concurrent
+  reloads stalled every task for 3.53 s and took 4.50 s to do 2.70 s of work.
+  Nothing yet asks for a reload except SIGHUP, so nothing yet can cause that —
+  which is a thing 57c has to keep true.
+
+  Its regression test is `a_reload_does_not_stop_the_only_worker`, and **the
+  first version of it passed against the defect**: `block_on` drives the test's
+  own future on the calling thread, so the one worker under test was never the
+  blocked one. Both halves are spawned now, which is also how `main` runs them.
+  `CLAUDE.md` §1 — the test agreed with the code until it was run against the
+  shape it forbids.
+- **57c. Then the transfer**, which is the part with a cost: it means `rdnsr` grows a
   replication task, an SOA timer and a NOTIFY listener, and those are what
   `rdnsd` is. The alternative worth measuring first is that the *operator* runs
   `rdnsd` as the secondary and points `rdnsr --rpz` at the zone file it writes,
@@ -1045,7 +1084,7 @@ Three things to settle, in this order. The first is done.
   unit, or a cron job beside the one that already writes the file. A hook is a
   smaller change than a replication task and would settle this row without it;
   measure that before building the task.
-- **And IXFR only if the zone is large enough to care.** A national blocklist is
+- **57d. And IXFR only if the zone is large enough to care.** A national blocklist is
   thousands of names; the RPZ feeds that are millions are the commercial malware
   ones. `rdns::ixfr` exists either way, so this is a question about the timer
   and not about the format.

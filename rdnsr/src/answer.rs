@@ -836,13 +836,17 @@ pub(crate) fn log_policy(zones: &PolicyZones) {
 /// A feed is rewritten under a running resolver — by a cron job, or by an
 /// `rdnsd` writing what it transferred — and until this the answer was a
 /// restart (`TODO.md` #57).
+///
+/// Neither line below names SIGHUP any more: [`crate::reload`] owns the
+/// triggers, and #57 has more of them coming. Which one asked is logged
+/// where it arrives.
 pub(crate) fn reload_policy(serving: &Resolving) {
     if !serving.policy.is_configured() {
         return;
     }
     match serving.policy.reload() {
         Ok(reloaded) => {
-            tracing::info!("policy zones re-read (SIGHUP)");
+            tracing::info!("policy zones re-read");
             log_policy(&reloaded.zones);
             // The one thing a new rule cannot reach on its own. A QNAME or
             // client-IP rule is consulted before every cache and a response-IP
@@ -862,7 +866,7 @@ pub(crate) fn reload_policy(serving: &Resolving) {
         // The previous set is still in force, which is the whole point of
         // saying so: a half-written feed must not lift a block.
         Err(e) => tracing::warn!(
-            "could not re-read the policy zones (SIGHUP); the previous ones are still in \
+            "could not re-read the policy zones; the previous ones are still in \
              force: {e}"
         ),
     }

@@ -2,14 +2,16 @@
 //! localhost by default, because an open resolver is somebody else's
 //! amplifier.
 //!
-//! This root is the CLI and the startup order, and nothing else: the three
+//! This root is the CLI and the startup order, and nothing else: the four
 //! modules under it are [`anchors`] (the trust anchors and RFC 5011's rolling),
-//! [`answer`] (a datagram in, the reply out — no sockets) and [`serve`] (the two
-//! socket loops and the shutdown). One `Resolver` with a mode rather than two
-//! programs; the reasoning is `TODO.md`'s "Architecture: the resolver".
+//! [`answer`] (a datagram in, the reply out — no sockets), [`reload`] (re-reading
+//! the certificate and the policy feeds, off the worker threads) and [`serve`]
+//! (the two socket loops and the shutdown). One `Resolver` with a mode rather
+//! than two programs; the reasoning is `TODO.md`'s "Architecture: the resolver".
 
 mod anchors;
 mod answer;
+mod reload;
 mod serve;
 #[cfg(test)]
 mod testutil;
@@ -32,7 +34,7 @@ use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
 use rdns::rfc5011::ManagedAnchors;
 use rdns::rpz::PolicyStore;
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
-use rdns::shutdown::{next_reload, reload_signal, Shutdown, Stop};
+use rdns::shutdown::Shutdown;
 use rdns::validation::{AdmissionCheck, AdmissionLimits};
 use rdns::UdpSizes;
 use rdns_transport::https;
@@ -44,7 +46,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
 
 use crate::anchors::spawn_anchor_manager;
-use crate::answer::{log_policy, reload_policy, Caches, Resolving};
+use crate::answer::{log_policy, Caches, Resolving};
 use crate::serve::udp_main;
 
 /// UDP queries this resolver will have in flight at once, when nothing says
@@ -751,13 +753,14 @@ async fn main() -> anyhow::Result<()> {
     // Two things pass through the one reload this daemon has: the certificate a
     // renewal rewrote, and every `--rpz` file. `rdnsd` folds the same
     // certificate call into the reload every trigger passes through; here there
-    // are no zones, so SIGHUP means these and only these. One certificate store
-    // serves all three encrypted listeners, so one reload reaches them all.
+    // are no zones, so a reload means these and only these. One certificate
+    // store serves all three encrypted listeners, so one reload reaches them
+    // all.
     //
     // Not in the `JoinSet` below: that set's rule is "the first task to end ends
     // the process", and this one ends on the stop signal by design.
     if tls_store.is_some() || serving.policy.is_configured() {
-        tokio::spawn(reload_on_signal(
+        tokio::spawn(reload::reload_task(
             tls_store.clone(),
             serving.clone(),
             shutdown.stop_handle(),
@@ -791,35 +794,4 @@ async fn main() -> anyhow::Result<()> {
     // client is waiting on, or the RFC 5011 manager part-way through rewriting
     // the anchor file.
     rdns_transport::serve_until_stopped(loops, anomalies, shutdown).await
-}
-
-/// SIGHUP: re-read the TLS certificate and every `--rpz` file.
-///
-/// A policy feed is rewritten under a running resolver and was not re-read
-/// until a restart (`TODO.md` #57). Both reloads leave what is in force in
-/// force if the new files do not parse, so a half-written feed or a
-/// half-renewed certificate costs a log line rather than the service.
-async fn reload_on_signal(
-    certificate: Option<Arc<CertificateStore>>,
-    serving: Arc<Resolving>,
-    stop: Stop,
-) {
-    let mut signals = reload_signal();
-    loop {
-        tokio::select! {
-            reloaded = next_reload(&mut signals) => {
-                if !reloaded {
-                    break;
-                }
-            }
-            _ = stop.wait() => break,
-        }
-        if let Some(store) = &certificate {
-            match store.reload() {
-                Ok(()) => tracing::info!("TLS certificate re-read (SIGHUP)"),
-                Err(e) => tracing::warn!("could not re-read the TLS certificate (SIGHUP): {e:#}"),
-            }
-        }
-        reload_policy(&serving);
-    }
 }
