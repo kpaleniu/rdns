@@ -1452,6 +1452,198 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// What the *signed* update path costs, which the table above does not
+    /// measure (`TODO.md` #64d).
+    ///
+    /// The question the row asks: does `sign_one_incrementally` swamp the four
+    /// O(zone) steps, making 64b's 26% and 64c's 42% shares of something that
+    /// barely matters? **It does.**
+    ///
+    /// ```text
+    ///   records   unsigned     signed  incr-sign  full-sign      carried
+    ///     10000     20.7ms    87.0ms    55.8ms   245.7ms  20004/20008
+    ///    100000    165.5ms   931.4ms   783.7ms  2556.1ms  200004/200008
+    ///   1000000   1952.1ms 11801.0ms 10314.9ms 26939.1ms  2000004/2000008
+    /// ```
+    ///
+    /// Three warm runs, discarding the first after a rebuild. At a million
+    /// records **signing is 10.3 s of 11.7 s, 88%**, so the whole of 64b and
+    /// 64c — 68% of the unsigned 1.95 s — is **10% of what a signed update
+    /// costs**. `full-sign` reproduces #44c's 28 s by a different route.
+    ///
+    /// A real [`ZoneSigning`] rather than a bare `sign_zone_incrementally`, so
+    /// the column is the whole path an operator pays. The row filed this as
+    /// wanting "signing keys on disk", and it does — but generated ones,
+    /// written out by `SigningKey::write_to_dir`, not an operator's.
+    ///
+    /// `carried` is how many of the installed zone's RRSIGs are byte-identical
+    /// to one at the same owner in the served version, over how many there
+    /// are: a count rather than a timing, so it reads the same on every
+    /// machine. **Four are made fresh at every size** — the A RRset added, the
+    /// two NSECs the insertion moves, and the bumped SOA — which is what makes
+    /// the 10.3 s the interesting number. It is not the ECDSA. Carrying every
+    /// signature forward still pays `PreviousSignatures::of` over the served
+    /// zone, `carry_over_records`, `Layout::of` and a full NSEC chain, all
+    /// O(zone); `sign_zone_incrementally`'s header argues for building the
+    /// chain in full and is right, and this is what that costs (`TODO.md`
+    /// #64e).
+    ///
+    /// NSEC, one ECDSA P-256 KSK and one ZSK, which is the cheap end: NSEC3
+    /// hashes every name, and a second algorithm signs every RRset twice.
+    #[test]
+    #[ignore]
+    fn signed_update_cost_against_zone_size() {
+        use clap::Parser;
+        use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
+        use rdns::zone_signer::sign_zone;
+        use std::collections::{BTreeMap, HashSet};
+        use std::time::Instant;
+
+        if cfg!(debug_assertions) {
+            panic!(
+                "this would measure the debug build. Run:\n  \
+                 cargo test -p rdnsd --release signed_update_cost -- --ignored --nocapture"
+            );
+        }
+
+        let dir = std::env::temp_dir().join(format!("rdns-signed-update-{}", std::process::id()));
+        let key_dir = dir.join("keys");
+        std::fs::create_dir_all(&key_dir).expect("temp dirs");
+        let keys: Vec<SigningKey> = [
+            rdns::dnssec::DNSKEY_FLAG_ZONE | rdns::dnssec::DNSKEY_FLAG_SEP,
+            rdns::dnssec::DNSKEY_FLAG_ZONE,
+        ]
+        .into_iter()
+        .map(|flags| {
+            let key =
+                SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, "example.com.", flags)
+                    .expect("a key");
+            key.write_to_dir(&key_dir).expect("the key file");
+            key
+        })
+        .collect();
+        let mut cli = crate::Cli::parse_from(["rdnsd"]);
+        cli.signing_key_dir = Some(key_dir);
+        let signing = ZoneSigning::load(&cli, &BTreeMap::new())
+            .expect("the keys load")
+            .expect("a key directory means signing");
+
+        println!(
+            "{:>9}  {:>9} {:>9} {:>9} {:>9}  {:>9}",
+            "records", "unsigned", "signed", "incr-sign", "full-sign", "carried"
+        );
+        for records in [10_000usize, 100_000, 1_000_000] {
+            let mut text = String::from("$TTL 3600\n");
+            text.push_str(
+                "@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n",
+            );
+            text.push_str("@ IN NS ns.example.com.\n");
+            text.push_str("ns IN A 192.0.2.1\n");
+            for i in 0..records {
+                let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
+                text.push_str(&format!("h{i} IN A 10.{a}.{b}.{c}\n"));
+            }
+            let path = dir.join("example.com.zone");
+            std::fs::write(&path, &text).expect("write the fixture");
+
+            let source = parse_zone_file_at(&path, "example.com.").expect("the fixture parses");
+            let policy = signing.policy_for("example.com.", current_unix_timestamp());
+            // The served version: what an update signs *against*.
+            let start = Instant::now();
+            let previous = sign_zone(&source, &keys, &policy).expect("the fixture signs");
+            let full_sign = start.elapsed();
+            drop(source);
+
+            let change = update::Change::Add(rdns::ResourceRecord {
+                name: nm("added.example.com."),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(3600),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    std::net::Ipv4Addr::new(198, 51, 100, 1),
+                ))
+                .expect("the rdata builds"),
+            });
+
+            // Both paths through the same door, so the difference between the
+            // columns is the signing and nothing else. The file is restored
+            // between them: the first call already added the record to it.
+            let start = Instant::now();
+            apply_update_to_file(
+                &path,
+                "example.com.",
+                &previous,
+                &[],
+                std::slice::from_ref(&change),
+                None,
+            )
+            .unwrap_or_else(|_| panic!("the unsigned update applies at {records}"));
+            let unsigned = start.elapsed();
+
+            std::fs::write(&path, &text).expect("restore the fixture");
+            let start = Instant::now();
+            let (installed, report) = apply_update_to_file(
+                &path,
+                "example.com.",
+                &previous,
+                &[],
+                std::slice::from_ref(&change),
+                Some(&signing),
+            )
+            .unwrap_or_else(|_| panic!("the signed update applies at {records}"));
+            let signed = start.elapsed();
+            assert_eq!(report.changed, 1, "one record added at {records}");
+            let installed = installed.expect("a changed zone is installed");
+
+            // The signing step alone, from the same inputs the call above fed
+            // it, so `signed` minus this is the four unsigned steps.
+            std::fs::write(&path, &text).expect("restore the fixture");
+            let reparsed = parse_zone_file_at(&path, "example.com.").expect("parses");
+            let applied = update::apply(&reparsed, std::slice::from_ref(&change));
+            let start = Instant::now();
+            let again = signing
+                .sign_one_incrementally(&previous, applied.zone)
+                .expect("signs");
+            let incr_sign = start.elapsed();
+            assert_eq!(
+                again.records().len(),
+                installed.records().len(),
+                "the same zone either way at {records}"
+            );
+
+            let rrsig = rdns::record_types::RRSIG;
+            let was: HashSet<(&rdns::Name, &[u8])> = previous
+                .records()
+                .iter()
+                .filter(|r| r.rdata.rtype() == rrsig)
+                .map(|r| (&r.name, r.rdata.bytes()))
+                .collect();
+            let now: Vec<_> = installed
+                .records()
+                .iter()
+                .filter(|r| r.rdata.rtype() == rrsig)
+                .collect();
+            let carried = now
+                .iter()
+                .filter(|r| was.contains(&(&r.name, r.rdata.bytes())))
+                .count();
+            // Made fresh, not carried: what the run actually paid ECDSA for.
+            let made = now.len() - carried;
+            println!(
+                "{records:>9}  {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>7.1}ms  {:>9}",
+                unsigned.as_secs_f64() * 1000.0,
+                signed.as_secs_f64() * 1000.0,
+                incr_sign.as_secs_f64() * 1000.0,
+                full_sign.as_secs_f64() * 1000.0,
+                format!("{carried}/{}", now.len()),
+            );
+            assert!(
+                made < 16,
+                "a one-record update re-signed {made} RRsets at {records}: the carry-forward                  is what makes incr-sign cheaper than full-sign, so this number is the claim"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Every encrypted transport gets its own dnstap label.
     ///
     /// `TODO.md` #54: the dispatcher was told [`Privacy`], which is `Clear`,

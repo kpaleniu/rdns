@@ -55,8 +55,12 @@ the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
 lock. The row was filed with the measurement that refuted the fix it was going
 to propose. **64a is fixed** — four passes and 1.7 s, and it was three
-clones and not the one the row named — and 64b, 64c and 64d are the three that
-carry decisions.
+clones and not the one the row named. **64d is closed and answered the question
+the other two were waiting on**: signing is 88% of a signed update, so 64b and
+64c together are worth 10% of one rather than the 68% they are of an unsigned
+one — and the measurement filed **64e**, which is that carrying every signature
+forward still costs four O(zone) passes and 10.3 s at a million records. 64b,
+64c and 64e are what is left, and none of them names a remedy yet.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -1685,7 +1689,8 @@ change**. The largest is `zone_to_string` at 35%, not the re-read at 25%.
 `tokio::Mutex` held across the whole read-modify-write, and its doc says why:
 "One lock for all zones rather than one per zone: two concurrent UPDATEs is not
 a workload this has." So 1.8 s is the *server's* update throughput at that
-size, for every zone at once — about one every two seconds.
+size, for every zone at once — about one every two seconds. **On a signed zone
+it is one every twelve** (64d).
 
 - **64a. A clone nothing reads. — fixed 2026-09-14.** With no signing
   configured `apply_update_to_file` returned `applied.zone.clone()`, and the
@@ -1738,12 +1743,69 @@ size, for every zone at once — about one every two seconds.
   removes 64b and 64c together: 1 228 ms of 1 800, 68%.** It is also much the
   largest of these, and the invoice is in the next paragraph rather than in a
   remedy this row names.
-- **64d. The signed path is not measured.** These numbers are an unsigned zone.
+- **64d. The signed path, measured — 2026-09-14. Signing is 88% of it, so
+  64b and 64c are worth 10%.** ~~These numbers are an unsigned zone.
   `sign_one_incrementally` is not in them. #44c's 28 s is a *full* sign of a
   million-record zone and is an upper bound that does not apply. Whether
   signing swamps all five steps is the measurement that decides whether any of
   this matters for a signed deployment, and it wants signing keys on disk,
-  which is why it is a row and not a footnote.
+  which is why it is a row and not a footnote.~~ It wanted *generated* keys on
+  disk, which `SigningKey::write_to_dir` supplies in six lines — the cost that
+  made it a row rather than a footnote was not there.
+
+  `cargo test -p rdnsd --release signed_update_cost -- --ignored --nocapture`,
+  which is `dispatch::tests::signed_update_cost_against_zone_size`. NSEC, one
+  ECDSA P-256 KSK and one ZSK; three warm runs, discarding the first after a
+  rebuild:
+
+  | records | unsigned | signed | incr-sign | full-sign | carried |
+  |---|---|---|---|---|---|
+  | 10 000 | 20.7 ms | 87.0 | 55.8 | 245.7 | 20004/20008 |
+  | 100 000 | 165.5 ms | 931.4 | 783.7 | 2 556.1 | 200004/200008 |
+  | **1 000 000** | **1 952 ms** | **11 801** | **10 315** | **26 939** | 2000004/2000008 |
+
+  So a signed update to a million-record zone is **11.7 s, of which signing is
+  10.3 s — 88%**. The four O(zone) steps the table at the top of this section
+  measures are the remaining 12%, and removing 64b and 64c together — 68% of
+  those — is **10% of a signed update**. The percentages in 64b and 64c are
+  shares of an unsigned one and are not wrong; what changes is what they are
+  worth buying.
+
+  `full-sign` reproduces #44c's 28 s (26.9–27.3 s) by a different route, which
+  is the one number here that was already known and the reason to trust the
+  rest.
+
+  **The measurement that could have refuted it** (§19) was `carried`, and it
+  refuted the explanation rather than the finding. The obvious reading of
+  "signing is 88%" is that a signed update pays for signatures. It does not:
+  **exactly four RRSIGs are made fresh at every size** — the A RRset added, the
+  two NSECs the insertion moves, and the bumped SOA — and every other one is
+  carried forward byte-identical. Ten seconds for four ECDSA operations. That
+  is #64e, and it is a different finding from the one this row was filed to
+  take.
+- **64e. Carrying every signature forward still costs O(zone), and that is now
+  the whole bill — filed 2026-09-14.** Out of 64d. `sign_zone_incrementally`
+  re-makes 4 signatures out of 2 000 008 and takes **10.3 s at a million
+  records**, against 26.9 s for a full sign. The 16.6 s difference is the ECDSA
+  the carry-forward saves; the 10.3 s that remains is `PreviousSignatures::of`
+  over the served zone, `carry_over_records`, `Layout::of` and a full NSEC
+  chain, four O(zone) passes with no crypto in them.
+
+  **No remedy named, on purpose** (§18: a row naming a wrong remedy costs more
+  than one naming none). The obvious one — rebuild only the part of the chain
+  that moved — is argued against in `sign_zone_incrementally`'s own header, and
+  the argument is correct: an NSEC's `next` and its bitmap make "changed names
+  plus chain neighbours" a chain that validates against itself while denying a
+  name that exists (RFC 4034 §4.1.2, RFC 5155 §7.1). That header also claims
+  "what is saved is the signing, which is the expensive half", and 64d's table
+  says it is: 16.6 s of 26.9. Both the decision and its stated reason survive
+  the measurement. What the measurement adds is that the half deliberately kept
+  is 88% of what a dynamic UPDATE now costs, which is a fact about the *update*
+  path that nothing about the *load* path implied.
+
+  The measurement that would let somebody start: the four passes above, timed
+  apart. 64d times the signing as one column because that is what its question
+  needed, and splitting it is this row's first step rather than its conclusion.
 
 **What 64c would actually cost, since "add a WAL" is the wrong description.**
 The journal is already where a write-ahead log sits — `zones.rs` writes it
