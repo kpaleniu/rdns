@@ -54,8 +54,9 @@ since before 57 existed.
 the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
 lock. The row was filed with the measurement that refuted the fix it was going
-to propose. **64a is fixed** — four passes and 1.7 s — and 64b, 64c and 64d
-are the three that carry decisions.
+to propose. **64a is fixed** — four passes and 1.7 s, and it was three
+clones and not the one the row named — and 64b, 64c and 64d are the three that
+carry decisions.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
