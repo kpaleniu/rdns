@@ -142,7 +142,8 @@ process down. Binds 127.0.0.1 by default.
 
 1. `validation::Request::from_bytes` — parses and refuses QR=1. Both failures are
    silence.
-2. Opcode: anything but QUERY is NOTIMP with the opcode echoed, carrying
+2. Opcode: NOTIFY goes to §5.6's policy re-read when `--rpz-notify-from` names
+   anybody; anything else but QUERY is NOTIMP with the opcode echoed, carrying
    EDE 21 (Not Supported).
 3. EDNS sanity: malformed option list → FORMERR; version > 0 → BADVERS.
    Neither carries an Extended DNS Error, for the reason `03`'s §3.2.1 gives.
@@ -329,8 +330,17 @@ RPZ wildcard rule is RFC 1034 §4.3.3's.
   `rpz-client-ip` rule is consulted before every cache and an `rpz-ip` rule is
   applied to what leaves, so either binds the next query whatever is held,
   while `rpz-nsdname` and `rpz-nsip` are asked only while a delegation is
-  walked — which a cache hit never does. A feed is delivered by whatever writes
-  the file; `rdnsr` is not a secondary and does not listen for NOTIFY.
+  walked — which a cache hit never does.
+- **A NOTIFY from a `--rpz-notify-from` address asks for the same re-read**
+  (`TODO.md` #57c), which is how a feed `rdnsd` replicates reaches `rdnsr`:
+  `announce_transfer` already notifies every `--also-notify` peer after every
+  transfer. NOERROR and the re-read queued, because RFC 1996 §4.7 wants the
+  reply before the work; REFUSED from an address the list does not name;
+  NOTAUTH for a zone no feed carries; NOTIMP when the list is empty, since then
+  the resolver really does not implement one. The message's serial is not read:
+  it is unauthenticated, and all it could do here is let a re-read be skipped.
+  A feed is otherwise delivered by whatever writes the file — `rdnsr` is not a
+  secondary and has no zone map.
 - Every rewrite goes out with AD clear and an Extended DNS Error: 15 (Blocked)
   when the answer is a denial, 4 (Forged Answer) when records are still
   provided — RFC 8914 §4.5 draws that line.
