@@ -10,7 +10,7 @@ use rdns::logging::QueryLogger;
 use rdns::metrics::DnsMetrics;
 use rdns::record_types;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode};
-use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter};
+use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
 use rdns::validation::AdmissionCheck;
 use rdns::{DnsMessage, OpCode, Qtype, QuerySection, ResponseCode};
 use rdns_transport::ServeContext;
@@ -18,7 +18,8 @@ use rdns_transport::ServeContext;
 use rdns::cache::StalePolicy;
 use rdns::rpz::{PolicyStore, PolicyZones};
 
-use crate::answer::{Caches, Resolving};
+use crate::answer::{Caches, NotifyAcl, Resolving};
+use crate::reload::PolicyReload;
 
 /// A name from a literal, for tests only: `Name` is fallible to build and a
 /// test that writes a bad one should fail loudly at that line.
@@ -74,6 +75,7 @@ pub(crate) fn serving(
         policy: PolicyStore::in_memory(policy),
         prefetch: false,
         dns64: None,
+        rpz_notify: None,
         ctx,
     })
 }
@@ -89,8 +91,34 @@ pub(crate) fn serving_policy(policy: Arc<PolicyStore>) -> Arc<Resolving> {
         policy,
         prefetch: false,
         dns64: None,
+        rpz_notify: None,
         ctx,
     })
+}
+
+/// A resolver that will take a NOTIFY from `from`, and the handle a queued
+/// reload lands on so a test can see whether one did.
+pub(crate) fn serving_notified(
+    policy: Arc<PolicyStore>,
+    from: &[&str],
+) -> (Arc<Resolving>, PolicyReload) {
+    let reload = PolicyReload::default();
+    let ctx = test_shell();
+    let caches = Caches::new(16, 4, StalePolicy::OFF, ctx.clock.clone());
+    let specs: Vec<String> = from.iter().map(|s| s.to_string()).collect();
+    let serving = Arc::new(Resolving {
+        resolver: test_resolver(),
+        caches,
+        policy,
+        prefetch: false,
+        dns64: None,
+        rpz_notify: Some(NotifyAcl {
+            from: TransferAcl::parse_named(&specs, "--rpz-notify-from").expect("the list parses"),
+            reload: reload.clone(),
+        }),
+        ctx,
+    });
+    (serving, reload)
 }
 
 /// A directory under `TEMP`, removed when it goes out of scope.
@@ -123,6 +151,36 @@ impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// A NOTIFY for `zone`, shaped the way `rdnsd` sends one: QTYPE SOA, no answer
+/// section. The serial is deliberately absent, because nothing here reads it.
+pub(crate) fn notify_message(zone: &str) -> Vec<u8> {
+    let msg = DnsMessage {
+        id: 0x1234,
+        response: false,
+        opcode: OpCode::Notify,
+        authoritive: false,
+        truncation: false,
+        recursion: false,
+        recursion_ok: false,
+        ad: false,
+        cd: false,
+        rcode: ResponseCode::Ok,
+        queries: vec![QuerySection {
+            qname: nm(zone),
+            qtype: Qtype::of(record_types::SOA),
+            qclass: rdns::QueryClass::IN,
+        }],
+        answers: Vec::new(),
+        authorities: Vec::new(),
+        additionals: Vec::new(),
+        edns: None,
+    };
+    let mut buf = vec![0u8; 512];
+    let n = msg.to_bytes(&mut buf).expect("serialize");
+    buf.truncate(n);
+    buf
 }
 
 pub(crate) fn message(opcode: OpCode, response: bool) -> Vec<u8> {

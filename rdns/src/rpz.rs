@@ -620,6 +620,18 @@ impl PolicyZones {
         &self.zones
     }
 
+    /// Whether one of these zones *is* the zone named — an exact origin, not a
+    /// zone that would answer for the name.
+    ///
+    /// For deciding whether a NOTIFY is about a feed we hold (`TODO.md` #57).
+    /// A linear scan because a resolver runs a handful of feeds and a map would
+    /// be slower over one (`CLAUDE.md` §13); `NameRef`'s `PartialEq` is the
+    /// ASCII fold (RFC 4343), so this cannot disagree with a zone map keyed on
+    /// folded octets.
+    pub fn carries(&self, zone: NameRef<'_>) -> bool {
+        self.zones.iter().any(|held| held.origin() == zone)
+    }
+
     /// The rewrite that applies before anything is resolved: the client's
     /// address, then the name it asked for, zone by zone in order.
     pub fn before_query(

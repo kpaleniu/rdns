@@ -23,6 +23,7 @@ use rdns::record_types;
 use rdns::resolver::{NameserverPolicy, Resolver};
 use rdns::response::ClientEdns;
 use rdns::rpz::{Action, DelegationPolicy, PolicyStore, PolicyZones, Rewrite};
+use rdns::security::TransferAcl;
 use rdns::special_names;
 use rdns::validation::{Request, Transport};
 use rdns::Qtype;
@@ -32,6 +33,8 @@ use rdns::{
     OPT_RECORD_TYPE,
 };
 use rdns_transport::ServeContext;
+
+use crate::reload::PolicyReload;
 
 /// What `rdnsr` remembers between queries.
 ///
@@ -109,7 +112,27 @@ pub(crate) struct Resolving {
     pub(crate) prefetch: bool,
     /// The NAT64 prefix to synthesize AAAA records into, if any (`--dns64`).
     pub(crate) dns64: Option<Dns64>,
+    /// Who may send a NOTIFY asking for the `--rpz` files to be re-read, and
+    /// how to queue one. `None` unless `--rpz-notify-from` named somebody, and
+    /// then a NOTIFY is NOTIMP as it was before `TODO.md` #57c — because then
+    /// this resolver really does not implement one.
+    pub(crate) rpz_notify: Option<NotifyAcl>,
     pub(crate) ctx: Arc<ServeContext>,
+}
+
+/// Who may ask for a policy reload, and the handle that queues it.
+///
+/// The two halves are one struct because neither is any use alone, and because
+/// the ACL existing is what says the feature is on: `CLAUDE.md` §16's "who are
+/// you" and "what may you do" are the same question here, since the only thing
+/// a NOTIFY may do is queue the one reload.
+pub(crate) struct NotifyAcl {
+    /// Addresses and prefixes, parsed by the same `TransferAcl` the query-rate
+    /// exemptions use — including its rule that a v4 prefix never matches a
+    /// v4-mapped v6 peer, which a second implementation would not have
+    /// (`CLAUDE.md` §7).
+    pub(crate) from: TransferAcl,
+    pub(crate) reload: PolicyReload,
 }
 
 /// What answering one query produced: the reply, and any work it left behind.
@@ -171,6 +194,7 @@ pub(crate) async fn handle_query(
         policy,
         prefetch,
         dns64: _,
+        rpz_notify,
         ctx,
     } = serving;
     // One snapshot for one query: a SIGHUP can install a new set part-way
@@ -207,6 +231,17 @@ pub(crate) async fn handle_query(
     // will send, which on TCP is neither (`rdns::UdpSizes::reply_ceiling`).
     // Before the opcode check, because a NOTIMP reply is bounded by it too.
     let client_max = ctx.udp.reply_ceiling(&msg, transport);
+
+    // A NOTIFY is how a policy feed says it has changed, for a resolver told
+    // whose word to take for it (`TODO.md` #57c).
+    if msg.opcode == OpCode::Notify {
+        if let Some(acl) = rpz_notify {
+            let (reply, rcode) =
+                policy_notify(&msg, peer, acl, &policy, ctx.udp.advertised(), client_max);
+            ctx.record_answer(rcode, timer);
+            return reply.into();
+        }
+    }
 
     // NOTIMP is more useful than answering a NOTIFY or an UPDATE with a
     // plausible QUERY-shaped reply the sender will misread (RFC 1035 §4.1.1).
@@ -837,9 +872,9 @@ pub(crate) fn log_policy(zones: &PolicyZones) {
 /// `rdnsd` writing what it transferred — and until this the answer was a
 /// restart (`TODO.md` #57).
 ///
-/// Neither line below names SIGHUP any more: [`crate::reload`] owns the
-/// triggers, and #57 has more of them coming. Which one asked is logged
-/// where it arrives.
+/// Neither line below names SIGHUP any more: [`crate::reload`] coalesces its
+/// triggers, so a message naming one of them would be a guess. Which trigger
+/// asked is logged where it arrives.
 pub(crate) fn reload_policy(serving: &Resolving) {
     if !serving.policy.is_configured() {
         return;
@@ -1057,6 +1092,80 @@ fn unsupported_opcode(msg: &DnsMessage, advertised: u16, max_len: usize) -> Opti
         resp.set_edns(edns);
     }
     resp.to_bytes_within(max_len).ok()
+}
+
+/// Answer a NOTIFY about a policy zone, and queue the re-read it asks for
+/// (RFC 1996).
+///
+/// Three outcomes, in this order:
+///
+/// - From an address `--rpz-notify-from` does not list: REFUSED. The check is
+///   first because a NOTIFY costs its recipient a full re-read of every feed —
+///   seconds, and twice the feeds' memory while both sets are live — so the
+///   work is never started for a sender that may not ask for it (`CLAUDE.md`
+///   §16). `rdnsd` refuses one the same way and says so with the same EDE code.
+/// - Naming a zone no `--rpz` file carries: NOTAUTH. Distinguished from the
+///   refusal on the wire and not only in the log, because the operator who can
+///   see this is on the sending side.
+/// - Otherwise NOERROR, and a reload is *queued*. §4.7 wants the reply before
+///   the work, and here the work is seconds long; [`PolicyReload`] bounds how
+///   much of it a burst can ask for.
+///
+/// The serial in the message is not read, though RFC 1996 §3.7 allows it. It is
+/// unauthenticated, and the only thing it could do here is let a reload be
+/// *skipped* — so a spoofed one would suppress a real update, which is the
+/// failure this path exists to prevent. `rdnsd` ignores it for the same reason
+/// and settles the question against the master; here the file is the master, so
+/// the re-read settles it.
+fn policy_notify(
+    msg: &DnsMessage,
+    peer: IpAddr,
+    acl: &NotifyAcl,
+    policy: &PolicyZones,
+    advertised: u16,
+    max_len: usize,
+) -> (Option<Vec<u8>>, ResponseCode) {
+    // RFC 8914 §4.19's "a query from an 'unauthorized' client", which is what
+    // this is: refused on its address, exactly as a transfer is.
+    const NOT_LISTED: ExtendedError = ExtendedError::new(
+        InfoCode::PROHIBITED,
+        "--rpz-notify-from does not list this address",
+    );
+    // Not §4.21's Not Authoritative, which is about a query with RD clear and
+    // would be a false statement besides: this server holds policy zones, just
+    // not that one. OTHER carries the sentence (§4.1).
+    const NOT_A_POLICY_ZONE: ExtendedError =
+        ExtendedError::new(InfoCode::OTHER, "no --rpz file carries that zone");
+
+    let (rcode, why) = if !acl.from.allows(peer) {
+        tracing::warn!(
+            %peer,
+            "NOTIFY REFUSED: --rpz-notify-from does not list it, and a NOTIFY \
+             costs its recipient a re-read of every feed"
+        );
+        (ResponseCode::Refused, Some(NOT_LISTED))
+    } else {
+        match rdns::notify::notified_zone(msg) {
+            Some(zone) if policy.carries(zone.as_ref()) => {
+                tracing::info!(%peer, "NOTIFY for {zone}: a policy re-read is queued");
+                acl.reload.request();
+                (ResponseCode::Ok, None)
+            }
+            named => {
+                // `notified_zone` is `None` for a NOTIFY whose question is not
+                // for SOA as well as for one with no question at all; the root
+                // stands in, as it does in `rdnsd`, and the rcode is the same
+                // either way.
+                let zone = named.unwrap_or_default();
+                tracing::info!(%peer, "NOTIFY for {zone}: NOTAUTH, no --rpz file carries it");
+                (ResponseCode::NotAuthorized, Some(NOT_A_POLICY_ZONE))
+            }
+        }
+    };
+    // `rdns::notify`'s builder, so this reply and `rdnsd`'s cannot drift about
+    // the opcode, the echoed question or the mirrored OPT (`CLAUDE.md` §7).
+    let reply = rdns::notify::notify_response(msg, rcode, advertised, why);
+    (reply.to_bytes_within(max_len).ok(), rcode)
 }
 
 /// A reply to `request` carrying `answers`, from whatever produced them.
@@ -1302,6 +1411,174 @@ mod tests {
         );
     }
 
+    /// A resolver holding one policy zone, `rpz.invalid.`, that takes a NOTIFY
+    /// from `from`.
+    fn notified_by(from: &[&str]) -> (Arc<Resolving>, PolicyReload) {
+        serving_notified(
+            PolicyStore::in_memory(policy("evil.example.com IN CNAME .\n")),
+            from,
+        )
+    }
+
+    async fn notify_reply(serving: &Resolving, peer: IpAddr, zone: &str) -> DnsMessage {
+        let bytes = handle_query(
+            notify_message(zone),
+            peer,
+            current_unix_timestamp(),
+            serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("a NOTIFY is answered, not dropped");
+        DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply")
+    }
+
+    /// Whether a reload is waiting. Consumes it, so a test asserting "none"
+    /// after asserting "one" is asking a real question.
+    fn a_reload_is_queued(reload: &PolicyReload) -> bool {
+        futures_lite_now_or_never(reload.requested())
+    }
+
+    /// Poll a future once and say whether it finished. Enough for a `Notify`
+    /// permit, which is ready or is not — no executor, no timing.
+    fn futures_lite_now_or_never(fut: impl std::future::Future<Output = ()>) -> bool {
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut fut = Box::pin(fut);
+        matches!(fut.as_mut().poll(&mut cx), Poll::Ready(()))
+    }
+
+    /// The whole of `TODO.md` #57c's happy path: a listed sender, a zone we
+    /// hold, NOERROR, and a re-read queued rather than run.
+    #[tokio::test]
+    async fn a_notify_from_a_listed_address_queues_a_re_read() {
+        let (serving, reload) = notified_by(&["198.51.100.0/24"]);
+        let reply = notify_reply(&serving, TEST_PEER, "rpz.invalid.").await;
+
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(
+            reply.opcode,
+            OpCode::Notify,
+            "the opcode is the sender's (RFC 1035 §4.1.1)"
+        );
+        assert!(reply.response);
+        assert!(a_reload_is_queued(&reload), "the re-read must be queued");
+    }
+
+    /// `CLAUDE.md` §16: a NOTIFY naming a zone this resolver really does hold,
+    /// from an address that may not ask about it, buys nothing.
+    ///
+    /// It does *not* test the order of the two checks, though the code checks
+    /// the address first and should: swapping them was tried here and changed
+    /// no reply, because the expensive thing is the re-read and that is gated on
+    /// the address in either order. The scan the other order would run first is
+    /// a handful of origins (`CLAUDE.md` §19).
+    #[tokio::test]
+    async fn a_notify_from_an_unlisted_address_is_refused_and_costs_nothing() {
+        let (serving, reload) = notified_by(&["192.0.2.1"]);
+        let reply = notify_reply(&serving, TEST_PEER, "rpz.invalid.").await;
+
+        assert_eq!(reply.rcode, ResponseCode::Refused);
+        assert!(
+            !a_reload_is_queued(&reload),
+            "an unlisted sender must not queue work"
+        );
+    }
+
+    /// The two refusals carry their reason to a sender that offered somewhere
+    /// to put it (RFC 8914 §2) — and carry different ones, because "you may
+    /// not ask" and "I do not hold that zone" are different problems an
+    /// operator fixes in different files. No OPT in the NOTIFY, no OPT in the
+    /// reply, which is why the tests above do not look for one.
+    #[tokio::test]
+    async fn a_refused_notify_says_why_when_the_sender_used_edns() {
+        for (from, zone, expected) in [
+            ("192.0.2.1", "rpz.invalid.", InfoCode::PROHIBITED),
+            ("198.51.100.0/24", "elsewhere.invalid.", InfoCode::OTHER),
+        ] {
+            let (serving, _reload) = notified_by(&[from]);
+            let mut msg = DnsMessage::try_from_bytes(&notify_message(zone)).expect("parses");
+            msg.set_edns(Edns::with_payload_size(4096));
+
+            let bytes = handle_query(
+                msg.to_bytes_within(4096).expect("serialize"),
+                TEST_PEER,
+                current_unix_timestamp(),
+                &serving,
+                Transport::Udp,
+            )
+            .await
+            .reply
+            .expect("answered");
+            let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+
+            let edns = reply.edns.as_ref().expect("the OPT is mirrored");
+            let errors = ExtendedError::all_in(edns).expect("a well-formed option list");
+            assert_eq!(
+                errors.iter().map(|(code, _)| *code).collect::<Vec<_>>(),
+                vec![expected],
+                "{zone} from {from}"
+            );
+        }
+    }
+
+    /// NOTAUTH rather than REFUSED, so the operator on the sending side can
+    /// tell "you may not ask" from "I do not have that zone" without a log on
+    /// this side.
+    #[tokio::test]
+    async fn a_notify_for_a_zone_no_feed_carries_is_notauth() {
+        let (serving, reload) = notified_by(&["198.51.100.0/24"]);
+        let reply = notify_reply(&serving, TEST_PEER, "elsewhere.invalid.").await;
+
+        assert_eq!(reply.rcode, ResponseCode::NotAuthorized);
+        assert!(
+            !a_reload_is_queued(&reload),
+            "a zone we do not hold must not queue a re-read of the ones we do"
+        );
+    }
+
+    /// The serial is not read, though RFC 1996 §3.7 offers it. Acting on it
+    /// could only ever *skip* a re-read, and it is unauthenticated — so a
+    /// spoofed high serial would suppress a real update. This carries a serial
+    /// the file has already passed, and the re-read is queued anyway.
+    #[tokio::test]
+    async fn a_notify_with_a_stale_serial_still_queues_a_re_read() {
+        let (serving, reload) = notified_by(&["198.51.100.0/24"]);
+        let mut msg = DnsMessage::try_from_bytes(&notify_message("rpz.invalid.")).expect("parses");
+        msg.answers = vec![soa("rpz.invalid.")];
+
+        let bytes = handle_query(
+            msg.to_bytes_within(4096).expect("serialize"),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert!(a_reload_is_queued(&reload));
+    }
+
+    /// Without `--rpz-notify-from` nothing changes: this resolver does not
+    /// implement NOTIFY, and says so.
+    #[tokio::test]
+    async fn a_notify_is_notimp_when_no_address_may_send_one() {
+        let serving = serving(
+            test_resolver(),
+            test_shell(),
+            policy("evil.example.com IN CNAME .\n"),
+        );
+        let reply = notify_reply(&serving, TEST_PEER, "rpz.invalid.").await;
+
+        assert_eq!(reply.rcode, ResponseCode::NotImplemented);
+        assert_eq!(reply.opcode, OpCode::Notify);
+    }
+
     /// A query for `name` with `queries` questions in it, CD as given.
     fn query_for(name: &str, questions: usize, cd: bool) -> Vec<u8> {
         let mut msg = DnsMessage::try_from_bytes(&message(OpCode::Query, false)).expect("parses");
@@ -1341,6 +1618,7 @@ mod tests {
                 policy: PolicyStore::in_memory(PolicyZones::default()),
                 prefetch,
                 dns64: None,
+                rpz_notify: None,
                 ctx,
             }),
             clock,
@@ -1552,6 +1830,7 @@ mod tests {
                 rdns::dns64::Dns64::new(rdns::dns64::Nat64Prefix::well_known(), &[])
                     .expect("the Well-Known Prefix"),
             ),
+            rpz_notify: None,
             ctx: test_shell(),
         })
     }

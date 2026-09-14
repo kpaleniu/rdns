@@ -46,7 +46,8 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
 
 use crate::anchors::spawn_anchor_manager;
-use crate::answer::{log_policy, Caches, Resolving};
+use crate::answer::{log_policy, Caches, NotifyAcl, Resolving};
+use crate::reload::PolicyReload;
 use crate::serve::udp_main;
 
 /// UDP queries this resolver will have in flight at once, when nothing says
@@ -346,6 +347,20 @@ struct Cli {
     /// and this daemon has flags.
     #[arg(long, value_name = "POLICY", default_value = "given")]
     rpz_policy: rdns::rpz::PolicyOverride,
+    /// Addresses that may send a NOTIFY asking for the `--rpz` files to be
+    /// re-read: `192.0.2.1`, `10.0.0.0/8`, `2001:db8::/32`. Repeatable.
+    ///
+    /// An RPZ is a DNS zone, so the thing that maintains one already announces
+    /// a change this way — an `rdnsd` replicating the feed announces it to its
+    /// `--also-notify` targets after every transfer, with no new code on that
+    /// side. This is the ear for it (`TODO.md` #57c).
+    ///
+    /// A list rather than a default, because a NOTIFY costs its recipient a
+    /// full re-read of every feed: seconds for a large one, and twice the
+    /// feeds' memory while both sets are live. Naming nobody leaves a NOTIFY
+    /// answered NOTIMP, which is what this resolver did before.
+    #[arg(long, value_name = "ADDR|CIDR")]
+    rpz_notify_from: Vec<String>,
 }
 
 #[tokio::main]
@@ -497,6 +512,28 @@ async fn main() -> anyhow::Result<()> {
     // starting without it is the failure worth avoiding most here.
     let policy = PolicyStore::load(&cli.rpz, cli.rpz_policy)?;
 
+    // With the policy, and before anything binds, for the same reason: a typo
+    // in the list is an announcement that will be refused, and an operator
+    // finds that out when the feed goes stale rather than at startup.
+    let reload = PolicyReload::default();
+    let rpz_notify = if cli.rpz_notify_from.is_empty() {
+        None
+    } else {
+        if cli.rpz.is_empty() {
+            // Not a warning. There is nothing for a NOTIFY to re-read, so the
+            // list is a policy the operator believes is in force and is not
+            // (`CLAUDE.md` §15).
+            return Err(anyhow!(
+                "--rpz-notify-from names who may ask for the --rpz files to be \
+                 re-read, and no --rpz names one"
+            ));
+        }
+        Some(NotifyAcl {
+            from: TransferAcl::parse_named(&cli.rpz_notify_from, "--rpz-notify-from")?,
+            reload: reload.clone(),
+        })
+    };
+
     // Before anything binds, as everything else operator-supplied is: a NAT64
     // prefix that does not parse is an IPv6-only network with no DNS at all.
     let dns64 = match &cli.dns64 {
@@ -622,6 +659,21 @@ async fn main() -> anyhow::Result<()> {
         refusals_per_source: cli.anomaly_source_refusals,
     };
     log_policy(&policy.in_force());
+    // What a NOTIFY may do here, printed for the same reason the rate limit is:
+    // silence is a legitimate answer to one and an operator watching a feed go
+    // stale cannot tell a refused announcement from one nobody sent
+    // (`CLAUDE.md` §14).
+    if let Some(acl) = rpz_notify.as_ref() {
+        tracing::info!(
+            "a NOTIFY from {} address(es) queues a re-read of every --rpz file; \
+             from anywhere else it is REFUSED",
+            acl.from.len()
+        );
+    } else if !cli.rpz.is_empty() {
+        tracing::info!(
+            "no --rpz-notify-from: a feed is re-read on SIGHUP only, and a NOTIFY is NOTIMP"
+        );
+    }
 
     if let Some(dns64) = dns64.as_ref() {
         tracing::info!(
@@ -695,6 +747,7 @@ async fn main() -> anyhow::Result<()> {
         policy,
         prefetch: cli.prefetch,
         dns64,
+        rpz_notify,
         ctx: ctx.clone(),
     });
 
@@ -763,6 +816,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(reload::reload_task(
             tls_store.clone(),
             serving.clone(),
+            reload,
             shutdown.stop_handle(),
         ));
     }

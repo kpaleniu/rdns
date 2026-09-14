@@ -50,10 +50,11 @@ closing it is what added #53 — a zone this server signed itself verified again
 at every load — which closed the same day it was taken.
 #57 is what is left of what 45a left — **#56 closed the same day it was filed**,
 and what it found was in a cache nobody was looking at rather than in the
-resolver's return type. **#57's own first item closed the same day too**: a
-SIGHUP re-reads every `--rpz` file now, so what is left of it is the transfer
-and the IXFR question, and the row says why the cheap answer to both may be a
-post-transfer hook in `rdnsd`. #58 is what 45b left, #59 what #51 left and #60
+resolver's return type. **Three of #57's four items are closed**: a reload
+re-reads every `--rpz` file, runs off the worker threads, and can be asked for
+by a NOTIFY from a listed address. What is left is the transfer itself (57d) and
+the IXFR question, and the measurements in the row say the transfer is decided
+by memory rather than by time. #58 is what 45b left, #59 what #51 left and #60
 what #51 turned up on the way; and #21 is an inventory of deliberate deviations
 rather than a queue. **#59's prerequisite is gone**: #54
 was it, and closing it put `validation::Arrival` where a peer certificate can
@@ -963,21 +964,23 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13, 57a-b closed**
+### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13, 57a-c closed, 57d-e open**
 
 Also left behind by 45a, and the half of its own row that did not survive
 contact with the code. #45a said the pleasing part was the delivery mechanism —
 "an RPZ *is* a DNS zone, so the AXFR/IXFR/NOTIFY machinery that already exists
 is how the policy would arrive". The machinery does exist. It is in `rdnsd`:
 `rdns::secondary`, `rdns::transfer`, `rdns::notify`, `rdnsd/src/replication.rs`.
-`rdnsr` has never been a secondary of anything, has no zone map, and does not
-listen for a NOTIFY at all.
+`rdnsr` has never been a secondary of anything, has no zone map, and ~~does not
+listen for a NOTIFY at all~~ — **it does since 57c, which is what closed the
+delivery half without `rdnsd` changing at all.** It is still not a secondary and
+still has no zone map.
 
 So `--rpz` takes a path, and a feed is refreshed by whatever writes that path —
 which is how an operator with one feed and a cron job already works, and is not
 how an operator with an hourly-updated blocklist wants to work.
 
-Four items. 57a and 57b are done.
+Five items. 57a-c are done; 57d and 57e are what is left.
 
 - **57a.** ~~**Re-read before replicate.**~~ **Done, `rpz::PolicyStore`.** SIGHUP
   re-reads every `--rpz` file, all-or-nothing, and a feed that will not parse
@@ -1056,16 +1059,10 @@ Four items. 57a and 57b are done.
   reload, and above one core it cost 1/N of capacity. The work is now on
   `spawn_blocking`.
 
-  The reload cost itself is linear at ~2.7 µs per rule — 1.5 ms at a thousand
-  rules, 170 ms at a hundred thousand, 2.74 s at a million — and a set is
-  352-407 bytes per rule held. The re-read is all-or-nothing, so both sets are
-  live at once and a million-rule feed peaks at **1.06 GB** to re-read 407 MB.
-  That number is what 57d and the IXFR question below turn on.
-
-  The last row of the table is why the task is sequential: four concurrent
-  reloads stalled every task for 3.53 s and took 4.50 s to do 2.70 s of work.
-  Nothing yet asks for a reload except SIGHUP, so nothing yet can cause that —
-  which is a thing 57c has to keep true.
+  The last row is the one that gated 57c: four concurrent reloads stalled every
+  task for 3.53 s and took 4.50 s to do 2.70 s of work. Reloads are therefore
+  serialised — one task, awaiting each — and requests coalesce onto a single
+  `Notify` permit, so a burst asks for one re-read and not one per request.
 
   Its regression test is `a_reload_does_not_stop_the_only_worker`, and **the
   first version of it passed against the defect**: `block_on` drives the test's
@@ -1073,21 +1070,85 @@ Four items. 57a and 57b are done.
   blocked one. Both halves are spawned now, which is also how `main` runs them.
   `CLAUDE.md` §1 — the test agreed with the code until it was run against the
   shape it forbids.
-- **57c. Then the transfer**, which is the part with a cost: it means `rdnsr` grows a
-  replication task, an SOA timer and a NOTIFY listener, and those are what
-  `rdnsd` is. The alternative worth measuring first is that the *operator* runs
-  `rdnsd` as the secondary and points `rdnsr --rpz` at the zone file it writes,
-  which is two processes and no new code, and is what several ISPs do with BIND
-  for unrelated reasons. **The reload above is what makes that alternative work
-  at all**, and it leaves exactly one gap: nothing sends the SIGHUP. `rdnsd` has
-  no post-transfer hook, so today the trigger is the operator's — a systemd path
-  unit, or a cron job beside the one that already writes the file. A hook is a
-  smaller change than a replication task and would settle this row without it;
-  measure that before building the task.
-- **57d. And IXFR only if the zone is large enough to care.** A national blocklist is
-  thousands of names; the RPZ feeds that are millions are the commercial malware
-  ones. `rdns::ixfr` exists either way, so this is a question about the timer
-  and not about the format.
+- **57c.** ~~**Then the transfer.**~~ **The delivery half is done,
+  `--rpz-notify-from`.** ~~The reload above leaves exactly one gap: nothing
+  sends the SIGHUP. `rdnsd` has no post-transfer hook, so today the trigger is
+  the operator's — a systemd path unit, or a cron job beside the one that
+  already writes the file. A hook is a smaller change than a replication task
+  and would settle this row without it; measure that before building the
+  task.~~
+
+  **Wrong about `rdnsd`, and the hook was never needed.** `rdnsd`'s secondary
+  path ends at `announce_transfer` (`rdnsd/src/replication.rs`), which sends a
+  NOTIFY to every `--also-notify` peer after every transfer — a post-transfer
+  hook for anything that listens, already shipped, per zone, signed if the peer
+  names a key. The gap was never on the sending side; it was that `rdnsr`
+  answered NOTIFY with NOTIMP. It now has the ear, and `rdnsd` needed no change
+  at all.
+
+  `--rpz-notify-from` is a list of addresses and prefixes, parsed by the
+  `TransferAcl` the query-rate exemptions already use. Naming nobody leaves a
+  NOTIFY answered NOTIMP, because then the resolver really does not implement
+  one; naming somebody with no `--rpz` is refused at startup. From a listed
+  address, naming a zone a feed carries: NOERROR and a re-read *queued* (RFC
+  1996 §4.7 wants the reply before the work, and the work is seconds). From
+  anywhere else: REFUSED. For a zone no feed carries: NOTAUTH — distinguished on
+  the wire and not only in the log, because the operator who can act on it is on
+  the sending side.
+
+  **The serial in the message is not read**, though §3.7 offers it. It is
+  unauthenticated, and the only thing it could do here is let a re-read be
+  *skipped*, so a spoofed one would suppress a real update — the failure the
+  path exists to prevent. `rdnsd` ignores it for the same reason and settles the
+  question against the master; here the file is the master.
+
+  Six tests, each run against the shape it forbids: the outcome three against an
+  absent ACL and an absent zone check and against the pre-change NOTIMP path;
+  the serial one against a handler that compares serials; the coalescing one
+  against a counting semaphore. **One claim did not survive being checked**: the
+  refusal test was filed saying it proved the address is checked *before* the
+  zone. Swapping the two changed no reply, because the expensive thing is the
+  re-read and that is gated on the address either way — the order is still right
+  (`CLAUDE.md` §16) and the test does not demonstrate it (§19).
+
+  Proved against a process on both platforms, not only against the functions
+  (§4): `rdnsr` started with a feed, queried, the feed rewritten, a NOTIFY sent,
+  queried again — the new rule blocks; an unlisted sender gets REFUSED, an
+  unknown zone NOTAUTH, a feed replaced with rubbish leaves the block in force.
+  On Linux the same run also sends SIGHUP, which is the `cfg(unix)` arm Windows
+  never compiles. **Windows had no reload trigger before this**: `next_reload`
+  is `pending()` there, so a NOTIFY is the only one it has.
+- **57d. What is left of the transfer**: whether `rdnsr` should replicate a
+  policy zone itself rather than read what another process wrote. The arithmetic
+  is free — `xfr::fetch_zone` returns a `Zone` and `rpz::PolicyZone::new` takes
+  one — and the cost is a replication task, three timers, an EXPIRE, and a state
+  sidecar, which is what `rdnsd` is.
+
+  **Gated on a prerequisite outside this row.** A transfer spec is per zone
+  (master, key name, TLS anchors); `MasterSpec` carries four fields and `rdnsd`
+  spends 1 402 lines of `config.rs` on 84 public items to express that. `rdnsr`
+  has 39 flags and no config file, and `--rpz-policy`'s own doc comment already
+  concedes the point for a smaller thing. So 57d is a decision about `rdnsr`
+  config before it is a decision about transfers.
+
+  With 57c shipped, the two-process arrangement — `rdnsd` replicates, `rdnsr`
+  reads, a NOTIFY joins them — needs no operator cron job and no new code on
+  either side. **That is the thing 57d has to beat**, and it is worth saying
+  that it may not be beaten.
+- **57e. And IXFR only if the zone is large enough to care.** A national
+  blocklist is thousands of names; the RPZ feeds that are millions are the
+  commercial malware ones. `rdns::ixfr` exists either way, so this is a question
+  about the timer and not about the format.
+
+  **What 57b measured moves this**, and away from the timer. Reload cost is
+  linear at ~2.7 µs per rule — 1.5 ms at a thousand rules, 170 ms at a hundred
+  thousand, 2.74 s at a million — which any sane cadence absorbs on two or more
+  cores. Memory does not: a set is 352-407 bytes per rule held, and the reload
+  is all-or-nothing, so both sets are live at once. A million-rule feed holds
+  407 MB and peaks at **1.06 GB** to re-read it. Applying a forty-record delta
+  should not cost a gigabyte, so if the million-rule feed is a real target the
+  incremental path is required — and IXFR has nothing to apply a delta to
+  without 57d. 57e therefore does not precede 57d; it is an argument for it.
 
 ---
 

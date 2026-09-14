@@ -1,47 +1,91 @@
 //! Re-reading what a running resolver was started with: the TLS certificate and
 //! every `--rpz` file.
 //!
-//! One task, and its shape is a measurement.
+//! One task, and everything about its shape is a measurement.
 //!
 //! The reads are blocking and slow — a million-rule QNAME feed is 2.7 s to
 //! re-read and peaks at 1.06 GB while both sets are live, since
 //! [`rdns::rpz::PolicyStore::reload`] builds the whole new set before
-//! installing any of it. They ran on a tokio worker until `TODO.md` #57b, and
-//! `#[tokio::main]` gives one worker per core: measured on a one-worker runtime,
-//! a probe asking for 1 ms ticks saw a 2.715 s gap, which is a resolver
-//! answering nothing for the length of a reload. With two workers it was 2.28 ms
-//! against a 2.17 ms floor — the defect cost 1/N of capacity above one core and
-//! everything at one, so the work goes to [`tokio::task::spawn_blocking`]
-//! (`CLAUDE.md` §9).
+//! installing any of it.
+//! They ran on a tokio worker until `TODO.md` #57b, and `#[tokio::main]` gives
+//! one worker per core: measured on a one-worker runtime, a probe asking for
+//! 1 ms ticks saw a 2.715 s gap, which is a resolver answering nothing for the
+//! length of a reload. With two workers it was 2.28 ms against a 2.17 ms floor
+//! — the defect cost 1/N of capacity above one core and everything at one, so
+//! the work goes to [`tokio::task::spawn_blocking`] (`CLAUDE.md` §9).
 //!
-//! The task is also sequential, so two reloads never overlap: four at once on
-//! four workers stalled every task for 3.53 s and took 4.50 s to do 2.70 s of
-//! work.
+//! The task is sequential, so two reloads never overlap: four at once on four
+//! workers stalled every task for 3.53 s and took 4.50 s to do 2.70 s of work.
+//! And [`PolicyReload`]'s single permit collapses a burst of requests into one
+//! queued reload, which is what makes it safe for a NOTIFY — a packet whose
+//! rate a remote party chooses — to ask for one at all (`CLAUDE.md` §5).
 
 use std::sync::Arc;
 
 use rdns::shutdown::{next_reload, reload_signal, Stop};
 use rdns_transport::tls::CertificateStore;
+use tokio::sync::Notify;
 
 use crate::answer::{reload_policy, Resolving};
 
-/// Re-read on SIGHUP, one at a time, off the worker threads.
+/// A handle for asking that the `--rpz` files be re-read.
+///
+/// Held by the answer path, which must not hold an `Arc<Resolving>` back to
+/// reach the reloader: this carries the wake-up and nothing else, so there is
+/// no cycle to leak.
+#[derive(Clone, Default)]
+pub(crate) struct PolicyReload(Arc<Notify>);
+
+impl PolicyReload {
+    /// Queue a reload, if one is not already queued.
+    ///
+    /// At most one waits however many ask, because `Notify` holds a single
+    /// permit. That is the bound, and it is the reason this is a `Notify`
+    /// rather than a channel: the work is idempotent, so a hundred requests and
+    /// one request want the same single re-read, and an unbounded queue of them
+    /// is the amplification `CLAUDE.md` §5 is about. `rdnsd`'s refresh task
+    /// wakes on the same primitive for the same reason.
+    pub(crate) fn request(&self) {
+        self.0.notify_one();
+    }
+
+    /// Resolve when a reload has been asked for.
+    ///
+    /// Cancel-safe, which is what lets it sit in the `select!` below: a permit
+    /// outlives the dropped future, so a request racing the stop signal is not
+    /// silently swallowed — it is simply never run, which is what stopping
+    /// means.
+    pub(crate) async fn requested(&self) {
+        self.0.notified().await;
+    }
+}
+
+/// Re-read on SIGHUP or on request, one at a time, off the worker threads.
+///
+/// SIGHUP re-reads the certificate as well; a request does not. A NOTIFY is the
+/// only thing that asks, it is about a policy zone, and a stranger's packet has
+/// no business making this process re-open its key material — nor leaving a
+/// "could not re-read the TLS certificate" line behind to be diagnosed by
+/// somebody who did not touch it.
 pub(crate) async fn reload_task(
     certificate: Option<Arc<CertificateStore>>,
     serving: Arc<Resolving>,
+    wanted: PolicyReload,
     stop: Stop,
 ) {
     let mut signals = reload_signal();
     loop {
-        tokio::select! {
+        let certificate = tokio::select! {
             reloaded = next_reload(&mut signals) => {
                 if !reloaded {
                     break;
                 }
+                certificate.as_ref()
             }
+            () = wanted.requested() => None,
             () = stop.wait() => break,
-        }
-        reload_now(certificate.as_ref(), &serving).await;
+        };
+        reload_now(certificate, &serving).await;
     }
 }
 
@@ -61,7 +105,7 @@ async fn reload_now(certificate: Option<&Arc<CertificateStore>>, serving: &Arc<R
     .await;
     if let Err(e) = ran {
         // The task must survive it: what panicked did not install anything, so
-        // the previous set is still in force and the next trigger can still be
+        // the previous set is still in force and the next request can still be
         // served. Ending the loop here would leave a resolver that looks healthy
         // and never reloads again (`CLAUDE.md` §4).
         tracing::error!("the reload panicked and nothing was re-read: {e}");
@@ -71,6 +115,7 @@ async fn reload_now(certificate: Option<&Arc<CertificateStore>>, serving: &Arc<R
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use super::*;
     use crate::testutil::{serving_policy, ScratchDir};
@@ -91,7 +136,30 @@ mod tests {
         dir.write("feed.rpz.invalid.zone", &text)
     }
 
-    /// The defect this item fixed, on the runtime shape that made it fatal.
+    /// The coalescing, at the level where it is decided.
+    ///
+    /// Fails against a channel or a semaphore, which would hand back one
+    /// completion per request and let a NOTIFY flood queue a reload per packet.
+    #[tokio::test]
+    async fn a_burst_of_requests_queues_one_reload() {
+        let wanted = PolicyReload::default();
+        for _ in 0..100 {
+            wanted.request();
+        }
+        // The first is waiting and returns at once.
+        tokio::time::timeout(Duration::from_secs(5), wanted.requested())
+            .await
+            .expect("the first request is queued");
+        // The other ninety-nine were folded into it.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), wanted.requested())
+                .await
+                .is_err(),
+            "a hundred requests must queue one reload, not a hundred"
+        );
+    }
+
+    /// The defect #57b fixed, on the runtime shape that made it fatal.
     ///
     /// One worker, so a reload that occupies it is the whole runtime. The probe
     /// counts completed yields rather than measuring a delay, because a count is
@@ -136,12 +204,10 @@ mod tests {
         );
     }
 
-    /// A panicking reload arrives as a join error rather than taking the
-    /// process with it — the third-party behaviour the loop above depends on
-    /// (`CLAUDE.md` §4).
+    /// A reload that panics must not take the task with it.
     #[tokio::test]
-    async fn a_panicking_reload_is_a_join_error() {
+    async fn the_task_outlives_a_panicking_reload() {
         let ran = tokio::task::spawn_blocking(|| panic!("as a reload might")).await;
-        assert!(ran.is_err());
+        assert!(ran.is_err(), "a panic arrives as a join error, not a hang");
     }
 }
