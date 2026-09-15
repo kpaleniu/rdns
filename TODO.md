@@ -65,7 +65,12 @@ question** and kills the option 63a was framed around: `rdnsr` would name **0**
 of those 18, because every one is zones, signing or catalogs. What it wants a
 piece of is the private `Server`, 22 of whose 34 keys it already has as flags —
 so the open decision is a second parser against a split `[server]`, and the
-only code genuinely shared is `read_secret_file`.
+only code genuinely shared is `read_secret_file`. **63h built both, and a third
+the two of them named**: the split `[server]` is out — flattening a shared
+struct costs a config error its line number and its expected-key list, for
+`rdnsd`'s existing file as much as for the new one — and what is recommended is
+the macro shape, which declares the 22 keys once and reads exactly as today
+does. Three branches, nothing landed: the shape is the owner's to pick.
 **#64 came out of asking 57d's question of `rdnsd`**: if a zone file is both
 the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
@@ -1759,7 +1764,7 @@ next caller is told the cost rather than finding it.
 
 ---
 
-### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a and 63g answered, 63e-f closed**
+### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a, 63g and 63h answered, 63e-f closed**
 
 Filed out of 57d, which cannot be decided without it: a transfer spec is per
 zone, and there is nowhere to write one. Filed as its own number rather than
@@ -1960,6 +1965,95 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   The line it draws: a *protocol* constant belongs in `rdns` and both binaries
   cite it; a *policy* default like `--query-rate` does not, which is why the
   other 13 agreements are not a defect to fix.
+
+- **63h. The shapes, built — 2026-09-15.** §19: arguing costs more than
+  compiling, and what decided this was in neither argument. Three branches, each
+  compiling, clippy-clean under `--all-targets` and passing the suite:
+  `wip/63-shape-a` (929f544, 76f69b7), `wip/63-shape-b` (1d6e0e5),
+  `wip/63-shape-c` (4d469d9).
+
+  The same feature in all three, so only the shape differs: `rdnsr --config`
+  with `[server]`, `[resolver]` and `[rpz]`, `deny_unknown_fields` throughout,
+  `conflicts_with = "config"` on all 37 file-settable flags (§15), and 63e's
+  shape applied to this daemon first — 19 flag defaults moved to crate-root
+  functions and every flag `default_value_t`, so the file inherits the flag's
+  number. `rdnsr --help` is byte-identical but for the `--config` entry, which
+  is the check that the conversion changed nothing. Per-feed RPZ policy, the
+  thing #63 exists to unblock, is in none of them: it is a `[[rpz]]`
+  array-of-tables away once the parser has a home.
+
+  | | A: second parser | B: shared struct in `rdns` | C: shared fields, by macro |
+  |---|---|---|---|
+  | diff against main | 4 files, +633/−38 | 8 files, +799/−152 | 7 files, +789/−168 |
+  | `rdnsd` | untouched | `config.rs` +135/−114, 2 tests rewritten | `config.rs` +60/−130, no test edited |
+  | new public API in `rdns` | none | 24 items | 1 macro |
+  | `rdns` packages | 52 | **55** (`serde`, `serde_core`, `serde_derive`) | 52 |
+  | `rdns-transport` packages | 88 | 91 | 88 |
+  | a typo in `[server]` | the key's line, expected keys listed | **the table's line, nothing listed** | the key's line, expected keys listed |
+  | the 22 keys declared | twice | once | once |
+  | their `Default` spelled | twice | twice | once |
+  | folding them into `Cli` | 22 lines per daemon | 22 lines per daemon | 22 lines per daemon |
+  | `cargo fmt` reaches them | yes | yes | **no — inside a macro invocation** |
+  | tests, Windows / Linux | 1179 / 1199 | 1180 / not run | 1180 / 1200 |
+
+  **What building them settled, none of which the row's prose had.**
+
+  - **`#[serde(flatten)]` and `deny_unknown_fields` do coexist** — the *inner*
+    struct's denial catches what the outer did not claim, so B's typo check
+    works. What it costs is the message: serde buffers a flattened map, so a
+    typo *or a wrong type* anywhere in `[server]` is reported at the table's
+    line with no expected-key list, against the key's exact span today. That is
+    §15's "must fail at startup with a line number", and B regresses it for
+    `rdnsd`'s existing file, not only for the new one.
+  - **Sharing a declaration does not share its application.** All three fold 22
+    keys into a `Cli` with 22 lines per daemon. The alternative was built and
+    thrown away: a `ServerCommon::apply_to` taking 22 `&mut` arguments, three
+    `Option<String>` listeners among them, where transposing two compiles (§14).
+  - **B's `Option` per key is forced, not chosen**: `host`, `query-rate` and
+    `query-burst` differ per daemon on purpose (63g), so a shared *struct* can
+    hold no default and every key becomes an override. C keeps the values,
+    because the defaults come from the calling crate's root by name.
+  - **A derived `Default` beside `#[serde(default = "…")]` silently disagrees
+    with it.** In B an absent `[server]` meant `max-inflight-udp = 0`, which
+    `check` refuses; the tripwire test caught it. Same class as 63e, one level
+    down: two spellings of one default with nothing comparing them.
+  - **`rdnsc` and `rdnsctl` are not affected by anything here** — both depend on
+    `rdns-core`, not on `rdns`, so B's three packages stop at `rdns-transport`
+    and the two daemons. The `Cargo.lock` is unchanged in all three shapes:
+    `rdnsd` already paid for `toml` and `serde`, and `rdnsr`'s own tree goes
+    104 → 113 either way.
+
+  **The measurement that could have refuted the recommendation** (§19), taken
+  before making it: *"the 22 keys never actually move together, so declaring
+  them twice costs nothing."* **False.** Of the 23 commits that have touched
+  `rdnsd/src/config.rs`, **12 also touch `rdnsr/src/main.rs`**, and 7 of those
+  12 are this exact class — the UDP reply cap, the anomaly thresholds, the
+  request-size caps, UDP admission, and DoT, DoQ and DoH, each adding one
+  setting to both daemons in one commit. So the duplication does recur, about
+  seven times over the project's life, at three lines a time in a commit that
+  already edits both crates.
+
+  **And one that refuted a cost.** A's real risk is not those three lines, it is
+  #46c's shape — a key and a flag that mean one setting with nothing comparing
+  them. clap can compare them: `get_arg_conflicts_with` names every flag
+  `--config` replaces, and that set *is* what the file must be able to say.
+  `every_flag_the_file_replaces_has_a_key_in_it` (76f69b7) walks it, watched
+  failing against a deleted `resolver.prefetch`. It is shape-independent, so it
+  is not a point for A over B or C — but it means A's duplication is checked
+  rather than trusted.
+
+  **Recommendation: C, and B is out.** B's one advantage — the 22 keys declared
+  once — is C's too, and C also shares the `Default` the other two spell twice,
+  while B pays for it with the error message operators read at 3am, three
+  packages into a library that reads no files, and 24 public items for one
+  consumer. C's cost is narrower and visible: the declarations sit inside a
+  macro invocation, so `cargo fmt` stops reaching them (§12), `grep` for a key
+  lands in `rdns/src/config.rs` rather than the daemon's own file, and the
+  contract "the calling crate's root defines these `default_*` functions" is
+  prose enforced by a compile error. `clippy::crate_in_macro_def` fires on
+  precisely that contract and is allowed with the reason beside it. If that
+  reads as too clever for what it buys, A is the fallback and loses only the
+  single declaration — nothing an operator can see.
 
 **The dependency objection is already answered, measured rather than argued**
 (§15's "pay for a parser; do not pay for a stub"). `toml` + `serde` is **nine
