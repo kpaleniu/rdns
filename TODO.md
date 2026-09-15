@@ -89,7 +89,11 @@ the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
 lock. The row was filed with the measurement that refuted the fix it was going
 to propose. **64a is fixed** — four passes and 1.7 s, and it was three
-clones and not the one the row named. **64d is closed and answered the question
+clones and not the one the row named. **64b is built on a branch and its
+headline number did not reproduce**: the mechanism is right, the safety
+property has a test, and the 25% it promised at a million records is 1-5% for
+a reason only partly explained — the row says where a clean reading would
+start. **64d is closed and answered the question
 the other two were waiting on**: signing is 88% of a signed update, so 64b and
 64c together are worth 10% of one rather than the 68% they are of an unsigned
 one — and the measurement filed **64e**, which is that carrying every signature
@@ -2355,7 +2359,7 @@ transfers.
 
 ---
 
-### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14**
+### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14, 64a and 64d closed, 64b built but unresolved**
 
 Filed with the measurement that **refuted the reason it was going to be filed**.
 The finding on the way in was "the UPDATE path re-reads the zone file, so an
@@ -2419,12 +2423,96 @@ it is one every twelve** (64d).
   above the five that followed it, and it was *inside* the unfixed band. The
   four remaining steps are unmoved. **Four O(zone) passes now, not five**; the
   section heading is the shape at filing and is left as the identifier it is.
-- **64b. The re-read, which is a policy wearing a cost.** `parse_zone_file_at`
-  per update, under "so an edit since the last load is not silently reverted" —
-  **451 ms, 25%**. The rule is defensible; paying it unconditionally is the
-  part that is not. Whether an mtime check is enough depends on a question
-  nobody has asked: what an operator editing a file under a server taking
-  dynamic updates is entitled to.
+- **64b. The re-read, which is a policy wearing a cost — built, and the number
+  did not hold.** `parse_zone_file_at` per update, under "so an edit since the
+  last load is not silently reverted" — **451 ms, 25%**. The rule is
+  defensible; paying it unconditionally is the part that is not. ~~Whether an
+  mtime check is enough depends on a question nobody has asked: what an
+  operator editing a file under a server taking dynamic updates is entitled
+  to.~~ Both halves of that are answered below — the question was worth asking
+  and the mtime framing was the wrong one.
+  **Built 2026-09-15 on branch `64b-digest`, and its headline number did not
+  reproduce. Not on `main`.** The mechanism is correct, tested and cheap; the
+  25% this row promised at a million records is 1-5%, and part of the gap is
+  unexplained. Kept on a branch rather than landed or deleted, because the
+  thing worth having next is the explanation and a clean reading.
+
+  **The question this row said nobody had asked is answered, by measurement
+  rather than by judgement.** "Whether an mtime check is enough" turns out not
+  to matter: reading and hashing the file is **7.4 ms against a 452 ms parse**
+  at a million records — 1.6% of what it replaces — so the honest test is
+  affordable and the `stat` shortcut buys nothing. `stat` is 0.14 ms and cannot
+  see an edit that preserves length and timestamp, and a missed edit is the
+  operator's change silently reverted, which is the failure the re-read exists
+  to prevent (§4). The branch has no mtime path on purpose.
+
+  What the operator is entitled to, stated so the next person can disagree with
+  it: **any change to the file, by anyone, is seen before the next update is
+  applied.** Not "an edit the server can tell was deliberate", not "an edit
+  since the last reload" — any difference from the bytes this server last
+  wrote. That is what the digest tests, and it is strictly stronger than what
+  mtime could promise.
+
+  **The shape.** The digest lives under `UpdateHandling::applying`, the lock
+  that already serializes the read-modify-write, so "this is what we wrote" is
+  guarded by the lock that made it true rather than remembered beside it.
+  Reuse is confined to the *unsigned* case: a signed server serves RRSIGs and
+  NSECs the file does not carry, and 64d measured those four steps at 12% of a
+  signed update anyway, so the case worth having is the one where the served
+  copy *is* what the file holds.
+
+  **What does not reproduce.** Development machine, Windows, release, one
+  unsigned update; cold means no remembered digest, warm means the digest
+  matches and the parse is skipped:
+
+  | records | cold | warm | saved |
+  |---|---|---|---|
+  | 10 000 | 19.3-20.2 ms | 16.8-17.4 ms | ~15% |
+  | 100 000 | 149.8 ms | 105.1-105.6 ms | **30%** |
+  | 1 000 000 | 1 732 ms | 1 654-1 718 ms | **1-5%** |
+
+  The saving *shrinks* with zone size, and the absolute saving at a million
+  (14-78 ms) is smaller than at a hundred thousand (45 ms). That cannot be true
+  if the only difference is skipping a 450 ms parse, so something else in the
+  warm path grows with the zone.
+
+  **What has been ruled in, and it is not enough.** The reused zone is one
+  `update::apply` built rather than one the parser built, and the steps after
+  it are not the same speed on the two: `zone_to_string` is **937 ms fresh
+  against 1 007 ms served** at a million records, and 63.7 against 78.6 at a
+  hundred thousand. That is ~70 ms of a ~380 ms gap. `update::apply` itself is
+  not it — 438.7 fresh against 425.6 served, inside the noise.
+
+  **What has been ruled out.** The fast path *is* taken: instrumented, and the
+  digest matches on the warm run at every size. The warm update changes a
+  *different* record than the cold one, so it is not timing an early exit —
+  the first version of this measurement did exactly that and read as a 3.3x
+  win, which is §1 in its own measurement.
+
+  **Where a clean reading would start.** Not with the columns in
+  `update_cost_against_zone_size`: they are measured on a restored file in a
+  different cache state and sum to more than the total they decompose, so they
+  cannot be used to attribute the gap. What is needed is the warm path profiled
+  as one thing — most likely `dhat` or a sampling profile of the second
+  `apply_update_to_file` call at a million records — against the cold path, and
+  the difference read off rather than inferred.
+
+  Two hypotheses worth testing before inventing a third: the served zone's
+  *index* is shaped differently from a parsed one (#61 made the index build 73%
+  of a load, and nothing says `update::apply` leaves it in the same state), and
+  holding the served zone alive across the warm call doubles live memory at a
+  size where that matters — a million records is ~300 MB of zone.
+
+  ```sh
+  cargo test -p rdnsd --release update_cost -- --ignored --nocapture
+  ```
+
+  **The half that is not in doubt** is the safety property, and it has a test:
+  `an_edit_under_a_running_server_is_seen_even_when_the_re_read_is_skipped`
+  drives three updates — no digest, matching digest, matching digest after the
+  file has been edited underneath — and fails against reusing the served copy
+  unconditionally. Whatever happens to the performance argument, that is the
+  rule the re-read was there for and it still holds.
 
   **The reload path wants the same test, and that is 65c option C — moved here
   2026-09-14.** With #65a landed a reload signs each zone against the version
