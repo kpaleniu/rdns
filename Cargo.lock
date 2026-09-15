@@ -1193,7 +1193,9 @@ dependencies = [
  "quinn",
  "rdns",
  "rdns-transport",
+ "serde",
  "tokio",
+ "toml",
  "tracing",
 ]
 

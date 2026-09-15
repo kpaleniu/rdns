@@ -11,6 +11,7 @@
 
 mod anchors;
 mod answer;
+mod config;
 mod reload;
 mod serve;
 #[cfg(test)]
@@ -69,6 +70,71 @@ const MAX_INFLIGHT_UDP: usize = 1024;
 /// name in it. `NsecCache` bounds the records within each zone separately.
 const NSEC_CACHE_ZONES: usize = 1000;
 
+// The resolver's defaults, in one place because each is spelled twice: `Cli`
+// takes them through `default_value_t` and the config file's tables through
+// `#[serde(default = "crate::...")]`. `rdnsd` has the same block for the same
+// reason, and the reason is `TODO.md` #63e — sixteen settings there had a
+// literal on each side and nothing comparing them.
+//
+// Here and not in `config`, because a flag's default is the daemon's and the
+// file inherits it — and an item private in the crate root is visible to every
+// module under it, which is all `config` needs (`CLAUDE.md` §17).
+
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_port() -> u16 {
+    53
+}
+fn default_cache_size() -> usize {
+    10_000
+}
+fn default_max_inflight_udp() -> usize {
+    MAX_INFLIGHT_UDP
+}
+fn default_query_rate() -> u32 {
+    200
+}
+fn default_query_burst() -> u32 {
+    100
+}
+fn default_response_rate() -> u32 {
+    8192
+}
+fn default_max_udp_request() -> u16 {
+    4096
+}
+fn default_max_tcp_request() -> u16 {
+    16 * 1024
+}
+fn default_udp_payload_size() -> u16 {
+    rdns::FLAG_DAY_UDP_SIZE
+}
+fn default_max_udp_response() -> u16 {
+    rdns::FLAG_DAY_UDP_SIZE
+}
+fn default_anomaly_interval() -> u64 {
+    60
+}
+fn default_anomaly_query_rate() -> f64 {
+    50.0
+}
+fn default_anomaly_error_percent() -> f64 {
+    10.0
+}
+fn default_anomaly_source_queries() -> u64 {
+    100
+}
+fn default_anomaly_source_refusals() -> u64 {
+    5
+}
+fn default_serve_stale() -> u64 {
+    0
+}
+fn default_rpz_policy() -> rdns::rpz::PolicyOverride {
+    rdns::rpz::PolicyOverride::Given
+}
+
 /// Recursive DNS resolver with caching.
 ///
 /// Unlike the authoritative server (`rdnsd`), `rdnsr` answers by resolving:
@@ -82,37 +148,37 @@ const NSEC_CACHE_ZONES: usize = 1000;
 #[command(version = rdns::VERSION, about, long_about = None)]
 struct Cli {
     /// Address to listen on. Defaults to localhost to avoid an open resolver.
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value_t = default_host(), conflicts_with = "config")]
     host: String,
-    #[arg(long, default_value = "53")]
+    #[arg(long, default_value_t = default_port(), conflicts_with = "config")]
     port: u16,
     /// Forward to this resolver instead of recursing, e.g. 8.8.8.8:53
     /// (repeatable). Passing any `--upstream` switches the resolver from
     /// recursion to forwarding, the way `forwarders`/`forward-zone` does in
     /// BIND and Unbound.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     upstream: Vec<SocketAddr>,
     /// Root hints file (named.root format) to prime recursion from, replacing
     /// the built-in list. Only used when recursing; ignored with --upstream.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     root_hints: Option<std::path::PathBuf>,
     /// Maximum number of cached RRsets.
-    #[arg(long, default_value = "10000")]
+    #[arg(long, default_value_t = default_cache_size(), conflicts_with = "config")]
     cache_size: usize,
     /// Disable caching entirely.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     no_cache: bool,
     /// Validate DNSSEC on resolved answers: walk the chain of trust from a
     /// trust anchor, set AD only on answers that verify, and refuse to serve
     /// ones that fail (SERVFAIL, unless the client sets CD).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     dnssec_validate: bool,
     /// Trust anchors in DS presentation format, replacing the built-in ICANN
     /// root key. Only used with --dnssec-validate.
     ///
     /// A file rather than a rebuild, because the root KSK rolls over and a
     /// binary compiled before the roll is wrong until it is rebuilt.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     trust_anchor: Option<std::path::PathBuf>,
     /// A *managed* trust anchor file, followed and rewritten as keys roll
     /// (RFC 5011). Only used with --dnssec-validate.
@@ -125,7 +191,7 @@ struct Cli {
     ///
     /// Created from the anchors in force when it does not exist, so pointing at
     /// a new path is enough to start.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     auto_trust_anchor: Option<std::path::PathBuf>,
     /// How much to say: error, warn, info, debug or trace.
     ///
@@ -146,21 +212,21 @@ struct Cli {
     ///
     /// Dropping is silent: a reply to a spoofed source is what an amplifier
     /// sends.
-    #[arg(long, value_name = "QUERIES", default_value_t = MAX_INFLIGHT_UDP)]
+    #[arg(long, value_name = "QUERIES", default_value_t = default_max_inflight_udp(), conflicts_with = "config")]
     max_inflight_udp: usize,
     /// Queries per second, per client address. 0 turns the limit off.
     ///
     /// 200 where `rdnsd`'s is 1000: an authoritative server's clients are
     /// resolvers, and one resolver behind one address legitimately asks orders
     /// of magnitude more than one person does.
-    #[arg(long, value_name = "QUERIES_PER_SEC", default_value = "200")]
+    #[arg(long, value_name = "QUERIES_PER_SEC", default_value_t = default_query_rate(), conflicts_with = "config")]
     query_rate: u32,
     /// How many queries may arrive at once before `--query-rate` applies.
     ///
     /// A DNS client sends its queries in bursts by nature — one page load is
     /// dozens of names at once — so a limiter with no burst allowance drops
     /// traffic that is not a flood at all.
-    #[arg(long, value_name = "QUERIES", default_value = "100")]
+    #[arg(long, value_name = "QUERIES", default_value_t = default_query_burst(), conflicts_with = "config")]
     query_burst: u32,
     /// An address or CIDR prefix the query rate limit does not apply to,
     /// repeatable.
@@ -168,7 +234,7 @@ struct Cli {
     /// For a monitoring probe whose whole job is to query more often than a
     /// client would, and for a forwarder in front of this one. Without it the
     /// only way to spare a known-good source is to raise the limit for everybody.
-    #[arg(long, value_name = "ADDR|CIDR")]
+    #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     query_rate_exempt: Vec<String>,
     /// Largest UDP request accepted, in octets.
     ///
@@ -176,11 +242,11 @@ struct Cli {
     /// (RFC 6891 §6.2.4): refusing under what was advertised is a promise broken
     /// in silence (`TODO.md` #40f). A client's padded query (RFC 8467) is the
     /// request here that grows, where `rdnsd`'s is a signed UPDATE.
-    #[arg(long, value_name = "OCTETS", default_value = "4096")]
+    #[arg(long, value_name = "OCTETS", default_value_t = default_max_udp_request(), conflicts_with = "config")]
     max_udp_request: u16,
     /// Largest TCP request accepted, in octets. Not a protocol limit — the
     /// length prefix allows 65,535 — but a query has no reason to be large.
-    #[arg(long, value_name = "OCTETS", default_value = "16384")]
+    #[arg(long, value_name = "OCTETS", default_value_t = default_max_tcp_request(), conflicts_with = "config")]
     max_tcp_request: u16,
     /// UDP payload size advertised to clients in every reply's OPT, in octets.
     ///
@@ -194,7 +260,7 @@ struct Cli {
     /// Knot's `udp-max-payload`, NSD's `ipv4-edns-size` and Unbound's
     /// `edns-buffer-size` after DNS Flag Day 2020. Not the size an upstream answer is read into, which is
     /// separate since `TODO.md` #41c. Floored at 512.
-    #[arg(long, value_name = "OCTETS", default_value_t = rdns::FLAG_DAY_UDP_SIZE)]
+    #[arg(long, value_name = "OCTETS", default_value_t = default_udp_payload_size(), conflicts_with = "config")]
     udp_payload_size: u16,
     /// Largest UDP reply this resolver will send, in octets.
     ///
@@ -203,7 +269,7 @@ struct Cli {
     /// cap the reply is an empty TC=1 and the client asks again over TCP, which
     /// is never capped. 65535 is "whatever the client asked for"; floored at
     /// 512.
-    #[arg(long, value_name = "OCTETS", default_value_t = rdns::FLAG_DAY_UDP_SIZE)]
+    #[arg(long, value_name = "OCTETS", default_value_t = default_max_udp_response(), conflicts_with = "config")]
     max_udp_response: u16,
     /// How often to report what the last interval's traffic looked like, in
     /// seconds. 0 turns the anomaly warnings off.
@@ -211,14 +277,14 @@ struct Cli {
     /// Every threshold below is per interval, so this is also the unit they are
     /// read in: `--anomaly-source-queries 100` at the default is a hundred
     /// queries a minute from one address.
-    #[arg(long, value_name = "SECONDS", default_value = "60")]
+    #[arg(long, value_name = "SECONDS", default_value_t = default_anomaly_interval(), conflicts_with = "config")]
     anomaly_interval: u64,
     /// Warn above this query rate, averaged over `--anomaly-interval`. 0 is off.
-    #[arg(long, value_name = "QUERIES_PER_SEC", default_value = "50")]
+    #[arg(long, value_name = "QUERIES_PER_SEC", default_value_t = default_anomaly_query_rate(), conflicts_with = "config")]
     anomaly_query_rate: f64,
     /// Warn when more than this percentage of an interval's queries failed.
     /// 0 is off.
-    #[arg(long, value_name = "PERCENT", default_value = "10")]
+    #[arg(long, value_name = "PERCENT", default_value_t = default_anomaly_error_percent(), conflicts_with = "config")]
     anomaly_error_percent: f64,
     /// Warn about a source that sent more than this many queries in one
     /// interval. 0 is off.
@@ -226,11 +292,11 @@ struct Cli {
     /// A log line, not a metric: naming the address is the point, and an
     /// address is exactly what a Prometheus label must not be — the cardinality
     /// is the client's to choose.
-    #[arg(long, value_name = "QUERIES", default_value = "100")]
+    #[arg(long, value_name = "QUERIES", default_value_t = default_anomaly_source_queries(), conflicts_with = "config")]
     anomaly_source_queries: u64,
     /// Warn about a source the rate limiter refused more than this many times
     /// in one interval. 0 is off.
-    #[arg(long, value_name = "REFUSALS", default_value = "5")]
+    #[arg(long, value_name = "REFUSALS", default_value_t = default_anomaly_source_refusals(), conflicts_with = "config")]
     anomaly_source_refusals: u64,
     /// Response bytes per second, per client address. 0 turns the budget off.
     ///
@@ -239,43 +305,43 @@ struct Cli {
     /// makes ordinary. Meters what leaves, since that is what an amplification
     /// attack is made of, and UDP only — a TCP query completed a handshake, so
     /// there is nobody to reflect at.
-    #[arg(long, value_name = "BYTES_PER_SEC", default_value = "8192")]
+    #[arg(long, value_name = "BYTES_PER_SEC", default_value_t = default_response_rate(), conflicts_with = "config")]
     response_rate: u32,
     /// Serve Prometheus metrics and a liveness probe on this address.
     ///
     /// No meaningful `/readyz`: a resolver has nothing to wait for, so it
     /// answers ready as soon as it is up. `metrics_server` serves the route
     /// because it is shared with `rdnsd`.
-    #[arg(long, value_name = "ADDR:PORT")]
+    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     metrics_listen: Option<String>,
     /// Also answer DNS over TLS here (RFC 7858). Needs --tls-cert and --tls-key.
     ///
     /// 853 is the assigned port, and a resolver is what RFC 7858 was written
     /// for: the stub-to-recursive hop is the one it names. In addition to the
     /// plain listeners on --port, not instead of them.
-    #[arg(long, value_name = "ADDR:PORT")]
+    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     tls_listen: Option<String>,
     /// Also answer DNS over QUIC here (RFC 9250). Needs --tls-cert and --tls-key.
     ///
     /// 853 as well: DoT is TCP and DoQ is UDP, so the two do not collide.
-    #[arg(long, value_name = "ADDR:PORT")]
+    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     quic_listen: Option<String>,
     /// Also answer DNS over HTTPS here (RFC 8484). Needs --tls-cert and --tls-key.
     ///
     /// 443 is the port: DoH is meant to look like other HTTPS traffic.
-    #[arg(long, value_name = "ADDR:PORT")]
+    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     https_listen: Option<String>,
     /// The path --https-listen answers on.
-    #[arg(long, value_name = "PATH", default_value = rdns_transport::https::DEFAULT_PATH)]
+    #[arg(long, value_name = "PATH", default_value = rdns_transport::https::DEFAULT_PATH, conflicts_with = "config")]
     https_path: String,
     /// The PEM certificate chain --tls-listen presents. Leaf first.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
     tls_cert: Option<PathBuf>,
     /// The PEM private key for --tls-cert.
     ///
     /// Refused if it is readable by its group or by everybody. Unix only;
     /// Windows has no equivalent.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
     tls_key: Option<PathBuf>,
     /// Synthesize AAAA records from A records under this NAT64 prefix, so an
     /// IPv6-only client can reach an IPv4-only name (RFC 6147).
@@ -288,7 +354,7 @@ struct Cli {
     /// zone and is only reachable through a translator this resolver does not
     /// operate, so turning it on says one is there.
     #[arg(long, value_name = "PREFIX", num_args = 0..=1,
-          default_missing_value = rdns::dns64::WELL_KNOWN_PREFIX)]
+          default_missing_value = rdns::dns64::WELL_KNOWN_PREFIX, conflicts_with = "config")]
     dns64: Option<String>,
     /// An IPv6 prefix whose presence in a AAAA answer is to be read as no
     /// answer at all (RFC 6147 §5.1.4), repeatable.
@@ -296,7 +362,7 @@ struct Cli {
     /// Added to `::ffff:0:0/96`, which §5.1.4 asks for by name and which is
     /// never removed: an address in it is an IPv4 address written differently,
     /// so a client given one is no better off.
-    #[arg(long, value_name = "CIDR")]
+    #[arg(long, value_name = "CIDR", conflicts_with = "config")]
     dns64_exclude: Vec<String>,
     /// A Response Policy Zone file, repeatable and consulted in the order
     /// given: the first zone with a rule for a query decides it.
@@ -307,7 +373,7 @@ struct Cli {
     /// name if it has none.
     ///
     /// Not naming one is the off switch, and costs nothing per query.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
     rpz: Vec<PathBuf>,
     /// Serve an expired answer for this many seconds past its TTL when the
     /// authoritative servers cannot be reached (RFC 8767). 0 turns it off, and
@@ -323,7 +389,7 @@ struct Cli {
     /// §6 is explicit that a withdrawn name stays alive for the whole window.
     /// The stale answer carries a 30-second TTL (§4), says so with an Extended
     /// DNS Error (RFC 8914 §4.4), and is counted.
-    #[arg(long, value_name = "SECONDS", default_value = "0")]
+    #[arg(long, value_name = "SECONDS", default_value_t = default_serve_stale(), conflicts_with = "config")]
     serve_stale: u64,
     /// Re-resolve a cached name in the last tenth of its TTL, so a popular
     /// name never makes a client wait for the walk (Unbound's `prefetch`).
@@ -335,7 +401,7 @@ struct Cli {
     /// Off by default: it turns a client's query into two, for a name nobody
     /// may ask for again, and `dns_prefetches_total` against
     /// `dns_cache_hits_total` is how an operator decides whether that pays.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "config")]
     prefetch: bool,
     /// What a policy zone's rules mean, when it should not be taken at its
     /// word: given, disabled, passthru, drop, nxdomain, nodata or tcp-only.
@@ -347,7 +413,7 @@ struct Cli {
     /// and this daemon has flags (`TODO.md` #63). That is the wrong shape for
     /// the one use `passthru` has — a new feed is measured before it is
     /// enforced, and here that means measuring every feed at once.
-    #[arg(long, value_name = "POLICY", default_value = "given")]
+    #[arg(long, value_name = "POLICY", default_value_t = default_rpz_policy(), conflicts_with = "config")]
     rpz_policy: rdns::rpz::PolicyOverride,
     /// Addresses that may send a NOTIFY asking for the `--rpz` files to be
     /// re-read: `192.0.2.1`, `10.0.0.0/8`, `2001:db8::/32`. Repeatable.
@@ -361,13 +427,20 @@ struct Cli {
     /// full re-read of every feed: seconds for a large one, and twice the
     /// feeds' memory while both sets are live. Naming nobody leaves a NOTIFY
     /// answered NOTIMP, which is what this resolver did before.
-    #[arg(long, value_name = "ADDR|CIDR")]
+    #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     rpz_notify_from: Vec<String>,
+    /// Read the settings from this file instead of the command line.
+    ///
+    /// Exclusive of the flags it would set: `--config` with `--port` is an
+    /// error and not a precedence rule, because both values are valid and the
+    /// wrong one would be picked silently (`CLAUDE.md` §15).
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     // Before anything with something to say, and through the same initialiser
     // `rdnsd` uses so the two cannot format or filter differently.
@@ -376,6 +449,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         cli.log_level
     });
+
+    // The same settings the flags carry, in a file. It *replaces* the flags
+    // rather than layering over them; see `config` for why that is an error
+    // rather than a precedence rule.
+    if let Some(path) = cli.config.clone() {
+        config::Config::load(&path)?.apply(&mut cli);
+        tracing::info!("configured from {}", path.display());
+    }
+    let cli = cli;
 
     // Before anything is spawned: it owns the only durable state this process
     // writes.
