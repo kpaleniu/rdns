@@ -710,7 +710,12 @@ struct UpdateHandling {
     /// One lock for all zones rather than one per zone: two concurrent UPDATEs
     /// is not a workload this has. Held across file I/O and a signing run, so
     /// `tokio::Mutex` and not a `std` one.
-    applying: tokio::sync::Mutex<()>,
+    ///
+    /// It guards the digest of each zone file as this server last wrote it
+    /// (`TODO.md` #64b), because that fact is *made* under this lock: nothing
+    /// else writes a zone file while it is held, so the map cannot be stale
+    /// with respect to anything the server itself did.
+    applying: tokio::sync::Mutex<std::collections::HashMap<PathBuf, u64>>,
 }
 
 impl UpdateHandling {
@@ -723,7 +728,7 @@ impl UpdateHandling {
         UpdateHandling {
             source: None,
             signing: None,
-            applying: tokio::sync::Mutex::new(()),
+            applying: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 }
@@ -2302,7 +2307,7 @@ async fn main() -> Result<()> {
     let updates = Arc::new(UpdateHandling {
         source: Some(source.clone()),
         signing: signing.clone(),
-        applying: tokio::sync::Mutex::new(()),
+        applying: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
     // Reload on SIGHUP or on the control socket, and re-sign on the signature
@@ -3706,7 +3711,7 @@ mod tests {
             updates: Arc::new(UpdateHandling {
                 source: Some(source),
                 signing: None,
-                applying: tokio::sync::Mutex::new(()),
+                applying: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             }),
             journal,
             dnstap: None,

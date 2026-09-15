@@ -89,11 +89,12 @@ the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
 lock. The row was filed with the measurement that refuted the fix it was going
 to propose. **64a is fixed** — four passes and 1.7 s, and it was three
-clones and not the one the row named. **64b is built on a branch and its
-headline number did not reproduce**: the mechanism is right, the safety
-property has a test, and the 25% it promised at a million records is 1-5% for
-a reason only partly explained — the row says where a clean reading would
-start. **64d is closed and answered the question
+clones and not the one the row named. **64b is closed**: read the file's
+bytes every time, parse them only when they are not the bytes this server last
+wrote, which is **38% off an unsigned update** at a million records. Its
+headline number had not reproduced, and what did not reproduce was the
+benchmark — one filter selected two million-record benchmarks and libtest ran
+them at once. **64d is closed and answered the question
 the other two were waiting on**: signing is 88% of a signed update, so 64b and
 64c together are worth 10% of one rather than the 68% they are of an unsigned
 one — and the measurement filed **64e**, which is that carrying every signature
@@ -103,7 +104,7 @@ split to the bottom**: six passes and not the four it named, and the largest,
 everything and holds the four ECDSA operations. What a remedy would have to
 address is now a number — 31% to build and free the carry-forward index, 24%
 to probe it and `Layout` once per RRset — and it is the two maps keyed by a
-name, not the chain and not the crypto. 64b, 64c and 64e are what is left, and
+name, not the chain and not the crypto. 64c, 64e and 64f are what is left, and
 none of them names a remedy yet.
 **#65 came out of asking 64e's question of the load path and closed the same
 day**, the shapes built and the recommended one declined. The reason for asking
@@ -114,8 +115,8 @@ SIGHUP included. A reload carries forward now, except the re-signing timer's,
 which reloads *in order to* refresh. The option the row recommended was keyed on
 signature age and does not work at all: the expiry spread is a fifth of the
 validity and the interval a third, so every signature crosses any threshold in
-the same tick. Its only remaining half is C, which is #64b's question and is
-filed there.
+the same tick. Its only remaining half is C, which is now **#64f** — 64b
+answered the question and not the reload path that shares it.
 **#44 and #45 are both closed in full, and so are #48, #49, #51, #53, #54 and
 #55**, which is everything 44a, 44f and #50 left.
 ~~**None of them is a live defect**~~ — **that claim was wrong about #47**,
@@ -2458,7 +2459,7 @@ transfers.
 
 ---
 
-### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14, 64a and 64d closed, 64b built but unresolved**
+### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14, 64a, 64b and 64d closed, 64f out of 64b**
 
 Filed with the measurement that **refuted the reason it was going to be filed**.
 The finding on the way in was "the UPDATE path re-reads the zone file, so an
@@ -2522,28 +2523,27 @@ it is one every twelve** (64d).
   above the five that followed it, and it was *inside* the unfixed band. The
   four remaining steps are unmoved. **Four O(zone) passes now, not five**; the
   section heading is the shape at filing and is left as the identifier it is.
-- **64b. The re-read, which is a policy wearing a cost — built, and the number
-  did not hold.** `parse_zone_file_at` per update, under "so an edit since the
-  last load is not silently reverted" — **451 ms, 25%**. The rule is
-  defensible; paying it unconditionally is the part that is not. ~~Whether an
-  mtime check is enough depends on a question nobody has asked: what an
-  operator editing a file under a server taking dynamic updates is entitled
-  to.~~ Both halves of that are answered below — the question was worth asking
-  and the mtime framing was the wrong one.
-  **Built 2026-09-15 on branch `64b-digest`, and its headline number did not
-  reproduce. Not on `main`.** The mechanism is correct, tested and cheap; the
-  25% this row promised at a million records is 1-5%, and part of the gap is
-  unexplained. Kept on a branch rather than landed or deleted, because the
-  thing worth having next is the explanation and a clean reading.
+- **64b. The re-read, which is a policy wearing a cost — landed 2026-09-15.**
+  `parse_zone_file_at` per update, under "so an edit since the last load is not
+  silently reverted" — **451 ms, 25%**. The rule is defensible; paying it
+  unconditionally is the part that is not. ~~Whether an mtime check is enough
+  depends on a question nobody has asked: what an operator editing a file under
+  a server taking dynamic updates is entitled to.~~ Both halves of that are
+  answered below — the question was worth asking and the mtime framing was the
+  wrong one.
+
+  Read the bytes always; parse them only when they are not the bytes this
+  server last wrote. **38% off an unsigned update at a million records.** The
+  reload half of this row is now #64f.
 
   **The question this row said nobody had asked is answered, by measurement
   rather than by judgement.** "Whether an mtime check is enough" turns out not
-  to matter: reading and hashing the file is **7.4 ms against a 452 ms parse**
-  at a million records — 1.6% of what it replaces — so the honest test is
-  affordable and the `stat` shortcut buys nothing. `stat` is 0.14 ms and cannot
+  to matter: reading and hashing the file is **7.8 ms against a 435 ms parse**
+  at a million records — 1.8% of what it replaces — so the honest test is
+  affordable and the `stat` shortcut buys nothing. `stat` is 0.07 ms and cannot
   see an edit that preserves length and timestamp, and a missed edit is the
   operator's change silently reverted, which is the failure the re-read exists
-  to prevent (§4). The branch has no mtime path on purpose.
+  to prevent (§4). There is no mtime path on purpose.
 
   What the operator is entitled to, stated so the next person can disagree with
   it: **any change to the file, by anyone, is seen before the next update is
@@ -2558,29 +2558,77 @@ it is one every twelve** (64d).
   Reuse is confined to the *unsigned* case: a signed server serves RRSIGs and
   NSECs the file does not carry, and 64d measured those four steps at 12% of a
   signed update anyway, so the case worth having is the one where the served
-  copy *is* what the file holds.
-
-  **What does not reproduce.** Development machine, Windows, release, one
-  unsigned update; cold means no remembered digest, warm means the digest
-  matches and the parse is skipped:
+  copy *is* what the file holds. A signed server pays the re-read exactly as
+  before.
 
   | records | cold | warm | saved |
   |---|---|---|---|
-  | 10 000 | 19.3-20.2 ms | 16.8-17.4 ms | ~15% |
-  | 100 000 | 149.8 ms | 105.1-105.6 ms | **30%** |
-  | 1 000 000 | 1 732 ms | 1 654-1 718 ms | **1-5%** |
+  | 10 000 | 21.4 ms | 15.7 ms | 27% |
+  | 100 000 | 164.1 ms | 104.5 ms | **36%** |
+  | 1 000 000 | 1 906 ms | 1 178 ms | **38%** |
 
-  The saving *shrinks* with zone size, and the absolute saving at a million
+  Three runs on the development machine, Windows, release; the spread is
+  26-28%, 33-36%, 37-38%. `warm_update_cost_against_cold`.
+
+  ~~**Built 2026-09-15 on branch `64b-digest`, and its headline number did not
+  reproduce.** The mechanism is correct, tested and cheap; the 25% this row
+  promised at a million records is 1-5%, and part of the gap is unexplained.~~
+  ~~The saving *shrinks* with zone size, and the absolute saving at a million
   (14-78 ms) is smaller than at a hundred thousand (45 ms). That cannot be true
   if the only difference is skipping a 450 ms parse, so something else in the
-  warm path grows with the zone.
+  warm path grows with the zone.~~ ~~`zone_to_string` is **937 ms fresh against
+  1 007 ms served** at a million records, and 63.7 against 78.6 at a hundred
+  thousand. That is ~70 ms of a ~380 ms gap.~~ **Every number in that paragraph
+  is a measurement of the benchmark rather than of the code — corrected
+  2026-09-15**, and the reasoning is left standing because the way those
+  numbers were taken is the finding. Nothing in the warm path grows with the
+  zone; the saving grows, as skipping a parse must. `zone_to_string` is 645 ms
+  on a fresh zone and 645 on a served one, indistinguishable, and the
+  937/1 007 pair is what the same test prints while something else is running.
 
-  **What has been ruled in, and it is not enough.** The reused zone is one
-  `update::apply` built rather than one the parser built, and the steps after
-  it are not the same speed on the two: `zone_to_string` is **937 ms fresh
-  against 1 007 ms served** at a million records, and 63.7 against 78.6 at a
-  hundred thousand. That is ~70 ms of a ~380 ms gap. `update::apply` itself is
-  not it — 438.7 fresh against 425.6 served, inside the noise.
+  **What was running was this file's other benchmark.** The recipe is
+  `cargo test -p rdnsd --release update_cost -- --ignored --nocapture`, and
+  `update_cost` is a *substring*: it selects `update_cost_against_zone_size`
+  and `signed_update_cost_against_zone_size` both, which libtest then runs in
+  parallel. So a million-record update was timed against a million-record
+  signing run — 12 s of one overlapping 2 s of the other, and which call in the
+  pair catches the overlap is scheduling luck. Run verbatim today it costs the
+  warm call ~300 ms and leaves 22% where serialized it reads 38%; and one warm
+  iteration in six spiked `zone_to_string` to 1 211 ms at a hundred thousand
+  records against 62 for its neighbours, which is the size of outlier the
+  recorded numbers need. **The fix is a lock rather than a better recipe**
+  (`CLAUDE.md` §17): `dispatch::tests::ONE_AT_A_TIME`, held for the whole body
+  of each of the three benchmarks, so the documented recipe is right whatever
+  it selects and whatever `--test-threads` says. It is the only instance —
+  `zone_signer`'s three `#[ignore]`d benchmarks have distinct names and no
+  recipe selects two of them, and `rdns/tests/scale.rs` has one.
+
+  **And the comparison itself was two calls that differed in more than the
+  thing under test** (§1). The cold call was timed in position 1 and the warm
+  one in position 2, in a process whose heap had just grown by a million-record
+  zone. That is worth ~130 ms on its own, in the direction that *flatters* the
+  digest, so it was not the bug — but it is why the replacement harness
+  alternates cold and warm from identical state: the file holds exactly what
+  the served zone serializes to, the digest is the digest of those bytes, an
+  assertion checks that every round, and the only difference between iterations
+  is whether `known` is supplied.
+
+  **The decomposition, from timers inside `apply_update_to_file`** — the clean
+  reading this row asked for, and its columns sum to the total within 2 ms at a
+  million records, which a separately-timed decomposition cannot be made to do.
+  Cold: parse 527, `update::apply` 364, freeing the parsed zone 146,
+  `zone_to_string` 636, write 140. Warm: the same, less the parse and the
+  freeing, plus 17 for the read and the digest. **Freeing what the parse built
+  is a fifth of the saving and nothing had counted it**: a million records is
+  two million small allocations to return.
+
+  **Both hypotheses this row named are refuted, each by one measurement.**
+  ~~The served zone's *index* is shaped differently from a parsed one~~ — no:
+  `update::apply` costs 364 ms on a served zone against 389 on a freshly parsed
+  one, and `zone_to_string` 645 against 645, inside the noise either way.
+  ~~Holding the served zone alive across the warm call doubles live memory~~ —
+  no: two *extra* million-record zones held live for the whole run leave the
+  warm call at 1 141-1 166 ms, unchanged.
 
   **What has been ruled out.** The fast path *is* taken: instrumented, and the
   digest matches on the warm run at every size. The warm update changes a
@@ -2588,39 +2636,16 @@ it is one every twelve** (64d).
   the first version of this measurement did exactly that and read as a 3.3x
   win, which is §1 in its own measurement.
 
-  **Where a clean reading would start.** Not with the columns in
-  `update_cost_against_zone_size`: they are measured on a restored file in a
-  different cache state and sum to more than the total they decompose, so they
-  cannot be used to attribute the gap. What is needed is the warm path profiled
-  as one thing — most likely `dhat` or a sampling profile of the second
-  `apply_update_to_file` call at a million records — against the cold path, and
-  the difference read off rather than inferred.
-
-  Two hypotheses worth testing before inventing a third: the served zone's
-  *index* is shaped differently from a parsed one (#61 made the index build 73%
-  of a load, and nothing says `update::apply` leaves it in the same state), and
-  holding the served zone alive across the warm call doubles live memory at a
-  size where that matters — a million records is ~300 MB of zone.
-
   ```sh
-  cargo test -p rdnsd --release update_cost -- --ignored --nocapture
+  cargo test -p rdnsd --release warm_update_cost -- --ignored --nocapture
   ```
 
-  **The half that is not in doubt** is the safety property, and it has a test:
-  `an_edit_under_a_running_server_is_seen_even_when_the_re_read_is_skipped`
+  **The half that was never in doubt** is the safety property, and it has a
+  test: `an_edit_under_a_running_server_is_seen_even_when_the_re_read_is_skipped`
   drives three updates — no digest, matching digest, matching digest after the
   file has been edited underneath — and fails against reusing the served copy
   unconditionally. Whatever happens to the performance argument, that is the
   rule the re-read was there for and it still holds.
-
-  **The reload path wants the same test, and that is 65c option C — moved here
-  2026-09-14.** With #65a landed a reload signs each zone against the version
-  being served, which is 9.7 s at a million records instead of 27.6; a zone
-  whose file did not move needs neither, and could keep the served `Arc<Zone>`
-  untouched. That is worth 9.7 s per unchanged zone on every SIGHUP, so a
-  hundred-zone server where one file moved pays ninety-nine of them today.
-  Nothing more is needed than the did-the-file-change test above, which is why
-  the two are one row: taking either answers both.
 - **64c. The file is the authority, and that is the other 42%.** `to_string`
   plus `write` — 621 + 136 ms — exist because the update must reach the file:
   `UpdateHandling`'s doc says the re-signing timer reloads every zone from its
@@ -2629,6 +2654,11 @@ it is one every twelve** (64d).
   removes 64b and 64c together: 1 228 ms of 1 800, 68%.** It is also much the
   largest of these, and the invoice is in the next paragraph rather than in a
   remedy this row names.
+
+  **64b landed separately, so that pairing is now only how it was priced.** An
+  unsigned update does not re-read, and `to_string` plus `write` are **776 ms
+  of the 1 178 ms that remains, 66%** — a larger share of a smaller number. A
+  signed update is unchanged: 64b's reuse does not apply there.
 - **64d. The signed path, measured — 2026-09-14. Signing is 88% of it, so
   64b and 64c are worth 10%.** ~~These numbers are an unsigned zone.
   `sign_one_incrementally` is not in them. #44c's 28 s is a *full* sign of a
@@ -2807,6 +2837,29 @@ no recovery path at all today.
 the zone file is never half-written, so unlike a database there is no torn-write
 problem here to solve. 64c buys latency, not durability. Pricing it as
 durability work is how it would get over-built.
+
+- **64f. The reload path wants the same did-the-file-change test — filed
+  2026-09-15**, out of 64b, which is where it sat as 65c's option C (moved
+  there 2026-09-14). With #65a landed a reload signs each zone against the
+  version being served, which is 9.7 s at a million records instead of 27.6; a
+  zone whose file did not move needs neither, and could keep the served
+  `Arc<Zone>` untouched. That is worth 9.7 s per unchanged zone on every
+  SIGHUP, so a hundred-zone server where one file moved pays ninety-nine of
+  them today.
+
+  ~~Nothing more is needed than the did-the-file-change test above, which is
+  why the two are one row: taking either answers both.~~ **Taking 64b did not
+  answer it, so it is its own row** (§18). 64b's digest is a `HashMap` under
+  `UpdateHandling::applying` — a lock the update path holds and the reload path
+  does not, and a map keyed by the paths *updates* have written, which on a
+  server taking no updates is empty. What the two share is the argument, not
+  the mechanism: the bytes are cheap to read and hash (1.8% of the parse at a
+  million records), and the operator is entitled to have any edit seen.
+
+  What it would cost is not yet measured, and the measurement that decides the
+  shape is where the digest lives: a reload reads every zone file in the
+  directory, so the map is the reloader's rather than the updater's, and the
+  two want to agree or a reload will re-parse a file an update just wrote.
 
 **Not filed: a database, or a binary zone format.** #61's ablation settles it on
 this tree's own numbers — at 1M records, parsing text was ~25% of a load and
@@ -3434,7 +3487,7 @@ the week; the record is under "How the queue kept going stale" in
 | **52** | a rate-limit test is a coin toss at a second boundary | **filed and closed 2026-09-12**, one commit. Not a defect in the server, and the filing undercounted it by 23: the shape is a test that reads the wall clock at a limiter call, and there were **43 such call sites across 24 tests**, six of them assertions a refill actually breaks. Both buckets refill by whole seconds, so the verdict depended on whether two reads straddled one. 41 sites needed nothing but one `let now` per test, because `should_allow` has taken the instant as a parameter since #28a; the two that read the clock inside the loop under test — `tcp::serve`'s per-connection charge and `rdnsr`'s UDP loop — got `rdns::clock::Clock` on `ServeContext`. The test now asserts the refill as well as the refusal, which is the half that says the connection was charged rather than never admitted |
 | **47** | a NOTIFY reply carried no OPT record | **filed and closed 2026-09-12**, one commit, and it was a defect after all: the row read RFC 6891 §6.1.1 as "asks for" where it is "if an OPT record is present in a received **request**, compliant responders MUST include an OPT record in their respective responses" — a NOTIFY is a request. Counting the shape (§18) found a second site and a second MUST: `transfer::Envelopes` built the first AXFR envelope's OPT from `has_edns()` and a fresh `Edns`, which drops DO, against RFC 3225 §3's unconditional "the DO bit of the query MUST be copied in the response". Nothing tested either. The three NOTIFY refusals now carry three different EDEs, because "you are not one of my masters" and "I am that zone's primary" are one RCODE and two operator problems. `ClientEdns::mirror_with` became total on the way, so the `Err` all three callers answered identically is one doc comment rather than four. The EDE half is a reading rather than a quotation and the peers were asked: BIND 9.20 and Knot 3.6 mirror the OPT and DO and send no EDE, NSD 4.12 answers NXDOMAIN with QDCOUNT=0 and no OPT. Nine new assertions in the interop harness, 29 passed 0 failed in 43e |
 | **44** | what an operator would find missing in `rdnsd` | **filed 2026-09-11, closed in full 2026-09-12**, seven rows: catalog zones, EDE, the scale measurement, XoT, multi-signer, rollover and dnstap. Five numbers filed on the way out — #47, #48, #49, #50, #51, #54, #55 — and **0 packages** added by the lot, dnstap's two wire formats included. Every row's closing note says the same thing in its own words: the filing was right about what was missing and wrong about where the work was. 44a missed that provisioning is a diff; 44b's "small" cost a type at 24 sites; 44d's "cheap after 42a" described the half already done; 44e's premise was refuted by one test; 44f's ZSK half needed four numbers in a file and no state machine. Only 44c came out the size it was filed as, and it is the one that found a live defect (**#50**). The preamble's "none of these is a defect" did not survive either: #50 came out of 44c, and #47 — filed by 44b as not a defect — closed carrying two MUSTs |
-| **65** | every load re-signed every zone from scratch | **filed and closed 2026-09-14**, out of 64e. `ZoneSigning::apply` signed unconditionally, so a SIGHUP, an `rdnsctl reload` or a catalog change cost a full sign of every signed zone — 27.6 s at a million records — and moved the RDATA of every RRSIG, which is the whole zone in the next IXFR delta. **The four shapes were built and the recommended one was declined** (§19, #40a's precedent again). What landed is A, keyed on the trigger: the re-signing timer reloads *in order to* refresh, so it is the one reload that may carry nothing forward, and the other two carry everything whose RRset did not move — 9.7 s against 27.6, still 53.6% saved when a tenth of the zone changes (65b). **B is declined on a measurement**: the expiry spread is a fifth of the validity and the re-signing interval a third, so every signature crosses any refresh threshold in the same tick — 0 or all 126 of a fixture's RRSIGs, never between — and the only threshold that saves work hands the refreshing run a signature with four tenths of an interval left, against the 1.4 §8 asks for. The patch was reverted and the finding kept as a tripwire on the two constants. C moved to **#64b**, whose did-the-file-change test it is. The prerequisite the row called plumbing was one four-line method: `Zones::snapshot_all` |
+| **65** | every load re-signed every zone from scratch | **filed and closed 2026-09-14**, out of 64e. `ZoneSigning::apply` signed unconditionally, so a SIGHUP, an `rdnsctl reload` or a catalog change cost a full sign of every signed zone — 27.6 s at a million records — and moved the RDATA of every RRSIG, which is the whole zone in the next IXFR delta. **The four shapes were built and the recommended one was declined** (§19, #40a's precedent again). What landed is A, keyed on the trigger: the re-signing timer reloads *in order to* refresh, so it is the one reload that may carry nothing forward, and the other two carry everything whose RRset did not move — 9.7 s against 27.6, still 53.6% saved when a tenth of the zone changes (65b). **B is declined on a measurement**: the expiry spread is a fifth of the validity and the re-signing interval a third, so every signature crosses any refresh threshold in the same tick — 0 or all 126 of a fixture's RRSIGs, never between — and the only threshold that saves work hands the refreshing run a signature with four tenths of an interval left, against the 1.4 §8 asks for. The patch was reverted and the finding kept as a tripwire on the two constants. C moved to **#64b** and then, when 64b closed without reaching the reload path, to **#64f**. The prerequisite the row called plumbing was one four-line method: `Zones::snapshot_all` |
 | **63** | `rdnsr` had 39 flags and no config file | **filed 2026-09-14, closed 2026-09-15**, ten rows, filed out of 57d because a prerequisite named in prose is one nobody schedules (§18). 63a answered the split question with the compiler rather than a line count — 18 escaping items of 84 `pub`s, and 63g then measured that `rdnsr` would name **0** of them — so the module stayed in `rdnsd` and what is shared is one macro. 63h built all three shapes and kept the two declined ones as branches: the shared struct is out because `#[serde(flatten)]` makes serde buffer the table, costing every `[server]` typo its line number and its expected-key list in `rdnsd`'s existing file too. On the way, 63e found 16 defaults written twice with nothing comparing them, 63f the same bare-`pub` sweep for the `cfg(unix)` file Windows cannot compile, and 63i the one flag of 35 not refused beside `--config`. **63j is what the file existed for**: `[[rpz.feeds]]`, a policy per feed, which costs the match path nothing because `PolicyZone` has carried one since 45a. `rdnsr --check-config` closed with it |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly

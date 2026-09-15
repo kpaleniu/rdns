@@ -34,7 +34,7 @@ use rdns::{
     tsig::{self, TsigCheck, TsigSession},
     update,
     validation::{Arrival, Privacy, Request, Transport},
-    zone::{parse_zone_file_at, Zone},
+    zone::Zone,
     DnsMessage, ExtendedError, OpCode, Qtype, ResponseCode,
 };
 use rdns_transport::tcp::{self, send_framed, Reply};
@@ -952,8 +952,14 @@ impl Server {
             );
         };
 
-        // §3.7's serialization, held across the whole read-modify-write.
-        let _applying = self.updates.applying.lock().await;
+        // §3.7's serialization, held across the whole read-modify-write — and
+        // the digests live under it, so "this is what we last wrote" is
+        // guarded by the lock that made it true rather than remembered beside
+        // it (`TODO.md` #64b).
+        let mut digests = self.updates.applying.lock().await;
+        let known = digests.get(&path).copied();
+        // Cloned for the digest map below: the blocking task takes the original.
+        let for_digest = path.clone();
 
         // Everything from here to the installed zone is blocking — a parse, a
         // full ECDSA signing run, and two file operations — so it goes to a
@@ -971,6 +977,7 @@ impl Server {
                 &prerequisites,
                 &changes,
                 signing.as_deref(),
+                known,
             )
         })
         .await;
@@ -995,7 +1002,10 @@ impl Server {
         };
 
         let (installed, report) = match outcome {
-            Ok(applied) => applied,
+            Ok((installed, report, digest)) => {
+                digests.insert(for_digest, digest);
+                (installed, report)
+            }
             Err(UpdateFailure::Prerequisite(rejected)) => {
                 tracing::info!(peer = %ip, "UPDATE of {zone_name}: {rejected}");
                 return self.signed_error(msg, rejected.rcode, None, ip, Some(session), max_len);
@@ -1044,7 +1054,7 @@ impl Server {
             ),
         }
 
-        drop(_applying);
+        drop(digests);
         self.signed_error(msg, ResponseCode::Ok, None, ip, Some(session), max_len)
     }
 
@@ -1177,12 +1187,28 @@ enum UpdateFailure {
     System(anyhow::Error),
 }
 
+/// What this server last wrote to a zone file, for telling an operator's edit
+/// from its own (`TODO.md` #64b).
+///
+/// Not a cryptographic digest: the question is whether the bytes changed, and
+/// anybody who can rewrite the zone file already owns the process. `DefaultHasher`
+/// is not stable across Rust releases, which does not matter — every comparison
+/// is against a value this same process computed, and a restart re-reads
+/// anyway.
+fn digest_of(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Apply an UPDATE to the zone as its *file* has it, persist it, and return the
 /// version to install.
 ///
-/// `Ok((None, report))` when nothing changed: no write, nothing to install, and
-/// the client still gets NOERROR. See [`crate::UpdateHandling`] for why the file rather
-/// than the copy in memory is what gets read and written.
+/// `Ok((None, report, digest))` when nothing changed: no write, nothing to
+/// install, and the client still gets NOERROR. See [`crate::UpdateHandling`]
+/// for why the file rather than the copy in memory is what gets read and
+/// written.
 ///
 /// Write then install: a crash between the two loses nothing, where the other
 /// order serves a change that a restart makes disappear. The write is atomic
@@ -1195,31 +1221,67 @@ fn apply_update_to_file(
     prerequisites: &[update::Prerequisite],
     changes: &[update::Change],
     signing: Option<&ZoneSigning>,
-) -> Result<(Option<Zone>, UpdateReport), UpdateFailure> {
-    // The zone as the file has it: unsigned, on the operator's serial. Re-read
-    // rather than taken from the served copy, so an edit since the last load is
-    // not silently reverted.
-    let source = parse_zone_file_at(path, origin)
+    known: Option<u64>,
+) -> Result<(Option<Zone>, UpdateReport, u64), UpdateFailure> {
+    // The zone as the file has it: unsigned, on the operator's serial. Taken
+    // from the file rather than from the served copy, so an edit since the last
+    // load is not silently reverted.
+    //
+    // The *bytes* always; the parse only when they are not the bytes this
+    // server last wrote (`TODO.md` #64b). Reading and digesting 24 MB is
+    // 7.8 ms against 435 for the parse and index, so the honest test is 1.8% of
+    // what it replaces — which is why there is no `stat` shortcut here. `stat`
+    // is 0.07 ms and cannot see an edit that preserves length and timestamp,
+    // and a missed edit is the operator's change silently reverted, which is
+    // the failure this re-read exists to prevent (`CLAUDE.md` §4).
+    let raw = std::fs::read(path)
         .with_context(|| format!("re-reading {} to update it", path.display()))
         .map_err(UpdateFailure::System)?;
+    let digest = digest_of(&raw);
+
+    // Reusing the served copy is only sound with no signing configured: then it
+    // *is* what the file holds, because the last thing written there was the
+    // last thing installed. A signed server serves RRSIGs and NSECs the file
+    // does not carry, and 64d measured the four O(zone) steps at 12% of a
+    // signed update anyway — so the case worth having is this one.
+    let reused = known == Some(digest) && signing.is_none();
+    let parsed;
+    let source = if reused {
+        previous
+    } else {
+        let text = String::from_utf8(raw)
+            .map_err(|_| anyhow::anyhow!("{} is not UTF-8", path.display()))
+            .map_err(UpdateFailure::System)?;
+        parsed = rdns::zone::parse_zone_file(&text, origin)
+            .with_context(|| format!("re-reading {} to update it", path.display()))
+            .map_err(UpdateFailure::System)?;
+        &parsed
+    };
 
     // §3.2, against the unsigned zone: a prerequisite naming RRSIG or NSEC would
     // otherwise assert on this server's signing configuration.
-    update::check_prerequisites(&source, prerequisites).map_err(UpdateFailure::Prerequisite)?;
+    update::check_prerequisites(source, prerequisites).map_err(UpdateFailure::Prerequisite)?;
 
     let update::Applied {
         zone,
         changed,
         ignored,
-    } = update::apply(&source, changes);
+    } = update::apply(source, changes);
     let report = UpdateReport { changed, ignored };
     if changed == 0 {
-        return Ok((None, report));
+        // Nothing written, so the file is still what was just read.
+        return Ok((None, report, digest));
     }
 
-    rdns::zone_writer::write_zone_file(&zone, path)
+    let text = rdns::zone_writer::zone_to_string(&zone)
         .with_context(|| format!("writing {} back after an update", path.display()))
         .map_err(UpdateFailure::System)?;
+    rdns::persist::write_atomically_str(path, &text)
+        .with_context(|| format!("writing {} back after an update", path.display()))
+        .map_err(UpdateFailure::System)?;
+    // The bytes as written, so the next update can tell them from an edit. Off
+    // the text rather than by re-reading it: the same bytes went to the file.
+    let written = digest_of(text.as_bytes());
 
     // Signed as a load would sign it, from the file's now-bumped serial, so the
     // served number moves too. Incrementally against the version being served:
@@ -1231,7 +1293,7 @@ fn apply_update_to_file(
             .map_err(UpdateFailure::System)?,
         None => zone,
     };
-    Ok((Some(installed), report))
+    Ok((Some(installed), report, written))
 }
 
 /// What an UPDATE did, for the log line: the counts, without the zone.
@@ -1323,8 +1385,42 @@ mod tests {
     use crate::testutil::{nm, query};
     use crate::zones::zone_key;
     use rdns::record_types;
+    use rdns::zone::parse_zone_file_at;
     use rdns::UdpSizes;
     use std::collections::HashMap;
+
+    /// The `#[ignore]`d benchmarks below take turns.
+    ///
+    /// `update_cost` as a filter matches more than one of them, and libtest
+    /// runs what a filter selects in parallel — so the recipe in each of their
+    /// doc comments timed a million-record update against a million-record
+    /// signing run. That is how #64b came to record a 1-5% saving for a change
+    /// that saves 38%. Here rather than in the recipes, because a recipe is a
+    /// document and this is the machine (`CLAUDE.md` §17).
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A turn, held for the whole body of a benchmark.
+    ///
+    /// Poisoning is ignored: one benchmark panicking says nothing about whether
+    /// the next may run, and the alternative is every later one failing for a
+    /// reason that is not theirs.
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A zone of `records` A records under one apex, for the benchmarks.
+    fn zone_text(records: usize) -> String {
+        let mut text = String::new();
+        text.push_str("$TTL 3600\n");
+        text.push_str("@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n");
+        text.push_str("@ IN NS ns.example.com.\n");
+        text.push_str("ns IN A 192.0.2.1\n");
+        for i in 0..records {
+            let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
+            text.push_str(&format!("h{i} IN A 10.{a}.{b}.{c}\n"));
+        }
+        text
+    }
 
     /// What one dynamic UPDATE costs as the zone grows (`TODO.md` #64).
     ///
@@ -1358,6 +1454,9 @@ mod tests {
     /// been measured; #44c's 28 s is a *full* sign of a zone this size and is
     /// an upper bound that does not apply.
     ///
+    /// This is the cold path throughout — the re-read column is what
+    /// [`warm_update_cost_against_cold`] skips.
+    ///
     /// All of it runs under `UpdateHandling::applying`, which is one lock for
     /// the whole process — so this is the server's update throughput, not one
     /// client's latency.
@@ -1366,26 +1465,13 @@ mod tests {
     fn update_cost_against_zone_size() {
         use std::time::Instant;
 
+        let _turn = one_at_a_time();
+
         if cfg!(debug_assertions) {
             panic!(
                 "this would measure the debug build. Run:\n  \
                  cargo test -p rdnsd --release update_cost -- --ignored --nocapture"
             );
-        }
-
-        fn zone_text(records: usize) -> String {
-            let mut text = String::new();
-            text.push_str("$TTL 3600\n");
-            text.push_str(
-                "@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n",
-            );
-            text.push_str("@ IN NS ns.example.com.\n");
-            text.push_str("ns IN A 192.0.2.1\n");
-            for i in 0..records {
-                let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
-                text.push_str(&format!("h{i} IN A 10.{a}.{b}.{c}\n"));
-            }
-            text
         }
 
         let dir = std::env::temp_dir().join(format!("rdns-update-cost-{}", std::process::id()));
@@ -1413,12 +1499,13 @@ mod tests {
 
             // The whole path, as `answer_update` calls it on its blocking task.
             let start = Instant::now();
-            let (installed, applied) = apply_update_to_file(
+            let (installed, applied, _) = apply_update_to_file(
                 &path,
                 "example.com.",
                 &previous,
                 &[],
                 std::slice::from_ref(&change),
+                None,
                 None,
             )
             .unwrap_or_else(|_| panic!("the update applies at {records}"));
@@ -1426,12 +1513,40 @@ mod tests {
             assert_eq!(applied.changed, 1, "one record added at {records}");
             assert!(installed.is_some(), "a changed zone is installed");
 
-            // The same three O(zone) steps, timed apart. Restore the file
+            // The same four O(zone) steps, timed apart. Restore the file
             // first: the call above already added the record to it.
             std::fs::write(&path, &text).expect("restore the fixture");
             let start = Instant::now();
             let source = parse_zone_file_at(&path, "example.com.").expect("parses");
             let reread = start.elapsed();
+
+            // What a "did the file change" test would cost instead of that
+            // re-read (`TODO.md` #64b). Two candidates, and the question is
+            // whether the cheap one is honest: `stat` cannot see an edit that
+            // preserves length and timestamp, and a missed edit is an
+            // operator's change silently reverted, which is the failure the
+            // re-read exists to prevent (`CLAUDE.md` §4).
+            let start = Instant::now();
+            let meta = std::fs::metadata(&path).expect("stat");
+            let stat_len = meta.len();
+            let stat_at = meta.modified().expect("mtime");
+            let stat = start.elapsed();
+            let start = Instant::now();
+            let raw = std::fs::read(&path).expect("read");
+            let read = start.elapsed();
+            let start = Instant::now();
+            let digest = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                raw.hash(&mut h);
+                h.finish()
+            };
+            let hash = start.elapsed();
+            let _ = (stat_len, stat_at, digest);
+            println!(
+                "{:>9}  stat {:>9.3?}  read {:>9.3?}  hash {:>9.3?}  re-read {:>9.3?}",
+                records, stat, read, hash, reread
+            );
             let start = Instant::now();
             let applied = update::apply(&source, std::slice::from_ref(&change));
             let apply = start.elapsed();
@@ -1448,6 +1563,108 @@ mod tests {
                 "{records:>9}  {:>7.1}ms {reread:>9.1?} {apply:>9.1?} {to_string:>9.1?} {write:>9.1?}  {:>6} KB",
                 total.as_secs_f64() * 1000.0,
                 bytes / 1024
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What skipping the re-read saves: the same update, cold against warm
+    /// (`TODO.md` #64b).
+    ///
+    /// ```text
+    ///   records       cold      warm     saved
+    ///     10000     21.4ms    15.7ms       27%
+    ///    100000    164.1ms   104.5ms       36%
+    ///   1000000   1905.8ms  1178.1ms       38%
+    /// ```
+    ///
+    /// Every iteration starts from the *same* state — the file holds exactly
+    /// what the served zone serializes to, and the digest is the digest of
+    /// those bytes, which the assertion below checks — so the only difference
+    /// between a cold iteration and a warm one is whether `known` is supplied.
+    /// Alternating rather than one of each, because what a call costs depends
+    /// on where in the process's life it falls, and one of each charges that
+    /// difference to the thing under test. The first version of this
+    /// measurement did exactly that and read 1-5% at a million records
+    /// (`CLAUDE.md` §1).
+    ///
+    /// The saving *grows* with the zone, because it is the parse plus the
+    /// freeing of what the parse built, less a read and a hash — see #64b for
+    /// that decomposition, which sums to the total within 2 ms.
+    #[test]
+    #[ignore]
+    fn warm_update_cost_against_cold() {
+        use std::time::Instant;
+
+        let _turn = one_at_a_time();
+
+        if cfg!(debug_assertions) {
+            panic!(
+                "this would measure the debug build. Run:\n  \
+                 cargo test -p rdnsd --release warm_update_cost -- --ignored --nocapture"
+            );
+        }
+
+        let dir = std::env::temp_dir().join(format!("rdns-warm-update-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        println!(
+            "{:>9}  {:>9} {:>9} {:>9}",
+            "records", "cold", "warm", "saved"
+        );
+        for records in [10_000usize, 100_000, 1_000_000] {
+            let path = dir.join("example.com.zone");
+            std::fs::write(&path, zone_text(records)).expect("write the fixture");
+            let mut served = parse_zone_file_at(&path, "example.com.").expect("the fixture parses");
+            let mut digest = digest_of(&std::fs::read(&path).expect("read the fixture"));
+            let mut cold = Vec::new();
+            let mut warm = Vec::new();
+
+            for round in 0..6 {
+                let reuse = round % 2 == 1;
+                // A record nobody has added yet: an UPDATE that changes nothing
+                // returns before serializing, which would time the early exit
+                // and read as a win (`CLAUDE.md` §1).
+                let change = update::Change::Add(rdns::ResourceRecord {
+                    name: nm(&format!("added-{round}.example.com.")),
+                    class: rdns::Class::new(1),
+                    ttl: rdns::Ttl::from_secs(3600),
+                    rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                        std::net::Ipv4Addr::new(198, 51, 100, round + 1),
+                    ))
+                    .expect("the rdata builds"),
+                });
+                let start = Instant::now();
+                let (installed, report, written) = apply_update_to_file(
+                    &path,
+                    "example.com.",
+                    &served,
+                    &[],
+                    std::slice::from_ref(&change),
+                    None,
+                    if reuse { Some(digest) } else { None },
+                )
+                .unwrap_or_else(|_| panic!("the update applies at {records}"));
+                let elapsed = start.elapsed().as_secs_f64() * 1e3;
+                assert_eq!(report.changed, 1, "one record added at {records}");
+                served = installed.unwrap_or_else(|| panic!("a changed zone at {records}"));
+                digest = written;
+                // The premise of the comparison: whatever the call did, the
+                // next iteration starts from a file that is what the served
+                // zone serializes to, and from its digest. Without this the two
+                // kinds of iteration would differ in more than `known`.
+                assert_eq!(
+                    digest,
+                    digest_of(&std::fs::read(&path).expect("read back")),
+                    "the digest returned is the digest of the file at {records}"
+                );
+                if reuse { &mut warm } else { &mut cold }.push(elapsed);
+            }
+
+            let mean = |runs: &[f64]| runs.iter().sum::<f64>() / runs.len() as f64;
+            let (cold, warm) = (mean(&cold), mean(&warm));
+            println!(
+                "{records:>9}  {cold:>7.1}ms {warm:>7.1}ms {:>8.0}%",
+                (cold - warm) / cold * 100.0
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1499,6 +1716,8 @@ mod tests {
         use rdns::zone_signer::sign_zone;
         use std::collections::{BTreeMap, HashSet};
         use std::time::Instant;
+
+        let _turn = one_at_a_time();
 
         if cfg!(debug_assertions) {
             panic!(
@@ -1576,19 +1795,21 @@ mod tests {
                 &[],
                 std::slice::from_ref(&change),
                 None,
+                None,
             )
             .unwrap_or_else(|_| panic!("the unsigned update applies at {records}"));
             let unsigned = start.elapsed();
 
             std::fs::write(&path, &text).expect("restore the fixture");
             let start = Instant::now();
-            let (installed, report) = apply_update_to_file(
+            let (installed, report, _digest) = apply_update_to_file(
                 &path,
                 "example.com.",
                 &previous,
                 &[],
                 std::slice::from_ref(&change),
                 Some(&signing),
+                None,
             )
             .unwrap_or_else(|_| panic!("the signed update applies at {records}"));
             let signed = start.elapsed();
@@ -1656,6 +1877,113 @@ mod tests {
     ///
     /// A table rather than a live exchange: the mapping is what changed, and
     /// `record_dnstap` needs a sink, a socket and a parsed message to reach.
+    /// The rule the re-read exists for, kept while the re-read is skipped:
+    /// an edit made under a running server is not silently reverted
+    /// (`TODO.md` #64b).
+    ///
+    /// Three updates against one file. The first has no remembered digest and
+    /// parses. The second is handed the digest the first returned and must
+    /// still produce the same zone — that is the fast path. The third is handed
+    /// that same digest after the file has been *edited* underneath, and must
+    /// see the edit: the digest no longer matches, so the parse happens.
+    ///
+    /// Fails against a `stat`-based test on the third case whenever the edit
+    /// preserves length and timestamp, and fails against reusing the served
+    /// copy unconditionally on the third case always.
+    #[test]
+    fn an_edit_under_a_running_server_is_seen_even_when_the_re_read_is_skipped() {
+        let dir = rdns::testutil::ScratchDir::new("update-digest");
+        // Column zero: a leading space makes the parser read the owner name as
+        // omitted (`TODO.md` #60, in a fixture).
+        let text = concat!(
+            "$TTL 3600\n",
+            "@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n",
+            "@ IN NS ns.example.com.\n",
+            "ns IN A 192.0.2.1\n",
+        );
+        let path = dir.write("example.com.zone", text);
+        let served = parse_zone_file_at(&path, "example.com.").expect("the fixture parses");
+
+        let add = |name: &str, last: u8| {
+            update::Change::Add(rdns::ResourceRecord {
+                name: nm(name),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(3600),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    std::net::Ipv4Addr::new(198, 51, 100, last),
+                ))
+                .expect("the rdata builds"),
+            })
+        };
+
+        // No digest yet: the file is parsed.
+        let (installed, report, digest) = apply_update_to_file(
+            &path,
+            "example.com.",
+            &served,
+            &[],
+            std::slice::from_ref(&add("one.example.com.", 1)),
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| panic!("the first update applies"));
+        assert_eq!(report.changed, 1);
+        let served = installed.expect("a changed zone is installed");
+
+        // The digest matches what was written, so the served copy is reused.
+        let (installed, report, digest) = apply_update_to_file(
+            &path,
+            "example.com.",
+            &served,
+            &[],
+            std::slice::from_ref(&add("two.example.com.", 2)),
+            None,
+            Some(digest),
+        )
+        .unwrap_or_else(|_| panic!("the second update applies"));
+        assert_eq!(report.changed, 1);
+        let served = installed.expect("a changed zone is installed");
+        assert!(
+            served
+                .query(
+                    nm("one.example.com.").as_ref(),
+                    Qtype::of(rdns::record_types::A)
+                )
+                .len()
+                == 1,
+            "the first update survived the one that reused the served copy"
+        );
+
+        // An operator edits the file. The digest is stale, so the edit is read.
+        let edited = format!(
+            "{text}edited IN A 203.0.113.9
+"
+        );
+        std::fs::write(&path, &edited).expect("the operator edits the file");
+        let (installed, report, _) = apply_update_to_file(
+            &path,
+            "example.com.",
+            &served,
+            &[],
+            std::slice::from_ref(&add("three.example.com.", 3)),
+            None,
+            Some(digest),
+        )
+        .unwrap_or_else(|_| panic!("the third update applies"));
+        assert_eq!(report.changed, 1);
+        let installed = installed.expect("a changed zone is installed");
+        assert_eq!(
+            installed
+                .query(
+                    nm("edited.example.com.").as_ref(),
+                    Qtype::of(rdns::record_types::A)
+                )
+                .len(),
+            1,
+            "the operator's edit is in the zone that was installed"
+        );
+    }
+
     #[test]
     fn a_dnstap_entry_names_the_transport_including_the_encrypted_three() {
         use rdns::validation::TlsVersion;
