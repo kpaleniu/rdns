@@ -340,16 +340,8 @@ fn signing_key(args: &Cli) -> Result<Option<TsigKey>> {
 
 /// The secret in `path`, refusing a file anyone else can read.
 fn read_secret(path: &Path) -> Result<String> {
-    rdns_core::persist::ensure_private(path, "a TSIG secret")
-        .with_context(|| format!("{}", path.display()))?;
-    let secret = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?
-        .trim()
-        .to_string();
-    if secret.is_empty() {
-        bail!("{} is empty", path.display());
-    }
-    Ok(secret)
+    rdns_core::persist::read_secret(path, "a TSIG secret")
+        .with_context(|| format!("{}", path.display()))
 }
 
 /// One message's answer section as zone-file lines, counting the SOAs that

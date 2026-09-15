@@ -117,6 +117,11 @@ pub(crate) struct Resolving {
     /// then a NOTIFY is NOTIMP as it was before `TODO.md` #57c — because then
     /// this resolver really does not implement one.
     pub(crate) rpz_notify: Option<NotifyAcl>,
+    /// One wake per *transferred* feed (`TODO.md` #57d shape A). A NOTIFY names
+    /// a zone, so the feed it names is the feed that refreshes; waking the
+    /// process-wide reload instead would let one publisher make this resolver
+    /// re-read every other operator's file.
+    pub(crate) feed_wakes: Vec<crate::rpz_transfer::FeedWake>,
     pub(crate) ctx: Arc<ServeContext>,
 }
 
@@ -195,6 +200,7 @@ pub(crate) async fn handle_query(
         prefetch,
         dns64: _,
         rpz_notify,
+        feed_wakes,
         ctx,
     } = serving;
     // One snapshot for one query: a SIGHUP can install a new set part-way
@@ -236,8 +242,15 @@ pub(crate) async fn handle_query(
     // whose word to take for it (`TODO.md` #57c).
     if msg.opcode == OpCode::Notify {
         if let Some(acl) = rpz_notify {
-            let (reply, rcode) =
-                policy_notify(&msg, peer, acl, &policy, ctx.udp.advertised(), client_max);
+            let (reply, rcode) = policy_notify(
+                &msg,
+                peer,
+                acl,
+                &policy,
+                feed_wakes,
+                ctx.udp.advertised(),
+                client_max,
+            );
             ctx.record_answer(rcode, timer);
             return reply.into();
         }
@@ -1137,6 +1150,7 @@ fn policy_notify(
     peer: IpAddr,
     acl: &NotifyAcl,
     policy: &PolicyZones,
+    feed_wakes: &[crate::rpz_transfer::FeedWake],
     advertised: u16,
     max_len: usize,
 ) -> (Option<Vec<u8>>, ResponseCode) {
@@ -1161,6 +1175,25 @@ fn policy_notify(
         (ResponseCode::Refused, Some(NOT_LISTED))
     } else {
         match rdns::notify::notified_zone(msg) {
+            // A transferred feed refreshes by asking its master, so the NOTIFY
+            // wakes that feed's task and nobody else's — one publisher must not
+            // be able to make this resolver re-read another operator's files
+            // (`TODO.md` #57d shape A). The re-read still happens: the task
+            // asks for one once the file is written.
+            Some(zone)
+                if feed_wakes
+                    .iter()
+                    .any(|wake| wake.zone.as_ref() == zone.as_ref()) =>
+            {
+                tracing::info!(%peer, "NOTIFY for {zone}: that feed's transfer is woken");
+                for wake in feed_wakes
+                    .iter()
+                    .filter(|w| w.zone.as_ref() == zone.as_ref())
+                {
+                    wake.request();
+                }
+                (ResponseCode::Ok, None)
+            }
             Some(zone) if policy.carries(zone.as_ref()) => {
                 tracing::info!(%peer, "NOTIFY for {zone}: a policy re-read is queued");
                 acl.reload.request();
@@ -1634,6 +1667,7 @@ mod tests {
                 prefetch,
                 dns64: None,
                 rpz_notify: None,
+                feed_wakes: Vec::new(),
                 ctx,
             }),
             clock,
@@ -1846,6 +1880,7 @@ mod tests {
                     .expect("the Well-Known Prefix"),
             ),
             rpz_notify: None,
+            feed_wakes: Vec::new(),
             ctx: test_shell(),
         })
     }

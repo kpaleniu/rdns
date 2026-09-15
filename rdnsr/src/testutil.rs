@@ -76,6 +76,7 @@ pub(crate) fn serving(
         prefetch: false,
         dns64: None,
         rpz_notify: None,
+        feed_wakes: Vec::new(),
         ctx,
     })
 }
@@ -92,6 +93,7 @@ pub(crate) fn serving_policy(policy: Arc<PolicyStore>) -> Arc<Resolving> {
         prefetch: false,
         dns64: None,
         rpz_notify: None,
+        feed_wakes: Vec::new(),
         ctx,
     })
 }
@@ -116,6 +118,7 @@ pub(crate) fn serving_notified(
             from: TransferAcl::parse_named(&specs, "--rpz-notify-from").expect("the list parses"),
             reload: reload.clone(),
         }),
+        feed_wakes: Vec::new(),
         ctx,
     });
     (serving, reload)

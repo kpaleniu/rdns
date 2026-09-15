@@ -674,15 +674,8 @@ impl Config {
 /// one answer and a second copy of it would be a second thing to get wrong
 /// (`CLAUDE.md` §7). The reasoning is there.
 fn read_secret_file(path: &Path) -> Result<String> {
-    rdns::persist::ensure_private(path, "a TSIG secret")?;
-    let secret = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?
-        .trim()
-        .to_string();
-    if secret.is_empty() {
-        bail!("{} is empty", path.display());
-    }
-    Ok(secret)
+    rdns::persist::read_secret(path, "a TSIG secret")
+        .with_context(|| format!("reading {}", path.display()))
 }
 
 #[cfg(test)]

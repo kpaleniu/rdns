@@ -130,16 +130,18 @@ at every load — which closed the same day it was taken.
 and what it found was in a cache nobody was looking at rather than in the
 resolver's return type. **Three of #57's four items are closed**: a reload
 re-reads every `--rpz` file, runs off the worker threads, and can be asked for
-by a NOTIFY from a listed address. What is left is the transfer itself (57d) and
-the IXFR question. **Both of 57d's shapes are built** — branches
-`57d-shape-a` and `57d-shape-b` — and the install they differ over is 1 894 ms
-against 32.8 at a million rules, which turned out not to be what decides the
-row: memory is the same either way, and what is left is persistence and
-**which way EXPIRE fails for a blocklist** — answered 2026-09-15 with a
-per-feed `on-expire` defaulting to `enforce`, which cannot be built before 57d
-itself, since the resolver holds no age for a feed at all. The two-process path
-answers that
-one today by accident — `withdraw` takes an expired zone out of `rdnsd`'s zone
+by a NOTIFY from a listed address. **57d is taken** — shape A, `rdnsr` transfers a
+policy zone into the file it reads, with `on-expire` per feed — and what is
+left is the IXFR question and the feed's age where an operator can see it
+(57g); **57f closed with it** — a feed's master names a key with `#name`, the
+key is resolved at startup so an undefined one stops the process, and the
+secret reader that would have been its third copy is `persist::read_secret`.
+**Both shapes were built first** — `57d-shape-a` and `57d-shape-b` — and the
+install they differ over, 1 894 ms against 32.8 at a million rules, turned out
+not to be what decided it: memory is the same either way, and A was taken on
+persistence. **Which way EXPIRE fails** is answered with a per-feed
+`on-expire` defaulting to `enforce`. Before all this the two-process path
+answered that one by accident — `withdraw` takes an expired zone out of `rdnsd`'s zone
 map and leaves the file, so `rdnsr` goes on enforcing it with no age for it
 anywhere. #58 is what 45b left, #59 what #51 left and #60
 what #51 turned up on the way; and #21 is an inventory of deliberate deviations
@@ -1093,7 +1095,7 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13, 57a-c closed, 57d-e open with a remedy named**
+### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13, 57a-d and 57f closed, 57e and 57g open**
 
 Also left behind by 45a, and the half of its own row that did not survive
 contact with the code. #45a said the pleasing part was the delivery mechanism —
@@ -1252,7 +1254,45 @@ Five items. 57a-c are done; 57d and 57e are what is left.
   On Linux the same run also sends SIGHUP, which is the `cfg(unix)` arm Windows
   never compiles. **Windows had no reload trigger before this**: `next_reload`
   is `pending()` there, so a NOTIFY is the only one it has.
-- **57d. What is left of the transfer**: whether `rdnsr` should replicate a
+- **57d. What is left of the transfer — taken 2026-09-15, shape A.**
+
+  **The argument that decided it arrived after the row was written.** 57c gave
+  `rdnsr` an ear for a NOTIFY; what it does with one is queue a re-read of the
+  *files*. So if nothing fetched, the
+  re-read is a no-op, and the publisher's "it changed" is only meaningful when
+  `rdnsd` — or a cron job that happened to run — did the fetching. **The
+  resolver accepted a signal it could not act on.** That is what 57d closes,
+  and it is a better reason than either figure the shapes were compared on.
+
+  A rather than B on the row's own conclusion: the install cost is not what
+  decides this and persistence is. The file survives a restart, so a resolver
+  that transferred a blocklist yesterday begins today with yesterday's rules
+  rather than none, and `Readiness::ready()` keeps meaning what it says. B's
+  57x is real and buys nothing here — 1.9 s on a blocking thread at an hourly
+  cadence is 0.05% of a core.
+
+  Landed with the remedy above rather than after it: `on-expire` per feed,
+  defaulting to `enforce`, refused without `master` because a feed nobody
+  transfers has no contact to lose (§15 — a setting that cannot act is a
+  setting the operator believes is in force). The age it fires on is the task's
+  own `last_contact`, which is the only one this process has. Lifting removes
+  the file and asks for a re-read, so one feed stops being enforced without
+  disturbing the others; both directions WARN once on the transition, and
+  coming back into contact WARNs too, because the lifting did.
+
+  **What is not done: 57f, TSIG.** `MasterSpec::key_name` wants a keyring and
+  `rdnsr` has none, so a transferred feed arrives unauthenticated. Cheap now
+  that `rdns-tsig` is a crate (#66c) — the work is a config table and a keyring,
+  not a dependency — and a blocklist fetched without authentication is worth
+  the row rather than a sentence in a module header (§18).
+
+  **What is still owed for `enforce` being the default** (§14): the feed's age
+  is inside the task and nowhere an operator can see it. A per-feed gauge on
+  `rdnsr`, `Option`-shaped so a feed that never transferred reads `absent()`
+  and not 1970, is 57g.
+
+  The row as it was written, kept because two of its claims did not survive
+  being built — it asked whether `rdnsr` should replicate a
   policy zone itself rather than read what another process wrote. The arithmetic
   is free — `xfr::fetch_zone` returns a `Zone` and `rpz::PolicyZone::new` takes
   one — and the cost is a replication task, three timers, an EXPIRE, and a state
@@ -1492,6 +1532,48 @@ Five items. 57a-c are done; 57d and 57e are what is left.
   *is* "old set + new set", and it would only help a set of many zones by giving
   up the all-or-nothing property that is the point (§4).
 
+- **57f. A transferred policy feed arrives unauthenticated — filed and closed
+  2026-09-15.** `[keys."partner.key."]` in `rdnsr`'s config, in `rdnsd`'s
+  spelling and through `TsigKey::parse`, so the two daemons and `rdnsc` cannot
+  disagree about what a key means (§7). A feed's `master` names one with
+  `#name`; the key is resolved at *startup*, so a name that defines nothing
+  stops the process instead of sending one unsigned request per refresh
+  forever. Unsigned stays allowed — a feed reached over a private link is a
+  real deployment — and what is refused is asking for a key and not getting it.
+  Two doors, because a secret file that cannot be read passes the config check
+  and fails the lookup: `Config::check` refuses an undefined name, and `serve`
+  refuses again with the secret file named.
+
+  No `zones` or `update-zones` beside the key, which `rdnsd`'s table has: those
+  are a *server's* answer to "what may this key do", and a resolver only ever
+  presents one. A scope here would be a setting that cannot act (§15, §16).
+
+  **The third copy of the secret reader is gone with it** (§7): `ensure_private`
+  then read then reject-empty existed in `rdnsd`'s config and `rdnsc`'s
+  `--tsig-file`, and this would have been the third. It is
+  `rdns_core::persist::read_secret` now, and both existing callers are four
+  lines each.
+  The row as filed, kept because it named a cost that turned out to be the
+  cheap part — out of 57d, which landed without it and said so in its own
+  module header:
+  `MasterSpec::key_name` is looked up in a keyring and `rdnsr` has none, so
+  `master = "block.example.@192.0.2.9#partner.key."` parses and the key name
+  goes nowhere. A blocklist fetched without authentication is a blocklist
+  anyone on the path can replace.
+
+  **Cheap now, and it was not before**: `rdns-tsig` is its own crate since #66c
+  and `rdns` re-exports it, so the work is a `[keys]` table in `rdnsr`'s config
+  and a keyring beside the feeds — the secret-file reader is
+  `persist::ensure_private` plus four lines, which `rdnsd` and `rdnsc` both
+  already call (§7). Not a dependency question any more.
+- **57g. `enforce` is the default and the age is invisible — filed 2026-09-15.**
+  57d's `on-expire` fires on the task's own `last_contact`, which lives in the
+  task and nowhere an operator can see. §14: a per-feed gauge on `rdnsr`,
+  `Option`-shaped so a feed that never transferred reads `absent()` rather than
+  1970 — the same shape `dns_zone_last_refresh_timestamp_seconds` has on
+  `rdnsd`, for the same reason. Defaulting to `enforce` without it ships the
+  silently-stale blocklist this whole finding is about; the difference is that
+  it is now on purpose and has a number.
 ---
 
 ### 58. serve-stale answers a dead upstream and not a slow one — **filed 2026-09-13**

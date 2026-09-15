@@ -32,6 +32,29 @@ pub fn write_atomically_str(path: &Path, contents: &str) -> io::Result<()> {
     write_atomically(path, contents.as_bytes())
 }
 
+/// Read a secret out of a file nobody but the owner may read.
+///
+/// The mode check first, then the read: a secret anyone can read is refused
+/// rather than used, which is the only thing that makes a file better than
+/// `argv` (`CLAUDE.md` §15). Empty is refused too — a file somebody meant to
+/// fill and did not is a key that would fail every handshake with a message
+/// about base64.
+///
+/// Here because it is the third caller: `rdnsd`'s config, `rdnsc`'s `--tsig-file`
+/// and `rdnsr`'s policy keys all want exactly this, and a second copy of a
+/// security check is where the next bug goes (§7).
+pub fn read_secret(path: &Path, what: &str) -> io::Result<String> {
+    ensure_private(path, what)?;
+    let secret = fs::read_to_string(path)?.trim().to_string();
+    if secret.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is empty", path.display()),
+        ));
+    }
+    Ok(secret)
+}
+
 /// Same, for a file nobody but the owner may read: a private key, a shared
 /// secret.
 ///

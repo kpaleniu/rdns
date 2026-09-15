@@ -13,6 +13,7 @@ mod anchors;
 mod answer;
 mod config;
 mod reload;
+mod rpz_transfer;
 mod serve;
 #[cfg(test)]
 mod testutil;
@@ -49,6 +50,7 @@ use tokio::task::JoinSet;
 use crate::anchors::spawn_anchor_manager;
 use crate::answer::{log_policy, Caches, NotifyAcl, Resolving};
 use crate::reload::PolicyReload;
+use crate::rpz_transfer::{refresh_task, FeedWake, TransferredFeed};
 use crate::serve::udp_main;
 
 /// UDP queries this resolver will have in flight at once, when nothing says
@@ -456,6 +458,22 @@ struct Cli {
     /// `feeds` picking between them is not a precedence rule (`CLAUDE.md` §15).
     #[arg(skip)]
     rpz_feeds: Vec<Feed>,
+    /// The feeds this resolver transfers for itself, and the file each is
+    /// written to (`TODO.md` #57d shape A).
+    ///
+    /// Not a flag: a master needs a zone name, a key and eventually TLS
+    /// anchors per feed, which is a table and not a word — the same argument
+    /// `--rpz-policy` lost.
+    #[arg(skip)]
+    rpz_masters: Vec<TransferredFeed>,
+    /// TSIG keys a transferred feed's master may be signed with, in
+    /// `TsigKey::parse`'s form (`TODO.md` #57f).
+    ///
+    /// Not a flag: a secret in `argv` is readable out of `ps` by anyone on the
+    /// machine, and the config file is where §15 puts one. `rdnsc` has the flag
+    /// form because a query client is a person at a terminal; a daemon is not.
+    #[arg(skip)]
+    tsig_key: Vec<String>,
 }
 
 impl Cli {
@@ -902,6 +920,63 @@ async fn main() -> anyhow::Result<()> {
         shutdown.stop_handle(),
     ));
 
+    // The keys a transferred policy feed may be signed with. Parsed through
+    // `TsigKey::parse`, so this daemon and `rdnsd` cannot disagree about what a
+    // key means (`CLAUDE.md` §7).
+    let policy_keys: Vec<rdns::tsig::TsigKey> = cli
+        .tsig_key
+        .iter()
+        .map(|spec| rdns::tsig::TsigKey::parse(spec))
+        .collect::<Result<_, _>>()
+        .context("a TSIG key in [keys]")?;
+
+    // Built before `Resolving` because the answer path holds them: a NOTIFY
+    // naming a transferred feed wakes that feed's task, where one naming a file
+    // feed queues the process-wide re-read. One zone, one wake.
+    let feed_wakes: Vec<FeedWake> = cli
+        .rpz_masters
+        .iter()
+        .map(|feed| FeedWake::new(feed.spec.zone.clone()))
+        .collect();
+
+    // One task per transferred feed, outside the `JoinSet` for the reason the
+    // anomaly watcher is: the set ends the process when its first member ends,
+    // and these end on the stop signal by design.
+    let mut transfers = Vec::new();
+    for (feed, wake) in cli.rpz_masters.iter().zip(&feed_wakes) {
+        // Resolved here rather than in the task: a key name that defines
+        // nothing must stop the process, not send one unsigned request per
+        // refresh forever (`TODO.md` #57f). `Config::check` refuses it first
+        // for the file path; this is the second door, and the one that holds if
+        // a key's secret file could not be read.
+        let mut feed = feed.clone();
+        if let Some(name) = &feed.spec.key_name {
+            // By name alone, not through `TsigKeyring::get`: that takes an
+            // algorithm too, because a *server* reads both off the arriving
+            // record. A client knows only the name it was configured with, and
+            // the algorithm is whatever `[keys]` said.
+            let Some(key) = policy_keys
+                .iter()
+                .find(|key: &&rdns::tsig::TsigKey| key.name.eq_ignore_ascii_case(name))
+            else {
+                return Err(anyhow!(
+                    "policy feed {} transfers with TSIG key {name:?}, which is not \
+                     defined — check [keys.{name:?}] and whether its secret file \
+                     could be read",
+                    feed.spec.zone
+                ));
+            };
+            feed.key = Some(key.clone());
+        }
+        transfers.push(tokio::spawn(refresh_task(
+            feed,
+            reload.clone(),
+            wake.clone(),
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        )));
+    }
+
     // One handle for every listener: the four encrypted ones each built their
     // own copy of the same three fields, and a fourth field to add is a fourth
     // place to forget it (`CLAUDE.md` §7).
@@ -912,6 +987,7 @@ async fn main() -> anyhow::Result<()> {
         prefetch: cli.prefetch,
         dns64,
         rpz_notify,
+        feed_wakes,
         ctx: ctx.clone(),
     });
 

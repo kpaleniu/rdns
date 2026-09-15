@@ -19,8 +19,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use rdns::secondary::MasterSpec;
 use serde::Deserialize;
 
+use crate::rpz_transfer::TransferredFeed;
 use crate::Cli;
 
 /// The whole file.
@@ -38,6 +40,32 @@ pub(crate) struct Config {
     resolver: ResolverSection,
     #[serde(default)]
     rpz: Rpz,
+    /// TSIG keys, by key name, in `rdnsd`'s spelling: `[keys."partner.key."]`.
+    /// A policy feed's `master` names one with `#name` (`TODO.md` #57f).
+    #[serde(default)]
+    keys: std::collections::BTreeMap<String, Key>,
+}
+
+/// One TSIG key, client-side.
+///
+/// `rdnsd`'s table has `zones` and `update-zones` beside these; a resolver
+/// *fetches*, so it authenticates the master and authorizes nothing — those two
+/// are a server's answer to "what may this key do" and would be settings that
+/// cannot act here (`CLAUDE.md` §15, §16).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct Key {
+    #[serde(default = "default_tsig_algorithm")]
+    algorithm: String,
+    /// The secret, base64. Mutually exclusive with `secret-file`.
+    secret: Option<String>,
+    /// A file holding the secret, base64, whitespace trimmed. Mode-checked, and
+    /// refused if anyone but its owner can read it.
+    secret_file: Option<PathBuf>,
+}
+
+fn default_tsig_algorithm() -> String {
+    "hmac-sha256".to_string()
 }
 
 // `[server]`: the 22 keys both daemons have, from `rdns::server_table!`, then
@@ -145,14 +173,61 @@ struct Rpz {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct FeedEntry {
+    /// Where the feed is read from — and, for a transferred one, where it is
+    /// written to. Required either way, which is shape A's whole argument: the
+    /// file is the thing that survives a restart (`TODO.md` #57d).
     file: PathBuf,
+    /// `zone@master[:port]`, in `rdnsd`'s `--secondary` spelling and parsed by
+    /// its parser, so the two cannot disagree about what a master is
+    /// (`CLAUDE.md` §7). Absent is a feed somebody else writes, which is how
+    /// every feed worked before this.
+    master: Option<String>,
     /// Absent inherits `[rpz].policy`, which is §15's `Option` per field for an
     /// override: a feed that says nothing must not be reset to the default
     /// because another one did.
     policy: Option<String>,
+    /// What an unrefreshed feed means: `enforce` (the default) or `lift`.
+    /// Only a transferred feed can expire, so this without `master` is a
+    /// setting that cannot act and is refused (`TODO.md` #57d).
+    on_expire: Option<String>,
 }
 
 impl Config {
+    /// The TSIG keys this config defines, in the `[alg:]name:secret` form
+    /// `rdns::tsig::TsigKey::parse` takes.
+    ///
+    /// Through the parser rather than building keys directly, so this daemon,
+    /// `rdnsd` and `rdnsc` cannot disagree about what a key means (§7). No zone
+    /// list: the fourth field is a *server's* transfer scope, and a resolver
+    /// only ever presents a key.
+    ///
+    /// A secret that will not read is a key that is left out, and `serve` says
+    /// so — the alternative is failing the whole config for a file that may
+    /// belong to a feed nobody uses this run.
+    fn tsig_specs(&self) -> Vec<String> {
+        let mut specs = Vec::new();
+        for (name, key) in &self.keys {
+            let secret = match (&key.secret, &key.secret_file) {
+                (Some(secret), None) => secret.trim().to_string(),
+                (None, Some(file)) => match rdns::persist::read_secret(file, "a TSIG secret") {
+                    Ok(secret) => secret,
+                    Err(e) => {
+                        tracing::warn!(
+                            "TSIG key {name}: {} could not be read, so this key is not \
+                                 defined and any feed naming it will fail: {e}",
+                            file.display()
+                        );
+                        continue;
+                    }
+                },
+                // `check` has already refused both and neither.
+                _ => continue,
+            };
+            specs.push(format!("{}:{name}:{secret}", key.algorithm));
+        }
+        specs
+    }
+
     /// Read and validate a config file.
     ///
     /// Validation happens here rather than at first use, so that everything
@@ -202,6 +277,23 @@ impl Config {
                  handshake"
             );
         }
+        for (name, key) in &self.keys {
+            match (&key.secret, &key.secret_file) {
+                (Some(_), Some(_)) => bail!(
+                    "TSIG key {name:?} gives both secret and secret-file; \
+                     one of them is not being used and it is not obvious which"
+                ),
+                (None, None) => bail!("TSIG key {name:?} has neither secret nor secret-file"),
+                _ => {}
+            }
+            if rdns::tsig::TsigAlgorithm::from_name(&key.algorithm).is_none() {
+                bail!(
+                    "TSIG key {name:?} names algorithm {:?}, which is not one of \
+                     hmac-sha1, hmac-sha256, hmac-sha384, hmac-sha512",
+                    key.algorithm
+                );
+            }
+        }
         // Through the flag's own parser, so a policy name means one thing.
         if let Some(policy) = &self.rpz.policy {
             policy
@@ -211,6 +303,41 @@ impl Config {
         // Named by its file rather than by its index: an operator reading this
         // has the file open at the feed, not at the third table.
         for feed in &self.rpz.feeds {
+            if let Some(master) = &feed.master {
+                MasterSpec::parse(master)
+                    .map_err(|e| anyhow::anyhow!("rpz.feeds master {master:?}: {e}"))?;
+            }
+            if let Some(key) = feed
+                .master
+                .as_deref()
+                .and_then(|m| MasterSpec::parse(m).ok())
+                .and_then(|spec| spec.key_name)
+            {
+                // A key name that names nothing is a transfer the operator
+                // believes is signed and is not (§15) — `rdnsd` refuses the
+                // same way for `[zones.*].masters`.
+                if !self.keys.contains_key(&key)
+                    && !self.keys.keys().any(|k| k.eq_ignore_ascii_case(&key))
+                {
+                    bail!(
+                        "rpz.feeds {} transfers with key {key:?}, and no [keys.{key:?}] \
+                         defines it",
+                        feed.file.display()
+                    );
+                }
+            }
+            if let Some(on_expire) = &feed.on_expire {
+                on_expire
+                    .parse::<crate::rpz_transfer::OnExpire>()
+                    .map_err(|e| anyhow::anyhow!("rpz.feeds {}: {e}", feed.file.display()))?;
+                if feed.master.is_none() {
+                    bail!(
+                        "rpz.feeds {}: on-expire needs master. A feed nobody transfers \
+                         has no contact to lose, so the setting could never fire",
+                        feed.file.display()
+                    );
+                }
+            }
             if let Some(policy) = &feed.policy {
                 policy
                     .parse::<rdns::rpz::PolicyOverride>()
@@ -291,7 +418,28 @@ impl Config {
                 rdns::rpz::Feed::new(feed.file.clone(), policy)
             })
             .collect();
+        cli.rpz_masters = self
+            .rpz
+            .feeds
+            .iter()
+            .filter_map(|feed| {
+                let master = feed.master.as_ref()?;
+                Some(TransferredFeed {
+                    spec: MasterSpec::parse(master).expect("checked in Config::check"),
+                    // Filled in by `serve`, which owns the keyring: `check` has
+                    // already refused a name that defines nothing.
+                    key: None,
+                    file: feed.file.clone(),
+                    on_expire: feed
+                        .on_expire
+                        .as_deref()
+                        .map(|text| text.parse().expect("checked in Config::check"))
+                        .unwrap_or_default(),
+                })
+            })
+            .collect();
         cli.rpz_notify_from = self.rpz.notify_from.clone();
+        cli.tsig_key = self.tsig_specs();
     }
 }
 
@@ -593,6 +741,182 @@ policy = \"given\"
             .expect("parses")
             .apply(&mut cli);
         assert_eq!(cli.dns64.as_deref(), Some("2001:db8::/96"));
+    }
+
+    /// #57d shape A: a feed names a master *and* the file it is written to,
+    /// because the file is both where the transfer lands and what a restart
+    /// begins from.
+    ///
+    /// Fails against shape B, where a transferred feed has no file at all.
+    #[test]
+    fn a_transferred_feed_names_a_master_beside_its_file() {
+        let mut cli = Cli::parse_from(["rdnsr"]);
+        parse(
+            "[[rpz.feeds]]
+             file = \"malware.rpz.zone\"
+             master = \"malware.rpz.example.@192.0.2.9\"
+",
+        )
+        .expect("parses")
+        .apply(&mut cli);
+
+        assert_eq!(feed_paths(&cli), [PathBuf::from("malware.rpz.zone")]);
+        assert_eq!(cli.rpz_masters.len(), 1);
+        assert_eq!(
+            cli.rpz_masters[0].spec.zone.as_ref().to_presentation(),
+            "malware.rpz.example."
+        );
+        assert_eq!(cli.rpz_masters[0].file, PathBuf::from("malware.rpz.zone"));
+
+        // A feed nobody transfers is still the ordinary case and starts no task.
+        let mut cli = Cli::parse_from(["rdnsr"]);
+        parse(
+            "[[rpz.feeds]]
+file = \"written-by-cron.zone\"
+",
+        )
+        .expect("parses")
+        .apply(&mut cli);
+        assert!(cli.rpz_masters.is_empty());
+    }
+
+    /// A master that does not parse is a startup error with the text in it, not
+    /// a feed that silently never refreshes.
+    /// #57d's remedy: which way a stale feed fails is the operator's, per feed.
+    ///
+    /// Fails against a global setting and against a default read off the rules,
+    /// both of which the row shows wrong — an `rpz-passthru` feed is an
+    /// allowlist and wants the opposite answer from a blocklist.
+    #[test]
+    fn a_feed_says_what_its_expiry_means_and_defaults_to_enforce() {
+        let mut cli = Cli::parse_from(["rdnsr"]);
+        parse(
+            "[[rpz.feeds]]
+             file = \"block.zone\"
+             master = \"block.example.@192.0.2.9\"
+             [[rpz.feeds]]
+             file = \"allow.zone\"
+             master = \"allow.example.@192.0.2.9\"
+             on-expire = \"lift\"
+",
+        )
+        .expect("parses")
+        .apply(&mut cli);
+
+        let ways: Vec<_> = cli.rpz_masters.iter().map(|f| f.on_expire).collect();
+        assert_eq!(
+            ways,
+            [
+                crate::rpz_transfer::OnExpire::Enforce,
+                crate::rpz_transfer::OnExpire::Lift
+            ],
+            "the feed that says nothing enforces; the one that says lift lifts"
+        );
+    }
+
+    /// A setting that could never fire is refused rather than ignored (§15).
+    #[test]
+    fn on_expire_without_a_master_is_refused() {
+        let err = parse(
+            "[[rpz.feeds]]
+file = \"a.zone\"
+on-expire = \"lift\"
+",
+        )
+        .expect_err("a feed nobody transfers cannot expire");
+        assert!(
+            err.to_string().contains("on-expire needs master"),
+            "got: {err}"
+        );
+
+        let err = parse(
+            "[[rpz.feeds]]
+file = \"a.zone\"
+master = \"a.example.@192.0.2.9\"
+             on-expire = \"ignore\"
+",
+        )
+        .expect_err("an unknown value");
+        assert!(err.to_string().contains("unknown on-expire"), "got: {err}");
+    }
+
+    /// #57f: a feed's master may name a key, and a name that defines nothing is
+    /// refused at startup rather than sending an unsigned transfer.
+    #[test]
+    fn a_feed_can_name_a_key_and_an_undefined_one_is_refused() {
+        let mut cli = Cli::parse_from(["rdnsr"]);
+        parse(
+            "[keys.\"partner.key.\"]
+             secret = \"c2VjcmV0\"
+             [[rpz.feeds]]
+             file = \"block.zone\"
+             master = \"block.example.@192.0.2.9#partner.key.\"
+",
+        )
+        .expect("parses")
+        .apply(&mut cli);
+        assert_eq!(cli.tsig_key, ["hmac-sha256:partner.key.:c2VjcmV0"]);
+        assert_eq!(
+            cli.rpz_masters[0].spec.key_name.as_deref(),
+            Some("partner.key.")
+        );
+
+        let err = parse(
+            "[[rpz.feeds]]
+             file = \"block.zone\"
+             master = \"block.example.@192.0.2.9#nosuch.key.\"
+",
+        )
+        .expect_err("a key that defines nothing");
+        assert!(err.to_string().contains("no [keys."), "got: {err}");
+    }
+
+    /// The same rules `rdnsd` applies to a key table, because it is the same
+    /// table (§7).
+    #[test]
+    fn a_key_needs_exactly_one_secret_and_a_known_algorithm() {
+        let err = parse(
+            "[keys.\"k.\"]
+secret = \"c2VjcmV0\"
+secret-file = \"s\"
+",
+        )
+        .expect_err("two secrets");
+        assert!(
+            err.to_string().contains("both secret and secret-file"),
+            "got: {err}"
+        );
+
+        let err = parse(
+            "[keys.\"k.\"]
+",
+        )
+        .expect_err("no secret");
+        assert!(
+            err.to_string().contains("neither secret nor secret-file"),
+            "got: {err}"
+        );
+
+        let err = parse(
+            "[keys.\"k.\"]
+secret = \"c2VjcmV0\"
+algorithm = \"md5\"
+",
+        )
+        .expect_err("an unknown algorithm");
+        assert!(err.to_string().contains("hmac-sha256"), "got: {err}");
+    }
+
+    #[test]
+    fn a_malformed_master_is_refused_at_startup() {
+        let err = parse(
+            "[[rpz.feeds]]
+file = \"a.zone\"
+master = \"192.0.2.9\"
+",
+        )
+        .expect_err("no zone before the '@'");
+        assert!(err.to_string().contains("rpz.feeds master"), "got: {err}");
     }
 
     #[test]
