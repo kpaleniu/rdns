@@ -19,6 +19,7 @@ sha2 = "0.10"
 
 tokio.workspace = true
 rustls.workspace = true
+rustls-pki-types.workspace = true
 tokio-rustls.workspace = true
 tracing.workspace = true
 # The subscriber is here, but nothing in this crate installs one: `logging::init`

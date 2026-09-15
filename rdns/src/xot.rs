@@ -61,7 +61,11 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, ServerName};
+// The name and the port moved to `endpoint`, which parses them and needs no
+// TLS stack to do it (`TODO.md` #67c); re-exported because this module is where
+// a reader looks for them.
+pub use crate::endpoint::{XotName, XOT_PORT};
+use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -70,54 +74,8 @@ use tokio_rustls::TlsConnector;
 use crate::error::{ConfigError, ConfigResult, TransferError, TransferResult};
 use crate::tls_identity::TlsIdentity;
 
-/// The port RFC 9103 §7.3 says an XoT connection SHOULD use, which is
-/// RFC 7858's.
-pub const XOT_PORT: u16 = 853;
-
 /// The ALPN token RFC 9103 §7.1 requires be selected.
 const ALPN_DOT: &[u8] = b"dot";
-
-/// The name a master's certificate has to carry, and the SNI sent to it.
-///
-/// RFC 8310 §6.1 calls this the authentication domain name. A newtype rather
-/// than a `String` because it is parsed once, at startup, where a bad one is a
-/// sentence on stderr instead of a transfer that fails on a timer months later
-/// (`CLAUDE.md` §15).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct XotName {
-    name: ServerName<'static>,
-    /// What the operator wrote, for messages: `ServerName`'s own rendering
-    /// lower-cases and normalizes, and an error should quote the flag.
-    text: String,
-}
-
-impl XotName {
-    pub fn parse(text: &str) -> ConfigResult<Self> {
-        let text = text.trim();
-        if text.is_empty() {
-            return Err(ConfigError::new(
-                "+tls= with no name after it: RFC 9103 §7.5 has the client \
-                 authenticate the master by name, so there is no name to check \
-                 the certificate against",
-            ));
-        }
-        let name = ServerName::try_from(text.to_owned()).map_err(|e| {
-            ConfigError::new(format!(
-                "{text:?} is not a name a certificate can be checked against: {e}"
-            ))
-        })?;
-        Ok(XotName {
-            name,
-            text: text.to_owned(),
-        })
-    }
-}
-
-impl std::fmt::Display for XotName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.text)
-    }
-}
 
 /// The trust anchors every XoT connection this server makes is verified
 /// against, and the TLS settings RFC 9103 fixes.
@@ -274,7 +232,7 @@ impl XotClient {
         })?;
         let connector = TlsConnector::from(self.trust.config.clone());
         connector
-            .connect(self.name.name.clone(), tcp)
+            .connect(self.name.server_name(), tcp)
             .await
             .map_err(|e| {
                 TransferError::Io(io::Error::new(

@@ -23,7 +23,63 @@
 use std::net::{IpAddr, SocketAddr};
 
 use crate::error::{ConfigError, ConfigResult};
-use crate::xot::{XotName, XOT_PORT};
+use rustls_pki_types::ServerName;
+
+/// The port RFC 9103 §7.3 says an XoT connection SHOULD use, which is
+/// RFC 7858's.
+pub const XOT_PORT: u16 = 853;
+
+/// The name a master's certificate has to carry, and the SNI sent to it.
+///
+/// RFC 8310 §6.1 calls this the authentication domain name. A newtype rather
+/// than a `String` because it is parsed once, at startup, where a bad one is a
+/// sentence on stderr instead of a transfer that fails on a timer months later
+/// (`CLAUDE.md` §15).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct XotName {
+    name: ServerName<'static>,
+    /// What the operator wrote, for messages: `ServerName`'s own rendering
+    /// lower-cases and normalizes, and an error should quote the flag.
+    text: String,
+}
+
+impl XotName {
+    pub fn parse(text: &str) -> ConfigResult<Self> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(ConfigError::new(
+                "+tls= with no name after it: RFC 9103 §7.5 has the client \
+                 authenticate the master by name, so there is no name to check \
+                 the certificate against",
+            ));
+        }
+        let name = ServerName::try_from(text.to_owned()).map_err(|e| {
+            ConfigError::new(format!(
+                "{text:?} is not a name a certificate can be checked against: {e}"
+            ))
+        })?;
+        Ok(XotName {
+            name,
+            text: text.to_owned(),
+        })
+    }
+}
+
+impl XotName {
+    /// The checked name, for the one caller that opens a connection with it.
+    ///
+    /// `pub(crate)` rather than public: what a caller outside this crate has
+    /// business with is the name it wrote, which `Display` gives.
+    pub(crate) fn server_name(&self) -> ServerName<'static> {
+        self.name.clone()
+    }
+}
+
+impl std::fmt::Display for XotName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
 
 /// One peer, parsed.
 ///

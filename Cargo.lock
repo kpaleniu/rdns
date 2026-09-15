@@ -1113,6 +1113,7 @@ dependencies = [
  "rdns-core",
  "ring",
  "rustls",
+ "rustls-pki-types",
  "sha1",
  "sha2",
  "thiserror",

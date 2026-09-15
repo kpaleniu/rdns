@@ -19,8 +19,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::endpoint::XotName;
 use crate::record_types as rt;
-use crate::xot::XotName;
 use crate::zone::Zone;
 use crate::{Name, ParsedRecord, Serial};
 

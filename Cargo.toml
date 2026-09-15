@@ -64,6 +64,12 @@ tracing = "0.1"
 # and dropped. A dependency whose output nothing reads is §14's liability; turn
 # the feature and the bridge on together or neither.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Just the certificate and name types, without the TLS stack under them. Already
+# in the tree through `rustls` (which re-exports it), so this costs no package —
+# what it buys is that `endpoint`, `secondary` and `notify` hold a checked
+# server name without linking `ring`, `once_cell`, `rustls-webpki` and `subtle`
+# (`TODO.md` #67c).
+rustls-pki-types = { version = "1", default-features = false, features = ["std"] }
 hyper = { version = "1.11", default-features = false, features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", default-features = false, features = ["server", "tokio"] }
 http-body-util = "0.1"
