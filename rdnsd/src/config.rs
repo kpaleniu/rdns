@@ -40,136 +40,66 @@ pub(crate) struct Config {
     zones: BTreeMap<String, ZoneConfig>,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-struct Server {
-    #[serde(default = "crate::default_host")]
-    host: String,
-    #[serde(default = "crate::default_port")]
-    port: u16,
-    /// A directory of `.zone` files. Zones named in `[zones.*]` may add to or
-    /// override what is found here.
-    zone_dir: Option<String>,
-    #[serde(default)]
-    allow_transfer: Vec<String>,
-    #[serde(default)]
-    also_notify: Vec<String>,
-    #[serde(default = "crate::default_response_rate")]
-    response_rate: u32,
-    #[serde(default = "crate::default_query_rate")]
-    query_rate: u32,
-    #[serde(default = "crate::default_query_burst")]
-    query_burst: u32,
-    #[serde(default)]
-    query_rate_exempt: Vec<String>,
-    /// Largest request accepted, per transport, in octets. The UDP one is
-    /// floored at the advertised payload size — see `crate::admission_limits`.
-    #[serde(default = "crate::default_max_udp_request")]
-    max_udp_request: u16,
-    #[serde(default = "crate::default_max_tcp_request")]
-    max_tcp_request: u16,
-    /// What every reply's OPT advertises this server can reassemble, and the
-    /// largest UDP reply it will send. Both floored at 512 — see
-    /// `rdns::UdpSizes`.
-    #[serde(default = "crate::default_udp_payload_size")]
-    udp_payload_size: u16,
-    #[serde(default = "crate::default_max_udp_response")]
-    max_udp_response: u16,
-    /// How often the anomaly warnings run, in seconds; 0 is off. The four
-    /// thresholds below are per interval.
-    #[serde(default = "crate::default_anomaly_interval")]
-    anomaly_interval: u64,
-    #[serde(default = "crate::default_anomaly_query_rate")]
-    anomaly_query_rate: f64,
-    #[serde(default = "crate::default_anomaly_error_percent")]
-    anomaly_error_percent: f64,
-    #[serde(default = "crate::default_anomaly_source_queries")]
-    anomaly_source_queries: u64,
-    #[serde(default = "crate::default_anomaly_source_refusals")]
-    anomaly_source_refusals: u64,
-    /// Concurrent UDP answers, which is also the number of tasks sharing the
-    /// socket. Defaults to the machine's parallelism — see
-    /// `crate::default_udp_workers`, which is the same function the flag's
-    /// default comes from so the two cannot drift.
-    #[serde(default = "crate::default_udp_workers")]
-    udp_workers: usize,
-    metrics_listen: Option<String>,
-    /// Where the dnstap query stream goes: `tcp:<addr:port>` or `file:<path>`.
-    /// Absent is off.
-    dnstap: Option<String>,
-    /// How large a dnstap *capture file* may grow before the writing stops.
-    /// 0 is no limit; ignored for a `tcp:` target.
-    #[serde(default = "crate::default_dnstap_max_bytes")]
-    dnstap_max_bytes: u64,
-    /// Where to answer DNS over TLS (RFC 7858), and with what. All three or
-    /// none: `apply` refuses a listener with no certificate, because the
-    /// config file has no equivalent of clap's `requires` and would otherwise
-    /// bind 853 with nothing to present on it.
-    tls_listen: Option<String>,
-    quic_listen: Option<String>,
-    https_listen: Option<String>,
-    https_path: Option<String>,
-    tls_cert: Option<PathBuf>,
-    tls_key: Option<PathBuf>,
-    /// Trust anchors for transfers this server *fetches* over TLS
-    /// (RFC 9103), and whether one that arrives must have been encrypted.
-    /// Separate settings because they are separate directions: a server can be
-    /// a secondary over XoT, a primary that insists on it, or both.
-    transfer_tls_ca: Option<PathBuf>,
-    /// The certificate this server presents to a master that asks for one
-    /// (RFC 9103 §7.5's mutual TLS). Both keys or neither; `check` says so,
-    /// because a chain with no key cannot be presented.
-    transfer_tls_cert: Option<PathBuf>,
-    transfer_tls_key: Option<PathBuf>,
-    #[serde(default)]
-    transfer_tls_only: bool,
-    /// Where `rdnsctl` reaches this server. Unix only, and refused at startup
-    /// on Windows rather than ignored — the field parses everywhere so that one
-    /// config file can be read on either platform and fail with a sentence
-    /// instead of an unknown-key error.
-    control_socket: Option<PathBuf>,
-    #[serde(default)]
-    allow_partial_load: bool,
-}
-
-impl Default for Server {
-    fn default() -> Self {
-        Server {
-            host: crate::default_host(),
-            port: crate::default_port(),
-            zone_dir: None,
-            allow_transfer: Vec::new(),
-            also_notify: Vec::new(),
-            response_rate: crate::default_response_rate(),
-            query_rate: crate::default_query_rate(),
-            query_burst: crate::default_query_burst(),
-            query_rate_exempt: Vec::new(),
-            max_udp_request: crate::default_max_udp_request(),
-            max_tcp_request: crate::default_max_tcp_request(),
-            udp_payload_size: crate::default_udp_payload_size(),
-            max_udp_response: crate::default_max_udp_response(),
-            anomaly_interval: crate::default_anomaly_interval(),
-            anomaly_query_rate: crate::default_anomaly_query_rate(),
-            anomaly_error_percent: crate::default_anomaly_error_percent(),
-            anomaly_source_queries: crate::default_anomaly_source_queries(),
-            anomaly_source_refusals: crate::default_anomaly_source_refusals(),
-            udp_workers: crate::default_udp_workers(),
-            metrics_listen: None,
-            dnstap: None,
-            dnstap_max_bytes: crate::default_dnstap_max_bytes(),
-            tls_listen: None,
-            quic_listen: None,
-            https_listen: None,
-            https_path: None,
-            tls_cert: None,
-            tls_key: None,
-            transfer_tls_ca: None,
-            transfer_tls_cert: None,
-            transfer_tls_key: None,
-            transfer_tls_only: false,
-            control_socket: None,
-            allow_partial_load: false,
-        }
+// `[server]`: the 22 keys both daemons have, from `rdns::server_table!`, then
+// this daemon's twelve. The macro also writes `Default`, so the shared half is
+// spelled once there rather than once per daemon (`TODO.md` #63).
+rdns::server_table! {
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    struct Server {
+        /// A directory of `.zone` files. Zones named in `[zones.*]` may add to
+        /// or override what is found here.
+        zone_dir: Option<String>,
+        #[serde(default)]
+        allow_transfer: Vec<String>,
+        #[serde(default)]
+        also_notify: Vec<String>,
+        /// Concurrent UDP answers, which is also the number of tasks sharing
+        /// the socket. Defaults to the machine's parallelism — see
+        /// `crate::default_udp_workers`, which is the same function the flag's
+        /// default comes from so the two cannot drift.
+        #[serde(default = "crate::default_udp_workers")]
+        udp_workers: usize,
+        /// Where the dnstap query stream goes: `tcp:<addr:port>` or
+        /// `file:<path>`. Absent is off.
+        dnstap: Option<String>,
+        /// How large a dnstap *capture file* may grow before the writing stops.
+        /// 0 is no limit; ignored for a `tcp:` target.
+        #[serde(default = "crate::default_dnstap_max_bytes")]
+        dnstap_max_bytes: u64,
+        /// Trust anchors for transfers this server *fetches* over TLS
+        /// (RFC 9103), and whether one that arrives must have been encrypted.
+        /// Separate settings because they are separate directions: a server can
+        /// be a secondary over XoT, a primary that insists on it, or both.
+        transfer_tls_ca: Option<PathBuf>,
+        /// The certificate this server presents to a master that asks for one
+        /// (RFC 9103 §7.5's mutual TLS). Both keys or neither; `check` says so,
+        /// because a chain with no key cannot be presented.
+        transfer_tls_cert: Option<PathBuf>,
+        transfer_tls_key: Option<PathBuf>,
+        #[serde(default)]
+        transfer_tls_only: bool,
+        /// Where `rdnsctl` reaches this server. Unix only, and refused at
+        /// startup on Windows rather than ignored — the field parses everywhere
+        /// so that one config file can be read on either platform and fail with
+        /// a sentence instead of an unknown-key error.
+        control_socket: Option<PathBuf>,
+        #[serde(default)]
+        allow_partial_load: bool,
+    }
+    defaults {
+        zone_dir: None,
+        allow_transfer: Vec::new(),
+        also_notify: Vec::new(),
+        udp_workers: crate::default_udp_workers(),
+        dnstap: None,
+        dnstap_max_bytes: crate::default_dnstap_max_bytes(),
+        transfer_tls_ca: None,
+        transfer_tls_cert: None,
+        transfer_tls_key: None,
+        transfer_tls_only: false,
+        control_socket: None,
+        allow_partial_load: false,
     }
 }
 

@@ -13,6 +13,7 @@ pub use rdns_core::*;
 mod bench;
 pub mod cache;
 pub mod catalog;
+pub mod config;
 pub mod denial_wire;
 pub mod dns64;
 pub mod dnssec;

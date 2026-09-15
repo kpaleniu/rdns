@@ -39,91 +39,20 @@ pub(crate) struct Config {
     rpz: Rpz,
 }
 
-/// The listeners and the limits — the keys `rdnsd`'s `[server]` also has, plus
-/// `max-inflight-udp`, which is a resolver's shape of `rdnsd`'s `udp-workers`.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-struct Server {
-    #[serde(default = "crate::default_host")]
-    host: String,
-    #[serde(default = "crate::default_port")]
-    port: u16,
-    #[serde(default = "crate::default_query_rate")]
-    query_rate: u32,
-    #[serde(default = "crate::default_query_burst")]
-    query_burst: u32,
-    #[serde(default)]
-    query_rate_exempt: Vec<String>,
-    #[serde(default = "crate::default_response_rate")]
-    response_rate: u32,
-    /// Largest request accepted, per transport, in octets. The UDP one is
-    /// floored at the advertised payload size — see `crate::admission_limits`.
-    #[serde(default = "crate::default_max_udp_request")]
-    max_udp_request: u16,
-    #[serde(default = "crate::default_max_tcp_request")]
-    max_tcp_request: u16,
-    /// What every reply's OPT advertises this resolver can reassemble, and the
-    /// largest UDP reply it will send. Both floored at 512 — see
-    /// `rdns::UdpSizes`.
-    #[serde(default = "crate::default_udp_payload_size")]
-    udp_payload_size: u16,
-    #[serde(default = "crate::default_max_udp_response")]
-    max_udp_response: u16,
-    /// How many recursions may be outstanding. No off switch, unlike
-    /// `query-rate` — see the flag.
-    #[serde(default = "crate::default_max_inflight_udp")]
-    max_inflight_udp: usize,
-    /// How often the anomaly warnings run, in seconds; 0 is off. The four
-    /// thresholds below are per interval.
-    #[serde(default = "crate::default_anomaly_interval")]
-    anomaly_interval: u64,
-    #[serde(default = "crate::default_anomaly_query_rate")]
-    anomaly_query_rate: f64,
-    #[serde(default = "crate::default_anomaly_error_percent")]
-    anomaly_error_percent: f64,
-    #[serde(default = "crate::default_anomaly_source_queries")]
-    anomaly_source_queries: u64,
-    #[serde(default = "crate::default_anomaly_source_refusals")]
-    anomaly_source_refusals: u64,
-    metrics_listen: Option<String>,
-    /// Where to answer DNS over TLS, QUIC and HTTPS, and with what. A listener
-    /// with no certificate is refused by `check`: the file has no equivalent of
-    /// clap's `requires` and would otherwise bind 853 with nothing to present.
-    tls_listen: Option<String>,
-    quic_listen: Option<String>,
-    https_listen: Option<String>,
-    https_path: Option<String>,
-    tls_cert: Option<PathBuf>,
-    tls_key: Option<PathBuf>,
-}
-
-impl Default for Server {
-    fn default() -> Self {
-        Server {
-            host: crate::default_host(),
-            port: crate::default_port(),
-            query_rate: crate::default_query_rate(),
-            query_burst: crate::default_query_burst(),
-            query_rate_exempt: Vec::new(),
-            response_rate: crate::default_response_rate(),
-            max_udp_request: crate::default_max_udp_request(),
-            max_tcp_request: crate::default_max_tcp_request(),
-            udp_payload_size: crate::default_udp_payload_size(),
-            max_udp_response: crate::default_max_udp_response(),
-            max_inflight_udp: crate::default_max_inflight_udp(),
-            anomaly_interval: crate::default_anomaly_interval(),
-            anomaly_query_rate: crate::default_anomaly_query_rate(),
-            anomaly_error_percent: crate::default_anomaly_error_percent(),
-            anomaly_source_queries: crate::default_anomaly_source_queries(),
-            anomaly_source_refusals: crate::default_anomaly_source_refusals(),
-            metrics_listen: None,
-            tls_listen: None,
-            quic_listen: None,
-            https_listen: None,
-            https_path: None,
-            tls_cert: None,
-            tls_key: None,
-        }
+// `[server]`: the 22 keys both daemons have, from `rdns::server_table!`, then
+// `max-inflight-udp`, which is a resolver's shape of `rdnsd`'s `udp-workers`.
+// The macro writes `Default` too, so the shared half is spelled once.
+rdns::server_table! {
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+    struct Server {
+        /// How many recursions may be outstanding. No off switch, unlike
+        /// `query-rate` — see the flag.
+        #[serde(default = "crate::default_max_inflight_udp")]
+        max_inflight_udp: usize,
+    }
+    defaults {
+        max_inflight_udp: crate::default_max_inflight_udp(),
     }
 }
 
@@ -459,6 +388,31 @@ mod tests {
 
         // And at the top level, where a whole section could go missing.
         assert!(parse("[sever]\nport = 53\n").is_err(), "a mistyped table");
+    }
+
+    /// The shared fields expand in this crate, so a typo in `[server]` reads
+    /// exactly as one in `[resolver]` does: the key's own line, and the list of
+    /// what was expected. That is what the flattened-struct shape gave up
+    /// (`TODO.md` #63h).
+    #[test]
+    fn a_typo_in_the_shared_table_keeps_its_line_and_its_suggestions() {
+        let err = parse(
+            "[server]
+hsot = \"127.0.0.1\"
+",
+        )
+        .expect_err("a typo");
+        let text = err.to_string();
+        assert!(text.contains("unknown field `hsot`"), "got: {text}");
+        assert!(text.contains("line 2"), "the key's line: {text}");
+        assert!(
+            text.contains("expected one of"),
+            "no expected-key list: {text}"
+        );
+        assert!(
+            text.contains("max-inflight-udp"),
+            "own keys listed too: {text}"
+        );
     }
 
     #[test]
