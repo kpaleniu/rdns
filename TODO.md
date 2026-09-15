@@ -139,7 +139,10 @@ teaches `rdnsc` to write what it already transfers correctly, **and the owner
 decided the same day that it gets TSIG**: 5 packages and, the part that is not
 a count, a C toolchain in its build. #67 is the consequence — the first thing
 that is not a daemon now links crypto, so where the crate line belongs is a
-measurement somebody owes. **#60 closed 2026-09-14**: 19 flattened messages put back
+measurement, **taken the same day**: `rdnsc` linking `rdns` outright would cost
++38 packages and 47% of its binary, so that is out; the tangle inside `rdns` is
+one edge and costs nothing; and the figure that would decide a split needs 66a
+to exist, so **66a goes first and #67 finishes after it**. **#60 closed 2026-09-14**: 19 flattened messages put back
 on their `\` continuations and a test that will not let a twentieth in, and the
 row's own count of 21 across 12 files did not reproduce — three of its files
 hold nothing at all, one of them the false positive the row had predicted.
@@ -2635,13 +2638,72 @@ dependencies (`thiserror`, `rand`, `base64`). `rdns-transport` exists because a
 TLS stack belongs at the socket layer and because its consumers are binaries
 that may use `anyhow`. `rdns` is everything else.
 
-Today, measured 2026-09-15 with `cargo tree --no-dedupe`, distinct packages:
+**Measured 2026-09-15, and it moved the ordering rather than the line.**
+
+This row was filed the same day saying ~~"`rdnsr`, `rdnsd` **118** each" and
+"`rdns` (library) 109"~~, and **both were the wrong question** — kept because
+the mistake is the one bare `cargo tree` makes for you: it counts
+**dev**-dependencies, so those figures included `criterion` and `dhat`, which
+no binary links. What a binary links is `-e normal,build`:
 
 | | packages |
 |---|---|
+| `rdns-core` | **15** |
 | `rdnsc`, `rdnsctl` | **34** each |
-| `rdnsr`, `rdnsd` | **118** each |
-| `rdns` (library) | 109 |
+| `rdns` (library) | 51, or **55** with build deps |
+| `rdnsr`, `rdnsd` | 108, or **113** with build deps |
+
+**The two ways to give `rdnsc` what #66 needs, priced against each other:**
+
+| | packages | `rdnsc.exe`, release |
+|---|---|---|
+| today | 34 | **814 080 bytes** |
+| plus `ring` (66c) | **39** | not yet measurable — 66a does not exist |
+| depending on `rdns` | **72** | **1 199 104 bytes** |
+
+The last row is the one that settles something: one reachable call into
+`zone_writer` costs **+38 packages and +385 KB, 47% of the binary**, because a
+dependency on `rdns` is a dependency on `tokio`, `rustls` and `ring` whatever
+the caller touches. So "just let `rdnsc` link `rdns`" is out, and it is out on a
+number rather than on taste. Measured by adding the dependency and a call
+behind an environment check — a call that is *reachable*, since the first
+attempt used a private unused function and the linker dropped it, reading
+identical to the byte.
+
+**The tangle inside `rdns` is one edge, and it costs nothing.** Of 41 modules,
+only 9 reach neither crypto nor a runtime — but 30-odd of the rest reach
+`tokio` through exactly one hop: `rdns::error`, which owns it because
+`From<tokio::time::error::Elapsed>` can only be written where the error type is
+defined. The module's own header says that and cites #31, so the reason was
+answered rather than rediscovered (§19). Discount that single edge and the
+free set goes **9 to 14** — `denial_wire`, `dns64`, `security` and `svcb` join
+it. None of this is a *cost*: it adds no package to any binary, and §14's rule
+is to count what a dependency does at run time. It is a map of where a line
+could go, not evidence that one should move.
+
+**The layering the map suggests**, if a split happens at all — each layer named
+by the heaviest thing it needs:
+
+| layer | needs | modules |
+|---|---|---|
+| wire | — | `rdns-core` as it stands |
+| zone and presentation | `sha1` | `zone`, `zone_writer`, `denial_wire`, `svcb`, `ixfr`, `transfer`, `update`, `journal`, `catalog` |
+| crypto | `ring` | `dnssec*`, `tsig`, `zone_signer` |
+| runtime | `tokio`, `rustls` | `resolver`, `xfr`, `xot`, `secondary`, `notify`, `endpoint`, `shutdown`, `logging`, `tls_identity` |
+
+`rdnsc` under #66 wants the second layer and one module of the third, and none
+of the fourth. The `sha1` in the second layer is `dnssec_denial::Nsec3Hash`
+reached through `zone` — so a presentation split that avoids `Zone` (66a's own
+open question) may not need it at all.
+
+**What would refute the whole thing, and why this row is now blocked.** The
+only size figure here is for linking *all* of `rdns`, which is an upper bound.
+Nobody has measured what `rdnsc` pays for the items it actually needs —
+record presentation plus TSIG — and if that is 50 KB then a new crate buys a
+manifest that reads better and nothing else, which is exactly what this row
+warns against. That measurement needs 66a to exist. **So 66a goes first and
+#67 finishes after it**, which is the reverse of the order this row was filed
+in.
 
 What #66 does to that is 34 → 39 for `rdnsc` and a C compiler in its build.
 What it does to the *principle* is less clear, and that is this row:
