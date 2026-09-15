@@ -14,9 +14,9 @@ use std::path::PathBuf;
 
 use crate::error::ZoneError;
 use crate::ixfr::ZoneDelta;
+use crate::record_text::resource_record_line;
 use crate::record_types as rt;
 use crate::zone::{parse_zone_file, Zone};
-use crate::zone_writer::resource_record_line;
 use crate::{Name, NameRef, ResourceRecord, Serial};
 
 /// The line that separates one difference sequence from the next.

@@ -2,7 +2,7 @@
 //! them: canonical name order (RFC 4034 §6.1), type bitmaps (§4.1.2) and
 //! base32hex (RFC 4648 §7).
 //!
-//! Split out of [`crate::dnssec_denial`] because `zone` and `zone_writer` need
+//! Split out of `rdns::dnssec_denial` because `zone` and `zone_writer` need
 //! all three to read and write NSEC and NSEC3 records, and a zone file is not a
 //! DNSSEC question: those two edges were the only ones blocking the crate cut
 //! #31 measured, and they carried no crypto across. `dnssec_denial` keeps
@@ -14,9 +14,9 @@
 //! — one that folded case with `str::to_uppercase`, the Unicode fold RFC 4343
 //! forbids (`CLAUDE.md` §8), and disagreed with this one about `=` padding.
 
-use crate::error::{WireError, WireResult};
-use crate::NameRef;
-use crate::Rtype;
+use rdns_core::error::{WireError, WireResult};
+use rdns_core::NameRef;
+use rdns_core::Rtype;
 use std::cmp::Ordering;
 
 /// Compare two names in DNSSEC canonical order (RFC 4034 §6.1).
@@ -34,7 +34,7 @@ pub const NSEC3_HASH_LEN: usize = 20;
 /// The 20 octets RFC 5155 §5 hashes a name to, and the only length one can be.
 ///
 /// SHA-1 is the only algorithm IANA has registered for NSEC3 and
-/// [`Nsec3`](crate::dnssec_denial::Nsec3) refuses any other, so a hash of another length is not a short hash — it is
+/// `rdns::dnssec_denial`'s `Nsec3` refuses any other, so a hash of another length is not a short hash — it is
 /// not a hash. As a `Vec<u8>` it was a heap allocation per map key for 20 bytes,
 /// and a wrong length from a remote record was stored and then silently never
 /// matched, which is what `covers` carried an `is_empty()` guard for
@@ -112,7 +112,7 @@ pub struct CanonicalKey(Vec<u8>);
 /// walks forwards, since the wire form is a chain of length octets, and the
 /// alternative to re-walking it is an offset table on the stack for a name that
 /// has three labels.
-pub(crate) fn reversed_labels(name: NameRef<'_>) -> impl Iterator<Item = Folded<'_>> {
+pub fn reversed_labels(name: NameRef<'_>) -> impl Iterator<Item = Folded<'_>> {
     (1..=name.label_count()).map(move |n| Folded(name.suffix(n).labels().next().unwrap_or(&[])))
 }
 
@@ -122,7 +122,7 @@ pub(crate) fn reversed_labels(name: NameRef<'_>) -> impl Iterator<Item = Folded<
 /// A newtype because `Iterator::cmp` needs `Ord` and `Iterator::cmp_by` is
 /// unstable. `Eq` is written in terms of `Ord` rather than derived, since a
 /// derived one would compare the bytes without folding and disagree with it.
-pub(crate) struct Folded<'a>(&'a [u8]);
+pub struct Folded<'a>(&'a [u8]);
 
 impl Folded<'_> {
     fn folded(&self) -> impl Iterator<Item = u8> + '_ {
@@ -248,12 +248,13 @@ pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>> {
 /// base32hex (RFC 4648 §7): how an NSEC3 owner label carries a hash.
 const BASE32HEX: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
 
-/// The same alphabet down-cased, for [`nsec3_owner_name`]. A second table
+/// The same alphabet down-cased, for `rdns::dnssec_denial`'s owner-name
+/// builder. A second table
 /// rather than a fold of the first: the fold was the allocation.
-pub(crate) const BASE32HEX_LOWER: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+pub const BASE32HEX_LOWER: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
 
 /// The number of base32hex characters `len` octets encode to, unpadded.
-pub(crate) fn base32hex_len(len: usize) -> usize {
+pub fn base32hex_len(len: usize) -> usize {
     (len * 8).div_ceil(5)
 }
 
@@ -269,7 +270,7 @@ pub fn base32hex_encode(data: &[u8]) -> String {
 ///
 /// Returns how many were written. For an owner name the encoding is a *label*,
 /// so the bytes are what is wanted and a `String` is the conversion.
-pub(crate) fn encode_base32hex_in(data: &[u8], alphabet: &[u8; 32], out: &mut [u8]) -> usize {
+pub fn encode_base32hex_in(data: &[u8], alphabet: &[u8; 32], out: &mut [u8]) -> usize {
     let mut at = 0;
     for chunk in data.chunks(5) {
         let mut buf = [0u8; 5];
@@ -285,7 +286,7 @@ pub(crate) fn encode_base32hex_in(data: &[u8], alphabet: &[u8; 32], out: &mut [u
     at
 }
 
-pub(crate) fn encode_base32hex(data: &[u8], alphabet: &[u8; 32], out: &mut String) {
+pub fn encode_base32hex(data: &[u8], alphabet: &[u8; 32], out: &mut String) {
     for chunk in data.chunks(5) {
         let mut buf = [0u8; 5];
         buf[..chunk.len()].copy_from_slice(chunk);
@@ -330,8 +331,13 @@ pub fn base32hex_decode(text: &str) -> WireResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record_types as rt;
-    use crate::test_records::nm;
+    use rdns_core::record_types as rt;
+    /// `rdns::test_records::nm`, which is `#[cfg(test)]` there and so invisible
+    /// across a crate boundary. Three lines rather than making that module
+    /// public for one helper (`TODO.md` #67).
+    fn nm(text: &str) -> rdns_core::Name {
+        rdns_core::Name::from_presentation(text).expect("a name")
+    }
 
     /// The two orderings under test, over names written as text. Both take a
     /// `NameRef` now, and a test that spelled the conversion at every call site

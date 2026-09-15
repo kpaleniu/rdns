@@ -42,7 +42,6 @@ mod parse;
 mod rdata;
 
 pub use parse::{parse_zone_file, parse_zone_file_at};
-pub(crate) use rdata::format_dnssec_time;
 
 /// The origin a zone file's name says it holds: `example.com.zone` is
 /// `example.com.`, and a name without the extension is taken whole.
@@ -831,13 +830,14 @@ fn parent_key(key: &[u8]) -> Option<&[u8]> {
 mod tests {
 
     use super::parse::absolutize;
-    use super::rdata::{parse_dnssec_time, rdata_from_fields};
+    use super::rdata::rdata_from_fields;
     use super::*;
     use crate::error::ZoneError;
     use crate::record_types;
     use crate::test_records::nm;
     use crate::testutil::ScratchDir;
     use crate::ParsedRecord;
+    use rdns_present::dnssec_time::parse_dnssec_time;
     use std::net::Ipv4Addr;
 
     #[test]
@@ -2163,38 +2163,6 @@ $TTL 3600
             err.to_string().contains("unknown record type"),
             "got: {err}"
         );
-    }
-
-    /// The formatter and the parser are inverses, or a rewritten RRSIG claims a
-    /// different validity period from the one it was signed with.
-    #[test]
-    fn test_dnssec_time_round_trips() {
-        for (epoch, text) in [
-            (0u32, "19700101000000"),
-            (1, "19700101000001"),
-            (951_868_800, "20000301000000"), // the day after a leap day
-            (1_078_012_800, "20040229000000"), // a leap day itself
-            (1_609_459_199, "20201231235959"),
-            (2_147_483_647, "20380119031407"),
-            (u32::MAX, "21060207062815"),
-        ] {
-            assert_eq!(format_dnssec_time(epoch), text, "formatting {epoch}");
-            assert_eq!(parse_dnssec_time(text), Ok(epoch), "parsing {text}");
-        }
-    }
-
-    /// A 14-*byte* string is not fourteen characters, and the slicing is by
-    /// byte: a multi-byte character must not panic on a char boundary.
-    #[test]
-    fn a_fourteen_byte_time_that_is_not_fourteen_digits_is_an_error() {
-        let multibyte = "abcé123456789";
-        assert_eq!(multibyte.len(), 14, "the byte-length check passes");
-        assert!(parse_dnssec_time(multibyte).is_err(), "must not panic");
-
-        // The same shape with the multi-byte character at each slice boundary.
-        for probe in ["é12345678901", "1234é678901234", "123456789012é"] {
-            let _ = parse_dnssec_time(probe);
-        }
     }
 
     /// Every field is range-checked: an out-of-range one otherwise produces a

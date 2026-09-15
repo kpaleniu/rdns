@@ -169,7 +169,7 @@ fn writing_a_record_as_text_borrows_it() {
     let (from_zone, zone_blocks) =
         allocations(|| rdns::zone_writer::record_to_string(&record).expect("a line"));
     let (from_wire, wire_blocks) =
-        allocations(|| rdns::zone_writer::resource_record_line(&wire).expect("a line"));
+        allocations(|| rdns::record_text::resource_record_line(&wire).expect("a line"));
 
     // The shape this replaced, measured rather than asserted in prose: the
     // journal held a `ResourceRecord` and built a `ZoneRecord` to render it.

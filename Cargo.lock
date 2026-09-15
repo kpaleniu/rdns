@@ -1111,6 +1111,7 @@ dependencies = [
  "rand 0.8.8",
  "rcgen",
  "rdns-core",
+ "rdns-present",
  "ring",
  "rustls",
  "rustls-pki-types",
@@ -1130,6 +1131,15 @@ dependencies = [
  "base64 0.22.1",
  "rand 0.8.8",
  "thiserror",
+]
+
+[[package]]
+name = "rdns-present"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "rdns",
+ "rdns-core",
 ]
 
 [[package]]

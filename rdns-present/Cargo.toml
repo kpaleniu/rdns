@@ -1,0 +1,19 @@
+[package]
+name = "rdns-present"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The text presentation format a zone file is written in, and the wire encodings it needs: canonical order, type bitmaps, base32hex, SVCB parameters. No crypto, no async."
+
+[dependencies]
+rdns-core.workspace = true
+# RFC 9460 §2.1's `ech=` parameter is base64, and core already carries this for
+# DNSKEY and TSIG secrets — so it costs the workspace nothing.
+base64 = "0.22"
+
+[dev-dependencies]
+# A cycle, which cargo permits for dev-dependencies alone: three tests here
+# round-trip through the zone *parser*, which is `rdns`'s and is not coming
+# back. `TODO.md` #67 — this is one of the costs the shape was built to show.
+rdns.workspace = true

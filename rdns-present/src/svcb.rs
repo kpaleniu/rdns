@@ -12,8 +12,8 @@
 //! character-string escaping, which is what RFC 9460 §2.1 asks for and what
 //! lets a zone carry a parameter registered after this code was written.
 
-use crate::codecs::{base64_encode, char_string_decode, char_string_escaped};
-use crate::error::ZoneError;
+use rdns_core::codecs::{base64_encode, char_string_decode, char_string_escaped};
+use rdns_core::error::ZoneError;
 use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -39,7 +39,7 @@ pub mod svc_param_keys {
 /// The name of a SvcParamKey, or its `keyNNNNN` form (RFC 9460 §2.1).
 ///
 /// Always a name [`svc_param_key_from_name`] reads back, which is the same
-/// contract [`crate::record_types::record_type_name`] has with its inverse.
+/// contract [`rdns_core::record_types::record_type_name`] has with its inverse.
 pub fn svc_param_key_name(key: u16) -> Cow<'static, str> {
     let known = match key {
         svc_param_keys::MANDATORY => "mandatory",
@@ -86,7 +86,7 @@ pub fn svc_param_key_from_name(name: &str) -> Option<u16> {
 /// in the strictly increasing order the wire needs (RFC 9460 §2.2), so an
 /// operator may write them in any order. A repeated key is refused *here*
 /// rather than there, because here is where the line number is.
-pub(crate) fn parse_params(fields: &[&str], ln: usize) -> Result<Vec<(u16, Vec<u8>)>, ZoneError> {
+pub fn parse_params(fields: &[&str], ln: usize) -> Result<Vec<(u16, Vec<u8>)>, ZoneError> {
     let mut params: Vec<(u16, Vec<u8>)> = Vec::new();
     for field in fields {
         let (name, value) = match field.split_once('=') {
@@ -330,7 +330,7 @@ fn comma_list(text: &str, name: &str, ln: usize) -> Result<Vec<String>, ZoneErro
 /// record to RFC 3597 `\#` form would also be correct but loses the six
 /// parameters that were fine, and returning `None` would put a "cannot write
 /// this" case into every caller for a record we can always write.
-pub(crate) fn present_params(params: &[(u16, Vec<u8>)]) -> String {
+pub fn present_params(params: &[(u16, Vec<u8>)]) -> String {
     let mut out = String::new();
     for (code, value) in params {
         if !out.is_empty() {
@@ -442,10 +442,10 @@ fn present_value(code: u16, value: &[u8]) -> Option<Option<String>> {
 mod tests {
 
     use super::{svc_param_key_from_name, svc_param_key_name};
-    use crate::codecs::hex_encode;
-    use crate::record_types as rt;
-    use crate::zone::{parse_zone_file, Zone};
-    use crate::zone_writer::zone_to_string;
+    use rdns::zone::{parse_zone_file, Zone};
+    use rdns::zone_writer::zone_to_string;
+    use rdns_core::codecs::hex_encode;
+    use rdns_core::record_types as rt;
 
     /// The RDATA of the one SVCB or HTTPS record in a one-line zone, as hex.
     fn rdata_hex(line: &str) -> String {

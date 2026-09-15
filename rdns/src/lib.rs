@@ -9,12 +9,18 @@
 
 pub use rdns_core::*;
 
+// The presentation format is its own crate since `TODO.md` #66a, so that a
+// client can render a record without linking a server. Re-exported under the
+// paths it had, because 11 modules here name them and none of them cares which
+// crate the encodings live in.
+pub use rdns_present::record_text;
+pub use rdns_present::{denial_wire, svcb};
+
 #[cfg(test)]
 mod bench;
 pub mod cache;
 pub mod catalog;
 pub mod config;
-pub mod denial_wire;
 pub mod dns64;
 pub mod dnssec;
 pub mod dnssec_answer;
@@ -46,7 +52,6 @@ pub mod secondary;
 pub mod security;
 pub mod shutdown;
 pub mod special_names;
-pub mod svcb;
 /// Plain record fixtures, for tests only.
 #[cfg(test)]
 mod test_records;
