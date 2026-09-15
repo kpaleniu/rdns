@@ -37,7 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#64** and **#21**, as of 2026-09-15.
+**#57**, **#58**, **#59**, **#64**, **#66**, **#67** and **#21**, as of
+2026-09-15.
 **#61 closed the day it was filed**: the reload is 3.76x faster and holds
 68 MB less per million rules, and rayon was measured and declined.
 **#62 closed the day after it was filed**, all three rows. 62a was the one on
@@ -122,10 +123,23 @@ and what it found was in a cache nobody was looking at rather than in the
 resolver's return type. **Three of #57's four items are closed**: a reload
 re-reads every `--rpz` file, runs off the worker threads, and can be asked for
 by a NOTIFY from a listed address. What is left is the transfer itself (57d) and
-the IXFR question, and the measurements in the row say the transfer is decided
-by memory rather than by time. #58 is what 45b left, #59 what #51 left and #60
+the IXFR question. **Both of 57d's shapes are built** — branches
+`57d-shape-a` and `57d-shape-b` — and the install they differ over is 1 894 ms
+against 32.8 at a million rules, which turned out not to be what decides the
+row: memory is the same either way, and what is left is persistence and
+**which way EXPIRE fails for a blocklist**. The two-process path answers that
+one today by accident — `withdraw` takes an expired zone out of `rdnsd`'s zone
+map and leaves the file, so `rdnsr` goes on enforcing it with no age for it
+anywhere. #58 is what 45b left, #59 what #51 left and #60
 what #51 turned up on the way; and #21 is an inventory of deliberate deviations
-rather than a queue. **#60 closed 2026-09-14**: 19 flattened messages put back
+rather than a queue. **#66 and #67 were filed out of 57d on 2026-09-15**, from
+the question that row never asked — what an operator who wants only a resolver
+actually runs, which today is `rdnsd` as a download client for `rdnsr`. #66
+teaches `rdnsc` to write what it already transfers correctly, **and the owner
+decided the same day that it gets TSIG**: 5 packages and, the part that is not
+a count, a C toolchain in its build. #67 is the consequence — the first thing
+that is not a daemon now links crypto, so where the crate line belongs is a
+measurement somebody owes. **#60 closed 2026-09-14**: 19 flattened messages put back
 on their `\` continuations and a test that will not let a twentieth in, and the
 row's own count of 21 across 12 files did not reproduce — three of its files
 hold nothing at all, one of them the false positive the row had predicted.
@@ -935,7 +949,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59** and **#64**, plus **#21** — see
+**#57**, **#58**, **#59**, **#64**, **#66** and **#67**, plus **#21** — see
 "What is open" above, which is the same list and the only place it is written
 down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -1241,10 +1255,11 @@ Five items. 57a-c are done; 57d and 57e are what is left.
   live in the tree with no 57d near it. So #63 does not depend on 57d being
   taken, and 57d is not the argument for it.
 
-  **The three shapes, if it is ever taken** — read off the code rather than
-  guessed, and none of them built, so this is an inventory and not a
-  recommendation. **A**: transfer, write the zone file, let the existing reload
-  re-read it; nothing in `rdns::rpz` or the answer path changes, and it pays
+  **The three shapes** — read off the code rather than guessed. **A and B were
+  built on 2026-09-15 and the numbers are below**; the inventory is kept as it
+  was written, because two of its claims did not survive being compiled.
+  **A**: transfer, write the zone file, let the existing reload re-read it;
+  nothing in `rdns::rpz` or the answer path changes, and it pays
   `PolicyZones::load` at 0.633 s per refresh at a million rules, plus a
   serialization nothing has measured, to reparse what it just held. **B**:
   transfer straight into `PolicyZone::new`, which is 41 ms on that feed — but
@@ -1267,6 +1282,117 @@ Five items. 57a-c are done; 57d and 57e are what is left.
   reads, a NOTIFY joins them — needs no operator cron job and no new code on
   either side. **That is the thing 57d has to beat**, and it is worth saying
   that it may not be beaten.
+
+  **The direction EXPIRE fails in is undecided, and the shipped arrangement
+  decided it by accident — filed 2026-09-15.** `rdns::rpz` has no notion of a
+  timer: with `--rpz` the file is the master and nothing expires. The two-process
+  path does have one, and it does not do what it looks like. `withdraw`
+  (`rdnsd/src/replication.rs:649`) drops the zone from the zone map, the deltas
+  and the gauges; the *file* stays, and `rdnsr` re-reads files. So an expired
+  policy feed goes on being enforced, with nothing logged on the side that
+  enforces it — and the last-contact sidecar and
+  `dns_zone_last_refresh_timestamp_seconds` are `rdnsd`'s, so the process
+  applying the policy holds no age for it at all.
+
+  Under 57d the timer arrives in `rdnsr` whether or not it is honoured.
+  `draft-vixie-dns-rpz-04` §2 makes it real — "The RPZ's SOA record is real, with
+  a serial number used for NOTIFY and IXFR, and timers used for AXFR and IXFR" —
+  and §2 requires RPZs to "be primary or secondary zones at subscriber recursive
+  resolvers", so dropping one of a secondary's three timers is a claim to defend
+  rather than an omission. What to do when it fires is not specified.
+
+  Neither direction is safe, and `rdnsd`'s answer does not transfer:
+
+  - **Lift** (withdraw, as an authoritative zone does) silently un-blocks
+    everything the feed carried, on a process that stays healthy. The trigger is
+    the master being unreachable, so blackholing the publisher is an off-path off
+    switch for the blocklist — and the EXPIRE it runs on is the publisher's
+    number, not the resolver operator's. Withdrawal is right for authoritative
+    data because serving it stale with AA set is a false statement about somebody
+    else's zone. A policy zone asserts no authority, so the reason does not carry.
+  - **Enforce** makes a retraction unreachable: a delisted false positive, or a
+    lifted order, stays applied until a person notices. That is `CLAUDE.md` §4's
+    "missing state degrades, never crashes is right for a cache and wrong for
+    anything with teeth" pointed the other way, and it is defensible only with
+    the age visible on the enforcing process — `Option`-shaped, so a feed that
+    never transferred is `absent()` rather than 1970 (§14).
+
+  **And "closed" cannot be derived from the zone.** The costs are asymmetric —
+  lifting hits every client behind the resolver and is remotely triggerable,
+  while enforcing hits the listed names and is visible to whoever is blocked —
+  which argues for enforcing by default. But `Action::Passthru` and
+  `PolicyOverride::Passthru` make a feed an *allow*list, and a stale one of those
+  fails open for exactly what it exempts. The safe direction is a statement about
+  what a feed is for, so it belongs beside `policy` in `[[rpz.feeds]]`, per feed.
+  **Nothing built and no remedy claimed past that** (§18): what is established is
+  that a global rule and a default read off the rules are both wrong.
+
+  **A and B are built — 2026-09-15, branches `57d-shape-a` and `57d-shape-b`,
+  both off `57d-measure`.** §19: arguing costs more than compiling, and what
+  the build settled is not what the row expected it to.
+
+  The measurement both turn on is `rdns/tests/rpz_install.rs`, which times the
+  one thing they do differently — what happens after the last envelope arrives.
+  A million QNAME rules, release, three warm runs after a discarded first,
+  spread 0.4% on A's total and 5.9% on B's:
+
+  | at 1M rules | A: into the file | B: straight into the index |
+  |---|---|---|
+  | per refresh | **1 894–1 902 ms** | **32.3–34.2 ms** |
+  | of which | serialize 495, write 635, re-read 756 | index 32.8 |
+  | installed set | 303.4 B/rule | 303.4 B/rule |
+  | transient | an 85 B/rule string, plus a second copy of the zone | none measurable |
+  | diff | 303 insertions, `rdnsr` only | 641, of which 211 lines of `rdns::rpz` and 129 of its tests |
+
+  Four things the build surfaced that the inventory above had not:
+
+  - **The row expected memory to decide this and it does not.** Both shapes
+    install the same zone, 303.4 B/rule measured from the same baseline — the
+    first run of the probe read B as holding nothing, which was the measurement
+    taking A's parse and B's hand-me-down from different starting points. What
+    actually differs is transient: A serializes an 85 B/rule string and parses
+    a second copy of a zone this process had just held.
+  - **A's cost is not the reload the row named.** It is the serialize-and-write
+    the row called "a serialization nothing has measured": 1 130 ms of 1 894,
+    60%. The re-read it did name is the smaller half.
+  - **B's type change has almost no blast radius.** `PolicyZones` holding
+    `Arc<PolicyZone>` changed no call site outside `rpz.rs` — the four
+    `.zones()` users deref through it — and one field on `Resolving` cost six
+    initializers, five of them tests. "The type has to become a list of
+    sources" was right and "does not fit at all" overstated it.
+  - **Both shapes needed something neither the row nor 57c had named: a NOTIFY
+    wake per feed.** `PolicyReload` is one permit for the process, which is
+    right when every feed is a file somebody else writes — the re-read is of
+    the set, and the ACL is the bound. Once a feed has a master of its own, a
+    NOTIFY from one publisher makes this resolver re-read every *other*
+    operator's file, so the wake has to name the zone. Not a defect in the
+    shipped tree, and it would be one the day either shape landed.
+
+  **What neither shape settles, and why the numbers do not close the row.**
+  1.9 s on a blocking thread at an hourly cadence is 0.05% of a core, so A is
+  affordable for one big feed; what makes it expensive is a *set*, because the
+  reload is all-or-nothing and one feed's refresh re-reads every feed. And B
+  buys its 57x by giving up the only thing A has: the file. A restart under A
+  begins with yesterday's rules, under B with none —
+  `PolicyStore::awaiting` counts exactly that, and it is the same question as
+  the EXPIRE direction above. So the install cost was worth measuring and is
+  not the discriminator; **the row turns on persistence and on which way a
+  stale feed fails, not on what an install costs.**
+
+  Both branches stop short of the same two things, named rather than defaulted
+  into (§18): **no TSIG** — `MasterSpec::key_name` wants the keyring
+  `--tsig-key` defines and `rdnsr` has none, so a transfer on either branch is
+  unauthenticated — and **no EXPIRE**, which is the question above and not a
+  loop to write.
+
+  **One claim here is not first-party and must not be quoted until it is.** BIND
+  is reported to log `response-policy zone expired; policies unloaded` — to lift,
+  that is — but that comes from operator write-ups; the BIND 9 ARM says a
+  subscriber "must be configured as a secondary server for the zone" and says
+  nothing about expiry, and BIND's source was not read. Unbound transfers an RPZ
+  by AXFR/IXFR and its documentation is silent on the question; Knot Resolver's
+  RPZ is file-only with a watchdog, which is the shape this tree ships. §4 wants
+  the other implementations quoted, and one of the three is a rumour.
 - **57e. And IXFR only if the zone is large enough to care.** A national
   blocklist is thousands of names; the RPZ feeds that are millions are the
   commercial malware ones. `rdns::ixfr` exists either way, so this is a question
@@ -2438,6 +2564,111 @@ this tree's own numbers — at 1M records, parsing text was ~25% of a load and
 building the index ~73%. A format that hands back records still to be indexed
 buys the 25%. The post-#61 breakdown has not been taken, so that share today is
 unknown, and taking it is the thing that would reopen this.
+
+---
+
+### 66. `rdnsc` cannot write what it transfers — **filed 2026-09-15**
+
+Out of #57d, and out of the question that row never asked: *what does an
+operator who only wants a resolver actually run?*
+
+An RPZ feed arrives by zone transfer — `draft-vixie-dns-rpz-04` §2 requires
+RPZs to "be primary or secondary zones at subscriber recursive resolvers", and
+the commercial feeds ship that way — while `rdnsr` reads a file. Something has
+to bridge the two, and the only bridge in this tree is `rdnsd`: an
+authoritative nameserver, run as a download client for a resolver. That is a
+deployment smell and the field does not share it. BIND has the subscriber
+resolver *be* the secondary; Unbound's `rpz:` clause takes a `master:` and
+transfers the zone itself. Only Knot Resolver is file-only with a watchdog,
+which is the shape shipped here.
+
+**`rdnsc` is already most of the way there and nobody noticed.** `read_transfer`
+does AXFR correctly — RFC 5936 §2.2's SOA-to-SOA termination, the framing, the
+id check on messages after the first, a refusal detected before the read
+timeout. What it does with the records is `println!("{rr:?}")`: Rust's `Debug`,
+which no parser reads. Two things are missing, and only one of them is cheap.
+
+- **66a. Record-level presentation is in the wrong crate.** `record_to_string`
+  needs `codecs` and `record_types`, both already in `rdns-core`, plus
+  `denial_wire`'s base32hex and type-bitmap encoders and `format_dnssec_time`.
+  **None of that is crypto** — `denial_wire` holds no hash, `Nsec3Hash` is
+  `dnssec_denial`'s. It sits in `rdns` because it arrived as half of "write a
+  zone file", not because it needs anything there. The *zone* half —
+  `zone_to_string`, `write_zone_file` — needs `Zone` and `persist` and stays.
+
+  **The thing to check before moving anything** (§19): `record_to_string` takes
+  a `ZoneRecord`, and `rdnsc` holds `ResourceRecord` off the wire. So the
+  signature that moves is not the signature that exists, and a move that lands
+  the wrong one is a move done twice. `persist` has no crate-internal
+  dependencies at all and would follow cheaply if the atomic write is wanted
+  there too.
+- **66b. Writing what arrived.** With 66a, `rdnsc --axfr` writing a loadable
+  zone file is a printer and a rename. It does *not* close #57d: no serial
+  check, so every refresh is a full transfer; no IXFR; no NOTIFY, so the
+  operator is on cron's clock and not the publisher's. Say so in the flag's own
+  help, because the gap is invisible from the command line.
+- **66c. TSIG, and it is the expensive one. Decided 2026-09-15: `rdnsc` gets
+  it.** Without it `rdnsc` can only fetch from masters that authenticate by
+  address, which is not how a keyed commercial feed is delivered — so the
+  option exists in form and not in practice.
+
+  **Measured before the decision, not after:** `ring` costs 5 packages
+  (`ring`, `untrusted`, `cc`, `find-msvc-tools`, `shlex`), taking `rdnsc` from
+  **34 to 39**. The count is not the cost. `cc` is: **`rdnsc` builds today with
+  no C toolchain and will not afterwards**, which is a property of the code and
+  true on every machine. It also brings §15's secret-file mode check into a
+  third binary, and that check is the reason a secret in a file beats one in
+  `argv` at all.
+
+---
+
+### 67. The crate split, re-measured now that a small binary takes crypto — **filed 2026-09-15**
+
+#66c is the first time anything but the two daemons links a crypto library, and
+the boundary it crosses was never written down as a rule — only as a
+consequence. So the question is whether the line is still in the right place,
+and the answer is a measurement rather than an argument (§19).
+
+The line as it stands, and it is defensible: `rdns-core` is the wire format —
+codes, names, records, EDNS, the message — with no runtime and three
+dependencies (`thiserror`, `rand`, `base64`). `rdns-transport` exists because a
+TLS stack belongs at the socket layer and because its consumers are binaries
+that may use `anyhow`. `rdns` is everything else.
+
+Today, measured 2026-09-15 with `cargo tree --no-dedupe`, distinct packages:
+
+| | packages |
+|---|---|
+| `rdnsc`, `rdnsctl` | **34** each |
+| `rdnsr`, `rdnsd` | **118** each |
+| `rdns` (library) | 109 |
+
+What #66 does to that is 34 → 39 for `rdnsc` and a C compiler in its build.
+What it does to the *principle* is less clear, and that is this row:
+`rdns-core` has been "what a tool can link without paying for a server", and
+after #66c one tool pays for crypto anyway.
+
+**What to measure, per candidate, before proposing any move:**
+
+- what each binary links and which item made it link that;
+- for each item proposed to move, its transitive dependencies *inside* this
+  workspace — the measurement that refutes a move is finding the item already
+  needs something core does not have (66a passes this; TSIG does not, since
+  `ring::hmac` is the whole point of it);
+- what a move costs the crate it leaves, since `rdns` re-exports and every path
+  that changes is a `use` somewhere.
+
+**Two shapes worth building rather than arguing** (§19, and #63h's precedent —
+the recommended one lost): a third crate between core and `rdns` for wire plus
+presentation plus transaction authentication, against simply widening
+`rdns-core` and letting `ring` into it. Neither is obviously right, and the one
+that sounds tidier is the one that adds a crate.
+
+**The limits this row inherits.** §14: count what a dependency does at run
+time, not how it reads in a manifest. §17: do not restructure on a smell — the
+`rdns` library is large (zone, DNSSEC, resolver, cache, xfr, RPZ, metrics) and
+that is a different complaint from this one, with no measurement behind it yet.
+A split that makes the graph prettier and no binary smaller has bought nothing.
 
 ---
 
