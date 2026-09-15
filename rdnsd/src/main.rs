@@ -608,7 +608,12 @@ struct Cli {
     ///
     /// The config file's `server.dnstap-max-bytes` is the same setting, and
     /// takes its default from the same [`default_dnstap_max_bytes`].
-    #[arg(long, value_name = "OCTETS", default_value_t = default_dnstap_max_bytes())]
+    #[arg(
+        long,
+        value_name = "OCTETS",
+        default_value_t = default_dnstap_max_bytes(),
+        conflicts_with = "config"
+    )]
     dnstap_max_bytes: u64,
     /// Serve Prometheus metrics and a liveness probe on this address.
     ///

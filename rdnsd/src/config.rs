@@ -758,7 +758,7 @@ fn read_secret_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     fn parse(text: &str) -> Result<Config> {
         let config: Config = toml::from_str(text)?;
@@ -865,6 +865,68 @@ anomaly-source-refusals = 0
         assert_eq!(config.server.anomaly_error_percent, 25.5);
         assert_eq!(config.server.anomaly_source_queries, 5000);
         assert_eq!(config.server.anomaly_source_refusals, 0, "off");
+    }
+
+    /// A flag the file can also set has to be refused beside `--config` (§15):
+    /// two sources for one setting is an error, not a precedence rule, and the
+    /// failure is silent because both values are valid.
+    ///
+    /// The mirror of `rdnsr`'s tie test — there, every flag `--config` replaces
+    /// has a key in the file; here, every flag it does *not* replace has none.
+    /// clap owns one half and serde the other, so neither list is maintained by
+    /// hand.
+    #[test]
+    fn a_setting_the_file_can_write_is_refused_beside_config() {
+        let command = Cli::command();
+        let mut both = Vec::new();
+        for arg in command.get_arguments() {
+            let Some(long) = arg.get_long() else { continue };
+            if long == "config" {
+                continue;
+            }
+            if command
+                .get_arg_conflicts_with(arg)
+                .iter()
+                .any(|other| other.get_long() == Some("config"))
+            {
+                continue;
+            }
+            // Not refused beside `--config`, so the file must not have the key.
+            for (table, text) in [
+                (
+                    "server",
+                    format!(
+                        "[server]
+zone-dir = \"z\"
+{long} = 0
+"
+                    ),
+                ),
+                (
+                    "signing",
+                    format!(
+                        "[server]
+zone-dir = \"z\"
+[signing]
+key-dir = \"k\"
+{long} = 0
+"
+                    ),
+                ),
+            ] {
+                let refused = match toml::from_str::<Config>(&text) {
+                    Ok(_) => false,
+                    Err(e) => e.to_string().contains(&format!("unknown field `{long}`")),
+                };
+                if !refused {
+                    both.push(format!("{table}.{long}"));
+                }
+            }
+        }
+        assert!(
+            both.is_empty(),
+            "settable from the file and accepted beside --config: {both:?}",
+        );
     }
 
     /// The most important line in the file. A mistyped key that is silently

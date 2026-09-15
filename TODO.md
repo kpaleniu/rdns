@@ -70,7 +70,11 @@ the two of them named**: the split `[server]` is out — flattening a shared
 struct costs a config error its line number and its expected-key list, for
 `rdnsd`'s existing file as much as for the new one — and what is recommended is
 the macro shape, which declares the 22 keys once and reads exactly as today
-does. Three branches, nothing landed: the shape is the owner's to pick.
+does. Three branches, nothing landed: the shape is the owner's to pick. **63i came
+out of the same counting and closed the same day**: `--dnstap-max-bytes` was
+the one flag of 35 not refused beside `--config`, so the file overwrote it in
+silence, and what replaced the missing conflict is a test that asks clap for
+the set rather than a list somebody keeps.
 **#64 came out of asking 57d's question of `rdnsd`**: if a zone file is both
 the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
@@ -1764,7 +1768,7 @@ next caller is told the cost rather than finding it.
 
 ---
 
-### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a, 63g and 63h answered, 63e-f closed**
+### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a, 63g and 63h answered, 63e-f and 63i closed**
 
 Filed out of 57d, which cannot be decided without it: a transfer spec is per
 zone, and there is nowhere to write one. Filed as its own number rather than
@@ -2054,6 +2058,22 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   precisely that contract and is allowed with the reason beside it. If that
   reads as too clever for what it buys, A is the fallback and loses only the
   single declaration — nothing an operator can see.
+
+- **63i. One `[server]` key's flag was not refused beside `--config` — filed
+  and closed 2026-09-15**, found while counting what a config file for `rdnsr`
+  has to do. §15's "two sources for one setting is an error, not a precedence
+  rule": `rdnsd --config x.toml --dnstap-max-bytes 5` was accepted, the file's
+  value won, and both numbers are valid so nothing could look wrong. 34 of the
+  35 `[server]` and `[signing]` keys had the conflict; `dnstap-max-bytes` did
+  not, under a doc comment saying the file "is the same setting" — §4's claim
+  to verify, beside the pair 63e had already corrected for the *default*.
+
+  **1 of 35, counted before fixing** (§18) and counted mechanically, because a
+  list somebody maintains is how this one was missed: clap knows which flags
+  `--config` does not replace, and the file must then have no key for them.
+  `a_setting_the_file_can_write_is_refused_beside_config` walks that set and
+  parses a config naming each; watched failing, it names
+  `server.dnstap-max-bytes` and nothing else.
 
 **The dependency objection is already answered, measured rather than argued**
 (§15's "pay for a parser; do not pay for a stub"). `toml` + `serde` is **nine
