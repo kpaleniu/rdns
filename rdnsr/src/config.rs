@@ -326,7 +326,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     fn parse(text: &str) -> Result<Config> {
         let config: Config = toml::from_str(text)?;
@@ -375,6 +375,72 @@ mod tests {
             serve_stale => "resolver.serve-stale",
             rpz_policy => "rpz.policy",
         }
+    }
+
+    /// Every flag `--config` conflicts with has a key in this file, and the two
+    /// spellings match.
+    ///
+    /// This is what ties the two declarations together, and what #46c is the
+    /// precedent for: `[zones."x"].also-notify` was parsed into a field nothing
+    /// read, because a key and a flag that mean one setting were written in two
+    /// places with nothing comparing them. clap knows which flags conflict with
+    /// `--config` — that set *is* "what the file must be able to say" — so the
+    /// check is mechanical rather than a list somebody maintains.
+    ///
+    /// A type error counts as found: what is being asserted is that the key
+    /// exists under one of the three tables, not that this value fits it.
+    #[test]
+    fn every_flag_the_file_replaces_has_a_key_in_it() {
+        let command = Cli::command();
+        // Asked of each flag, not of `--config`: the conflict is declared on
+        // the flags, and `get_arg_conflicts_with` reports what the argument
+        // handed to it declares, so asking `--config` returns nothing at all.
+        let replaced: Vec<_> = command
+            .get_arguments()
+            .filter(|arg| {
+                command
+                    .get_arg_conflicts_with(arg)
+                    .iter()
+                    .any(|other| other.get_long() == Some("config"))
+            })
+            .collect();
+        assert!(
+            replaced.len() > 30,
+            "the file replaces {} flags, which is too few to be the whole set",
+            replaced.len(),
+        );
+        // The three flags the file spells differently, because the table name
+        // carries half of it. Written down rather than inferred: a rename is a
+        // decision, and one that is not declared here is a typo.
+        let renamed = |long: &str| match long {
+            "rpz" => Some("files"),
+            "rpz-policy" => Some("policy"),
+            "rpz-notify-from" => Some("notify-from"),
+            _ => None,
+        };
+        let mut missing = Vec::new();
+        for arg in replaced {
+            let Some(long) = arg.get_long() else { continue };
+            let key = renamed(long).unwrap_or(long);
+            let found = ["server", "resolver", "rpz"].iter().any(|table| {
+                let text = format!(
+                    "[{table}]
+{key} = 0
+"
+                );
+                match toml::from_str::<Config>(&text) {
+                    Ok(_) => true,
+                    Err(e) => !e.to_string().contains("unknown field"),
+                }
+            });
+            if !found {
+                missing.push(long.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "flags --config replaces with no key in the file: {missing:?}",
+        );
     }
 
     /// The most important line in the file: a mistyped key is refused, and the
