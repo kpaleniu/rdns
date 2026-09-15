@@ -8,14 +8,17 @@ Configuration, limits, observability, lifecycle, and the two client binaries.
 
 ### Flags or a file, never both
 
-`--config` conflicts with every flag it could set: `--config` with `--port` is an
-error, not a precedence rule.
+Both daemons take `--config`, and in both it conflicts with every flag it could
+set: `--config` with `--port` is an error, not a precedence rule.
 
 Flags that are not mutually exclusive with `--config`, because the file has no
 place for them: `--check-config`, `--log-level`, `--quiet`, `--generate-keys`,
-`--key-algorithm`.
+`--key-algorithm`. The set is checked rather than listed —
+`a_setting_the_file_can_write_is_refused_beside_config` asks clap for the flags
+`--config` does not replace and refuses the file a key for any of them, and
+`rdnsr` has the same check from the other end.
 
-### The file
+### `rdnsd`'s file
 
 TOML, `deny_unknown_fields` throughout — a mistyped key fails at startup with a
 line number.
@@ -114,6 +117,45 @@ Rules the schema encodes:
 - `server.transfer-tls-cert` and `server.transfer-tls-key` are both or neither,
   and need `transfer-tls-ca`: they are the identity presented when this server
   *fetches* a zone, so without anchors nothing would ever present them.
+
+### `rdnsr`'s file
+
+The same rules, three tables, and no zones: `[server]` is the listeners and the
+limits, `[resolver]` is where answers come from and what is kept, `[rpz]` is the
+policy feeds.
+
+```toml
+[server]
+host = "127.0.0.1"          # a resolver's default, not 0.0.0.0
+port = 53
+query-rate = 200            # 200 and not rdnsd's 1000: one resolver behind one
+query-burst = 100           # address asks far more than one person does
+max-inflight-udp = 1024     # concurrent recursions; a resolver's udp-workers
+metrics-listen = "127.0.0.1:9153"
+
+[resolver]
+upstream = ["8.8.8.8:53"]   # naming any switches recursion to forwarding
+cache-size = 10000
+dnssec-validate = true
+auto-trust-anchor = "/var/lib/rdns/anchors.xml"   # RFC 5011
+serve-stale = 0             # RFC 8767 window in seconds; 0 is off
+dns64 = true                # or a prefix; true is the Well-Known Prefix
+
+[rpz]
+files = ["malware.rpz", "court-order.rpz"]   # consulted in this order
+policy = "given"            # PolicyOverride::from_str, the flag's own parser
+notify-from = ["192.0.2.1"]
+```
+
+The 22 `[server]` keys both daemons have are declared once, by
+`rdns::server_table!`, and expanded into each daemon's own struct. A macro
+rather than a shared struct because a `#[serde(flatten)]`ed struct makes serde
+buffer the table: a typo would then be reported at the table's line with no
+expected-key list, for `rdnsd`'s file as much as for this one (`TODO.md` #63h).
+The macro takes each field's default from the calling crate's root, which is why
+`host`, `query-rate` and `query-burst` can differ between the two daemons.
+
+`log-level` and `quiet` are not settable from either file.
 
 ### Secret files
 

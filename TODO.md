@@ -49,7 +49,7 @@ one before each and 12.0 ms now — and it found a second cost nobody had filed:
 `reindex` rebuilt the denial chains under a comment claiming they move with the
 apex, which they do not.
 **#63 was filed out of 57d** and is the prerequisite 57d had been naming in
-prose: `rdnsr` has no config file, so there is nowhere to write a per-zone
+prose: `rdnsr` had no config file, so there was nowhere to write a per-zone
 anything. It does not wait on 57d — `--rpz-policy` has wanted the same file
 since before 57 existed. **63a is answered**: the split is about **18** items
 and not the 84 the row counted, measured by sealing the file and letting the
@@ -68,13 +68,14 @@ so the open decision is a second parser against a split `[server]`, and the
 only code genuinely shared is `read_secret_file`. **63h built both, and a third
 the two of them named**: the split `[server]` is out — flattening a shared
 struct costs a config error its line number and its expected-key list, for
-`rdnsd`'s existing file as much as for the new one — and what is recommended is
-the macro shape, which declares the 22 keys once and reads exactly as today
-does. Three branches, nothing landed: the shape is the owner's to pick. **63i came
-out of the same counting and closed the same day**: `--dnstap-max-bytes` was
-the one flag of 35 not refused beside `--config`, so the file overwrote it in
-silence, and what replaced the missing conflict is a test that asks clap for
-the set rather than a list somebody keeps.
+`rdnsd`'s existing file as much as for the new one — and what landed is the
+macro shape: c8ac8eb, b7c62a3 and 1e511d0, with A and B kept as branches for
+the measurements behind the choice. What is left of #63 is **63j**, the
+per-feed policy the file was wanted for. **63i came out of the same counting
+and closed the same day**: `--dnstap-max-bytes` was the one flag of 35 not
+refused beside `--config`, so the file overwrote it in silence, and what
+replaced the missing conflict is a test that asks clap for the set rather than
+a list somebody keeps.
 **#64 came out of asking 57d's question of `rdnsd`**: if a zone file is both
 the interchange format and the store, what does mutating it cost? One UPDATE was
 five O(zone) passes and 1.8 s on a million-record zone, under a process-wide
@@ -1768,7 +1769,7 @@ next caller is told the cost rather than finding it.
 
 ---
 
-### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, 63a, 63g and 63h answered, 63e-f and 63i closed**
+### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, the file landed 2026-09-15 by 63h's shape C; 63j open**
 
 Filed out of 57d, which cannot be decided without it: a transfer spec is per
 zone, and there is nowhere to write one. Filed as its own number rather than
@@ -2046,7 +2047,7 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   is not a point for A over B or C — but it means A's duplication is checked
   rather than trusted.
 
-  **Recommendation: C, and B is out.** B's one advantage — the 22 keys declared
+  **C landed, and B is out.** B's one advantage — the 22 keys declared
   once — is C's too, and C also shares the `Default` the other two spell twice,
   while B pays for it with the error message operators read at 3am, three
   packages into a library that reads no files, and 24 public items for one
@@ -2055,9 +2056,12 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   lands in `rdns/src/config.rs` rather than the daemon's own file, and the
   contract "the calling crate's root defines these `default_*` functions" is
   prose enforced by a compile error. `clippy::crate_in_macro_def` fires on
-  precisely that contract and is allowed with the reason beside it. If that
-  reads as too clever for what it buys, A is the fallback and loses only the
-  single declaration — nothing an operator can see.
+  precisely that contract and is allowed with the reason beside it. A was the fallback and
+  loses only the single declaration — nothing an operator can see.
+
+  **What landed**: c8ac8eb (the file), b7c62a3 (the flag-to-key tie) and
+  1e511d0 (`rdns::server_table!`), against 1181 tests on Windows. What is left
+  of #63 is 63j.
 
 - **63i. One `[server]` key's flag was not refused beside `--config` — filed
   and closed 2026-09-15**, found while counting what a config file for `rdnsr`
@@ -2074,6 +2078,21 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   `a_setting_the_file_can_write_is_refused_beside_config` walks that set and
   parses a config naming each; watched failing, it names
   `server.dnstap-max-bytes` and nothing else.
+
+- **63j. Per-feed RPZ policy, which is what #63 was for — open.** The file
+  exists now and `[rpz]` holds `files`, `policy` and `notify-from`, all three
+  still global. The shape is a `[[rpz]]` array of tables — an array, because the
+  order of the feeds is the order they are consulted and a map would reorder
+  them — each with `file` and an optional `policy` inheriting the global one
+  (§15's `Option` per field). It needs `PolicyStore::load` to take a policy per
+  feed rather than one for the set; `rdns::rpz` is where that lives and the
+  measurement to take first is what the per-feed override costs the match path,
+  which is per query.
+
+  Also open and smaller: `rdnsr` has no `--check-config`. `rdnsd`'s runs
+  everything that does not bind a socket, and the resolver's equivalent is the
+  feeds parsing and the anchors loading — the two things whose failure at
+  startup is a resolver that answers nothing or blocks nothing.
 
 **The dependency objection is already answered, measured rather than argued**
 (§15's "pay for a parser; do not pay for a stub"). `toml` + `serde` is **nine
