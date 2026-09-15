@@ -315,9 +315,15 @@ RPZ wildcard rule is RFC 1034 §4.3.3's.
   a walk starts at the deepest zone already known and a policy asked only at
   referrals would hold for one client and not the next. `rpz-passthru` at a
   delegation does not stop the walk. The startup banner counts all five kinds.
-- Zones are consulted in the order `--rpz` names them; the first with a rule
-  decides. `--rpz-policy` overrides every action in every zone
-  (`given`/`disabled`/`passthru`/`drop`/`nxdomain`/`nodata`/`tcp-only`).
+- Zones are consulted in the order they are named; the first with a rule
+  decides. A policy
+  (`given`/`disabled`/`passthru`/`drop`/`nxdomain`/`nodata`/`tcp-only`)
+  overrides every action in the zone it applies to. `--rpz-policy` says it of
+  every `--rpz` at once, which is all a command line can express; the config
+  file's `[[rpz.feeds]]` says it per feed, inheriting `[rpz].policy` where a
+  feed does not — a new feed is introduced by measuring it in `passthru` while
+  the others stay enforced (`TODO.md` #63j). The policy is `rpz::Feed`'s, held
+  by the `PolicyZone` it loaded, so it costs the match path nothing.
 - A policy zone without an apex SOA is refused at load, since a negative rewrite
   owes one (RFC 2308 §5). An address trigger that is not an address is refused
   too. Loading is all-or-nothing.

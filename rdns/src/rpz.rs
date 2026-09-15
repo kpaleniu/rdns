@@ -180,6 +180,32 @@ impl PolicyOverride {
     }
 }
 
+/// One feed: the file it is read from, and what its rules mean.
+///
+/// A policy per feed and not one for the set, because that is how a feed is
+/// introduced: the new one runs in `passthru` while the others stay enforced
+/// (`TODO.md` #63j). The command line cannot say it — `--rpz-policy` is one
+/// setting for every `--rpz` — so [`Feed::each`] is the flags' shape of it.
+#[derive(Debug, Clone)]
+pub struct Feed {
+    pub path: PathBuf,
+    pub policy: PolicyOverride,
+}
+
+impl Feed {
+    pub fn new(path: impl Into<PathBuf>, policy: PolicyOverride) -> Feed {
+        Feed {
+            path: path.into(),
+            policy,
+        }
+    }
+
+    /// Every path at one policy, in order — what a command line can express.
+    pub fn each(paths: &[PathBuf], policy: PolicyOverride) -> Vec<Feed> {
+        paths.iter().map(|p| Feed::new(p.clone(), policy)).collect()
+    }
+}
+
 /// The label that ends the owner name of every trigger type that is not a
 /// QNAME.
 ///
@@ -730,14 +756,14 @@ pub struct PolicyZones {
 }
 
 impl PolicyZones {
-    /// Load each file, in the order they will be consulted.
+    /// Load each feed, in the order they will be consulted.
     ///
     /// All-or-nothing: a feed that does not parse must not leave the resolver
     /// enforcing a policy shorter than the one configured (`CLAUDE.md` §4).
-    pub fn load(paths: &[PathBuf], policy: PolicyOverride) -> ConfigResult<PolicyZones> {
-        let mut zones = Vec::with_capacity(paths.len());
-        for path in paths {
-            zones.push(PolicyZone::load(path, policy)?);
+    pub fn load(feeds: &[Feed]) -> ConfigResult<PolicyZones> {
+        let mut zones = Vec::with_capacity(feeds.len());
+        for feed in feeds {
+            zones.push(PolicyZone::load(&feed.path, feed.policy)?);
         }
         Ok(PolicyZones { zones })
     }
@@ -888,18 +914,16 @@ impl PolicyZones {
 /// lock may be held over it (`CLAUDE.md` §9).
 #[derive(Debug)]
 pub struct PolicyStore {
-    paths: Vec<PathBuf>,
-    policy: PolicyOverride,
+    feeds: Vec<Feed>,
     current: RwLock<Arc<PolicyZones>>,
 }
 
 impl PolicyStore {
-    /// Read every file, or fail without installing any of them.
-    pub fn load(paths: &[PathBuf], policy: PolicyOverride) -> ConfigResult<Arc<PolicyStore>> {
-        let zones = PolicyZones::load(paths, policy)?;
+    /// Read every feed, or fail without installing any of them.
+    pub fn load(feeds: &[Feed]) -> ConfigResult<Arc<PolicyStore>> {
+        let zones = PolicyZones::load(feeds)?;
         Ok(Arc::new(PolicyStore {
-            paths: paths.to_vec(),
-            policy,
+            feeds: feeds.to_vec(),
             current: RwLock::new(Arc::new(zones)),
         }))
     }
@@ -908,15 +932,14 @@ impl PolicyStore {
     /// caller that has already built them. Reloading one re-reads nothing.
     pub fn in_memory(zones: PolicyZones) -> Arc<PolicyStore> {
         Arc::new(PolicyStore {
-            paths: Vec::new(),
-            policy: PolicyOverride::Given,
+            feeds: Vec::new(),
             current: RwLock::new(Arc::new(zones)),
         })
     }
 
-    /// Whether any file was named, and so whether a reload has anything to do.
+    /// Whether any feed was named, and so whether a reload has anything to do.
     pub fn is_configured(&self) -> bool {
-        !self.paths.is_empty()
+        !self.feeds.is_empty()
     }
 
     /// The set to decide one query by.
@@ -938,7 +961,7 @@ impl PolicyStore {
     /// the resolver enforcing a policy shorter than the one configured, so the
     /// previous set stays in force and the caller is told which file was wrong.
     pub fn reload(&self) -> ConfigResult<Reloaded> {
-        let zones = Arc::new(PolicyZones::load(&self.paths, self.policy)?);
+        let zones = Arc::new(PolicyZones::load(&self.feeds)?);
         let mut guard = match self.current.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -1740,8 +1763,8 @@ evil.example.com IN CNAME .
     fn a_reload_reads_the_file_again() {
         let dir = ScratchDir::new("rpz-reload");
         let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
-        let store = PolicyStore::load(std::slice::from_ref(&path), PolicyOverride::Given)
-            .expect("it loads");
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("it loads");
         assert_eq!(
             action_for(&store.in_force(), "second.example.com.", Qtype::of(rt::A)),
             None
@@ -1764,6 +1787,50 @@ evil.example.com IN CNAME .
         );
     }
 
+    /// A policy per feed, which is what a set of them is for: the new feed is
+    /// measured in `passthru` while the enforced one stays enforced
+    /// (`TODO.md` #63j).
+    ///
+    /// Fails against the shape this replaced, where `load` took one policy for
+    /// the set and both rules would read as `Passthru`. The match path is
+    /// unchanged — `PolicyZone` has held its own policy since it was written,
+    /// and `action_at` has always applied that one.
+    #[test]
+    fn each_feed_keeps_the_policy_it_was_loaded_with() {
+        let dir = ScratchDir::new("rpz-per-feed");
+        let enforced = dir.write("enforced.zone", &feed(1, "blocked.example.com", None));
+        let measured = dir.write("measured.zone", &feed(1, "candidate.example.com", None));
+        let store = PolicyStore::load(&[
+            Feed::new(enforced, PolicyOverride::Given),
+            Feed::new(measured, PolicyOverride::Passthru),
+        ])
+        .expect("both load");
+
+        let in_force = store.in_force();
+        assert_eq!(
+            action_for(&in_force, "blocked.example.com.", Qtype::of(rt::A)),
+            Some(Action::Nxdomain)
+        );
+        assert_eq!(
+            action_for(&in_force, "candidate.example.com.", Qtype::of(rt::A)),
+            Some(Action::Passthru),
+            "the feed being measured must not block while the other one does"
+        );
+
+        // And a reload keeps them apart, which is the half that would drift:
+        // the store carries the feeds rather than one policy for the set.
+        std::fs::write(
+            dir.path().join("measured.zone"),
+            feed(2, "another.example.com", None),
+        )
+        .expect("rewrite");
+        let reloaded = store.reload().expect("it re-reads");
+        assert_eq!(
+            action_for(&reloaded.zones, "another.example.com.", Qtype::of(rt::A)),
+            Some(Action::Passthru)
+        );
+    }
+
     /// All-or-nothing, as at startup: one unparseable file out of two must not
     /// leave the resolver enforcing half the policy (`CLAUDE.md` §4).
     #[test]
@@ -1771,8 +1838,11 @@ evil.example.com IN CNAME .
         let dir = ScratchDir::new("rpz-reload-broken");
         let first = dir.write("first.zone", &feed(1, "first.example.com", None));
         let second = dir.write("second.zone", &feed(1, "second.example.com", None));
-        let store = PolicyStore::load(&[first.clone(), second.clone()], PolicyOverride::Given)
-            .expect("both load");
+        let store = PolicyStore::load(&[
+            Feed::new(first.clone(), PolicyOverride::Given),
+            Feed::new(second.clone(), PolicyOverride::Given),
+        ])
+        .expect("both load");
 
         // The first file is good and the second is not, so a loader that
         // installed as it went would leave the new first rule in force.
@@ -1803,8 +1873,8 @@ evil.example.com IN CNAME .
     fn only_a_moved_nameserver_rule_reports_a_change() {
         let dir = ScratchDir::new("rpz-reload-versions");
         let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
-        let store = PolicyStore::load(std::slice::from_ref(&path), PolicyOverride::Given)
-            .expect("it loads");
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("it loads");
 
         std::fs::write(&path, feed(2, "second.example.com", None)).expect("rewrite");
         assert!(

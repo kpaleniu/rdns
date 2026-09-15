@@ -12,7 +12,8 @@
 //!
 //! Three tables and not one: `[server]` is the listeners and the limits,
 //! `[resolver]` is what makes this a resolver rather than a server, and `[rpz]`
-//! is the policy feeds. Every key here is a flag `rdnsr` already has.
+//! is the policy feeds. Every key here is a flag `rdnsr` already has, except
+//! the one the file exists for: `[[rpz.feeds]].policy`, which is per feed.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -119,17 +120,36 @@ enum Dns64 {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct Rpz {
-    /// The zone files, in the order they are consulted: the first zone with a
-    /// rule for a query decides it.
+    /// The feeds, in the order they are consulted: the first zone with a rule
+    /// for a query decides it.
+    ///
+    /// An array of tables and not a map of them, because that order is the
+    /// policy and a map would reorder it.
     #[serde(default)]
-    files: Vec<PathBuf>,
-    /// What every feed's rules mean, in `--rpz-policy`'s spelling. Parsed by
-    /// `PolicyOverride::from_str`, the flag's own parser, so the two cannot
-    /// disagree about what `passthru` is (`CLAUDE.md` §15).
+    feeds: Vec<FeedEntry>,
+    /// What a feed's rules mean when it does not say for itself, in
+    /// `--rpz-policy`'s spelling. Parsed by `PolicyOverride::from_str`, the
+    /// flag's own parser, so the two cannot disagree about what `passthru` is
+    /// (`CLAUDE.md` §15).
     policy: Option<String>,
     /// Who may send a NOTIFY asking for the feeds to be re-read.
     #[serde(default)]
     notify_from: Vec<String>,
+}
+
+/// One feed: `[[rpz.feeds]]`.
+///
+/// This is what #63 was filed for. A new feed is introduced by measuring it in
+/// `passthru` while the others stay enforced, and `--rpz-policy` can only say
+/// it of every feed at once.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct FeedEntry {
+    file: PathBuf,
+    /// Absent inherits `[rpz].policy`, which is §15's `Option` per field for an
+    /// override: a feed that says nothing must not be reset to the default
+    /// because another one did.
+    policy: Option<String>,
 }
 
 impl Config {
@@ -188,6 +208,15 @@ impl Config {
                 .parse::<rdns::rpz::PolicyOverride>()
                 .map_err(|e| anyhow::anyhow!("rpz.policy: {e}"))?;
         }
+        // Named by its file rather than by its index: an operator reading this
+        // has the file open at the feed, not at the third table.
+        for feed in &self.rpz.feeds {
+            if let Some(policy) = &feed.policy {
+                policy
+                    .parse::<rdns::rpz::PolicyOverride>()
+                    .map_err(|e| anyhow::anyhow!("rpz.feeds {}: {e}", feed.file.display()))?;
+            }
+        }
         Ok(())
     }
 
@@ -243,11 +272,25 @@ impl Config {
         };
         cli.dns64_exclude = self.resolver.dns64_exclude.clone();
 
-        cli.rpz = self.rpz.files.clone();
         if let Some(policy) = &self.rpz.policy {
             // `check` has already parsed it.
             cli.rpz_policy = policy.parse().expect("checked in Config::check");
         }
+        // The global is the default for a feed that does not say, so it is read
+        // after being overwritten above and not from the file again.
+        let global = cli.rpz_policy;
+        cli.rpz_feeds = self
+            .rpz
+            .feeds
+            .iter()
+            .map(|feed| {
+                let policy = match &feed.policy {
+                    Some(policy) => policy.parse().expect("checked in Config::check"),
+                    None => global,
+                };
+                rdns::rpz::Feed::new(feed.file.clone(), policy)
+            })
+            .collect();
         cli.rpz_notify_from = self.rpz.notify_from.clone();
     }
 }
@@ -256,6 +299,7 @@ impl Config {
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
+    use rdns::rpz::PolicyOverride;
 
     fn parse(text: &str) -> Result<Config> {
         let config: Config = toml::from_str(text)?;
@@ -342,7 +386,7 @@ mod tests {
         // carries half of it. Written down rather than inferred: a rename is a
         // decision, and one that is not declared here is a typo.
         let renamed = |long: &str| match long {
-            "rpz" => Some("files"),
+            "rpz" => Some("feeds"),
             "rpz-policy" => Some("policy"),
             "rpz-notify-from" => Some("notify-from"),
             _ => None,
@@ -427,11 +471,111 @@ hsot = \"127.0.0.1\"
         assert!(err.to_string().contains("unknown RPZ policy"), "got: {err}");
 
         let mut cli = Cli::parse_from(["rdnsr"]);
-        parse("[rpz]\npolicy = \"passthru\"\nfiles = [\"a.rpz\"]\n")
+        parse("[rpz]\npolicy = \"passthru\"\n[[rpz.feeds]]\nfile = \"a.rpz\"\n")
             .expect("parses")
             .apply(&mut cli);
         assert_eq!(cli.rpz_policy, rdns::rpz::PolicyOverride::Passthru);
-        assert_eq!(cli.rpz, vec![PathBuf::from("a.rpz")]);
+        assert_eq!(feed_paths(&cli), [PathBuf::from("a.rpz")]);
+    }
+
+    fn feed_paths(cli: &Cli) -> Vec<PathBuf> {
+        cli.feeds().into_iter().map(|f| f.path).collect()
+    }
+
+    fn feed_policies(cli: &Cli) -> Vec<PolicyOverride> {
+        cli.feeds().into_iter().map(|f| f.policy).collect()
+    }
+
+    /// What #63 exists for: one feed is measured in `passthru` while the others
+    /// stay enforced.
+    ///
+    /// Fails against the shape this replaced, where `[rpz].policy` was the only
+    /// place a policy could be written and applied to every feed at once.
+    #[test]
+    fn a_feed_carries_its_own_policy_and_the_others_keep_theirs() {
+        let mut cli = Cli::parse_from(["rdnsr"]);
+        parse(
+            "[[rpz.feeds]]
+file = \"court-order.rpz\"
+
+[[rpz.feeds]]
+file = \"new-feed.rpz\"
+policy = \"passthru\"
+",
+        )
+        .expect("parses")
+        .apply(&mut cli);
+        assert_eq!(
+            feed_paths(&cli),
+            [
+                PathBuf::from("court-order.rpz"),
+                PathBuf::from("new-feed.rpz")
+            ],
+            "the order of the feeds is the order they are consulted",
+        );
+        assert_eq!(
+            feed_policies(&cli),
+            [PolicyOverride::Given, PolicyOverride::Passthru],
+        );
+    }
+
+    /// Absent means inherit, and what it inherits is the global (§15's `Option`
+    /// per field, not a whole struct).
+    #[test]
+    fn a_feed_that_says_nothing_inherits_the_global_policy() {
+        let mut cli = Cli::parse_from(["rdnsr"]);
+        parse(
+            "[rpz]
+policy = \"disabled\"
+
+[[rpz.feeds]]
+file = \"a.rpz\"
+
+[[rpz.feeds]]
+file = \"b.rpz\"
+policy = \"given\"
+",
+        )
+        .expect("parses")
+        .apply(&mut cli);
+        assert_eq!(
+            feed_policies(&cli),
+            [PolicyOverride::Disabled, PolicyOverride::Given],
+        );
+    }
+
+    /// A feed's own policy goes through the flag's parser too, and the error
+    /// names the feed rather than its index.
+    #[test]
+    fn a_misspelled_per_feed_policy_names_the_file() {
+        let err = parse("[[rpz.feeds]]\nfile = \"a.rpz\"\npolicy = \"passthur\"\n")
+            .expect_err("a misspelled policy");
+        let text = err.to_string();
+        assert!(text.contains("unknown RPZ policy"), "got: {text}");
+        assert!(text.contains("a.rpz"), "which feed: {text}");
+    }
+
+    /// The flags fan one policy out over every `--rpz`, which is all a command
+    /// line can say.
+    #[test]
+    fn the_flags_give_every_feed_the_same_policy() {
+        let cli = Cli::parse_from([
+            "rdnsr",
+            "--rpz",
+            "a.rpz",
+            "--rpz",
+            "b.rpz",
+            "--rpz-policy",
+            "passthru",
+        ]);
+        assert_eq!(
+            feed_paths(&cli),
+            [PathBuf::from("a.rpz"), PathBuf::from("b.rpz")]
+        );
+        assert_eq!(
+            feed_policies(&cli),
+            [PolicyOverride::Passthru, PolicyOverride::Passthru],
+        );
     }
 
     /// `--dns64` given without a value is the well-known prefix, and the file

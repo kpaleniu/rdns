@@ -33,7 +33,7 @@ use rdns::metrics::DnsMetrics;
 use rdns::readiness::Readiness;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
 use rdns::rfc5011::ManagedAnchors;
-use rdns::rpz::PolicyStore;
+use rdns::rpz::{Feed, PolicyStore};
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
 use rdns::shutdown::Shutdown;
 use rdns::validation::{AdmissionCheck, AdmissionLimits};
@@ -409,10 +409,11 @@ struct Cli {
     /// `given` — the default — does what each rule says. `passthru` matches and
     /// changes nothing, which is how a new feed is measured before it is
     /// enforced; `disabled` keeps the configuration and matches nothing.
-    /// Applies to every `--rpz` zone: a per-zone policy wants a config file,
-    /// and this daemon has flags (`TODO.md` #63). That is the wrong shape for
-    /// the one use `passthru` has — a new feed is measured before it is
-    /// enforced, and here that means measuring every feed at once.
+    ///
+    /// Applies to every `--rpz` zone, which is the wrong shape for the one use
+    /// `passthru` has: measuring a new feed here means measuring every feed at
+    /// once. `--config`'s `[[rpz.feeds]]` is where a policy per feed is
+    /// written, and this is its default there.
     #[arg(long, value_name = "POLICY", default_value_t = default_rpz_policy(), conflicts_with = "config")]
     rpz_policy: rdns::rpz::PolicyOverride,
     /// Addresses that may send a NOTIFY asking for the `--rpz` files to be
@@ -436,6 +437,36 @@ struct Cli {
     /// wrong one would be picked silently (`CLAUDE.md` §15).
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+    /// Validate the configuration and exit without binding a socket.
+    ///
+    /// Reads and indexes every policy feed, loads the trust anchors, parses
+    /// every ACL and the NAT64 prefix, and reads the certificate. Exit 0 means
+    /// it would start.
+    ///
+    /// Not `requires = "config"`, which is where this differs from `rdnsd`'s:
+    /// everything it checks here is flag-settable too, and a dry run that
+    /// refuses the flag form checks the deployments that need it least.
+    #[arg(long)]
+    check_config: bool,
+    /// The feeds with a policy each, which only a config file can express.
+    ///
+    /// Not a flag: `--rpz-policy` is one setting for every `--rpz`, so the
+    /// command line's shape is [`Feed::each`] and the file's is this. They
+    /// cannot both be set — every `--rpz*` flag conflicts with `--config` — so
+    /// `feeds` picking between them is not a precedence rule (`CLAUDE.md` §15).
+    #[arg(skip)]
+    rpz_feeds: Vec<Feed>,
+}
+
+impl Cli {
+    /// The policy feeds, in the order they are consulted.
+    fn feeds(&self) -> Vec<Feed> {
+        if self.rpz_feeds.is_empty() {
+            Feed::each(&self.rpz, self.rpz_policy)
+        } else {
+            self.rpz_feeds.clone()
+        }
+    }
 }
 
 #[tokio::main]
@@ -523,8 +554,11 @@ async fn main() -> anyhow::Result<()> {
                     ManagedAnchors::load_or_seed(path, &anchors, current_unix_timestamp())?;
                 // Now rather than at the first change, so an operator who
                 // points at a new path can see what is trusted without waiting
-                // a month for something to happen.
-                if !path.exists() {
+                // a month for something to happen. Not under `--check-config`:
+                // a dry run that creates the file leaves it owned by whoever
+                // ran the check, which the daemon may then not be able to
+                // write.
+                if !path.exists() && !cli.check_config {
                     anchors.save(path)?;
                     tracing::info!(
                         file = %path.display(),
@@ -594,7 +628,8 @@ async fn main() -> anyhow::Result<()> {
     // Before anything binds, like the certificate and the metrics listener: a
     // policy file that will not parse is a block that is not in force, and
     // starting without it is the failure worth avoiding most here.
-    let policy = PolicyStore::load(&cli.rpz, cli.rpz_policy)?;
+    let feeds = cli.feeds();
+    let policy = PolicyStore::load(&feeds)?;
 
     // With the policy, and before anything binds, for the same reason: a typo
     // in the list is an announcement that will be refused, and an operator
@@ -603,7 +638,7 @@ async fn main() -> anyhow::Result<()> {
     let rpz_notify = if cli.rpz_notify_from.is_empty() {
         None
     } else {
-        if cli.rpz.is_empty() {
+        if feeds.is_empty() {
             // Not a warning. There is nothing for a NOTIFY to re-read, so the
             // list is a policy the operator believes is in force and is not
             // (`CLAUDE.md` §15).
@@ -630,6 +665,68 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Read before anything binds, which is what this comment claimed while
+    // sitting below three of them: a certificate that will not load is a DoT
+    // listener that answers nothing, and `--check-config` has to reach it.
+    // Either encrypted listener needs the pair, which clap's `requires` cannot
+    // express as an "or", so the check is here.
+    let encrypted =
+        cli.tls_listen.is_some() || cli.quic_listen.is_some() || cli.https_listen.is_some();
+    let tls_store = match (encrypted, &cli.tls_cert, &cli.tls_key) {
+        (true, Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
+        (true, _, _) => {
+            return Err(anyhow!(
+                "--tls-listen, --quic-listen and --https-listen need both --tls-cert \
+                 and --tls-key"
+            ))
+        }
+        _ => None,
+    };
+
+    // Here for the same reason, and it was below the binds too: a typo in the
+    // list is a client paying the rate limit its operator exempted it from.
+    let query_rate_exempt =
+        TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?;
+
+    // The dry run exits here, and *here* specifically: everything above is
+    // everything knowable without binding a socket. The config parsed, every
+    // feed was read and indexed, the trust anchors loaded, every ACL and the
+    // NAT64 prefix parsed, and the certificate read against its key. What is
+    // left is binding sockets and starting timers.
+    if cli.check_config {
+        // `println!`, not `tracing`: this is the answer on stdout, and
+        // `--quiet` must not take away the output of a command whose whole job
+        // is to produce it. `rdnsd --check-config` says it the same way.
+        let in_force = policy.in_force();
+        let overridden = in_force
+            .zones()
+            .iter()
+            .filter(|z| z.policy() != rdns::rpz::PolicyOverride::Given)
+            .count();
+        println!(
+            "configuration is valid: {}, {} policy feed(s){}, cache {}, encrypted transports {}",
+            source,
+            in_force.zones().len(),
+            // Said out loud because a feed at `passthru` or `disabled` blocks
+            // nothing, and that is the policy mistake that looks exactly like a
+            // working server.
+            match overridden {
+                0 => String::new(),
+                n => format!(" ({n} not taken at their word)"),
+            },
+            if capacity == 0 {
+                "disabled".to_string()
+            } else {
+                format!("{capacity} entries")
+            },
+            match (encrypted, &tls_store) {
+                (false, _) | (_, None) => "disabled".to_string(),
+                (true, Some(_)) => "certificate loads".to_string(),
+            },
+        );
+        return Ok(());
+    }
+
     let addr = format!("{}:{}", cli.host, cli.port);
     // Both transports are mandatory: an answer over the client's UDP payload
     // size gets TC=1, and RFC 1035 §4.2.1 has the client retry over TCP.
@@ -646,22 +743,6 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    // Read before anything binds, like the metrics listener above: a
-    // certificate that will not load is a DoT listener that answers nothing.
-    // Either encrypted listener needs the pair, which clap's `requires` cannot
-    // express as an "or", so the check is here.
-    let encrypted =
-        cli.tls_listen.is_some() || cli.quic_listen.is_some() || cli.https_listen.is_some();
-    let tls_store = match (encrypted, &cli.tls_cert, &cli.tls_key) {
-        (true, Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
-        (true, _, _) => {
-            return Err(anyhow!(
-                "--tls-listen, --quic-listen and --https-listen need both --tls-cert \
-                 and --tls-key"
-            ))
-        }
-        _ => None,
-    };
     let tls_listener = match (&cli.tls_listen, &tls_store) {
         (Some(spec), Some(store)) => Some((
             TcpListener::bind(spec)
@@ -692,9 +773,8 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    let query_limit = RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(
-        TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?,
-    );
+    let query_limit =
+        RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(query_rate_exempt);
     // Floored at what this resolver advertises, for the reason
     // `--max-udp-request` gives: the advertisement is a promise.
     let admission = AdmissionLimits::new(
@@ -753,7 +833,7 @@ async fn main() -> anyhow::Result<()> {
              from anywhere else it is REFUSED",
             acl.from.len()
         );
-    } else if !cli.rpz.is_empty() {
+    } else if !feeds.is_empty() {
         tracing::info!(
             "no --rpz-notify-from: a feed is re-read on SIGHUP only, and a NOTIFY is NOTIMP"
         );

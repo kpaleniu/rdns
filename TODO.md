@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#63**, **#64** and **#21**, as of 2026-09-14.
+**#57**, **#58**, **#59**, **#64** and **#21**, as of 2026-09-15.
 **#61 closed the day it was filed**: the reload is 3.76x faster and holds
 68 MB less per million rules, and rayon was measured and declined.
 **#62 closed the day after it was filed**, all three rows. 62a was the one on
@@ -70,8 +70,11 @@ the two of them named**: the split `[server]` is out — flattening a shared
 struct costs a config error its line number and its expected-key list, for
 `rdnsd`'s existing file as much as for the new one — and what landed is the
 macro shape: c8ac8eb, b7c62a3 and 1e511d0, with A and B kept as branches for
-the measurements behind the choice. What is left of #63 is **63j**, the
-per-feed policy the file was wanted for. **63i came out of the same counting
+the measurements behind the choice. **63j closed 2026-09-15 and #63 with it**:
+`[[rpz.feeds]]` gives each feed its own policy, which costs the match path
+nothing because `PolicyZone` has held one since 45a — the measurement the row
+asked for first was a `grep` — and `rdnsr --check-config` landed beside it,
+finding two things read below the binds that a dry run has to reach. **63i came out of the same counting
 and closed the same day**: `--dnstap-max-bytes` was the one flag of 35 not
 refused beside `--config`, so the file overwrote it in silence, and what
 replaced the missing conflict is a test that asks clap for the set rather than
@@ -746,6 +749,23 @@ cargo run -p rdnsr -- --port 15354 --dnssec-validate --trust-anchor ./root-ancho
 # well as read: a successor key is adopted after 30 days of publication, and one
 # that revokes itself is dropped. Created from the anchors in force if absent.
 cargo run -p rdnsr -- --port 15354 --dnssec-validate --auto-trust-anchor ./root.key
+
+# The same settings in a file, and its dry run. `[[rpz.feeds]]` is the one thing
+# the flags cannot say: a policy per feed, so a new feed is measured in
+# `passthru` while the rest stay enforced.
+cargo run -p rdnsr -- --config ./rdnsr.toml
+cargo run -p rdnsr -- --config ./rdnsr.toml --check-config   # dry run, exits 0
+#
+#   [rpz]
+#   policy = "given"            # what a feed that says nothing inherits
+#   notify-from = ["192.0.2.1"]
+#
+#   [[rpz.feeds]]
+#   file = "court-order.rpz"
+#
+#   [[rpz.feeds]]
+#   file = "new-feed.rpz"
+#   policy = "passthru"
 ```
 
 ### Verifying, and one trap that invalidates it
@@ -915,7 +935,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59**, **#63** and **#64**, plus **#21** — see
+**#57**, **#58**, **#59** and **#64**, plus **#21** — see
 "What is open" above, which is the same list and the only place it is written
 down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -1769,7 +1789,7 @@ next caller is told the cost rather than finding it.
 
 ---
 
-### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, the file landed 2026-09-15 by 63h's shape C; 63j open**
+### 63. `rdnsr` has 39 flags and no config file — **filed 2026-09-14, closed 2026-09-15 by 63h's shape C, with 63j the per-feed policy it was for**
 
 Filed out of 57d, which cannot be decided without it: a transfer spec is per
 zone, and there is nowhere to write one. Filed as its own number rather than
@@ -2080,20 +2100,57 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   parses a config naming each; watched failing, it names
   `server.dnstap-max-bytes` and nothing else.
 
-- **63j. Per-feed RPZ policy, which is what #63 was for — open.** The file
-  exists now and `[rpz]` holds `files`, `policy` and `notify-from`, all three
-  still global. The shape is a `[[rpz]]` array of tables — an array, because the
-  order of the feeds is the order they are consulted and a map would reorder
-  them — each with `file` and an optional `policy` inheriting the global one
-  (§15's `Option` per field). It needs `PolicyStore::load` to take a policy per
-  feed rather than one for the set; `rdns::rpz` is where that lives and the
-  measurement to take first is what the per-feed override costs the match path,
-  which is per query.
+- **63j. Per-feed RPZ policy, which is what #63 was for — filed 2026-09-14,
+  closed 2026-09-15.** The shape the row named is what landed, one level deeper
+  in the file: `[[rpz.feeds]]` and not `[[rpz]]`, since `[rpz]` still holds the
+  two settings that are about the set — `policy`, now the default a feed
+  inherits, and `notify-from`. An array of tables because the order of the feeds
+  is the order they are consulted; `file` required and `policy` an `Option` that
+  means inherit (§15).
 
-  Also open and smaller: `rdnsr` has no `--check-config`. `rdnsd`'s runs
-  everything that does not bind a socket, and the resolver's equivalent is the
-  feeds parsing and the anchors loading — the two things whose failure at
-  startup is a resolver that answers nothing or blocks nothing.
+  **The measurement the row asked for first was a `grep`, not a benchmark**, and
+  taking it is what made the row small. The per-feed override costs the match
+  path **nothing, by construction**: `PolicyZone` has held its own
+  `PolicyOverride` since 45a and `action_at` has always applied *that* one, so
+  the diff touches `PolicyZones::load`, `PolicyStore` and a new `Feed` type, and
+  no function a query calls. The refuting question (§19) — *does the query path
+  read one policy for the set?* — is answered by where `PolicyStore::policy` was
+  read: `reload`, and nowhere else. It is gone; the store carries the feeds.
+
+  **`files = [...]` is deleted rather than kept beside the array**, because two
+  ways to name a feed is §15's two sources for one setting. That costs the terse
+  spelling for the common case, and the way to have had both was measured rather
+  than argued: an `#[serde(untagged)]` entry accepting a string *or* a table
+  reports a typo'd key as **"data did not match any variant of untagged enum
+  FeedSpec"**, spanning the whole array, with no expected-key list — the same
+  error-message regression that decided 63h against shape B, and for the same
+  reason. A wrong *type* reads identically. Declined.
+
+  **`rdnsr --check-config` landed with it**, and it is not `requires = "config"`
+  where `rdnsd`'s is: every feed, anchor, ACL, prefix and certificate it checks
+  is flag-settable too, so requiring the file would refuse the dry run to the
+  deployments that have least else to catch a mistake. It reports how many feeds
+  are *not* taken at their word, because a feed at `passthru` or `disabled`
+  blocks nothing and looks exactly like a working server.
+
+  **Two things moving it up found** (§4's "a comment records why", checked
+  against what the code does). `--tls-cert`/`--tls-key` were read *below* three
+  binds under a comment saying "read before anything binds, like the metrics
+  listener above", and `--query-rate-exempt` was parsed below them too; both are
+  above now, which is what made them reachable from the dry run. And the dry run
+  does not write the `--auto-trust-anchor` file when it is absent: a check that
+  creates it leaves it owned by whoever ran the check.
+
+  Verified as a process and not by reading the diff (§4): a feed that will not
+  parse and a misspelled per-feed policy each exit 1 naming the file, the flag
+  form and the file form each exit 0, and `--host 192.0.2.1 --check-config`
+  exits 0 where the same arguments without it die at the bind with
+  `os error 10049` — which is the proof it binds nothing. Three tests watched
+  failing against the one-policy-for-the-set shape:
+  `each_feed_keeps_the_policy_it_was_loaded_with`,
+  `a_feed_carries_its_own_policy_and_the_others_keep_theirs` and
+  `a_feed_that_says_nothing_inherits_the_global_policy`. 1186 tests on Windows
+  and 1206 on Linux, clippy clean on both.
 
 **The dependency objection is already answered, measured rather than argued**
 (§15's "pay for a parser; do not pay for a stub"). `toml` + `serde` is **nine
@@ -2525,6 +2582,7 @@ the week; the record is under "How the queue kept going stale" in
 | **47** | a NOTIFY reply carried no OPT record | **filed and closed 2026-09-12**, one commit, and it was a defect after all: the row read RFC 6891 §6.1.1 as "asks for" where it is "if an OPT record is present in a received **request**, compliant responders MUST include an OPT record in their respective responses" — a NOTIFY is a request. Counting the shape (§18) found a second site and a second MUST: `transfer::Envelopes` built the first AXFR envelope's OPT from `has_edns()` and a fresh `Edns`, which drops DO, against RFC 3225 §3's unconditional "the DO bit of the query MUST be copied in the response". Nothing tested either. The three NOTIFY refusals now carry three different EDEs, because "you are not one of my masters" and "I am that zone's primary" are one RCODE and two operator problems. `ClientEdns::mirror_with` became total on the way, so the `Err` all three callers answered identically is one doc comment rather than four. The EDE half is a reading rather than a quotation and the peers were asked: BIND 9.20 and Knot 3.6 mirror the OPT and DO and send no EDE, NSD 4.12 answers NXDOMAIN with QDCOUNT=0 and no OPT. Nine new assertions in the interop harness, 29 passed 0 failed in 43e |
 | **44** | what an operator would find missing in `rdnsd` | **filed 2026-09-11, closed in full 2026-09-12**, seven rows: catalog zones, EDE, the scale measurement, XoT, multi-signer, rollover and dnstap. Five numbers filed on the way out — #47, #48, #49, #50, #51, #54, #55 — and **0 packages** added by the lot, dnstap's two wire formats included. Every row's closing note says the same thing in its own words: the filing was right about what was missing and wrong about where the work was. 44a missed that provisioning is a diff; 44b's "small" cost a type at 24 sites; 44d's "cheap after 42a" described the half already done; 44e's premise was refuted by one test; 44f's ZSK half needed four numbers in a file and no state machine. Only 44c came out the size it was filed as, and it is the one that found a live defect (**#50**). The preamble's "none of these is a defect" did not survive either: #50 came out of 44c, and #47 — filed by 44b as not a defect — closed carrying two MUSTs |
 | **65** | every load re-signed every zone from scratch | **filed and closed 2026-09-14**, out of 64e. `ZoneSigning::apply` signed unconditionally, so a SIGHUP, an `rdnsctl reload` or a catalog change cost a full sign of every signed zone — 27.6 s at a million records — and moved the RDATA of every RRSIG, which is the whole zone in the next IXFR delta. **The four shapes were built and the recommended one was declined** (§19, #40a's precedent again). What landed is A, keyed on the trigger: the re-signing timer reloads *in order to* refresh, so it is the one reload that may carry nothing forward, and the other two carry everything whose RRset did not move — 9.7 s against 27.6, still 53.6% saved when a tenth of the zone changes (65b). **B is declined on a measurement**: the expiry spread is a fifth of the validity and the re-signing interval a third, so every signature crosses any refresh threshold in the same tick — 0 or all 126 of a fixture's RRSIGs, never between — and the only threshold that saves work hands the refreshing run a signature with four tenths of an interval left, against the 1.4 §8 asks for. The patch was reverted and the finding kept as a tripwire on the two constants. C moved to **#64b**, whose did-the-file-change test it is. The prerequisite the row called plumbing was one four-line method: `Zones::snapshot_all` |
+| **63** | `rdnsr` had 39 flags and no config file | **filed 2026-09-14, closed 2026-09-15**, ten rows, filed out of 57d because a prerequisite named in prose is one nobody schedules (§18). 63a answered the split question with the compiler rather than a line count — 18 escaping items of 84 `pub`s, and 63g then measured that `rdnsr` would name **0** of them — so the module stayed in `rdnsd` and what is shared is one macro. 63h built all three shapes and kept the two declined ones as branches: the shared struct is out because `#[serde(flatten)]` makes serde buffer the table, costing every `[server]` typo its line number and its expected-key list in `rdnsd`'s existing file too. On the way, 63e found 16 defaults written twice with nothing comparing them, 63f the same bare-`pub` sweep for the `cfg(unix)` file Windows cannot compile, and 63i the one flag of 35 not refused beside `--config`. **63j is what the file existed for**: `[[rpz.feeds]]`, a policy per feed, which costs the match path nothing because `PolicyZone` has carried one since 45a. `rdnsr --check-config` closed with it |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

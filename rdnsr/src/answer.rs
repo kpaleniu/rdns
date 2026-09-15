@@ -1231,7 +1231,7 @@ pub(crate) fn truncate_reply(reply: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use rdns::clock::current_unix_timestamp;
-    use rdns::rpz::PolicyOverride;
+    use rdns::rpz::{Feed, PolicyOverride};
     use rdns::Qtype;
 
     use rdns::clock::Clock;
@@ -2780,8 +2780,8 @@ mod tests {
     async fn a_rule_that_arrived_at_a_reload_blocks_the_next_query() {
         let dir = ScratchDir::new("reload-blocks");
         let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
-        let store = PolicyStore::load(std::slice::from_ref(&path), PolicyOverride::Given)
-            .expect("it loads");
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("it loads");
         let serving = serving_policy(store);
         assert!(
             serving
@@ -2821,8 +2821,8 @@ mod tests {
     async fn a_nameserver_rule_that_arrived_at_a_reload_empties_the_caches() {
         let dir = ScratchDir::new("reload-caches");
         let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
-        let store = PolicyStore::load(std::slice::from_ref(&path), PolicyOverride::Given)
-            .expect("it loads");
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("it loads");
         let serving = serving_policy(store);
         let held = nm("held.example.com.");
         let qtype = Qtype::of(record_types::A);
@@ -2854,8 +2854,8 @@ mod tests {
     async fn a_feed_that_will_not_parse_leaves_the_block_in_force() {
         let dir = ScratchDir::new("reload-broken");
         let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
-        let store = PolicyStore::load(std::slice::from_ref(&path), PolicyOverride::Given)
-            .expect("it loads");
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("it loads");
         let serving = serving_policy(store);
 
         std::fs::write(&path, "this is not a zone file\n").expect("rewrite");

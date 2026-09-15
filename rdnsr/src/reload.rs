@@ -124,7 +124,7 @@ mod tests {
 
     use super::*;
     use crate::testutil::{serving_policy, ScratchDir};
-    use rdns::rpz::{PolicyOverride, PolicyStore};
+    use rdns::rpz::{Feed, PolicyOverride, PolicyStore};
 
     /// A feed big enough that a reload is unmistakably slow: 100k rules is
     /// ~170 ms on the development machine, against the microseconds a test
@@ -180,8 +180,8 @@ mod tests {
     async fn a_reload_does_not_stop_the_only_worker() {
         let dir = ScratchDir::new("reload-blocking");
         let path = big_feed(&dir, 100_000);
-        let store = PolicyStore::load(std::slice::from_ref(&path), PolicyOverride::Given)
-            .expect("the feed loads");
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("the feed loads");
         let serving = serving_policy(store);
 
         let ticks = Arc::new(AtomicU64::new(0));

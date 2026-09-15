@@ -142,10 +142,20 @@ serve-stale = 0             # RFC 8767 window in seconds; 0 is off
 dns64 = true                # or a prefix; true is the Well-Known Prefix
 
 [rpz]
-files = ["malware.rpz", "court-order.rpz"]   # consulted in this order
-policy = "given"            # PolicyOverride::from_str, the flag's own parser
-notify-from = ["192.0.2.1"]
+policy = "given"            # PolicyOverride::from_str, the flag's own parser;
+notify-from = ["192.0.2.1"] # the default for a feed that does not say
+
+[[rpz.feeds]]               # an array: this order is the order they are
+file = "court-order.rpz"    # consulted, and a map would reorder it
+
+[[rpz.feeds]]
+file = "new-feed.rpz"
+policy = "passthru"         # measured while the one above stays enforced
 ```
+
+The per-feed policy is what the file was wanted for: `--rpz-policy` is one
+setting for every `--rpz`, so measuring a new feed from the command line means
+measuring every feed at once.
 
 The 22 `[server]` keys both daemons have are declared once, by
 `rdns::server_table!`, and expanded into each daemon's own struct. A macro
@@ -174,6 +184,15 @@ means the server would start.
 Member zones of a catalog are not among the zone count it reports: they arrive
 with the catalog, so what a dry run can check is that the catalog itself is
 configured and that its key resolves.
+
+`rdnsr --check-config` is the same idea over what a resolver has: every policy
+feed read and indexed, the trust anchors loaded, every ACL and the NAT64 prefix
+parsed, the certificate read against its key. It reports how many feeds are not
+taken at their word, because a feed at `passthru` or `disabled` blocks nothing
+and looks exactly like a working server. Two differences from `rdnsd`'s: it does
+not require `--config`, since everything it checks is flag-settable too; and it
+does not write the `--auto-trust-anchor` file when that file does not yet exist,
+because a dry run would leave it owned by whoever ran the check.
 
 ---
 
@@ -215,7 +234,7 @@ specified in `05-resolver.md`.
 
 | flag | default | what it turns on |
 |---|---|---|
-| `--rpz PATH` (repeatable, ordered) | none | response policy zones; `--rpz-policy` overrides every action in every zone (§5.6) |
+| `--rpz PATH` (repeatable, ordered) | none | response policy zones; `--rpz-policy` overrides every action in every zone, and `[[rpz.feeds]]` in the config file does it per feed (§5.6) |
 | `--serve-stale SECONDS` | `0`, off | answering from expired cache when a refresh fails (RFC 8767, §5.5) |
 | `--prefetch` | off | re-resolving a cache entry in the last tenth of its TTL (§5.5) |
 | `--dns64 [PREFIX]` | off; the Well-Known Prefix when given no value | synthesizing AAAA from A (RFC 6147, §5.7). `--dns64-exclude` adds to §5.1.4's `::ffff:0:0/96` |
