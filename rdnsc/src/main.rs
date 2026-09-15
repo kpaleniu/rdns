@@ -12,6 +12,7 @@ use rdns_core::socket::bind_addr_for;
 use rdns_core::validation::{answers_query, SentQuery};
 use rdns_core::Name;
 use rdns_core::{DnsMessage, DnsMessageBuilder, ExtendedError, Qtype, ResponseCode};
+use rdns_present::record_text;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -164,7 +165,18 @@ fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
 /// section starts with the zone's SOA and ends with the same SOA again, and
 /// that second copy is the only end marker there is. Records are printed rather
 /// than assembled — a client that held the zone would be `rdns::xfr`, which
-/// `rdnsc` does not link (it takes `rdns-core` alone).
+/// `rdnsc` does not link.
+///
+/// What is printed is the zone-file presentation format, so `rdnsc … AXFR
+/// example.com > example.com.zone` produces a file this tree's own parser
+/// reads. Every line carries an absolute owner name, its own TTL and its class,
+/// so no `$ORIGIN` or `$TTL` is needed and no line depends on another
+/// (`TODO.md` #66b).
+///
+/// **It is not a secondary.** There is no SOA probe, so every run is a full
+/// transfer; no IXFR; no NOTIFY, so whatever calls this is on its own timer;
+/// and no TSIG yet (#66c). A feed refreshed this way is refreshed when cron
+/// says so, not when the publisher does.
 fn read_transfer(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Result<()> {
     let mut stream = send_over_tcp(server, query)?;
     let mut soas = 0;
@@ -194,16 +206,34 @@ fn read_transfer(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resu
             bail!("a message in the stream carries id {:#06x}", message.id);
         }
 
-        for rr in &message.answers {
-            if rr.rdata.rtype() == rt::SOA {
-                soas += 1;
-            }
+        for line in transfer_lines(&message, &mut soas)? {
             records += 1;
-            println!("{rr:?}");
+            println!("{line}");
         }
     }
     eprintln!("transfer complete: {records} records");
     Ok(())
+}
+
+/// One message's answer section as zone-file lines, counting the SOAs that
+/// frame the stream.
+///
+/// The closing SOA is RFC 5936 §2.2's end marker and not a second record: a
+/// zone file carrying the apex SOA twice is not the zone that was transferred,
+/// and this tree's own parser refuses it. Separate from the read loop so that
+/// is testable without a socket.
+fn transfer_lines(message: &DnsMessage, soas: &mut usize) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for rr in &message.answers {
+        if rr.rdata.rtype() == rt::SOA {
+            *soas += 1;
+            if *soas == 2 {
+                break;
+            }
+        }
+        lines.push(record_text::resource_record_line(rr)?);
+    }
+    Ok(lines)
 }
 
 /// Connect and send one framed message.
@@ -300,5 +330,126 @@ fn print_message(msg: &DnsMessage) {
         .chain(&msg.additionals)
     {
         println!("{r:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rdns_core::record_types::record_type_name;
+
+    /// An AXFR as it arrives: the zone's SOA, its records, then the SOA again
+    /// as the end marker (RFC 5936 §2.2), split across two messages.
+    fn transferred() -> (Vec<DnsMessage>, rdns::zone::Zone) {
+        // Column zero on purpose: a leading space makes the parser read the
+        // owner name as omitted, which is `TODO.md` #60's defect arriving in a
+        // fixture rather than in a message.
+        let text = concat!(
+            "$ORIGIN example.com.\n",
+            "$TTL 3600\n",
+            "@    IN SOA ns1.example.com. admin.example.com. ( 7 3600 600 604800 300 )\n",
+            "@    IN NS  ns1.example.com.\n",
+            "ns1  IN A   192.0.2.1\n",
+            "www  IN AAAA 2001:db8::10\n",
+            "txt  IN TXT \"one\" \"two\"\n",
+            "mail IN MX  10 mx.example.com.\n",
+        );
+        let zone = rdns::zone::parse_zone_file(text, "example.com.").expect("the zone parses");
+
+        let soa = zone
+            .records()
+            .iter()
+            .find(|r| r.rdata.rtype() == rt::SOA)
+            .expect("an apex SOA")
+            .clone();
+        let as_wire = |r: &rdns::zone::ZoneRecord| rdns_core::ResourceRecord {
+            name: r.name.clone(),
+            class: r.class,
+            ttl: r.ttl,
+            rdata: r.rdata.clone(),
+        };
+
+        let mut first = DnsMessageBuilder::new().build();
+        first.answers.push(as_wire(&soa));
+        for r in zone.records().iter().filter(|r| r.rdata.rtype() != rt::SOA) {
+            first.answers.push(as_wire(r));
+        }
+        let mut last = DnsMessageBuilder::new().build();
+        // The end marker, and a record after it that a correct reader never
+        // sees — if the loop kept going it would be in the output.
+        last.answers.push(as_wire(&soa));
+        last.answers.push(as_wire(&soa));
+        (vec![first, last], zone)
+    }
+
+    /// What a transfer prints is what this tree's parser reads back.
+    ///
+    /// Fails against the shape this replaced, which printed `{:?}`: Rust's
+    /// `Debug` is not a zone file and `parse_zone_file` rejects the first line.
+    #[test]
+    fn a_transfer_prints_a_zone_file_that_loads() {
+        let (messages, original) = transferred();
+        let mut soas = 0;
+        let mut out = String::new();
+        for message in &messages {
+            for line in transfer_lines(message, &mut soas).expect("every record is spellable") {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+
+        let reloaded = rdns::zone::parse_zone_file(&out, "example.com.").unwrap_or_else(|e| {
+            panic!(
+                "what was printed does not load: {e}
+{out}"
+            )
+        });
+        assert_eq!(
+            reloaded.records().len(),
+            original.records().len(),
+            "every record survived the round trip"
+        );
+        for before in original.records() {
+            assert!(
+                reloaded
+                    .records()
+                    .iter()
+                    .any(|after| after.name == before.name
+                        && after.rdata.rtype() == before.rdata.rtype()
+                        && after.rdata.bytes() == before.rdata.bytes()),
+                "{} {} did not survive",
+                before.name.as_ref().to_presentation(),
+                record_type_name(before.rdata.rtype())
+            );
+        }
+    }
+
+    /// The closing SOA is the end marker, not a record.
+    ///
+    /// Fails against a loop that prints every answer: the zone would carry its
+    /// apex SOA twice, which `parse_zone_file` refuses — so this is the reason
+    /// the test above passes at all.
+    #[test]
+    fn the_end_marker_is_not_written_as_a_record() {
+        let (messages, _) = transferred();
+        let mut soas = 0;
+        let soa_lines: usize = messages
+            .iter()
+            .map(|m| {
+                transfer_lines(m, &mut soas)
+                    .expect("spellable")
+                    .iter()
+                    .filter(|l| l.contains(" SOA "))
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            soa_lines, 1,
+            "one SOA in the file, whatever the stream sent"
+        );
+        assert_eq!(
+            soas, 2,
+            "and both were counted, which is what ends the read"
+        );
     }
 }

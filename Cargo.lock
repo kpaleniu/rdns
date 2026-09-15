@@ -1166,7 +1166,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rdns",
  "rdns-core",
+ "rdns-present",
 ]
 
 [[package]]

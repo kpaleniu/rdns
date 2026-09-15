@@ -2573,7 +2573,7 @@ unknown, and taking it is the thing that would reopen this.
 
 ---
 
-### 66. `rdnsc` cannot write what it transfers — **filed 2026-09-15, 66a closed**
+### 66. `rdnsc` cannot write what it transfers — **filed 2026-09-15, 66a and 66b closed**
 
 Out of #57d, and out of the question that row never asked: *what does an
 operator who only wants a resolver actually run?*
@@ -2611,11 +2611,32 @@ which no parser reads. Two things are missing, and only one of them is cheap.
   the wrong one is a move done twice. `persist` has no crate-internal
   dependencies at all and would follow cheaply if the atomic write is wanted
   there too.
-- **66b. Writing what arrived.** With 66a, `rdnsc --axfr` writing a loadable
-  zone file is a printer and a rename. It does *not* close #57d: no serial
-  check, so every refresh is a full transfer; no IXFR; no NOTIFY, so the
-  operator is on cron's clock and not the publisher's. Say so in the flag's own
-  help, because the gap is invisible from the command line.
+- **66b. Writing what arrived. — done 2026-09-15**, the printer; the rename is
+  not here and is named below. `rdnsc … AXFR example.com > example.com.zone`
+  now produces a file this tree's parser reads, where it printed Rust's
+  `{:?}` before. One package and **+48 KB** on the binary (814 080 to 862 208),
+  against the 385 KB #67 measured for reaching the same function through
+  `rdns`.
+
+  **The closing SOA is not a record.** RFC 5936 §2.2 ends the stream with a
+  second copy of the apex SOA, and writing it would make a zone file that
+  carries its SOA twice — which `parse_zone_file` refuses, so the bug would
+  have been the whole feature. `transfer_lines` is separate from the read loop
+  so that is testable without a socket, and both tests were run against the
+  shapes they forbid: one fails with `unsupported record type "{"` against the
+  old `{:?}`, the other with two SOAs against a loop that prints every answer.
+
+  **The caveat is in the function's own doc comment, where a reader of the code
+  finds it**: no SOA probe, so every run is a full transfer; no IXFR; no
+  NOTIFY, so whatever calls this is on cron's clock and not the publisher's;
+  no TSIG until 66c. It does not close #57d and is not meant to.
+
+  **What is left: the rename.** Writing to a path that a running `rdnsr`
+  re-reads wants `persist::write_atomically_str`, which is `rdns`'s and has no
+  intra-crate dependencies at all — so it is a move, not a rewrite. It is not
+  done here because **66c forces the same move anyway**: a TSIG secret read
+  from a file needs `persist::ensure_private`, which is §15's mode check. Both
+  land together or the module gets moved twice.
 - **66c. TSIG, and it is the expensive one. Decided 2026-09-15: `rdnsc` gets
   it.** Without it `rdnsc` can only fetch from masters that authenticate by
   address, which is not how a keyed commercial feed is delivered — so the
