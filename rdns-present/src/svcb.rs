@@ -40,7 +40,7 @@ pub mod svc_param_keys {
 ///
 /// Always a name [`svc_param_key_from_name`] reads back, which is the same
 /// contract [`rdns_core::record_types::record_type_name`] has with its inverse.
-pub fn svc_param_key_name(key: u16) -> Cow<'static, str> {
+pub(crate) fn svc_param_key_name(key: u16) -> Cow<'static, str> {
     let known = match key {
         svc_param_keys::MANDATORY => "mandatory",
         svc_param_keys::ALPN => "alpn",
@@ -58,7 +58,7 @@ pub fn svc_param_key_name(key: u16) -> Cow<'static, str> {
 ///
 /// RFC 9460 §2.1 spells the generic form `key65535` with no leading zeros and
 /// requires the value to fit a `u16`, so `key65536` and `key0001` are not keys.
-pub fn svc_param_key_from_name(name: &str) -> Option<u16> {
+pub(crate) fn svc_param_key_from_name(name: &str) -> Option<u16> {
     match name {
         "mandatory" => Some(svc_param_keys::MANDATORY),
         "alpn" => Some(svc_param_keys::ALPN),
@@ -330,7 +330,7 @@ fn comma_list(text: &str, name: &str, ln: usize) -> Result<Vec<String>, ZoneErro
 /// record to RFC 3597 `\#` form would also be correct but loses the six
 /// parameters that were fine, and returning `None` would put a "cannot write
 /// this" case into every caller for a record we can always write.
-pub fn present_params(params: &[(u16, Vec<u8>)]) -> String {
+pub(crate) fn present_params(params: &[(u16, Vec<u8>)]) -> String {
     let mut out = String::new();
     for (code, value) in params {
         if !out.is_empty() {

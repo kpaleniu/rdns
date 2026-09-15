@@ -5,10 +5,12 @@
 //! the real verification path through it rather than a mock.
 
 use crate::clock::current_unix_timestamp;
+use crate::denial_wire::build_type_bitmap;
 use crate::dnssec::{
     key_tag, rrsig_labels_of, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_SEP,
     DNSKEY_FLAG_ZONE,
 };
+use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, Nsec3, Nsec3Hash};
 use crate::dnssec_key::{SigningAlgorithm, SigningKey};
 use crate::record_types as rt;
 use crate::test_records::nm;
@@ -317,4 +319,92 @@ pub fn signing_keys(origin: &str) -> Vec<SigningKey> {
 /// the only value either signing test has wanted.
 pub fn signing_policy(now: u64, chain: DenialChain) -> SigningPolicy {
     SigningPolicy::valid_for(now, 30 * 86_400).with_chain(chain)
+}
+
+// The NSEC3 fixtures, here rather than in `crate::test_records` because they
+// hash a name and that module says it holds nothing cryptographic
+// (`TODO.md` #67f).
+
+/// The NSEC3 parameters every fixture here hashes under. One salt and one
+/// iteration count, because two records in one proof that disagree about
+/// either are a chain with a hole in it rather than a test.
+pub const NSEC3_SALT: [u8; 2] = [0xaa, 0xbb];
+
+pub const NSEC3_ITERATIONS: u16 = 3;
+
+/// The NSEC3 denying `name`, parsed — the owner hash is `name`'s under
+/// [`NSEC3_SALT`], and `next` is given outright because a fixture wants to
+/// choose what the span contains.
+pub fn nsec3(zone: &str, name: &str, next: &[u8], flags: u8, types: &[Rtype]) -> Nsec3 {
+    let hash = nsec3_hash_name(nm(name).as_ref(), &NSEC3_SALT, NSEC3_ITERATIONS)
+        .expect("hash the owner name");
+    Nsec3 {
+        owner: nsec3_owner_name_at(hash, nm(zone).as_ref()).expect("an NSEC3 owner name"),
+        owner_hash: hash,
+        zone: nm(zone),
+        hash_algorithm: 1,
+        flags,
+        iterations: NSEC3_ITERATIONS,
+        salt: NSEC3_SALT.to_vec(),
+        next_hashed_owner: Nsec3Hash::from_wire(next).expect("a 20-octet next hash"),
+        type_bitmap: build_type_bitmap(types),
+    }
+}
+
+/// The same record on the wire.
+pub fn nsec3_record(
+    zone: &str,
+    name: &str,
+    next: &[u8],
+    flags: u8,
+    types: &[Rtype],
+    ttl: Ttl,
+) -> ResourceRecord {
+    nsec3_as_record(&nsec3(zone, name, next, flags, types), ttl)
+}
+
+/// An NSEC3 with both hashes given outright, for a chain laid out by hand
+/// rather than by finding names that hash where they are wanted.
+pub fn nsec3_span(
+    zone: &str,
+    owner_hash: &[u8],
+    next: &[u8],
+    types: &[Rtype],
+    ttl: Ttl,
+) -> ResourceRecord {
+    ResourceRecord {
+        name: nsec3_owner_name_at(
+            Nsec3Hash::from_wire(owner_hash).expect("a 20-octet owner hash"),
+            nm(zone).as_ref(),
+        )
+        .expect("an NSEC3 owner name"),
+        class: Class::new(1),
+        ttl,
+        rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
+            hash_algorithm: 1,
+            flags: 0,
+            iterations: NSEC3_ITERATIONS,
+            salt: NSEC3_SALT.to_vec(),
+            next_hashed_owner: next.to_vec(),
+            type_bitmap: build_type_bitmap(types),
+        })
+        .expect("encode NSEC3"),
+    }
+}
+
+fn nsec3_as_record(n: &Nsec3, ttl: Ttl) -> ResourceRecord {
+    ResourceRecord {
+        name: n.owner.clone(),
+        class: Class::new(1),
+        ttl,
+        rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
+            hash_algorithm: n.hash_algorithm,
+            flags: n.flags,
+            iterations: n.iterations,
+            salt: n.salt.clone(),
+            next_hashed_owner: n.next_hashed_owner.as_bytes().to_vec(),
+            type_bitmap: n.type_bitmap.clone(),
+        })
+        .expect("encode NSEC3"),
+    }
 }

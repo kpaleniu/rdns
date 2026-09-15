@@ -6,8 +6,7 @@
 //! of RFC 5155 §5.
 
 use crate::denial_wire::{
-    base32hex_decode, bitmap_has_type, canonical_name_cmp, encode_base32hex, encode_base32hex_in,
-    BASE32HEX_LOWER,
+    base32hex_decode, bitmap_has_type, canonical_name_cmp, encode_base32hex_in, BASE32HEX_LOWER,
 };
 use crate::dname::MAX_NAME_LEN;
 use crate::error::WireResult;
@@ -49,15 +48,6 @@ pub fn nsec3_owner_name_at(hash: Nsec3Hash, origin: NameRef<'_>) -> WireResult<N
     Name::prefixed(&label[..len], origin)
 }
 
-pub fn nsec3_owner_name(hash: &[u8], origin: &str) -> String {
-    let mut out =
-        String::with_capacity(crate::denial_wire::base32hex_len(hash.len()) + 1 + origin.len());
-    encode_base32hex(hash, BASE32HEX_LOWER, &mut out);
-    out.push('.');
-    out.push_str(origin);
-    out
-}
-
 /// The NSEC3 hash of `name` (RFC 5155 §5): SHA-1 over the name's wire form,
 /// salted and iterated.
 ///
@@ -78,7 +68,7 @@ pub fn nsec3_hash(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Nsec
 /// octets and neither it nor the wire name it starts from needs the heap. The
 /// closest-encloser walk hashes a name per label of the QNAME and each
 /// iteration used to rebuild the digest as a fresh `Vec`.
-pub fn nsec3_hash_in(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Nsec3Hash> {
+fn nsec3_hash_in(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Nsec3Hash> {
     // Into the stack: §8.3's walk hashes a name per label of the QNAME and
     // keeps none of them, so this is the one place presentation text is read
     // without building a `Name`.
@@ -818,8 +808,8 @@ mod tests {
 
     use super::*;
     use crate::denial_wire::{base32hex_encode, build_type_bitmap};
+    use crate::dnssec_test_util::{nsec3, NSEC3_ITERATIONS, NSEC3_SALT};
     use crate::test_records::nm;
-    use crate::test_records::{nsec3, NSEC3_ITERATIONS, NSEC3_SALT};
     use crate::Class;
     use crate::RecordData;
     use crate::Ttl;

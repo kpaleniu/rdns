@@ -37,8 +37,12 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#64**, **#66**, **#67**, **#68** and **#21**, as
-of 2026-09-15.
+**#57**, **#58**, **#59**, **#64**, **#68** and **#21**, as of 2026-09-15.
+**#66 and #67 closed the day they were filed**, together: `rdnsc` transfers a
+zone, signs it, verifies every envelope and writes a loadable file, and the
+crate line moved twice to let it — `rdns-present` for the format and
+`rdns-tsig` for the MAC, both measured against the alternative rather than
+argued.
 **#61 closed the day it was filed**: the reload is 3.76x faster and holds
 68 MB less per million rules, and rayon was measured and declined.
 **#62 closed the day after it was filed**, all three rows. 62a was the one on
@@ -955,8 +959,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59**, **#64**, **#66**, **#67** and **#68**, plus
-**#21** — see "What is open" above, which is the same list and the only place it is written
+**#57**, **#58**, **#59**, **#64** and **#68**, plus **#21** — see
+"What is open" above, which is the same list and the only place it is written
 down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
 numbers are stable identifiers referenced from the code, so they move rather
@@ -2680,7 +2684,7 @@ which no parser reads. Two things are missing, and only one of them is cheap.
 
 ---
 
-### 67. The crate split, re-measured now that a small binary takes crypto — **filed 2026-09-15**
+### 67. The crate split, re-measured now that a small binary takes crypto — **filed and closed 2026-09-15**
 
 #66c is the first time anything but the two daemons links a crypto library, and
 the boundary it crosses was never written down as a rule — only as a
@@ -2845,7 +2849,9 @@ crate change. Every count below was re-checked before being written down.
   The alternative — moving the field off `MasterSpec` — costs 23 edits and
   contradicts `secondary.rs:126`, which says `for_member` is a method *because*
   `tls` is the field that would be forgotten. Declined on both counts.
-- **67d. `tsig` already needs nothing from `rdns`, which settles 66c's shape.**
+- **67d. `tsig` already needs nothing from `rdns`, which settles 66c's shape.
+  — acted on by #66c, which moved it.** The measurement held exactly: the move
+  was a rename of paths and nothing else.
   Every `crate::` path in its production code resolves to `rdns-core`:
   `crate::error` and `crate::clock` and nothing else — checked by stripping the
   test module and listing them. So the module's whole dependency set is
@@ -2888,7 +2894,7 @@ crate change. Every count below was re-checked before being written down.
     year write-only because the loop had no owner (#30m), and two copies is what
     §7 forbids.
 - **67f. Two dead public functions, and a test fixture that would drag `sha1`
-  into any new crate.** Found on the way; §18 says dead code is a finding and
+  into any new crate. — done 2026-09-15.** Found on the way; §18 says dead code is a finding and
   not litter, so it is filed before it is deleted.
   - `dnssec_denial::nsec3_owner_name` (`:51`, `pub`) has **no caller in the
     workspace** — the only other mention is a doc link at `denial_wire.rs:213`.
@@ -2902,7 +2908,7 @@ crate change. Every count below was re-checked before being written down.
     lines** (`dnssec_denial.rs:843`, `nsec_cache.rs:983`), those two being the
     only users. Without it, a crate cut's tests pull `sha1` back through the
     fixtures and the measurement lies.
-- **67g. One finding outside the sweep's brief.**
+- **67g. One finding outside the sweep's brief. — done 2026-09-15.**
   `security::ResponseLimiter::tracked` (`security.rs:372`) reads a poisoned lock
   as zero clients — `lock().map(..).unwrap_or(0)` — where the five decision
   paths above it all use `let Ok(..) else` with a commented policy. It is
@@ -2936,6 +2942,26 @@ not know without compiling, all cheap and all worth the record:
   clean over `--all-targets` on both, `cargo doc` clean. The 20-test gap is the
   `cfg(unix)` half — the permission checks and `rdnsd`'s control socket — which
   is the same tell that number has always been.
+
+**What 67f and 67g cost, and the one thing deleting turned up.**
+`nsec3_owner_name` went, and `nsec3_hash_in` is private — and the deletion left
+`encode_base32hex` with no caller outside `rdns-present`, which nothing would
+have warned about because the crate split had made it `pub`. That prompted
+counting the rest: **7 of the crate's public items had no user outside it**, so
+they are `pub(crate)` again — most of the 8 that #67's decision unsealed,
+clawed back. `parse_params`, `encode_base32hex_in`, `BASE32HEX_LOWER`,
+`reversed_labels` and `record_line` stay public because `rdns` names them.
+
+Re-sealing created two doc links from a public page to a private item, which
+is §37's exact shape, and `cargo doc --no-deps` caught both — the third time in
+two days that command has been the thing that noticed. Both are prose now
+saying *why* the item is private.
+
+The NSEC3 fixtures moved to `dnssec_test_util`, which makes `test_records`'s
+"nothing cryptographic lives here" true for the first time: `nsec3` called
+`nsec3_hash_name` fifty lines under that sentence. `ResponseLimiter::tracked`
+recovers a poisoned lock instead of reading it as zero clients, with the
+failure policy written down as the five decision paths above it already do.
 
 **What this changes about the row.** The crate line was never the thing in the
 way. 67a-c are about a dozen lines of moves that take the free set from 9 to 21

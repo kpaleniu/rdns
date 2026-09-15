@@ -215,7 +215,7 @@ fn bitmap_types(bitmap: &[u8]) -> Vec<Rtype> {
 /// Every type set in a bitmap, ascending — or `Err(what was read before the
 /// damage)` when the bitmap does not parse to its end. Re-encoding a bitmap only
 /// partly understood would emit a record other than the one we were given.
-pub fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>> {
+pub(crate) fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>> {
     let mut types = Vec::new();
     let mut rest = bitmap;
     while !rest.is_empty() {
@@ -254,7 +254,7 @@ const BASE32HEX: &[u8; 32] = b"0123456789ABCDEFGHIJKLMNOPQRSTUV";
 pub const BASE32HEX_LOWER: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
 
 /// The number of base32hex characters `len` octets encode to, unpadded.
-pub fn base32hex_len(len: usize) -> usize {
+pub(crate) fn base32hex_len(len: usize) -> usize {
     (len * 8).div_ceil(5)
 }
 
@@ -266,7 +266,8 @@ pub fn base32hex_encode(data: &[u8]) -> String {
 }
 
 /// The same into a caller's byte buffer, which must hold
-/// [`base32hex_len`] octets.
+/// `base32hex_len` octets — private to this crate, since nothing outside it
+/// sizes a buffer for this.
 ///
 /// Returns how many were written. For an owner name the encoding is a *label*,
 /// so the bytes are what is wanted and a `String` is the conversion.
@@ -286,7 +287,7 @@ pub fn encode_base32hex_in(data: &[u8], alphabet: &[u8; 32], out: &mut [u8]) -> 
     at
 }
 
-pub fn encode_base32hex(data: &[u8], alphabet: &[u8; 32], out: &mut String) {
+pub(crate) fn encode_base32hex(data: &[u8], alphabet: &[u8; 32], out: &mut String) {
     for chunk in data.chunks(5) {
         let mut buf = [0u8; 5];
         buf[..chunk.len()].copy_from_slice(chunk);

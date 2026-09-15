@@ -28,7 +28,9 @@ fn days_in_month(month: i32, year: i32) -> Option<i32> {
 
 /// An RRSIG's inception or expiration: a bare epoch, or `YYYYMMDDHHmmSS` in UTC
 /// (RFC 4034 §3.2). Every field is range-checked and the result is checked to
-/// fit. The inverse is [`format_dnssec_time`].
+/// fit. The inverse is `format_dnssec_time`, which is private to this crate:
+/// the only thing that writes one of these is `record_text`, while the zone
+/// parser is in `rdns` and reads them (`TODO.md` #67f).
 pub fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
     if let Ok(epoch) = time_str.parse::<u32>() {
         return Ok(epoch);
@@ -92,7 +94,7 @@ pub fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
 ///
 /// The parser also accepts a bare epoch and writing that would be shorter, but
 /// nothing else in the ecosystem does.
-pub fn format_dnssec_time(epoch: u32) -> String {
+pub(crate) fn format_dnssec_time(epoch: u32) -> String {
     let mut days = (epoch / 86400) as i32;
     let seconds = epoch % 86400;
 

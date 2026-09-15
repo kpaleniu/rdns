@@ -978,10 +978,9 @@ mod tests {
     use super::*;
     use crate::denial_wire::build_type_bitmap;
     use crate::dnssec_denial::nsec3_hash;
+    use crate::dnssec_test_util::{nsec3_record, nsec3_span, NSEC3_ITERATIONS, NSEC3_SALT};
     use crate::test_records::nm;
-    use crate::test_records::{
-        nsec3_record, nsec3_span, nsec_record, soa_record, NSEC3_ITERATIONS, NSEC3_SALT,
-    };
+    use crate::test_records::{nsec_record, soa_record};
     use crate::Class;
     use crate::{OpCode, QueryClass, QuerySection, RecordData};
 

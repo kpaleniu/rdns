@@ -368,8 +368,18 @@ impl ResponseLimiter {
     }
 
     /// How many clients are being tracked. For tests and diagnostics.
+    ///
+    /// A poisoned lock is recovered rather than read as zero. The count is
+    /// still whole — nothing here panics holding this lock, and a panic
+    /// elsewhere does not unmake a `HashMap` — and "no clients tracked" is a
+    /// statement about the limiter that would be false (`CLAUDE.md` §4). Every
+    /// decision path in this file states its failure policy in a comment; this
+    /// one was the exception, and it is `TODO.md` #67g.
     pub fn tracked(&self) -> usize {
-        self.clients.lock().map(|c| c.len()).unwrap_or(0)
+        match self.clients.lock() {
+            Ok(clients) => clients.len(),
+            Err(poisoned) => poisoned.into_inner().len(),
+        }
     }
 
     /// Drop clients that have been quiet long enough to have refilled anyway —
