@@ -139,7 +139,10 @@ teaches `rdnsc` to write what it already transfers correctly, **and the owner
 decided the same day that it gets TSIG**: 5 packages and, the part that is not
 a count, a C toolchain in its build. #67 is the consequence — the first thing
 that is not a daemon now links crypto, so where the crate line belongs is a
-measurement, **taken the same day**: `rdnsc` linking `rdns` outright would cost
+measurement, **taken the same day, and then swept module by module**: almost
+every heavy edge in `rdns` is incidental, and 67a-c undo the three that matter
+for about a dozen moved lines — the free set goes 9 of 41 to 21. What the
+measurement itself said: `rdnsc` linking `rdns` outright would cost
 +38 packages and 47% of its binary, so that is out; the tangle inside `rdns` is
 one edge and costs nothing; and the figure that would decide a split needs 66a
 to exist, so **66a goes first and #67 finishes after it**. **#60 closed 2026-09-14**: 19 flattened messages put back
@@ -2692,9 +2695,16 @@ by the heaviest thing it needs:
 | runtime | `tokio`, `rustls` | `resolver`, `xfr`, `xot`, `secondary`, `notify`, `endpoint`, `shutdown`, `logging`, `tls_identity` |
 
 `rdnsc` under #66 wants the second layer and one module of the third, and none
-of the fourth. The `sha1` in the second layer is `dnssec_denial::Nsec3Hash`
-reached through `zone` — so a presentation split that avoids `Zone` (66a's own
-open question) may not need it at all.
+of the fourth.
+
+~~The `sha1` in the second layer is `dnssec_denial::Nsec3Hash` reached through
+`zone` — so a presentation split that avoids `Zone` (66a's own open question)
+may not need it at all.~~ **Half right, and the wrong half is the interesting
+one.** The `sha1` is indeed that one import, but `Nsec3Hash` does no hashing at
+all, so the presentation split does not have to avoid `Zone` — see **67a**,
+which deletes that column. **67c** does the same to the fourth layer's first
+three entries. The table is the map as it was drawn before the sweep; read it
+with 67a-c beside it.
 
 **What would refute the whole thing, and why this row is now blocked.** The
 only size figure here is for linking *all* of `rdns`, which is an upper bound.
@@ -2719,6 +2729,141 @@ after #66c one tool pays for crypto anyway.
   `ring::hmac` is the whole point of it);
 - what a move costs the crate it leaves, since `rdns` re-exports and every path
   that changes is a `use` somewhere.
+
+**Why each module depends on what it depends on — swept 2026-09-15, three
+passes, one per layer.** The question the row was filed with was *where should
+the line go*. The sweep answers a better one: **almost every heavy edge in this
+crate is incidental, and four small moves undo them.** Counting the free set as
+this row does above — modules reaching neither crypto nor a runtime — it goes
+from **9 of 41 to 21 of 41** for roughly a dozen moved lines, none of which is a
+crate change. Every count below was re-checked before being written down.
+
+- **67a. `Nsec3Hash` is not cryptography, and it is the only reason `zone`
+  reaches `sha1`.** `dnssec_denial.rs:220` is a `[u8; 20]` newtype with
+  `from_wire` and `as_bytes`, derives only, **no trait impls at all** — it
+  hashes nothing. `zone.rs` uses it at 5 sites (`:30`, `:138` as a `BTreeMap`
+  key, `:259`, `:398`, `:423`), and `:423` already sits beside
+  `denial_wire::base32hex_decode`. Moving the type into `denial_wire` and
+  re-exporting it is **one line in `zone.rs`**; the four other importers are
+  unchanged.
+
+  `denial_wire.rs:8` states the rule — "`dnssec_denial` keeps everything that
+  hashes, proves or verifies" — and `Nsec3Hash` does none of the three, so this
+  finishes a sweep that stopped one type short rather than contradicting it.
+  **Found independently by the zone pass and the crypto pass**, which is the
+  strength of evidence #61a had.
+
+  **It refutes this row's own layering table**: the "zone and presentation"
+  layer does not need `sha1`, and a presentation split does not have to avoid
+  `Zone` after all. All nine of those modules become dependency-free.
+- **67b. `rdns::error` sheds `tokio` for five deleted lines and two changed
+  ones.** The hub edge measured above is two impls, and they are not equal.
+  `From<Elapsed> for TransferError` (`error.rs:155`) has **no user**: `Elapsed`
+  is named nowhere in the workspace outside `error.rs` itself, and all three
+  `TransferResult`-returning timeout sites (`xfr.rs:609`, `:631`, `:663`) use an
+  explicit `map_err` naming the master and the zone, which the impl would have
+  thrown away. An unused trait impl draws no dead-code warning, which is how it
+  survived. `From<Elapsed> for ResolveError` (`:149`) is live at five sites, all
+  in `resolver/recurse.rs`.
+
+  So: delete the dead one, and move `ResolveError`, `ResolveResult` and
+  `extended_error` into `resolver`, where the timeout is — **two `use` lines**
+  (`resolver.rs:12`, `rdnsr/src/answer.rs:18`), since `recurse.rs` and
+  `validate.rs` reach them through `use super::*`. **`rdns::error` must not
+  re-export them**: a `pub use` restores the edge being cut and adds a reverse
+  one. `TransferError` stays where it is — its four users straddle the
+  presentation and runtime layers (`ixfr.rs:11`, `transfer.rs:9` against
+  `xfr.rs:8`, `xot.rs:70`), so moving it would push `tokio` *into* the
+  presentation layer.
+- **67c. `XotName` is a name, not a TLS stack.** `endpoint`, `secondary` and
+  `notify` are in the runtime layer for one reason: `Endpoint.tls` and
+  `MasterSpec.tls` hold an `xot::XotName`, which is a
+  `rustls::pki_types::ServerName` plus the operator's text. `rustls-pki-types`
+  costs `web-time` and `zeroize`; `rustls` additionally costs `once_cell`,
+  `ring`, `rustls-webpki` and `subtle`. Move `XotName` beside `tls_identity` —
+  whose only dependency is already `rustls-pki-types`, and which needs no
+  `tokio` today — and `xot` keeps the connector.
+
+  **Five non-test sites** (`endpoint.rs:26`, `:39`, `:63`; `secondary.rs:23`,
+  `:120`), one test helper and three in `xfr.rs`'s mocks. `XotName::parse` does
+  not move, so §15's startup check is untouched. `notify` is the sharpest case:
+  it links a TLS type solely to call `.is_some()` on it at `notify.rs:49` and
+  refuse `+tls=` on `--also-notify`; it needs the bit, not the name.
+
+  The alternative — moving the field off `MasterSpec` — costs 23 edits and
+  contradicts `secondary.rs:126`, which says `for_member` is a method *because*
+  `tls` is the field that would be forgotten. Declined on both counts.
+- **67d. `tsig` already needs nothing from `rdns`, which settles 66c's shape.**
+  Every `crate::` path in its production code resolves to `rdns-core`:
+  `crate::error` and `crate::clock` and nothing else — checked by stripping the
+  test module and listing them. So the module's whole dependency set is
+  **`rdns-core` + `ring` + `base64`**, and core already carries `base64`. There
+  are **no intra-crate references to untangle**; the only `rdns`-side mention is
+  `test_records::nm` in its own tests.
+
+  A client-only surface — sign a request, keep its MAC, check the reply — is
+  `sign_request` (`:770`), `request_mac` (`:794`) and `check_response` (`:803`),
+  costed at **≈575 of 1096 production lines**, of which **22 are `ring::hmac`**:
+  the algorithm table, key parsing, the RFC 8945 record, the framing and the
+  name and time helpers. What drops is the server and authorization half —
+  `TsigKeyring`, `TsigSession`, `check_request`, `UpdatePolicy`, the zone scopes.
+
+  `tsig.rs:3` gives the reason the module carries its own framing — "works on
+  bytes, not a parsed `crate::DnsMessage`: name compression is a choice, so a
+  re-serialized message is not the bytes that were sent" — and that reason is
+  *why* it needs nothing from `rdns`. The proposal rests on it rather than
+  arguing with it.
+- **67e. Declined, with the numbers, so nobody re-derives them.** §18: a
+  measurement taken and dropped is a measurement taken twice.
+  - `dnssec.rs`'s verify/parse seam: **441 no-crypto lines against 90** — typed
+    views, canonical form, `signed_data`, `key_tag`, the RFC 3110 key split,
+    against `verify` and `ds_digest`. Declined because the no-crypto half's only
+    consumers are `verify_rrset` and `dnssec_key::sign_rrset`, which are the
+    crypto half — and `dnssec.rs` reaches nothing in `rdns` anyway, so a crate
+    cut gets the whole module without the internal split.
+  - `zone_signer`: **2 production lines of 1342** are the crypto (`:1240` signs,
+    `:1083` hashes). Declined because parameterising over "a signer" makes the
+    module generic over its own purpose, and because its header (`:4`) records
+    that its output is judged by `verify_rrset`, `proves_nxdomain` and
+    `proves_nodata` unmodified — §1's "judge output with the reader", which a
+    split would cost.
+  - `nsec_cache` (4 hashing sites), `dnssec_chain` (6 `verify_rrset` calls),
+    `dnssec_validation_mode` (1) and `rfc5011` (3) all reach crypto only through
+    `dnssec` and `dnssec_denial`, and each would end up generic over the thing it
+    exists to do.
+  - `logging::watch_anomalies` is `logging`'s only `tokio` reach, 18 lines,
+    **2 callers**. Declined: `logging.rs:252` records that this facility spent a
+    year write-only because the loop had no owner (#30m), and two copies is what
+    §7 forbids.
+- **67f. Two dead public functions, and a test fixture that would drag `sha1`
+  into any new crate.** Found on the way; §18 says dead code is a finding and
+  not litter, so it is filed before it is deleted.
+  - `dnssec_denial::nsec3_owner_name` (`:51`, `pub`) has **no caller in the
+    workspace** — the only other mention is a doc link at `denial_wire.rs:213`.
+    Superseded by `nsec3_owner_name_at` (`:42`), which takes a `NameRef` and
+    builds no `String`.
+  - `dnssec_denial::nsec3_hash_in` (`:80`, `pub`) is called only by `nsec3_hash`
+    (`:71`) in the same file. Public for no consumer.
+  - `test_records.rs:4` says "Nothing cryptographic lives here" while `:87`
+    calls `nsec3_hash_name`. The three NSEC3 fixtures want moving to
+    `dnssec_test_util`, which already holds keys and signatures — **two `use`
+    lines** (`dnssec_denial.rs:843`, `nsec_cache.rs:983`), those two being the
+    only users. Without it, a crate cut's tests pull `sha1` back through the
+    fixtures and the measurement lies.
+- **67g. One finding outside the sweep's brief.**
+  `security::ResponseLimiter::tracked` (`security.rs:372`) reads a poisoned lock
+  as zero clients — `lock().map(..).unwrap_or(0)` — where the five decision
+  paths above it all use `let Ok(..) else` with a commented policy. It is
+  documented "for tests and diagnostics", so the stakes are low and the shape is
+  still §4's.
+
+**What this changes about the row.** The crate line was never the thing in the
+way. 67a-c are about a dozen lines of moves that take the free set from 9 to 21
+of 41 and cost no `Cargo.toml` a single edit; 67d says the one module `rdnsc`
+needs is already shaped for a move. Whether any of it should *become* a crate
+still turns on the binary-size figure this row is blocked on, which still needs
+66a. The difference is that after 67a-c the question can be answered on its
+merits instead of on accidents.
 
 **Two shapes worth building rather than arguing** (§19, and #63h's precedent —
 the recommended one lost): a third crate between core and `rdns` for wire plus
