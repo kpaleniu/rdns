@@ -131,7 +131,10 @@ the IXFR question. **Both of 57d's shapes are built** — branches
 `57d-shape-a` and `57d-shape-b` — and the install they differ over is 1 894 ms
 against 32.8 at a million rules, which turned out not to be what decides the
 row: memory is the same either way, and what is left is persistence and
-**which way EXPIRE fails for a blocklist**. The two-process path answers that
+**which way EXPIRE fails for a blocklist** — answered 2026-09-15 with a
+per-feed `on-expire` defaulting to `enforce`, which cannot be built before 57d
+itself, since the resolver holds no age for a feed at all. The two-process path
+answers that
 one today by accident — `withdraw` takes an expired zone out of `rdnsd`'s zone
 map and leaves the file, so `rdnsr` goes on enforcing it with no age for it
 anywhere. #58 is what 45b left, #59 what #51 left and #60
@@ -1086,7 +1089,7 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13, 57a-c closed, 57d-e open**
+### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13, 57a-c closed, 57d-e open with a remedy named**
 
 Also left behind by 45a, and the half of its own row that did not survive
 contact with the code. #45a said the pleasing part was the delivery mechanism —
@@ -1334,8 +1337,57 @@ Five items. 57a-c are done; 57d and 57e are what is left.
   `PolicyOverride::Passthru` make a feed an *allow*list, and a stale one of those
   fails open for exactly what it exempts. The safe direction is a statement about
   what a feed is for, so it belongs beside `policy` in `[[rpz.feeds]]`, per feed.
-  **Nothing built and no remedy claimed past that** (§18): what is established is
-  that a global rule and a default read off the rules are both wrong.
+  **The remedy, decided by the owner 2026-09-15: a setting per feed.** Not a
+  global rule and not a default derived from the rules — both were shown wrong
+  above. `[[rpz.feeds]]` gains a third key beside `file` and `policy`:
+
+  ```toml
+  [[rpz.feeds]]
+  file = "malware.rpz.zone"
+  master = "malware.rpz.example.@192.0.2.9"   # 57d
+  on-expire = "enforce"                       # or "lift"; enforce is the default
+  ```
+
+  `enforce` keeps the rules in force past EXPIRE; `lift` withdraws the feed, as
+  `rdnsd` does for an authoritative zone. The default is `enforce` on the
+  asymmetry argued above — lifting hits every client behind the resolver and is
+  triggerable by anyone who can blackhole the publisher, while enforcing hits
+  the listed names and is visible to whoever is blocked. An operator whose feed
+  is an allowlist sets `lift` and says so in the file, which is the whole point
+  of the key: `Action::Passthru` means the safe direction is a fact about what
+  a feed is *for*, and nothing in the zone carries that.
+
+  **What is already true, checked rather than assumed.** `PolicyZone` has
+  carried a `PolicyOverride` per feed since 45a, so the match path costs
+  nothing — the same grep that answered 63j. The config shape is there: an
+  `Option<String>` per field is §15's override, and `[rpz].policy` already
+  shows how a feed inherits when it says nothing.
+
+  **What has to exist first, and it is not the key.** `rdnsr` holds **no age
+  for a feed at all** — no last-contact time, no `refreshed_at`, nothing; the
+  sidecar and `dns_zone_last_refresh_timestamp_seconds` are `rdnsd`'s. So
+  `on-expire` has nothing to fire on until the resolver knows when the
+  publisher last spoke, which is 57d's transfer. **Filing the key without that
+  is filing a setting that cannot act**, and the mtime shortcut is refused for
+  the reason `secondary.rs` already gives: an unrelated touch resets the clock
+  and a copy preserves a timestamp describing the wrong event.
+
+  So the order is 57d first, `on-expire` with it, and neither alone. Under
+  shape A the age can come off the transfer task; under B likewise — it is the
+  same task either way, which is why this does not choose between them.
+
+  **What `enforce` owes, since it is the default** (§14, §4): the feed's age
+  has to be visible on the process enforcing it — a per-feed gauge on `rdnsr`,
+  `Option`-shaped so a feed that never transferred is `absent()` and not 1970.
+  A silently stale blocklist with no number on it is the condition this whole
+  finding is about, and defaulting to `enforce` without the gauge would ship it
+  deliberately.
+
+  **What would refute the key** (§19): a deployment where every feed wants the
+  same answer. Then `on-expire` is ceremony and a global setting would have
+  done. The case that decides it is a feed made of `rpz-passthru` rules — an
+  allowlist — and this tree has never been pointed at one. If none exists in
+  the wild, the per-feed shape is wrong and the default is the whole answer.
 
   **A and B are built — 2026-09-15, branches `57d-shape-a` and `57d-shape-b`,
   both off `57d-measure`.** §19: arguing costs more than compiling, and what
