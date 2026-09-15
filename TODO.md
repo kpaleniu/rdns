@@ -1972,10 +1972,11 @@ remaining work is a `TODO.md` item, or it is deleted", found by going to look.
   other 13 agreements are not a defect to fix.
 
 - **63h. The shapes, built — 2026-09-15.** §19: arguing costs more than
-  compiling, and what decided this was in neither argument. Three branches, each
-  compiling, clippy-clean under `--all-targets` and passing the suite:
-  `wip/63-shape-a` (929f544, 76f69b7), `wip/63-shape-b` (1d6e0e5),
-  `wip/63-shape-c` (4d469d9).
+  compiling, and what decided this was in neither argument. Three shapes, each
+  compiling, clippy-clean under `--all-targets` and passing the suite. The two
+  that were declined are kept as branches — `wip/63-shape-a` (929f544,
+  76f69b7) and `wip/63-shape-b` (1d6e0e5); C's branch is deleted, because it is
+  in main (c8ac8eb, b7c62a3, 1e511d0).
 
   The same feature in all three, so only the shape differs: `rdnsr --config`
   with `[server]`, `[resolver]` and `[rpz]`, `deny_unknown_fields` throughout,
