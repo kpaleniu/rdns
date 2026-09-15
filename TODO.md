@@ -139,10 +139,10 @@ teaches `rdnsc` to write what it already transfers correctly, **and the owner
 decided the same day that it gets TSIG**: 5 packages and, the part that is not
 a count, a C toolchain in its build. #67 is the consequence — the first thing
 that is not a daemon now links crypto, so where the crate line belongs is a
-measurement, **taken the same day, and then swept module by module**: almost
-every heavy edge in `rdns` is incidental, and 67a-c undo the three that matter
-for about a dozen moved lines — the free set goes 9 of 41 to 21. What the
-measurement itself said: `rdnsc` linking `rdns` outright would cost
+measurement, **taken the same day, swept module by module, and 67a-c landed**:
+almost every heavy edge in `rdns` was incidental, and undoing the three that
+mattered took the free set from 9 of 41 to **23**, for no package and no
+binary. What the measurement itself said: `rdnsc` linking `rdns` outright would cost
 +38 packages and 47% of its binary, so that is out; the tangle inside `rdns` is
 one edge and costs nothing; and the figure that would decide a split needs 66a
 to exist, so **66a goes first and #67 finishes after it**. **#60 closed 2026-09-14**: 19 flattened messages put back
@@ -2739,7 +2739,7 @@ from **9 of 41 to 21 of 41** for roughly a dozen moved lines, none of which is a
 crate change. Every count below was re-checked before being written down.
 
 - **67a. `Nsec3Hash` is not cryptography, and it is the only reason `zone`
-  reaches `sha1`.** `dnssec_denial.rs:220` is a `[u8; 20]` newtype with
+  reaches `sha1`. — done 2026-09-15.** `dnssec_denial.rs:220` is a `[u8; 20]` newtype with
   `from_wire` and `as_bytes`, derives only, **no trait impls at all** — it
   hashes nothing. `zone.rs` uses it at 5 sites (`:30`, `:138` as a `BTreeMap`
   key, `:259`, `:398`, `:423`), and `:423` already sits beside
@@ -2757,7 +2757,7 @@ crate change. Every count below was re-checked before being written down.
   layer does not need `sha1`, and a presentation split does not have to avoid
   `Zone` after all. All nine of those modules become dependency-free.
 - **67b. `rdns::error` sheds `tokio` for five deleted lines and two changed
-  ones.** The hub edge measured above is two impls, and they are not equal.
+  ones. — done 2026-09-15.** The hub edge measured above is two impls, and they are not equal.
   `From<Elapsed> for TransferError` (`error.rs:155`) has **no user**: `Elapsed`
   is named nowhere in the workspace outside `error.rs` itself, and all three
   `TransferResult`-returning timeout sites (`xfr.rs:609`, `:631`, `:663`) use an
@@ -2775,7 +2775,7 @@ crate change. Every count below was re-checked before being written down.
   presentation and runtime layers (`ixfr.rs:11`, `transfer.rs:9` against
   `xfr.rs:8`, `xot.rs:70`), so moving it would push `tokio` *into* the
   presentation layer.
-- **67c. `XotName` is a name, not a TLS stack.** `endpoint`, `secondary` and
+- **67c. `XotName` is a name, not a TLS stack. — done 2026-09-15.** `endpoint`, `secondary` and
   `notify` are in the runtime layer for one reason: `Endpoint.tls` and
   `MasterSpec.tls` hold an `xot::XotName`, which is a
   `rustls::pki_types::ServerName` plus the operator's text. `rustls-pki-types`
@@ -2856,6 +2856,34 @@ crate change. Every count below was re-checked before being written down.
   paths above it all use `let Ok(..) else` with a commented policy. It is
   documented "for tests and diagnostics", so the stakes are low and the shape is
   still §4's.
+
+**67a-c landed 2026-09-15, and the free set is 23 of 41** — measured with the
+same pass that proposed them, not predicted. Three things the proposals could
+not know without compiling, all cheap and all worth the record:
+
+- 67a needed a constructor. `hash_wire` builds the value from the array it just
+  filled, which a private field in another module no longer allows, so
+  `Nsec3Hash::from_octets` exists — total, where `from_wire` on a known-good
+  array would be an `expect` on an infallible path (§4). And `cargo doc` caught
+  the upward doc link the pass predicted, which is the one claim in the recipe
+  a compiler checks for free.
+- 67c needed a *dependency*, not just a move. The pass said `tls_identity`'s
+  "only dependency is already `rustls-pki-types`" — it reaches those types
+  through `rustls`, like everything else here, so holding a `ServerName`
+  without the TLS stack meant naming `rustls-pki-types` directly. It was
+  already in the tree through `rustls`, so it costs nothing: `rdns` 55 packages
+  before and after, both daemons 113. The type went to `endpoint` rather than
+  beside `tls_identity`, because `endpoint` is what parses it and `xot` never
+  imported `endpoint`, so there is no cycle to argue about.
+- **The count was 24 predicted and 23 measured.** `notify` leaves the TLS stack
+  and stays out of the free set, because it reaches `ring` through `tsig` — it
+  signs the NOTIFY. A real crypto edge, and not the one 67c was about.
+
+  Verified on both platforms, since all three touch modules one side compiles
+  differently (§1): **1 186 passing on Windows and 1 206 on Linux**, clippy
+  clean over `--all-targets` on both, `cargo doc` clean. The 20-test gap is the
+  `cfg(unix)` half — the permission checks and `rdnsd`'s control socket — which
+  is the same tell that number has always been.
 
 **What this changes about the row.** The crate line was never the thing in the
 way. 67a-c are about a dozen lines of moves that take the free set from 9 to 21
