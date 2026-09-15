@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#64**, **#66**, **#67** and **#21**, as of
-2026-09-15.
+**#57**, **#58**, **#59**, **#64**, **#66**, **#67**, **#68** and **#21**, as
+of 2026-09-15.
 **#61 closed the day it was filed**: the reload is 3.76x faster and holds
 68 MB less per million rules, and rayon was measured and declined.
 **#62 closed the day after it was filed**, all three rows. 62a was the one on
@@ -955,8 +955,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59**, **#64**, **#66** and **#67**, plus **#21** — see
-"What is open" above, which is the same list and the only place it is written
+**#57**, **#58**, **#59**, **#64**, **#66**, **#67** and **#68**, plus
+**#21** — see "What is open" above, which is the same list and the only place it is written
 down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
 numbers are stable identifiers referenced from the code, so they move rather
@@ -2573,7 +2573,7 @@ unknown, and taking it is the thing that would reopen this.
 
 ---
 
-### 66. `rdnsc` cannot write what it transfers — **filed 2026-09-15**
+### 66. `rdnsc` cannot write what it transfers — **filed 2026-09-15, 66a closed**
 
 Out of #57d, and out of the question that row never asked: *what does an
 operator who only wants a resolver actually run?*
@@ -2594,7 +2594,10 @@ id check on messages after the first, a refusal detected before the read
 timeout. What it does with the records is `println!("{rr:?}")`: Rust's `Debug`,
 which no parser reads. Two things are missing, and only one of them is cheap.
 
-- **66a. Record-level presentation is in the wrong crate.** `record_to_string`
+- **66a. Record-level presentation is in the wrong crate. — done 2026-09-15**,
+  in two steps: `record_line` taking the four fields rather than either record
+  type, then the move, which landed as `rdns-present` under #67's decision
+  below. `rdnsc` can now render a record with one crate and 46 KB. `record_to_string`
   needs `codecs` and `record_types`, both already in `rdns-core`, plus
   `denial_wire`'s base32hex and type-bitmap encoders and `format_dnssec_time`.
   **None of that is crypto** — `denial_wire` holds no hash, `Nsec3Hash` is
@@ -2893,17 +2896,87 @@ still turns on the binary-size figure this row is blocked on, which still needs
 66a. The difference is that after 67a-c the question can be answered on its
 merits instead of on accidents.
 
-**Two shapes worth building rather than arguing** (§19, and #63h's precedent —
+~~**Two shapes worth building rather than arguing** (§19, and #63h's precedent —
 the recommended one lost): a third crate between core and `rdns` for wire plus
 presentation plus transaction authentication, against simply widening
-`rdns-core` and letting `ring` into it. Neither is obviously right, and the one
-that sounds tidier is the one that adds a crate.
+`rdns-core` and letting `ring` into it.~~ **Both built 2026-09-15** — for the
+presentation half; the `ring` half is 66c's and untaken.
+**Decided 2026-09-15: the fourth crate, `rdns-present`, and it is on `main`.**
+Both shapes were built, measured the same way and run green; the branch that
+lost is kept at `67-shape-core` with its own commit message, as #63h's were.
+
+`rdnsc` with record presentation reachable, release, against 814 080 bytes and
+34 packages today:
+
+| | bytes | packages |
+|---|---|---|
+| **`rdns-present`** | **860 160** (+46 KB) | **35** (+1) |
+| into `rdns-core` | 861 696 (+47.6 KB) | 34 (+0) |
+| depending on `rdns` | 1 199 104 (+385 KB) | 72 (+38) |
+
+**The size did not decide it.** The two shapes are 1.5 KB apart, and the only
+figure that matters is that both are ~8x cheaper than letting `rdnsc` link the
+server library — so the linker does *not* strip a dependency on `rdns` down to
+what is called. That settles the refutation this row was filed with ("if that
+is 50 KB then a new crate buys a manifest that reads better and nothing else"):
+46 KB against 385 is the comparison, and the split earns its place.
+
+**What decided it was a thing no argument had surfaced.** Seven `svcb` tests
+round-trip through the zone *parser*, which is `rdns`'s. A dev-dependency back
+on `rdns` carries them in the fourth-crate shape — cargo permits the cycle —
+and does not in the other, because there the cycle runs *through the crate
+under test*: cargo builds a second instance of `rdns-core`, and `crate::Rtype`
+stops being `rdns::Rtype` (`expected rdns::Rtype, found codes::Rtype`). Those
+seven had to leave the module they test. That is #20's rule broken by a crate
+boundary rather than by anybody's decision, and it is the kind of thing §19
+says only building finds.
+
+Two smaller costs, the same in both shapes and worth knowing before the next
+one: **8 `pub(crate)` items became `pub`**, which is #38's sweep in reverse;
+and doc links stopped resolving upward — four in the shape that landed, six in
+the other — every one caught by `cargo doc --no-deps` and rewritten as prose.
+That is the cost that is invisible unless the command in the recipe is run.
+
+Verified on both platforms after the merge: **1 186 passing on Windows and
+1 206 on Linux**, clippy clean over `--all-targets`, `cargo doc` clean,
+`cargo fmt --check` clean. `rdns`'s own lib count drops 733 to 714 on Linux
+because 19 tests went to `rdns-present` with the code they test.
+
+**What is left of #67.** 67d says `tsig` is already shaped for the same move —
+its production code names nothing outside `rdns-core` — and that is 66c's
+prerequisite, not this row's. 67f's dead code and 67g's poisoned-lock getter
+are unrelated and still open. The layering table above is now two rows shorter
+in practice: `denial_wire`, `svcb`, `dnssec_time` and `record_text` are
+`rdns-present`'s, and what is left in `rdns` under "zone and presentation" is
+the half that needs a `Zone`.
 
 **The limits this row inherits.** §14: count what a dependency does at run
 time, not how it reads in a manifest. §17: do not restructure on a smell — the
 `rdns` library is large (zone, DNSSEC, resolver, cache, xfr, RPZ, metrics) and
 that is a different complaint from this one, with no measurement behind it yet.
 A split that makes the graph prettier and no binary smaller has bought nothing.
+
+---
+
+### 68. A socket test that binds a real port fails under a parallel suite — **filed 2026-09-15**
+
+`rdns_transport::metrics_server::tests::a_server_with_nothing_to_wait_for_is_ready_at_once`
+failed once during a `cargo test --workspace` run and passed on the two runs
+after it, on three runs of its own crate's suite and on three of the module
+alone. Not caused by the change it was seen under (#67's crate move touches
+nothing in `rdns-transport`); seen there, so filed there.
+
+It binds a listener and scrapes it over TCP, which is what makes it worth
+having and also what makes it the one shape `CLAUDE.md` §10 warns about: under
+a whole-workspace run every test binary is competing for ephemeral ports and
+for the scheduler, and the assertion has no headroom.
+
+**Not diagnosed.** What is known is the failure mode (one run in five, under
+load) and what it is not (a lint, a platform, or this week's changes). What
+would settle it is reading `start()` and `scrape()` for where the wait is —
+whether the server is accepting before the scrape connects — rather than
+raising a timeout, which §10 says is how a tripwire gets ratified into a
+regression.
 
 ---
 
