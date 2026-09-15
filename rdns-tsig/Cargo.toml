@@ -1,0 +1,14 @@
+[package]
+name = "rdns-tsig"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TSIG: authenticating a DNS transaction with a shared secret (RFC 8945). The client half and the server half, over the bytes that were sent."
+
+[dependencies]
+rdns-core.workspace = true
+# The MAC, and nothing else — 22 of this crate's lines call it.
+ring = "0.17"
+# A secret is written in base64. Already in the tree through `rdns-core`.
+base64 = "0.22"

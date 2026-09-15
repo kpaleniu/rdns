@@ -2573,7 +2573,7 @@ unknown, and taking it is the thing that would reopen this.
 
 ---
 
-### 66. `rdnsc` cannot write what it transfers — **filed 2026-09-15, 66a and 66b closed**
+### 66. `rdnsc` cannot write what it transfers — **filed and closed 2026-09-15**
 
 Out of #57d, and out of the question that row never asked: *what does an
 operator who only wants a resolver actually run?*
@@ -2631,24 +2631,52 @@ which no parser reads. Two things are missing, and only one of them is cheap.
   NOTIFY, so whatever calls this is on cron's clock and not the publisher's;
   no TSIG until 66c. It does not close #57d and is not meant to.
 
-  **What is left: the rename.** Writing to a path that a running `rdnsr`
-  re-reads wants `persist::write_atomically_str`, which is `rdns`'s and has no
-  intra-crate dependencies at all — so it is a move, not a rewrite. It is not
-  done here because **66c forces the same move anyway**: a TSIG secret read
-  from a file needs `persist::ensure_private`, which is §15's mode check. Both
-  land together or the module gets moved twice.
+  ~~**What is left: the rename.**~~ **Landed with 66c**, which is why it was
+  left: `persist` moved to `rdns-core` for §15's mode check, and `--write PATH`
+  then cost fifteen lines. `> file` truncates in place, so a resolver that
+  re-reads mid-write sees half a zone; a rename is the old file or the new one.
+  The transfer is held in memory when a path is given, because a rename needs
+  the whole thing first — a million-record zone is ~45 MB of text
+  (`rdns/tests/scale.rs`), which is a CLI's business and not a daemon's.
 - **66c. TSIG, and it is the expensive one. Decided 2026-09-15: `rdnsc` gets
-  it.** Without it `rdnsc` can only fetch from masters that authenticate by
+  it. — done 2026-09-15, and it cost more than this row said.** Without it `rdnsc` can only fetch from masters that authenticate by
   address, which is not how a keyed commercial feed is delivered — so the
   option exists in form and not in practice.
 
-  **Measured before the decision, not after:** `ring` costs 5 packages
+  ~~**Measured before the decision, not after:** `ring` costs 5 packages
   (`ring`, `untrusted`, `cc`, `find-msvc-tools`, `shlex`), taking `rdnsc` from
-  **34 to 39**. The count is not the cost. `cc` is: **`rdnsc` builds today with
-  no C toolchain and will not afterwards**, which is a property of the code and
-  true on every machine. It also brings §15's secret-file mode check into a
-  third binary, and that check is the reason a secret in a file beats one in
-  `argv` at all.
+  **34 to 39**.~~ **39 was right about `ring` and wrong about the total**: with
+  `rdns-tsig` and `rdns-present` it is **41**, and the figure the row did not
+  take at all is the binary — **862 208 bytes to 1 259 520, +397 KB for the
+  MAC**, where the whole presentation layer was +48. `rdnsc` is 814 080 bytes
+  before any of #66 and 1 259 520 after: **+55%**.
+
+  The count was never the cost, and this row said so about the wrong thing.
+  `cc` is still the durable one — **`rdnsc` built with no C toolchain before
+  this and does not now** — but 397 KB is what an operator actually ships.
+  `rdnsctl` is untouched at 34 packages, which is the whole reason TSIG is its
+  own crate rather than `rdns-core`'s.
+
+  **What landed.** `rdns-tsig`, exactly as 67d measured it: every `crate::`
+  path in the module resolved to `rdns-core`, so the move was a rename of
+  paths and nothing else, and its 27 tests came with it. `persist` moved to
+  `rdns-core` for §15's mode check — it has no intra-crate dependencies, and
+  core already holds `socket` and `clock`, which are the same kind of shared
+  infrastructure. `rdnsc` signs the request, keeps its MAC, and verifies
+  **every** envelope of a transfer, refusing an unsigned one rather than
+  accepting it unauthenticated — `rdns::xfr`'s rule and the same sentence (§7).
+
+  **A defect the tests found, which is a platform trap in a new place** (§1):
+  the first shape was `--tsig-file [alg:]name:path`, and **a Windows path
+  carries a colon**, so `rsplit_once(':')` cut the spec in a different place on
+  the two platforms. It is `--tsig-file PATH` with `--tsig-name NAME` now, and
+  clap's `requires` ties them.
+
+  **The fixture problem for the third time** (#67f): `rdns::test_records::nm`
+  is `#[cfg(test)]`, so no other crate can see it, and `rdns-tsig`'s tests
+  carry three lines of their own. `testutil::ScratchDir` went the other way —
+  moved to `rdns-core` and made `pub`, because duplicating it is what that
+  module exists to have stopped.
 
 ---
 

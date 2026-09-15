@@ -9,6 +9,7 @@ description = "DNS above the wire: zone files, DNSSEC, transfers, the resolver a
 [dependencies]
 rdns-core.workspace = true
 rdns-present.workspace = true
+rdns-tsig.workspace = true
 thiserror = "2.0"
 rand = "0.8"
 

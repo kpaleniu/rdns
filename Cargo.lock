@@ -1112,6 +1112,7 @@ dependencies = [
  "rcgen",
  "rdns-core",
  "rdns-present",
+ "rdns-tsig",
  "ring",
  "rustls",
  "rustls-pki-types",
@@ -1161,6 +1162,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rdns-tsig"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "rdns-core",
+ "ring",
+]
+
+[[package]]
 name = "rdnsc"
 version = "0.1.0"
 dependencies = [
@@ -1169,6 +1179,7 @@ dependencies = [
  "rdns",
  "rdns-core",
  "rdns-present",
+ "rdns-tsig",
 ]
 
 [[package]]

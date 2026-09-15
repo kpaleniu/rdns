@@ -14,7 +14,12 @@ pub use rdns_core::*;
 // paths it had, because 11 modules here name them and none of them cares which
 // crate the encodings live in.
 pub use rdns_present::record_text;
+// `persist` is `rdns-core`'s since `TODO.md` #66c: writing a file a reader
+// cannot catch half-written, and refusing to read a secret anyone can, are
+// things a *client* needs too. Re-exported under the path it had.
+pub use rdns_core::persist;
 pub use rdns_present::{denial_wire, svcb};
+pub use rdns_tsig as tsig;
 
 #[cfg(test)]
 mod bench;
@@ -43,7 +48,6 @@ pub mod metrics;
 pub mod negative_cache;
 pub mod notify;
 pub mod nsec_cache;
-pub mod persist;
 pub mod readiness;
 pub mod resolver;
 pub mod rfc5011;
@@ -56,11 +60,8 @@ pub mod special_names;
 #[cfg(test)]
 mod test_records;
 /// Scratch directories, for tests only.
-#[cfg(test)]
-mod testutil;
 pub mod tls_identity;
 pub mod transfer;
-pub mod tsig;
 pub mod update;
 pub mod xfr;
 pub mod xot;

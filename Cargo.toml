@@ -3,6 +3,7 @@ members = [
     "rdns",
     "rdns-core",
     "rdns-present",
+    "rdns-tsig",
     "rdns-transport",
     "rdnsc",
     "rdnsctl",
@@ -28,6 +29,7 @@ rust-version = "1.95"
 rdns = { path = "rdns", version = "0.1.0" }
 rdns-core = { path = "rdns-core", version = "0.1.0" }
 rdns-present = { path = "rdns-present", version = "0.1.0" }
+rdns-tsig = { path = "rdns-tsig", version = "0.1.0" }
 rdns-transport = { path = "rdns-transport", version = "0.1.0" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }

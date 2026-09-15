@@ -21,10 +21,12 @@ pub mod ede;
 pub mod error;
 pub mod name;
 pub mod name_keys;
+pub mod persist;
 mod record_data;
 pub mod record_types;
 pub mod response;
 pub mod socket;
+pub mod testutil;
 pub mod text_names;
 pub mod validation;
 

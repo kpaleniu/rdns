@@ -14,6 +14,9 @@ rdns-core.workspace = true
 # `{:?}` (`TODO.md` #66b). One package and 46 KB; depending on `rdns` for the
 # same function measured at 38 packages and 385 KB (#67).
 rdns-present.workspace = true
+# TSIG, so a transfer can be signed (`TODO.md` #66c). `ring` is what this costs
+# — 5 packages and a C toolchain in the build, measured before the decision.
+rdns-tsig.workspace = true
 
 [dev-dependencies]
 # For the one thing a client cannot check on its own: that what it prints is

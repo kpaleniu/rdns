@@ -1,6 +1,6 @@
 //! TSIG: authenticating a DNS message with a shared secret (RFC 8945).
 //!
-//! Works on bytes, not a parsed [`crate::DnsMessage`]: name compression is a
+//! Works on bytes, not a parsed [`rdns_core::DnsMessage`]: name compression is a
 //! choice, so a re-serialized message is not the bytes that were sent.
 //!
 //! What the digest covers (RFC 8945 §4.3.3, §5.4.2):
@@ -15,22 +15,22 @@
 //! signed, fudge, error and other data; "timers only" is the time signed and the
 //! fudge, used for every message after the first in a transfer (§5.3.1).
 
-use crate::error::{ConfigError, ConfigResult};
+use rdns_core::error::{ConfigError, ConfigResult};
 
 /// A name from config, as uncompressed wire octets.
 ///
-/// Through [`crate::Name`], which is the one text-to-wire door: RFC 8945's key
+/// Through [`rdns_core::Name`], which is the one text-to-wire door: RFC 8945's key
 /// and algorithm names are domain names, and the digest covers their encoded
 /// form. `dname_to_bytes` was a second decoder that refused RFC 1035 §5.1's
 /// escapes, so the two disagreed about what a key name meant.
-fn name_wire(name: &str) -> crate::error::WireResult<Vec<u8>> {
-    Ok(crate::Name::from_presentation(name)?
+fn name_wire(name: &str) -> rdns_core::error::WireResult<Vec<u8>> {
+    Ok(rdns_core::Name::from_presentation(name)?
         .as_ref()
         .as_wire()
         .to_vec())
 }
-use crate::clock::current_unix_timestamp;
 use base64::Engine;
+use rdns_core::clock::current_unix_timestamp;
 use ring::hmac;
 
 /// The TSIG pseudo-record type. A meta-type: no zone ever holds one.
@@ -981,7 +981,7 @@ fn tsig_record_len(
     other_len: usize,
 ) -> usize {
     let wire_len = |name: &str| {
-        crate::Name::from_presentation(name)
+        rdns_core::Name::from_presentation(name)
             .map(|n| n.as_ref().as_wire().len())
             // A name's wire form is never longer than its text plus two, which
             // is the bound `transfer::Envelopes` packs against.
@@ -1097,9 +1097,14 @@ pub fn now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record_types as rt;
-    use crate::test_records::nm;
-    use crate::{DnsMessage, DnsMessageBuilder, Qtype, Rtype};
+    use rdns_core::record_types as rt;
+    /// `rdns::test_records::nm`, which is `#[cfg(test)]` there and so invisible
+    /// across a crate boundary (`TODO.md` #66c, and #67f's fixture problem for
+    /// the third time).
+    fn nm(text: &str) -> rdns_core::Name {
+        rdns_core::Name::from_presentation(text).expect("a name")
+    }
+    use rdns_core::{DnsMessage, DnsMessageBuilder, Qtype, Rtype};
 
     fn test_key() -> TsigKey {
         // 32 bytes, the natural length for HMAC-SHA256.
@@ -1135,7 +1140,7 @@ mod tests {
         for pad in 0..250usize {
             let mut msg = DnsMessage::try_from_bytes(&query_bytes(
                 "big.example.com.",
-                Qtype::of(crate::record_types::TXT),
+                Qtype::of(rdns_core::record_types::TXT),
             ))
             .expect("a query parses");
             msg.response = true;
@@ -1143,11 +1148,11 @@ mod tests {
             let chunks = 255;
             let mut strings: Vec<Vec<u8>> = (0..chunks).map(|_| filler.clone()).collect();
             strings.push(vec![b'y'; pad]);
-            msg.answers.push(crate::ResourceRecord {
+            msg.answers.push(rdns_core::ResourceRecord {
                 name: nm(&nm("big.example.com.").to_string()),
-                class: crate::Class::new(1),
-                ttl: crate::Ttl::from_secs(60),
-                rdata: crate::RecordData::from_parsed(&crate::ParsedRecord::TXT(strings))
+                class: rdns_core::Class::new(1),
+                ttl: rdns_core::Ttl::from_secs(60),
+                rdata: rdns_core::RecordData::from_parsed(&rdns_core::ParsedRecord::TXT(strings))
                     .expect("a TXT encodes"),
             });
 
@@ -1166,7 +1171,7 @@ mod tests {
                         "a signature that fits must actually fit: {} octets",
                         signed.len()
                     );
-                    let framed = crate::framed(&signed).expect("and frames");
+                    let framed = rdns_core::framed(&signed).expect("and frames");
                     let prefix = u16::from_be_bytes([framed[0], framed[1]]) as usize;
                     assert_eq!(
                         prefix,
@@ -1204,10 +1209,10 @@ mod tests {
 
         let mut msg = DnsMessage::try_from_bytes(&query_bytes(
             "www.example.com.",
-            Qtype::of(crate::record_types::A),
+            Qtype::of(rdns_core::record_types::A),
         ))
         .expect("the query parses");
-        msg.set_edns(crate::Edns::with_payload_size(1232));
+        msg.set_edns(rdns_core::Edns::with_payload_size(1232));
         assert!(msg.edns().is_some(), "the message really carries an OPT");
 
         let unsigned = msg.to_bytes_within(512).expect("serialize");

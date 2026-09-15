@@ -2,6 +2,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -13,6 +14,7 @@ use rdns_core::validation::{answers_query, SentQuery};
 use rdns_core::Name;
 use rdns_core::{DnsMessage, DnsMessageBuilder, ExtendedError, Qtype, ResponseCode};
 use rdns_present::record_text;
+use rdns_tsig::{self as tsig, TsigKey};
 
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -30,6 +32,37 @@ struct Cli {
     /// Without it a server is required not to send RRSIG, NSEC or NSEC3.
     #[arg(long)]
     pub dnssec: bool,
+    /// Write a transfer to this path instead of stdout, atomically: a
+    /// temporary beside it, fsynced, then renamed over.
+    ///
+    /// For the file a running resolver re-reads. `> file` truncates in place,
+    /// so a reader that loads it mid-write sees half a zone; a rename is
+    /// either the old file or the new one (`rdns_core::persist`).
+    #[arg(long, value_name = "PATH")]
+    pub write: Option<String>,
+    /// Sign the request with a TSIG key: `[algorithm:]name:secret`
+    /// (RFC 8945). The default algorithm is hmac-sha256.
+    ///
+    /// The secret is in `argv`, where anyone on the machine can read it out of
+    /// `ps` — use `--tsig-file` for anything but a test.
+    #[arg(short = 'y', long, value_name = "SPEC", conflicts_with = "tsig_file")]
+    pub tsig: Option<String>,
+    /// The same, with the secret read from a file rather than from `argv`.
+    /// Needs `--tsig-name`; the file holds the base64 secret and nothing else.
+    ///
+    /// The file must not be readable by anyone but its owner, and is refused
+    /// if it is — a secret in a file is only better than one in `argv` if the
+    /// file is private (`CLAUDE.md` §15). Windows has no equivalent of the
+    /// mode, so there it is not checked and nothing pretends it was.
+    ///
+    /// A separate flag from the name, and not `name:path`: a Windows path
+    /// carries a colon, so a colon-separated spec with a path in it parses
+    /// differently on the two platforms.
+    #[arg(long, value_name = "PATH", requires = "tsig_name")]
+    pub tsig_file: Option<String>,
+    /// The key `--tsig-file`'s secret belongs to: `[algorithm:]name`.
+    #[arg(long, value_name = "NAME", requires = "tsig_file")]
+    pub tsig_name: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -75,11 +108,37 @@ fn main() -> Result<()> {
     let len = request
         .to_bytes(&mut buf)
         .context("serializing the query")?;
-    let query = &buf[..len];
+    // Signed before anything else touches it: TSIG covers the bytes that go on
+    // the wire, and the MAC of the request is what the reply's signature is
+    // computed over (RFC 8945 §5.4.1).
+    let key = signing_key(&args)?;
+    let signed;
+    let query: &[u8] = match &key {
+        Some(key) => {
+            signed = tsig::sign_request(buf[..len].to_vec(), key, tsig::now())
+                .context("signing the query")?;
+            &signed
+        }
+        None => &buf[..len],
+    };
+    let request_mac = key
+        .as_ref()
+        .map(|_| {
+            tsig::request_mac(query)
+                .ok_or_else(|| anyhow!("the signed query carries no TSIG to bind the reply to"))
+        })
+        .transpose()?;
 
     if transfer {
         // RFC 5936 §4.2: AXFR is TCP only, and a zone is not one message.
-        return read_transfer(server, query, &request);
+        return read_transfer(
+            server,
+            query,
+            &request,
+            key.as_ref(),
+            request_mac.as_deref(),
+            args.write.as_deref(),
+        );
     }
 
     let response = ask_over_udp(server, query, &request)?;
@@ -151,7 +210,7 @@ fn ask_over_udp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
 /// The same exchange over TCP, with the RFC 1035 §4.2.2 length prefix.
 fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Result<DnsMessage> {
     let mut stream = send_over_tcp(server, query)?;
-    let message = read_framed(&mut stream)?
+    let (_packet, message) = read_framed(&mut stream)?
         .ok_or_else(|| anyhow!("{server} closed the connection without answering"))?;
     // The connection identifies the peer, but the id and question still catch
     // a stale message left in the stream.
@@ -177,14 +236,27 @@ fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
 /// transfer; no IXFR; no NOTIFY, so whatever calls this is on its own timer;
 /// and no TSIG yet (#66c). A feed refreshed this way is refreshed when cron
 /// says so, not when the publisher does.
-fn read_transfer(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Result<()> {
+fn read_transfer(
+    server: SocketAddr,
+    query: &[u8],
+    request: &DnsMessage,
+    key: Option<&TsigKey>,
+    request_mac: Option<&[u8]>,
+    write_to: Option<&str>,
+) -> Result<()> {
     let mut stream = send_over_tcp(server, query)?;
+    // Held rather than streamed when a file is being written: the rename is
+    // what makes a reader safe, and a rename needs the whole thing first.
+    let mut held = String::new();
+    // The reply's signature is over the request's MAC; every envelope after the
+    // first is over the one before it (RFC 8945 §5.3.1).
+    let mut previous_mac = request_mac.map(|m| m.to_vec()).unwrap_or_default();
     let mut soas = 0;
     let mut records = 0;
     let mut first = true;
 
     while soas < 2 {
-        let Some(message) = read_framed(&mut stream)? else {
+        let Some((packet, message)) = read_framed(&mut stream)? else {
             bail!("the transfer stopped after {records} records, with no closing SOA");
         };
         // A refusal is one message with an rcode and no records, and looking for
@@ -195,6 +267,20 @@ fn read_transfer(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resu
                 message.rcode,
                 extended_errors(&message)
             );
+        }
+        if let Some(key) = key {
+            // Refused rather than accepted unauthenticated: RFC 8945 §5.3.1
+            // lets an intermediate envelope go unsigned, but it still enters
+            // the next signed digest, which `check_response` cannot see. This
+            // is `rdns::xfr`'s rule, and the same sentence (`CLAUDE.md` §7).
+            previous_mac = tsig::check_response(&packet, key, &previous_mac, first, tsig::now())
+                .map_err(|e| {
+                    anyhow!(
+                        "the transfer's signature failed: {}. A configured key \
+                         means every envelope must be signed",
+                        e.reason()
+                    )
+                })?;
         }
         if first {
             matches_request(&message, request)
@@ -208,11 +294,62 @@ fn read_transfer(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resu
 
         for line in transfer_lines(&message, &mut soas)? {
             records += 1;
-            println!("{line}");
+            if write_to.is_some() {
+                held.push_str(&line);
+                held.push('\n');
+            } else {
+                println!("{line}");
+            }
         }
     }
-    eprintln!("transfer complete: {records} records");
+    if let Some(path) = write_to {
+        rdns_core::persist::write_atomically_str(Path::new(path), &held)
+            .with_context(|| format!("writing {path}"))?;
+        eprintln!("transfer complete: {records} records written to {path}");
+    } else {
+        eprintln!("transfer complete: {records} records");
+    }
     Ok(())
+}
+
+/// The key to sign with, from whichever flag named one.
+///
+/// `--tsig-file` takes `[algorithm:]name:path` and reads the secret out of the
+/// file, which is refused unless it is private to its owner — the check is
+/// `rdns_core::persist::ensure_private`, the same one `rdnsd` applies to a
+/// secret and to a DNSSEC private key (`CLAUDE.md` §7, §15). Both forms end at
+/// `TsigKey::parse`, so the two cannot disagree about what a spec means.
+fn signing_key(args: &Cli) -> Result<Option<TsigKey>> {
+    if let Some(spec) = &args.tsig {
+        return Ok(Some(TsigKey::parse(spec).context("--tsig")?));
+    }
+    let Some(path) = &args.tsig_file else {
+        return Ok(None);
+    };
+    // clap's `requires` makes this unreachable, and saying so beats an
+    // `expect` that claims the parser checked something it did not.
+    let name = args
+        .tsig_name
+        .as_deref()
+        .ok_or_else(|| anyhow!("--tsig-file needs --tsig-name to say which key the secret is"))?;
+    let secret = read_secret(Path::new(path))?;
+    Ok(Some(
+        TsigKey::parse(&format!("{name}:{secret}")).context("--tsig-file")?,
+    ))
+}
+
+/// The secret in `path`, refusing a file anyone else can read.
+fn read_secret(path: &Path) -> Result<String> {
+    rdns_core::persist::ensure_private(path, "a TSIG secret")
+        .with_context(|| format!("{}", path.display()))?;
+    let secret = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?
+        .trim()
+        .to_string();
+    if secret.is_empty() {
+        bail!("{} is empty", path.display());
+    }
+    Ok(secret)
 }
 
 /// One message's answer section as zone-file lines, counting the SOAs that
@@ -251,7 +388,7 @@ fn send_over_tcp(server: SocketAddr, query: &[u8]) -> Result<TcpStream> {
 
 /// One length-prefixed message, or `None` when the peer closed cleanly between
 /// messages — which is the end of a stream and not a failure to report.
-fn read_framed(stream: &mut TcpStream) -> Result<Option<DnsMessage>> {
+fn read_framed(stream: &mut TcpStream) -> Result<Option<(Vec<u8>, DnsMessage)>> {
     let mut prefix = [0u8; 2];
     match stream.read_exact(&mut prefix) {
         Ok(()) => {}
@@ -262,9 +399,11 @@ fn read_framed(stream: &mut TcpStream) -> Result<Option<DnsMessage>> {
     stream
         .read_exact(&mut body)
         .context("reading the response body")?;
-    Ok(Some(
-        DnsMessage::try_from_bytes(&body).context("parsing the TCP response")?,
-    ))
+    // The bytes as well as the message: TSIG is computed over what was sent,
+    // and a re-serialized message is not those bytes — name compression is a
+    // choice (`rdns_tsig`'s own header).
+    let message = DnsMessage::try_from_bytes(&body).context("parsing the TCP response")?;
+    Ok(Some((body, message)))
 }
 
 /// Whether `message` is a response to `request`.
@@ -451,5 +590,133 @@ mod tests {
             soas, 2,
             "and both were counted, which is what ends the read"
         );
+    }
+
+    /// A flag-supplied key parses through `TsigKey::parse`, so `rdnsc` and
+    /// `rdnsd` cannot disagree about what a spec means.
+    #[test]
+    fn a_key_can_come_from_the_flag() {
+        let args = Cli::parse_from([
+            "rdnsc",
+            "-y",
+            "hmac-sha512:key.name.:c2VjcmV0",
+            "ns",
+            "A",
+            "h",
+        ]);
+        let key = signing_key(&args).expect("it parses").expect("a key");
+        assert_eq!(key.name, "key.name.");
+
+        let bad = Cli::parse_from(["rdnsc", "-y", "nosuchalg:n:c2VjcmV0", "ns", "A", "h"]);
+        let err = signing_key(&bad).expect_err("an unknown algorithm");
+        assert!(err.to_string().contains("--tsig"), "got: {err}");
+    }
+
+    /// The file form reads the secret out of the file rather than `argv`, which
+    /// is the only reason it exists.
+    #[test]
+    fn a_key_can_come_from_a_file() {
+        let dir = rdns_core::testutil::ScratchDir::new("rdnsc-tsig");
+        let path = dir.write(
+            "secret",
+            "c2VjcmV0
+",
+        );
+        rdns_core::persist::restrict_to_owner(&path).expect("private");
+
+        let file = path.display().to_string();
+        let args = Cli::parse_from([
+            "rdnsc",
+            "--tsig-file",
+            &file,
+            "--tsig-name",
+            "hmac-sha256:key.name.",
+            "ns",
+            "A",
+            "h",
+        ]);
+        let key = signing_key(&args).expect("it reads").expect("a key");
+        assert_eq!(key.name, "key.name.");
+
+        // The same key by either route, or the two flags mean different things.
+        let inline = Cli::parse_from([
+            "rdnsc",
+            "-y",
+            "hmac-sha256:key.name.:c2VjcmV0",
+            "ns",
+            "A",
+            "h",
+        ]);
+        let inline = signing_key(&inline).expect("parses").expect("a key");
+        let mut buf = [0u8; 512];
+        let query = DnsMessageBuilder::new()
+            .with_query(
+                Name::from_presentation("example.com.").expect("a name"),
+                Qtype::AXFR,
+            )
+            .with_id(0x4242)
+            .build();
+        let len = query.to_bytes(&mut buf).expect("serializes");
+        let now = 1_700_000_000;
+        let one = tsig::sign_request(buf[..len].to_vec(), &key, now).expect("signs");
+        let two = tsig::sign_request(buf[..len].to_vec(), &inline, now).expect("signs");
+        assert_eq!(one, two, "the file and the flag name the same key");
+        assert!(
+            tsig::request_mac(&one).is_some(),
+            "a signed request carries the MAC the reply is bound to"
+        );
+    }
+
+    /// A secret anyone can read is refused, which is what makes the file form
+    /// better than `argv` at all (`CLAUDE.md` §15).
+    ///
+    /// Unix only: Windows has no equivalent of the mode, so there the check
+    /// does not apply and this asserts nothing rather than asserting something
+    /// false.
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_secret_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = rdns_core::testutil::ScratchDir::new("rdnsc-tsig-mode");
+        let path = dir.write(
+            "secret",
+            "c2VjcmV0
+",
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        let file = path.display().to_string();
+        let args = Cli::parse_from([
+            "rdnsc",
+            "--tsig-file",
+            &file,
+            "--tsig-name",
+            "key.name.",
+            "ns",
+            "A",
+            "h",
+        ]);
+        let err = signing_key(&args).expect_err("a readable secret");
+        let text = format!("{err:#}");
+        assert!(text.contains("TSIG secret"), "got: {text}");
+    }
+
+    /// The two flags are mutually exclusive: two secrets for one query is two
+    /// answers to one question, and clap refuses it rather than picking.
+    #[test]
+    fn the_two_key_flags_are_exclusive() {
+        let both = Cli::try_parse_from([
+            "rdnsc",
+            "-y",
+            "n:c2VjcmV0",
+            "--tsig-file",
+            "/tmp/s",
+            "--tsig-name",
+            "n",
+            "ns",
+            "A",
+            "h",
+        ]);
+        assert!(both.is_err(), "naming a key twice is refused");
     }
 }
