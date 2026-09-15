@@ -72,21 +72,53 @@ pub fn write_zone_file(zone: &Zone, path: &Path) -> Result<(), ZoneError> {
     })
 }
 
-/// One record as a zone-file line.
-pub fn record_to_string(record: &ZoneRecord) -> Result<String, ZoneError> {
-    let owner = writable_name(record.name.as_ref());
-    let class = class_name(record.class).ok_or_else(|| {
-        ZoneError::invalid(format!(
-            "record {owner}: unknown class {}",
-            record.class.to_u16()
-        ))
+/// One record as a zone-file line, from its four fields.
+///
+/// The fields rather than either record type, because there are two of them
+/// with the same four fields in a different order — [`ZoneRecord`] and
+/// [`crate::ResourceRecord`] — and every caller holds one or the other
+/// (`TODO.md` #66a). `Ttl` and `Class` are `Copy` and the other two are
+/// borrowed, so no caller allocates to call this; taking one of the two record
+/// types would have made the other clone four fields to build a temporary,
+/// which is exactly what `journal::write_record` used to do.
+pub fn record_line(
+    name: NameRef<'_>,
+    ttl: Ttl,
+    class: Class,
+    rdata: &RecordData,
+) -> Result<String, ZoneError> {
+    let owner = writable_name(name);
+    let class_text = class_name(class).ok_or_else(|| {
+        ZoneError::invalid(format!("record {owner}: unknown class {}", class.to_u16()))
     })?;
 
-    let (rtype, rdata) = rdata_to_string(&record.rdata);
+    let (rtype, rdata) = rdata_to_string(rdata);
     Ok(format!(
-        "{owner:<24} {ttl:<7} {class:<3} {rtype:<7} {rdata}",
-        ttl = record.ttl
+        "{owner:<24} {ttl:<7} {class_text:<3} {rtype:<7} {rdata}"
     ))
+}
+
+/// One record as a zone-file line.
+pub fn record_to_string(record: &ZoneRecord) -> Result<String, ZoneError> {
+    record_line(
+        record.name.as_ref(),
+        record.ttl,
+        record.class,
+        &record.rdata,
+    )
+}
+
+/// The same, for a record off the wire rather than out of a zone.
+///
+/// What a transfer hands back and what a journal holds are `ResourceRecord`s,
+/// so this is the entry point anything but `zone_to_string` wants.
+pub fn resource_record_line(record: &crate::ResourceRecord) -> Result<String, ZoneError> {
+    record_line(
+        record.name.as_ref(),
+        record.ttl,
+        record.class,
+        &record.rdata,
+    )
 }
 
 /// The type name and RDATA text for a stored record.

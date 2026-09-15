@@ -15,8 +15,8 @@ use std::path::PathBuf;
 use crate::error::ZoneError;
 use crate::ixfr::ZoneDelta;
 use crate::record_types as rt;
-use crate::zone::{parse_zone_file, Zone, ZoneRecord};
-use crate::zone_writer::record_to_string;
+use crate::zone::{parse_zone_file, Zone};
+use crate::zone_writer::resource_record_line;
 use crate::{Name, NameRef, ResourceRecord, Serial};
 
 /// The line that separates one difference sequence from the next.
@@ -169,12 +169,7 @@ impl Journal {
 }
 
 fn write_record(out: &mut String, record: &ResourceRecord) -> Result<(), ZoneError> {
-    let line = record_to_string(&ZoneRecord {
-        name: record.name.clone(),
-        ttl: record.ttl,
-        class: record.class,
-        rdata: record.rdata.clone(),
-    })?;
+    let line = resource_record_line(record)?;
     out.push_str(&line);
     if !line.ends_with('\n') {
         out.push('\n');

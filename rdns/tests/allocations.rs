@@ -133,6 +133,73 @@ fn allocation_counts() {
     verifying_an_rrset_against_two_candidate_signatures();
     checking_one_rrset_does_not_read_the_whole_zone();
     a_busy_neighbour_stays_out_of_the_count();
+    writing_a_record_as_text_borrows_it();
+}
+
+/// Rendering a record as a zone-file line costs the line and nothing else.
+///
+/// `TODO.md` #66a. `record_to_string` took a `ZoneRecord`, so `journal`, which
+/// holds `ResourceRecord`s, built a throwaway one per record — `name.clone()`
+/// and `rdata.clone()`, two heap blocks a record, to call a function that reads
+/// four fields and writes a string. `record_line` takes the fields instead:
+/// `Ttl` and `Class` are `Copy` and the other two are borrowed.
+///
+/// The assertion is that the two entry points cost the *same*, which is what
+/// "no caller allocates to call this" means and which no timing could say.
+/// Against the old shape the `ResourceRecord` path was two blocks dearer.
+fn writing_a_record_as_text_borrows_it() {
+    let zone = parse_zone_file(ZONE, "example.com.").expect("the zone parses");
+    let record = zone
+        .records()
+        .iter()
+        .find(|r| r.rdata.rtype() == rdns::record_types::A)
+        .expect("an A record")
+        .clone();
+    let wire = rdns::ResourceRecord {
+        name: record.name.clone(),
+        class: record.class,
+        ttl: record.ttl,
+        rdata: record.rdata.clone(),
+    };
+
+    // The first call in a process picks up one-off initialization
+    // (`CLAUDE.md` §10).
+    let _ = rdns::zone_writer::record_to_string(&record);
+
+    let (from_zone, zone_blocks) =
+        allocations(|| rdns::zone_writer::record_to_string(&record).expect("a line"));
+    let (from_wire, wire_blocks) =
+        allocations(|| rdns::zone_writer::resource_record_line(&wire).expect("a line"));
+
+    // The shape this replaced, measured rather than asserted in prose: the
+    // journal held a `ResourceRecord` and built a `ZoneRecord` to render it.
+    let (from_copy, copy_blocks) = allocations(|| {
+        rdns::zone_writer::record_to_string(&rdns::zone::ZoneRecord {
+            name: wire.name.clone(),
+            ttl: wire.ttl,
+            class: wire.class,
+            rdata: wire.rdata.clone(),
+        })
+        .expect("a line")
+    });
+
+    assert_eq!(from_zone, from_wire, "the same record, the same line");
+    assert_eq!(from_zone, from_copy, "and the same line the old path wrote");
+    assert_eq!(
+        copy_blocks,
+        wire_blocks + 2,
+        "the copy is the name and the RDATA, once each, per record journalled"
+    );
+    println!("record_to_string: {zone_blocks} allocations, resource_record_line: {wire_blocks}");
+    assert_eq!(
+        zone_blocks, wire_blocks,
+        "neither entry point may copy the record to render it"
+    );
+    // 14 on the development machine: the owner name, the re-encode
+    // `rdata_to_string` compares against, the type name and the line itself.
+    // The range is wide because this is the *equality* above's backstop, not a
+    // budget — a change here is a change in how a line is rendered.
+    within("rendering one A record as a line", zone_blocks, 10..=18);
 }
 
 /// What checking one RRset of a signed zone costs, at two zone sizes.
