@@ -40,6 +40,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rdns::clock::current_unix_timestamp;
+use rdns::metrics::DnsMetrics;
 use rdns::secondary::{MasterSpec, RefreshTimers};
 use rdns::shutdown::{Busy, Stop};
 use rdns::tsig::TsigKey;
@@ -127,6 +128,7 @@ pub(crate) async fn refresh_task(
     feed: TransferredFeed,
     reload: PolicyReload,
     wake: FeedWake,
+    metrics: Arc<DnsMetrics>,
     stop: Stop,
     busy: Busy,
 ) {
@@ -149,6 +151,10 @@ pub(crate) async fn refresh_task(
                 Ok(fetched) => {
                     timers = fetched;
                     last_contact = current_unix_timestamp();
+                    // The same gauge `rdnsd` sets for a replicated zone, because
+                    // a policy feed is one: same name, same shape, same alert
+                    // (`CLAUDE.md` §7, §14). `TODO.md` #57g.
+                    metrics.note_zone_transfer(feed.spec.zone.as_ref(), last_contact);
                     if lifted {
                         // Back in contact: the rules go back into force, and it
                         // is said out loud because the lifting was.
@@ -166,7 +172,14 @@ pub(crate) async fn refresh_task(
                          stays in force: {e}",
                         feed.spec.zone
                     );
-                    expire_if_out_of_contact(&feed, &timers, last_contact, &mut lifted, &reload);
+                    expire_if_out_of_contact(
+                        &feed,
+                        &timers,
+                        last_contact,
+                        &mut lifted,
+                        &reload,
+                        &metrics,
+                    );
                     timers.after_failure()
                 }
             }
@@ -197,6 +210,7 @@ fn expire_if_out_of_contact(
     last_contact: u64,
     lifted: &mut bool,
     reload: &PolicyReload,
+    metrics: &DnsMetrics,
 ) {
     if *lifted || !timers.has_expired(last_contact, current_unix_timestamp()) {
         return;
@@ -223,6 +237,11 @@ fn expire_if_out_of_contact(
                 "policy zone {zone}: EXPIRE ({expire}s) passed with no contact. Its rules \
                  are no longer enforced — on-expire is lift"
             );
+            // Forgotten, not frozen: the feed is no longer enforced, and a
+            // gauge left at its last value shows a policy nobody applies as
+            // perfectly healthy (§14). Under `enforce` the series deliberately
+            // stays and goes stale — that staleness *is* the alert.
+            metrics.forget_zone(feed.spec.zone.as_ref());
             reload.request();
         }
     }
@@ -257,4 +276,94 @@ async fn fetch_and_write(
     // that did not change is re-read anyway.
     reload.request();
     Ok(timers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rdns::Name;
+
+    fn feed(on_expire: OnExpire) -> TransferredFeed {
+        TransferredFeed {
+            spec: MasterSpec::parse("block.example.@192.0.2.9").expect("a spec"),
+            file: std::path::PathBuf::from("nonexistent-on-purpose.zone"),
+            on_expire,
+            key: None,
+        }
+    }
+
+    fn gauge_lines(metrics: &DnsMetrics) -> Vec<String> {
+        metrics
+            .to_prometheus_format()
+            .lines()
+            .filter(|l| l.starts_with("dns_zone_last_refresh_timestamp_seconds{"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A feed that has never transferred has no age, and says so by being
+    /// absent rather than by reading 1970 (`CLAUDE.md` §14).
+    ///
+    /// Fails against a gauge initialised to zero, which is the shape that fires
+    /// every staleness alert there is on a resolver that just started.
+    #[test]
+    fn a_feed_that_never_transferred_is_absent_not_zero() {
+        let metrics = DnsMetrics::new();
+        assert!(
+            gauge_lines(&metrics).is_empty(),
+            "nothing transferred, so there is no age to report"
+        );
+
+        let zone = Name::from_presentation("block.example.").expect("a name");
+        metrics.note_zone_transfer(zone.as_ref(), 1_700_000_000);
+        assert_eq!(
+            gauge_lines(&metrics),
+            ["dns_zone_last_refresh_timestamp_seconds{zone=\"block.example.\"} 1700000000"]
+        );
+    }
+
+    /// Lifting stops reporting the feed; enforcing deliberately does not.
+    ///
+    /// The second half is the point of the pair: under `enforce` the series
+    /// stays and goes stale, and that staleness is what
+    /// `time() - dns_zone_last_refresh_timestamp_seconds > EXPIRE` fires on.
+    /// A gauge forgotten there would hide exactly the condition #57d is about.
+    #[test]
+    fn lifting_forgets_the_feed_and_enforcing_keeps_it_stale() {
+        let expired = RefreshTimers::from_soa(3600, 600, 1);
+        let long_ago = current_unix_timestamp() - 10_000;
+        let reload = PolicyReload::default();
+
+        for (way, expected) in [(OnExpire::Enforce, 1), (OnExpire::Lift, 0)] {
+            let metrics = DnsMetrics::new();
+            let feed = feed(way);
+            metrics.note_zone_transfer(feed.spec.zone.as_ref(), long_ago);
+            let mut lifted = false;
+            expire_if_out_of_contact(&feed, &expired, long_ago, &mut lifted, &reload, &metrics);
+
+            assert!(lifted, "{way:?}: the transition happened");
+            assert_eq!(
+                gauge_lines(&metrics).len(),
+                expected,
+                "{way:?}: a feed still enforced keeps its age; a lifted one stops being reported"
+            );
+        }
+    }
+
+    /// The transition fires once, not once per RETRY.
+    #[test]
+    fn the_expiry_warning_is_a_transition_and_not_a_repeat() {
+        let expired = RefreshTimers::from_soa(3600, 600, 1);
+        let long_ago = current_unix_timestamp() - 10_000;
+        let metrics = DnsMetrics::new();
+        let reload = PolicyReload::default();
+        let feed = feed(OnExpire::Lift);
+
+        let mut lifted = false;
+        expire_if_out_of_contact(&feed, &expired, long_ago, &mut lifted, &reload, &metrics);
+        assert!(lifted);
+        // Called again with the same state: nothing to say and nothing to do.
+        expire_if_out_of_contact(&feed, &expired, long_ago, &mut lifted, &reload, &metrics);
+        assert!(lifted);
+    }
 }

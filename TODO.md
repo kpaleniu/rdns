@@ -132,9 +132,10 @@ resolver's return type. **Three of #57's four items are closed**: a reload
 re-reads every `--rpz` file, runs off the worker threads, and can be asked for
 by a NOTIFY from a listed address. **57d is taken** — shape A, `rdnsr` transfers a
 policy zone into the file it reads, with `on-expire` per feed — and what is
-left is the IXFR question and the feed's age where an operator can see it
-(57g); **57f closed with it** — a feed's master names a key with `#name`, the
-key is resolved at startup so an undefined one stops the process, and the
+left is the IXFR question alone: **57f and 57g closed with it** — 57g was
+wiring rather than a metric, since a policy feed is a replicated zone and the
+gauge for one already existed. Under 57f a feed's master names a key with
+`#name`, resolved at startup so an undefined one stops the process, and the
 secret reader that would have been its third copy is `persist::read_secret`.
 **Both shapes were built first** — `57d-shape-a` and `57d-shape-b` — and the
 install they differ over, 1 894 ms against 32.8 at a million rules, turned out
@@ -1095,7 +1096,7 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13, 57a-d and 57f closed, 57e and 57g open**
+### 57. A policy zone arrives as a file, not as a transfer — **filed 2026-09-13, only 57e open**
 
 Also left behind by 45a, and the half of its own row that did not survive
 contact with the code. #45a said the pleasing part was the delivery mechanism —
@@ -1566,9 +1567,25 @@ Five items. 57a-c are done; 57d and 57e are what is left.
   and a keyring beside the feeds — the secret-file reader is
   `persist::ensure_private` plus four lines, which `rdnsd` and `rdnsc` both
   already call (§7). Not a dependency question any more.
-- **57g. `enforce` is the default and the age is invisible — filed 2026-09-15.**
-  57d's `on-expire` fires on the task's own `last_contact`, which lives in the
-  task and nowhere an operator can see. §14: a per-feed gauge on `rdnsr`,
+- **57g. `enforce` is the default and the age is invisible — filed and closed
+  2026-09-15, and it was wiring rather than a metric.** Everything it asked for
+  already existed: `DnsMetrics::note_zone_transfer`, `forget_zone`, and a
+  renderer that *omits* a zone with no transfer rather than zeroing it, with the
+  reason already written there — zero reads as 1970 and `absent()` is a question
+  the query language can ask. `rdnsr` already builds a `DnsMetrics`. So a policy
+  feed lands in the same `dns_zone_last_refresh_timestamp_seconds` an operator
+  already alerts on for `rdnsd`'s replicated zones: same name, same shape, same
+  PromQL (§7).
+
+  **`enforce` and the gauge are one decision seen twice.** Keeping a feed's
+  rules in force past EXPIRE is only defensible because the series stays and
+  goes stale, which is what `time() - dns_zone_last_refresh_timestamp_seconds >
+  EXPIRE` fires on. Lifting forgets the feed, because a gauge frozen at its last
+  value shows a policy nobody applies as perfectly healthy. The test asserts
+  both halves and fails in both directions — forgetting under `enforce` hides
+  the alert, not forgetting under `lift` invents one.
+  The row as filed: 57d's `on-expire` fires on the task's own `last_contact`,
+  which lives in the task and nowhere an operator can see. §14: a per-feed gauge on `rdnsr`,
   `Option`-shaped so a feed that never transferred reads `absent()` rather than
   1970 — the same shape `dns_zone_last_refresh_timestamp_seconds` has on
   `rdnsd`, for the same reason. Defaulting to `enforce` without it ships the

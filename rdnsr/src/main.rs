@@ -972,6 +972,7 @@ async fn main() -> anyhow::Result<()> {
             feed,
             reload.clone(),
             wake.clone(),
+            ctx.metrics.clone(),
             shutdown.stop_handle(),
             shutdown.busy(),
         )));
