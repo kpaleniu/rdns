@@ -18,6 +18,11 @@ use crate::NameRef;
 use crate::Rtype;
 use crate::{ParsedRecord, ResourceRecord};
 use sha1::{Digest, Sha1};
+
+/// Moved to [`crate::denial_wire`], which holds the encodings: a hash value of
+/// a fixed length is not a hash function (`TODO.md` #67a). Re-exported so the
+/// four importers that read them as this module's keep working.
+pub use crate::denial_wire::{Nsec3Hash, NSEC3_HASH_LEN};
 use std::cmp::Ordering;
 
 /// The most NSEC3 iterations we will compute before refusing.
@@ -27,10 +32,6 @@ use std::cmp::Ordering;
 /// recommends 0. Over the cap we error, which the chain validator turns into
 /// "insecure" rather than "bogus".
 pub const MAX_NSEC3_ITERATIONS: u16 = 150;
-
-/// The length of an NSEC3 hash. SHA-1 is the only algorithm RFC 5155 §5
-/// defines, and the registry it points at has had no second entry since.
-pub const NSEC3_HASH_LEN: usize = 20;
 
 /// The owner name of the NSEC3 record for `hash` in `origin`: the hash as a
 /// base32hex label (RFC 5155 §3.3), prepended to the zone.
@@ -123,7 +124,7 @@ fn hash_wire(wire: &mut [u8], salt: &[u8], iterations: u16) -> DnssecResult<Nsec
         hasher.update(salt);
         digest.copy_from_slice(&hasher.finalize());
     }
-    Ok(Nsec3Hash(digest))
+    Ok(Nsec3Hash::from_octets(digest))
 }
 
 /// An NSEC record and the name it sits at.
@@ -205,28 +206,6 @@ impl Nsec3Params<'_> {
             )));
         }
         nsec3_hash_name(name, self.salt, self.iterations)
-    }
-}
-
-/// The 20 octets RFC 5155 §5 hashes a name to, and the only length one can be.
-///
-/// SHA-1 is the only algorithm IANA has registered for NSEC3 and [`Nsec3`]
-/// refuses any other, so a hash of another length is not a short hash — it is
-/// not a hash. As a `Vec<u8>` it was a heap allocation per map key for 20 bytes,
-/// and a wrong length from a remote record was stored and then silently never
-/// matched, which is what `covers` carried an `is_empty()` guard for
-/// (`TODO.md` #40a).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Nsec3Hash([u8; NSEC3_HASH_LEN]);
-
-impl Nsec3Hash {
-    /// The hash these octets are, if they are the right number of them.
-    pub fn from_wire(bytes: &[u8]) -> Option<Nsec3Hash> {
-        Some(Nsec3Hash(bytes.try_into().ok()?))
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
     }
 }
 

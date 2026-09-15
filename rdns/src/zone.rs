@@ -26,8 +26,7 @@
 //! fields, and `checks` is what must be refused at load because it has no correct
 //! answer at query time.
 
-use crate::denial_wire::{base32hex_decode, canonical_sort_key, CanonicalKey};
-use crate::dnssec_denial::Nsec3Hash;
+use crate::denial_wire::{base32hex_decode, canonical_sort_key, CanonicalKey, Nsec3Hash};
 use crate::record_types as rt;
 use crate::Class;
 use crate::Rtype;

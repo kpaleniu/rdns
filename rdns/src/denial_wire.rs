@@ -6,7 +6,9 @@
 //! all three to read and write NSEC and NSEC3 records, and a zone file is not a
 //! DNSSEC question: those two edges were the only ones blocking the crate cut
 //! #31 measured, and they carried no crypto across. `dnssec_denial` keeps
-//! everything that hashes, proves or verifies.
+//! everything that *computes* a hash, proves or verifies — [`Nsec3Hash`] is
+//! here because it is a 20-octet value, not a hash function, and `zone` keyed a
+//! map on it (`TODO.md` #67a).
 //!
 //! It is also why `zone` had grown a second base32hex decoder (`TODO.md` #26b)
 //! — one that folded case with `str::to_uppercase`, the Unicode fold RFC 4343
@@ -25,6 +27,42 @@ use std::cmp::Ordering;
 /// `Iterator::cmp` gives both remaining rules for free: the first differing
 /// label decides, and a name that runs out of labels first is an ancestor and
 /// sorts before its descendants.
+/// The length of an NSEC3 hash. SHA-1 is the only algorithm RFC 5155 §5
+/// defines, and the registry it points at has had no second entry since.
+pub const NSEC3_HASH_LEN: usize = 20;
+
+/// The 20 octets RFC 5155 §5 hashes a name to, and the only length one can be.
+///
+/// SHA-1 is the only algorithm IANA has registered for NSEC3 and
+/// [`Nsec3`](crate::dnssec_denial::Nsec3) refuses any other, so a hash of another length is not a short hash — it is
+/// not a hash. As a `Vec<u8>` it was a heap allocation per map key for 20 bytes,
+/// and a wrong length from a remote record was stored and then silently never
+/// matched, which is what `covers` carried an `is_empty()` guard for
+/// (`TODO.md` #40a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Nsec3Hash([u8; NSEC3_HASH_LEN]);
+
+impl Nsec3Hash {
+    /// The hash these octets are, if they are the right number of them.
+    pub fn from_wire(bytes: &[u8]) -> Option<Nsec3Hash> {
+        Some(Nsec3Hash(bytes.try_into().ok()?))
+    }
+
+    /// The hash these exactly-[`NSEC3_HASH_LEN`] octets are.
+    ///
+    /// For the one caller that computed them and so cannot be wrong about the
+    /// length — `dnssec_denial::hash_wire`, which is in another module since
+    /// `TODO.md` #67a. Total, where `from_wire` on a known-good array would be
+    /// an `expect` on an infallible path (`CLAUDE.md` §4).
+    pub fn from_octets(octets: [u8; NSEC3_HASH_LEN]) -> Nsec3Hash {
+        Nsec3Hash(octets)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
 pub fn canonical_name_cmp(a: NameRef<'_>, b: NameRef<'_>) -> Ordering {
     reversed_labels(a).cmp(reversed_labels(b))
 }
