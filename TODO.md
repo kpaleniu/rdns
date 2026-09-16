@@ -116,10 +116,13 @@ split to the bottom**: six passes and not the four it named, and the largest,
 everything and holds the four ECDSA operations. What a remedy would have to
 address is now a number — 31% to build and free the carry-forward index, 24%
 to probe it and `Layout` once per RRset — and it is the two maps keyed by a
-name, not the chain and not the crypto. **64f closed 2026-09-16** — a reload
-keeps the zone it is serving for a file nobody touched, 11.4 s to 39 ms at a
-million records, on the condition `ProvenSigning` already computes. 64c and 64e
-are what is left, and neither names a remedy yet.
+name, not the chain and not the crypto. **64e and 64f both closed 2026-09-16.**
+64f: a reload keeps the zone it is serving for a file nobody touched, 11.4 s to
+39 ms at a million records, on the condition `ProvenSigning` already computes.
+64e: the two structures it named and nothing else, three shapes built and
+measured, −14% on an incremental sign and −16% on a signed UPDATE — and the one
+pass it did not take is **64g**. **64c** is what is left, and it is a decision
+rather than a measurement.
 **#65 came out of asking 64e's question of the load path and closed the same
 day**, the shapes built and the recommended one declined. The reason for asking
 was refuted first — a full sign is 84% ECDSA, so a remedy in the structures is
@@ -2473,7 +2476,7 @@ transfers.
 
 ---
 
-### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14, 64a, 64b, 64d and 64f closed; 64c and 64e open**
+### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14; 64a, 64b, 64d, 64e and 64f closed; 64c open, 64g out of 64e**
 
 Filed with the measurement that **refuted the reason it was going to be filed**.
 The finding on the way in was "the UPDATE path re-reads the zone file, so an
@@ -2814,12 +2817,71 @@ it is one every twelve** (64d).
     filing loop — which is what made the inner table possible — is free: three
     runs each side read 9 392 ms against 9 364 ms, which overlap.
 
-  **Still no remedy named** (§18). What the split establishes is where one
-  would have to go: **31%** is building and freeing `PreviousSignatures`, and a
-  further **24%** is the loop that probes it and `Layout` once per RRset. A
-  remedy is a decision about those two structures, not about the chain and not
-  about the crypto — and #40's rule applies to it, since what decides a key's
-  shape is what each probe has in hand.
+  ~~**Still no remedy named** (§18).~~ **Taken 2026-09-16, and it is the two
+  structures the split named and nothing else.** What the split established is
+  where one would have to go: **31%** building and freeing `PreviousSignatures`
+  and a further **24%** in the loop that probes it and `Layout` once per RRset.
+  Three shapes, built and measured in order:
+
+  | at 1 000 000 | total | previous-sigs | free | sign-rrsets |
+  |---|---|---|---|---|
+  | before | 9 204-9 246 | 1 791-1 804 | 1 168-1 210 | 2 204-2 244 |
+  | A: borrow the `Layout` entry | 9 018-9 105 | | | 2 022-2 067 |
+  | A+B: borrow `PreviousSignatures` | 7 815-7 937 | 1 220-1 320 | 394-428 | |
+  | **A+B+C: nest its key** | **7 919-7 965** | **1 255-1 270** | **470-524** | **1 996-2 013** |
+
+  Three runs each, and the first and last rows were taken **back to back in one
+  session** because the middle two were not: an earlier reading of C was
+  7 744-7 748 against a 9 279-9 367 baseline from an hour before, and comparing
+  those two numbers would have credited the machine's mood to the patch. **−14%
+  on an incremental sign, and −16% on a signed UPDATE** — 11 801 ms to 9 866 at
+  a million records.
+
+  - **A.** `signatures_for` iterates `Rrsets`, which is keyed by
+    `canonical_sort_key` — and then called `Layout::entry`, which *derives that
+    key again* and clones a `NameEntry` (a `BTreeSet<Rtype>`) to read two
+    bools. Two allocations per RRset, four million on a million-record zone,
+    for a key already in hand. `Layout::at` borrows. The row had this as "no
+    stated reason to answer, which §19 says is itself the finding"; there was
+    none, and the entry now carries one for why the *owning* spelling still
+    exists (an NSEC3 owner is a name the layout does not hold).
+  - **B.** `PreviousSignatures` cloned the `RecordData` of every record in the
+    previous zone — two million allocations to build and two million to free,
+    which is exactly the 31%. It borrows from `previous`, which outlives every
+    use of it. `free` fell 58%.
+  - **C.** The row named this one: "the tuple key `(folded, rtype)` cannot be
+    probed through `Borrow`: that wants the maps nested, `name -> rtype -> _`,
+    so the outer one takes `&[u8]`". Built, and it is right —
+    `Cow<'a, [u8]>: Borrow<[u8]>`, so the probe is the folded name itself and
+    costs nothing for a name already folded, which every name a previous run
+    wrote is. The inner level is a `Vec` scanned linearly, because a name holds
+    a handful of types.
+
+  **Two columns moved the wrong way and neither was touched**: `layout` 503-508
+  to 579-630 (+18%) and `carry-over` 1 076-1 095 to 1 132-1 150 (+5%). Recorded
+  rather than explained away — removing two million live allocations before
+  those passes run changes the heap they run against, and +90 ms of that is set
+  against −1 290 ms net.
+
+  **The invariant is unmoved**: `signed_update_cost` still reports
+  2 000 004 of 2 000 008 signatures carried forward byte-identical, which is the
+  measurement that would have caught a reuse rule broken by the key change.
+  `sign an eight-record zone` fell from 922 allocations to 593 — below the
+  assertion's floor, which moved to 400 with the reason beside it (§17 asks for
+  one in either direction).
+- **64g. `rrsets_of` clones the whole zone to sign it — filed 2026-09-16**, out
+  of 64e, which left it as the one named pass it did not take. `build-rrsets`
+  is **930 ms of 7 940 at a million records, 12%**: one `RecordData::clone` per
+  record, into a map `signatures_for` consumes and drops. It could borrow from
+  `signed` the way #64e's B made `PreviousSignatures` borrow from `previous` —
+  the borrow ends before `add_record` is called, so the checker allows it.
+
+  **No remedy claimed, because the obstacle is not in this function**:
+  `Rrset::new` takes `&'a [RecordData]` and `Rrset` is the granularity the
+  whole of `dnssec` works at, `verify_rrset` included. A borrowed
+  `Vec<&RecordData>` does not fit it, so this is a change to a core type's
+  shape and its call sites, not to a loop. Whoever takes it should count those
+  first (§18).
 
   **Half of that is this row's and half is not, and #65 is the half that is
   not.** `PreviousSignatures` is built by `sign_zone_incrementally` alone,

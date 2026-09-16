@@ -839,7 +839,12 @@ fn one_zone_load_and_sign() {
     // through the checked constructor: a DNSKEY decoder allocates one `Vec` for
     // the public key, and there are two keys. NSEC3 is off in this policy, so
     // `nsec3param_rdata` does not run.
-    within("sign an eight-record zone", sign_count, 600..=1_400);
+    //
+    // Floor moved 600 -> 400 by `TODO.md` #64e, which reads 593: `signatures_for`
+    // derived a `canonical_sort_key` the map it is iterating is already keyed by
+    // and cloned the `NameEntry` to read two bools, once per RRset. Downward,
+    // and §17 asks for a reason either way.
+    within("sign an eight-record zone", sign_count, 400..=1_400);
 }
 
 /// An AXFR out, where a per-record allocation multiplies by the zone size.

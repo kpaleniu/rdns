@@ -19,6 +19,8 @@
 //! classic signer bug — validators ignore the signature, and the extra RRSIG
 //! shows up in the parent's NSEC bitmap as a type that is not there.
 
+use std::borrow::Cow;
+
 use crate::denial_wire::{build_type_bitmap, canonical_sort_key, CanonicalKey};
 use crate::dnssec::{Dnskey, Rrset};
 use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, Nsec3Hash, MAX_NSEC3_ITERATIONS};
@@ -413,29 +415,58 @@ fn sign_zone_inner(
 /// the signatures "and what was the answer". Keeping a signature because the
 /// *name* still exists is how a zone serves a signature over data it no longer
 /// holds.
-struct PreviousSignatures {
-    /// (folded owner, type) -> the RRset as it was signed: its TTL, and its
+///
+/// Borrowed from `previous`, which outlives every use: an owned copy was a
+/// `RecordData` clone per record, two million allocations to build and two
+/// million frees, which measured as 20% and 13% of an incremental sign
+/// (`TODO.md` #64e).
+struct PreviousSignatures<'a> {
+    /// folded owner -> type -> the RRset as it was signed: its TTL, and its
     /// RDATA in the order the previous run saw them.
-    rrsets: BTreeMap<(Vec<u8>, Rtype), (Ttl, Vec<RecordData>)>,
-    /// (folded owner, covered type) -> the signatures over that RRset.
-    signatures: BTreeMap<(Vec<u8>, Rtype), Vec<CarriedSignature>>,
+    rrsets: ByName<'a, SignedRrset<'a>>,
+    /// folded owner -> covered type -> the signatures over that RRset.
+    signatures: ByName<'a, Vec<CarriedSignature<'a>>>,
+}
+
+/// Something held per (owner, type), nested so the outer map is probed with a
+/// folded name through `Borrow<[u8]>` rather than with a key built per probe.
+type ByName<'a, V> = BTreeMap<Cow<'a, [u8]>, Vec<(Rtype, V)>>;
+
+/// An RRset as the previous run signed it: its TTL, and its RDATA borrowed from
+/// that run's zone.
+type SignedRrset<'a> = (Ttl, Vec<&'a RecordData>);
+
+/// The entry for `rtype` under an owner, or a new empty one.
+///
+/// A `Vec` scanned rather than a second map: a name holds a handful of types,
+/// and the whole point of the nesting is that the outer key is probed through
+/// `Borrow<[u8]>` without building one.
+fn slot<V: Default>(types: &mut Vec<(Rtype, V)>, rtype: Rtype) -> &mut V {
+    if let Some(at) = types.iter().position(|(t, _)| *t == rtype) {
+        return &mut types[at].1;
+    }
+    types.push((rtype, V::default()));
+    &mut types.last_mut().expect("just pushed").1
 }
 
 /// One RRSIG from the previous run, with the two fields the reuse decision
 /// turns on read out once rather than per lookup.
-struct CarriedSignature {
-    rdata: RecordData,
+struct CarriedSignature<'a> {
+    rdata: &'a RecordData,
     expiration: u32,
     key_tag: u16,
 }
 
-impl PreviousSignatures {
-    fn of(previous: &Zone) -> Self {
-        let mut rrsets: BTreeMap<(Vec<u8>, Rtype), (Ttl, Vec<RecordData>)> = BTreeMap::new();
-        let mut signatures: BTreeMap<(Vec<u8>, Rtype), Vec<CarriedSignature>> = BTreeMap::new();
+impl<'a> PreviousSignatures<'a> {
+    fn of(previous: &'a Zone) -> Self {
+        let mut rrsets: ByName<'a, SignedRrset<'a>> = BTreeMap::new();
+        let mut signatures: ByName<'a, Vec<CarriedSignature<'a>>> = BTreeMap::new();
 
         for record in previous.records() {
-            let name = record.name.as_ref().folded().into_owned();
+            // A `Cow`, so a name already folded — which every name a previous
+            // run wrote is, `carry_over_records` having normalized it — costs
+            // nothing.
+            let name = record.name.as_ref().folded();
             if record.rdata.rtype() == rt::RRSIG {
                 // Not offered for reuse; the RRset gets a fresh signature.
                 if let Ok(ParsedRecord::RRSIG {
@@ -445,21 +476,22 @@ impl PreviousSignatures {
                     ..
                 }) = record.rdata.parse()
                 {
-                    signatures
-                        .entry((name, type_covered))
-                        .or_default()
-                        .push(CarriedSignature {
-                            rdata: record.rdata.clone(),
+                    slot(signatures.entry(name).or_default(), type_covered).push(
+                        CarriedSignature {
+                            rdata: &record.rdata,
                             expiration,
                             key_tag,
-                        });
+                        },
+                    );
                 }
                 continue;
             }
-            let entry = rrsets
-                .entry((name, record.rdata.rtype()))
-                .or_insert((record.ttl, Vec::new()));
-            entry.1.push(record.rdata.clone());
+            let rtype = record.rdata.rtype();
+            let rrset = slot(rrsets.entry(name).or_default(), rtype);
+            // The TTL of the first record of the RRset, as the previous run
+            // normalized it; `reuse` compares it against this run's.
+            rrset.0 = record.ttl;
+            rrset.1.push(&record.rdata);
         }
 
         PreviousSignatures { rrsets, signatures }
@@ -491,21 +523,37 @@ impl PreviousSignatures {
         rdatas: &[RecordData],
         key_tags: &[u16],
         signed_at: u64,
-    ) -> Option<&[CarriedSignature]> {
+    ) -> Option<&[CarriedSignature<'a>]> {
         // One folded key for both maps rather than two: this runs once per
         // RRset, so the second allocation was two million of them. The signing
         // loop went 2 318 ms -> 2 235 ms at that size, three runs each side
         // (`TODO.md` #64e).
-        let probe = (name.folded().into_owned(), rtype);
-        let (was_ttl, was) = self.rrsets.get(&probe)?;
+        // `Cow<[u8]>: Borrow<[u8]>`, so the outer map is probed with the folded
+        // name itself and a name already folded costs nothing. The tuple key it
+        // replaced could not be: a `Cow<'a, _>` cannot be built from a shorter
+        // borrow, so every probe was an owned copy — two million of them
+        // (`TODO.md` #64e, `rdns-core::name_keys`'s argument one map further
+        // in).
+        let folded = name.folded();
+        let (was_ttl, was) = &self
+            .rrsets
+            .get(folded.as_ref())?
+            .iter()
+            .find(|(t, _)| *t == rtype)?
+            .1;
         if *was_ttl != ttl || was.len() != rdatas.len() {
             return None;
         }
-        if !was.iter().all(|r| rdatas.contains(r)) || !rdatas.iter().all(|r| was.contains(r)) {
+        if !was.iter().all(|r| rdatas.contains(r)) || !rdatas.iter().all(|r| was.contains(&r)) {
             return None;
         }
 
-        let carried = self.signatures.get(&probe)?;
+        let carried = &self
+            .signatures
+            .get(folded.as_ref())?
+            .iter()
+            .find(|(t, _)| *t == rtype)?
+            .1;
         if carried.is_empty() {
             return None;
         }
@@ -1034,11 +1082,25 @@ impl Layout {
         included.into_values().collect()
     }
 
+    /// What is at `name`, for a caller that holds only the name.
+    ///
+    /// Owned, because it ends in a default for a name the layout does not hold
+    /// — an NSEC3 owner, which the hash invented and no record sits at. Costs a
+    /// [`canonical_sort_key`] and a `BTreeSet<Rtype>` clone, so a caller that
+    /// already has the key and only reads the entry wants [`Layout::at`]
+    /// instead (`TODO.md` #64e).
     fn entry(&self, name: NameRef<'_>) -> NameEntry {
-        self.names
-            .get(&canonical_sort_key(name))
-            .map(|(_, e)| e.clone())
+        self.at(&canonical_sort_key(name))
+            .cloned()
             .unwrap_or_default()
+    }
+
+    /// What is at a name the caller already has the key for, borrowed.
+    ///
+    /// `None` is a name with no records — see [`Layout::entry`] for what that
+    /// means and why the other spelling substitutes a default for it.
+    fn at(&self, key: &CanonicalKey) -> Option<&NameEntry> {
+        self.names.get(key).map(|(_, e)| e)
     }
 }
 
@@ -1184,9 +1246,17 @@ fn signatures_for(
     data_signers: &[&SigningKey],
 ) -> Result<Vec<ZoneRecord>> {
     let mut signatures = Vec::new();
-    for ((_, rtype), (name, ttl, rdatas)) in rrsets {
-        let entry = layout.entry(name.as_ref());
-        if !signable(&entry, name.as_ref(), rtype, layout.origin.as_ref()) {
+    for ((key, rtype), (name, ttl, rdatas)) in rrsets {
+        // The key the map is already keyed by, rather than `Layout::entry`
+        // deriving it again and cloning the entry to read two bools: two
+        // allocations per RRset, four million on a million-record zone
+        // (`TODO.md` #64e).
+        if !signable(
+            layout.at(&key),
+            name.as_ref(),
+            rtype,
+            layout.origin.as_ref(),
+        ) {
             continue;
         }
         let signers = if rtype == rt::DNSKEY {
@@ -1314,11 +1384,22 @@ fn sign_everything(
 }
 
 /// Whether this RRset is one the zone is authoritative for, and so must sign.
-fn signable(entry: &NameEntry, name: NameRef<'_>, rtype: Rtype, origin: NameRef<'_>) -> bool {
+///
+/// `None` is a name the layout does not hold, which is an NSEC3 owner: not in
+/// any delegation, not occluded, always ours.
+fn signable(
+    entry: Option<&NameEntry>,
+    name: NameRef<'_>,
+    rtype: Rtype,
+    origin: NameRef<'_>,
+) -> bool {
     if rtype == rt::RRSIG {
         // A validator checks an RRSIG against a key, never another RRSIG.
         return false;
     }
+    let Some(entry) = entry else {
+        return true;
+    };
     if entry.occluded {
         return false;
     }
@@ -2343,7 +2424,7 @@ a\.b    IN A   192.0.2.50
                 NOW,
             );
             if signable(
-                &layout.entry(nm(&name).as_ref()),
+                layout.at(&canonical_sort_key(nm(&name).as_ref())),
                 nm(&name).as_ref(),
                 rtype,
                 nm(ORIGIN).as_ref(),
