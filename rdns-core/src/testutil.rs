@@ -63,3 +63,26 @@ impl Drop for ScratchDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// The `#[ignore]`d benchmarks in one test binary take turns.
+///
+/// libtest runs what a filter selects in parallel, and a benchmark's own
+/// recipe is usually a filter that selects more than one of them — so the
+/// documented command times two million-record runs against each other. That
+/// is how `TODO.md` #64b came to record a 1-5% saving for a change that saves
+/// 38%, and `rdns/tests/rpz_install.rs` read 3 123 ms for a load that takes
+/// 2 198 when it had the binary to itself.
+///
+/// The mutex is per process, which is the right grain: the collision is within
+/// one test binary. What is shared here is the reason, not the state
+/// (`CLAUDE.md` §7).
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A turn, held for the whole body of a benchmark.
+///
+/// Poisoning is ignored: one benchmark panicking says nothing about whether the
+/// next may run, and the alternative is every later one failing for a reason
+/// that is not theirs.
+pub fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+}

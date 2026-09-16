@@ -63,6 +63,57 @@ pub fn origin_from_path(path: &str) -> String {
     }
 }
 
+/// What a zone file held when this process last parsed it, for telling a file
+/// that moved from one that did not.
+///
+/// Not a cryptographic digest: the question is whether the bytes changed, and
+/// anybody who can rewrite a zone file already owns the process.
+/// `DefaultHasher` is not stable across Rust releases, which does not matter —
+/// every comparison is against a value this same process computed, and a
+/// restart re-reads anyway.
+///
+/// One copy for three callers — `rdnsd`'s UPDATE path (`TODO.md` #64b) and its
+/// reload path (#64f), and the resolver's policy reload (#71b) — because two
+/// implementations of "did these bytes change" is how the two answers come to
+/// differ (`CLAUDE.md` §7). It lived in `rdnsd` alone until the third.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileDigest(u64);
+
+impl FileDigest {
+    /// The digest of bytes whose content is entirely their own — text this
+    /// process wrote, or a file already known to carry no `$INCLUDE`.
+    pub fn of(bytes: &[u8]) -> FileDigest {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        bytes.hash(&mut hasher);
+        FileDigest(hasher.finish())
+    }
+
+    /// The digest of a file read from disk, or `None` when it `$INCLUDE`s
+    /// another.
+    ///
+    /// A digest of the parent says nothing about the included file, so an edit
+    /// to that one would be invisible — the exact failure a re-read exists to
+    /// prevent (`CLAUDE.md` §4, `TODO.md` #64f). `None` rather than a digest
+    /// that would compare equal, so a caller cannot skip work on the strength
+    /// of it: the omission is the rule.
+    ///
+    /// A textual test rather than a report from the parser: it cannot miss one,
+    /// because an `$INCLUDE` the parser acts on is by definition in the text,
+    /// and a false positive inside a TXT record costs one re-parse.
+    pub fn of_self_contained(bytes: &[u8]) -> Option<FileDigest> {
+        // `eq_ignore_ascii_case` rather than uppercasing the line:
+        // `to_ascii_uppercase` allocates a copy of every line, and a feed is a
+        // line per rule.
+        const DIRECTIVE: &[u8] = b"$INCLUDE";
+        let included = bytes.split(|b| *b == b'\n').any(|line| {
+            let head = line.trim_ascii_start();
+            head.len() >= DIRECTIVE.len() && head[..DIRECTIVE.len()].eq_ignore_ascii_case(DIRECTIVE)
+        });
+        (!included).then(|| FileDigest::of(bytes))
+    }
+}
+
 /// Positions in [`Zone::records`], by the folded wire form of the owner name.
 /// Named so that [`Zone::note_non_terminals`] can take it apart from the rest
 /// of the zone.
@@ -839,6 +890,38 @@ mod tests {
     use crate::ParsedRecord;
     use rdns_present::dnssec_time::parse_dnssec_time;
     use std::net::Ipv4Addr;
+
+    /// The `$INCLUDE` rule is matched the way the parser matches it — case
+    /// insensitively, after leading whitespace — or the test and the thing it
+    /// is a test of disagree (`CLAUDE.md` §7). `parse_into` uses
+    /// `eq_ignore_ascii_case` on the first field.
+    #[test]
+    fn a_file_that_includes_another_has_no_digest() {
+        let plain = b"@ IN SOA ns. host. 1 2 3 4 5\nwww IN A 192.0.2.1\n";
+        assert!(FileDigest::of_self_contained(plain).is_some());
+        assert_eq!(
+            FileDigest::of_self_contained(plain),
+            Some(FileDigest::of(plain)),
+            "the same bytes, either way in"
+        );
+
+        for included in [
+            &b"$INCLUDE other.db\n"[..],
+            b"$include other.db\n",
+            b"   $Include other.db\n",
+            b"@ IN SOA ns. host. 1 2 3 4 5\n$INCLUDE other.db",
+        ] {
+            assert!(
+                FileDigest::of_self_contained(included).is_none(),
+                "a digest of this file says nothing about the one it includes"
+            );
+        }
+
+        // A prefix test, so a name beginning with the directive reads as one
+        // too. Deliberate and stated in the doc comment: erring towards a
+        // re-parse is the direction that cannot lose an edit.
+        assert!(FileDigest::of_self_contained(b"$INCLUDED IN TXT nope\n").is_none());
+    }
 
     #[test]
     fn test_zone_creation() {

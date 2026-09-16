@@ -44,7 +44,7 @@
 use crate::error::{ConfigError, ConfigResult};
 use crate::record_types as rt;
 use crate::resolver::NameserverPolicy;
-use crate::zone::{parse_zone_file_at, Located, NameKind, Zone, ZoneRecord};
+use crate::zone::{parse_zone_text_at, FileDigest, Located, NameKind, Zone, ZoneRecord};
 use crate::{Name, NameRef, ParsedRecord, Qtype, ResourceRecord, Serial};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -376,11 +376,33 @@ fn flatten(mut spans: Vec<Span>) -> Vec<Span> {
     out
 }
 
+/// A feed's file, as text.
+///
+/// The error names the file, because a resolver runs several and "no such file"
+/// on its own sends the operator to the wrong one.
+fn read_feed(path: &Path) -> ConfigResult<String> {
+    std::fs::read_to_string(path)
+        .map_err(|e| ConfigError::new(format!("RPZ {}: {e}", path.display())))
+}
+
+/// Where a policy zone was read from, when a reload could keep it rather than
+/// read it again (`TODO.md` #71b).
+///
+/// Absent for a zone built in memory, and for a file that `$INCLUDE`s another —
+/// [`FileDigest::of_self_contained`] says why that one has to be read every
+/// time.
+#[derive(Debug)]
+struct ReadFrom {
+    path: PathBuf,
+    digest: FileDigest,
+}
+
 /// One policy zone, indexed for the three questions a query asks of it.
 #[derive(Debug)]
 pub struct PolicyZone {
     zone: Zone,
     policy: PolicyOverride,
+    read_from: Option<ReadFrom>,
     client_ip: IpIndex,
     response_ip: IpIndex,
     ns_ip: IpIndex,
@@ -398,10 +420,23 @@ impl PolicyZone {
     /// `$ORIGIN` line, or from the file's own name as a fallback — the rule
     /// `rdnsd` names a zone in a directory by.
     pub fn load(path: &Path, policy: PolicyOverride) -> ConfigResult<PolicyZone> {
+        let text = read_feed(path)?;
+        PolicyZone::parse(path, &text, policy)
+    }
+
+    /// The same, for a caller that has already read the file — which
+    /// [`PolicyZones::reload`] has, because deciding whether to parse at all is
+    /// what it read the bytes for.
+    fn parse(path: &Path, text: &str, policy: PolicyOverride) -> ConfigResult<PolicyZone> {
         let fallback = crate::zone::origin_from_path(&path.to_string_lossy());
-        let zone = parse_zone_file_at(path, &fallback)
+        let zone = parse_zone_text_at(text, &fallback, path)
             .map_err(|e| ConfigError::new(format!("RPZ {}: {e}", path.display())))?;
-        PolicyZone::new(zone, policy)
+        let mut indexed = PolicyZone::new(zone, policy)?;
+        indexed.read_from = FileDigest::of_self_contained(text.as_bytes()).map(|digest| ReadFrom {
+            path: path.to_path_buf(),
+            digest,
+        });
+        Ok(indexed)
     }
 
     /// Index a parsed zone as policy.
@@ -478,6 +513,7 @@ impl PolicyZone {
         Ok(PolicyZone {
             zone,
             policy,
+            read_from: None,
             client_ip,
             response_ip,
             ns_ip,
@@ -757,9 +793,14 @@ fn text(label: &[u8]) -> Result<&str, String> {
 ///
 /// Empty is the ordinary case and costs one `is_empty` per query:
 /// [`PolicyZones::before_query`] returns before touching the name.
+///
+/// `Arc` per zone so that a reload can hand a feed nobody touched straight back
+/// (`TODO.md` #71b). The zones are immutable once indexed — [`PolicyZone::zone`]
+/// says why — so sharing one between the old set and the new one is sharing a
+/// value neither can change.
 #[derive(Debug, Default)]
 pub struct PolicyZones {
-    zones: Vec<PolicyZone>,
+    zones: Vec<Arc<PolicyZone>>,
 }
 
 impl PolicyZones {
@@ -768,24 +809,75 @@ impl PolicyZones {
     /// All-or-nothing: a feed that does not parse must not leave the resolver
     /// enforcing a policy shorter than the one configured (`CLAUDE.md` §4).
     pub fn load(feeds: &[Feed]) -> ConfigResult<PolicyZones> {
+        PolicyZones::reload(feeds, &PolicyZones::default())
+    }
+
+    /// The same, keeping every feed whose file has not moved since `held` read
+    /// it — `TODO.md` #71b. Three million-rule feeds with one publisher cost
+    /// **781 ms** where the whole set cost **2 200**, and a SIGHUP over a quiet
+    /// set **62 ms** (`rdns/tests/rpz_install.rs`, release, the development
+    /// machine).
+    ///
+    /// Still all-or-nothing, and that is the property the row said must not be
+    /// lost: every feed is read and parsed before any of the set is built, so a
+    /// half-written file still leaves the previous set whole. What changes is
+    /// that the test is now per feed rather than per set — one feed publishing
+    /// no longer re-parses the others.
+    ///
+    /// The bytes are read either way and the digest is taken over them, because
+    /// a `stat` cannot see an edit that preserves length and timestamp and a
+    /// missed edit is the operator's change silently not taken (`CLAUDE.md`
+    /// §4). Measured at a million rules: read and digest 21 ms per feed against
+    /// ~720 for the parse and index it replaces — the same argument `rdnsd`'s
+    /// reload path makes (#64f), where it was 1.8%.
+    pub fn reload(feeds: &[Feed], held: &PolicyZones) -> ConfigResult<PolicyZones> {
         let mut zones = Vec::with_capacity(feeds.len());
         for feed in feeds {
-            zones.push(PolicyZone::load(&feed.path, feed.policy)?);
+            let text = read_feed(&feed.path)?;
+            let digest = FileDigest::of_self_contained(text.as_bytes());
+            match held.kept(feed, digest) {
+                Some(zone) => zones.push(zone),
+                None => zones.push(Arc::new(PolicyZone::parse(&feed.path, &text, feed.policy)?)),
+            }
         }
         Ok(PolicyZones { zones })
+    }
+
+    /// The zone this set holds for `feed`, when the file it was read from is
+    /// the file just read.
+    ///
+    /// Keyed on the path rather than on the position in `feeds`, so a set
+    /// reloaded against a different list of feeds cannot carry a zone forward
+    /// under somebody else's policy. The policy is compared as well, because
+    /// one file may be named twice at two policies (`TODO.md` #63j) and the
+    /// override is baked into the indexed zone.
+    fn kept(&self, feed: &Feed, digest: Option<FileDigest>) -> Option<Arc<PolicyZone>> {
+        let digest = digest?;
+        self.zones
+            .iter()
+            .find(|zone| {
+                zone.policy == feed.policy
+                    && zone
+                        .read_from
+                        .as_ref()
+                        .is_some_and(|from| from.path == feed.path && from.digest == digest)
+            })
+            .cloned()
     }
 
     /// Zones already built, in the order they are consulted — for a caller
     /// that did not read them from files.
     pub fn from_zones(zones: Vec<PolicyZone>) -> PolicyZones {
-        PolicyZones { zones }
+        PolicyZones {
+            zones: zones.into_iter().map(Arc::new).collect(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.zones.is_empty()
     }
 
-    pub fn zones(&self) -> &[PolicyZone] {
+    pub fn zones(&self) -> &[Arc<PolicyZone>] {
         &self.zones
     }
 
@@ -808,7 +900,10 @@ impl PolicyZones {
     /// in memory, so a refresh needs no second copy of a feed to hold a base
     /// against (`TODO.md` #57e).
     pub fn held(&self, zone: NameRef<'_>) -> Option<&PolicyZone> {
-        self.zones.iter().find(|held| held.origin() == zone)
+        self.zones
+            .iter()
+            .map(Arc::as_ref)
+            .find(|held| held.origin() == zone)
     }
 
     /// The rewrite that applies before anything is resolved: the client's
@@ -835,7 +930,7 @@ impl PolicyZones {
     /// The resolver is handed a policy only when one does: the walk asks
     /// nothing, and the per-query [`DelegationPolicy`] is never built.
     pub fn watches_delegations(&self) -> bool {
-        self.zones.iter().any(PolicyZone::watches_delegations)
+        self.zones.iter().any(|zone| zone.watches_delegations())
     }
 
     /// The version of each zone that watches delegations, in the order they
@@ -978,7 +1073,18 @@ impl PolicyStore {
     /// the resolver enforcing a policy shorter than the one configured, so the
     /// previous set stays in force and the caller is told which file was wrong.
     pub fn reload(&self) -> ConfigResult<Reloaded> {
-        let zones = Arc::new(PolicyZones::load(&self.feeds)?);
+        // The set in force, read out before the work and not under a guard: a
+        // feed is seconds to parse and no lock may be held over that
+        // (`CLAUDE.md` §9). Two reloads at once would both read it and the
+        // second to finish would win, which is what happens today as well; the
+        // resolver's reload task runs one at a time.
+        let held = self.in_force();
+        let zones = Arc::new(PolicyZones::reload(&self.feeds, &held)?);
+        let reread = zones
+            .zones()
+            .iter()
+            .filter(|zone| !held.zones().iter().any(|was| Arc::ptr_eq(zone, was)))
+            .count();
         let mut guard = match self.current.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -988,6 +1094,7 @@ impl PolicyStore {
         Ok(Reloaded {
             zones,
             delegation_rules_changed,
+            reread,
         })
     }
 }
@@ -998,6 +1105,13 @@ impl PolicyStore {
 pub struct Reloaded {
     /// The set now in force.
     pub zones: Arc<PolicyZones>,
+    /// How many feeds were parsed again, the rest having been kept whole
+    /// (`TODO.md` #71b).
+    ///
+    /// Logged, because a reload that skips work has to be able to say it did:
+    /// an operator whose edit did not register sees "0 of 3" and knows to look
+    /// at the file rather than at the rule (`CLAUDE.md` §14).
+    pub reread: usize,
     /// Whether any zone that has something to say about a delegation is at a
     /// different version than the one it replaced.
     ///
@@ -1220,7 +1334,7 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
     fn policy_zones(policy: PolicyOverride) -> PolicyZones {
         let zone = parse_zone_file(POLICY, ORIGIN).expect("the policy zone parses");
         PolicyZones {
-            zones: vec![PolicyZone::new(zone, policy).expect("it indexes")],
+            zones: vec![Arc::new(PolicyZone::new(zone, policy).expect("it indexes"))],
         }
     }
 
@@ -1404,7 +1518,9 @@ $TTL 60
 ";
         let zone = parse_zone_file(EVERYTHING, ORIGIN).expect("the policy zone parses");
         let zones = PolicyZones {
-            zones: vec![PolicyZone::new(zone, PolicyOverride::Given).expect("it indexes")],
+            zones: vec![Arc::new(
+                PolicyZone::new(zone, PolicyOverride::Given).expect("it indexes"),
+            )],
         };
         let action = |addr: IpAddr| {
             zones
@@ -1598,8 +1714,8 @@ evil.example.com IN CNAME rpz-passthru.
         let feed = parse_zone_file(POLICY, ORIGIN).unwrap();
         let zones = PolicyZones {
             zones: vec![
-                PolicyZone::new(local, PolicyOverride::Given).unwrap(),
-                PolicyZone::new(feed, PolicyOverride::Given).unwrap(),
+                Arc::new(PolicyZone::new(local, PolicyOverride::Given).unwrap()),
+                Arc::new(PolicyZone::new(feed, PolicyOverride::Given).unwrap()),
             ],
         };
         assert_eq!(
@@ -1922,6 +2038,102 @@ evil.example.com IN CNAME .
         )
         .expect("rewrite");
         assert!(store.reload().expect("re-reads").delegation_rules_changed);
+    }
+
+    /// #71b: a feed nobody touched is not read again, and the reload hands
+    /// back the same indexed zone.
+    ///
+    /// Pointer identity rather than a timing, because the saving is a parse
+    /// that either happened or did not and a count is deterministic where a
+    /// wall-clock assertion is a coin toss (`CLAUDE.md` §10). Fails against the
+    /// `PolicyZones::load(&self.feeds)` this replaced, which built a new
+    /// `PolicyZone` for every feed on every reload.
+    #[test]
+    fn a_feed_whose_file_did_not_move_is_kept_whole() {
+        let dir = ScratchDir::new("rpz-reload-kept");
+        let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("it loads");
+        let before = store.in_force().zones()[0].clone();
+
+        let reloaded = store.reload().expect("it re-reads");
+        assert_eq!(reloaded.reread, 0, "nothing moved, so nothing was parsed");
+        assert!(
+            Arc::ptr_eq(&before, &reloaded.zones.zones()[0]),
+            "an untouched feed must come back as the zone already in force"
+        );
+
+        // And the rule is still enforced, which is the thing the saving must
+        // not have cost.
+        assert_eq!(
+            action_for(&store.in_force(), "first.example.com.", Qtype::of(rt::A)),
+            Some(Action::Nxdomain)
+        );
+    }
+
+    /// The other half, and the one that matters: one feed publishing must not
+    /// re-read the others, and must still be seen itself.
+    #[test]
+    fn one_feed_changing_re_reads_only_that_feed() {
+        let dir = ScratchDir::new("rpz-reload-one");
+        let quiet = dir.write("quiet.zone", &feed(1, "quiet.example.com", None));
+        let busy = dir.write("busy.zone", &feed(1, "busy.example.com", None));
+        let store = PolicyStore::load(&[
+            Feed::new(&quiet, PolicyOverride::Given),
+            Feed::new(&busy, PolicyOverride::Given),
+        ])
+        .expect("both load");
+        let before = store.in_force().zones().to_vec();
+
+        std::fs::write(&busy, feed(2, "worse.example.com", None)).expect("rewrite");
+        let reloaded = store.reload().expect("it re-reads");
+        assert_eq!(reloaded.reread, 1, "one file moved out of two");
+        assert!(Arc::ptr_eq(&before[0], &reloaded.zones.zones()[0]));
+        assert!(!Arc::ptr_eq(&before[1], &reloaded.zones.zones()[1]));
+        assert_eq!(
+            action_for(&reloaded.zones, "worse.example.com.", Qtype::of(rt::A)),
+            Some(Action::Nxdomain),
+            "the feed that did publish has to be in force"
+        );
+        assert_eq!(
+            action_for(&reloaded.zones, "quiet.example.com.", Qtype::of(rt::A)),
+            Some(Action::Nxdomain),
+            "and the one that did not has to still be"
+        );
+    }
+
+    /// A digest of a feed says nothing about a file it `$INCLUDE`s, so a feed
+    /// with one is read every time (`rdns::zone::FileDigest::of_self_contained`).
+    ///
+    /// The failure this prevents is the one the re-read exists for: an
+    /// operator's edit silently not taken (`CLAUDE.md` §4). `rdnsd`'s reload
+    /// path has the same test for the same reason (`TODO.md` #64f).
+    #[test]
+    fn a_feed_that_includes_another_file_is_always_read_again() {
+        let dir = ScratchDir::new("rpz-reload-include");
+        dir.write("extra.zone", "included.example.com IN CNAME .\n");
+        let path = dir.write(
+            "feed.zone",
+            &format!(
+                "{}$INCLUDE extra.zone\n",
+                feed(1, "first.example.com", None)
+            ),
+        );
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("it loads");
+        let before = store.in_force().zones()[0].clone();
+        assert_eq!(
+            action_for(&store.in_force(), "included.example.com.", Qtype::of(rt::A)),
+            Some(Action::Nxdomain),
+            "the include was read"
+        );
+
+        let reloaded = store.reload().expect("it re-reads");
+        assert_eq!(reloaded.reread, 1);
+        assert!(
+            !Arc::ptr_eq(&before, &reloaded.zones.zones()[0]),
+            "the parent file's digest cannot speak for the included one"
+        );
     }
 
     /// A store nothing was loaded from reloads nothing: the `--rpz`-less

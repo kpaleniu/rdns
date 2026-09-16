@@ -909,7 +909,15 @@ pub(crate) fn reload_policy(serving: &Resolving) {
     }
     match serving.policy.reload() {
         Ok(reloaded) => {
-            tracing::info!("policy zones re-read");
+            // The count, not just "re-read": a feed whose file has not moved is
+            // kept whole (`TODO.md` #71b), so an operator whose edit did not
+            // register sees "0 of 3" here rather than a line that reads the
+            // same either way.
+            tracing::info!(
+                "policy zones re-read: {} of {} feeds had changed",
+                reloaded.reread,
+                reloaded.zones.zones().len()
+            );
             log_policy(&reloaded.zones);
             // The one thing a new rule cannot reach on its own. A QNAME or
             // client-IP rule is consulted before every cache and a response-IP
@@ -1128,10 +1136,12 @@ fn unsupported_opcode(msg: &DnsMessage, advertised: u16, max_len: usize) -> Opti
 /// Three outcomes, in this order:
 ///
 /// - From an address `--rpz-notify-from` does not list: REFUSED. The check is
-///   first because a NOTIFY costs its recipient a full re-read of every feed —
-///   seconds, and twice the feeds' memory while both sets are live — so the
-///   work is never started for a sender that may not ask for it (`CLAUDE.md`
-///   §16). `rdnsd` refuses one the same way and says so with the same EDE code.
+///   first because a NOTIFY costs its recipient a re-read of the feed it names —
+///   ~720 ms for a million-rule one, and that feed's memory twice over while
+///   both versions are live — so the work is never started for a sender that
+///   may not ask for it (`CLAUDE.md` §16). `rdnsd` refuses one the same way and
+///   says so with the same EDE code. It was a re-read of *every* feed until
+///   `TODO.md` #71b, which is why the ACL was worth putting first even then.
 /// - Naming a zone no `--rpz` file carries: NOTAUTH. Distinguished from the
 ///   refusal on the wire and not only in the log, because the operator who can
 ///   see this is on the sending side.
@@ -1170,7 +1180,7 @@ fn policy_notify(
         tracing::warn!(
             %peer,
             "NOTIFY REFUSED: --rpz-notify-from does not list it, and a NOTIFY \
-             costs its recipient a re-read of every feed"
+             costs its recipient a re-read of that feed"
         );
         (ResponseCode::Refused, Some(NOT_LISTED))
     } else {

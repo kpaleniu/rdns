@@ -749,7 +749,7 @@ struct UpdateHandling {
     /// (`TODO.md` #64b), because that fact is *made* under this lock: nothing
     /// else writes a zone file while it is held, so the map cannot be stale
     /// with respect to anything the server itself did.
-    applying: tokio::sync::Mutex<std::collections::HashMap<PathBuf, u64>>,
+    applying: tokio::sync::Mutex<std::collections::HashMap<PathBuf, rdns::zone::FileDigest>>,
 }
 
 impl UpdateHandling {

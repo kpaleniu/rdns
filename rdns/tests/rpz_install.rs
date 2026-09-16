@@ -19,13 +19,18 @@
 //!
 //! `RDNS_RPZ_RULES` sets the largest feed; the three smaller sizes are fixed so
 //! the shape is visible rather than one number that could be anything.
+//!
+//! The three take turns (`rdns::testutil::one_at_a_time`), because the recipe
+//! above selects all of them and libtest runs what a filter selects in
+//! parallel: the cold load below read 3 123 ms against three concurrent
+//! million-rule runs and 2 198 with the binary to itself.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use rdns::rpz::{PolicyOverride, PolicyZone};
+use rdns::rpz::{Feed, PolicyOverride, PolicyStore, PolicyZone};
 use rdns::zone::{parse_zone_file_at, Zone};
 use rdns::zone_writer::{write_zone_file, zone_to_string};
 
@@ -157,6 +162,7 @@ fn transferred(dir: &Path, rules: usize) -> Zone {
 #[test]
 #[ignore = "a measurement to take, not a check to run"]
 fn installing_a_transferred_policy_zone() {
+    let _turn = rdns::testutil::one_at_a_time();
     if cfg!(debug_assertions) {
         panic!(
             "this would measure the debug build. Run:\n  \
@@ -266,6 +272,7 @@ fn installing_a_transferred_policy_zone() {
 #[test]
 #[ignore = "a measurement to take, not a check to run"]
 fn refreshing_a_transferred_policy_zone() {
+    let _turn = rdns::testutil::one_at_a_time();
     if cfg!(debug_assertions) {
         panic!(
             "this would measure the debug build. Run:\n  \
@@ -375,6 +382,88 @@ fn refreshing_a_transferred_policy_zone() {
             ms(applied),
             ms(installed.elapsed),
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    println!();
+}
+
+/// What a *set* of feeds costs when one of them publishes — `TODO.md` #71b.
+///
+/// The two above measure one feed. This one measures the thing an operator
+/// actually runs: several feeds, one publisher, and a reload that used to be
+/// all-or-nothing over the set. `RDNS_RPZ_FEEDS` sets how many.
+///
+/// Three rows, and the middle one is the number the row was filed on: a cold
+/// load of the set, a reload with nothing changed, and a reload with exactly
+/// one feed rewritten. What the last two cost above the read-and-digest floor
+/// is the parse that was not skipped.
+#[test]
+#[ignore = "a measurement to take, not a check to run"]
+fn reloading_a_set_when_one_feed_publishes() {
+    let _turn = rdns::testutil::one_at_a_time();
+    if cfg!(debug_assertions) {
+        panic!(
+            "this would measure the debug build. Run:\n  \
+             cargo test --release -p rdns --test rpz_install -- --ignored --nocapture"
+        );
+    }
+
+    let largest = knob("RDNS_RPZ_RULES", 1_000_000);
+    let feeds = knob("RDNS_RPZ_FEEDS", 3);
+    let sizes: Vec<usize> = [10_000, 100_000]
+        .into_iter()
+        .filter(|n| *n < largest)
+        .chain(std::iter::once(largest))
+        .collect();
+
+    {
+        // The first measured block pays for whatever this process has not
+        // initialized yet (`CLAUDE.md` §10).
+        let dir = scratch("reload-warmup");
+        let path = dir.join("warm.zone");
+        std::fs::write(&path, feed_text(1_000)).expect("written");
+        let store = PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("loads");
+        drop(store.reload().expect("re-reads"));
+    }
+
+    println!(
+        "\n{:>9} | {:>11} {:>11} {:>11} | {:>9}",
+        "rules", "cold load", "none moved", "one moved", "feeds"
+    );
+    println!("{:->9}-+-{:->35}-+-{:->9}", "", "", "");
+
+    for rules in sizes {
+        let dir = scratch(&format!("reload-set-{rules}"));
+        // Each feed gets its own origin, so the set is a set rather than one
+        // zone held several times.
+        let paths: Vec<PathBuf> = (0..feeds)
+            .map(|i| {
+                let path = dir.join(format!("feed{i}.zone"));
+                let text = feed_text(rules).replace("rpz.example.", &format!("rpz{i}.example."));
+                std::fs::write(&path, text).expect("the feed is written");
+                path
+            })
+            .collect();
+        let configured = Feed::each(&paths, PolicyOverride::Given);
+
+        let (store, cold) = measure(|| PolicyStore::load(&configured).expect("the set loads"));
+        let (unchanged, quiet) = measure(|| store.reload().expect("re-reads"));
+        assert_eq!(unchanged.reread, 0, "nothing was rewritten");
+
+        // One feed publishes: same rules, one more, and a bumped serial.
+        let text = feed_text(rules).replace("rpz.example.", "rpz0.example.")
+            + "www.late.example IN CNAME .\n";
+        std::fs::write(&paths[0], text).expect("the publication is written");
+        let (published, busy) = measure(|| store.reload().expect("re-reads"));
+        assert_eq!(published.reread, 1, "one feed moved out of {feeds}");
+
+        println!(
+            "{rules:>9} | {:>11.1} {:>11.1} {:>11.1} | {feeds:>9}",
+            ms(cold.elapsed),
+            ms(quiet.elapsed),
+            ms(busy.elapsed),
+        );
+        drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
     println!();

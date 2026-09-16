@@ -427,9 +427,10 @@ struct Cli {
     /// side. This is the ear for it (`TODO.md` #57c).
     ///
     /// A list rather than a default, because a NOTIFY costs its recipient a
-    /// full re-read of every feed: seconds for a large one, and twice the
-    /// feeds' memory while both sets are live. Naming nobody leaves a NOTIFY
-    /// answered NOTIMP, which is what this resolver did before.
+    /// re-read of the feed it names: ~720 ms for a million-rule one, and that
+    /// feed's memory twice over while both versions are live (`TODO.md` #71b).
+    /// Naming nobody leaves a NOTIFY answered NOTIMP, which is what this
+    /// resolver did before.
     #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     rpz_notify_from: Vec<String>,
     /// Read the settings from this file instead of the command line.
@@ -847,8 +848,8 @@ async fn main() -> anyhow::Result<()> {
     // (`CLAUDE.md` §14).
     if let Some(acl) = rpz_notify.as_ref() {
         tracing::info!(
-            "a NOTIFY from {} address(es) queues a re-read of every --rpz file; \
-             from anywhere else it is REFUSED",
+            "a NOTIFY from {} address(es) queues a re-read of the --rpz file it \
+             names; from anywhere else it is REFUSED",
             acl.from.len()
         );
     } else if !feeds.is_empty() {

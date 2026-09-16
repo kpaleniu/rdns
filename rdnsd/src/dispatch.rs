@@ -34,7 +34,7 @@ use rdns::{
     tsig::{self, TsigCheck, TsigSession},
     update,
     validation::{Arrival, Privacy, Request, Transport},
-    zone::Zone,
+    zone::{FileDigest, Zone},
     DnsMessage, ExtendedError, OpCode, Qtype, ResponseCode,
 };
 use rdns_transport::tcp::{self, send_framed, Reply};
@@ -42,7 +42,7 @@ use rdns_transport::ServeContext;
 
 use crate::answer::{write_response, NOT_OUR_ZONE};
 use crate::replication::{Notified, Secondaries};
-use crate::zones::{digest_of, install_zone, ZoneContext, ZoneMap, ZoneSigning};
+use crate::zones::{install_zone, ZoneContext, ZoneMap, ZoneSigning};
 use crate::{bad_request, serving_error};
 use crate::{Scratch, Server};
 
@@ -1240,8 +1240,8 @@ fn apply_update_to_file(
     prerequisites: &[update::Prerequisite],
     changes: &[update::Change],
     signing: Option<&ZoneSigning>,
-    known: Option<u64>,
-) -> Result<(Option<Zone>, UpdateReport, u64), UpdateFailure> {
+    known: Option<FileDigest>,
+) -> Result<(Option<Zone>, UpdateReport, FileDigest), UpdateFailure> {
     // The zone as the file has it: unsigned, on the operator's serial. Taken
     // from the file rather than from the served copy, so an edit since the last
     // load is not silently reverted.
@@ -1256,7 +1256,7 @@ fn apply_update_to_file(
     let raw = std::fs::read(path)
         .with_context(|| format!("re-reading {} to update it", path.display()))
         .map_err(UpdateFailure::System)?;
-    let digest = digest_of(&raw);
+    let digest = FileDigest::of(&raw);
 
     // Reusing the served copy is only sound with no signing configured: then it
     // *is* what the file holds, because the last thing written there was the
@@ -1300,7 +1300,7 @@ fn apply_update_to_file(
         .map_err(UpdateFailure::System)?;
     // The bytes as written, so the next update can tell them from an edit. Off
     // the text rather than by re-reading it: the same bytes went to the file.
-    let written = digest_of(text.as_bytes());
+    let written = FileDigest::of(text.as_bytes());
 
     // Signed as a load would sign it, from the file's now-bumped serial, so the
     // served number moves too. Incrementally against the version being served:
@@ -1408,24 +1408,7 @@ pub(crate) mod tests {
     use rdns::UdpSizes;
     use std::collections::HashMap;
 
-    /// The `#[ignore]`d benchmarks below take turns.
-    ///
-    /// `update_cost` as a filter matches more than one of them, and libtest
-    /// runs what a filter selects in parallel — so the recipe in each of their
-    /// doc comments timed a million-record update against a million-record
-    /// signing run. That is how #64b came to record a 1-5% saving for a change
-    /// that saves 38%. Here rather than in the recipes, because a recipe is a
-    /// document and this is the machine (`CLAUDE.md` §17).
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// A turn, held for the whole body of a benchmark.
-    ///
-    /// Poisoning is ignored: one benchmark panicking says nothing about whether
-    /// the next may run, and the alternative is every later one failing for a
-    /// reason that is not theirs.
-    pub(crate) fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-        ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
-    }
+    pub(crate) use rdns::testutil::one_at_a_time;
 
     /// A zone of `records` A records under one apex, for the benchmarks.
     pub(crate) fn zone_text(records: usize) -> String {
@@ -1634,7 +1617,7 @@ pub(crate) mod tests {
             let path = dir.join("example.com.zone");
             std::fs::write(&path, zone_text(records)).expect("write the fixture");
             let mut served = parse_zone_file_at(&path, "example.com.").expect("the fixture parses");
-            let mut digest = digest_of(&std::fs::read(&path).expect("read the fixture"));
+            let mut digest = FileDigest::of(&std::fs::read(&path).expect("read the fixture"));
             let mut cold = Vec::new();
             let mut warm = Vec::new();
 
@@ -1673,7 +1656,7 @@ pub(crate) mod tests {
                 // kinds of iteration would differ in more than `known`.
                 assert_eq!(
                     digest,
-                    digest_of(&std::fs::read(&path).expect("read back")),
+                    FileDigest::of(&std::fs::read(&path).expect("read back")),
                     "the digest returned is the digest of the file at {records}"
                 );
                 if reuse { &mut warm } else { &mut cold }.push(elapsed);

@@ -23,7 +23,7 @@ use rdns::journal::Journal;
 use rdns::metrics::DnsMetrics;
 use rdns::name_keys::NameKeyBuf;
 use rdns::record_types;
-use rdns::zone::{parse_zone_file_at, Zone};
+use rdns::zone::{parse_zone_file_at, FileDigest, Zone};
 use rdns::zone_signer::{
     active_signing_keys, algorithms_missing_signatures, resign_after, sign_zone,
     sign_zone_incrementally, DenialChain, DnskeySignature, SigningPolicy,
@@ -57,47 +57,12 @@ pub(crate) fn zone_key(zone: &Zone) -> NameKeyBuf {
     NameKeyBuf::new(zone.origin())
 }
 
-/// What this server last saw in a zone file, for telling a file that moved from
-/// one that did not.
-///
-/// Not a cryptographic digest: the question is whether the bytes changed, and
-/// anybody who can rewrite the zone file already owns the process.
-/// `DefaultHasher` is not stable across Rust releases, which does not matter —
-/// every comparison is against a value this same process computed, and a restart
-/// re-reads anyway.
-///
-/// One copy, used by the UPDATE path (`TODO.md` #64b) and the reload path
-/// (#64f), because two implementations of "did these bytes change" is how the
-/// two answers come to differ (`CLAUDE.md` §7).
-pub(crate) fn digest_of(bytes: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Whether `bytes` are a zone file whose content is entirely its own.
-///
-/// A digest of the file says nothing about a file it `$INCLUDE`s, so an edit to
-/// an included file would be invisible to [`Keepable`] — the exact failure the
-/// re-read exists to prevent (`CLAUDE.md` §4). A textual test rather than a
-/// report from the parser: it cannot miss one, because an `$INCLUDE` the parser
-/// acts on is by definition in the text, and a false positive inside a TXT
-/// record costs one re-parse.
-fn is_self_contained(bytes: &[u8]) -> bool {
-    !bytes.split(|b| *b == b'\n').any(|line| {
-        line.trim_ascii_start()
-            .to_ascii_uppercase()
-            .starts_with(b"$INCLUDE")
-    })
-}
-
 /// What each zone file held when this process last parsed it.
 ///
 /// Shared between the startup load and every reload, so the first SIGHUP after
 /// a start already has something to compare against.
 #[derive(Clone, Default)]
-pub(crate) struct LoadedFiles(Arc<std::sync::Mutex<HashMap<PathBuf, (u64, NameKeyBuf)>>>);
+pub(crate) struct LoadedFiles(Arc<std::sync::Mutex<HashMap<PathBuf, (FileDigest, NameKeyBuf)>>>);
 
 impl LoadedFiles {
     /// The zone key this path last parsed to, if its bytes have not changed
@@ -106,13 +71,13 @@ impl LoadedFiles {
     /// A poisoned lock answers `None`, so the file is parsed: skipping work on
     /// the strength of state that cannot be read is the wrong way for this to
     /// fail (`CLAUDE.md` §6).
-    fn unchanged(&self, path: &Path, digest: u64) -> Option<NameKeyBuf> {
+    fn unchanged(&self, path: &Path, digest: FileDigest) -> Option<NameKeyBuf> {
         let seen = self.0.lock().ok()?;
         let (last, key) = seen.get(path)?;
         (*last == digest).then(|| key.clone())
     }
 
-    fn note(&self, path: &Path, digest: u64, key: &NameKeyBuf) {
+    fn note(&self, path: &Path, digest: FileDigest, key: &NameKeyBuf) {
         let Ok(mut seen) = self.0.lock() else {
             return;
         };
@@ -158,10 +123,9 @@ pub(crate) struct Keepable<'a> {
 impl Keepable<'_> {
     /// The served zone for this file, when it may be kept whole.
     fn zone_for(&self, path: &Path, bytes: &[u8]) -> Option<(NameKeyBuf, Arc<Zone>)> {
-        if !is_self_contained(bytes) {
-            return None;
-        }
-        let key = self.files.unchanged(path, digest_of(bytes))?;
+        let key = self
+            .files
+            .unchanged(path, FileDigest::of_self_contained(bytes)?)?;
         let zone = self.served.get(&key)?;
         let origin = key.as_name().to_owned();
         match self.signing.and_then(|s| s.keys_for(&origin)) {
@@ -180,11 +144,10 @@ impl Keepable<'_> {
     }
 
     fn note(&self, path: &Path, bytes: &[u8], key: &NameKeyBuf) {
-        if is_self_contained(bytes) {
-            self.files.note(path, digest_of(bytes), key);
-        } else {
+        match FileDigest::of_self_contained(bytes) {
+            Some(digest) => self.files.note(path, digest, key),
             // An `$INCLUDE` makes the digest a claim about the wrong file.
-            self.files.forget(path);
+            None => self.files.forget(path),
         }
     }
 }

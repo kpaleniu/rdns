@@ -44,7 +44,13 @@ transfer, because applying forty records to a million-record zone cost 1 018 ms
 building a key per record of the *base*. What the row was actually missing was
 smaller and older: the refresh had no SOA probe at all, so an unchanged feed
 cost a transfer and a reload every REFRESH. **#71** is what is left after both,
-and it is neither the wire nor the format. **#64 is closed** — 64c, 64e and 64f
+and it is neither the wire nor the format. **71b closed 2026-09-16** — a reload
+keeps every feed whose file did not move, so a three-feed set costs 781 ms for
+one publication where it cost 2 200, and a quiet SIGHUP 62 ms — which leaves
+**71a**, the row filed with no remedy claimed. Its by-product is the larger
+finding: `rpz_install.rs` had no turnstile, so every number #57e and #71
+recorded was taken with two other million-rule measurements running. That is
+#64b's defect, found twice. **#64 is closed** — 64c, 64e and 64f
 all went the same day, and 64c is the one whose remedy was declined on its own
 re-measurement; **64g closed with it**, and its own filing was the thing it
 refuted — the "core type's shape and its call sites" it was not taken for is a
@@ -1625,11 +1631,21 @@ refresh that only asks for what moved.
   RFC 1995 §4 lets a master answer that with a longer chain or with the whole
   zone.
 
-  **What is left is neither the wire nor the format, and is #71**: 801 ms of
-  the 808 is rebuilding a `Zone` whose index holds positions and cannot be
-  edited, and the 1 351 ms install is shape A writing out what this process
-  already holds. Both are measured there, and 71a is the same obstacle #64g and
-  #65 reach from the UPDATE and signing sides.
+  **What is left is neither the wire nor the format, and is #71**: ~~801 ms of
+  the 808~~ **the whole of the 783** is rebuilding a `Zone` whose index holds
+  positions and cannot be edited — an empty difference sequence costs 793 on the
+  same zone, which is the same number back — and the ~~1 351 ms~~ **1 190 ms**
+  install is shape A writing out what this process already holds. Both are
+  measured there, and 71a is the same obstacle #64g and #65 reach from the
+  UPDATE and signing sides.
+
+  **Every figure this row recorded was taken under contention** and is struck
+  above where #71 re-measured it: `rpz_install.rs` had no turnstile, so the
+  recipe in its own module doc ran three million-rule measurements at once. The
+  reasoning is left standing because it is unchanged — the shape of the row,
+  that the install and the rebuild are both zone-sized and the wire is not, is
+  what the numbers were for and is what they still say. See #71's head for the
+  fix; #64b is where this defect was first found.
 
 - **57f. A transferred policy feed arrives unauthenticated — filed and closed
   2026-09-15.** `[keys."partner.key."]` in `rdnsr`'s config, in `rdnsd`'s
@@ -3170,6 +3186,12 @@ durability work is how it would get over-built.
   digest. The update path is unmoved: 1 716 ms total against the 1 713-1 731
   band #64a recorded.
 
+  **The 39 ms is 15.6 ms since 2026-09-16**, and the table is left as it was
+  measured. The `$INCLUDE` test this row introduced uppercased every line of
+  every file, which is an allocation per record; #71b found it on moving the
+  code into `rdns` for a third caller and replaced it with
+  `eq_ignore_ascii_case`. Nothing about what the condition *decides* moved.
+
   **The two conditions, and neither is about the output.** The file's bytes are
   what this process last parsed, *and* the signing this reload would do has the
   same key roles as the signing whose output was verified. The second is
@@ -3836,7 +3858,7 @@ Prometheus and the `image` job's probes all send a `Host` and are unaffected.
 
 ---
 
-### 71. A forty-record change rebuilds a zone and re-reads a file — **filed 2026-09-16**
+### 71. A forty-record change rebuilds a zone and re-reads a file — **filed 2026-09-16, 71b closed the same day**
 
 Out of 57e, which took the wire down to what actually changed and left
 everything after it sized by the zone. Measured on the development machine,
@@ -3845,14 +3867,32 @@ release, a million-rule QNAME feed
 
 | applying a forty-rule change at 1M rules | ms |
 |---|---|
-| the difference off the wire and assembled | ~7 |
-| `ixfr::Patch::apply`, rebuilding the zone | 801 |
-| `write_zone_file` then `PolicyZone::load` | 1 351 |
+| the difference off the wire and assembled | ~~about 7~~ **below the noise** |
+| `ixfr::Patch::apply`, rebuilding the zone | ~~801~~ **793** |
+| `write_zone_file` then `PolicyZone::load` | ~~1 351~~ **1 190** |
+
+The first row is now a *nothing* rather than a small number: the whole IXFR
+round trip is 783 ms and applying an **empty** difference sequence to a zone
+this size is 793, so the wire and the assembly are smaller than what separates
+two runs of this harness. Same conclusion as the 7, at a size where the
+subtraction no longer has a sign.
 
 Only the first is the size of the change. The third is shape A's trade and not
 a defect — the file is the store (#57d), so an install serializes a zone this
 process holds and parses it back, which is what buys a restart its rules — and
 it is in the table so that 71a's number is not read as the whole cost.
+
+**The struck figures were measured against themselves**, and finding that is
+71b's by-product rather than its point. `rpz_install.rs` holds three
+`#[ignore]`d million-rule measurements and the recipe in its own module doc
+selects all three; libtest runs what a filter selects in parallel, so every
+number this row and 57e recorded was taken with two other million-rule runs on
+the machine. It is #64b's defect exactly, found there for the same reason and
+fixed there with a turnstile — which `rdnsd`'s dispatch tests had and this file
+did not (§7). The turnstile now lives in `rdns_core::testutil::one_at_a_time`
+and both call it. The re-measured column above is what these cost with the
+binary to themselves; the *shape* of the row is unchanged, which is why this is
+a correction and not a retraction.
 
 - **71a. `Zone` cannot be edited, so any change rebuilds it.** `Patch::apply`
   walks every record and `add_record` folds a key and files a position for
@@ -3864,19 +3904,69 @@ it is in the table so that 71a's number is not read as the whole cost.
   because the clone was laying the RDATA out in the order the signing loop
   reads it. #65's five shared passes are 4.4 s at a million records. Two rows
   naming one type is how both get half-done (§18); the numbers to beat are
-  801 ms here and 4.4 s there, and 64g's result says what a remedy has to keep:
-  the order the reader walks in.
-- **71b. One feed changing re-reads every feed.** `PolicyStore::reload` is
-  `PolicyZones::load(&self.feeds)`: all-or-nothing over the whole set, which is
-  right for what it was written for — a half-written file must not lift a block
-  (§4) — and which costs O(every feed) for a change in one. 57e's probe means
-  it now happens per *publication* rather than per REFRESH, so the row is worth
-  less than it was the day before it was filed. The shape that would fix it is
-  57d shape B's type change, which that branch measured as having almost no
-  blast radius: `PolicyZones` holding `Arc<PolicyZone>` changed no call site
-  outside `rpz.rs`. **What it buys has not been measured** — the number to beat
-  is 1 351 ms per million-rule feed that did *not* change — and the property it
-  must not lose is the all-or-nothing one, per feed rather than per set.
+  793 ms here — 801 as first recorded, and the difference is the contention the
+  section head describes — and 4.4 s there, and 64g's result says what a remedy
+  has to keep: the order the reader walks in. **71b closing changes nothing
+  about this row**: the `Arc<PolicyZone>` it landed shares a zone that nobody
+  edits, which is the same fact stated the other way round.
+- **71b. One feed changing re-reads every feed — filed 2026-09-16, closed the
+  same day.** `PolicyStore::reload` was `PolicyZones::load(&self.feeds)`:
+  all-or-nothing over the whole set, which is right for what it was written for
+  — a half-written file must not lift a block (§4) — and which cost O(every
+  feed) for a change in one. 57e's probe means it happens per *publication*
+  rather than per REFRESH, so the row was worth less than it was the day before
+  it was filed. The shape the row named is what landed: `PolicyZones` holds
+  `Arc<PolicyZone>`, and a reload hands a feed nobody touched straight back.
+
+  **The all-or-nothing property is kept and is now per feed**: every file is
+  still read and every changed one parsed before any of the set is built, so a
+  half-written feed still leaves the previous set whole.
+
+  **What it buys**, on `reloading_a_set_when_one_feed_publishes` — three feeds,
+  one publisher, release, the development machine. The `cold load` column is
+  the old behaviour, not a separate run: a reload *was* a cold load of the
+  whole set, so that is what the other two are against.
+
+  | rules per feed | cold load | none moved | one moved |
+  |---|---|---|---|
+  | 10 000 | 29.1 ms | **0.6 ms** | **17.0 ms** |
+  | 100 000 | 191.9 ms | **6.2 ms** | **71.6 ms** |
+  | **1 000 000** | **2 200 ms** | **62.0 ms** | **781 ms** |
+
+  So a SIGHUP over a quiet set is 35x cheaper and one publication into a
+  three-feed set is 2.8x, and both ratios grow with the number of feeds.
+
+  **The test is the file's bytes and not its `stat`**, which is the measurement
+  that decided the shape: reading and digesting a million-rule feed is 21 ms
+  against the ~720 its parse and index cost, so the honest test is 3% of what
+  it replaces — #64f measured 1.8% for a zone file. A `stat` is 0.08 ms and
+  cannot see an edit that preserves length and timestamp, and a missed edit is
+  the operator's change silently not taken — the exact failure a re-read exists
+  to prevent (§4). #64f made the same argument for `rdnsd` and this is the same
+  code now: `rdns::zone::FileDigest` was `rdnsd`'s `digest_of` plus its
+  `is_self_contained`, moved on the third caller (§7, `origin_from_path`'s
+  precedent).
+
+  **An `$INCLUDE` is never kept**, for #64f's reason: a digest of a feed says
+  nothing about a file it includes. The type carries that rule rather than each
+  caller re-asserting it — `FileDigest::of_self_contained` returns `None`, so a
+  caller cannot skip work on the strength of a digest that could not speak for
+  the file (§17). Both daemons' tests for it fail against a version that
+  returns `Some`.
+
+  **Two things found on the way**, both in the moved code and both outside what
+  the row named:
+
+  - The `$INCLUDE` scan uppercased every line, which is an allocation per rule.
+    `eq_ignore_ascii_case` on the head instead took the quiet-set reload from
+    162 ms to 62, and `rdnsd`'s own unchanged-reload figure (#64f, which
+    recorded **39 ms** at a million records) to **15.6 ms** on the same
+    harness. #64f's table is left as it was measured.
+  - The query path pays nothing for the `Arc`. Four feeds of 200 000 rules,
+    timed against the pre-change tree: a miss is 446-476 ns before and
+    452-474 after, a hit 252-258 against 255-263. There is no RPZ benchmark to
+    hang this on and the A/B was a throwaway, which is why the numbers are here
+    rather than in a committed harness.
 
 ---
 
@@ -4025,7 +4115,7 @@ the week; the record is under "How the queue kept going stale" in
 | **64** | one dynamic UPDATE was five O(zone) passes | **filed 2026-09-14, closed 2026-09-16**, seven rows, and it was filed with the measurement that refuted the fix it was going to propose (§19). 64a: a whole-zone clone nobody read, three instances not one, fixed in the type. 64b: read the file's bytes every time, parse them only when they are not the bytes this server last wrote — 38% off an unsigned update, and its headline number *did not reproduce* because one `--ignored` filter selected two million-record benchmarks and libtest ran them at once. 64d: signing is 88% of a signed update, and the measurement that could have refuted it — `carried` — refuted the *explanation* instead: exactly four RRSIGs are made fresh at any zone size. 64e: the two structures the split named, three shapes built, −14%. 64f: a reload keeps the zone it is serving for a file nobody touched, 11.4 s to 39 ms, on the condition `ProvenSigning` already computes. **64c is the one declined**: its 42% was more than half serializer — RFC 3597's hex form built for every record and thrown away — and `to_string` fell 636 ms to 250 with the file still the authority, which leaves the checkpoint design buying 387 ms of a 1 335 ms update and 4% of a signed one. 64g, the one 64e did not take, closed the same day #64 did: the type change it was filed as too big for is a default type parameter and **zero** of `Rrset::new`'s 43 call sites, it takes the named pass down 25% — and the total does not move, because the clone it removes was buying the signing loop its locality. Landed on the allocation count (593 -> 566 on an eight-record zone) and said so |
 | **59** | nothing here demanded a client certificate for a transfer | **filed 2026-09-13, closed 2026-09-16**, the server half of #51 and RFC 9103 §7.5's other method — the one the section says to prefer. The shape the row named is what landed: an optional verifier, so the same listener still answers a DoT stub with no certificate, and the transfer path refusing what arrived without one. **Neither of the two identity mappings it proposed survived**: a certificate standing for a TSIG key's scope would need both credentials, and a hand-matched subject would be the X.509 parser #42a declined. What landed is the subject *alternative* name checked by `webpki` — the same code that verified the chain, already in the lock, **0 packages** — with `--allow-transfer-cert name[:zones]` in `--tsig-key`'s spelling. Authentication and authorization stay apart (#16): a second certificate from the same CA transfers nothing until it is listed. `ZoneScope` is now one type for both credentials, and `Arrival` carries the certificate, which is what #54's shape was built for — `Arrival::Tcp` cannot carry one. The row's own §19 answer is unchanged and still right: no peer exists that will not transfer over TSIG |
 | **70** | the metrics endpoint did not enforce RFC 9112 §3.2, and its header said it did | **filed and closed 2026-09-16**, out of #68. Both of the header's claims about hyper were estimates of somebody else's code and both were wrong — no `Host` was **200**, not 400, and an over-long request line is **414 past 64 KiB**, not 431 past 8 KB — and four tests in that same file had disproved the first on the day it was written. Filed as a decision rather than a defect and taken by the owner: `bad_host` now answers 400 to all **three** of §3.2's MUSTs, which the row had read as one, and hyper answered 200 to every one of them. The count was wrong too — "four tests" was six tests and eleven requests (§18). The probe it costs is paid back in the refusal's body: §3.2 exempts HTTP/1.0, and `curl`, Prometheus and CI's own probes all send a `Host` |
-| **57** | a policy zone arrived as a file somebody else wrote, not as a transfer | **filed 2026-09-13, closed 2026-09-16**, five rows, left behind by 45a — and the delivery half needed no code in `rdnsd` at all: `announce_transfer` had notified every `--also-notify` peer after every transfer since it was written, and what was missing was `rdnsr`'s ear (57c). 57a's reload found a resolver with `--rpz` and no DoT that had no reload task at all; 57b measured the reload *on* a worker and a one-core resolver answering nothing for 2.7 s. 57d built both shapes and was decided by neither's install cost: A keeps the file, so a restart begins with yesterday's rules. 57e is the one whose own measurement refuted it — IXFR was **slower than AXFR** here, 1 485 ms against 1 372 at a million rules, because applying forty records built a key per record of the base; and the bigger miss was that a refresh had no SOA probe at all, so an unchanged feed cost a transfer and a reload every REFRESH. Both daemons share `xfr::refresh_zone` now (§7). **#71** is what is left, and it is neither the wire nor the format |
+| **57** | a policy zone arrived as a file somebody else wrote, not as a transfer | **filed 2026-09-13, closed 2026-09-16**, five rows, left behind by 45a — and the delivery half needed no code in `rdnsd` at all: `announce_transfer` had notified every `--also-notify` peer after every transfer since it was written, and what was missing was `rdnsr`'s ear (57c). 57a's reload found a resolver with `--rpz` and no DoT that had no reload task at all; 57b measured the reload *on* a worker and a one-core resolver answering nothing for 2.7 s. 57d built both shapes and was decided by neither's install cost: A keeps the file, so a restart begins with yesterday's rules. 57e is the one whose own measurement refuted it — IXFR was **slower than AXFR** here, 1 485 ms against 1 372 at a million rules, because applying forty records built a key per record of the base; and the bigger miss was that a refresh had no SOA probe at all, so an unchanged feed cost a transfer and a reload every REFRESH. Both daemons share `xfr::refresh_zone` now (§7). **#71** is what is left, and it is neither the wire nor the format — and every figure in this row was taken under the libtest contention #71 found, so they are the shape and not the clock |
 | **69** | four accept loops ended on any error, where the UDP side had a helper | **filed and closed 2026-09-16**, out of #68. Filed with no remedy on purpose (§18), and both missing measurements were taken the same day — which reversed the reason. **The remote provocation does not exist**: four `SO_LINGER 0` resets before the accept come back as `Ok` on Windows and on Linux, so §4's *remote* kill switch does not apply. **Descriptor exhaustion does, and needs nobody**: at `ulimit -n`, `accept` returns `EMFILE`, `Uncategorized`/raw 24, invisible to every portable kind — and both daemons' `JoinSet` ends the process when its first task ends, so `accepted?` turned a self-clearing condition into a whole-server outage across every transport. Windows could not be made to reach it (100 000 handles, no failure). Provoked before and after against a real `tcp::serve`: the old code's next write is a reset, the new one answers. One shared `survive_accept_error` at all four sites — retry the aborted kinds, log and back off 100 ms on exhaustion, still fatal otherwise |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly

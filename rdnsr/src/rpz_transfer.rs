@@ -21,9 +21,10 @@
 //! So an unchanged million-rule feed costs one round trip where it used to cost
 //! a transfer and a reload, and a changed one asks for what changed. The
 //! install is the half that is still zone-sized whatever arrives, because the
-//! file is the store (`TODO.md` #57d's shape A) — and the reload is
-//! all-or-nothing over every feed, so a feed that *did* change re-reads the
-//! ones that did not (`TODO.md` #71).
+//! file is the store (`TODO.md` #57d's shape A). It is that feed's size and no
+//! more: a reload keeps every feed whose file has not moved, so one publisher
+//! no longer re-reads the others (`TODO.md` #71b). What is left zone-sized is
+//! #71a.
 //!
 //! **What it buys**, and the reason the row called it the one that argues for
 //! itself: the file is the thing that survives a restart. A resolver that
@@ -468,7 +469,9 @@ mod tests {
     /// Fails against the shape this replaced, which fetched the whole zone
     /// every REFRESH and rewrote the file whatever the master's serial —
     /// 2.5 s of serialize-write-reparse per unchanged million-rule feed, and a
-    /// re-read of every *other* feed with it (`TODO.md` #57e).
+    /// re-read of every *other* feed with it (`TODO.md` #57e). The second half
+    /// is gone on its own account as well — #71b — but this test is about the
+    /// first: a master with nothing new must not write the file at all.
     #[tokio::test]
     async fn a_master_with_nothing_new_is_asked_and_not_transferred() {
         let dir = ScratchDir::new("rpz-current");

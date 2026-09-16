@@ -7,6 +7,14 @@
 //! re-read and peaks at 759 MB while both sets are live, since
 //! [`rdns::rpz::PolicyStore::reload`] builds the whole new set before
 //! installing any of it. The 2x peak is inherent and `TODO.md` #61 says why.
+//!
+//! Both of those are now the cost of a feed *that moved*. `TODO.md` #71b made
+//! the test per feed: a file whose bytes are what this process last parsed is
+//! handed back as the zone already in force, at 21 ms and no second copy, so a
+//! three-feed set with one publisher is 781 ms where it was 2 200 and a SIGHUP
+//! over a quiet set is 62 ms. The task still reads every file, because the only
+//! honest way to know a feed did not move is to read it (`CLAUDE.md` §4).
+//!
 //! They ran on a tokio worker until `TODO.md` #57b, and `#[tokio::main]` gives
 //! one worker per core: measured on a one-worker runtime, a probe asking for
 //! 1 ms ticks saw a 2.715 s gap, which is a resolver answering nothing for the
@@ -176,12 +184,19 @@ mod tests {
     /// calling thread and the worker under test was never the blocked one. Both
     /// halves are `tokio::spawn`ed for that reason, which is also how `main`
     /// runs them.
+    ///
+    /// **The feed is rewritten before the reload**, or there is nothing to
+    /// measure: since `TODO.md` #71b a file whose bytes have not moved is not
+    /// parsed at all, and a 100k feed that is merely re-read is ~2 ms — which
+    /// the old blocking shape would have passed. The rewrite puts the parse
+    /// back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_reload_does_not_stop_the_only_worker() {
         let dir = ScratchDir::new("reload-blocking");
         let path = big_feed(&dir, 100_000);
         let store =
             PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("the feed loads");
+        big_feed(&dir, 100_001);
         let serving = serving_policy(store);
 
         let ticks = Arc::new(AtomicU64::new(0));
