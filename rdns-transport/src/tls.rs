@@ -51,7 +51,7 @@ use rdns::tls_identity::TlsIdentity;
 
 use crate::tcp::{Handler, RateLimit, SplitStream};
 use crate::TransportLimits;
-use rdns::validation::{Arrival, TlsVersion};
+use rdns::validation::{Arrival, PeerCertificate, TlsVersion};
 
 /// The port RFC 7858 §3.1 assigns.
 pub const DOT_PORT: u16 = 853;
@@ -179,8 +179,30 @@ fn read_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<Certified
 }
 
 /// The rustls configuration a DoT listener serves under.
-pub fn server_config(store: Arc<CertificateStore>) -> Result<Arc<ServerConfig>> {
-    Ok(Arc::new(config_with_alpn(store, ALPN_DOT)))
+pub fn server_config(
+    store: Arc<CertificateStore>,
+    clients: Option<rdns::tls_identity::TrustAnchors>,
+) -> Result<Arc<ServerConfig>> {
+    Ok(Arc::new(config_with_alpn(store, ALPN_DOT, clients)?))
+}
+
+/// A verifier that *asks* for a client certificate and accepts a client that
+/// has none (`TODO.md` #59).
+///
+/// Optional, not required, because one `ServerConfig` serves DoT, DoQ and DoH:
+/// demanding a certificate would demand one from every stub resolver on the
+/// same port, and RFC 8310 §8.2's mTLS for DoT is a different relationship
+/// from RFC 9103 §7.5's for transfers. What a presented certificate then
+/// *authorizes* is the transfer path's decision and nobody else's
+/// (`CLAUDE.md` §16) — here it is only verified against the operator's
+/// anchors.
+fn client_verifier(
+    anchors: Arc<rustls::RootCertStore>,
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
+    rustls::server::WebPkiClientVerifier::builder(anchors)
+        .allow_unauthenticated()
+        .build()
+        .context("building the transfer client certificate verifier")
 }
 
 /// The same configuration under a different ALPN token.
@@ -188,14 +210,23 @@ pub fn server_config(store: Arc<CertificateStore>) -> Result<Arc<ServerConfig>> 
 /// DoQ is the other caller (`TODO.md` #42b): same certificate, same store, same
 /// reload — a different protocol on top. Shared so that a certificate renewal
 /// reaches both listeners, which it would not if each built its own.
-pub(crate) fn config_with_alpn(store: Arc<CertificateStore>, alpn: &[u8]) -> ServerConfig {
-    let mut config = ServerConfig::builder()
-        // A DoT or DoQ *server* authenticates itself to the client and does not
-        // ask the client to authenticate. See the module docs.
-        .with_no_client_auth()
-        .with_cert_resolver(store);
+pub(crate) fn config_with_alpn(
+    store: Arc<CertificateStore>,
+    alpn: &[u8],
+    clients: Option<rdns::tls_identity::TrustAnchors>,
+) -> Result<ServerConfig> {
+    let builder = ServerConfig::builder();
+    // Without anchors a DoT or DoQ *server* authenticates itself to the client
+    // and does not ask the client to authenticate. See the module docs; with
+    // them it asks and takes no for an answer (`client_verifier`).
+    let mut config = match clients {
+        Some(anchors) => builder
+            .with_client_cert_verifier(client_verifier(anchors.store())?)
+            .with_cert_resolver(store),
+        None => builder.with_no_client_auth().with_cert_resolver(store),
+    };
     config.alpn_protocols = vec![alpn.to_vec()];
-    config
+    Ok(config)
 }
 
 /// Accept TLS connections and serve each one as an ordinary DNS-over-TCP
@@ -283,6 +314,21 @@ pub async fn serve<H: Handler>(
     }
 }
 
+/// The end-entity certificate this client presented, if it presented one.
+///
+/// The first of `peer_certificates()` is the end entity (rustls hands the
+/// chain back leaf-first, as TLS sends it). Only a configuration with a client
+/// verifier ever sees one, and even then it is optional: the verifier this
+/// build installs allows an unauthenticated client, because the same listener
+/// answers a DoT stub resolver that has no certificate to offer (RFC 8310
+/// §8.2's mTLS is a different relationship from RFC 9103 §7.5's).
+pub(crate) fn presented_certificate(connection: &rustls::ServerConnection) -> PeerCertificate {
+    match connection.peer_certificates().and_then(<[_]>::first) {
+        Some(end_entity) => PeerCertificate::presented(end_entity.as_ref()),
+        None => PeerCertificate::none(),
+    }
+}
+
 /// Serve one connection whose handshake is already done.
 ///
 /// Separate so a caller with its own accept loop — a test, say — can drive a
@@ -304,10 +350,13 @@ pub async fn serve_one_tls<H: Handler>(
     // "1.2 or later" and a stub resolver in the field may offer nothing else.
     // A *transfer* needs 1.3 (RFC 9103 §7.2), and only the connection knows
     // which it got.
-    let arrival = Arrival::Dot(match stream.get_ref().1.protocol_version() {
-        Some(rustls::ProtocolVersion::TLSv1_3) => TlsVersion::Tls13,
-        _ => TlsVersion::Older,
-    });
+    let arrival = Arrival::Dot(
+        match stream.get_ref().1.protocol_version() {
+            Some(rustls::ProtocolVersion::TLSv1_3) => TlsVersion::Tls13,
+            _ => TlsVersion::Older,
+        },
+        presented_certificate(stream.get_ref().1),
+    );
     crate::tcp::serve_one(stream, peer, handler, limits, rate, arrival, stop).await;
 }
 
@@ -400,7 +449,7 @@ mod tests {
 
         /// What the last message handled arrived over.
         fn seen(&self) -> Option<Arrival> {
-            *self.1.lock().expect("the test's own mutex")
+            self.1.lock().expect("the test's own mutex").clone()
         }
     }
 
@@ -435,6 +484,154 @@ mod tests {
         )
     }
 
+    /// A client configuration that presents `identity` when the server asks.
+    fn client_config_with_identity(
+        anchor: &[u8],
+        identity: &testing::Pem,
+    ) -> Arc<rustls::ClientConfig> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(anchor.to_vec()))
+            .expect("the anchor loads");
+        let chain = vec![rustls::pki_types::CertificateDer::from(
+            identity.der.clone(),
+        )];
+        let key = {
+            use rustls::pki_types::pem::PemObject;
+            rustls::pki_types::PrivateKeyDer::from_pem_file(&identity.key)
+                .expect("the client key reads")
+        };
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_client_auth_cert(chain, key)
+                .expect("a client configuration"),
+        )
+    }
+
+    /// The anchors a listener checks a client certificate against, from one
+    /// self-signed certificate: self-signed makes the anchor the leaf, which is
+    /// what lets a second certificate be a negative control.
+    fn anchors_of(pem: &testing::Pem) -> rdns::tls_identity::TrustAnchors {
+        rdns::tls_identity::TrustAnchors::from_ca_file(&pem.cert, "the test anchors")
+            .expect("anchors load")
+    }
+
+    /// What a client proved reaches the handler, which is the whole of #59's
+    /// plumbing half: a transfer's authorization is decided from
+    /// [`Arrival::peer_certificate`] and nothing else can supply it.
+    ///
+    /// Fails against a listener built `with_no_client_auth`, which is what this
+    /// one is without anchors: rustls never asks, so `peer_certificates()` is
+    /// empty however many certificates the client holds.
+    #[tokio::test]
+    async fn a_client_certificate_reaches_the_handler() {
+        let server_pem = write_pem("mtls-server", "localhost");
+        let client_pem = write_pem("mtls-client", "partner.example");
+        let store = CertificateStore::load(&server_pem.cert, &server_pem.key).expect("loads");
+        let config = server_config(store, Some(anchors_of(&client_pem))).expect("a server config");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let shutdown = Shutdown::new();
+        let handler = Arc::new(Echo::new(context(0)));
+        let seen = handler.clone();
+        let server = tokio::spawn(serve(
+            listener,
+            config,
+            handler,
+            TransportLimits::default(),
+            RateLimit::PerMessage,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        let connector = tokio_rustls::TlsConnector::from(client_config_with_identity(
+            &server_pem.der,
+            &client_pem,
+        ));
+        let tcp = TcpStream::connect(addr).await.expect("connect");
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
+        let mut tls = connector.connect(name, tcp).await.expect("the handshake");
+
+        let question = query(0x5959);
+        tls.write_all(&rdns::framed(&question).expect("frames"))
+            .await
+            .expect("send");
+        let mut prefix = [0u8; 2];
+        tls.read_exact(&mut prefix).await.expect("length prefix");
+        let mut body = vec![0u8; u16::from_be_bytes(prefix) as usize];
+        tls.read_exact(&mut body).await.expect("body");
+
+        match seen.seen().expect("the handler saw the message") {
+            Arrival::Dot(TlsVersion::Tls13, presented) => assert_eq!(
+                presented.der(),
+                Some(client_pem.der.as_slice()),
+                "the end-entity certificate, as the client sent it"
+            ),
+            other => panic!("expected a DoT arrival, got {other:?}"),
+        }
+
+        shutdown.begin();
+        let _ = server.await;
+    }
+
+    /// And a client with no certificate is served anyway, which is why the
+    /// verifier allows an unauthenticated one: the same listener answers stub
+    /// resolvers, and RFC 8310 §8.2's mTLS is a different relationship from
+    /// RFC 9103 §7.5's.
+    ///
+    /// Fails against `WebPkiClientVerifier::builder(..).build()` without
+    /// `allow_unauthenticated`, where this handshake is refused outright.
+    #[tokio::test]
+    async fn a_stub_resolver_with_no_certificate_is_still_served() {
+        let server_pem = write_pem("mtls-optional", "localhost");
+        let client_pem = write_pem("mtls-optional-client", "partner.example");
+        let store = CertificateStore::load(&server_pem.cert, &server_pem.key).expect("loads");
+        let config = server_config(store, Some(anchors_of(&client_pem))).expect("a server config");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let shutdown = Shutdown::new();
+        let handler = Arc::new(Echo::new(context(0)));
+        let seen = handler.clone();
+        let server = tokio::spawn(serve(
+            listener,
+            config,
+            handler,
+            TransportLimits::default(),
+            RateLimit::PerMessage,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        let connector = tokio_rustls::TlsConnector::from(client_config(&server_pem.der));
+        let tcp = TcpStream::connect(addr).await.expect("connect");
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
+        let mut tls = connector.connect(name, tcp).await.expect("the handshake");
+
+        let question = query(0x5960);
+        tls.write_all(&rdns::framed(&question).expect("frames"))
+            .await
+            .expect("send");
+        let mut prefix = [0u8; 2];
+        tls.read_exact(&mut prefix).await.expect("length prefix");
+        let mut body = vec![0u8; u16::from_be_bytes(prefix) as usize];
+        tls.read_exact(&mut body).await.expect("body");
+        assert_eq!(body, question, "answered like any other query");
+
+        match seen.seen().expect("the handler saw the message") {
+            Arrival::Dot(_, presented) => assert!(
+                !presented.is_some(),
+                "nothing was presented, and nothing is what the transfer path sees"
+            ),
+            other => panic!("expected a DoT arrival, got {other:?}"),
+        }
+
+        shutdown.begin();
+        let _ = server.await;
+    }
+
     /// The whole of 42a in one test: a real handshake, then an ordinary
     /// length-prefixed DNS message over it (RFC 7858 §3.3), answered by the same
     /// `tcp::serve_one` the plain transport uses.
@@ -442,7 +639,7 @@ mod tests {
     async fn a_dot_client_completes_a_handshake_and_gets_an_answer() {
         let pem = write_pem("handshake", "localhost");
         let store = CertificateStore::load(&pem.cert, &pem.key).expect("loads");
-        let config = server_config(store).expect("a server config");
+        let config = server_config(store, None).expect("a server config");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -496,7 +693,7 @@ mod tests {
         // one.
         assert_eq!(
             seen.seen(),
-            Some(Arrival::Dot(TlsVersion::Tls13)),
+            Some(Arrival::Dot(TlsVersion::Tls13, PeerCertificate::none())),
             "a DoT connection this build negotiates is TLS 1.3"
         );
 
@@ -515,7 +712,7 @@ mod tests {
         let pem = write_pem("failure", "localhost");
         let other = write_pem("failure-other", "localhost");
         let store = CertificateStore::load(&pem.cert, &pem.key).expect("loads");
-        let config = server_config(store).expect("a server config");
+        let config = server_config(store, None).expect("a server config");
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");

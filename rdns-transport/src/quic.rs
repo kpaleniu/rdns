@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use quinn::{Endpoint, ServerConfig};
 
 use rdns::shutdown::{Busy, Stop};
-use rdns::validation::{Arrival, Transport};
+use rdns::validation::{Arrival, PeerCertificate, Transport};
 
 use crate::tcp::{Handler, RateLimit, Reply};
 use crate::tls::CertificateStore;
@@ -60,8 +60,9 @@ const DOQ_PROTOCOL_ERROR: u32 = 0x2;
 pub fn server_config(
     store: Arc<CertificateStore>,
     limits: TransportLimits,
+    clients: Option<rdns::tls_identity::TrustAnchors>,
 ) -> Result<ServerConfig> {
-    let crypto = crate::tls::config_with_alpn(store, ALPN_DOQ);
+    let crypto = crate::tls::config_with_alpn(store, ALPN_DOQ, clients)?;
     // QUIC is TLS 1.3 only, and this is where a configuration that cannot do
     // 1.3 is refused rather than failing every handshake later.
     let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
@@ -162,6 +163,23 @@ async fn serve_connection<H: Handler>(
     rate: RateLimit,
     stop: Stop,
 ) {
+    // Read once per connection, not per stream: the handshake is the only place
+    // a certificate is presented, and a transfer over DoQ is authorized from it
+    // exactly as one over DoT is (`TODO.md` #59). `peer_identity` is quinn's
+    // `Box<dyn Any>` because the crypto layer is generic; under rustls it is the
+    // chain, leaf first.
+    let presented = match connection
+        .peer_identity()
+        .and_then(|identity| {
+            identity
+                .downcast::<Vec<rustls::pki_types::CertificateDer>>()
+                .ok()
+        })
+        .and_then(|chain| chain.first().map(|leaf| leaf.as_ref().to_vec()))
+    {
+        Some(der) => PeerCertificate::presented(der),
+        None => PeerCertificate::none(),
+    };
     loop {
         // `accept_bi` is the shutdown check's home for the same reason the TCP
         // loop checks between messages: between streams the peer has committed
@@ -184,8 +202,9 @@ async fn serve_connection<H: Handler>(
             continue;
         }
         let handler = handler.clone();
+        let presented = presented.clone();
         tokio::spawn(async move {
-            serve_stream(send, recv, peer, handler, limits, now).await;
+            serve_stream(send, recv, peer, handler, limits, now, presented).await;
         });
     }
 }
@@ -198,6 +217,7 @@ async fn serve_stream<H: Handler>(
     handler: Arc<H>,
     limits: TransportLimits,
     now: u64,
+    presented: PeerCertificate,
 ) {
     // The client closes its half after one query, so reading to the end is the
     // whole message and needs no length prefix to bound it — but the prefix is
@@ -255,7 +275,9 @@ async fn serve_stream<H: Handler>(
         // Unconditionally 1.3: RFC 9001 §4.2 gives QUIC no other option
         // ("QUIC ... MUST use TLS 1.3 or greater"), so there is no handshake to
         // interrogate the way `tls.rs` has to.
-        handler.handle(packet, peer, now, Arrival::Doq, tx).await;
+        handler
+            .handle(packet, peer, now, Arrival::Doq(presented), tx)
+            .await;
     });
 
     while let Some(reply) = rx.recv().await {
@@ -327,7 +349,7 @@ mod tests {
         let store = CertificateStore::load(&pem.cert, &pem.key).expect("loads");
         let limits = TransportLimits::default();
         let endpoint = Endpoint::server(
-            server_config(store, limits).expect("a quinn config"),
+            server_config(store, limits, None).expect("a quinn config"),
             "127.0.0.1:0".parse().expect("an address"),
         )
         .expect("bind");
@@ -398,7 +420,7 @@ mod tests {
         let store = CertificateStore::load(&pem.cert, &pem.key).expect("loads");
         let limits = TransportLimits::default();
         let endpoint = Endpoint::server(
-            server_config(store, limits).expect("a quinn config"),
+            server_config(store, limits, None).expect("a quinn config"),
             "127.0.0.1:0".parse().expect("an address"),
         )
         .expect("bind");

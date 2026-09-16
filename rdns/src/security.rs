@@ -22,8 +22,13 @@
 //! Not [`crate::validation`], which asks whether a packet is worth parsing at
 //! all: that is a property of the bytes, this is a property of who sent them.
 
+use rustls::pki_types::{CertificateDer, ServerName};
+
 use crate::clock::current_unix_timestamp;
 use crate::error::{ConfigError, ConfigResult};
+use crate::text_names::absolute_lowered;
+use crate::validation::PeerCertificate;
+use crate::zone_scope::ZoneScope;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -394,6 +399,146 @@ impl ResponseLimiter {
     }
 }
 
+/// Which client certificates may transfer which zones — RFC 9103 §7.5's mTLS,
+/// as this server answers it (`TODO.md` #59).
+///
+/// §7.5 gives a primary two ways to decide a transfer client is allowed:
+/// "mutual TLS (mTLS)" or "an IP-based ACL ... combined with a valid TSIG/SIG(0)
+/// signature on the XFR request", and adds "If only one method is selected, then
+/// mTLS is preferred". [`TransferAcl`] plus `TsigKey` is the second; this is the
+/// first, and the two are additive — an operator who wants only mTLS lists no
+/// addresses and defines no keys.
+///
+/// **A verified certificate answers "who", and this list answers "what"**
+/// (`CLAUDE.md` §16). rustls has already decided the chain is trustworthy by
+/// the time anything here is asked; what is left is which of the names the
+/// operator wrote down this certificate is, and that is a question about the
+/// certificate's subject alternative names rather than about its issuer. A
+/// second certificate from the same CA therefore transfers nothing until it is
+/// listed, which is the property #16 was filed for.
+///
+/// The name check is `webpki`'s, the same code that verified the chain: it
+/// costs no package — rustls links it already — and a hand-rolled SAN reader
+/// would be a second X.509 parser in a tree that deliberately has none
+/// (`TODO.md` #42a).
+#[derive(Debug, Default)]
+pub struct TransferCertificates {
+    clients: Vec<TransferCertificate>,
+}
+
+/// One client identity: a DNS name that must appear in the certificate, and
+/// what the holder may take.
+#[derive(Debug, Clone)]
+pub struct TransferCertificate {
+    name: String,
+    scope: ZoneScope,
+}
+
+impl TransferCertificate {
+    /// The name this identity is written down as, for a log line and the
+    /// startup banner.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Whether this identity may transfer the zone at `apex`.
+    pub fn may_transfer(&self, apex: &str) -> bool {
+        self.scope.allows(apex)
+    }
+
+    /// What it may transfer, or `None` for every zone — what the banner prints.
+    pub fn scope(&self) -> Option<&[String]> {
+        self.scope.listed()
+    }
+}
+
+impl TransferCertificates {
+    /// Parse `name[:zone[,zone]]` rules — `partner.example.` for a client that
+    /// may transfer anything, `partner.example.:example.com.` for one that may
+    /// not.
+    ///
+    /// The separator is the one `TsigKey::parse` uses for the same field, so an
+    /// operator writing both lists writes them the same way. A rule that does
+    /// not parse is an error rather than a skip: a typo must stop the server,
+    /// not leave a client authorized for more than the operator believes.
+    pub fn parse(specs: &[String]) -> ConfigResult<TransferCertificates> {
+        let mut clients = Vec::new();
+        for spec in specs {
+            let spec = spec.trim();
+            if spec.is_empty() {
+                continue;
+            }
+            let (name, zones) = match spec.split_once(':') {
+                Some((name, zones)) => (name, zones),
+                None => (spec, ""),
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(ConfigError::new(format!(
+                    "the transfer certificate rule {spec:?} names no client: the shape is \
+                     name[:zone[,zone]], where the name is one the certificate carries as a \
+                     subject alternative name"
+                )));
+            }
+            let zones: Vec<&str> = zones.split(',').filter(|z| !z.trim().is_empty()).collect();
+            // Every field refused rather than trimmed to a name: a rule written
+            // with a scheme, a user or a path is one the operator believes
+            // matches something, and a zone that cannot be an apex would
+            // silently authorize nothing (`CLAUDE.md` §15).
+            for field in std::iter::once(&name).chain(zones.iter()) {
+                if field.contains('/') || field.contains('@') || field.trim().is_empty() {
+                    return Err(ConfigError::new(format!(
+                        "the transfer certificate rule {spec:?} holds {field:?}, which is \
+                         not a DNS name"
+                    )));
+                }
+            }
+            clients.push(TransferCertificate {
+                name: absolute_lowered(name).into_owned(),
+                scope: ZoneScope::of(zones),
+            });
+        }
+        Ok(TransferCertificates { clients })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+    }
+
+    /// Every identity, for the startup banner: a list nobody prints is a policy
+    /// nobody reviewed (`CLAUDE.md` §14).
+    pub fn listed(&self) -> &[TransferCertificate] {
+        &self.clients
+    }
+
+    /// Which listed identity this certificate is, if it is one of them.
+    ///
+    /// `None` when nothing was presented, when no rule names a name the
+    /// certificate carries, or when the DER will not parse — the last because
+    /// rustls verified the chain and this is a second look at the same bytes,
+    /// so a failure here is a mismatch rather than a reason to answer
+    /// differently.
+    ///
+    /// The certificate's *own* validity is not re-checked: the handshake did
+    /// that against the configured anchors, and re-deciding it here would be
+    /// two policies to keep in step (`CLAUDE.md` §7).
+    pub fn identify(&self, presented: &PeerCertificate) -> Option<&TransferCertificate> {
+        let der = presented.der()?;
+        let der = CertificateDer::from(der);
+        let cert = webpki::EndEntityCert::try_from(&der).ok()?;
+        self.clients.iter().find(|client| {
+            // `ServerName` is the type webpki matches SANs against, whatever
+            // end of the connection presented them; a trailing dot is not part
+            // of a DNS-ID (RFC 6125 §6.4.1), so it comes off here.
+            let name = client.name.trim_end_matches('.');
+            match ServerName::try_from(name) {
+                Ok(name) => cert.verify_is_valid_for_subject_name(&name).is_ok(),
+                Err(_) => false,
+            }
+        })
+    }
+}
+
 /// Who may ask for a zone transfer. Empty means nobody, and empty is the
 /// default — an AXFR is the whole database, so it is allowed by list only.
 ///
@@ -517,6 +662,84 @@ fn prefix_matches(rule: &[u8], peer: &[u8], prefix: u8) -> bool {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    /// A certificate carrying `name` as a subject alternative name, generated
+    /// per run for the reason the DoT fixtures give: a private key in the tree
+    /// is a private key in every clone.
+    fn certificate_for(name: &str) -> PeerCertificate {
+        let issued =
+            rcgen::generate_simple_self_signed(vec![name.to_string()]).expect("a certificate");
+        PeerCertificate::presented(issued.cert.der().to_vec())
+    }
+
+    /// The whole of #59's authorization half: who the certificate is decides
+    /// nothing, and what the operator wrote down decides everything
+    /// (`CLAUDE.md` §16).
+    #[test]
+    fn a_certificate_authorizes_only_the_zones_it_is_listed_for() {
+        let clients = TransferCertificates::parse(&[
+            "partner.example.:example.com.,example.net.".to_string(),
+            "everything.example.".to_string(),
+        ])
+        .expect("the rules parse");
+
+        let partner = certificate_for("partner.example");
+        let identity = clients.identify(&partner).expect("a listed client");
+        assert_eq!(identity.name(), "partner.example.");
+        assert!(identity.may_transfer("example.com."));
+        assert!(identity.may_transfer("EXAMPLE.NET"));
+        assert!(
+            !identity.may_transfer("other.test."),
+            "a scoped certificate takes what it is listed for and nothing else"
+        );
+        assert!(
+            !identity.may_transfer("sub.example.com."),
+            "and not a child of a listed zone, which is a zone of its own"
+        );
+
+        // The wide case, which exists and is printed rather than assumed.
+        let all = clients
+            .identify(&certificate_for("everything.example"))
+            .expect("listed");
+        assert!(all.may_transfer("anything.test."));
+        assert_eq!(all.scope(), None);
+    }
+
+    /// A certificate the operator did not list is nobody, however it was
+    /// issued: verifying the chain is authentication, and this is the other
+    /// question (`CLAUDE.md` §16, `TODO.md` #16).
+    #[test]
+    fn a_certificate_nobody_listed_authorizes_nothing() {
+        let clients =
+            TransferCertificates::parse(&["partner.example.".to_string()]).expect("parses");
+
+        assert!(clients
+            .identify(&certificate_for("stranger.example"))
+            .is_none());
+        assert!(
+            clients
+                .identify(&certificate_for("partner.example.evil.test"))
+                .is_none(),
+            "a name that merely contains the listed one is not it"
+        );
+        assert!(
+            clients.identify(&PeerCertificate::none()).is_none(),
+            "a connection with no certificate is not a listed client"
+        );
+    }
+
+    /// A typo in a rule stops the server rather than leaving a client
+    /// authorized for more, or less, than the operator believes.
+    #[test]
+    fn a_rule_that_is_not_a_name_is_refused() {
+        assert!(TransferCertificates::parse(&[":example.com.".to_string()]).is_err());
+        assert!(TransferCertificates::parse(&["https://partner.example".to_string()]).is_err());
+        assert!(TransferCertificates::parse(&["user@partner.example".to_string()]).is_err());
+        // An empty rule is a blank line in a config file, not a mistake.
+        assert!(TransferCertificates::parse(&["  ".to_string()])
+            .expect("parses")
+            .is_empty());
+    }
 
     #[test]
     fn test_rate_limiter_allows_under_limit() {

@@ -766,7 +766,7 @@ async fn main() -> anyhow::Result<()> {
             TcpListener::bind(spec)
                 .await
                 .with_context(|| format!("--tls-listen {spec}"))?,
-            tls::server_config(store.clone())?,
+            tls::server_config(store.clone(), None)?,
         )),
         _ => None,
     };
@@ -775,14 +775,14 @@ async fn main() -> anyhow::Result<()> {
             TcpListener::bind(spec)
                 .await
                 .with_context(|| format!("--https-listen {spec}"))?,
-            https::endpoint(store.clone(), &cli.https_path),
+            https::endpoint(store.clone(), &cli.https_path, None)?,
         )),
         _ => None,
     };
     let quic_endpoint = match (&cli.quic_listen, &tls_store) {
         (Some(spec), Some(store)) => Some(
             quinn::Endpoint::server(
-                quic::server_config(store.clone(), TransportLimits::default())?,
+                quic::server_config(store.clone(), TransportLimits::default(), None)?,
                 spec.parse()
                     .with_context(|| format!("--quic-listen {spec} is not an address:port"))?,
             )

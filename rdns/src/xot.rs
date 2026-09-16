@@ -65,7 +65,6 @@ use std::sync::Arc;
 // TLS stack to do it (`TODO.md` #67c); re-exported because this module is where
 // a reader looks for them.
 pub use crate::endpoint::{XotName, XOT_PORT};
-use rustls::pki_types::CertificateDer;
 use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -107,40 +106,15 @@ impl XotTrust {
     /// nothing in it verifies nothing, so it would start, and then fail every
     /// handshake with a message about the master (`CLAUDE.md` §4).
     pub fn from_ca_file(path: &Path, identity: Option<TlsIdentity>) -> ConfigResult<Self> {
-        use rustls::pki_types::pem::PemObject;
-
-        let mut roots = RootCertStore::empty();
-        let certs = CertificateDer::pem_file_iter(path).map_err(|e| {
-            ConfigError::new(format!(
-                "reading the transfer trust anchors {}: {e}",
-                path.display()
-            ))
-        })?;
-        for cert in certs {
-            let cert = cert.map_err(|e| {
-                ConfigError::new(format!(
-                    "parsing the transfer trust anchors {}: {e}",
-                    path.display()
-                ))
-            })?;
-            roots.add(cert).map_err(|e| {
-                ConfigError::new(format!(
-                    "{} holds a certificate that cannot be a trust anchor: {e}",
-                    path.display()
-                ))
-            })?;
-        }
-        if roots.is_empty() {
-            return Err(ConfigError::new(format!(
-                "{} holds no CERTIFICATE block: an empty anchor set loads and \
-                 then refuses every master's certificate",
-                path.display()
-            )));
-        }
+        // One loader for both ends of the transfer (`CLAUDE.md` §7): the
+        // client's anchors here, the primary's client-certificate anchors in
+        // `TODO.md` #59.
+        let roots =
+            crate::tls_identity::TrustAnchors::from_ca_file(path, "the transfer trust anchors")?;
         let anchors = roots.len();
         let presenting = identity.is_some();
         Ok(XotTrust {
-            config: Arc::new(client_config(roots, identity)?),
+            config: Arc::new(client_config(roots.store(), identity)?),
             anchors,
             presenting,
         })
@@ -165,7 +139,7 @@ impl XotTrust {
 /// TLS 1.3 and nothing else (§7.2), ALPN `dot` (§7.1), the operator's anchors
 /// and, when one is configured, the certificate this client presents (§7.5).
 fn client_config(
-    roots: RootCertStore,
+    roots: Arc<RootCertStore>,
     identity: Option<TlsIdentity>,
 ) -> ConfigResult<ClientConfig> {
     // `builder_with_protocol_versions` rather than `builder`: the workspace

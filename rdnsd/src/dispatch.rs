@@ -109,9 +109,9 @@ impl Wire<'_> {
         match self {
             Wire::Datagram(..) => dnstap::SocketProtocol::Udp,
             Wire::Framed(_, Arrival::Tcp) => dnstap::SocketProtocol::Tcp,
-            Wire::Framed(_, Arrival::Dot(_)) => dnstap::SocketProtocol::Dot,
-            Wire::Framed(_, Arrival::Doh(_)) => dnstap::SocketProtocol::Doh,
-            Wire::Framed(_, Arrival::Doq) => dnstap::SocketProtocol::Doq,
+            Wire::Framed(_, Arrival::Dot(..)) => dnstap::SocketProtocol::Dot,
+            Wire::Framed(_, Arrival::Doh(..)) => dnstap::SocketProtocol::Doh,
+            Wire::Framed(_, Arrival::Doq(_)) => dnstap::SocketProtocol::Doq,
         }
     }
 
@@ -280,7 +280,7 @@ impl Server {
         // which `write_response` does below.
         if matches!(qtype, Some(Qtype::AXFR) | Some(Qtype::IXFR)) {
             if let Wire::Framed(out, arrival) = wire {
-                self.answer_transfer(&msg, peer, session.as_mut(), now, arrival.privacy(), out)
+                self.answer_transfer(&msg, peer, session.as_mut(), now, arrival, out)
                     .await;
                 return;
             }
@@ -487,9 +487,10 @@ impl Server {
         peer: SocketAddr,
         mut session: Option<&mut TsigSession>,
         now: u64,
-        privacy: Privacy,
+        arrival: &Arrival,
         out: &mpsc::Sender<Reply>,
     ) {
+        let privacy = arrival.privacy();
         let ip = peer.ip();
         let qname = msg
             .queries
@@ -546,9 +547,10 @@ impl Server {
         // REFUSED, not NOTAUTH: the peer proved who it is and the answer is no,
         // which is policy rather than a claim about the zone's authority.
         let apex = &qname;
+        let apex_text = apex.as_ref().to_presentation();
         let unauthorized = session
             .as_ref()
-            .filter(|s| !s.may_transfer(&apex.as_ref().to_presentation()))
+            .filter(|s| !s.may_transfer(&apex_text))
             .map(|s| s.key_name().to_string());
         if let Some(key_name) = unauthorized {
             serving_error!(
@@ -568,12 +570,44 @@ impl Server {
             return;
         }
 
-        let authenticated_by = session.as_ref().map(|s| s.key_name().to_string());
-        if authenticated_by.is_none() && !self.transfer_acl.allows(ip) {
+        // RFC 9103 §7.5's other method, and the one it says to prefer: "mutual
+        // TLS (mTLS)". A certificate verified against `--transfer-client-ca`
+        // during the handshake says *who*; `--allow-transfer-cert` says what
+        // they may take, and an unlisted certificate authorizes nothing
+        // (`CLAUDE.md` §16). Scoped elsewhere is a refusal of its own, for the
+        // reason the key one is: the peer proved who it is and the answer is
+        // no.
+        let by_certificate = self
+            .transfer_clients
+            .identify(arrival.peer_certificate())
+            .map(|client| (client.name().to_string(), client.may_transfer(&apex_text)));
+        if let Some((name, false)) = &by_certificate {
             serving_error!(
                 self.ctx.logger,
                 ip,
-                "{kind} of {qname} REFUSED: no TSIG key, and not in --allow-transfer"
+                "{kind} of {qname} REFUSED: certificate {name} is scoped to other zones"
+            );
+            self.send_transfer_error(
+                msg,
+                ResponseCode::Refused,
+                Some(NOT_YOURS),
+                ip,
+                session,
+                out,
+            )
+            .await;
+            return;
+        }
+        let authorized_by_certificate = matches!(by_certificate, Some((_, true)));
+
+        let authenticated_by = session.as_ref().map(|s| s.key_name().to_string());
+        if authenticated_by.is_none() && !authorized_by_certificate && !self.transfer_acl.allows(ip)
+        {
+            serving_error!(
+                self.ctx.logger,
+                ip,
+                "{kind} of {qname} REFUSED: no TSIG key, no listed client certificate, \
+                 and not in --allow-transfer"
             );
             // No session on this path by construction — it is the "no key" case.
             self.send_transfer_error(msg, ResponseCode::Refused, Some(NOT_YOURS), ip, None, out)
@@ -1971,20 +2005,32 @@ pub(crate) mod tests {
 
     #[test]
     fn a_dnstap_entry_names_the_transport_including_the_encrypted_three() {
-        use rdns::validation::TlsVersion;
+        use rdns::validation::{PeerCertificate, TlsVersion};
         let (tx, _rx) = mpsc::channel::<Reply>(1);
         let cases = [
             (Arrival::Tcp, dnstap::SocketProtocol::Tcp),
-            (Arrival::Dot(TlsVersion::Tls13), dnstap::SocketProtocol::Dot),
+            (
+                Arrival::Dot(TlsVersion::Tls13, PeerCertificate::none()),
+                dnstap::SocketProtocol::Dot,
+            ),
             // The version does not change the label: DoT over 1.2 is still DoT,
             // and it is `Privacy` that decides whether a transfer may use it.
-            (Arrival::Dot(TlsVersion::Older), dnstap::SocketProtocol::Dot),
-            (Arrival::Doh(TlsVersion::Tls13), dnstap::SocketProtocol::Doh),
-            (Arrival::Doq, dnstap::SocketProtocol::Doq),
+            (
+                Arrival::Dot(TlsVersion::Older, PeerCertificate::none()),
+                dnstap::SocketProtocol::Dot,
+            ),
+            (
+                Arrival::Doh(TlsVersion::Tls13, PeerCertificate::none()),
+                dnstap::SocketProtocol::Doh,
+            ),
+            (
+                Arrival::Doq(PeerCertificate::none()),
+                dnstap::SocketProtocol::Doq,
+            ),
         ];
         for (arrival, expected) in cases {
             assert_eq!(
-                Wire::Framed(&tx, arrival).socket_protocol(),
+                Wire::Framed(&tx, arrival.clone()).socket_protocol(),
                 expected,
                 "{arrival:?}"
             );

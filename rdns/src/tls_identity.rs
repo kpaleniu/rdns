@@ -19,7 +19,10 @@
 
 use std::path::Path;
 
+use std::sync::Arc;
+
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::RootCertStore;
 
 use crate::error::{ConfigError, ConfigResult};
 
@@ -117,5 +120,70 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("absent.pem"), "{text}");
         assert!(text.contains("the transfer client certificate"), "{text}");
+    }
+}
+
+/// The certificate authorities a peer's certificate is checked against, read
+/// from one PEM bundle.
+///
+/// Both directions need this and they used to read it separately: an XoT
+/// *client* checking a master's certificate ([`crate::xot::XotTrust`]) and,
+/// since `TODO.md` #59, a primary checking a transfer client's. The empty-file
+/// refusal is the reason it is one function — an anchor set with nothing in it
+/// loads, starts, and then refuses every handshake with a message about the
+/// other end (`CLAUDE.md` §4, §7).
+///
+/// A newtype rather than a bare `Arc<RootCertStore>` so that a caller outside
+/// this crate can hold one without naming `rustls`, and so the count survives:
+/// rustls does not hand the store back once a verifier has it, and the startup
+/// banner should say how many anchors an operator actually loaded.
+#[derive(Debug, Clone)]
+pub struct TrustAnchors {
+    roots: Arc<RootCertStore>,
+}
+
+impl TrustAnchors {
+    /// Read a PEM bundle. `what` names it for the error message, because an
+    /// operator with anchors on both ends needs to know which file is wrong.
+    pub fn from_ca_file(path: &Path, what: &str) -> ConfigResult<TrustAnchors> {
+        use rustls::pki_types::pem::PemObject;
+
+        let mut roots = RootCertStore::empty();
+        let certs = CertificateDer::pem_file_iter(path)
+            .map_err(|e| ConfigError::new(format!("reading {what} {}: {e}", path.display())))?;
+        for cert in certs {
+            let cert = cert
+                .map_err(|e| ConfigError::new(format!("parsing {what} {}: {e}", path.display())))?;
+            roots.add(cert).map_err(|e| {
+                ConfigError::new(format!(
+                    "{} holds a certificate that cannot be a trust anchor: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+        if roots.is_empty() {
+            return Err(ConfigError::new(format!(
+                "{} holds no CERTIFICATE block: an empty anchor set loads and then \
+                 refuses every certificate it is asked about",
+                path.display()
+            )));
+        }
+        Ok(TrustAnchors {
+            roots: Arc::new(roots),
+        })
+    }
+
+    /// How many anchors were loaded, for the startup banner.
+    pub fn len(&self) -> usize {
+        self.roots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.roots.is_empty()
+    }
+
+    /// The store itself, for the rustls configuration that will hold it.
+    pub fn store(&self) -> Arc<RootCertStore> {
+        self.roots.clone()
     }
 }

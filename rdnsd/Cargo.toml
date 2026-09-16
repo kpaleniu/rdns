@@ -29,6 +29,10 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Two tests build a subscriber to assert what each log level emits; nothing in
 # the binary does (`TODO.md` #30n).
 tracing-subscriber.workspace = true
+# A client certificate per run for the mTLS transfer tests (`TODO.md` #59), the
+# same dev-dependency and flags `rdns` and `rdns-transport` use — one version in
+# the lock rather than three, and zero runtime packages.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [features]
 # Swap in DHAT's allocator shim and write `dhat-heap.json` on exit. Never on by

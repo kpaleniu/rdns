@@ -41,7 +41,7 @@ pub(crate) struct Config {
 }
 
 // `[server]`: the 22 keys both daemons have, from `rdns::server_table!`, then
-// this daemon's twelve. The macro also writes `Default`, so the shared half is
+// this daemon's fourteen. The macro also writes `Default`, so the shared half is
 // spelled once there rather than once per daemon (`TODO.md` #63).
 rdns::server_table! {
     #[derive(Debug, Deserialize)]
@@ -79,6 +79,17 @@ rdns::server_table! {
         transfer_tls_key: Option<PathBuf>,
         #[serde(default)]
         transfer_tls_only: bool,
+        /// Trust anchors a transfer *client's* certificate is checked against
+        /// (RFC 9103 §7.5's mTLS, `TODO.md` #59). The other direction from
+        /// `transfer_tls_ca`, and named separately for that reason: a server
+        /// can check masters, be checked by clients, or both.
+        transfer_client_ca: Option<PathBuf>,
+        /// Which client certificates may transfer which zones, as
+        /// `name[:zone[,zone]]`. Needs `transfer-client-ca`; `check` says so,
+        /// because a rule about a certificate nothing verifies is a policy the
+        /// operator believes is in force and is not.
+        #[serde(default)]
+        allow_transfer_cert: Vec<String>,
         /// Where `rdnsctl` reaches this server. Unix only, and refused at
         /// startup on Windows rather than ignored — the field parses everywhere
         /// so that one config file can be read on either platform and fail with
@@ -98,6 +109,8 @@ rdns::server_table! {
         transfer_tls_cert: None,
         transfer_tls_key: None,
         transfer_tls_only: false,
+        transfer_client_ca: None,
+        allow_transfer_cert: Vec::new(),
         control_socket: None,
         allow_partial_load: false,
     }
@@ -352,6 +365,17 @@ impl Config {
                  an identity (RFC 9103 §7.5)"
             ),
         }
+        // The same "a rule that cannot act" check clap's `requires` gives the
+        // flags (`CLAUDE.md` §15).
+        if !self.server.allow_transfer_cert.is_empty() && self.server.transfer_client_ca.is_none() {
+            bail!(
+                "server.allow-transfer-cert lists clients and server.transfer-client-ca \
+                 names no anchors, so no certificate is ever asked for or verified \
+                 (RFC 9103 §7.5)"
+            );
+        }
+        rdns::security::TransferCertificates::parse(&self.server.allow_transfer_cert)
+            .context("server.allow-transfer-cert")?;
         if self.server.transfer_tls_cert.is_some() && self.server.transfer_tls_ca.is_none() {
             bail!(
                 "server.transfer-tls-cert is the certificate this server presents when it \
@@ -566,6 +590,8 @@ impl Config {
         cli.transfer_tls_cert = self.server.transfer_tls_cert.clone();
         cli.transfer_tls_key = self.server.transfer_tls_key.clone();
         cli.transfer_tls_only = self.server.transfer_tls_only;
+        cli.transfer_client_ca = self.server.transfer_client_ca.clone();
+        cli.allow_transfer_cert = self.server.allow_transfer_cert.clone();
         cli.control_socket = self.server.control_socket.clone();
         cli.allow_partial_load = self.server.allow_partial_load;
         cli.tsig_key = self.tsig_specs()?;
@@ -788,6 +814,60 @@ anomaly-source-refusals = 0
         assert_eq!(config.server.anomaly_error_percent, 25.5);
         assert_eq!(config.server.anomaly_source_queries, 5000);
         assert_eq!(config.server.anomaly_source_refusals, 0, "off");
+    }
+
+    /// The file can express mTLS for transfers, and refuses the half of it
+    /// that cannot act — `TODO.md` #59, `CLAUDE.md` §15.
+    ///
+    /// Fails against a file with no key for either setting, which is what an
+    /// operator running from `--config` had before: the flags conflict with
+    /// `--config`, so a feature the file cannot spell is a feature they cannot
+    /// use.
+    #[test]
+    fn the_file_can_name_transfer_clients_and_refuses_a_list_nothing_verifies() {
+        let config = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+transfer-client-ca = "/etc/rdns/clients-ca.pem"
+allow-transfer-cert = ["partner.example.:example.com."]
+"#,
+        )
+        .expect("both keys together are a valid policy");
+        let mut cli = Cli::parse_from(["rdnsd"]);
+        config.apply(&mut cli).expect("the file applies");
+        assert_eq!(
+            cli.transfer_client_ca.as_deref(),
+            Some(Path::new("/etc/rdns/clients-ca.pem"))
+        );
+        assert_eq!(cli.allow_transfer_cert, ["partner.example.:example.com."]);
+
+        let err = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+allow-transfer-cert = ["partner.example."]
+"#,
+        )
+        .expect_err("a list with no anchors authorizes nothing and says so at startup");
+        assert!(
+            err.to_string().contains("transfer-client-ca"),
+            "the error names the missing half: {err}"
+        );
+
+        let err = parse(
+            r#"
+[server]
+zone-dir = "./zones"
+transfer-client-ca = "ca.pem"
+allow-transfer-cert = ["https://partner.example"]
+"#,
+        )
+        .expect_err("a rule that is not a name is a typo, not a client");
+        assert!(
+            err.to_string().contains("allow-transfer-cert"),
+            "the error names the setting: {err}"
+        );
     }
 
     /// A flag the file can also set has to be refused beside `--config` (§15):

@@ -29,6 +29,7 @@ pub mod socket;
 pub mod testutil;
 pub mod text_names;
 pub mod validation;
+pub mod zone_scope;
 
 /// [`RecordData`] lives in its own module so its fields are private to it.
 pub use record_data::RecordData;

@@ -284,6 +284,10 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
         };
         let handler = handler.clone();
         let tx = tx.clone();
+        // One `Arc` bump per message since `TODO.md` #59 made an `Arrival`
+        // carry what the client proved; the message it rides with cost a round
+        // trip to arrive.
+        let arrival = arrival.clone();
         tokio::spawn(async move {
             handler.handle(packet, peer, now, arrival, tx).await;
             drop(permit);

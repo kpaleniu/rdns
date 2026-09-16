@@ -22,6 +22,10 @@ sha2 = "0.10"
 tokio.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+# The SAN check for `security::TransferCertificates` (`TODO.md` #59), which is
+# the same code rustls used to verify the chain — already in the lock under
+# `rustls`, so naming it costs no package and saves a second X.509 parser.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
 tokio-rustls.workspace = true
 tracing.workspace = true
 # The subscriber is here, but nothing in this crate installs one: `logging::init`

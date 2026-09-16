@@ -18,6 +18,8 @@
 //! one); and what the sender may *do*, which is policy and needs a
 //! configuration this module never sees.
 
+use std::sync::Arc;
+
 use crate::edns::CLASSIC_UDP_SIZE;
 use crate::error::{AnswerMismatch, RequestError, RequestResult, WireError};
 use crate::{DnsMessage, NameRef, OpCode, Qtype, QueryClass};
@@ -182,17 +184,63 @@ impl Privacy {
 ///
 /// No `Udp` variant, on purpose: this reaches a consumer by way of a
 /// *connection* handler, and a datagram takes a different path in both daemons.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Clone` rather than `Copy` since `TODO.md` #59: an encrypted connection
+/// carries what the client proved about itself, which is a certificate, and a
+/// plain one cannot. The clone is one `Arc` bump per message on a connection
+/// that already spends a round trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Arrival {
     /// Plain TCP (RFC 1035 §4.2.2).
     Tcp,
     /// DNS over TLS (RFC 7858). 1.2 is allowed for a query (§4.1), so the
     /// version is carried.
-    Dot(TlsVersion),
+    Dot(TlsVersion, PeerCertificate),
     /// DNS over HTTPS (RFC 8484), same.
-    Doh(TlsVersion),
+    Doh(TlsVersion, PeerCertificate),
     /// DNS over QUIC (RFC 9250). No version: RFC 9001 §4.2 makes it 1.3.
-    Doq,
+    Doq(PeerCertificate),
+}
+
+/// What the client proved about itself in the handshake: the end-entity
+/// certificate it presented, or nothing.
+///
+/// The DER as rustls verified it, not a name read out of it. Which name counts
+/// is the *authorizing* end's question — RFC 9103 §7.5's mTLS says a transfer
+/// client may be recognised by its certificate and says nothing about how the
+/// two are matched — and a transport that answered it would be deciding policy
+/// (`CLAUDE.md` §16).
+///
+/// `None` is the ordinary case: a DoT stub resolver asking a question offers no
+/// certificate and must not be made to (RFC 8310 §8.2's mTLS is a different
+/// relationship from RFC 9103's).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PeerCertificate(Option<Arc<Vec<u8>>>);
+
+impl PeerCertificate {
+    /// The one a plain connection has, borrowable because there is nothing in
+    /// it to own.
+    const NONE: &'static PeerCertificate = &PeerCertificate(None);
+
+    /// Nothing was presented — every plain connection, and every encrypted one
+    /// whose client was not asked or did not answer.
+    pub fn none() -> PeerCertificate {
+        PeerCertificate(None)
+    }
+
+    /// The end-entity certificate, in DER, as it arrived.
+    pub fn presented(der: impl Into<Vec<u8>>) -> PeerCertificate {
+        PeerCertificate(Some(Arc::new(der.into())))
+    }
+
+    /// The DER, for a caller that knows what it wants to match it against.
+    pub fn der(&self) -> Option<&[u8]> {
+        self.0.as_deref().map(Vec::as_slice)
+    }
+
+    pub fn is_some(&self) -> bool {
+        self.0.is_some()
+    }
 }
 
 /// Which TLS version an encrypted connection negotiated.
@@ -209,13 +257,26 @@ pub enum TlsVersion {
 }
 
 impl Arrival {
+    /// What the client proved about itself, if the connection let it prove
+    /// anything.
+    pub fn peer_certificate(&self) -> &PeerCertificate {
+        match self {
+            Arrival::Tcp => PeerCertificate::NONE,
+            Arrival::Dot(_, cert) | Arrival::Doh(_, cert) | Arrival::Doq(cert) => cert,
+        }
+    }
+
     /// What this connection hid from the path it crossed.
     pub fn privacy(&self) -> Privacy {
         match self {
             Arrival::Tcp => Privacy::Clear,
-            Arrival::Doq => Privacy::Tls13,
-            Arrival::Dot(TlsVersion::Tls13) | Arrival::Doh(TlsVersion::Tls13) => Privacy::Tls13,
-            Arrival::Dot(TlsVersion::Older) | Arrival::Doh(TlsVersion::Older) => Privacy::TlsOlder,
+            Arrival::Doq(_) => Privacy::Tls13,
+            Arrival::Dot(TlsVersion::Tls13, _) | Arrival::Doh(TlsVersion::Tls13, _) => {
+                Privacy::Tls13
+            }
+            Arrival::Dot(TlsVersion::Older, _) | Arrival::Doh(TlsVersion::Older, _) => {
+                Privacy::TlsOlder
+            }
         }
     }
 }
@@ -929,31 +990,56 @@ mod tests {
     #[test]
     fn what_each_arrival_hid() {
         assert_eq!(Arrival::Tcp.privacy(), Privacy::Clear);
-        assert_eq!(Arrival::Dot(TlsVersion::Tls13).privacy(), Privacy::Tls13);
-        assert_eq!(Arrival::Dot(TlsVersion::Older).privacy(), Privacy::TlsOlder);
-        assert_eq!(Arrival::Doh(TlsVersion::Tls13).privacy(), Privacy::Tls13);
-        assert_eq!(Arrival::Doh(TlsVersion::Older).privacy(), Privacy::TlsOlder);
+        assert_eq!(
+            Arrival::Dot(TlsVersion::Tls13, PeerCertificate::none()).privacy(),
+            Privacy::Tls13
+        );
+        assert_eq!(
+            Arrival::Dot(TlsVersion::Older, PeerCertificate::none()).privacy(),
+            Privacy::TlsOlder
+        );
+        assert_eq!(
+            Arrival::Doh(TlsVersion::Tls13, PeerCertificate::none()).privacy(),
+            Privacy::Tls13
+        );
+        assert_eq!(
+            Arrival::Doh(TlsVersion::Older, PeerCertificate::none()).privacy(),
+            Privacy::TlsOlder
+        );
         // RFC 9001 §4.2: "QUIC ... MUST use TLS 1.3 or greater", so there is no
         // older DoQ to carry a version for.
-        assert_eq!(Arrival::Doq.privacy(), Privacy::Tls13);
+        assert_eq!(
+            Arrival::Doq(PeerCertificate::none()).privacy(),
+            Privacy::Tls13
+        );
 
         // Only 1.3 may carry a transfer (RFC 9103 §7.2), whichever protocol it
         // is under.
-        assert!(Arrival::Doq.privacy().is_xot());
-        assert!(Arrival::Dot(TlsVersion::Tls13).privacy().is_xot());
-        assert!(!Arrival::Dot(TlsVersion::Older).privacy().is_xot());
+        assert!(Arrival::Doq(PeerCertificate::none()).privacy().is_xot());
+        assert!(Arrival::Dot(TlsVersion::Tls13, PeerCertificate::none())
+            .privacy()
+            .is_xot());
+        assert!(!Arrival::Dot(TlsVersion::Older, PeerCertificate::none())
+            .privacy()
+            .is_xot());
         assert!(!Arrival::Tcp.privacy().is_xot());
     }
 
-    /// Two octets, the same as the `Privacy` it replaces plus a discriminant.
+    /// ~~Two octets, the same as the `Privacy` it replaces plus a
+    /// discriminant.~~ **Sixteen since `TODO.md` #59**, and upward, so the
+    /// reason is here (§17): a connection carries the certificate its client
+    /// presented, which is an `Option<Arc<Vec<u8>>>` — one pointer, `None`
+    /// costing nothing extra by the niche, and the version and discriminant
+    /// padded out beside it. `Arc<[u8]>` would be worse, being a fat pointer.
     ///
     /// Pinned because this rides on the answer path, once per message
     /// (`CLAUDE.md` §17's rule about measuring rather than assuming a newtype
     /// is free). The `{ protocol, privacy }` pair measured the same 2, which is
     /// why size was not what decided between them.
     #[test]
-    fn an_arrival_costs_two_octets() {
-        assert_eq!(std::mem::size_of::<Arrival>(), 2);
+    fn an_arrival_costs_sixteen_octets() {
+        assert_eq!(std::mem::size_of::<Arrival>(), 16);
+        assert_eq!(std::mem::size_of::<PeerCertificate>(), 8);
     }
 
     /// A truncated compression pointer is the parser's business, not this

@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#59**, **#68**, **#71** and **#21**, as of 2026-09-16. **#57 is
+**#58**, **#68**, **#71** and **#21**, as of 2026-09-16. **#57 is
 closed**: 57e was the last of it, and the measurement that
 could have refuted it did — IXFR as this tree had it was *slower* than a whole
 transfer, because applying forty records to a million-record zone cost 1 018 ms
@@ -204,9 +204,10 @@ bucket at all — `dns_slow_resolutions_total` tells a slow
 resolution that answered from one that failed, because the second serves stale
 today and only the first is the feature's case. The row's own remedy was the
 wrong one, which is the mistake `CLAUDE.md` §18 names. 58b and 58c wait on the
-number, and the number wants a deployment. **#59's prerequisite is gone**: #54
-was it, and closing it put `validation::Arrival` where a peer certificate can
-hang off the two TLS variants and nowhere else. Everything else numbered is
+number, and the number wants a deployment. **#59 closed 2026-09-16 on the
+prerequisite #54 left it**: a peer certificate hangs off `validation::Arrival`'s
+encrypted variants and nowhere else, so a transfer over plain TCP cannot be
+authorized by one. Everything else numbered is
 closed; the table under "Closed work" says which, when, and where the
 reasoning went.
 
@@ -1004,7 +1005,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#59**, **#68** and **#71**, plus **#21** — see
+**#58**, **#68** and **#71**, plus **#21** — see
 "What is open" above, which is the same list and the only place it is written
 down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -1773,7 +1774,7 @@ Three things to settle, and the first is a measurement:
 
 ---
 
-### 59. Nothing here demands a client certificate for a transfer — **filed 2026-09-13**
+### 59. Nothing here demands a client certificate for a transfer — **filed 2026-09-13, closed 2026-09-16**
 
 The server half of #51, which closed the client half. RFC 9103 §7.5 gives a
 primary two ways to decide a transfer client is allowed: "mutual TLS (mTLS)" or
@@ -1826,6 +1827,57 @@ so. This needs either a second listener, or a verifier that allows an
 unauthenticated client with the transfer path refusing what arrived without one
 — which is the shape to build, and the one to measure against a DoT stub
 resolver that offers no certificate.
+
+**Taken 2026-09-16.** The shape the row named is what landed — "a verifier that
+allows an unauthenticated client with the transfer path refusing what arrived
+without one" — and the measurement it asked for is a test:
+`a_stub_resolver_with_no_certificate_is_still_served` drives a DoT client with
+no certificate against a listener that asks for one, and it fails against
+`WebPkiClientVerifier::builder(..).build()` without `allow_unauthenticated`,
+where the handshake is refused outright.
+
+**What a certificate maps to, which the row said to settle first.** Neither of
+the two options it named. Not "a certificate that stands for a TSIG key's
+scope", because then a transfer needs both credentials and mTLS alone is not
+one of §7.5's two methods; and not a subject name matched by hand, because that
+is an X.509 parser this tree deliberately does not have (#42a). What landed is
+the subject *alternative* name, checked by `webpki` — the same code that
+verified the chain, already in the lock under `rustls`, so **0 packages** — and
+`--allow-transfer-cert name[:zone[,zone]]` beside it, in `--tsig-key`'s
+spelling for the same field.
+
+- **Authentication and authorization stay apart** (§16, and #16 is the defect
+  this avoids repeating): the anchors decide whether a certificate is
+  trustworthy, the list decides what its holder may take, and a second
+  certificate from the same CA transfers nothing until it is listed. The three
+  credentials — address, key, certificate — are additive, so an operator who
+  wants mTLS alone lists no addresses and defines no keys. There is no
+  "require mTLS" switch because there is nothing for it to do.
+- **The scope check is one function now.** `TsigKey` and the new credential
+  both answer "may this take that zone", and two spellings of that is how one
+  of them comes to say yes: `rdns_core::zone_scope::ZoneScope` is the answer
+  for both, with the case fold (RFC 4343) and the apex-not-child rule in one
+  place (§7).
+- **`Arrival` carries the certificate**, which is #54's shape used for what
+  #54 was built for: `Arrival::Tcp` cannot carry one, so a transfer over plain
+  TCP cannot be authorized this way by construction. It costs `Copy` — 2 octets
+  to 16, one `Arc` bump per message, both recorded at the assertion that pins
+  the size (§17).
+- **The anchor loader was already written twice waiting to happen**: `XotTrust`
+  read a CA bundle for the client direction with an empty-file refusal, and
+  this needed the same for the server direction. One `TrustAnchors` does both.
+
+**What the row got wrong about its own cost.** It called the plumbing done and
+the decision open; the decision took a paragraph and the plumbing took the
+diff. The DoT/DoQ/DoH configurations share one builder, so the verifier reaches
+all three at once — that part was as cheap as the row hoped.
+
+**And what it was right about, which does not change** (§19): no peer exists
+that will not transfer to us over TSIG. #43's harness still uses TSIG against
+BIND, Knot and NSD, including 43g's transfer over TLS. This is an
+interoperability gap with nobody on the other side of it today, and it is
+implemented because the operator who has standardized on mTLS is the one who
+cannot use a workaround.
 
 **What would refute the value of it** (§19): that a peer exists which will not
 transfer to us over TSIG. None does today — #43's harness uses TSIG for every
@@ -3971,6 +4023,7 @@ the week; the record is under "How the queue kept going stale" in
 | **65** | every load re-signed every zone from scratch | **filed and closed 2026-09-14**, out of 64e. `ZoneSigning::apply` signed unconditionally, so a SIGHUP, an `rdnsctl reload` or a catalog change cost a full sign of every signed zone — 27.6 s at a million records — and moved the RDATA of every RRSIG, which is the whole zone in the next IXFR delta. **The four shapes were built and the recommended one was declined** (§19, #40a's precedent again). What landed is A, keyed on the trigger: the re-signing timer reloads *in order to* refresh, so it is the one reload that may carry nothing forward, and the other two carry everything whose RRset did not move — 9.7 s against 27.6, still 53.6% saved when a tenth of the zone changes (65b). **B is declined on a measurement**: the expiry spread is a fifth of the validity and the re-signing interval a third, so every signature crosses any refresh threshold in the same tick — 0 or all 126 of a fixture's RRSIGs, never between — and the only threshold that saves work hands the refreshing run a signature with four tenths of an interval left, against the 1.4 §8 asks for. The patch was reverted and the finding kept as a tripwire on the two constants. C moved to **#64b** and then, when 64b closed without reaching the reload path, to **#64f**. The prerequisite the row called plumbing was one four-line method: `Zones::snapshot_all` |
 | **63** | `rdnsr` had 39 flags and no config file | **filed 2026-09-14, closed 2026-09-15**, ten rows, filed out of 57d because a prerequisite named in prose is one nobody schedules (§18). 63a answered the split question with the compiler rather than a line count — 18 escaping items of 84 `pub`s, and 63g then measured that `rdnsr` would name **0** of them — so the module stayed in `rdnsd` and what is shared is one macro. 63h built all three shapes and kept the two declined ones as branches: the shared struct is out because `#[serde(flatten)]` makes serde buffer the table, costing every `[server]` typo its line number and its expected-key list in `rdnsd`'s existing file too. On the way, 63e found 16 defaults written twice with nothing comparing them, 63f the same bare-`pub` sweep for the `cfg(unix)` file Windows cannot compile, and 63i the one flag of 35 not refused beside `--config`. **63j is what the file existed for**: `[[rpz.feeds]]`, a policy per feed, which costs the match path nothing because `PolicyZone` has carried one since 45a. `rdnsr --check-config` closed with it |
 | **64** | one dynamic UPDATE was five O(zone) passes | **filed 2026-09-14, closed 2026-09-16**, seven rows, and it was filed with the measurement that refuted the fix it was going to propose (§19). 64a: a whole-zone clone nobody read, three instances not one, fixed in the type. 64b: read the file's bytes every time, parse them only when they are not the bytes this server last wrote — 38% off an unsigned update, and its headline number *did not reproduce* because one `--ignored` filter selected two million-record benchmarks and libtest ran them at once. 64d: signing is 88% of a signed update, and the measurement that could have refuted it — `carried` — refuted the *explanation* instead: exactly four RRSIGs are made fresh at any zone size. 64e: the two structures the split named, three shapes built, −14%. 64f: a reload keeps the zone it is serving for a file nobody touched, 11.4 s to 39 ms, on the condition `ProvenSigning` already computes. **64c is the one declined**: its 42% was more than half serializer — RFC 3597's hex form built for every record and thrown away — and `to_string` fell 636 ms to 250 with the file still the authority, which leaves the checkpoint design buying 387 ms of a 1 335 ms update and 4% of a signed one. 64g, the one 64e did not take, closed the same day #64 did: the type change it was filed as too big for is a default type parameter and **zero** of `Rrset::new`'s 43 call sites, it takes the named pass down 25% — and the total does not move, because the clone it removes was buying the signing loop its locality. Landed on the allocation count (593 -> 566 on an eight-record zone) and said so |
+| **59** | nothing here demanded a client certificate for a transfer | **filed 2026-09-13, closed 2026-09-16**, the server half of #51 and RFC 9103 §7.5's other method — the one the section says to prefer. The shape the row named is what landed: an optional verifier, so the same listener still answers a DoT stub with no certificate, and the transfer path refusing what arrived without one. **Neither of the two identity mappings it proposed survived**: a certificate standing for a TSIG key's scope would need both credentials, and a hand-matched subject would be the X.509 parser #42a declined. What landed is the subject *alternative* name checked by `webpki` — the same code that verified the chain, already in the lock, **0 packages** — with `--allow-transfer-cert name[:zones]` in `--tsig-key`'s spelling. Authentication and authorization stay apart (#16): a second certificate from the same CA transfers nothing until it is listed. `ZoneScope` is now one type for both credentials, and `Arrival` carries the certificate, which is what #54's shape was built for — `Arrival::Tcp` cannot carry one. The row's own §19 answer is unchanged and still right: no peer exists that will not transfer over TSIG |
 | **70** | the metrics endpoint did not enforce RFC 9112 §3.2, and its header said it did | **filed and closed 2026-09-16**, out of #68. Both of the header's claims about hyper were estimates of somebody else's code and both were wrong — no `Host` was **200**, not 400, and an over-long request line is **414 past 64 KiB**, not 431 past 8 KB — and four tests in that same file had disproved the first on the day it was written. Filed as a decision rather than a defect and taken by the owner: `bad_host` now answers 400 to all **three** of §3.2's MUSTs, which the row had read as one, and hyper answered 200 to every one of them. The count was wrong too — "four tests" was six tests and eleven requests (§18). The probe it costs is paid back in the refusal's body: §3.2 exempts HTTP/1.0, and `curl`, Prometheus and CI's own probes all send a `Host` |
 | **57** | a policy zone arrived as a file somebody else wrote, not as a transfer | **filed 2026-09-13, closed 2026-09-16**, five rows, left behind by 45a — and the delivery half needed no code in `rdnsd` at all: `announce_transfer` had notified every `--also-notify` peer after every transfer since it was written, and what was missing was `rdnsr`'s ear (57c). 57a's reload found a resolver with `--rpz` and no DoT that had no reload task at all; 57b measured the reload *on* a worker and a one-core resolver answering nothing for 2.7 s. 57d built both shapes and was decided by neither's install cost: A keeps the file, so a restart begins with yesterday's rules. 57e is the one whose own measurement refuted it — IXFR was **slower than AXFR** here, 1 485 ms against 1 372 at a million rules, because applying forty records built a key per record of the base; and the bigger miss was that a refresh had no SOA probe at all, so an unchanged feed cost a transfer and a reload every REFRESH. Both daemons share `xfr::refresh_zone` now (§7). **#71** is what is left, and it is neither the wire nor the format |
 | **69** | four accept loops ended on any error, where the UDP side had a helper | **filed and closed 2026-09-16**, out of #68. Filed with no remedy on purpose (§18), and both missing measurements were taken the same day — which reversed the reason. **The remote provocation does not exist**: four `SO_LINGER 0` resets before the accept come back as `Ok` on Windows and on Linux, so §4's *remote* kill switch does not apply. **Descriptor exhaustion does, and needs nobody**: at `ulimit -n`, `accept` returns `EMFILE`, `Uncategorized`/raw 24, invisible to every portable kind — and both daemons' `JoinSet` ends the process when its first task ends, so `accepted?` turned a self-clearing condition into a whole-server outage across every transport. Windows could not be made to reach it (100 000 handles, no failure). Provoked before and after against a real `tcp::serve`: the old code's next write is a reset, the new one answers. One shared `survive_accept_error` at all four sites — retry the aborted kinds, log and back off 100 ms on exhaustion, still fatal otherwise |

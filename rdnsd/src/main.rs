@@ -66,7 +66,7 @@ use rdns::{
     notify::{self, NotifyOutcome, NotifyPeer, NotifyPolicy},
     readiness::Readiness,
     secondary::{state_file_path, StateFile},
-    security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl},
+    security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl, TransferCertificates},
     shutdown::{next_reload, reload_signal, Busy, Lifecycle, Shutdown, Stop},
     socket::bind_addr_for,
     tsig::{self, TsigKeyring},
@@ -567,6 +567,36 @@ struct Cli {
         conflicts_with = "config"
     )]
     transfer_tls_key: Option<PathBuf>,
+    /// PEM bundle of the certificate authorities a *client's* certificate is
+    /// checked against (RFC 9103 §7.5's mutual TLS, `TODO.md` #59).
+    ///
+    /// Naming it makes every encrypted listener ask for a certificate and take
+    /// no for an answer: one `ServerConfig` serves DoT, DoQ and DoH, so
+    /// demanding one would demand it of every stub resolver on the same port,
+    /// and RFC 8310 §8.2's mTLS for DoT is a different relationship from
+    /// §7.5's. What a presented certificate may then transfer is
+    /// --allow-transfer-cert's business and nothing else's.
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
+    transfer_client_ca: Option<PathBuf>,
+    /// A client certificate that may transfer, as `name[:zone[,zone]]`.
+    ///
+    /// The name is one the certificate carries as a subject alternative name,
+    /// and it is checked by the same code that verified the chain. Without
+    /// zones the holder may transfer every zone this server has, exactly as an
+    /// unscoped --tsig-key may; the startup banner prints what each one is
+    /// allowed, because a wide rule nobody reads is the defect `TODO.md` #16
+    /// was filed for.
+    ///
+    /// Repeat for more clients. Needs --transfer-client-ca: a rule about a
+    /// certificate nothing verifies would be a policy the operator believes is
+    /// in force and is not (`CLAUDE.md` §15).
+    #[arg(
+        long,
+        value_name = "NAME[:ZONES]",
+        requires = "transfer_client_ca",
+        conflicts_with = "config"
+    )]
+    allow_transfer_cert: Vec<String>,
     /// Refuse a zone transfer that did not arrive over an encrypted transport.
     ///
     /// The other half of RFC 9103: §11 says an individual transfer "is not
@@ -674,6 +704,10 @@ struct Server {
     ctx: ServeContext,
     /// Who may ask for a zone transfer. Empty by default, which refuses everyone.
     transfer_acl: Arc<TransferAcl>,
+    /// Which client certificates may transfer which zones — §7.5's other
+    /// method, additive with the ACL and the keyring (`TODO.md` #59). Empty
+    /// unless `--allow-transfer-cert` named somebody.
+    transfer_clients: Arc<TransferCertificates>,
     /// Refuse a transfer that did not arrive over TLS 1.3 (RFC 9103 §11,
     /// `--transfer-tls-only`). Beside the ACL because it is the other half of
     /// the same question — the ACL says who may ask, this says on what.
@@ -739,6 +773,8 @@ impl UpdateHandling {
 /// address-shaped things are one edit away from being swapped silently.
 struct ServePolicy {
     transfer_acl: TransferAcl,
+    /// Which client certificates may transfer which zones (`TODO.md` #59).
+    transfer_clients: TransferCertificates,
     /// Refuse a zone transfer that did not arrive encrypted (RFC 9103 §11).
     transfer_tls_only: bool,
     tsig_keys: TsigKeyring,
@@ -816,6 +852,12 @@ struct TlsPolicy {
     /// One store for both, so a renewal reaches both listeners. Two stores over
     /// the same two files would be a certificate that expires on one port.
     store: Arc<CertificateStore>,
+    /// Anchors a *client* certificate is verified against, when the operator
+    /// named some (`--transfer-client-ca`, `TODO.md` #59). `None` is the
+    /// ordinary case and means no client is asked for one. On the policy
+    /// rather than on one listener because the three encrypted transports
+    /// share a configuration, and a transfer may arrive over any of them.
+    clients: Option<rdns::tls_identity::TrustAnchors>,
 }
 
 /// Where the control socket lives and how it asks for a reload.
@@ -850,6 +892,7 @@ async fn serve(
 ) -> Result<()> {
     let ServePolicy {
         transfer_acl,
+        transfer_clients,
         transfer_tls_only,
         tsig_keys,
         response_rate,
@@ -957,7 +1000,7 @@ async fn serve(
             TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("--tls-listen {addr}"))?,
-            tls::server_config(policy.store.clone())?,
+            tls::server_config(policy.store.clone(), policy.clients.clone())?,
         )),
         None => None,
     };
@@ -966,7 +1009,7 @@ async fn serve(
             TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("--https-listen {addr}"))?,
-            https::endpoint(policy.store.clone(), path),
+            https::endpoint(policy.store.clone(), path, policy.clients.clone())?,
         )),
         None => None,
     };
@@ -975,7 +1018,11 @@ async fn serve(
     let quic_endpoint = match tls.as_ref().and_then(|p| p.doq.as_ref().map(|a| (p, a))) {
         Some((policy, addr)) => Some(
             quinn::Endpoint::server(
-                quic::server_config(policy.store.clone(), TransportLimits::default())?,
+                quic::server_config(
+                    policy.store.clone(),
+                    TransportLimits::default(),
+                    policy.clients.clone(),
+                )?,
                 addr.parse()
                     .with_context(|| format!("--quic-listen {addr} is not an address:port"))?,
             )
@@ -1022,6 +1069,7 @@ async fn serve(
             clock: Clock::system(),
         },
         transfer_acl: Arc::new(transfer_acl),
+        transfer_clients: Arc::new(transfer_clients),
         transfer_tls_only,
         tsig_keys: Arc::new(tsig_keys),
         secondaries,
@@ -2087,6 +2135,53 @@ async fn main() -> Result<()> {
             }
         );
     }
+    // The incoming half of §7.5: anchors for a *client's* certificate, and the
+    // list of which client may take which zone. Read here with everything else
+    // a dry run has to reach, and both refused without a listener a transfer
+    // can arrive on — a policy that cannot act is one the operator believes is
+    // in force (`CLAUDE.md` §15).
+    let transfer_clients = TransferCertificates::parse(&cli.allow_transfer_cert)?;
+    let client_anchors = match &cli.transfer_client_ca {
+        Some(path) => Some(rdns::tls_identity::TrustAnchors::from_ca_file(
+            path,
+            "the transfer client trust anchors",
+        )?),
+        None => None,
+    };
+    if let Some(anchors) = &client_anchors {
+        if cli.tls_listen.is_none() && cli.quic_listen.is_none() && cli.https_listen.is_none() {
+            return Err(anyhow!(
+                "--transfer-client-ca asks transfer clients for a certificate, and \
+                 there is no encrypted listener for one to arrive on: add \
+                 --tls-listen, --quic-listen or --https-listen"
+            ));
+        }
+        // What the incoming half is configured to do, and what each client may
+        // take. An unscoped rule transfers everything, so it is printed rather
+        // than left to be discovered (`CLAUDE.md` §14, §16).
+        tracing::info!(
+            "zone transfers accepted over mTLS: {} trust anchor(s), {} client(s) listed",
+            anchors.len(),
+            transfer_clients.listed().len()
+        );
+        for client in transfer_clients.listed() {
+            tracing::info!(
+                "  transfer certificate {} may transfer {}",
+                client.name(),
+                match client.scope() {
+                    Some(zones) => zones.join(", "),
+                    None => "every zone (no zone list)".to_string(),
+                }
+            );
+        }
+        if transfer_clients.is_empty() {
+            tracing::warn!(
+                "--transfer-client-ca names anchors and --allow-transfer-cert names \
+                 nobody, so a verified client certificate authorizes nothing"
+            );
+        }
+    }
+
     if xot.is_none() {
         if let Some(spec) = secondary_specs.iter().find(|spec| spec.tls.is_some()) {
             return Err(anyhow!(
@@ -2383,6 +2478,7 @@ async fn main() -> Result<()> {
         zone_map,
         ServePolicy {
             transfer_acl,
+            transfer_clients,
             transfer_tls_only: cli.transfer_tls_only,
             tsig_keys,
             response_rate: cli.response_rate,
@@ -2405,6 +2501,7 @@ async fn main() -> Result<()> {
                 doq: cli.quic_listen,
                 doh: cli.https_listen.map(|addr| (addr, cli.https_path.clone())),
                 store,
+                clients: client_anchors,
             }),
             readiness,
             updates,
@@ -2534,7 +2631,7 @@ mod tests {
     use rdns::record_types;
     use rdns::secondary::{zone_file_path, MasterSpec, RefreshTimers, TransferState};
     use rdns::tsig::{TsigAlgorithm, TsigKey};
-    use rdns::validation::{Arrival, TlsVersion};
+    use rdns::validation::{Arrival, PeerCertificate, TlsVersion};
     use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
     use rdns::Class;
     use rdns::QueryClass;
@@ -2822,6 +2919,7 @@ mod tests {
             ctx: test_context(),
             journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl")),
+            transfer_clients: Arc::new(TransferCertificates::default()),
             transfer_tls_only: false,
             tsig_keys: Arc::new(TsigKeyring::new(keys)),
             secondaries: Arc::new(Secondaries::default()),
@@ -3517,6 +3615,158 @@ mod tests {
 
     mod transfer_authorization {
         use super::*;
+        /// RFC 9103 §7.5's other method: a transfer authorized by the certificate
+        /// the client presented, with no TSIG key and an empty address ACL —
+        /// `TODO.md` #59.
+        ///
+        /// The handshake half is `rdns_transport::tls`'s
+        /// `a_client_certificate_reaches_the_handler`; what these drive is the
+        /// authorization, which is the half §16 is about.
+        mod transfer_by_certificate {
+            use super::*;
+            use rdns::validation::{Arrival, PeerCertificate, TlsVersion};
+
+            /// A certificate carrying `name`, generated per run.
+            fn certificate_for(name: &str) -> PeerCertificate {
+                let issued = rcgen::generate_simple_self_signed(vec![name.to_string()])
+                    .expect("a certificate");
+                PeerCertificate::presented(issued.cert.der().to_vec())
+            }
+
+            /// A primary with no ACL and no keys, so the certificate is the only
+            /// thing that can authorize anything.
+            async fn primary_trusting(rules: &[&str], presented: PeerCertificate) -> SocketAddr {
+                let zone = rdns::zone::parse_zone_file(
+                    "$ORIGIN example.com.\n\
+                 $TTL 3600\n\
+                 @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                 @   IN NS  ns1.example.com.\n\
+                 ns1 IN A   192.0.2.1\n",
+                    "example.com.",
+                )
+                .expect("parse");
+                let mut zones = HashMap::new();
+                zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
+                let specs: Vec<String> = rules.iter().map(|r| (*r).to_string()).collect();
+
+                let server = Arc::new(Server {
+                    zone_map: Arc::new(RwLock::new(Zones::new(zones))),
+                    ctx: test_context(),
+                    transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
+                    transfer_clients: Arc::new(
+                        TransferCertificates::parse(&specs).expect("the rules parse"),
+                    ),
+                    transfer_tls_only: false,
+                    tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
+                    secondaries: Arc::new(Secondaries::default()),
+                    deltas: Arc::new(RwLock::new(DeltaLog::new())),
+                    updates: Arc::new(UpdateHandling::disabled()),
+                    journal: None,
+                    dnstap: None,
+                });
+
+                // The arrival a DoT listener builds, with the certificate this
+                // client presented — the one thing the transport contributes.
+                let arrival = Arrival::Dot(TlsVersion::Tls13, presented);
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    while let Ok((stream, peer)) = listener.accept().await {
+                        tokio::spawn(tcp::serve_one(
+                            stream,
+                            peer,
+                            server.clone(),
+                            TransportLimits::default(),
+                            tcp::RateLimit::PerMessage,
+                            arrival.clone(),
+                            test_shutdown().stop_handle(),
+                        ));
+                    }
+                });
+                addr
+            }
+
+            async fn transfer(master: SocketAddr) -> rdns::error::TransferResult<rdns::zone::Zone> {
+                rdns::xfr::fetch_zone(
+                    &rdns::xfr::Master::plain(master),
+                    nm("example.com.").as_ref(),
+                    None,
+                )
+                .await
+            }
+
+            /// The case the row exists for: an operator who has standardized on
+            /// mTLS, with no addresses listed and no keys defined.
+            #[tokio::test]
+            async fn a_listed_certificate_transfers_its_zone() {
+                let master = primary_trusting(
+                    &["partner.example.:example.com."],
+                    certificate_for("partner.example"),
+                )
+                .await;
+
+                let zone = transfer(master).await.expect("a listed client transfers");
+                assert_eq!(zone.serial(), Some(Serial::new(1)));
+            }
+
+            /// #16's lesson, for the credential #59 adds: the certificate proves
+            /// who, and the zone list decides what. A partner's certificate must
+            /// not be every zone on the server.
+            #[tokio::test]
+            async fn a_certificate_scoped_to_another_zone_cannot_transfer_this_one() {
+                let master = primary_trusting(
+                    &["partner.example.:other.test."],
+                    certificate_for("partner.example"),
+                )
+                .await;
+
+                let err = transfer(master).await.expect_err(
+                    "a certificate scoped to other.test. must not transfer example.com.",
+                );
+                assert!(
+                    err.to_string().contains("Refused"),
+                    "want a refusal, got: {err}"
+                );
+            }
+
+            /// And a certificate nobody listed authorizes nothing, however it was
+            /// issued. The handshake verified it against the operator's anchors,
+            /// which is authentication and not permission (`CLAUDE.md` §16).
+            #[tokio::test]
+            async fn a_certificate_nobody_listed_transfers_nothing() {
+                let master = primary_trusting(
+                    &["partner.example.:example.com."],
+                    certificate_for("stranger.example"),
+                )
+                .await;
+
+                let err = transfer(master)
+                    .await
+                    .expect_err("an unlisted certificate is not a credential");
+                assert!(
+                    err.to_string().contains("Refused"),
+                    "want a refusal, got: {err}"
+                );
+            }
+
+            /// The control from the other direction: with no certificate the rules
+            /// change nothing, and the address ACL is still what decides.
+            #[tokio::test]
+            async fn a_client_with_no_certificate_falls_back_to_the_other_rules() {
+                let master =
+                    primary_trusting(&["partner.example.:example.com."], PeerCertificate::none())
+                        .await;
+
+                let err = transfer(master)
+                    .await
+                    .expect_err("no certificate, no key, and an empty ACL is a refusal");
+                assert!(
+                    err.to_string().contains("Refused"),
+                    "want a refusal, got: {err}"
+                );
+            }
+        }
+
         use rdns::tsig::{TsigAlgorithm, TsigKey, TsigKeyring};
 
         fn key(zones: &[&str]) -> TsigKey {
@@ -3688,6 +3938,7 @@ mod tests {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             ctx: test_context(),
             transfer_acl: Arc::new(TransferAcl::parse(acl).expect("acl")),
+            transfer_clients: Arc::new(TransferCertificates::default()),
             transfer_tls_only,
             tsig_keys: Arc::new(keys),
             secondaries: Arc::new(Secondaries::default()),
@@ -3707,7 +3958,7 @@ mod tests {
                     server.clone(),
                     TransportLimits::default(),
                     tcp::RateLimit::PerMessage,
-                    arrival,
+                    arrival.clone(),
                     test_shutdown().stop_handle(),
                 ));
             }
@@ -3749,6 +4000,7 @@ mod tests {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
             ctx: test_context(),
             transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
+            transfer_clients: Arc::new(TransferCertificates::default()),
             transfer_tls_only: false,
             tsig_keys: Arc::new(TsigKeyring::new(vec![key])),
             secondaries: Arc::new(Secondaries::default()),
@@ -5259,7 +5511,7 @@ mod tests {
             DeltaLog::new(),
             TsigKeyring::new(Vec::new()),
             true,
-            Arrival::Dot(TlsVersion::Tls13),
+            Arrival::Dot(TlsVersion::Tls13, PeerCertificate::none()),
         )
         .await;
         let spec = MasterSpec {
@@ -5298,7 +5550,7 @@ mod tests {
             DeltaLog::new(),
             TsigKeyring::new(Vec::new()),
             true,
-            Arrival::Dot(TlsVersion::Older),
+            Arrival::Dot(TlsVersion::Older, PeerCertificate::none()),
         )
         .await;
         let spec = MasterSpec {
@@ -5718,6 +5970,7 @@ mod tests {
             ctx: test_context(),
             journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
+            transfer_clients: Arc::new(TransferCertificates::default()),
             transfer_tls_only: false,
             tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
             secondaries: Arc::new(Secondaries::default()),

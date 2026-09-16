@@ -81,13 +81,17 @@ pub struct Endpoint {
 ///
 /// `h2` first: ALPN offers are ordered by the server's preference, and §5.2
 /// makes HTTP/2 the minimum recommended version.
-pub fn endpoint(store: Arc<CertificateStore>, path: &str) -> Endpoint {
-    let mut config = crate::tls::config_with_alpn(store, ALPN_H2);
+pub fn endpoint(
+    store: Arc<CertificateStore>,
+    path: &str,
+    clients: Option<rdns::tls_identity::TrustAnchors>,
+) -> anyhow::Result<Endpoint> {
+    let mut config = crate::tls::config_with_alpn(store, ALPN_H2, clients)?;
     config.alpn_protocols = vec![ALPN_H2.to_vec(), ALPN_HTTP11.to_vec()];
-    Endpoint {
+    Ok(Endpoint {
         tls: Arc::new(config),
         path: Arc::from(path),
-    }
+    })
 }
 
 /// Accept HTTPS connections and answer DNS queries on them, until told to stop.
@@ -164,13 +168,17 @@ pub async fn serve<H: Handler>(
             let negotiated_h2 = stream.get_ref().1.alpn_protocol() == Some(ALPN_H2);
             // From the finished handshake, as DoT does it: this build offers
             // 1.2 as well, and a transfer wants 1.3 (RFC 9103 §7.2).
-            let arrival = Arrival::Doh(match stream.get_ref().1.protocol_version() {
-                Some(rustls::ProtocolVersion::TLSv1_3) => TlsVersion::Tls13,
-                _ => TlsVersion::Older,
-            });
+            let arrival = Arrival::Doh(
+                match stream.get_ref().1.protocol_version() {
+                    Some(rustls::ProtocolVersion::TLSv1_3) => TlsVersion::Tls13,
+                    _ => TlsVersion::Older,
+                },
+                crate::tls::presented_certificate(stream.get_ref().1),
+            );
             let service = service_fn(move |request| {
                 let handler = handler.clone();
                 let path = path.clone();
+                let arrival = arrival.clone();
                 async move {
                     Ok::<_, std::convert::Infallible>(
                         answer(request, peer, handler, path, arrival).await,
@@ -418,7 +426,7 @@ mod tests {
             async move {
                 let _ = serve(
                     listener,
-                    endpoint(store, DEFAULT_PATH),
+                    endpoint(store, DEFAULT_PATH, None).expect("a DoH endpoint"),
                     Arc::new(Echo(context(0))),
                     TransportLimits::default(),
                     RateLimit::PerMessage,

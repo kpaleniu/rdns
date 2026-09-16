@@ -16,6 +16,7 @@
 //! fudge, used for every message after the first in a transfer (§5.3.1).
 
 use rdns_core::error::{ConfigError, ConfigResult};
+use rdns_core::zone_scope::ZoneScope;
 
 /// A name from config, as uncompressed wire octets.
 ///
@@ -145,10 +146,11 @@ pub struct TsigKey {
     pub name: String,
     pub algorithm: TsigAlgorithm,
     secret: Vec<u8>,
-    /// The zone apexes this key may transfer, absolute and down-cased. Empty
-    /// means every zone, kept so a binary upgrade cannot stop every transfer
-    /// on a working deployment; the startup banner names each key's scope.
-    zones: Vec<String>,
+    /// The zone apexes this key may transfer. Shared with the certificate
+    /// credential `TODO.md` #59 added, because two spellings of "may this
+    /// credential take that zone" is how one of them comes to say yes
+    /// (`CLAUDE.md` §7, §16).
+    zones: ZoneScope,
     /// What this key may rewrite through dynamic UPDATE. Denies by default,
     /// unlike `zones` — see [`UpdatePolicy`].
     update: UpdatePolicy,
@@ -160,7 +162,7 @@ impl TsigKey {
             name: canonical_key_name(name),
             algorithm,
             secret,
-            zones: Vec::new(),
+            zones: ZoneScope::everything(),
             update: UpdatePolicy::Denied,
         }
     }
@@ -171,10 +173,7 @@ impl TsigKey {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.zones = zones
-            .into_iter()
-            .map(|z| canonical_key_name(z.as_ref()))
-            .collect();
+        self.zones = ZoneScope::of(zones);
         self
     }
 
@@ -183,11 +182,7 @@ impl TsigKey {
     /// Matched against the apex: a transfer hands over a whole zone, so anything
     /// less specific authorizes more than it names.
     pub fn may_transfer(&self, apex: &str) -> bool {
-        if self.zones.is_empty() {
-            return true;
-        }
-        let apex = canonical_key_name(apex);
-        self.zones.contains(&apex)
+        self.zones.allows(apex)
     }
 
     /// Restrict — or grant — what this key may rewrite through dynamic UPDATE.
@@ -211,11 +206,7 @@ impl TsigKey {
 
     /// The zones this key is restricted to, or `None` if it is unrestricted.
     fn zone_scope(&self) -> Option<&[String]> {
-        if self.zones.is_empty() {
-            None
-        } else {
-            Some(&self.zones)
-        }
+        self.zones.listed()
     }
 
     /// Parse `[algorithm:]name:base64secret[:transfer-zones[:update-zones]]`;

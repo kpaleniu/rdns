@@ -232,7 +232,10 @@ if --transfer-tls-only and the connection is not TLS 1.3 or later:
         REFUSED   (EDE: zone transfers here are over TLS 1.3 only)
 else if a TSIG session exists and the key is scoped to zones not containing <apex>:
         REFUSED   (signed)
-else if no TSIG session and the source address is not in --allow-transfer:
+else if the client presented a listed certificate scoped to zones not containing <apex>:
+        REFUSED   (signed if there is a session)
+else if no TSIG session, no listed certificate for <apex>, and the source
+        address is not in --allow-transfer:
         REFUSED   (unsigned — there is no session to sign with)
 else:
         allowed
@@ -249,6 +252,19 @@ else:
   name.
 - An unscoped key transfers everything. The startup banner prints what each key
   may transfer.
+- **A client certificate is the third credential** (RFC 9103 §7.5's mTLS, which
+  the section says to prefer where only one method is selected).
+  `--transfer-client-ca` names the anchors it is verified against during the
+  handshake, and `--allow-transfer-cert name[:zones]` says which certificate may
+  take what — matched against the certificate's subject alternative names by
+  the same `webpki` that verified the chain. Verifying is authentication and the
+  list is authorization: a second certificate from the same CA transfers nothing
+  until it is listed. The three credentials are additive, so an operator who
+  wants mTLS alone lists no addresses and defines no keys.
+- The verifier *allows* an unauthenticated client, because one TLS configuration
+  serves DoT, DoQ and DoH: demanding a certificate would demand one of every stub
+  resolver on the port, and RFC 8310 §8.2's mTLS is a different relationship.
+  A connection with no certificate is judged by the other two rules alone.
 - A refused authenticated request is REFUSED, not NOTAUTH.
 - Every error reply on this path is signed if the request was (RFC 8945 §5.3),
   NOTAUTH, REFUSED and SERVFAIL included.

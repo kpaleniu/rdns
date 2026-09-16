@@ -46,6 +46,8 @@ transfer-tls-ca = "/etc/rdns/xot-ca.pem"  # anchors for XoT masters (RFC 9103)
 transfer-tls-cert = "/etc/rdns/client.pem"  # what to present if a master asks (§7.5)
 transfer-tls-key = "/etc/rdns/client.key"   # both or neither, mode-checked
 transfer-tls-only = false     # true: refuse a transfer not over TLS 1.3
+transfer-client-ca = "/etc/rdns/clients-ca.pem"   # anchors for a *client's* cert
+allow-transfer-cert = ["partner.example.:example.com."]   # name[:zone[,zone]]
 control-socket = "/run/rdns/rdnsd.sock"
 allow-partial-load = false
 dnstap = "tcp:127.0.0.1:6000"   # or file:/var/log/rdnsd.fstrm — see 6.4
@@ -117,6 +119,10 @@ Rules the schema encodes:
 - `server.transfer-tls-cert` and `server.transfer-tls-key` are both or neither,
   and need `transfer-tls-ca`: they are the identity presented when this server
   *fetches* a zone, so without anchors nothing would ever present them.
+- `server.allow-transfer-cert` needs `transfer-client-ca`, which is the same rule
+  from the other direction: a list of clients whose certificates nothing verifies
+  is a policy the operator believes is in force and is not. The anchors in turn
+  need an encrypted listener for a certificate to arrive on (03 §3.4).
 
 ### `rdnsr`'s file
 
