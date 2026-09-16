@@ -65,6 +65,85 @@ pub fn recv_error_is_transient(e: &std::io::Error) -> bool {
     )
 }
 
+/// Descriptor and buffer exhaustion, which `accept` reports with no portable
+/// [`std::io::ErrorKind`] — `EMFILE` arrives as `Uncategorized`, exactly as
+/// WSAEMSGSIZE does above, so the raw code is again the only way to see it.
+///
+/// Linux and Windows, because those are the two this is built and tested on;
+/// another Unix falls through to the kinds below, which is a smaller set and
+/// not a wrong one. Only the Linux numbers are measured: `EMFILE` is what an
+/// `accept` returns at `ulimit -n`, and a Windows process could not be made to
+/// run out of handles at all (100 000 opened, no failure).
+#[cfg(target_os = "linux")]
+const ACCEPT_EXHAUSTION: &[i32] = &[
+    24,  // EMFILE — this process is at its descriptor limit
+    23,  // ENFILE — the system is
+    105, // ENOBUFS
+    12,  // ENOMEM
+];
+#[cfg(windows)]
+const ACCEPT_EXHAUSTION: &[i32] = &[
+    10024, // WSAEMFILE
+    10055, // WSAENOBUFS
+];
+#[cfg(not(any(target_os = "linux", windows)))]
+const ACCEPT_EXHAUSTION: &[i32] = &[];
+
+/// How long an accept loop waits after descriptor or buffer exhaustion.
+///
+/// The length is not the point; having one is. `continue` on `EMFILE` with no
+/// pause spins a core against a kernel that has nothing to hand back until
+/// somebody else's connection closes.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// What an accept loop does with an `accept` error: `Ok` to carry on, `Err` for
+/// one worth ending the process over.
+///
+/// Both daemons run their accept loops in a `JoinSet` whose first finished task
+/// ends the process, so the `accepted?` these four loops used to spell made
+/// *any* accept error a whole-server outage — every transport, not just the one
+/// that failed. Measured on Linux: at the descriptor limit `accept` returns
+/// `EMFILE`, and the condition clears by itself as connections close. That is
+/// `CLAUDE.md` §4's receive-loop rule, which [`recv_error_is_transient`]
+/// answers for UDP and no accept loop had asked.
+///
+/// The other half of that rule — what a *remote* party can provoke — was
+/// measured and is nothing: a connection reset with `SO_LINGER 0` before the
+/// accept is handed back as an ordinary `Ok` on both platforms, and shows up
+/// later on the read. The aborted-connection kinds are recognized anyway
+/// because they are what BSD would return for it.
+pub async fn survive_accept_error(
+    e: std::io::Error,
+    transport: &str,
+) -> Result<(), std::io::Error> {
+    // The connection died between the handshake and the accept. Whatever else
+    // is queued is still good, so there is nothing to wait for.
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
+    ) {
+        return Ok(());
+    }
+    if e.kind() == std::io::ErrorKind::OutOfMemory
+        || e.raw_os_error()
+            .is_some_and(|c| ACCEPT_EXHAUSTION.contains(&c))
+    {
+        // Visible, because the alternative is a server that quietly refuses
+        // connections for as long as the pressure lasts (§4).
+        tracing::warn!(
+            transport,
+            error = %e,
+            backoff_ms = ACCEPT_BACKOFF.as_millis() as u64,
+            "out of descriptors accepting a connection; pausing"
+        );
+        tokio::time::sleep(ACCEPT_BACKOFF).await;
+        return Ok(());
+    }
+    Err(e)
+}
+
 /// The receive buffer one datagram needs.
 ///
 /// Not the EDNS payload size either server advertises: that bounds *responses*,
@@ -428,5 +507,49 @@ mod tests {
             ctx.accept_packet(peer, &big, Transport::Tcp),
             "and still under the TCP ceiling"
         );
+    }
+
+    /// The provocation is in `TODO.md` #69: at `ulimit -n`, `accept` returns
+    /// this and the four loops used to `?` it, which ends the process because
+    /// the first task out of the `JoinSet` ends it. `Uncategorized`, so the
+    /// raw code is the whole test.
+    #[tokio::test]
+    async fn descriptor_exhaustion_does_not_end_an_accept_loop() {
+        let exhausted = std::io::Error::from_raw_os_error(if cfg!(windows) { 10024 } else { 24 });
+        // `Uncategorized` is unnameable on stable, so the claim is spelled as
+        // what it is not: no kind recognizes this and only the raw code does.
+        assert!(
+            !matches!(
+                exhausted.kind(),
+                std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::OutOfMemory
+            ),
+            "{:?}",
+            exhausted.kind()
+        );
+        assert!(survive_accept_error(exhausted, "tcp").await.is_ok());
+    }
+
+    /// A connection that died before the accept costs the next one nothing.
+    #[tokio::test]
+    async fn an_aborted_connection_is_retried_at_once() {
+        let start = std::time::Instant::now();
+        let aborted = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        assert!(survive_accept_error(aborted, "tcp").await.is_ok());
+        assert!(
+            start.elapsed() < ACCEPT_BACKOFF,
+            "no backoff for an aborted connection: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Recovering from everything would turn a listener that cannot work into a
+    /// loop that says so ten times a second forever.
+    #[tokio::test]
+    async fn a_listener_that_cannot_work_still_ends_the_loop() {
+        let broken = std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        assert!(survive_accept_error(broken, "tcp").await.is_err());
     }
 }

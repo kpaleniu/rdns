@@ -70,7 +70,15 @@ pub async fn serve(
     let permits = Arc::new(tokio::sync::Semaphore::new(MAX_SCRAPES));
     loop {
         let (stream, _peer) = tokio::select! {
-            accepted = listener.accept() => accepted?,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                // Not `?`: descriptor exhaustion clears on its own, and this
+                // loop's death is the whole process's (`survive_accept_error`).
+                Err(e) => {
+                    crate::survive_accept_error(e, "metrics").await?;
+                    continue;
+                }
+            },
             _ = stop.wait() => return Ok(()),
         };
         // `try_acquire`, not `acquire`: a queued scrape is stale by the time it

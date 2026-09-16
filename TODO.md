@@ -44,9 +44,12 @@ the loop is spawned), the test it names has no wall-clock assertion, and
 ephemeral ports are not scarce here — a whole `--workspace` run adds ~100
 `TIME_WAIT` sockets to a 16 384-port range. 900 runs under load did not
 reproduce it. What was fixed is that the failure left no evidence, and what it
-found on the way out is **#69** (four accept loops treat any error as fatal
-while the UDP side has a helper for exactly that) and **#70** (the metrics
-header claimed two hyper behaviours hyper does not have).
+found on the way out is ~~**#69**~~ **#69, closed the same day it was filed**
+(four accept loops treated any error as fatal while the UDP side had a helper
+for exactly that; the remote provocation the row leaned on turned out not to
+exist, and `EMFILE` — which needs no remote party — took the whole server down)
+and **#70** (the metrics header claimed two hyper behaviours hyper does not
+have).
 **#66 and #67 closed the day they were filed**, together: `rdnsc` transfers a
 zone, signs it, verifies every envelope and writes a loadable file, and the
 crate line moved twice to let it — `rdns-present` for the format and
@@ -979,9 +982,9 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59**, **#64**, **#68**, **#69** and **#70**, plus **#21**
-— see "What is open" above, which is the same list and the only place it is
-written down.
+**#57**, **#58**, **#59**, **#64**, **#68** and **#70**, plus **#21** — see
+"What is open" above, which is the same list and the only place it is written
+down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
 numbers are stable identifiers referenced from the code, so they move rather
 than being renumbered.
@@ -3386,7 +3389,7 @@ does not have.
 
 ---
 
-### 69. Four accept loops end on any error; the UDP side has a helper for that — **filed 2026-09-16**
+### 69. Four accept loops end on any error; the UDP side has a helper for that — **filed and closed 2026-09-16**
 
 `tcp.rs:144`, `tls.rs:221`, `https.rs:108` and `metrics_server.rs:66` all spell
 the accept the same way:
@@ -3404,15 +3407,46 @@ switch" — and it is applied at two call sites, both UDP (`rdnsd/src/main.rs:12
 reasoning was moved into a helper and the four loops that were not the one it
 was written for never called it.
 
-**Filed with no remedy, because the remedy is the unchecked part.** What is
-measured is the four sites and the asymmetry. What is *not* checked is whether
-a remote party can provoke an accept error on either platform — the provocation
-is an RST between the handshake and the accept, which needs `SO_LINGER 0` and
-therefore `socket2`, not a dependency of this crate — and `EMFILE` is the case
-that needs no remote party at all and is where a naive `continue` turns a dead
-loop into a hot spin. So the row names a measurement to take and not a patch to
-apply (`CLAUDE.md` §18: a row naming a wrong remedy costs more than one naming
-none).
+~~**Filed with no remedy, because the remedy is the unchecked part.**~~ Filed
+that way and then both measurements were taken the same day, which is what the
+remedy needed:
+
+- **A remote party cannot provoke it, on either platform.** The provocation is
+  an RST between the handshake and the accept: `SO_LINGER 0` on four clients
+  that connect and drop against a listener that is not accepting yet. All four
+  came back from `accept` as an ordinary `Ok`, on Windows and on Linux; the
+  reset shows up later on the read. So the half of §4's rule that names a
+  *remote kill switch* does not apply here, and the finding as filed — which
+  leaned on it — was wrong about why it mattered. (`socket2` turned out to cost
+  no package, being already in the lock file under `quinn`; it is not a
+  dependency now either, because the probe is not a test.)
+- **Descriptor exhaustion does, and needs nobody.** Under `ulimit -n 128`,
+  `accept` returns **`EMFILE`** — `ErrorKind::Uncategorized`, raw 24, so no
+  portable kind sees it, exactly like WSAEMSGSIZE. Windows could not be made to
+  reach it at all: 100 000 handles opened without a failure. The condition is
+  ordinary — 128 connections per loop across TCP, DoT, DoH and the scrape
+  endpoint is over 400 descriptors before the zone files and the resolver's
+  outbound sockets, against a 1 024 soft limit — and it is *transient*, clearing
+  as connections close.
+
+**What it cost.** Both daemons run their accept loops in a `JoinSet` whose first
+finished task ends the process, so `accepted?` on one `EMFILE` did not stop one
+listener — it stopped the server, every transport at once, on a condition that
+would have cleared by itself.
+
+**Provoked, not read** (§4). A `tcp::serve` with one descriptor left and a
+connection pending: against the old code the probe's next write fails —
+`tcp.rs:405`, connection reset, the loop is gone — and against
+`survive_accept_error` the same probe answers. The probe is not committed: it
+needs `ulimit -n` and would open two hundred thousand files where CI's limit is
+high. What is committed is the classification, three tests, including that
+`EMFILE` is recognized by its raw code and by no kind.
+
+**The fix is one shared function** (§7), `survive_accept_error`, called at all
+four sites: aborted-connection kinds retry at once, exhaustion logs and sleeps
+100 ms first — a bare `continue` on `EMFILE` spins a core — and everything else
+is still fatal, because a listener that cannot work should not become a loop
+saying so ten times a second forever.
 
 ---
 
@@ -3587,6 +3621,7 @@ the week; the record is under "How the queue kept going stale" in
 | **44** | what an operator would find missing in `rdnsd` | **filed 2026-09-11, closed in full 2026-09-12**, seven rows: catalog zones, EDE, the scale measurement, XoT, multi-signer, rollover and dnstap. Five numbers filed on the way out — #47, #48, #49, #50, #51, #54, #55 — and **0 packages** added by the lot, dnstap's two wire formats included. Every row's closing note says the same thing in its own words: the filing was right about what was missing and wrong about where the work was. 44a missed that provisioning is a diff; 44b's "small" cost a type at 24 sites; 44d's "cheap after 42a" described the half already done; 44e's premise was refuted by one test; 44f's ZSK half needed four numbers in a file and no state machine. Only 44c came out the size it was filed as, and it is the one that found a live defect (**#50**). The preamble's "none of these is a defect" did not survive either: #50 came out of 44c, and #47 — filed by 44b as not a defect — closed carrying two MUSTs |
 | **65** | every load re-signed every zone from scratch | **filed and closed 2026-09-14**, out of 64e. `ZoneSigning::apply` signed unconditionally, so a SIGHUP, an `rdnsctl reload` or a catalog change cost a full sign of every signed zone — 27.6 s at a million records — and moved the RDATA of every RRSIG, which is the whole zone in the next IXFR delta. **The four shapes were built and the recommended one was declined** (§19, #40a's precedent again). What landed is A, keyed on the trigger: the re-signing timer reloads *in order to* refresh, so it is the one reload that may carry nothing forward, and the other two carry everything whose RRset did not move — 9.7 s against 27.6, still 53.6% saved when a tenth of the zone changes (65b). **B is declined on a measurement**: the expiry spread is a fifth of the validity and the re-signing interval a third, so every signature crosses any refresh threshold in the same tick — 0 or all 126 of a fixture's RRSIGs, never between — and the only threshold that saves work hands the refreshing run a signature with four tenths of an interval left, against the 1.4 §8 asks for. The patch was reverted and the finding kept as a tripwire on the two constants. C moved to **#64b** and then, when 64b closed without reaching the reload path, to **#64f**. The prerequisite the row called plumbing was one four-line method: `Zones::snapshot_all` |
 | **63** | `rdnsr` had 39 flags and no config file | **filed 2026-09-14, closed 2026-09-15**, ten rows, filed out of 57d because a prerequisite named in prose is one nobody schedules (§18). 63a answered the split question with the compiler rather than a line count — 18 escaping items of 84 `pub`s, and 63g then measured that `rdnsr` would name **0** of them — so the module stayed in `rdnsd` and what is shared is one macro. 63h built all three shapes and kept the two declined ones as branches: the shared struct is out because `#[serde(flatten)]` makes serde buffer the table, costing every `[server]` typo its line number and its expected-key list in `rdnsd`'s existing file too. On the way, 63e found 16 defaults written twice with nothing comparing them, 63f the same bare-`pub` sweep for the `cfg(unix)` file Windows cannot compile, and 63i the one flag of 35 not refused beside `--config`. **63j is what the file existed for**: `[[rpz.feeds]]`, a policy per feed, which costs the match path nothing because `PolicyZone` has carried one since 45a. `rdnsr --check-config` closed with it |
+| **69** | four accept loops ended on any error, where the UDP side had a helper | **filed and closed 2026-09-16**, out of #68. Filed with no remedy on purpose (§18), and both missing measurements were taken the same day — which reversed the reason. **The remote provocation does not exist**: four `SO_LINGER 0` resets before the accept come back as `Ok` on Windows and on Linux, so §4's *remote* kill switch does not apply. **Descriptor exhaustion does, and needs nobody**: at `ulimit -n`, `accept` returns `EMFILE`, `Uncategorized`/raw 24, invisible to every portable kind — and both daemons' `JoinSet` ends the process when its first task ends, so `accepted?` turned a self-clearing condition into a whole-server outage across every transport. Windows could not be made to reach it (100 000 handles, no failure). Provoked before and after against a real `tcp::serve`: the old code's next write is a reset, the new one answers. One shared `survive_accept_error` at all four sites — retry the aborted kinds, log and back off 100 ms on exhaustion, still fatal otherwise |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

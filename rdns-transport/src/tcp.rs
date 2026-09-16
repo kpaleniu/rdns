@@ -141,7 +141,15 @@ pub async fn serve<H: Handler>(
         // `accept` is cancel-safe, so a connection lost to this race stays in
         // the kernel's backlog.
         let (stream, peer) = tokio::select! {
-            accepted = listener.accept() => accepted?,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                // Not `?`: descriptor exhaustion clears on its own, and this
+                // loop's death is the whole process's (`survive_accept_error`).
+                Err(e) => {
+                    crate::survive_accept_error(e, "tcp").await?;
+                    continue;
+                }
+            },
             _ = stop.wait() => return Ok(()),
         };
         if rate == RateLimit::PerConnection

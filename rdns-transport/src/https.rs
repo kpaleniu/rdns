@@ -105,7 +105,15 @@ pub async fn serve<H: Handler>(
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
     loop {
         let (stream, peer) = tokio::select! {
-            accepted = listener.accept() => accepted?,
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                // Not `?`: descriptor exhaustion clears on its own, and this
+                // loop's death is the whole process's (`survive_accept_error`).
+                Err(e) => {
+                    crate::survive_accept_error(e, "doh").await?;
+                    continue;
+                }
+            },
             _ = stop.wait() => return Ok(()),
         };
         if rate == RateLimit::PerConnection
