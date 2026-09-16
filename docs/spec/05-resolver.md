@@ -345,8 +345,24 @@ RPZ wildcard rule is RFC 1034 §4.3.3's.
   NOTAUTH for a zone no feed carries; NOTIMP when the list is empty, since then
   the resolver really does not implement one. The message's serial is not read:
   it is unauthenticated, and all it could do here is let a re-read be skipped.
-  A feed is otherwise delivered by whatever writes the file — `rdnsr` is not a
-  secondary and has no zone map.
+- **A feed with a `master` is transferred by `rdnsr` itself** (`rpz_transfer`,
+  `TODO.md` #57d shape A, #57e), one task per feed on the zone's own SOA
+  timers, woken early by a NOTIFY naming that zone. A refresh asks for the
+  master's serial first and stops there unless it moved; otherwise it asks for
+  the difference from the version in force (IXFR, RFC 1995) or for the whole
+  zone when it holds none. What arrives is written to the feed's own file and
+  read back by the reload above, so a restart begins with the last transfer
+  rather than with nothing. Signed when the master names a key with `#name`,
+  resolved from `[keys]` at startup so an undefined name stops the process
+  rather than sending an unsigned request. A feed without a `master` is still
+  delivered by whatever writes the file; `rdnsr` has no zone map either way.
+- **`on-expire` says what an unrefreshed feed means**, per feed: `enforce` (the
+  default) keeps its rules in force past EXPIRE, `lift` removes the file and
+  stops applying them. Not derivable from the zone — `rpz-passthru` rules make
+  a feed an allowlist, where the two directions swap. Either way the transition
+  is warned once, and the feed's age is on
+  `dns_zone_last_refresh_timestamp_seconds`, absent until it has transferred
+  once and forgotten when it is lifted.
 - Every rewrite goes out with AD clear and an Extended DNS Error: 15 (Blocked)
   when the answer is a denial, 4 (Forged Answer) when records are still
   provided — RFC 8914 §4.5 draws that line.

@@ -306,77 +306,207 @@ fn record_key(_zone: &Zone, record: &ZoneRecord) -> RecordKey {
     }
 }
 
-/// Apply one difference sequence to a zone, returning the result.
+/// A chain of difference sequences, staged so the zone is rebuilt once.
+///
+/// RFC 1995 §4 sends one sequence per version step, and applying them one at a
+/// time means one O(zone) rebuild per step: 32 of them for a client at the end
+/// of a full chain, which is what `MAX_DELTAS_PER_ZONE` bounds it at. The steps
+/// are staged against the base instead — deletions as a multiset to withhold,
+/// additions as a list to append — which is the same arithmetic in one pass,
+/// because an intermediate version is never looked at. Its SOA is not looked at either: the framing
+/// carries one per step and only the last one survives.
+///
+/// The bound is the delta, not the zone: nothing here is sized by the base.
+#[derive(Debug, Default)]
+pub struct Patch {
+    /// What to withhold from the base, bucketed by folded owner name so a base
+    /// record can be probed with the octets it already holds — no key built per
+    /// record of the zone (`CLAUDE.md` §13).
+    withhold: HashMap<NameKeyBuf, Vec<Withheld>>,
+    /// What to append, in the order the steps asked for it. `None` is an
+    /// addition a later step deleted again.
+    append: Vec<Option<ResourceRecord>>,
+    /// Where each still-pending addition sits in `append`, for that
+    /// cancellation.
+    pending: HashMap<NameKeyBuf, Vec<usize>>,
+    /// How many deletions were asked for, which is what `missing` is measured
+    /// against.
+    requested: usize,
+    /// Deletions that cancelled an addition from an earlier step: they took
+    /// effect, and no record of the base answers for them.
+    cancelled: usize,
+}
+
+/// One record to withhold, and how many copies of it.
+///
+/// A count rather than a set: a zone may hold two identical records and a
+/// sequence may delete one of them.
+#[derive(Debug)]
+struct Withheld {
+    class: Class,
+    ttl: Ttl,
+    rdata: RecordData,
+    count: usize,
+}
+
+impl Withheld {
+    /// The identity a difference sequence compares by: everything about a
+    /// record that can change. The TTL included — a secondary re-serves that
+    /// number, so a TTL change is a deletion plus an addition, as BIND's
+    /// `ixfr-from-differences` produces.
+    fn matches(&self, class: Class, ttl: Ttl, rdata: &RecordData) -> bool {
+        self.count > 0 && self.class == class && self.ttl == ttl && &self.rdata == rdata
+    }
+}
+
+impl Patch {
+    pub fn new() -> Patch {
+        Patch::default()
+    }
+
+    /// Stage one difference sequence. Call once per step, in order.
+    ///
+    /// Deletions first, as the sequence orders them: a deletion cancels an
+    /// addition this patch is still holding from an earlier step, and only
+    /// falls through to the base when it cancels nothing.
+    pub fn step(&mut self, deleted: &[ResourceRecord], added: &[ResourceRecord]) {
+        self.requested += deleted.len();
+        for record in deleted {
+            if self.cancel_pending(record) {
+                self.cancelled += 1;
+                continue;
+            }
+            let key = NameKeyBuf::new(record.name.as_ref());
+            let bucket = self.withhold.entry(key).or_default();
+            match bucket
+                .iter_mut()
+                .find(|held| held.matches(record.class, record.ttl, &record.rdata))
+            {
+                Some(held) => held.count += 1,
+                None => bucket.push(Withheld {
+                    class: record.class,
+                    ttl: record.ttl,
+                    rdata: record.rdata.clone(),
+                    count: 1,
+                }),
+            }
+        }
+        for record in added {
+            let position = self.append.len();
+            self.append.push(Some(record.clone()));
+            self.pending
+                .entry(NameKeyBuf::new(record.name.as_ref()))
+                .or_default()
+                .push(position);
+        }
+    }
+
+    /// Take back an addition an earlier step made, if this deletion names one.
+    ///
+    /// Newest first: two steps adding the same record and one deleting it
+    /// leaves the older copy, which is what applying them in order does.
+    fn cancel_pending(&mut self, record: &ResourceRecord) -> bool {
+        let key = record.name.as_ref().folded();
+        let Some(positions) = self.pending.get(&*key) else {
+            return false;
+        };
+        let found = positions.iter().rposition(|at| {
+            self.append[*at].as_ref().is_some_and(|pending| {
+                pending.class == record.class
+                    && pending.ttl == record.ttl
+                    && pending.rdata == record.rdata
+            })
+        });
+        let Some(found) = found else {
+            return false;
+        };
+        let at = self
+            .pending
+            .get_mut(&*key)
+            .expect("the bucket a position was just read from")
+            .remove(found);
+        self.append[at] = None;
+        true
+    }
+
+    /// Rebuild `base` with the staged steps applied and `new_soa` at the apex.
+    ///
+    /// Returns the zone and the deletions no record answered — not an error:
+    /// the record is meant to be gone either way, and refusing would strand a
+    /// secondary on a version it can never leave.
+    pub fn apply(mut self, base: &Zone, new_soa: &ResourceRecord) -> (Zone, usize) {
+        let mut zone = Zone::new(base.origin().to_owned());
+        let mut removed = self.cancelled;
+        for record in base.records() {
+            // The patch's own SOA replaces this one; the framing carries it, so
+            // it is never among the deletions.
+            if base.is_apex_soa(record) {
+                continue;
+            }
+            if !self.withhold.is_empty() && self.withhold_one(record) {
+                removed += 1;
+                continue;
+            }
+            zone.add_record(record.clone());
+        }
+
+        zone.add_record(ZoneRecord {
+            name: new_soa.name.clone(),
+            ttl: new_soa.ttl,
+            class: new_soa.class,
+            rdata: new_soa.rdata.clone(),
+        });
+        for record in self.append.into_iter().flatten() {
+            zone.add_record(ZoneRecord {
+                name: record.name,
+                ttl: record.ttl,
+                class: record.class,
+                rdata: record.rdata,
+            });
+        }
+
+        (zone, self.requested - removed)
+    }
+
+    /// Whether this record of the base is one of the copies being withheld, and
+    /// takes it off the count if so.
+    ///
+    /// Probed with the octets the record already holds: `folded` borrows unless
+    /// the name carries upper case (RFC 4343), so the ordinary record costs a
+    /// hash and nothing else.
+    fn withhold_one(&mut self, record: &ZoneRecord) -> bool {
+        let Some(bucket) = self.withhold.get_mut(&*record.name.as_ref().folded()) else {
+            return false;
+        };
+        match bucket
+            .iter_mut()
+            .find(|held| held.matches(record.class, record.ttl, &record.rdata))
+        {
+            Some(held) => {
+                held.count -= 1;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Apply one difference sequence to a zone, returning the result and how many
+/// of its deletions found a record.
 ///
 /// The zone is rebuilt rather than edited, which is why `Zone` has no
 /// record-removal API: its index holds *positions* into the record vector, so an
 /// in-place removal invalidates every later one.
-///
-/// A deletion naming a record the zone does not hold is not an error — the
-/// record is meant to be gone either way, and refusing would strand a secondary
-/// on a version it can never leave. `removed` reports the count.
 pub fn apply_changes(
     base: &Zone,
     deleted: &[ResourceRecord],
     added: &[ResourceRecord],
     new_soa: &ResourceRecord,
 ) -> (Zone, usize) {
-    let mut to_remove: BTreeMap<RecordKey, usize> = BTreeMap::new();
-    for record in deleted {
-        *to_remove.entry(resource_key(base, record)).or_insert(0) += 1;
-    }
-
-    let mut zone = Zone::new(base.origin().to_owned());
-    let mut removed = 0;
-    for record in base.records() {
-        // The sequence's own SOA replaces this one; the framing carries it, so
-        // it is never among the deletions.
-        if base.is_apex_soa(record) {
-            continue;
-        }
-        let key = record_key(base, record);
-        if let Some(count) = to_remove.get_mut(&key) {
-            if *count > 0 {
-                *count -= 1;
-                removed += 1;
-                continue;
-            }
-        }
-        zone.add_record(ZoneRecord {
-            name: record.name.clone(),
-            ttl: record.ttl,
-            class: record.class,
-            rdata: record.rdata.clone(),
-        });
-    }
-
-    zone.add_record(ZoneRecord {
-        name: new_soa.name.clone(),
-        ttl: new_soa.ttl,
-        class: new_soa.class,
-        rdata: new_soa.rdata.clone(),
-    });
-    for record in added {
-        zone.add_record(ZoneRecord {
-            name: record.name.clone(),
-            ttl: record.ttl,
-            class: record.class,
-            rdata: record.rdata.clone(),
-        });
-    }
-
-    (zone, removed)
-}
-
-fn resource_key(_zone: &Zone, record: &ResourceRecord) -> RecordKey {
-    let name = record.name.clone();
-    RecordKey {
-        lowercase_name: name.as_ref().folded().into_owned(),
-        class: record.class,
-        ttl: record.ttl,
-        rdata: record.rdata.clone(),
-        name,
-    }
+    let mut patch = Patch::new();
+    patch.step(deleted, added);
+    let (zone, missing) = patch.apply(base, new_soa);
+    (zone, deleted.len() - missing)
 }
 
 /// What an IXFR request turned into.
@@ -539,6 +669,129 @@ mod tests {
 
     fn answers(messages: &[DnsMessage]) -> Vec<&ResourceRecord> {
         messages.iter().flat_map(|m| m.answers.iter()).collect()
+    }
+
+    /// The steps of a chain, as `xfr` stages them.
+    fn steps() -> Vec<(Vec<ResourceRecord>, Vec<ResourceRecord>)> {
+        let base = zone_at(1, "www IN A 192.0.2.1\nmail IN A 192.0.2.2\n");
+        let second = zone_at(2, "www IN A 192.0.2.9\nmail IN A 192.0.2.2\n");
+        // `ftp` arrives in step two and is gone again in step three, which is
+        // the case a patch staged against the base alone gets wrong: no record
+        // of the base answers that deletion, so `ftp` survives into a version
+        // that never had it.
+        let third = zone_at(
+            3,
+            "www IN A 192.0.2.9\nmail IN A 192.0.2.2\nftp IN A 192.0.2.3\n",
+        );
+        let fourth = zone_at(4, "www IN A 192.0.2.9\n");
+
+        [(&base, &second), (&second, &third), (&third, &fourth)]
+            .into_iter()
+            .map(|(from, to)| {
+                let delta = diff(from, to).expect("both versions have an SOA");
+                (delta.deleted, delta.added)
+            })
+            .collect()
+    }
+
+    fn contents(zone: &Zone) -> Vec<String> {
+        let mut out: Vec<String> = zone
+            .records()
+            .iter()
+            .map(|r| format!("{} {} {:?}", r.name, r.ttl, r.rdata))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// A chain applied in one pass is the zone the steps applied one at a time
+    /// produce.
+    ///
+    /// Fails against a patch that stages every deletion against the base: the
+    /// third step deletes a record the second step added, which no record of
+    /// the base answers for, so `ftp` would survive and the deletion would be
+    /// reported missing. It is also what stops the one-pass rewrite being a
+    /// claim — the reference here is the old behaviour, applied step by step.
+    #[test]
+    fn test_a_chain_applies_as_if_each_step_had_been_applied_in_turn() {
+        let base = zone_at(1, "www IN A 192.0.2.1\nmail IN A 192.0.2.2\n");
+        let final_soa = zone_at(4, "").apex_soa_record().expect("an apex SOA");
+
+        let mut sequential = base.clone();
+        let mut missing_sequentially = 0;
+        for (deleted, added) in steps() {
+            let (next, removed) = apply_changes(&sequential, &deleted, &added, &final_soa);
+            missing_sequentially += deleted.len() - removed;
+            sequential = next;
+        }
+
+        let mut patch = Patch::new();
+        for (deleted, added) in steps() {
+            patch.step(&deleted, &added);
+        }
+        let (staged, missing) = patch.apply(&base, &final_soa);
+
+        assert_eq!(contents(&staged), contents(&sequential));
+        assert_eq!(missing, missing_sequentially);
+        assert_eq!(missing, 0, "every deletion in this chain names a record");
+        assert!(
+            !contents(&staged).iter().any(|r| r.contains("mail")),
+            "the last step deletes mail: {:?}",
+            contents(&staged)
+        );
+        assert_eq!(staged.serial(), Some(Serial::new(4)));
+    }
+
+    /// A deletion naming a record nobody holds is counted, not refused:
+    /// refusing would strand a secondary on a version it can never leave.
+    #[test]
+    fn test_a_deletion_of_something_absent_is_counted_and_not_an_error() {
+        let base = zone_at(1, "www IN A 192.0.2.1\n");
+        let phantom = zone_at(2, "gone IN A 192.0.2.8\n")
+            .records()
+            .iter()
+            .find(|r| r.name == nm("gone.example.com."))
+            .map(|r| ResourceRecord {
+                name: r.name.clone(),
+                class: r.class,
+                ttl: r.ttl,
+                rdata: r.rdata.clone(),
+            })
+            .expect("the fixture holds it");
+        let soa = zone_at(2, "").apex_soa_record().expect("an apex SOA");
+
+        let (zone, removed) = apply_changes(&base, &[phantom], &[], &soa);
+        assert_eq!(removed, 0, "nothing was there to remove");
+        assert_eq!(zone.records().len(), base.records().len());
+    }
+
+    /// Two identical records and one deletion leaves one: a count, not a set.
+    #[test]
+    fn test_one_of_two_identical_records_can_be_deleted() {
+        let base = zone_at(1, "www IN A 192.0.2.1\nwww IN A 192.0.2.1\n");
+        let soa = zone_at(2, "").apex_soa_record().expect("an apex SOA");
+        let one = base
+            .records()
+            .iter()
+            .find(|r| r.name == nm("www.example.com."))
+            .map(|r| ResourceRecord {
+                name: r.name.clone(),
+                class: r.class,
+                ttl: r.ttl,
+                rdata: r.rdata.clone(),
+            })
+            .expect("the fixture holds two");
+
+        let (zone, removed) = apply_changes(&base, &[one], &[], &soa);
+        assert_eq!(removed, 1);
+        assert_eq!(
+            zone.records()
+                .iter()
+                .filter(|r| r.name == nm("www.example.com."))
+                .count(),
+            1,
+            "one copy deleted, one left"
+        );
     }
 
     #[test]

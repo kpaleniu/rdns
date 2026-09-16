@@ -392,19 +392,22 @@ impl IxfrAssembler {
         }
         if !self.sequences.is_empty() {
             let steps = self.sequences.len();
-            let mut zone = base.clone();
-            let mut missing_deletions = 0;
+            // Staged and applied once. Rebuilding per step was a zone-sized
+            // copy per version the client was behind — and `base.clone()` to
+            // start it, which the first step then threw away.
+            let mut patch = crate::ixfr::Patch::new();
+            let mut last_soa = None;
             for sequence in self.sequences {
                 let to_soa = sequence.to_soa.ok_or_else(|| {
                     TransferError::malformed(
                         "a difference sequence has no SOA for the version it produces",
                     )
                 })?;
-                let (next, removed) =
-                    crate::ixfr::apply_changes(&zone, &sequence.deleted, &sequence.added, &to_soa);
-                missing_deletions += sequence.deleted.len() - removed;
-                zone = next;
+                patch.step(&sequence.deleted, &sequence.added);
+                last_soa = Some(to_soa);
             }
+            let to_soa = last_soa.expect("a non-empty chain has a last step");
+            let (zone, missing_deletions) = patch.apply(base, &to_soa);
             return Ok(IxfrOutcome::Updated {
                 zone,
                 steps,
@@ -664,6 +667,108 @@ pub async fn fetch_changes(
             "incremental transfer of {zone} from {master} timed out"
         ))
     })?
+}
+
+/// What one refresh of a zone found at the master.
+pub enum Refresh {
+    /// The master's serial is not newer than the one we hold, so there is
+    /// nothing to fetch.
+    Current {
+        serial: Serial,
+        /// Whether the master said so in answer to the transfer request rather
+        /// than to the SOA probe — it changed its mind between the two
+        /// questions. Diagnostic only: the outcome is the same either way.
+        answering_the_transfer: bool,
+    },
+    /// A version newer than the one we hold, however it arrived.
+    Fetched(Fetched),
+}
+
+/// A version the master handed over, and what it cost to get.
+pub struct Fetched {
+    pub zone: Zone,
+    /// Version steps applied, or `None` for a whole zone.
+    pub steps: Option<usize>,
+    /// Deletions the version we held did not contain — our copy and the
+    /// master's had already diverged. Worth logging, never worth failing over.
+    pub missing_deletions: usize,
+}
+
+impl Fetched {
+    /// How the version arrived, for the line an operator reads.
+    pub fn how(&self) -> String {
+        match self.steps {
+            None => ", sent in full".to_string(),
+            Some(steps) => {
+                let mut how = format!(", {steps} incremental step(s)");
+                if self.missing_deletions > 0 {
+                    how.push_str(&format!(
+                        ", {} deletion(s) we did not hold",
+                        self.missing_deletions
+                    ));
+                }
+                how
+            }
+        }
+    }
+}
+
+/// One refresh: ask the master what it has, and fetch only if it moved —
+/// incrementally when we hold a version to move from.
+///
+/// The SOA probe is what makes an unchanged zone cost a round trip instead of a
+/// transfer, and it is why a secondary may be configured with a short REFRESH.
+/// IXFR is a preference and not a demand: the master may answer either request
+/// with the whole zone (RFC 1995 §4).
+///
+/// Shared because both daemons are secondaries of something — `rdnsd` of a zone
+/// it serves, `rdnsr` of a policy feed it enforces — and the second copy is
+/// where the bug lives (`CLAUDE.md` §7).
+pub async fn refresh_zone(
+    master: &Master,
+    zone: NameRef<'_>,
+    key: Option<&TsigKey>,
+    base: Option<&Zone>,
+) -> TransferResult<Refresh> {
+    let held = base.and_then(Zone::serial);
+    let remote = fetch_soa(master, zone, key).await?;
+    if let Some(held) = held {
+        if !remote.is_newer_than(held) {
+            return Ok(Refresh::Current {
+                serial: held,
+                answering_the_transfer: false,
+            });
+        }
+    }
+
+    let Some(base) = base else {
+        return Ok(Refresh::Fetched(Fetched {
+            zone: fetch_zone(master, zone, key).await?,
+            steps: None,
+            missing_deletions: 0,
+        }));
+    };
+
+    match fetch_changes(master, base, key).await? {
+        IxfrOutcome::UpToDate(serial) => Ok(Refresh::Current {
+            serial,
+            answering_the_transfer: true,
+        }),
+        IxfrOutcome::Updated {
+            zone,
+            steps,
+            missing_deletions,
+        } => Ok(Refresh::Fetched(Fetched {
+            zone,
+            steps: Some(steps),
+            missing_deletions,
+        })),
+        IxfrOutcome::FullTransfer(zone) => Ok(Refresh::Fetched(Fetched {
+            zone,
+            steps: None,
+            missing_deletions: 0,
+        })),
+    }
 }
 
 /// Open the connection a transfer runs over: TLS when the master is an XoT

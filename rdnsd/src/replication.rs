@@ -480,51 +480,27 @@ pub(crate) async fn refresh_once(
     let held = base.as_ref().and_then(Zone::serial);
 
     let master = replication.master(spec)?;
-    let remote = xfr::fetch_soa(&master, spec.zone.as_ref(), key).await?;
+    let refreshed = xfr::refresh_zone(&master, spec.zone.as_ref(), key, base.as_ref()).await?;
     let now = current_unix_timestamp();
 
     // EXPIRE resets on contact, not on a transfer: a zone confirmed current is
     // exactly what "not stale" means.
-    if let Some(held) = held {
-        if !remote.is_newer_than(held) {
-            record_state(state, spec, held, now, metrics).await?;
-            return Ok(format!("serial {held} is current"));
+    let fetched = match refreshed {
+        xfr::Refresh::Current {
+            serial,
+            answering_the_transfer,
+        } => {
+            record_state(state, spec, serial, now, metrics).await?;
+            return Ok(if answering_the_transfer {
+                format!("serial {serial} is current (the master says so)")
+            } else {
+                format!("serial {serial} is current")
+            });
         }
-    }
-
-    // A preference, not a demand: the master may answer either request with the
-    // whole zone (RFC 1995 §4).
-    let mut note = String::new();
-    let fetched = match &base {
-        Some(base) => match xfr::fetch_changes(&master, base, key).await? {
-            xfr::IxfrOutcome::UpToDate(serial) => {
-                // The SOA probe said otherwise a moment ago: the master changed
-                // its mind between the two questions.
-                record_state(state, spec, serial, now, metrics).await?;
-                return Ok(format!("serial {serial} is current (the master says so)"));
-            }
-            xfr::IxfrOutcome::Updated {
-                zone,
-                steps,
-                missing_deletions,
-            } => {
-                note = format!(", {steps} incremental step(s)");
-                if missing_deletions > 0 {
-                    // Our copy and the master's had already diverged. Not worth
-                    // failing over: the records are meant to be gone either way.
-                    note.push_str(&format!(
-                        ", {missing_deletions} deletion(s) we did not hold"
-                    ));
-                }
-                zone
-            }
-            xfr::IxfrOutcome::FullTransfer(zone) => {
-                note = ", sent in full".to_string();
-                zone
-            }
-        },
-        None => xfr::fetch_zone(&master, spec.zone.as_ref(), key).await?,
+        xfr::Refresh::Fetched(fetched) => fetched,
     };
+    let note = fetched.how();
+    let fetched = fetched.zone;
 
     let serial = fetched
         .serial()

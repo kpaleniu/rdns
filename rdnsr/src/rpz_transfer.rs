@@ -1,23 +1,43 @@
 //! Replicating a policy zone into the file it is already read from —
 //! `TODO.md` #57d, shape A.
 //!
-//! One task per transferred feed, on the zone's own SOA timers. What arrives is
-//! a [`rdns::zone::Zone`]; it is serialized, written where `[[rpz.feeds]].file`
-//! says, and the existing reload path reads it back. Nothing in `rdns::rpz`
-//! changes, nothing in the answer path changes, and `PolicyStore` never learns
-//! that a transfer exists.
+//! One task per transferred feed, on the zone's own SOA timers. A refresh asks
+//! the master for its serial first and stops there unless it moved; what
+//! arrives otherwise is a [`rdns::zone::Zone`], serialized, written where
+//! `[[rpz.feeds]].file` says, and read back by the existing reload path.
+//! Nothing in the answer path changes, and `PolicyStore` learns of a transfer
+//! only by being asked which version it holds.
 //!
-//! **What that costs, measured** (`rdns/tests/rpz_install.rs`, a million QNAME
-//! rules, release): 1 894 ms per refresh against shape B's 32.8 — 495 ms to
-//! serialize, 635 to write, 756 to read back and index a zone this process had
-//! already parsed once. And because the reload path is all-or-nothing over
-//! every feed, one feed's refresh re-reads all of them.
+//! **What a refresh costs, measured** (`rdns/tests/rpz_install.rs`, a million
+//! QNAME rules, release, the development machine, `TODO.md` #57e):
+//!
+//! | | ms |
+//! |---|---|
+//! | the serial probe, which is all an unchanged feed costs | 0.3 |
+//! | a whole zone (AXFR) | 1 596 |
+//! | the difference from the version in force (IXFR) | 808 |
+//! | writing the file and reading it back | 1 351 |
+//!
+//! So an unchanged million-rule feed costs one round trip where it used to cost
+//! a transfer and a reload, and a changed one asks for what changed. The
+//! install is the half that is still zone-sized whatever arrives, because the
+//! file is the store (`TODO.md` #57d's shape A) — and the reload is
+//! all-or-nothing over every feed, so a feed that *did* change re-reads the
+//! ones that did not (`TODO.md` #71).
 //!
 //! **What it buys**, and the reason the row called it the one that argues for
 //! itself: the file is the thing that survives a restart. A resolver that
 //! transferred a blocklist yesterday and is restarted today begins with
 //! yesterday's rules in force rather than with none, and nothing had to be
 //! designed for that — it is the same file an operator's cron job writes.
+//!
+//! The version an IXFR brings forward from is the one in force, read back out
+//! of [`PolicyStore`] rather than kept beside it: that zone is the file's
+//! contents, already parsed for the answer path, so a refresh holds no second
+//! copy of a feed. It can be one reload behind the file — a transfer installs
+//! by writing and asking for a re-read — which only means asking from an older
+//! serial, and RFC 1995 §4 lets a master answer that with a longer chain or
+//! with the whole zone.
 //!
 //! The transfer is signed when the feed's master names a key with `#name`
 //! (`TODO.md` #57f). The key is resolved out of `[keys]` at startup, so a name
@@ -41,6 +61,7 @@ use std::sync::Arc;
 
 use rdns::clock::current_unix_timestamp;
 use rdns::metrics::DnsMetrics;
+use rdns::rpz::{PolicyStore, PolicyZone};
 use rdns::secondary::{MasterSpec, RefreshTimers};
 use rdns::shutdown::{Busy, Stop};
 use rdns::tsig::TsigKey;
@@ -126,6 +147,7 @@ impl FeedWake {
 /// signal.
 pub(crate) async fn refresh_task(
     feed: TransferredFeed,
+    policy: Arc<PolicyStore>,
     reload: PolicyReload,
     wake: FeedWake,
     metrics: Arc<DnsMetrics>,
@@ -147,7 +169,7 @@ pub(crate) async fn refresh_task(
         // drain open for the life of the process (`CLAUDE.md` §9).
         let wait = {
             let _working = busy.clone();
-            match fetch_and_write(&master, &feed, &reload).await {
+            match fetch_and_write(&master, &feed, &policy, &reload).await {
                 Ok(fetched) => {
                     timers = fetched;
                     last_contact = current_unix_timestamp();
@@ -247,14 +269,53 @@ fn expire_if_out_of_contact(
     }
 }
 
-/// One transfer, written to the feed's file. Returns the timers the zone itself
-/// asks for.
+/// One refresh, written to the feed's file if the master had anything new.
+/// Returns the timers the zone itself asks for.
+///
+/// The version in force is the base: it is the file's contents, already parsed
+/// and already in memory for the answer path, so asking the master to bring
+/// *that* forward costs no second copy of the feed. It can be one reload behind
+/// the file — a transfer installs by writing and asking for a re-read — which
+/// only means asking from an older serial, and a master answers that with a
+/// longer chain or with the whole zone (RFC 1995 §4).
 async fn fetch_and_write(
     master: &Master,
     feed: &TransferredFeed,
+    policy: &Arc<PolicyStore>,
     reload: &PolicyReload,
 ) -> anyhow::Result<RefreshTimers> {
-    let zone = xfr::fetch_zone(master, feed.spec.zone.as_ref(), feed.key.as_ref()).await?;
+    let in_force = policy.in_force();
+    let base = in_force.held(feed.spec.zone.as_ref()).map(PolicyZone::zone);
+
+    let fetched =
+        match xfr::refresh_zone(master, feed.spec.zone.as_ref(), feed.key.as_ref(), base).await? {
+            // Nothing to write and nothing to re-read: an unchanged million-rule
+            // feed costs one round trip here and 2.5 s of serialize-write-reparse
+            // if this probe is skipped (`TODO.md` #57e). The contact still counts,
+            // because EXPIRE runs on contact and not on transfers.
+            xfr::Refresh::Current { serial, .. } => {
+                tracing::info!(
+                    "policy zone {}: serial {serial} is current, nothing transferred",
+                    feed.spec.zone
+                );
+                return Ok(base.and_then(RefreshTimers::from_zone).unwrap_or_default());
+            }
+            xfr::Refresh::Fetched(fetched) => fetched,
+        };
+    if fetched.missing_deletions > 0 {
+        // Our file and the master's zone had already diverged at the serial we
+        // asked from: the increments applied, but rules the master dropped are
+        // still being enforced here. Not fatal and not fixable from this side —
+        // the next full transfer settles it — so it is said out loud with the
+        // count.
+        tracing::warn!(
+            "policy zone {}: {} deletion(s) named records this feed did not hold",
+            feed.spec.zone,
+            fetched.missing_deletions
+        );
+    }
+    let how = fetched.how();
+    let zone = fetched.zone;
     let timers = RefreshTimers::from_zone(&zone).unwrap_or_default();
     let records = zone.records().len();
 
@@ -266,7 +327,7 @@ async fn fetch_and_write(
     tokio::task::spawn_blocking(move || write_zone_file(&zone, &path)).await??;
 
     tracing::info!(
-        "policy zone {} transferred from {master}: {records} records written to {}",
+        "policy zone {} transferred from {master}{how}: {records} records written to {}",
         feed.spec.zone,
         feed.file.display()
     );
@@ -281,7 +342,226 @@ async fn fetch_and_write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::ScratchDir;
+    use rdns::rpz::{Feed, PolicyOverride};
     use rdns::Name;
+    use std::net::SocketAddr;
+
+    /// A feed of two rules at `serial`, as a file's text.
+    fn feed_text(serial: u32, rules: &[&str]) -> String {
+        let mut text = format!(
+            "$ORIGIN block.example.\n\
+             $TTL 60\n\
+             @ IN SOA ns.block.example. hostmaster.block.example. {serial} 3600 600 86400 60\n\
+             @ IN NS localhost.\n"
+        );
+        for rule in rules {
+            text.push_str(&format!("{rule} IN CNAME .\n"));
+        }
+        text
+    }
+
+    fn zone_from(text: &str) -> rdns::zone::Zone {
+        rdns::zone::parse_zone_file(text, "block.example.").expect("the feed parses")
+    }
+
+    /// What the master was asked for, in order — the assertion that says which
+    /// protocol this took rather than what it ended up with (`CLAUDE.md` §10).
+    type Asked = Arc<std::sync::Mutex<Vec<&'static str>>>;
+
+    /// A master on loopback serving `zone`, with `deltas` so it can answer an
+    /// IXFR, recording the question of every request.
+    async fn spawn_master(
+        zone: rdns::zone::Zone,
+        deltas: rdns::ixfr::DeltaLog,
+    ) -> (SocketAddr, Asked) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a master");
+        let addr = listener.local_addr().expect("local addr");
+        let asked: Asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recording = asked.clone();
+        let shared = Arc::new((zone, deltas));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let shared = shared.clone();
+                let recording = recording.clone();
+                tokio::spawn(async move {
+                    let (zone, deltas) = &*shared;
+                    let mut length = [0u8; 2];
+                    if stream.read_exact(&mut length).await.is_err() {
+                        return;
+                    }
+                    let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+                    if stream.read_exact(&mut packet).await.is_err() {
+                        return;
+                    }
+                    let request = rdns::DnsMessage::try_from_bytes(&packet).expect("a request");
+                    let qtype = request.queries[0].qtype;
+                    let replies = if qtype == rdns::Qtype::of(rdns::record_types::AXFR) {
+                        recording.lock().expect("the log").push("AXFR");
+                        rdns::transfer::axfr_messages(&request, zone).expect("an AXFR")
+                    } else if qtype == rdns::Qtype::of(rdns::record_types::IXFR) {
+                        recording.lock().expect("the log").push("IXFR");
+                        rdns::ixfr::ixfr_response(&request, zone, deltas)
+                            .expect("an IXFR")
+                            .messages(&request, zone)
+                            .expect("its messages")
+                    } else {
+                        recording.lock().expect("the log").push("SOA");
+                        let mut reply = request.clone();
+                        reply.response = true;
+                        reply.authoritive = true;
+                        reply.answers = vec![zone.apex_soa_record().expect("an apex SOA")];
+                        vec![reply]
+                    };
+                    for reply in replies {
+                        let mut buf = vec![0u8; 65535];
+                        let n = reply.to_bytes(&mut buf).expect("serialize");
+                        let mut framed = (n as u16).to_be_bytes().to_vec();
+                        framed.extend_from_slice(&buf[..n]);
+                        if stream.write_all(&framed).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        (addr, asked)
+    }
+
+    /// Whether a reload was queued, without waiting for one that never comes.
+    async fn reload_queued(reload: &PolicyReload) -> bool {
+        tokio::time::timeout(std::time::Duration::from_millis(50), reload.requested())
+            .await
+            .is_ok()
+    }
+
+    /// The store, the feed and the master, all at `serial` and agreeing.
+    fn feed_in_force(
+        dir: &ScratchDir,
+        addr: SocketAddr,
+        text: &str,
+    ) -> (Arc<PolicyStore>, TransferredFeed) {
+        let path = dir.write("block.example.zone", text);
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("the feed loads");
+        let feed = TransferredFeed {
+            spec: MasterSpec::parse(&format!("block.example.@{addr}")).expect("a spec"),
+            file: path,
+            on_expire: OnExpire::Enforce,
+            key: None,
+        };
+        (store, feed)
+    }
+
+    /// A master with nothing new is one round trip: no transfer, no file, no
+    /// reload.
+    ///
+    /// Fails against the shape this replaced, which fetched the whole zone
+    /// every REFRESH and rewrote the file whatever the master's serial —
+    /// 2.5 s of serialize-write-reparse per unchanged million-rule feed, and a
+    /// re-read of every *other* feed with it (`TODO.md` #57e).
+    #[tokio::test]
+    async fn a_master_with_nothing_new_is_asked_and_not_transferred() {
+        let dir = ScratchDir::new("rpz-current");
+        let text = feed_text(1, &["www.malware.example"]);
+        let (addr, asked) = spawn_master(zone_from(&text), rdns::ixfr::DeltaLog::new()).await;
+        let (store, feed) = feed_in_force(&dir, addr, &text);
+        let reload = PolicyReload::default();
+
+        // A marker the refresh would overwrite if it wrote the file at all.
+        std::fs::write(&feed.file, "this file was not rewritten").expect("the marker is written");
+
+        fetch_and_write(&Master::plain(addr), &feed, &store, &reload)
+            .await
+            .expect("the refresh reaches the master");
+
+        assert_eq!(
+            *asked.lock().expect("the log"),
+            ["SOA"],
+            "an unchanged zone is a serial comparison and nothing else"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&feed.file).expect("the file is there"),
+            "this file was not rewritten"
+        );
+        assert!(
+            !reload_queued(&reload).await,
+            "nothing changed, so nothing has to be re-read"
+        );
+    }
+
+    /// A master that has moved on is asked for the difference, and the version
+    /// in force is what it is asked to bring forward.
+    ///
+    /// Fails against a refresh that always sends AXFR: the master records
+    /// which question it was asked.
+    #[tokio::test]
+    async fn a_newer_serial_arrives_as_an_increment_from_the_version_in_force() {
+        let dir = ScratchDir::new("rpz-increment");
+        let before = feed_text(1, &["www.malware.example"]);
+        let after = feed_text(2, &["shop.malware.example"]);
+        let mut deltas = rdns::ixfr::DeltaLog::new();
+        deltas.note_change(Some(&zone_from(&before)), &zone_from(&after));
+
+        let (addr, asked) = spawn_master(zone_from(&after), deltas).await;
+        let (store, feed) = feed_in_force(&dir, addr, &before);
+        let reload = PolicyReload::default();
+
+        fetch_and_write(&Master::plain(addr), &feed, &store, &reload)
+            .await
+            .expect("the refresh reaches the master");
+
+        assert_eq!(*asked.lock().expect("the log"), ["SOA", "IXFR"]);
+        let written = std::fs::read_to_string(&feed.file).expect("the file is there");
+        assert!(
+            written.contains("shop.malware.example"),
+            "the new rule is on disk: {written}"
+        );
+        assert!(
+            !written.contains("www.malware.example"),
+            "and the withdrawn one is not: {written}"
+        );
+        assert!(
+            reload_queued(&reload).await,
+            "a feed that changed has to be re-read before it is in force"
+        );
+    }
+
+    /// A feed with no version in force — the file could not be read, or this is
+    /// the first refresh — asks for the whole zone. There is nothing to bring
+    /// forward from.
+    #[tokio::test]
+    async fn a_feed_with_nothing_in_force_asks_for_the_whole_zone() {
+        let dir = ScratchDir::new("rpz-first");
+        let text = feed_text(1, &["www.malware.example"]);
+        let (addr, asked) = spawn_master(zone_from(&text), rdns::ixfr::DeltaLog::new()).await;
+        let store = PolicyStore::in_memory(rdns::rpz::PolicyZones::default());
+        let feed = TransferredFeed {
+            spec: MasterSpec::parse(&format!("block.example.@{addr}")).expect("a spec"),
+            file: dir.write("block.example.zone", ""),
+            on_expire: OnExpire::Enforce,
+            key: None,
+        };
+        let reload = PolicyReload::default();
+
+        fetch_and_write(&Master::plain(addr), &feed, &store, &reload)
+            .await
+            .expect("the refresh reaches the master");
+
+        assert_eq!(*asked.lock().expect("the log"), ["SOA", "AXFR"]);
+        assert!(std::fs::read_to_string(&feed.file)
+            .expect("the file is there")
+            .contains("www.malware.example"));
+    }
 
     fn feed(on_expire: OnExpire) -> TransferredFeed {
         TransferredFeed {

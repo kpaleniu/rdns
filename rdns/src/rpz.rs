@@ -490,6 +490,13 @@ impl PolicyZone {
         self.zone.origin()
     }
 
+    /// The zone behind the index, for a refresh that has to say which version
+    /// it holds (`TODO.md` #57e). Read-only: the index is built from these
+    /// records and cannot be kept in step with an edit.
+    pub fn zone(&self) -> &Zone {
+        &self.zone
+    }
+
     /// How many records the zone holds, for the startup banner: "the feed
     /// loaded" as a number rather than a claim.
     pub fn records(&self) -> usize {
@@ -791,7 +798,17 @@ impl PolicyZones {
     /// ASCII fold (RFC 4343), so this cannot disagree with a zone map keyed on
     /// folded octets.
     pub fn carries(&self, zone: NameRef<'_>) -> bool {
-        self.zones.iter().any(|held| held.origin() == zone)
+        self.held(zone).is_some()
+    }
+
+    /// The feed with that origin, if this set holds it.
+    ///
+    /// What a transfer asks for: the version in force is the version an IXFR
+    /// brings forward from (RFC 1995 §3), and it is already parsed and already
+    /// in memory, so a refresh needs no second copy of a feed to hold a base
+    /// against (`TODO.md` #57e).
+    pub fn held(&self, zone: NameRef<'_>) -> Option<&PolicyZone> {
+        self.zones.iter().find(|held| held.origin() == zone)
     }
 
     /// The rewrite that applies before anything is resolved: the client's

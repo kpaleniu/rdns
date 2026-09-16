@@ -970,6 +970,7 @@ async fn main() -> anyhow::Result<()> {
         }
         transfers.push(tokio::spawn(refresh_task(
             feed,
+            policy.clone(),
             reload.clone(),
             wake.clone(),
             ctx.metrics.clone(),

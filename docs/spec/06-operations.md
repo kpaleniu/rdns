@@ -151,6 +151,11 @@ file = "court-order.rpz"    # consulted, and a map would reorder it
 [[rpz.feeds]]
 file = "new-feed.rpz"
 policy = "passthru"         # measured while the one above stays enforced
+
+[[rpz.feeds]]
+file = "malware.rpz"        # transferred into that file, not written by a cron
+master = "malware.rpz.example.@192.0.2.9#partner.key."   # `#name` signs it
+on-expire = "enforce"       # or "lift"; enforce is the default
 ```
 
 The per-feed policy is what the file was wanted for: `--rpz-policy` is one
