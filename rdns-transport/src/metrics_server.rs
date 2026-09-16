@@ -21,13 +21,21 @@
 //! no `Host` header now gets 400 — RFC 9112 §3.2 requires that. And a request
 //! line longer than 8 KB is now hyper's 431.~~ **Neither was true**, and the
 //! tests in this file had disproved half of it on the day it was written:
-//! `a_query_string_is_still_a_scrape` sends no `Host` and asserts 200. Measured
-//! (`hyper_serves_what_the_header_used_to_claim_it_refused`): no `Host` is
+//! `a_query_string_is_still_a_scrape` sent no `Host` and asserted 200. Measured
+//! (`hyper_serves_what_the_header_used_to_claim_it_refused`): no `Host` was
 //! **200**, hyper does not look; an over-long request line is **414** past
 //! ~64 KB, hyper's read buffer, not 431 at 8 KB. Both numbers were estimates of
 //! somebody else's code — `CLAUDE.md` §4's "never state what a function does
-//! without opening it", about a dependency. §3.2's MUST is unenforced and
-//! that is now a decision to take rather than a claim (`TODO.md` #70).
+//! without opening it", about a dependency.
+//!
+//! **The first half is true now because this file makes it so** (`TODO.md`
+//! #70): `bad_host` below answers 400 to an HTTP/1.1 request with no `Host`,
+//! with two of them, or with one that is not `host[:port]` — all three of §3.2's
+//! MUSTs, and hyper answered 200 to all three. The cost is that
+//! `printf 'GET /metrics HTTP/1.1\r\n\r\n' | nc` stops working, so the refusal
+//! names the spelling that does: §3.2 exempts HTTP/1.0, and every scraper and
+//! `curl` sends a `Host` anyway. The second half is still hyper's and is
+//! pinned, not enforced.
 //!
 //! **Keep-alive is off on purpose**, which is the one thing hyper offers here
 //! that is not taken. The permit below is held for a connection's life, so a
@@ -113,6 +121,13 @@ fn answer(
     metrics: &DnsMetrics,
     readiness: &Readiness,
 ) -> Response<Full<Bytes>> {
+    if let Some(why) = bad_host(&request) {
+        return text(
+            StatusCode::BAD_REQUEST,
+            "text/plain",
+            format!("{why}\n\nUse `GET /metrics HTTP/1.0` for a request with no Host.\n"),
+        );
+    }
     // hyper has already stripped the query string, which `GET /metrics?x=1`
     // needs: a query string is ordinary scrape configuration, not a 404.
     match (request.method(), request.uri().path()) {
@@ -152,6 +167,49 @@ fn answer(
             "text/plain",
             "method not allowed\n".into(),
         ),
+    }
+}
+
+/// Why this request's `Host` breaks RFC 9112 §3.2, or `None` if it does not.
+///
+/// The section is three MUSTs in one sentence — "A server MUST respond with a
+/// 400 (Bad Request) to any HTTP/1.1 request message that lacks a Host header
+/// field and to any request message that contains more than one Host header
+/// field line or a Host header field with an invalid field value" — and hyper
+/// enforces none of them: measured before this was written, two `Host` lines
+/// and `Host: a b` were both answered 200.
+///
+/// The last of the three is delegated to `http`'s own authority parser rather
+/// than spelled out here, because "invalid field value" means §3.2's
+/// `uri-host [ ":" port ]` and a second implementation of that is the thing
+/// `CLAUDE.md` §7 is about.
+///
+/// HTTP/1.0 is exempt by the section's own wording, which is also the escape
+/// hatch for the hand-typed probe this costs: `GET /metrics HTTP/1.0` needs no
+/// header at all.
+fn bad_host(request: &Request<hyper::body::Incoming>) -> Option<&'static str> {
+    let mut hosts = request.headers().get_all(hyper::header::HOST).iter();
+    let Some(host) = hosts.next() else {
+        return match request.version() {
+            hyper::Version::HTTP_09 | hyper::Version::HTTP_10 => None,
+            _ => Some("an HTTP/1.1 request must carry a Host header (RFC 9112 §3.2)"),
+        };
+    };
+    if hosts.next().is_some() {
+        return Some("a request must carry one Host header, not several (RFC 9112 §3.2)");
+    }
+    // An empty value is legal for a request with no authority in its target,
+    // and this endpoint has no virtual hosts to distinguish anyway.
+    if host.is_empty() {
+        return None;
+    }
+    match host
+        .to_str()
+        .ok()
+        .and_then(|host| host.parse::<hyper::http::uri::Authority>().ok())
+    {
+        Some(_) => None,
+        None => Some("the Host header is not a valid host[:port] (RFC 9112 §3.2)"),
     }
 }
 
@@ -265,18 +323,18 @@ mod tests {
     #[tokio::test]
     async fn a_query_string_is_still_a_scrape() {
         let (addr, _shutdown, _metrics) = start().await;
-        let body = scrape(addr, "GET /metrics?x=1 HTTP/1.1\r\n\r\n").await;
+        let body = scrape(addr, "GET /metrics?x=1 HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
     }
 
     #[tokio::test]
     async fn healthz_answers_and_other_paths_do_not() {
         let (addr, _shutdown, _metrics) = start().await;
-        let body = scrape(addr, "GET /healthz HTTP/1.1\r\n\r\n").await;
+        let body = scrape(addr, "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
-        let body = scrape(addr, "GET /admin HTTP/1.1\r\n\r\n").await;
+        let body = scrape(addr, "GET /admin HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(body.starts_with("HTTP/1.1 404"), "{body}");
-        let body = scrape(addr, "POST /metrics HTTP/1.1\r\n\r\n").await;
+        let body = scrape(addr, "POST /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(body.starts_with("HTTP/1.1 405"), "{body}");
     }
 
@@ -288,12 +346,12 @@ mod tests {
             start_with(Readiness::waiting_for(["example.com.", "example.net."])).await;
 
         assert!(
-            scrape(addr, "GET /healthz HTTP/1.1\r\n\r\n")
+            scrape(addr, "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
                 .await
                 .starts_with("HTTP/1.1 200 OK"),
             "liveness does not wait on the zones"
         );
-        let body = scrape(addr, "GET /readyz HTTP/1.1\r\n\r\n").await;
+        let body = scrape(addr, "GET /readyz HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(
             body.starts_with("HTTP/1.1 503 Service Unavailable"),
             "{body}"
@@ -302,12 +360,12 @@ mod tests {
         assert!(body.contains("example.net."), "{body}");
 
         readiness.arrived("example.com.");
-        let body = scrape(addr, "GET /readyz HTTP/1.1\r\n\r\n").await;
+        let body = scrape(addr, "GET /readyz HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(body.starts_with("HTTP/1.1 503"), "one of two: {body}");
         assert!(!body.contains("example.com."), "it arrived: {body}");
 
         readiness.arrived("example.net.");
-        let body = scrape(addr, "GET /readyz HTTP/1.1\r\n\r\n").await;
+        let body = scrape(addr, "GET /readyz HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
         assert!(body.ends_with("ready\n"), "{body}");
     }
@@ -316,22 +374,54 @@ mod tests {
     #[tokio::test]
     async fn a_server_with_nothing_to_wait_for_is_ready_at_once() {
         let (addr, _shutdown, _metrics) = start().await;
-        let body = scrape(addr, "GET /readyz HTTP/1.1\r\n\r\n").await;
+        let body = scrape(addr, "GET /readyz HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
     }
 
-    /// Both halves of a claim this module's header made about hyper and nobody
-    /// ran. Pinned rather than described: the header's numbers were 400 and
-    /// 431, and a dependency's defaults are exactly the kind of claim that
-    /// changes under you (`TODO.md` #68).
+    /// RFC 9112 §3.2's three MUSTs, each of which hyper answered 200 to before
+    /// this endpoint checked them itself (`TODO.md` #70).
+    ///
+    /// Fails against the code it replaced in all four assertions, which is the
+    /// whole of the change: nothing here is about hyper's behaviour, only
+    /// about ours on top of it.
+    #[tokio::test]
+    async fn a_request_whose_host_breaks_the_rfc_is_refused() {
+        let (addr, _shutdown, _metrics) = start().await;
+
+        for (request, what) in [
+            ("GET /metrics HTTP/1.1\r\n\r\n", "no Host at all"),
+            (
+                "GET /metrics HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+                "two Host headers",
+            ),
+            (
+                "GET /metrics HTTP/1.1\r\nHost: not a host\r\n\r\n",
+                "a Host that is not host[:port]",
+            ),
+        ] {
+            let body = scrape(addr, request).await;
+            assert!(
+                body.starts_with("HTTP/1.1 400 Bad Request"),
+                "{what}: {}",
+                &body[..60.min(body.len())]
+            );
+        }
+
+        // §3.2 is about HTTP/1.1, and the exemption is what keeps a hand-typed
+        // probe working: `printf 'GET /metrics HTTP/1.0\r\n\r\n' | nc` is the
+        // spelling the 400's body points at.
+        let body = scrape(addr, "GET /metrics HTTP/1.0\r\n\r\n").await;
+        assert!(body.starts_with("HTTP/1.0 200 OK"), "{body}");
+    }
+
+    /// What hyper does with a request line longer than it will read — a claim
+    /// this module's header made, never ran, and got wrong by 8 KB and one
+    /// status code. Pinned rather than described, because a dependency's
+    /// defaults are exactly the kind of claim that changes under you
+    /// (`TODO.md` #68).
     #[tokio::test]
     async fn hyper_serves_what_the_header_used_to_claim_it_refused() {
         let (addr, _shutdown, _metrics) = start().await;
-
-        // RFC 9112 §3.2 says 400. hyper does not look, and the four tests above
-        // that send no `Host` are the evidence it never did (`TODO.md` #70).
-        let body = scrape(addr, "GET /metrics HTTP/1.1\r\n\r\n").await;
-        assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
 
         // Past hyper's 64 KiB read buffer, not past 8 KB, and 414 not 431:
         // 60 000 is served as an ordinary 404.
@@ -361,7 +451,7 @@ mod tests {
     #[tokio::test]
     async fn the_endpoint_stops_with_the_server() {
         let (addr, shutdown, _metrics) = start().await;
-        let body = scrape(addr, "GET /healthz HTTP/1.1\r\n\r\n").await;
+        let body = scrape(addr, "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
 
         shutdown.begin();

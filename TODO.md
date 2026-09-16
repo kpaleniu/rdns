@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#59**, **#68**, **#70**, **#71** and **#21**, as of
-2026-09-16. **#57 is closed**: 57e was the last of it, and the measurement that
+**#58**, **#59**, **#68**, **#71** and **#21**, as of 2026-09-16. **#57 is
+closed**: 57e was the last of it, and the measurement that
 could have refuted it did — IXFR as this tree had it was *slower* than a whole
 transfer, because applying forty records to a million-record zone cost 1 018 ms
 building a key per record of the *base*. What the row was actually missing was
@@ -59,8 +59,9 @@ found on the way out is ~~**#69**~~ **#69, closed the same day it was filed**
 (four accept loops treated any error as fatal while the UDP side had a helper
 for exactly that; the remote provocation the row leaned on turned out not to
 exist, and `EMFILE` — which needs no remote party — took the whole server down)
-and **#70** (the metrics header claimed two hyper behaviours hyper does not
-have).
+and ~~**#70**~~ **#70, closed 2026-09-16** (the metrics header claimed two
+hyper behaviours hyper does not have; the half worth having is enforced here
+now, and §3.2 turned out to be three MUSTs hyper answers 200 to).
 **#66 and #67 closed the day they were filed**, together: `rdnsc` transfers a
 zone, signs it, verifies every envelope and writes a loadable file, and the
 crate line moved twice to let it — `rdns-present` for the format and
@@ -1003,7 +1004,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#59**, **#68**, **#70** and **#71**, plus **#21** — see
+**#58**, **#59**, **#68** and **#71**, plus **#21** — see
 "What is open" above, which is the same list and the only place it is written
 down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -3733,7 +3734,7 @@ saying so ten times a second forever.
 
 ---
 
-### 70. The metrics endpoint does not enforce RFC 9112 §3.2, and its header said it did — **filed 2026-09-16**
+### 70. The metrics endpoint does not enforce RFC 9112 §3.2, and its header said it did — **filed and closed 2026-09-16**
 
 `metrics_server.rs`'s header claimed that folding onto hyper (#42c) changed
 "two behaviours, both toward the RFC": a `Host`-less HTTP/1.1 request getting
@@ -3750,15 +3751,36 @@ the file disproved half of its own header on the day it was written. The header
 is corrected and both behaviours are pinned by
 `hyper_serves_what_the_header_used_to_claim_it_refused`.
 
-**What is left is a decision, not a defect.** §3.2 is a MUST ("A server MUST
-respond with a 400 (Bad Request) to any HTTP/1.1 request message that lacks a
-Host header field"), and this server does not. The branch is five lines in
-`answer`. Against it: the endpoint has no virtual hosts, which is what the MUST
-protects, and enforcing it turns `printf 'GET /metrics HTTP/1.1\r\n\r\n' | nc`
-— an operator's probe — into a 400. Taking it means changing four tests, which
-is §1's ordinary case and not an argument either way. Not taken on this
-session's own authority: it is a behaviour change nobody asked for, on the
-operational shell, which is where `CLAUDE.md`'s preamble says the defects are.
+~~**What is left is a decision, not a defect.**~~ **Decided by the owner and
+taken 2026-09-16.** The argument against it was that the endpoint has no
+virtual hosts, which is what the MUST protects, and that enforcing it turns
+`printf 'GET /metrics HTTP/1.1\r\n\r\n' | nc` — an operator's probe — into a
+400.
+
+**Taken 2026-09-16, and the section is three MUSTs rather than the one the row
+read.** §3.2 in full: "A server MUST respond with a 400 (Bad Request) to any
+HTTP/1.1 request message that lacks a Host header field **and to any request
+message that contains more than one Host header field line or a Host header
+field with an invalid field value**". Measured before anything was written,
+because this row exists to correct estimates of somebody else's code: hyper
+answers **200** to all three — no `Host`, two `Host` lines, and `Host: a b`.
+
+`bad_host` refuses all three now. The third is delegated to `http`'s own
+authority parser rather than spelled out here, because "invalid field value" is
+§3.2's `uri-host [ ":" port ]` and a second implementation of that grammar is
+what §7 is about.
+
+**The count the row gave was wrong and §18's rule caught it**: "changing four
+tests" was six tests and eleven requests, every one of them an
+`HTTP/1.1\r\n\r\n` with no `Host` — which is also the measurement that says how
+easily this would have gone unnoticed, since the whole suite was written
+against an endpoint that did not look.
+
+**What it costs is what the row said**, and the refusal pays it back: a
+hand-typed `printf 'GET /metrics HTTP/1.1\r\n\r\n' | nc` is now a 400 whose
+body names the spelling that works. §3.2 is about HTTP/1.1 alone, so
+`GET /metrics HTTP/1.0` needs no header at all — asserted, not assumed. `curl`,
+Prometheus and the `image` job's probes all send a `Host` and are unaffected.
 
 ---
 
@@ -3949,6 +3971,7 @@ the week; the record is under "How the queue kept going stale" in
 | **65** | every load re-signed every zone from scratch | **filed and closed 2026-09-14**, out of 64e. `ZoneSigning::apply` signed unconditionally, so a SIGHUP, an `rdnsctl reload` or a catalog change cost a full sign of every signed zone — 27.6 s at a million records — and moved the RDATA of every RRSIG, which is the whole zone in the next IXFR delta. **The four shapes were built and the recommended one was declined** (§19, #40a's precedent again). What landed is A, keyed on the trigger: the re-signing timer reloads *in order to* refresh, so it is the one reload that may carry nothing forward, and the other two carry everything whose RRset did not move — 9.7 s against 27.6, still 53.6% saved when a tenth of the zone changes (65b). **B is declined on a measurement**: the expiry spread is a fifth of the validity and the re-signing interval a third, so every signature crosses any refresh threshold in the same tick — 0 or all 126 of a fixture's RRSIGs, never between — and the only threshold that saves work hands the refreshing run a signature with four tenths of an interval left, against the 1.4 §8 asks for. The patch was reverted and the finding kept as a tripwire on the two constants. C moved to **#64b** and then, when 64b closed without reaching the reload path, to **#64f**. The prerequisite the row called plumbing was one four-line method: `Zones::snapshot_all` |
 | **63** | `rdnsr` had 39 flags and no config file | **filed 2026-09-14, closed 2026-09-15**, ten rows, filed out of 57d because a prerequisite named in prose is one nobody schedules (§18). 63a answered the split question with the compiler rather than a line count — 18 escaping items of 84 `pub`s, and 63g then measured that `rdnsr` would name **0** of them — so the module stayed in `rdnsd` and what is shared is one macro. 63h built all three shapes and kept the two declined ones as branches: the shared struct is out because `#[serde(flatten)]` makes serde buffer the table, costing every `[server]` typo its line number and its expected-key list in `rdnsd`'s existing file too. On the way, 63e found 16 defaults written twice with nothing comparing them, 63f the same bare-`pub` sweep for the `cfg(unix)` file Windows cannot compile, and 63i the one flag of 35 not refused beside `--config`. **63j is what the file existed for**: `[[rpz.feeds]]`, a policy per feed, which costs the match path nothing because `PolicyZone` has carried one since 45a. `rdnsr --check-config` closed with it |
 | **64** | one dynamic UPDATE was five O(zone) passes | **filed 2026-09-14, closed 2026-09-16**, seven rows, and it was filed with the measurement that refuted the fix it was going to propose (§19). 64a: a whole-zone clone nobody read, three instances not one, fixed in the type. 64b: read the file's bytes every time, parse them only when they are not the bytes this server last wrote — 38% off an unsigned update, and its headline number *did not reproduce* because one `--ignored` filter selected two million-record benchmarks and libtest ran them at once. 64d: signing is 88% of a signed update, and the measurement that could have refuted it — `carried` — refuted the *explanation* instead: exactly four RRSIGs are made fresh at any zone size. 64e: the two structures the split named, three shapes built, −14%. 64f: a reload keeps the zone it is serving for a file nobody touched, 11.4 s to 39 ms, on the condition `ProvenSigning` already computes. **64c is the one declined**: its 42% was more than half serializer — RFC 3597's hex form built for every record and thrown away — and `to_string` fell 636 ms to 250 with the file still the authority, which leaves the checkpoint design buying 387 ms of a 1 335 ms update and 4% of a signed one. 64g, the one 64e did not take, closed the same day #64 did: the type change it was filed as too big for is a default type parameter and **zero** of `Rrset::new`'s 43 call sites, it takes the named pass down 25% — and the total does not move, because the clone it removes was buying the signing loop its locality. Landed on the allocation count (593 -> 566 on an eight-record zone) and said so |
+| **70** | the metrics endpoint did not enforce RFC 9112 §3.2, and its header said it did | **filed and closed 2026-09-16**, out of #68. Both of the header's claims about hyper were estimates of somebody else's code and both were wrong — no `Host` was **200**, not 400, and an over-long request line is **414 past 64 KiB**, not 431 past 8 KB — and four tests in that same file had disproved the first on the day it was written. Filed as a decision rather than a defect and taken by the owner: `bad_host` now answers 400 to all **three** of §3.2's MUSTs, which the row had read as one, and hyper answered 200 to every one of them. The count was wrong too — "four tests" was six tests and eleven requests (§18). The probe it costs is paid back in the refusal's body: §3.2 exempts HTTP/1.0, and `curl`, Prometheus and CI's own probes all send a `Host` |
 | **57** | a policy zone arrived as a file somebody else wrote, not as a transfer | **filed 2026-09-13, closed 2026-09-16**, five rows, left behind by 45a — and the delivery half needed no code in `rdnsd` at all: `announce_transfer` had notified every `--also-notify` peer after every transfer since it was written, and what was missing was `rdnsr`'s ear (57c). 57a's reload found a resolver with `--rpz` and no DoT that had no reload task at all; 57b measured the reload *on* a worker and a one-core resolver answering nothing for 2.7 s. 57d built both shapes and was decided by neither's install cost: A keeps the file, so a restart begins with yesterday's rules. 57e is the one whose own measurement refuted it — IXFR was **slower than AXFR** here, 1 485 ms against 1 372 at a million rules, because applying forty records built a key per record of the base; and the bigger miss was that a refresh had no SOA probe at all, so an unchanged feed cost a transfer and a reload every REFRESH. Both daemons share `xfr::refresh_zone` now (§7). **#71** is what is left, and it is neither the wire nor the format |
 | **69** | four accept loops ended on any error, where the UDP side had a helper | **filed and closed 2026-09-16**, out of #68. Filed with no remedy on purpose (§18), and both missing measurements were taken the same day — which reversed the reason. **The remote provocation does not exist**: four `SO_LINGER 0` resets before the accept come back as `Ok` on Windows and on Linux, so §4's *remote* kill switch does not apply. **Descriptor exhaustion does, and needs nobody**: at `ulimit -n`, `accept` returns `EMFILE`, `Uncategorized`/raw 24, invisible to every portable kind — and both daemons' `JoinSet` ends the process when its first task ends, so `accepted?` turned a self-clearing condition into a whole-server outage across every transport. Windows could not be made to reach it (100 000 handles, no failure). Provoked before and after against a real `tcp::serve`: the old code's next write is a reset, the new one answers. One shared `survive_accept_error` at all four sites — retry the aborted kinds, log and back off 100 ms on exhaustion, still fatal otherwise |
 

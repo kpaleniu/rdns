@@ -257,6 +257,13 @@ Off by default. `GET /metrics`, `GET /healthz`, `GET /readyz`. No TLS, no auth,
 no keep-alive, no compression — bind it on loopback or a management address.
 Scraped, not pushed.
 
+An HTTP/1.1 request is refused 400 unless it carries exactly one valid `Host`
+header, which is RFC 9112 §3.2's MUST and which hyper does not enforce for us.
+Scrapers and `curl` send one; a request typed by hand does not, so the refusal
+says what does — §3.2 exempts HTTP/1.0, and
+`printf 'GET /metrics HTTP/1.0\r\n\r\n' | nc host 9153` is the probe that needs
+no header.
+
 ### Counters (`dns_*_total`)
 
 `queries_received`, `queries_authoritative`, `responses_sent`,
