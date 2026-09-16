@@ -42,7 +42,7 @@ use rdns_transport::ServeContext;
 
 use crate::answer::{write_response, NOT_OUR_ZONE};
 use crate::replication::{Notified, Secondaries};
-use crate::zones::{install_zone, ZoneContext, ZoneMap, ZoneSigning};
+use crate::zones::{digest_of, install_zone, ZoneContext, ZoneMap, ZoneSigning};
 use crate::{bad_request, serving_error};
 use crate::{Scratch, Server};
 
@@ -1187,21 +1187,6 @@ enum UpdateFailure {
     System(anyhow::Error),
 }
 
-/// What this server last wrote to a zone file, for telling an operator's edit
-/// from its own (`TODO.md` #64b).
-///
-/// Not a cryptographic digest: the question is whether the bytes changed, and
-/// anybody who can rewrite the zone file already owns the process. `DefaultHasher`
-/// is not stable across Rust releases, which does not matter — every comparison
-/// is against a value this same process computed, and a restart re-reads
-/// anyway.
-fn digest_of(bytes: &[u8]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// Apply an UPDATE to the zone as its *file* has it, persist it, and return the
 /// version to install.
 ///
@@ -1380,7 +1365,7 @@ fn notify_reply(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::testutil::{nm, query};
     use crate::zones::zone_key;
@@ -1404,12 +1389,12 @@ mod tests {
     /// Poisoning is ignored: one benchmark panicking says nothing about whether
     /// the next may run, and the alternative is every later one failing for a
     /// reason that is not theirs.
-    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
         ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A zone of `records` A records under one apex, for the benchmarks.
-    fn zone_text(records: usize) -> String {
+    pub(crate) fn zone_text(records: usize) -> String {
         let mut text = String::new();
         text.push_str("$TTL 3600\n");
         text.push_str("@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n");

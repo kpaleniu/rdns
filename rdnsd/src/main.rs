@@ -44,9 +44,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zones::{
-    discard_orphan_journals, install_all_zones, load_zones_from_source, note_serials,
-    restore_journals, validate_zone_source, verify_zones, ProvenSigning, SigningRun, ZoneContext,
-    ZoneMap, ZoneSigning, ZoneSource, Zones,
+    discard_orphan_journals, install_all_zones, load_zones, note_serials, restore_journals,
+    validate_zone_source, verify_zones, Keepable, Loaded, LoadedFiles, ProvenSigning, SigningRun,
+    ZoneContext, ZoneMap, ZoneSigning, ZoneSource, Zones,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -1315,6 +1315,12 @@ struct Reloading {
     /// a reload that re-signs a zone with the same keys has nothing new to
     /// check (`TODO.md` #53).
     proved: ProvenSigning,
+    /// What each zone file held when it was last parsed, so a reload can keep
+    /// the zone it is serving for a file nobody touched — 11.4 s per unchanged
+    /// million-record signed zone (`TODO.md` #64f). Shared with the startup
+    /// pass for the same reason `proved` is: the first SIGHUP after a start has
+    /// something to compare against.
+    files: LoadedFiles,
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -1340,9 +1346,26 @@ impl Reloading {
 
     /// The blocking half of [`Reloading::load`], and named so at the call site.
     fn load_blocking(&self, source: &ZoneSource, previous: Option<&ZoneMap>) -> Result<ZoneMap> {
-        let mut zones = load_zones_from_source(source, self.replicating, self.allow_partial)?;
+        // One moment for the whole reload: `Keepable` decides whether a zone's
+        // key roles have moved and `apply` signs with the answer, so a key
+        // crossing its Activate between two reads would be a reload that
+        // silently declined to act on it.
+        let signed_at = rdns::clock::current_unix_timestamp();
+        // An empty map when the re-signing timer is the caller, which carries
+        // nothing forward and so may keep nothing — but still records what it
+        // read, or the SIGHUP after a tick re-parses everything.
+        let nothing = ZoneMap::new();
+        let keep = Keepable {
+            files: &self.files,
+            served: previous.unwrap_or(&nothing),
+            signing: self.signing.as_deref(),
+            proved: &self.proved,
+            signed_at,
+        };
+        let Loaded { mut zones, kept } =
+            load_zones(source, self.replicating, self.allow_partial, Some(&keep))?;
         let run = match &self.signing {
-            Some(signing) => signing.apply(&mut zones, previous)?,
+            Some(signing) => signing.apply_keeping(&mut zones, previous, &kept, signed_at)?,
             None => SigningRun::default(),
         };
         verify_zones(&zones, &self.validator, &run, &self.proved)?;
@@ -2102,7 +2125,27 @@ async fn main() -> Result<()> {
     // Blocking, and deliberately left on this thread: startup has no listeners
     // bound yet and nothing to answer, so there is no worker to take out of
     // service. The reload path is the one that needs `spawn_blocking`.
-    let mut zones = load_zones_from_source(&source, replicating, cli.allow_partial_load)?;
+    //
+    // Nothing is being served, so nothing can be kept; what the pass is for is
+    // the digests, which is what lets the *first* SIGHUP skip a file nobody
+    // touched rather than the second (`TODO.md` #64f).
+    let files = LoadedFiles::default();
+    let nothing = ZoneMap::new();
+    let proved = ProvenSigning::default();
+    let signed_at = rdns::clock::current_unix_timestamp();
+    let mut zones = load_zones(
+        &source,
+        replicating,
+        cli.allow_partial_load,
+        Some(&Keepable {
+            files: &files,
+            served: &nothing,
+            signing: signing.as_deref(),
+            proved: &proved,
+            signed_at,
+        }),
+    )?
+    .zones;
 
     // Signing happens between loading and serving, and so does checking the
     // result: verifying what we just produced is what catches a canonicalization
@@ -2116,9 +2159,8 @@ async fn main() -> Result<()> {
     let mut validator = DnssecValidator::new(cli.require_signed || signing.is_some());
     validator.set_require_signed(cli.require_signed);
     let validator = Arc::new(validator);
-    // Empty, so this pass checks everything; what it proves is what the reload
-    // path may then skip.
-    let proved = ProvenSigning::default();
+    // `proved` was empty above, so this pass checks everything; what it proves is
+    // what the reload path may then skip.
     verify_zones(&zones, &validator, &run, &proved)?;
 
     // The dry run exits here, and *here* specifically: everything above is
@@ -2325,6 +2367,7 @@ async fn main() -> Result<()> {
                 signing,
                 validator,
                 proved,
+                files,
             },
             source,
             served: served.clone(),
@@ -2487,7 +2530,7 @@ mod tests {
     use super::*;
     use crate::replication::{expire_if_out_of_contact, refresh_once};
     use crate::testutil::{make_response, nm, query, zkey, ScratchDir};
-    use crate::zones::{enumerate_zone_files, plan_reload, zone_key};
+    use crate::zones::{plan_reload, zone_key};
     use rdns::record_types;
     use rdns::secondary::{zone_file_path, MasterSpec, RefreshTimers, TransferState};
     use rdns::tsig::{TsigAlgorithm, TsigKey};
@@ -3698,7 +3741,9 @@ mod tests {
     ) -> SocketAddr {
         std::fs::write(dir.join("example.com.zone"), UPDATE_ZONE).expect("write the zone file");
         let source = ZoneSource::Directory(dir.to_string_lossy().to_string());
-        let zones = load_zones_from_source(&source, false, false).expect("load");
+        let zones = load_zones(&source, false, false, None)
+            .map(|l| l.zones)
+            .expect("load");
 
         let server = Arc::new(Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
@@ -5352,7 +5397,8 @@ mod tests {
             );
             let source = ZoneSource::Directory(dir.path().to_string_lossy().to_string());
 
-            let err = load_zones_from_source(&source, false, false)
+            let err = load_zones(&source, false, false, None)
+                .map(|l| l.zones)
                 .expect_err("a broken zone file must not pass for a configuration choice")
                 .to_string();
             assert!(
@@ -5376,7 +5422,8 @@ mod tests {
             );
             let source = ZoneSource::Directory(dir.path().to_string_lossy().to_string());
 
-            let zones = load_zones_from_source(&source, false, true)
+            let zones = load_zones(&source, false, true, None)
+                .map(|l| l.zones)
                 .expect("the flag is an explicit choice to serve a partial set");
             assert_eq!(zones.len(), 1);
             assert!(zones.contains_key(zkey("example.com.").as_slice()));
@@ -5392,20 +5439,23 @@ mod tests {
         /// `Err("No .zone files found")` for one — and the commit that removed it
         /// claimed the opposite. Nothing caught it, because nothing tested a
         /// secondary starting from an empty directory. The emptiness check now
-        /// lives in `load_zones_from_source`, which is the only place that knows
+        /// lives in `load_zones`, which is the only place that knows
         /// whether the caller is a secondary.
         #[tokio::test]
         async fn a_secondary_may_start_with_an_empty_zone_directory() {
             let dir = dir_with("empty-secondary", &[]);
             let source = ZoneSource::Directory(dir.path().to_string_lossy().to_string());
 
-            let zones = load_zones_from_source(&source, true, false)
+            let zones = load_zones(&source, true, false, None)
+                .map(|l| l.zones)
                 .expect("a secondary starts before its first transfer");
             assert!(zones.is_empty());
 
             // A primary with an empty --zone-dir is a typo in the path, and
             // serving nothing is not what was asked for.
-            assert!(load_zones_from_source(&source, false, false).is_err());
+            assert!(load_zones(&source, false, false, None)
+                .map(|l| l.zones)
+                .is_err());
         }
 
         /// The zone a secondary replicates, with an EXPIRE of one hour so the
@@ -5558,7 +5608,9 @@ mod tests {
             let missing = ZoneSource::Directory("no-such-directory-anywhere".to_string());
             for allow_partial in [false, true] {
                 assert!(
-                    load_zones_from_source(&missing, true, allow_partial).is_err(),
+                    load_zones(&missing, true, allow_partial, None)
+                        .map(|l| l.zones)
+                        .is_err(),
                     "allow_partial={allow_partial}: an I/O error is not a parse failure"
                 );
             }
@@ -5603,6 +5655,7 @@ mod tests {
                 signing: None,
                 validator: Arc::new(DnssecValidator::new(false)),
                 proved: ProvenSigning::default(),
+                files: LoadedFiles::default(),
             };
             let source = ZoneSource::Directory(dir.path().to_string_lossy().to_string());
 
@@ -6200,8 +6253,14 @@ ns.plain  IN A   192.0.2.30
                 .expect("load keys")
                 .expect("configured");
 
-            let mut zones =
-                enumerate_zone_files(dir.path().to_str().unwrap(), false).expect("zones");
+            let mut zones = load_zones(
+                &ZoneSource::Directory(dir.path().to_string_lossy().to_string()),
+                false,
+                false,
+                None,
+            )
+            .map(|l| l.zones)
+            .expect("zones");
             let run = signing.apply(&mut zones, None).expect("sign");
 
             // Checked with the same validator the server runs before serving.
@@ -6357,6 +6416,7 @@ ns.plain  IN A   192.0.2.30
                 signing: Some(Arc::new(signing)),
                 validator: Arc::new(DnssecValidator::new(true)),
                 proved: ProvenSigning::default(),
+                files: LoadedFiles::default(),
             },
             source: ZoneSource::Directory(dir.path().to_string_lossy().to_string()),
             served: served(&zone_map, &deltas),
@@ -6422,5 +6482,82 @@ ns.plain  IN A   192.0.2.30
             0,
             "the re-signing timer reloads in order to refresh, so it may carry nothing",
         );
+    }
+
+    /// What a reload costs when no zone file moved (`TODO.md` #64f).
+    ///
+    /// `#[ignore]`d and refused in debug, like the update benchmarks it shares
+    /// `one_at_a_time` with: it builds signed zones of up to a million records.
+    ///
+    /// ```sh
+    /// cargo test -p rdnsd --release reload_cost -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn reload_cost_against_zone_size() {
+        use crate::dispatch::tests::{one_at_a_time, zone_text};
+        use rdns::dnssec::DNSKEY_FLAG_ZONE;
+        use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
+        use std::time::Instant;
+
+        let _turn = one_at_a_time();
+        if cfg!(debug_assertions) {
+            panic!(
+                "this would measure the debug build. Run:
+                   cargo test -p rdnsd --release reload_cost -- --ignored --nocapture"
+            );
+        }
+
+        const ZONE: &str = "example.com.";
+        let dir = rdns::testutil::ScratchDir::new("reload-cost");
+        let key_dir = dir.path().join("keys");
+        std::fs::create_dir_all(&key_dir).expect("the key directory");
+        let key = SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ZONE, DNSKEY_FLAG_ZONE)
+            .expect("a key");
+        key.write_to_dir(&key_dir).expect("the key file");
+        let zone_dir = dir.path().join("zones");
+        std::fs::create_dir_all(&zone_dir).expect("the zone directory");
+
+        let mut cli = <Cli as clap::Parser>::parse_from(["rdnsd"]);
+        cli.signing_key_dir = Some(key_dir);
+        let signing = Arc::new(
+            ZoneSigning::load(&cli, &BTreeMap::new())
+                .expect("the keys load")
+                .expect("a key directory means signing"),
+        );
+        let reloading = Reloading {
+            replicating: false,
+            allow_partial: false,
+            secondaries: Arc::new(Secondaries::default()),
+            zone_dir: None,
+            signing: Some(signing.clone()),
+            validator: Arc::new(DnssecValidator::new(true)),
+            proved: ProvenSigning::default(),
+            files: LoadedFiles::default(),
+        };
+        let source = ZoneSource::Directory(zone_dir.to_string_lossy().to_string());
+
+        println!("{:>9}  {:>12} {:>12}", "records", "first", "unchanged");
+        for records in [10_000usize, 100_000, 1_000_000] {
+            std::fs::write(zone_dir.join("example.com.zone"), zone_text(records))
+                .expect("the fixture");
+
+            // The first load is what startup does: nothing served to carry from.
+            let start = Instant::now();
+            let served = reloading
+                .load_blocking(&source, None)
+                .expect("the first load");
+            let first = start.elapsed();
+
+            // And this is a SIGHUP against a directory nobody touched.
+            let start = Instant::now();
+            let again = reloading
+                .load_blocking(&source, Some(&served))
+                .expect("the reload");
+            let unchanged = start.elapsed();
+            assert_eq!(again.len(), 1);
+
+            println!("{records:>9}  {:>10.1?} {:>10.1?}", first, unchanged);
+        }
     }
 }

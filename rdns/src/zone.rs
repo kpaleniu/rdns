@@ -41,7 +41,7 @@ mod checks;
 mod parse;
 mod rdata;
 
-pub use parse::{parse_zone_file, parse_zone_file_at};
+pub use parse::{parse_zone_file, parse_zone_file_at, parse_zone_text_at};
 
 /// The origin a zone file's name says it holds: `example.com.zone` is
 /// `example.com.`, and a name without the extension is taken whole.

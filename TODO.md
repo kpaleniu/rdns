@@ -116,8 +116,10 @@ split to the bottom**: six passes and not the four it named, and the largest,
 everything and holds the four ECDSA operations. What a remedy would have to
 address is now a number — 31% to build and free the carry-forward index, 24%
 to probe it and `Layout` once per RRset — and it is the two maps keyed by a
-name, not the chain and not the crypto. 64c, 64e and 64f are what is left, and
-none of them names a remedy yet.
+name, not the chain and not the crypto. **64f closed 2026-09-16** — a reload
+keeps the zone it is serving for a file nobody touched, 11.4 s to 39 ms at a
+million records, on the condition `ProvenSigning` already computes. 64c and 64e
+are what is left, and neither names a remedy yet.
 **#65 came out of asking 64e's question of the load path and closed the same
 day**, the shapes built and the recommended one declined. The reason for asking
 was refuted first — a full sign is 84% ECDSA, so a remedy in the structures is
@@ -2471,7 +2473,7 @@ transfers.
 
 ---
 
-### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14, 64a, 64b and 64d closed, 64f out of 64b**
+### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14, 64a, 64b, 64d and 64f closed; 64c and 64e open**
 
 Filed with the measurement that **refuted the reason it was going to be filed**.
 The finding on the way in was "the UPDATE path re-reads the zone file, so an
@@ -2851,8 +2853,10 @@ problem here to solve. 64c buys latency, not durability. Pricing it as
 durability work is how it would get over-built.
 
 - **64f. The reload path wants the same did-the-file-change test — filed
-  2026-09-15**, out of 64b, which is where it sat as 65c's option C (moved
-  there 2026-09-14). With #65a landed a reload signs each zone against the
+  2026-09-15, closed 2026-09-16.** **11 400 ms to 39 ms** for an unchanged
+  million-record signed zone, measured on the same harness either side
+  (`reload_cost_against_zone_size`). Out of 64b, which is where it sat as 65c's
+  option C (moved there 2026-09-14). With #65a landed a reload signs each zone against the
   version being served, which is 9.7 s at a million records instead of 27.6; a
   zone whose file did not move needs neither, and could keep the served
   `Arc<Zone>` untouched. That is worth 9.7 s per unchanged zone on every
@@ -2868,10 +2872,60 @@ durability work is how it would get over-built.
   the mechanism: the bytes are cheap to read and hash (1.8% of the parse at a
   million records), and the operator is entitled to have any edit seen.
 
-  What it would cost is not yet measured, and the measurement that decides the
-  shape is where the digest lives: a reload reads every zone file in the
-  directory, so the map is the reloader's rather than the updater's, and the
-  two want to agree or a reload will re-parse a file an update just wrote.
+  ~~What it would cost is not yet measured~~ — **taken first, and it is larger
+  than the row's estimate**: a reload of an unchanged directory is 11.4 s per
+  million-record signed zone, not the 9.7 s the row carried over from 65b,
+  which was the signing alone. `first` in the same table is 27.9 s, so an
+  unchanged reload was 41% of a cold one.
+
+  | records | first load | unchanged reload | after |
+  |---|---|---|---|
+  | 10 000 | 904 ms | 61.7 ms | **0.55 ms** |
+  | 100 000 | 2.7 s | 850 ms | **4.2 ms** |
+  | **1 000 000** | **29.1 s** | **11.4 s** | **39 ms** |
+
+  What is left at a million records is the directory scan, the read and the
+  digest. The update path is unmoved: 1 716 ms total against the 1 713-1 731
+  band #64a recorded.
+
+  **The two conditions, and neither is about the output.** The file's bytes are
+  what this process last parsed, *and* the signing this reload would do has the
+  same key roles as the signing whose output was verified. The second is
+  `ProvenSigning`'s existing comparison, which is not a coincidence and is the
+  thing that makes this small: **a reload that may skip the verification
+  because nothing about the signing moved is a reload that may skip the
+  signing.** A key crossing its Activate (#44f) or a `SyncPublish` window (#55)
+  changes the output with the file unchanged, and both already move
+  `KeyRoles`. The moment is passed from the loader to `apply` rather than read
+  twice, so a key crossing between the two reads cannot be a reload that
+  silently declines to act on it.
+
+  **An `$INCLUDE` is never kept**, and finding that is what the row was for: a
+  digest of a zone file says nothing about a file it includes, so an edit to
+  the included one would be exactly the silent revert the re-read exists to
+  prevent (`CLAUDE.md` §4). The test is textual, on bytes the loader has
+  already read — it cannot miss one, because an `$INCLUDE` the parser acts on is
+  in the text by definition, and a false positive inside a TXT record costs one
+  re-parse. **64b needs no such test and that was checked rather than assumed**:
+  its map holds only digests of text `apply_update_to_file` itself wrote, and
+  what it writes is one flattened zone.
+
+  ~~The measurement that decides the shape is where the digest lives: a reload
+  reads every zone file in the directory, so the map is the reloader's rather
+  than the updater's, and the two want to agree or a reload will re-parse a file
+  an update just wrote.~~ **The two maps are separate and it costs one
+  re-parse, once.** The reloader records the digest of every file it reads, so
+  an UPDATE that wrote a file makes the *next* reload parse that one zone and
+  the one after that keep it. Sharing the map would need the digest out from
+  under `UpdateHandling::applying` — the lock the doc comment argues holds it,
+  because that is the lock under which "this is what we wrote" is *made* true —
+  to buy one zone's parse on one reload. `digest_of` and the `$INCLUDE` rule
+  are shared; the maps are not.
+
+  Three regression tests, each shown failing against the behaviour it replaces
+  (§1): an unchanged file is kept and an edited one is not (`Arc::ptr_eq`, not
+  a clock), a zone with an `$INCLUDE` is never kept, and a key that activates
+  stops the zone being kept.
 
 **Not filed: a database, or a binary zone format.** #61's ablation settles it on
 this tree's own numbers — at 1M records, parsing text was ~25% of a load and

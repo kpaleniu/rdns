@@ -1,5 +1,5 @@
 //! The zone map and everything that puts a zone into it: where a zone comes
-//! from ([`ZoneSource`], [`load_zones_from_source`]), what has to be true before
+//! from ([`ZoneSource`], [`load_zones`]), what has to be true before
 //! it is served ([`ZoneSigning`], [`verify_zones`]), and how it is swapped into
 //! the map without the derived state falling out of step ([`Zones`], [`ZoneContext`],
 //! [`install_zone`]). The reload task is a caller of this, not a part of it.
@@ -55,6 +55,146 @@ pub(crate) type ZoneMap = HashMap<NameKeyBuf, Arc<Zone>>;
 /// on an `Err` that could not happen (`CLAUDE.md` §4).
 pub(crate) fn zone_key(zone: &Zone) -> NameKeyBuf {
     NameKeyBuf::new(zone.origin())
+}
+
+/// What this server last saw in a zone file, for telling a file that moved from
+/// one that did not.
+///
+/// Not a cryptographic digest: the question is whether the bytes changed, and
+/// anybody who can rewrite the zone file already owns the process.
+/// `DefaultHasher` is not stable across Rust releases, which does not matter —
+/// every comparison is against a value this same process computed, and a restart
+/// re-reads anyway.
+///
+/// One copy, used by the UPDATE path (`TODO.md` #64b) and the reload path
+/// (#64f), because two implementations of "did these bytes change" is how the
+/// two answers come to differ (`CLAUDE.md` §7).
+pub(crate) fn digest_of(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether `bytes` are a zone file whose content is entirely its own.
+///
+/// A digest of the file says nothing about a file it `$INCLUDE`s, so an edit to
+/// an included file would be invisible to [`Keepable`] — the exact failure the
+/// re-read exists to prevent (`CLAUDE.md` §4). A textual test rather than a
+/// report from the parser: it cannot miss one, because an `$INCLUDE` the parser
+/// acts on is by definition in the text, and a false positive inside a TXT
+/// record costs one re-parse.
+fn is_self_contained(bytes: &[u8]) -> bool {
+    !bytes.split(|b| *b == b'\n').any(|line| {
+        line.trim_ascii_start()
+            .to_ascii_uppercase()
+            .starts_with(b"$INCLUDE")
+    })
+}
+
+/// What each zone file held when this process last parsed it.
+///
+/// Shared between the startup load and every reload, so the first SIGHUP after
+/// a start already has something to compare against.
+#[derive(Clone, Default)]
+pub(crate) struct LoadedFiles(Arc<std::sync::Mutex<HashMap<PathBuf, (u64, NameKeyBuf)>>>);
+
+impl LoadedFiles {
+    /// The zone key this path last parsed to, if its bytes have not changed
+    /// since.
+    ///
+    /// A poisoned lock answers `None`, so the file is parsed: skipping work on
+    /// the strength of state that cannot be read is the wrong way for this to
+    /// fail (`CLAUDE.md` §6).
+    fn unchanged(&self, path: &Path, digest: u64) -> Option<NameKeyBuf> {
+        let seen = self.0.lock().ok()?;
+        let (last, key) = seen.get(path)?;
+        (*last == digest).then(|| key.clone())
+    }
+
+    fn note(&self, path: &Path, digest: u64, key: &NameKeyBuf) {
+        let Ok(mut seen) = self.0.lock() else {
+            return;
+        };
+        seen.insert(path.to_path_buf(), (digest, key.clone()));
+    }
+
+    /// Forget a file, so the next load parses it.
+    fn forget(&self, path: &Path) {
+        let Ok(mut seen) = self.0.lock() else {
+            return;
+        };
+        seen.remove(path);
+    }
+}
+
+/// Whether a reload may keep the zone it is already serving for a file, instead
+/// of parsing and signing it again — `TODO.md` #64f, measured at **11.4 s** per
+/// unchanged million-record signed zone.
+///
+/// Two conditions, and both are about *inputs* rather than about the output:
+/// the file's bytes are what this process last parsed, and the signing this
+/// reload would do has the same key roles as the signing whose output was
+/// verified. The second is the same comparison [`ProvenSigning`] already makes,
+/// which is not a coincidence — a reload that may skip the verification because
+/// nothing about the signing moved is a reload that may skip the signing.
+///
+/// `None` on the re-signing timer's reload, which carries nothing forward
+/// because refreshing is what it woke up to do
+/// ([`ZoneSigning::resign_interval`]).
+pub(crate) struct Keepable<'a> {
+    pub(crate) files: &'a LoadedFiles,
+    /// The version being served, or an empty map at startup — where nothing can
+    /// be kept and the point of passing one is to record the digests.
+    pub(crate) served: &'a ZoneMap,
+    pub(crate) signing: Option<&'a ZoneSigning>,
+    pub(crate) proved: &'a ProvenSigning,
+    /// The moment [`ZoneSigning::apply`] will use, passed rather than read
+    /// again: a key crossing its Activate between the two reads would be a
+    /// reload that silently declined to act on it.
+    pub(crate) signed_at: u64,
+}
+
+impl Keepable<'_> {
+    /// The served zone for this file, when it may be kept whole.
+    fn zone_for(&self, path: &Path, bytes: &[u8]) -> Option<(NameKeyBuf, Arc<Zone>)> {
+        if !is_self_contained(bytes) {
+            return None;
+        }
+        let key = self.files.unchanged(path, digest_of(bytes))?;
+        let zone = self.served.get(&key)?;
+        let origin = key.as_name().to_owned();
+        match self.signing.and_then(|s| s.keys_for(&origin)) {
+            // Nothing signs this zone, so the file is the whole of its input.
+            None => Some((key, zone.clone())),
+            // Something does, and its output was verified under the key roles
+            // this reload would sign with.
+            Some(keys) => {
+                let mut run = SigningRun::default();
+                run.record(origin.clone(), keys, self.signed_at);
+                self.proved
+                    .already_proved(&origin, &run)
+                    .then(|| (key, zone.clone()))
+            }
+        }
+    }
+
+    fn note(&self, path: &Path, bytes: &[u8], key: &NameKeyBuf) {
+        if is_self_contained(bytes) {
+            self.files.note(path, digest_of(bytes), key);
+        } else {
+            // An `$INCLUDE` makes the digest a claim about the wrong file.
+            self.files.forget(path);
+        }
+    }
+}
+
+/// A load, and which of its zones came out of the previous one untouched.
+pub(crate) struct Loaded {
+    pub(crate) zones: ZoneMap,
+    /// Kept whole by [`Keepable`], so [`ZoneSigning::apply`] has nothing to do
+    /// for them and [`verify_zones`] has nothing to check.
+    pub(crate) kept: std::collections::HashSet<NameKeyBuf>,
 }
 
 /// Zone source: either a single file or a directory of zone files
@@ -773,6 +913,13 @@ impl ZoneSigning {
         self.shortest_validity() / 86_400
     }
 
+    /// The keys that sign `origin`, or `None` for a zone this server does not
+    /// sign. The one place the keyring is asked, so a caller cannot key on the
+    /// origin in whatever case it had.
+    pub(crate) fn keys_for(&self, origin: &Name) -> Option<&[SigningKey]> {
+        self.keys.get(origin).map(|k| k.as_slice())
+    }
+
     /// Sign one zone against the version already being served, carrying forward
     /// every signature whose RRset did not move.
     ///
@@ -813,7 +960,23 @@ impl ZoneSigning {
         previous: Option<&ZoneMap>,
     ) -> Result<SigningRun> {
         // One moment for the whole run — see `policy_for`.
-        let signed_at = current_unix_timestamp();
+        self.apply_keeping(
+            zones,
+            previous,
+            &std::collections::HashSet::new(),
+            current_unix_timestamp(),
+        )
+    }
+
+    /// [`ZoneSigning::apply`], told which zones a reload kept whole and given
+    /// the moment [`Keepable`] asked its question at (`TODO.md` #64f).
+    pub(crate) fn apply_keeping(
+        &self,
+        zones: &mut ZoneMap,
+        previous: Option<&ZoneMap>,
+        kept: &std::collections::HashSet<NameKeyBuf>,
+        signed_at: u64,
+    ) -> Result<SigningRun> {
         let mut run = SigningRun::default();
         for (key, zone) in zones.iter_mut() {
             let origin = key.as_name();
@@ -821,6 +984,13 @@ impl ZoneSigning {
                 continue;
             };
             run.record(origin.to_owned(), keys, signed_at);
+            if kept.contains(key) {
+                // The file did not move and the key roles are the ones this
+                // zone's signatures were verified under, which is what
+                // `Keepable` checked before it declined to read the file. The
+                // record above is what lets `verify_zones` skip it too.
+                continue;
+            }
             let carried = previous.and_then(|served| served.get(key));
             let origin = origin.to_presentation();
             let policy = self.policy_for(&origin, signed_at);
@@ -1177,40 +1347,59 @@ pub(crate) fn signed_rrsets(zone: &Zone) -> Vec<(Name, Rtype)> {
 /// Blocking, and says so: `read_dir`, then a `read_to_string` and a full parse
 /// per zone. Callers running while the listeners are live put it on a blocking
 /// thread; see [`crate::Reloading::load`].
-pub(crate) fn load_zones_from_source(
+///
+/// `keep` is what a reload may take from the version being served instead of
+/// reading it — see [`Keepable`]. `None` for a caller with nothing served *and*
+/// nothing to remember, which is `--check-config` and the tests; startup passes
+/// one over an empty map, so the first SIGHUP has digests to compare against.
+pub(crate) fn load_zones(
     source: &ZoneSource,
     replicating: bool,
     allow_partial: bool,
-) -> Result<ZoneMap> {
+    keep: Option<&Keepable<'_>>,
+) -> Result<Loaded> {
     match source {
         ZoneSource::SingleFile(path) => {
             // Path-aware, so a `$INCLUDE` in the file resolves next to it rather
             // than against whatever directory the daemon happens to run in.
             let zone_origin = rdns::zone::origin_from_path(path);
-            let zone = parse_zone_file_at(Path::new(path), &zone_origin)?;
-            let mut map = ZoneMap::new();
-            map.insert(zone_key(&zone), std::sync::Arc::new(zone));
-            tracing::info!("loaded zone from {}", path);
-            Ok(map)
+            let mut loaded = Loaded {
+                zones: ZoneMap::new(),
+                kept: Default::default(),
+            };
+            let (key, zone, was_kept) = load_one(Path::new(path), &zone_origin, keep)?;
+            if was_kept {
+                loaded.kept.insert(key.clone());
+            } else {
+                tracing::info!("loaded zone from {}", path);
+            }
+            loaded.zones.insert(key, zone);
+            Ok(loaded)
         }
         ZoneSource::Directory(dir) => {
-            let zones = enumerate_zone_files(dir, allow_partial)?;
-            if zones.is_empty() && !replicating {
+            let loaded = enumerate_zone_files(dir, allow_partial, keep)?;
+            if loaded.zones.is_empty() && !replicating {
                 return Err(anyhow!("No .zone files found in directory: {dir}"));
             }
-            Ok(zones)
+            Ok(loaded)
         }
         ZoneSource::Files(files) => {
             // All-or-nothing, as on the directory path: one broken file out of
             // forty must not leave the server answering REFUSED for that zone,
             // which looks the same as a zone nobody configured. Every failure is
             // collected so a deploy is fixed in one pass.
-            let mut map = ZoneMap::new();
+            let mut loaded = Loaded {
+                zones: ZoneMap::new(),
+                kept: Default::default(),
+            };
             let mut failures = Vec::new();
             for (origin, path) in files {
-                match parse_zone_file_at(Path::new(path), origin) {
-                    Ok(zone) => {
-                        map.insert(zone_key(&zone), std::sync::Arc::new(zone));
+                match load_one(Path::new(path), origin, keep) {
+                    Ok((key, zone, was_kept)) => {
+                        if was_kept {
+                            loaded.kept.insert(key.clone());
+                        }
+                        loaded.zones.insert(key, zone);
                     }
                     Err(e) => failures.push(format!("  {origin} from {path}: {e}")),
                 }
@@ -1236,15 +1425,51 @@ pub(crate) fn load_zones_from_source(
                     files.len()
                 );
             }
-            tracing::info!("loaded {} zone(s) named in the config", map.len());
-            Ok(map)
+            tracing::info!(
+                "loaded {} zone(s) named in the config, {} unchanged",
+                loaded.zones.len(),
+                loaded.kept.len()
+            );
+            Ok(loaded)
         }
     }
 }
 
-/// Enumerate all .zone files in a directory and load them
-pub(crate) fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<ZoneMap> {
+/// One zone file: keep what is being served for it, or read and parse it.
+///
+/// The bytes are read once whether or not they are parsed — the digest is the
+/// question, and reading 24 MB is 1.8% of parsing it (`TODO.md` #64b).
+fn load_one(
+    path: &Path,
+    origin: &str,
+    keep: Option<&Keepable<'_>>,
+) -> Result<(NameKeyBuf, Arc<Zone>, bool), rdns::error::ZoneError> {
+    let Some(keep) = keep else {
+        let zone = parse_zone_file_at(path, origin)?;
+        return Ok((zone_key(&zone), Arc::new(zone), false));
+    };
+    let text = std::fs::read_to_string(path).map_err(|source| rdns::error::ZoneError::Io {
+        path: path.display().to_string(),
+        source,
+    })?;
+    if let Some((key, zone)) = keep.zone_for(path, text.as_bytes()) {
+        return Ok((key, zone, true));
+    }
+    let zone = rdns::zone::parse_zone_text_at(&text, origin, path)?;
+    let key = zone_key(&zone);
+    keep.note(path, text.as_bytes(), &key);
+    Ok((key, Arc::new(zone), false))
+}
+
+/// Enumerate all .zone files in a directory and load them, keeping what a
+/// reload need not read again.
+fn enumerate_zone_files(
+    dir: &str,
+    allow_partial: bool,
+    keep: Option<&Keepable<'_>>,
+) -> Result<Loaded> {
     let mut zones = ZoneMap::new();
+    let mut kept = std::collections::HashSet::new();
     let mut failures: Vec<String> = Vec::new();
     let entries = std::fs::read_dir(dir)?;
 
@@ -1253,12 +1478,16 @@ pub(crate) fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<Zon
         let path = entry.path();
 
         if path.extension().and_then(|s| s.to_str()) == Some("zone") {
-            let path_str = path.to_string_lossy();
+            let path_str = path.to_string_lossy().into_owned();
             let zone_origin = rdns::zone::origin_from_path(&path_str);
-            match parse_zone_file_at(&path, &zone_origin) {
-                Ok(zone) => {
-                    tracing::info!("loaded zone from {}", path_str);
-                    zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
+            match load_one(&path, &zone_origin, keep) {
+                Ok((key, zone, was_kept)) => {
+                    if was_kept {
+                        kept.insert(key.clone());
+                    } else {
+                        tracing::info!("loaded zone from {}", path_str);
+                    }
+                    zones.insert(key, zone);
                 }
                 Err(e) => failures.push(format!("{path_str}: {e}")),
             }
@@ -1293,8 +1522,13 @@ pub(crate) fn enumerate_zone_files(dir: &str, allow_partial: bool) -> Result<Zon
         );
     }
 
-    tracing::info!("loaded {} zones from directory {}", zones.len(), dir);
-    Ok(zones)
+    tracing::info!(
+        "loaded {} zones from directory {}, {} unchanged",
+        zones.len(),
+        dir,
+        kept.len()
+    );
+    Ok(Loaded { zones, kept })
 }
 
 #[cfg(test)]
@@ -1884,5 +2118,182 @@ www IN A 192.0.2.2
             })
             .min()
             .expect("three runs")
+    }
+
+    /// A [`Keepable`] for a server that signs nothing — the common shape in
+    /// these tests, and a closure cannot spell its lifetimes.
+    fn unsigned_keepable<'a>(
+        files: &'a LoadedFiles,
+        served: &'a ZoneMap,
+        proved: &'a ProvenSigning,
+    ) -> Keepable<'a> {
+        Keepable {
+            files,
+            served,
+            signing: None,
+            proved,
+            signed_at: 1_700_000_000,
+        }
+    }
+
+    /// A directory with one zone file in it, and the source that names it.
+    fn zone_dir(dir: &ScratchDir, text: &str) -> (ZoneSource, std::path::PathBuf) {
+        let path = dir.path().join("example.com.zone");
+        std::fs::write(&path, text).expect("the fixture");
+        (
+            ZoneSource::Directory(dir.path().to_string_lossy().to_string()),
+            path,
+        )
+    }
+
+    const ZONE_TEXT: &str = "$TTL 3600
+@ IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )
+@ IN NS ns1.example.com.
+ns1 IN A 192.0.2.1
+";
+
+    /// A reload keeps the zone it is serving when the file did not move, and
+    /// reads it again when it did — `TODO.md` #64f, 11.4 s against 39 ms per
+    /// unchanged million-record signed zone.
+    ///
+    /// Pointer identity rather than a clock (`CLAUDE.md` §10): "this is the
+    /// same allocation" is exactly the claim, and a timing of it is a coin
+    /// toss.
+    #[test]
+    fn an_unchanged_zone_file_is_not_read_again_and_an_edited_one_is() {
+        let dir = ScratchDir::new("keep-unchanged");
+        let (source, path) = zone_dir(&dir, ZONE_TEXT);
+        let files = LoadedFiles::default();
+        let proved = ProvenSigning::default();
+        let nothing = ZoneMap::new();
+        let keep = |served| unsigned_keepable(&files, served, &proved);
+
+        let first = load_zones(&source, false, false, Some(&keep(&nothing))).expect("loads");
+        assert!(first.kept.is_empty(), "nothing was being served");
+
+        let again = load_zones(&source, false, false, Some(&keep(&first.zones))).expect("loads");
+        assert_eq!(again.kept.len(), 1, "the file did not move");
+        let key = zone_key(&rdns::zone::parse_zone_file(ZONE_TEXT, "example.com.").unwrap());
+        assert!(
+            Arc::ptr_eq(&first.zones[&key], &again.zones[&key]),
+            "the served zone is the one being served, not a copy of it"
+        );
+
+        std::fs::write(
+            &path,
+            format!(
+                "{ZONE_TEXT}www IN A 192.0.2.9
+"
+            ),
+        )
+        .expect("the edit");
+        let edited = load_zones(&source, false, false, Some(&keep(&again.zones))).expect("loads");
+        assert!(edited.kept.is_empty(), "the file moved");
+        assert!(!Arc::ptr_eq(&again.zones[&key], &edited.zones[&key]));
+    }
+
+    /// A digest of a zone file says nothing about a file it `$INCLUDE`s, so a
+    /// zone with one is read every time.
+    ///
+    /// The failure this prevents is the one the re-read exists for: an
+    /// operator's edit silently not taken (`CLAUDE.md` §4).
+    #[test]
+    fn a_zone_that_includes_another_file_is_always_read_again() {
+        let dir = ScratchDir::new("keep-include");
+        std::fs::write(
+            dir.path().join("extra.db"),
+            "www IN A 192.0.2.2
+",
+        )
+        .expect("the include");
+        let (source, _) = zone_dir(
+            &dir,
+            &format!(
+                "{ZONE_TEXT}$INCLUDE extra.db
+"
+            ),
+        );
+        let files = LoadedFiles::default();
+        let proved = ProvenSigning::default();
+        let nothing = ZoneMap::new();
+        let keep = |served| unsigned_keepable(&files, served, &proved);
+
+        let first = load_zones(&source, false, false, Some(&keep(&nothing))).expect("loads");
+        assert_eq!(first.zones.len(), 1);
+        let key = first.zones.keys().next().expect("one zone").clone();
+        assert_eq!(
+            first.zones[&key]
+                .query(nm("www.example.com.").as_ref(), Qtype::of(record_types::A))
+                .len(),
+            1,
+            "the include was read"
+        );
+        let again = load_zones(&source, false, false, Some(&keep(&first.zones))).expect("loads");
+        assert!(
+            again.kept.is_empty(),
+            "the parent file's digest cannot speak for the included one"
+        );
+    }
+
+    /// A key crossing its Activate changes the output with the file unchanged,
+    /// so it also has to stop the file being skipped (`TODO.md` #44f, #55).
+    ///
+    /// The condition is `ProvenSigning`'s, which is not a coincidence: a reload
+    /// that may skip verifying because nothing about the signing moved is a
+    /// reload that may skip signing.
+    #[test]
+    fn a_key_that_activates_stops_the_zone_being_kept() {
+        // The real clock, because `verify_zones` checks the signatures against
+        // it and a fixed moment in the past is an expired zone.
+        let now = current_unix_timestamp();
+        let later = now + 86_400;
+        let waiting = new_key()
+            .with_timing(KeyTiming {
+                activate: Some(later),
+                ..KeyTiming::default()
+            })
+            .expect("legal timing");
+        // Two, because the zone has to be signable at both moments: the second
+        // key is what makes the *set* of signers differ between them.
+        let signing = signing_with(vec![new_key(), waiting]);
+        let validator = DnssecValidator::new(true);
+        let proved = ProvenSigning::default();
+
+        // Sign and verify as the startup pass does, at a moment the key does
+        // not yet sign at.
+        let mut zones = unsigned_zone();
+        let run = signing
+            .apply_keeping(&mut zones, None, &Default::default(), now)
+            .expect("signs");
+        verify_zones(&zones, &validator, &run, &proved).expect("verifies");
+
+        let dir = ScratchDir::new("keep-activate");
+        let (source, _) = zone_dir(&dir, ZONE_TEXT);
+        let files = LoadedFiles::default();
+        let at = |signed_at| Keepable {
+            files: &files,
+            served: &zones,
+            signing: Some(&signing),
+            proved: &proved,
+            signed_at,
+        };
+        // The load that records the digest, and would keep it at the same
+        // moment the startup pass proved it for.
+        load_zones(&source, false, false, Some(&at(now))).expect("loads");
+        assert_eq!(
+            load_zones(&source, false, false, Some(&at(now)))
+                .expect("loads")
+                .kept
+                .len(),
+            1,
+            "nothing about the signing moved"
+        );
+        assert!(
+            load_zones(&source, false, false, Some(&at(later)))
+                .expect("loads")
+                .kept
+                .is_empty(),
+            "the key signs at this moment and did not at the last one"
+        );
     }
 }

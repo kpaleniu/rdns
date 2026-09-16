@@ -259,7 +259,16 @@ pub fn parse_zone_file_at(path: &Path, origin: &str) -> Result<Zone, ZoneError> 
         path: path.display().to_string(),
         source,
     })?;
-    parse_zone_file_with_base(&content, origin, path.parent())
+    parse_zone_text_at(&content, origin, path)
+}
+
+/// [`parse_zone_file_at`] for a caller that has already read the file.
+///
+/// `path` is where the content came from, for `$INCLUDE` alone. A loader that
+/// digests the bytes to decide whether to parse them at all would otherwise read
+/// the file twice (`TODO.md` #64f).
+pub fn parse_zone_text_at(content: &str, origin: &str, path: &Path) -> Result<Zone, ZoneError> {
+    parse_zone_file_with_base(content, origin, path.parent())
 }
 
 fn parse_zone_file_with_base(
