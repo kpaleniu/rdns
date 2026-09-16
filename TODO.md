@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#59**, **#64g**, **#68**, **#70**, **#71** and **#21**, as of
+**#58**, **#59**, **#68**, **#70**, **#71** and **#21**, as of
 2026-09-16. **#57 is closed**: 57e was the last of it, and the measurement that
 could have refuted it did — IXFR as this tree had it was *slower* than a whole
 transfer, because applying forty records to a million-record zone cost 1 018 ms
@@ -46,7 +46,9 @@ smaller and older: the refresh had no SOA probe at all, so an unchanged feed
 cost a transfer and a reload every REFRESH. **#71** is what is left after both,
 and it is neither the wire nor the format. **#64 is closed** — 64c, 64e and 64f
 all went the same day, and 64c is the one whose remedy was declined on its own
-re-measurement; **64g** is what 64e left. **#68 stays open and both of its
+re-measurement; **64g closed with it**, and its own filing was the thing it
+refuted — the "core type's shape and its call sites" it was not taken for is a
+default type parameter and zero call sites. **#68 stays open and both of its
 guesses are gone**: the
 accept-before-connect race it named cannot happen (the listener is bound before
 the loop is spawned), the test it names has no wall-clock assertion, and
@@ -126,7 +128,7 @@ everything and holds the four ECDSA operations. What a remedy would have to
 address is now a number — 31% to build and free the carry-forward index, 24%
 to probe it and `Layout` once per RRset — and it is the two maps keyed by a
 name, not the chain and not the crypto. **64c, 64e and 64f all closed
-2026-09-16**, which closes #64 and leaves **64g**. 64f: a reload keeps the zone
+2026-09-16**, and **64g the same day**, which closes #64 entire. 64f: a reload keeps the zone
 it is serving for a file nobody touched, 11.4 s to 39 ms at a million records,
 on the condition `ProvenSigning` already computes. 64e: the two structures it
 named and nothing else, three shapes built and measured, −14% on an incremental
@@ -1001,7 +1003,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#59**, **#64g**, **#68**, **#70** and **#71**, plus **#21** — see
+**#58**, **#59**, **#68**, **#70** and **#71**, plus **#21** — see
 "What is open" above, which is the same list and the only place it is written
 down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -2552,7 +2554,7 @@ transfers.
 
 ---
 
-### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14, closed 2026-09-16; 64g open, out of 64e**
+### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14, closed 2026-09-16, 64g with it**
 
 Filed with the measurement that **refuted the reason it was going to be filed**.
 The finding on the way in was "the UPDATE path re-reads the zone file, so an
@@ -2988,7 +2990,8 @@ it is one every twelve** (64d).
   `sign an eight-record zone` fell from 922 allocations to 593 — below the
   assertion's floor, which moved to 400 with the reason beside it (§17 asks for
   one in either direction).
-- **64g. `rrsets_of` clones the whole zone to sign it — filed 2026-09-16**, out
+- **64g. `rrsets_of` clones the whole zone to sign it — filed and closed
+  2026-09-16**, out
   of 64e, which left it as the one named pass it did not take. `build-rrsets`
   is **930 ms of 7 940 at a million records, 12%**: one `RecordData::clone` per
   record, into a map `signatures_for` consumes and drops. It could borrow from
@@ -3001,6 +3004,51 @@ it is one every twelve** (64d).
   `Vec<&RecordData>` does not fit it, so this is a change to a core type's
   shape and its call sites, not to a loop. Whoever takes it should count those
   first (§18).
+
+  **Taken and closed 2026-09-16, and the obstacle it was filed with was not
+  there.** The count §18 asks for went first: `Rrset::new` has **43 call
+  sites** and `Rrset<'_>` appears in **three signatures** — `verify_rrset`,
+  `SigningKey::sign_rrset` and a test helper — so "a change to a core type's
+  shape and its call sites" is one default type parameter and **zero call
+  sites**. `Rrset<'a, R = RecordData>` with `R: Borrow<RecordData>` on the
+  three consumers compiled the other 40 unchanged; `signed_data` took the same
+  bound.
+
+  **What it bought, three runs each side at a million records** (Windows,
+  release, `incremental_sign_cost_by_pass`):
+
+  | column | before | after |
+  |---|---|---|
+  | build-rrsets | 891-944 | **689-718** |
+  | sign-rrsets | 2 010-2 054 | 2 096-2 169 |
+  | file-sigs | 421-427 | 461-486 |
+  | **total** | **7 958-8 056** | **7 939-8 012** |
+
+  **The named pass fell 25% and the total did not move.** The two passes that
+  rose were not touched and their ranges do not overlap the old ones, so this
+  is not noise: the clone was *buying locality*. It laid the RDATA out in the
+  order the signing loop reads it, and a borrow leaves that loop chasing a
+  pointer per record into a record vector held in insertion order. 64e saw the
+  weaker version of this — "removing two million live allocations before those
+  passes run changes the heap they run against" — and here it is the whole
+  effect rather than 90 ms of it.
+
+  **Kept, on the one measurement that does not depend on what else the machine
+  is doing** (§10): `sign an eight-record zone` reads **593 -> 566**
+  allocations, two per record gone, and at a million records that is two
+  million allocations and two million frees off a pass that runs on a worker
+  which is also answering queries (§9). It is landed as a wash on the clock and
+  said so in `rrsets_of`'s doc comment, not as a speed-up.
+
+  **What this also settles without building it**: the narrower shape — keep the
+  map owning, but clone only the RRsets that are actually re-signed — removes
+  the same clones on the incremental path and none on a full sign, so it cannot
+  move a total that the wider change left where it was.
+
+  **The 12% is therefore still on the table and it is not this function's.**
+  What would move it is the same thing #71a names: `Zone` holding its records
+  in an order signing can walk, rather than every pass paying to reorder what
+  it reads.
 
   **Half of that is this row's and half is not, and #65 is the half that is
   not.** `PreviousSignatures` is built by `sign_zone_incrementally` alone,
@@ -3737,11 +3785,13 @@ it is in the table so that 71a's number is not read as the whole cost.
   each, because the index holds *positions* into the record vector — which is
   why removal has no API, and `ixfr.rs` says so. **No remedy claimed**: it is a
   core type's shape and its call sites, not a loop. Whoever takes it takes it
-  with **#64g** and **#65**'s unowned half, which are the same obstacle reached
-  from the UPDATE and signing sides — 64g's `rrsets_of` clones the zone because
-  `Rrset::new` borrows a `&[RecordData]`, and #65's five shared passes are 4.4 s
-  at a million records. Three rows naming one type is how all three get
-  half-done (§18); the numbers to beat are 801 ms here and 4.4 s there.
+  with **#65**'s unowned half, and with what **#64g** measured on its way out:
+  removing `rrsets_of`'s clone took that pass down 25% and the total nowhere,
+  because the clone was laying the RDATA out in the order the signing loop
+  reads it. #65's five shared passes are 4.4 s at a million records. Two rows
+  naming one type is how both get half-done (§18); the numbers to beat are
+  801 ms here and 4.4 s there, and 64g's result says what a remedy has to keep:
+  the order the reader walks in.
 - **71b. One feed changing re-reads every feed.** `PolicyStore::reload` is
   `PolicyZones::load(&self.feeds)`: all-or-nothing over the whole set, which is
   right for what it was written for — a half-written file must not lift a block
@@ -3898,7 +3948,7 @@ the week; the record is under "How the queue kept going stale" in
 | **44** | what an operator would find missing in `rdnsd` | **filed 2026-09-11, closed in full 2026-09-12**, seven rows: catalog zones, EDE, the scale measurement, XoT, multi-signer, rollover and dnstap. Five numbers filed on the way out — #47, #48, #49, #50, #51, #54, #55 — and **0 packages** added by the lot, dnstap's two wire formats included. Every row's closing note says the same thing in its own words: the filing was right about what was missing and wrong about where the work was. 44a missed that provisioning is a diff; 44b's "small" cost a type at 24 sites; 44d's "cheap after 42a" described the half already done; 44e's premise was refuted by one test; 44f's ZSK half needed four numbers in a file and no state machine. Only 44c came out the size it was filed as, and it is the one that found a live defect (**#50**). The preamble's "none of these is a defect" did not survive either: #50 came out of 44c, and #47 — filed by 44b as not a defect — closed carrying two MUSTs |
 | **65** | every load re-signed every zone from scratch | **filed and closed 2026-09-14**, out of 64e. `ZoneSigning::apply` signed unconditionally, so a SIGHUP, an `rdnsctl reload` or a catalog change cost a full sign of every signed zone — 27.6 s at a million records — and moved the RDATA of every RRSIG, which is the whole zone in the next IXFR delta. **The four shapes were built and the recommended one was declined** (§19, #40a's precedent again). What landed is A, keyed on the trigger: the re-signing timer reloads *in order to* refresh, so it is the one reload that may carry nothing forward, and the other two carry everything whose RRset did not move — 9.7 s against 27.6, still 53.6% saved when a tenth of the zone changes (65b). **B is declined on a measurement**: the expiry spread is a fifth of the validity and the re-signing interval a third, so every signature crosses any refresh threshold in the same tick — 0 or all 126 of a fixture's RRSIGs, never between — and the only threshold that saves work hands the refreshing run a signature with four tenths of an interval left, against the 1.4 §8 asks for. The patch was reverted and the finding kept as a tripwire on the two constants. C moved to **#64b** and then, when 64b closed without reaching the reload path, to **#64f**. The prerequisite the row called plumbing was one four-line method: `Zones::snapshot_all` |
 | **63** | `rdnsr` had 39 flags and no config file | **filed 2026-09-14, closed 2026-09-15**, ten rows, filed out of 57d because a prerequisite named in prose is one nobody schedules (§18). 63a answered the split question with the compiler rather than a line count — 18 escaping items of 84 `pub`s, and 63g then measured that `rdnsr` would name **0** of them — so the module stayed in `rdnsd` and what is shared is one macro. 63h built all three shapes and kept the two declined ones as branches: the shared struct is out because `#[serde(flatten)]` makes serde buffer the table, costing every `[server]` typo its line number and its expected-key list in `rdnsd`'s existing file too. On the way, 63e found 16 defaults written twice with nothing comparing them, 63f the same bare-`pub` sweep for the `cfg(unix)` file Windows cannot compile, and 63i the one flag of 35 not refused beside `--config`. **63j is what the file existed for**: `[[rpz.feeds]]`, a policy per feed, which costs the match path nothing because `PolicyZone` has carried one since 45a. `rdnsr --check-config` closed with it |
-| **64** | one dynamic UPDATE was five O(zone) passes | **filed 2026-09-14, closed 2026-09-16**, seven rows, and it was filed with the measurement that refuted the fix it was going to propose (§19). 64a: a whole-zone clone nobody read, three instances not one, fixed in the type. 64b: read the file's bytes every time, parse them only when they are not the bytes this server last wrote — 38% off an unsigned update, and its headline number *did not reproduce* because one `--ignored` filter selected two million-record benchmarks and libtest ran them at once. 64d: signing is 88% of a signed update, and the measurement that could have refuted it — `carried` — refuted the *explanation* instead: exactly four RRSIGs are made fresh at any zone size. 64e: the two structures the split named, three shapes built, −14%. 64f: a reload keeps the zone it is serving for a file nobody touched, 11.4 s to 39 ms, on the condition `ProvenSigning` already computes. **64c is the one declined**: its 42% was more than half serializer — RFC 3597's hex form built for every record and thrown away — and `to_string` fell 636 ms to 250 with the file still the authority, which leaves the checkpoint design buying 387 ms of a 1 335 ms update and 4% of a signed one. 64g is what 64e did not take |
+| **64** | one dynamic UPDATE was five O(zone) passes | **filed 2026-09-14, closed 2026-09-16**, seven rows, and it was filed with the measurement that refuted the fix it was going to propose (§19). 64a: a whole-zone clone nobody read, three instances not one, fixed in the type. 64b: read the file's bytes every time, parse them only when they are not the bytes this server last wrote — 38% off an unsigned update, and its headline number *did not reproduce* because one `--ignored` filter selected two million-record benchmarks and libtest ran them at once. 64d: signing is 88% of a signed update, and the measurement that could have refuted it — `carried` — refuted the *explanation* instead: exactly four RRSIGs are made fresh at any zone size. 64e: the two structures the split named, three shapes built, −14%. 64f: a reload keeps the zone it is serving for a file nobody touched, 11.4 s to 39 ms, on the condition `ProvenSigning` already computes. **64c is the one declined**: its 42% was more than half serializer — RFC 3597's hex form built for every record and thrown away — and `to_string` fell 636 ms to 250 with the file still the authority, which leaves the checkpoint design buying 387 ms of a 1 335 ms update and 4% of a signed one. 64g, the one 64e did not take, closed the same day #64 did: the type change it was filed as too big for is a default type parameter and **zero** of `Rrset::new`'s 43 call sites, it takes the named pass down 25% — and the total does not move, because the clone it removes was buying the signing loop its locality. Landed on the allocation count (593 -> 566 on an eight-record zone) and said so |
 | **57** | a policy zone arrived as a file somebody else wrote, not as a transfer | **filed 2026-09-13, closed 2026-09-16**, five rows, left behind by 45a — and the delivery half needed no code in `rdnsd` at all: `announce_transfer` had notified every `--also-notify` peer after every transfer since it was written, and what was missing was `rdnsr`'s ear (57c). 57a's reload found a resolver with `--rpz` and no DoT that had no reload task at all; 57b measured the reload *on* a worker and a one-core resolver answering nothing for 2.7 s. 57d built both shapes and was decided by neither's install cost: A keeps the file, so a restart begins with yesterday's rules. 57e is the one whose own measurement refuted it — IXFR was **slower than AXFR** here, 1 485 ms against 1 372 at a million rules, because applying forty records built a key per record of the base; and the bigger miss was that a refresh had no SOA probe at all, so an unchanged feed cost a transfer and a reload every REFRESH. Both daemons share `xfr::refresh_zone` now (§7). **#71** is what is left, and it is neither the wire nor the format |
 | **69** | four accept loops ended on any error, where the UDP side had a helper | **filed and closed 2026-09-16**, out of #68. Filed with no remedy on purpose (§18), and both missing measurements were taken the same day — which reversed the reason. **The remote provocation does not exist**: four `SO_LINGER 0` resets before the accept come back as `Ok` on Windows and on Linux, so §4's *remote* kill switch does not apply. **Descriptor exhaustion does, and needs nobody**: at `ulimit -n`, `accept` returns `EMFILE`, `Uncategorized`/raw 24, invisible to every portable kind — and both daemons' `JoinSet` ends the process when its first task ends, so `accepted?` turned a self-clearing condition into a whole-server outage across every transport. Windows could not be made to reach it (100 000 handles, no failure). Provoked before and after against a real `tcp::serve`: the old code's next write is a reset, the new one answers. One shared `survive_accept_error` at all four sites — retry the aborted kinds, log and back off 100 ms on exhaustion, still fatal otherwise |
 

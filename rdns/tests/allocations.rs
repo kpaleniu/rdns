@@ -845,10 +845,13 @@ fn one_zone_load_and_sign() {
     // the public key, and there are two keys. NSEC3 is off in this policy, so
     // `nsec3param_rdata` does not run.
     //
-    // Floor moved 600 -> 400 by `TODO.md` #64e, which reads 593: `signatures_for`
+    // Floor moved 600 -> 400 by `TODO.md` #64e, which read 593: `signatures_for`
     // derived a `canonical_sort_key` the map it is iterating is already keyed by
-    // and cloned the `NameEntry` to read two bools, once per RRset. Downward,
-    // and §17 asks for a reason either way.
+    // and cloned the `NameEntry` to read two bools, once per RRset. 566 since
+    // #64g, which stopped `rrsets_of` cloning the RDATA of every record into
+    // the map — two per record, and the one measurement of that change that
+    // does not depend on what else the machine is doing. Downward, and §17 asks
+    // for a reason either way.
     within("sign an eight-record zone", sign_count, 400..=1_400);
 }
 

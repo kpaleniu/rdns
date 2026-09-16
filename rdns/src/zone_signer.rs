@@ -520,7 +520,7 @@ impl<'a> PreviousSignatures<'a> {
         name: NameRef<'_>,
         rtype: Rtype,
         ttl: Ttl,
-        rdatas: &[RecordData],
+        rdatas: &[&RecordData],
         key_tags: &[u16],
         signed_at: u64,
     ) -> Option<&[CarriedSignature<'a>]> {
@@ -544,7 +544,7 @@ impl<'a> PreviousSignatures<'a> {
         if *was_ttl != ttl || was.len() != rdatas.len() {
             return None;
         }
-        if !was.iter().all(|r| rdatas.contains(r)) || !rdatas.iter().all(|r| was.contains(&r)) {
+        if !was.iter().all(|r| rdatas.contains(r)) || !rdatas.iter().all(|r| was.contains(r)) {
             return None;
         }
 
@@ -1210,24 +1210,38 @@ fn nsec3param_rdata(salt: &[u8], iterations: u16) -> RecordData {
 /// One signing run's RRsets: keyed in canonical order (RFC 4034 §6.1), so the
 /// signatures come out in a deterministic order, with the owner carried in the
 /// value because a `Name` has no `Ord`.
-type Rrsets = BTreeMap<(CanonicalKey, Rtype), (Name, Ttl, Vec<RecordData>)>;
+type Rrsets<'a> = BTreeMap<(CanonicalKey, Rtype), (&'a Name, Ttl, Vec<&'a RecordData>)>;
 
 /// The RRsets of `signed`, in RFC 4034 §6.1 order.
 ///
-/// Its own function because it is an O(zone) pass with an allocation per
-/// record and it was inside the one that looked like the signing step
-/// (`TODO.md` #64e). A `BTreeMap` rather than a sort at the end: the key is
-/// already [`canonical_sort_key`], and the chain built above it is in that
-/// order too.
-fn rrsets_of(signed: &Zone) -> Rrsets {
+/// Its own function because it is an O(zone) pass and it was inside the one
+/// that looked like the signing step (`TODO.md` #64e). A `BTreeMap` rather
+/// than a sort at the end: the key is already [`canonical_sort_key`], and the
+/// chain built above it is in that order too.
+///
+/// **The map borrows from `signed`, and that bought less than it should have**
+/// (`TODO.md` #64g). Owning it cost a `Name` and a `RecordData` clone per
+/// record; removing them took this pass from 891-944 ms to 689-718 at a
+/// million records and 27 allocations off signing an eight-record zone — and
+/// the total did not move, because `sign-rrsets` rose 5% and `file-sigs` 11%.
+/// The clone was buying locality: it laid the RDATA out in the order the
+/// signing loop reads it, where a borrow leaves that loop chasing a pointer
+/// into the zone's record vector per record. Kept because the allocations are
+/// real and the wall clock is a wash, not because it is faster.
+fn rrsets_of(signed: &Zone) -> Rrsets<'_> {
     // (owner, type) -> the RDATA of that RRset, in the order they were added.
-    let mut rrsets: Rrsets = BTreeMap::new();
+    // Borrowed from `signed`, which outlives every use of the map: owning it
+    // was a `Name` and a `RecordData` clone per record, 944 ms of an 8 s
+    // incremental sign at a million records and two million allocations to
+    // free afterwards (`TODO.md` #64g). `Rrset` is generic over what holds the
+    // RDATA for this.
+    let mut rrsets: Rrsets<'_> = BTreeMap::new();
     for record in signed.records() {
         let key = canonical_sort_key(record.name.as_ref());
         let entry = rrsets
             .entry((key, record.rdata.rtype()))
-            .or_insert_with(|| (record.name.clone(), record.ttl, Vec::new()));
-        entry.2.push(record.rdata.clone());
+            .or_insert_with(|| (&record.name, record.ttl, Vec::new()));
+        entry.2.push(&record.rdata);
     }
     rrsets
 }
@@ -1238,7 +1252,7 @@ fn rrsets_of(signed: &Zone) -> Rrsets {
 /// Takes `rrsets` by value: the RDATA in it is what gets signed, and a caller
 /// has no use for the map afterwards.
 fn signatures_for(
-    rrsets: Rrsets,
+    rrsets: Rrsets<'_>,
     layout: &Layout,
     policy: &SigningPolicy,
     previous: Option<&PreviousSignatures>,
@@ -3447,6 +3461,13 @@ a\.b    IN A   192.0.2.50
     /// fold, a chain key and an RDATA clone. And splitting `sign_everything`
     /// into the three functions this times is free: three runs each side read
     /// 9 392 ms against 9 364 ms, which overlap.
+    ///
+    /// **`build-rrsets` borrows since #64g** — 891-944 ms here, 689-718 after
+    /// — and the total did not move: `sign-rrsets` and `file-sigs` took it
+    /// back, 5% and 11%, neither of them touched. Recorded rather than
+    /// explained away (`CLAUDE.md` §10), with the reading it suggests in
+    /// `rrsets_of`: the clone was laying the RDATA out in the order the
+    /// signing loop reads it.
     ///
     /// A test inside this module rather than beside `scale.rs`, because every
     /// pass but the whole is private; the parts run in `sign_zone_inner`'s

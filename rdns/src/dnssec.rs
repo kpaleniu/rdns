@@ -11,6 +11,8 @@
 //! original TTL rather than the received one, embedded names down-cased for the
 //! RFC 4034 §6.2 types, RRs sorted by canonical RDATA, duplicates dropped.
 
+use std::borrow::Borrow;
+
 use crate::ede::InfoCode;
 use crate::error::WireError;
 use crate::error::{DnssecError, DnssecResult};
@@ -402,11 +404,11 @@ fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
 /// RRSIG's *original* TTL, not the received one; the owner is down-cased and,
 /// for a wildcard-expanded answer, replaced by the wildcard really signed; and
 /// the records are sorted by canonical RDATA with duplicates removed.
-pub fn signed_data(
+pub fn signed_data<R: Borrow<RecordData>>(
     rrsig: &Rrsig,
     owner: NameRef<'_>,
     class: Class,
-    rdatas: &[RecordData],
+    rdatas: &[R],
 ) -> DnssecResult<Vec<u8>> {
     if rdatas.is_empty() {
         return Err(DnssecError::signing(
@@ -436,7 +438,7 @@ pub fn signed_data(
     // RDATA, so sorting encoded RRs orders by length first.
     let mut canonical: Vec<Vec<u8>> = rdatas
         .iter()
-        .map(canonical_rdata)
+        .map(|rdata| canonical_rdata(rdata.borrow()))
         .collect::<Result<_, _>>()?;
     canonical.sort_unstable();
     canonical.dedup();
@@ -686,16 +688,32 @@ impl std::fmt::Display for Bogus {
 /// A signature covers an RRset as a unit, never an individual record, so this
 /// is the granularity everything in DNSSEC works at — including the attacks,
 /// which are mostly about adding a record to a set or removing one from it.
-#[derive(Debug, Clone, Copy)]
-pub struct Rrset<'a> {
+/// `R` is what holds one record's RDATA: `RecordData` for a caller that owns
+/// the set, `&RecordData` for one that has it inside something else. The zone
+/// signer is the second — grouping a million-record zone into RRsets cost a
+/// clone per record, which was 944 ms of an 8 s incremental sign (`TODO.md`
+/// #64g) — and a default type parameter is what keeps that off the 40 call
+/// sites that do own their RDATA.
+#[derive(Debug)]
+pub struct Rrset<'a, R = RecordData> {
     pub owner: NameRef<'a>,
     pub rtype: Rtype,
     pub class: Class,
-    pub rdatas: &'a [RecordData],
+    pub rdatas: &'a [R],
 }
 
-impl<'a> Rrset<'a> {
-    pub fn new(owner: NameRef<'a>, rtype: Rtype, class: Class, rdatas: &'a [RecordData]) -> Self {
+// Written out rather than derived: `derive` would bound `R: Clone`/`R: Copy`,
+// and every field here is a reference or a scalar whatever `R` is.
+impl<R> Clone for Rrset<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<R> Copy for Rrset<'_, R> {}
+
+impl<'a, R> Rrset<'a, R> {
+    pub fn new(owner: NameRef<'a>, rtype: Rtype, class: Class, rdatas: &'a [R]) -> Self {
         Rrset {
             owner,
             rtype,
@@ -715,8 +733,8 @@ impl<'a> Rrset<'a> {
 /// must be the zone we think we are talking to (or any name could sign for any
 /// other), the key must be a zone key at that name, the signature must be
 /// current, and the label count must not claim more labels than the name has.
-pub fn verify_rrset(
-    rrset: &Rrset<'_>,
+pub fn verify_rrset<R: Borrow<RecordData>>(
+    rrset: &Rrset<'_, R>,
     rrsigs: &[Rrsig],
     keys: &[Dnskey],
     zone: NameRef<'_>,

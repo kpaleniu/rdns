@@ -533,9 +533,9 @@ impl SigningKey {
     /// The signer name is this key's owner and cannot be passed in — a signature
     /// naming another zone is rejected by [`crate::dnssec::verify_rrset`] before
     /// the bytes are looked at.
-    pub fn sign_rrset(
+    pub fn sign_rrset<R: std::borrow::Borrow<crate::RecordData>>(
         &self,
-        rrset: &Rrset<'_>,
+        rrset: &Rrset<'_, R>,
         original_ttl: u32,
         inception: u32,
         expiration: u32,
