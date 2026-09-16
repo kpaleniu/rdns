@@ -195,11 +195,16 @@ fn writing_a_record_as_text_borrows_it() {
         zone_blocks, wire_blocks,
         "neither entry point may copy the record to render it"
     );
-    // 14 on the development machine: the owner name, the re-encode
-    // `rdata_to_string` compares against, the type name and the line itself.
+    // ~~14 on the development machine: the owner name, the re-encode
+    // `rdata_to_string` compares against, the type name and the line itself.~~
+    // **7 since `TODO.md` #64c**, and the four things listed were never the
+    // whole of it: `rdata_to_string` also built RFC 3597's hex form for every
+    // record and threw it away whenever the type-specific one worked — one
+    // allocation per RDATA octet, so four here and ~110 per RRSIG. Floor moved
+    // 10 -> 5; §17 asks for a reason in either direction.
     // The range is wide because this is the *equality* above's backstop, not a
     // budget — a change here is a change in how a line is rendered.
-    within("rendering one A record as a line", zone_blocks, 10..=18);
+    within("rendering one A record as a line", zone_blocks, 5..=18);
 }
 
 /// What checking one RRset of a signed zone costs, at two zone sizes.

@@ -37,8 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#64**, **#68**, **#69**, **#70** and **#21**, as of
-2026-09-16. **#68 stays open and both of its guesses are gone**: the
+**#57**, **#58**, **#59**, **#64g**, **#68**, **#70** and **#21**, as of
+2026-09-16. **#64 is closed** — 64c, 64e and 64f all went the same day, and 64c
+is the one whose remedy was declined on its own re-measurement; **64g** is what
+64e left. **#68 stays open and both of its guesses are gone**: the
 accept-before-connect race it named cannot happen (the listener is bound before
 the loop is spawned), the test it names has no wall-clock assertion, and
 ephemeral ports are not scarce here — a whole `--workspace` run adds ~100
@@ -116,13 +118,16 @@ split to the bottom**: six passes and not the four it named, and the largest,
 everything and holds the four ECDSA operations. What a remedy would have to
 address is now a number — 31% to build and free the carry-forward index, 24%
 to probe it and `Layout` once per RRset — and it is the two maps keyed by a
-name, not the chain and not the crypto. **64e and 64f both closed 2026-09-16.**
-64f: a reload keeps the zone it is serving for a file nobody touched, 11.4 s to
-39 ms at a million records, on the condition `ProvenSigning` already computes.
-64e: the two structures it named and nothing else, three shapes built and
-measured, −14% on an incremental sign and −16% on a signed UPDATE — and the one
-pass it did not take is **64g**. **64c** is what is left, and it is a decision
-rather than a measurement.
+name, not the chain and not the crypto. **64c, 64e and 64f all closed
+2026-09-16**, which closes #64 and leaves **64g**. 64f: a reload keeps the zone
+it is serving for a file nobody touched, 11.4 s to 39 ms at a million records,
+on the condition `ProvenSigning` already computes. 64e: the two structures it
+named and nothing else, three shapes built and measured, −14% on an incremental
+sign and −16% on a signed UPDATE. 64c: the measurement that could refute it
+went first and did — more than half of its 42% was the *serializer*, which
+built RFC 3597's hex form for every record and discarded it, and `to_string`
+fell 636 ms to 250 with the file exactly as authoritative as before. The design
+half is declined on what is left of it.
 **#65 came out of asking 64e's question of the load path and closed the same
 day**, the shapes built and the recommended one declined. The reason for asking
 was refuted first — a full sign is 84% ECDSA, so a remedy in the structures is
@@ -987,7 +992,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59**, **#64**, **#68** and **#70**, plus **#21** — see
+**#57**, **#58**, **#59**, **#64g**, **#68** and **#70**, plus **#21** — see
 "What is open" above, which is the same list and the only place it is written
 down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -2476,7 +2481,7 @@ transfers.
 
 ---
 
-### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14; 64a, 64b, 64d, 64e and 64f closed; 64c open, 64g out of 64e**
+### 64. One dynamic UPDATE is five O(zone) passes — **filed 2026-09-14, closed 2026-09-16; 64g open, out of 64e**
 
 Filed with the measurement that **refuted the reason it was going to be filed**.
 The finding on the way in was "the UPDATE path re-reads the zone file, so an
@@ -2587,6 +2592,11 @@ it is one every twelve** (64d).
   Three runs on the development machine, Windows, release; the spread is
   26-28%, 33-36%, 37-38%. `warm_update_cost_against_cold`.
 
+  **Both columns moved when 64c made the writer cheaper**, and the share went
+  *up* because what the warm path still pays shrank: 1 397 ms cold against
+  753 ms warm at a million records, **46%**. The table above is the measurement
+  as it stood and is left as it was taken.
+
   ~~**Built 2026-09-15 on branch `64b-digest`, and its headline number did not
   reproduce.** The mechanism is correct, tested and cheap; the 25% this row
   promised at a million records is 1-5%, and part of the gap is unexplained.~~
@@ -2663,8 +2673,46 @@ it is one every twelve** (64d).
   file has been edited underneath — and fails against reusing the served copy
   unconditionally. Whatever happens to the performance argument, that is the
   rule the re-read was there for and it still holds.
-- **64c. The file is the authority, and that is the other 42%.** `to_string`
-  plus `write` — 621 + 136 ms — exist because the update must reach the file:
+- **64c. The file is the authority, and that is the other 42% — filed
+  2026-09-14, closed 2026-09-16 with the design half declined.** The row asked
+  whether the file should stop being the authority. The measurement that could
+  refute it went first (§19) and did: **more than half of the 42% was not the
+  file at all, it was the serializer**, and `to_string` fell **636 ms to 250**
+  at a million records with the file exactly as authoritative as before.
+
+  `rdata_to_string` built RFC 3597 §5's `\# <len> <hex>` form for **every**
+  record and threw it away whenever the type-specific spelling worked — which
+  is the ordinary case — and built it with a `format!` **per RDATA octet**. Four
+  discarded allocations for an A record, ~110 for an RRSIG. Lazy now, and the
+  hex goes through `write!` into a pre-sized buffer.
+  `zone_to_string` then allocated a `String` per record and copied it into the
+  output, and grew that output from empty: `record_line_into` is the primitive
+  and `record_line` the allocating wrapper, which is `CLAUDE.md` §13's own
+  shape.
+
+  | at 1 000 000, unsigned | before | after |
+  |---|---|---|
+  | one update, cold | 1 716 ms | **1 333-1 337** |
+  | `to_string` | 636 ms | **250-257** |
+  | one update, warm (#64b) | 1 178 ms | **753** |
+  | 64b's saving | 38% | **46%** |
+  | rendering one A record | 14 allocations | **7** |
+
+  Output byte-identical, and checked rather than assumed: the six `round_trip`
+  fixtures — ordinary records, the DNSSEC types, TXT sequences, CDS/CDNSKEY and
+  SOA ordering — hash to the same digests either side.
+
+  **And the design question is declined on what is left.** `to_string` plus
+  `write` is now **387 ms of a 1 335 ms cold update and 4% of a signed one**,
+  against the 776 ms of 1 178 the row priced. What the remedy costs has not
+  moved: four deliberate properties of the journal and a recovery path that does
+  not exist, all of it buying latency rather than durability
+  (`persist::write_atomically` already means no zone file is ever half-written).
+  Declined here so the next reader finds the numbers rather than the question
+  — if it is taken up it gets its own number.
+
+  ~~`to_string` plus `write` — 621 + 136 ms — exist because the update must
+  reach the file:~~
   `UpdateHandling`'s doc says the re-signing timer reloads every zone from its
   file, so an in-memory-only edit is discarded within one re-signing interval
   with nothing logged. **Making the file a checkpoint rather than the authority
@@ -3737,6 +3785,7 @@ the week; the record is under "How the queue kept going stale" in
 | **44** | what an operator would find missing in `rdnsd` | **filed 2026-09-11, closed in full 2026-09-12**, seven rows: catalog zones, EDE, the scale measurement, XoT, multi-signer, rollover and dnstap. Five numbers filed on the way out — #47, #48, #49, #50, #51, #54, #55 — and **0 packages** added by the lot, dnstap's two wire formats included. Every row's closing note says the same thing in its own words: the filing was right about what was missing and wrong about where the work was. 44a missed that provisioning is a diff; 44b's "small" cost a type at 24 sites; 44d's "cheap after 42a" described the half already done; 44e's premise was refuted by one test; 44f's ZSK half needed four numbers in a file and no state machine. Only 44c came out the size it was filed as, and it is the one that found a live defect (**#50**). The preamble's "none of these is a defect" did not survive either: #50 came out of 44c, and #47 — filed by 44b as not a defect — closed carrying two MUSTs |
 | **65** | every load re-signed every zone from scratch | **filed and closed 2026-09-14**, out of 64e. `ZoneSigning::apply` signed unconditionally, so a SIGHUP, an `rdnsctl reload` or a catalog change cost a full sign of every signed zone — 27.6 s at a million records — and moved the RDATA of every RRSIG, which is the whole zone in the next IXFR delta. **The four shapes were built and the recommended one was declined** (§19, #40a's precedent again). What landed is A, keyed on the trigger: the re-signing timer reloads *in order to* refresh, so it is the one reload that may carry nothing forward, and the other two carry everything whose RRset did not move — 9.7 s against 27.6, still 53.6% saved when a tenth of the zone changes (65b). **B is declined on a measurement**: the expiry spread is a fifth of the validity and the re-signing interval a third, so every signature crosses any refresh threshold in the same tick — 0 or all 126 of a fixture's RRSIGs, never between — and the only threshold that saves work hands the refreshing run a signature with four tenths of an interval left, against the 1.4 §8 asks for. The patch was reverted and the finding kept as a tripwire on the two constants. C moved to **#64b** and then, when 64b closed without reaching the reload path, to **#64f**. The prerequisite the row called plumbing was one four-line method: `Zones::snapshot_all` |
 | **63** | `rdnsr` had 39 flags and no config file | **filed 2026-09-14, closed 2026-09-15**, ten rows, filed out of 57d because a prerequisite named in prose is one nobody schedules (§18). 63a answered the split question with the compiler rather than a line count — 18 escaping items of 84 `pub`s, and 63g then measured that `rdnsr` would name **0** of them — so the module stayed in `rdnsd` and what is shared is one macro. 63h built all three shapes and kept the two declined ones as branches: the shared struct is out because `#[serde(flatten)]` makes serde buffer the table, costing every `[server]` typo its line number and its expected-key list in `rdnsd`'s existing file too. On the way, 63e found 16 defaults written twice with nothing comparing them, 63f the same bare-`pub` sweep for the `cfg(unix)` file Windows cannot compile, and 63i the one flag of 35 not refused beside `--config`. **63j is what the file existed for**: `[[rpz.feeds]]`, a policy per feed, which costs the match path nothing because `PolicyZone` has carried one since 45a. `rdnsr --check-config` closed with it |
+| **64** | one dynamic UPDATE was five O(zone) passes | **filed 2026-09-14, closed 2026-09-16**, seven rows, and it was filed with the measurement that refuted the fix it was going to propose (§19). 64a: a whole-zone clone nobody read, three instances not one, fixed in the type. 64b: read the file's bytes every time, parse them only when they are not the bytes this server last wrote — 38% off an unsigned update, and its headline number *did not reproduce* because one `--ignored` filter selected two million-record benchmarks and libtest ran them at once. 64d: signing is 88% of a signed update, and the measurement that could have refuted it — `carried` — refuted the *explanation* instead: exactly four RRSIGs are made fresh at any zone size. 64e: the two structures the split named, three shapes built, −14%. 64f: a reload keeps the zone it is serving for a file nobody touched, 11.4 s to 39 ms, on the condition `ProvenSigning` already computes. **64c is the one declined**: its 42% was more than half serializer — RFC 3597's hex form built for every record and thrown away — and `to_string` fell 636 ms to 250 with the file still the authority, which leaves the checkpoint design buying 387 ms of a 1 335 ms update and 4% of a signed one. 64g is what 64e did not take |
 | **69** | four accept loops ended on any error, where the UDP side had a helper | **filed and closed 2026-09-16**, out of #68. Filed with no remedy on purpose (§18), and both missing measurements were taken the same day — which reversed the reason. **The remote provocation does not exist**: four `SO_LINGER 0` resets before the accept come back as `Ok` on Windows and on Linux, so §4's *remote* kill switch does not apply. **Descriptor exhaustion does, and needs nobody**: at `ulimit -n`, `accept` returns `EMFILE`, `Uncategorized`/raw 24, invisible to every portable kind — and both daemons' `JoinSet` ends the process when its first task ends, so `accepted?` turned a self-clearing condition into a whole-server outage across every transport. Windows could not be made to reach it (100 000 handles, no failure). Provoked before and after against a real `tcp::serve`: the old code's next write is a reset, the new one answers. One shared `survive_accept_error` at all four sites — retry the aborted kinds, log and back off 100 ms on exhaustion, still fatal otherwise |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly

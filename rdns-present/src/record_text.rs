@@ -40,15 +40,40 @@ pub fn record_line(
     class: Class,
     rdata: &RecordData,
 ) -> Result<String, ZoneError> {
+    let mut out = String::new();
+    record_line_into(&mut out, name, ttl, class, rdata)?;
+    Ok(out)
+}
+
+/// [`record_line`] for a caller writing a whole zone, which is the same line
+/// appended to a buffer it already has.
+///
+/// The primitive, with [`record_line`] as the allocating wrapper
+/// (`CLAUDE.md` §13): `zone_to_string` allocated a `String` per record and
+/// copied it into the output, two million of each on a million-record zone
+/// (`TODO.md` #64c).
+///
+/// Nothing is appended unless the whole line can be written, so a caller that
+/// gives up on the error keeps a buffer with no half-record in it.
+pub fn record_line_into(
+    out: &mut String,
+    name: NameRef<'_>,
+    ttl: Ttl,
+    class: Class,
+    rdata: &RecordData,
+) -> Result<(), ZoneError> {
+    use std::fmt::Write;
     let owner = writable_name(name);
     let class_text = class_name(class).ok_or_else(|| {
         ZoneError::invalid(format!("record {owner}: unknown class {}", class.to_u16()))
     })?;
 
     let (rtype, rdata) = rdata_to_string(rdata);
-    Ok(format!(
+    let _ = write!(
+        out,
         "{owner:<24} {ttl:<7} {class_text:<3} {rtype:<7} {rdata}"
-    ))
+    );
+    Ok(())
 }
 
 /// The same, for a record off the wire rather than out of a zone.
@@ -71,28 +96,39 @@ pub fn resource_record_line(record: &ResourceRecord) -> Result<String, ZoneError
 /// need not be enumerated here.
 fn rdata_to_string(stored: &RecordData) -> (Cow<'static, str>, String) {
     let name = record_type_name(stored.rtype());
-    let generic = (name.clone(), generic_rdata(stored));
+    // Lazily, which is `TODO.md` #64c's first measurement: this was built for
+    // every record and thrown away whenever the type-specific form worked,
+    // which is the ordinary case. An RRSIG is ~110 octets and the hex form
+    // allocated per octet, so a signature cost ~110 discarded allocations.
+    let generic = |name: Cow<'static, str>| (name, generic_rdata(stored));
 
     let Ok(parsed) = stored.parse() else {
-        return generic;
+        return generic(name);
     };
     match RecordData::from_parsed(&parsed) {
         Ok(reencoded) if reencoded.bytes() == stored.bytes() => {}
-        _ => return generic,
+        _ => return generic(name),
     }
     match presentation_rdata(&parsed) {
         Some(text) => (name, text),
-        None => generic,
+        None => generic(name),
     }
 }
 
 /// `\# <length> <hex>` (RFC 3597 §5) — the form that is exact for anything.
 fn generic_rdata(stored: &RecordData) -> String {
-    let mut out = format!("\\# {}", stored.bytes().len());
-    if !stored.bytes().is_empty() {
+    use std::fmt::Write;
+    let bytes = stored.bytes();
+    // Two hex digits an octet, plus the prefix: one allocation, not one per
+    // reallocation.
+    let mut out = String::with_capacity(bytes.len() * 2 + 16);
+    let _ = write!(out, "\\# {}", bytes.len());
+    if !bytes.is_empty() {
         out.push(' ');
-        for byte in stored.bytes() {
-            out.push_str(&format!("{byte:02X}"));
+        for byte in bytes {
+            // `write!` rather than `push_str(&format!(..))`, which allocated a
+            // `String` per octet.
+            let _ = write!(out, "{byte:02X}");
         }
     }
     out

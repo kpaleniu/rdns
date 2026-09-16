@@ -27,7 +27,11 @@ use crate::ParsedRecord;
 /// Fails only on a record this format cannot express — see the module docs; in
 /// practice that is an owner name needing escapes.
 pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
-    let mut out = String::new();
+    // A zone file runs to tens of megabytes and this grew from empty, so a
+    // million-record zone was ~25 reallocations copying up to the whole file
+    // each time. The estimate need not be right — being wrong costs one
+    // `realloc` (`TODO.md` #64c).
+    let mut out = String::with_capacity(zone.records().len() * 64 + 256);
 
     out.push_str("; ");
     out.push_str(&zone.origin().to_presentation());
@@ -44,12 +48,10 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
     // absolute and compares case-insensitively, so the two now agree — which is
     // the point of asking one of them.
     for record in zone.records().iter().filter(|r| zone.is_apex_soa(r)) {
-        out.push_str(&record_to_string(record)?);
-        out.push('\n');
+        record_into(&mut out, record)?;
     }
     for record in zone.records().iter().filter(|r| !zone.is_apex_soa(r)) {
-        out.push_str(&record_to_string(record)?);
-        out.push('\n');
+        record_into(&mut out, record)?;
     }
 
     Ok(out)
@@ -66,6 +68,19 @@ pub fn write_zone_file(zone: &Zone, path: &Path) -> Result<(), ZoneError> {
         path: path.display().to_string(),
         source,
     })
+}
+
+/// One record and its newline, appended to a zone being written.
+fn record_into(out: &mut String, record: &ZoneRecord) -> Result<(), ZoneError> {
+    crate::record_text::record_line_into(
+        out,
+        record.name.as_ref(),
+        record.ttl,
+        record.class,
+        &record.rdata,
+    )?;
+    out.push('\n');
+    Ok(())
 }
 
 /// One record as a zone-file line.
