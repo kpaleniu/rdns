@@ -17,10 +17,17 @@
 //! and the `match (method, path)`, which is a `service_fn` with the same arms
 //! and the same bodies.
 //!
-//! **Two behaviours changed, both toward the RFC.** An HTTP/1.1 request with no
-//! `Host` header now gets 400 rather than being served — RFC 9112 §3.2 requires
-//! that, the hand-rolled version never looked, and every real scraper sends one.
-//! And a request line longer than 8 KB is now hyper's 431 rather than ours.
+//! ~~**Two behaviours changed, both toward the RFC.** An HTTP/1.1 request with
+//! no `Host` header now gets 400 — RFC 9112 §3.2 requires that. And a request
+//! line longer than 8 KB is now hyper's 431.~~ **Neither was true**, and the
+//! tests in this file had disproved half of it on the day it was written:
+//! `a_query_string_is_still_a_scrape` sends no `Host` and asserts 200. Measured
+//! (`hyper_serves_what_the_header_used_to_claim_it_refused`): no `Host` is
+//! **200**, hyper does not look; an over-long request line is **414** past
+//! ~64 KB, hyper's read buffer, not 431 at 8 KB. Both numbers were estimates of
+//! somebody else's code — `CLAUDE.md` §4's "never state what a function does
+//! without opening it", about a dependency. §3.2's MUST is unenforced and
+//! that is now a decision to take rather than a claim (`TODO.md` #70).
 //!
 //! **Keep-alive is off on purpose**, which is the one thing hyper offers here
 //! that is not taken. The permit below is held for a connection's life, so a
@@ -158,17 +165,42 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
+    /// Every failure names the socket call and the address. #68 was one run of
+    /// this that failed and could not be diagnosed, because the assertion it
+    /// failed printed neither the body nor which of the three steps went wrong.
     async fn scrape(addr: SocketAddr, request: &str) -> String {
-        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("connect to {addr}: {e}"));
         stream
             .write_all(request.as_bytes())
             .await
-            .expect("send the request");
+            .unwrap_or_else(|e| panic!("send to {addr}: {e}"));
         let mut out = String::new();
         tokio::io::AsyncReadExt::read_to_string(&mut stream, &mut out)
             .await
-            .expect("read the response");
+            .unwrap_or_else(|e| panic!("read from {addr}: {e}"));
         out
+    }
+
+    /// [`scrape`] for a request hyper refuses part-read: it stops at its buffer
+    /// limit, answers and closes with the rest of the request still in flight,
+    /// which is an RST rather than a FIN. A reset here ends the response; in
+    /// [`scrape`] it stays a panic, because there it is the finding.
+    async fn scrape_tolerating_reset(addr: SocketAddr, request: &str) -> String {
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("connect to {addr}: {e}"));
+        let _ = stream.write_all(request.as_bytes()).await;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
     }
 
     async fn start() -> (SocketAddr, Shutdown, Arc<DnsMetrics>) {
@@ -232,15 +264,12 @@ mod tests {
     #[tokio::test]
     async fn healthz_answers_and_other_paths_do_not() {
         let (addr, _shutdown, _metrics) = start().await;
-        assert!(scrape(addr, "GET /healthz HTTP/1.1\r\n\r\n")
-            .await
-            .starts_with("HTTP/1.1 200 OK"));
-        assert!(scrape(addr, "GET /admin HTTP/1.1\r\n\r\n")
-            .await
-            .starts_with("HTTP/1.1 404"));
-        assert!(scrape(addr, "POST /metrics HTTP/1.1\r\n\r\n")
-            .await
-            .starts_with("HTTP/1.1 405"));
+        let body = scrape(addr, "GET /healthz HTTP/1.1\r\n\r\n").await;
+        assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
+        let body = scrape(addr, "GET /admin HTTP/1.1\r\n\r\n").await;
+        assert!(body.starts_with("HTTP/1.1 404"), "{body}");
+        let body = scrape(addr, "POST /metrics HTTP/1.1\r\n\r\n").await;
+        assert!(body.starts_with("HTTP/1.1 405"), "{body}");
     }
 
     /// The point of the split: a secondary that has bound its sockets but
@@ -279,18 +308,53 @@ mod tests {
     #[tokio::test]
     async fn a_server_with_nothing_to_wait_for_is_ready_at_once() {
         let (addr, _shutdown, _metrics) = start().await;
-        assert!(scrape(addr, "GET /readyz HTTP/1.1\r\n\r\n")
-            .await
-            .starts_with("HTTP/1.1 200 OK"));
+        let body = scrape(addr, "GET /readyz HTTP/1.1\r\n\r\n").await;
+        assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
+    }
+
+    /// Both halves of a claim this module's header made about hyper and nobody
+    /// ran. Pinned rather than described: the header's numbers were 400 and
+    /// 431, and a dependency's defaults are exactly the kind of claim that
+    /// changes under you (`TODO.md` #68).
+    #[tokio::test]
+    async fn hyper_serves_what_the_header_used_to_claim_it_refused() {
+        let (addr, _shutdown, _metrics) = start().await;
+
+        // RFC 9112 §3.2 says 400. hyper does not look, and the four tests above
+        // that send no `Host` are the evidence it never did (`TODO.md` #70).
+        let body = scrape(addr, "GET /metrics HTTP/1.1\r\n\r\n").await;
+        assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
+
+        // Past hyper's 64 KiB read buffer, not past 8 KB, and 414 not 431:
+        // 60 000 is served as an ordinary 404.
+        let body = scrape(
+            addr,
+            &format!("GET /{} HTTP/1.1\r\nHost: x\r\n\r\n", "x".repeat(60_000)),
+        )
+        .await;
+        assert!(
+            body.starts_with("HTTP/1.1 404"),
+            "{}",
+            &body[..60.min(body.len())]
+        );
+        let body = scrape_tolerating_reset(
+            addr,
+            &format!("GET /{} HTTP/1.1\r\nHost: x\r\n\r\n", "x".repeat(100_000)),
+        )
+        .await;
+        assert!(
+            body.starts_with("HTTP/1.1 414"),
+            "{}",
+            &body[..60.min(body.len())]
+        );
     }
 
     /// The endpoint watches the stop; it does not claim the drain.
     #[tokio::test]
     async fn the_endpoint_stops_with_the_server() {
         let (addr, shutdown, _metrics) = start().await;
-        assert!(scrape(addr, "GET /healthz HTTP/1.1\r\n\r\n")
-            .await
-            .starts_with("HTTP/1.1 200 OK"));
+        let body = scrape(addr, "GET /healthz HTTP/1.1\r\n\r\n").await;
+        assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
 
         shutdown.begin();
         assert!(

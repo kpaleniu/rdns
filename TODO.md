@@ -37,7 +37,16 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#57**, **#58**, **#59**, **#64**, **#68** and **#21**, as of 2026-09-15.
+**#57**, **#58**, **#59**, **#64**, **#68**, **#69**, **#70** and **#21**, as of
+2026-09-16. **#68 stays open and both of its guesses are gone**: the
+accept-before-connect race it named cannot happen (the listener is bound before
+the loop is spawned), the test it names has no wall-clock assertion, and
+ephemeral ports are not scarce here — a whole `--workspace` run adds ~100
+`TIME_WAIT` sockets to a 16 384-port range. 900 runs under load did not
+reproduce it. What was fixed is that the failure left no evidence, and what it
+found on the way out is **#69** (four accept loops treat any error as fatal
+while the UDP side has a helper for exactly that) and **#70** (the metrics
+header claimed two hyper behaviours hyper does not have).
 **#66 and #67 closed the day they were filed**, together: `rdnsc` transfers a
 zone, signs it, verifies every envelope and writes a loadable file, and the
 crate line moved twice to let it — `rdns-present` for the format and
@@ -970,9 +979,9 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#57**, **#58**, **#59**, **#64** and **#68**, plus **#21** — see
-"What is open" above, which is the same list and the only place it is written
-down.
+**#57**, **#58**, **#59**, **#64**, **#68**, **#69** and **#70**, plus **#21**
+— see "What is open" above, which is the same list and the only place it is
+written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
 numbers are stable identifiers referenced from the code, so they move rather
 than being renumbered.
@@ -3333,17 +3342,106 @@ after it, on three runs of its own crate's suite and on three of the module
 alone. Not caused by the change it was seen under (#67's crate move touches
 nothing in `rdns-transport`); seen there, so filed there.
 
-It binds a listener and scrapes it over TCP, which is what makes it worth
+~~It binds a listener and scrapes it over TCP, which is what makes it worth
 having and also what makes it the one shape `CLAUDE.md` §10 warns about: under
 a whole-workspace run every test binary is competing for ephemeral ports and
-for the scheduler, and the assertion has no headroom.
+for the scheduler, and the assertion has no headroom.~~ ~~What would settle it
+is reading `start()` and `scrape()` for where the wait is — whether the server
+is accepting before the scrape connects.~~
 
-**Not diagnosed.** What is known is the failure mode (one run in five, under
-load) and what it is not (a lint, a platform, or this week's changes). What
-would settle it is reading `start()` and `scrape()` for where the wait is —
-whether the server is accepting before the scrape connects — rather than
-raising a timeout, which §10 says is how a tripwire gets ratified into a
-regression.
+**Both guesses were wrong, and the row's own instruction is what showed it**
+(2026-09-16). Reading the twenty lines:
+
+- **There is no wait to get wrong.** `start_with` binds the listener and *then*
+  spawns `serve`, so a `connect` that beats the accept loop waits in the
+  kernel's backlog rather than failing. The accept-before-connect race the row
+  named cannot happen.
+- **That test has no wall-clock assertion**, so "the assertion has no headroom"
+  is about a different test — the only `Duration` in the module is
+  `the_endpoint_stops_with_the_server`'s 3 s drain budget.
+- **Ephemeral ports are not scarce here**, which was the third guess and the
+  one a measurement kills outright: the box sits at ~3 320 sockets in
+  `TIME_WAIT` against a 16 384-port dynamic range, and a whole `--workspace` run
+  adds about **100**. Sampled every 5 s across a run: 3 320 → 3 422 → 3 374.
+
+**Not reproduced.** 900 runs of the module (`--test-threads 8`), 600 of them
+with four concurrent `cargo test --workspace` runs as load: **0 failures**. 200
+more on Linux after the change below: 0.
+
+**What was wrong and is fixed**: the test that failed is one of the two in the
+module whose assertions printed *nothing* — no body, and `scrape`'s three
+`expect`s named neither the failing call's error nor the address. One run in
+nine hundred failed and left no evidence, which is why the row could say the
+failure mode but not the failure. Every assertion carries its body now and
+every socket call names itself; the next occurrence says which of connect,
+send, read or the status went wrong. **Left open** on that footing: there is
+one unexplained failure and no explanation, only a smaller cost to seeing the
+next one.
+
+**Two findings on the way out**, both in the file the row points at and
+neither the flake: **#69**, every accept loop in the crate treats any accept
+error as fatal while the UDP side has `recv_error_is_transient` and a written
+reason; and **#70**, the module header claimed two hyper behaviours that hyper
+does not have.
+
+---
+
+### 69. Four accept loops end on any error; the UDP side has a helper for that — **filed 2026-09-16**
+
+`tcp.rs:144`, `tls.rs:221`, `https.rs:108` and `metrics_server.rs:66` all spell
+the accept the same way:
+
+```rust
+accepted = listener.accept() => accepted?,
+```
+
+so any `Err` returns from `serve`, and the transport stops accepting for the
+life of the process. `rdns_transport::recv_error_is_transient` exists because
+`CLAUDE.md` §4 made exactly this argument about `recv_from` — "anything a
+remote party can provoke has to be recognized here or it is a remote kill
+switch" — and it is applied at two call sites, both UDP (`rdnsd/src/main.rs:1238`,
+`rdnsr/src/serve.rs:54`). The accept loops have nothing. §7's shape: the
+reasoning was moved into a helper and the four loops that were not the one it
+was written for never called it.
+
+**Filed with no remedy, because the remedy is the unchecked part.** What is
+measured is the four sites and the asymmetry. What is *not* checked is whether
+a remote party can provoke an accept error on either platform — the provocation
+is an RST between the handshake and the accept, which needs `SO_LINGER 0` and
+therefore `socket2`, not a dependency of this crate — and `EMFILE` is the case
+that needs no remote party at all and is where a naive `continue` turns a dead
+loop into a hot spin. So the row names a measurement to take and not a patch to
+apply (`CLAUDE.md` §18: a row naming a wrong remedy costs more than one naming
+none).
+
+---
+
+### 70. The metrics endpoint does not enforce RFC 9112 §3.2, and its header said it did — **filed 2026-09-16**
+
+`metrics_server.rs`'s header claimed that folding onto hyper (#42c) changed
+"two behaviours, both toward the RFC": a `Host`-less HTTP/1.1 request getting
+400 per RFC 9112 §3.2, and a request line over 8 KB getting 431. Both were
+estimates of somebody else's code, never run. Measured:
+
+| claimed | actual |
+|---|---|
+| no `Host` on HTTP/1.1 → 400 | **200**; hyper does not look |
+| request line > 8 KB → 431 | **414**, and past 64 KiB — hyper's read buffer. 60 000 bytes is an ordinary 404 |
+
+Four tests in that same file send HTTP/1.1 with no `Host` and assert 200, so
+the file disproved half of its own header on the day it was written. The header
+is corrected and both behaviours are pinned by
+`hyper_serves_what_the_header_used_to_claim_it_refused`.
+
+**What is left is a decision, not a defect.** §3.2 is a MUST ("A server MUST
+respond with a 400 (Bad Request) to any HTTP/1.1 request message that lacks a
+Host header field"), and this server does not. The branch is five lines in
+`answer`. Against it: the endpoint has no virtual hosts, which is what the MUST
+protects, and enforcing it turns `printf 'GET /metrics HTTP/1.1\r\n\r\n' | nc`
+— an operator's probe — into a 400. Taking it means changing four tests, which
+is §1's ordinary case and not an argument either way. Not taken on this
+session's own authority: it is a behaviour change nobody asked for, on the
+operational shell, which is where `CLAUDE.md`'s preamble says the defects are.
 
 ---
 
