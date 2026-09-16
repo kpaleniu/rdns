@@ -758,6 +758,8 @@ impl<'a> Working<'a> {
 
     fn into_zone(self) -> Zone {
         let mut zone = Zone::new(self.base.origin().to_owned());
+        // An UPDATE's records are the base's, plus or minus what it changed.
+        zone.reserve_like(self.base, 0);
         for record in self.records {
             zone.add_record(record);
         }

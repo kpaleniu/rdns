@@ -369,6 +369,25 @@ impl Zone {
         self.index.reserve(2 * records);
     }
 
+    /// Room for a rebuild of `base`, plus `extra` records it will gain.
+    ///
+    /// [`Zone::reserve`] for a caller that holds the zone it is rebuilding, and
+    /// so knows the two counts instead of estimating one from the other. The
+    /// index gets `base`'s own entry count, which is right for every zone
+    /// shape: `reserve`'s `2 * records` is the ratio a feed of
+    /// `<name>.<origin>` rules has, and twice the table a zone whose names are
+    /// all apex children needs. On such a feed, where the two agree on size,
+    /// the exact form still measured 386 ms against 401 at a million records.
+    ///
+    /// The three callers that rebuild a zone record by record all had the
+    /// counts and none of them passed them — `TODO.md` #61b reserved the parse
+    /// and stopped at one of four sites (#71c).
+    pub(crate) fn reserve_like(&mut self, base: &Zone, extra: usize) {
+        self.records.reserve(base.records.len() + extra);
+        self.index.reserve(base.index.len() + extra);
+        self.spills.reserve(base.spills.len());
+    }
+
     /// Add a record to the zone
     pub fn add_record(&mut self, record: ZoneRecord) {
         // Owned: the key becomes an index entry, and the statements below need

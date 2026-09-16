@@ -46,11 +46,15 @@ smaller and older: the refresh had no SOA probe at all, so an unchanged feed
 cost a transfer and a reload every REFRESH. **#71** is what is left after both,
 and it is neither the wire nor the format. **71b closed 2026-09-16** — a reload
 keeps every feed whose file did not move, so a three-feed set costs 781 ms for
-one publication where it cost 2 200, and a quiet SIGHUP 62 ms — which leaves
-**71a**, the row filed with no remedy claimed. Its by-product is the larger
-finding: `rpz_install.rs` had no turnstile, so every number #57e and #71
-recorded was taken with two other million-rule measurements running. That is
-#64b's defect, found twice. **#64 is closed** — 64c, 64e and 64f
+one publication where it cost 2 200, and a quiet SIGHUP 62 ms. **71c closed the
+same day**: three of the four sites that rebuild a zone never got #61b's
+`reserve`, which is 793 ms to 445 on the one 71a is filed against. What is left
+is **71a**, now measured at 445 ms rather than the 793 it was filed at — over
+half of that row was a capacity hint and not the type. Two by-products worth
+the trip: `rpz_install.rs` had no turnstile, so every number #57e and #71
+recorded was taken with two other million-rule measurements running (#64b's
+defect, found twice), and the clone inside the rebuild is 125 ms of the 445 —
+#64g's result reached from the other side. **#64 is closed** — 64c, 64e and 64f
 all went the same day, and 64c is the one whose remedy was declined on its own
 re-measurement; **64g closed with it**, and its own filing was the thing it
 refuted — the "core type's shape and its call sites" it was not taken for is a
@@ -2018,6 +2022,15 @@ double the table as well as the keys.
   record count. Index build **743 -> 423 ms**. The hint is `2 * records` because
   of the non-terminals; `1 *` buys only 743 -> 678, and the cost of `2 *` is an
   oversized table for a zone whose names are all apex children.
+
+  **It reached one of four call sites, and that was found two days later
+  (#71c).** Nothing above is wrong: the parse is what this row measured and the
+  parse is what it fixed. What it did not do is count the instances of the shape
+  first (§18) — `ixfr::Patch::apply`, `xfr::into_zone` and
+  `update::into_zone` all build a zone record by record, all knew their counts,
+  and all three kept growing the index from empty for two more days. The "cost
+  of `2 *`" caveat above is why those three got `reserve_like` instead: a caller
+  holding the base does not have to estimate.
 - ~~**61c. `note_non_terminals` owned what it walked.**~~ **Done.** A `&mut self` method, so
   it allocated the origin key and every ancestor to satisfy the borrow checker —
   four allocations per record. A free function over the index instead:
@@ -3868,14 +3881,18 @@ release, a million-rule QNAME feed
 | applying a forty-rule change at 1M rules | ms |
 |---|---|
 | the difference off the wire and assembled | ~~about 7~~ **below the noise** |
-| `ixfr::Patch::apply`, rebuilding the zone | ~~801~~ **793** |
-| `write_zone_file` then `PolicyZone::load` | ~~1 351~~ **1 190** |
+| `ixfr::Patch::apply`, rebuilding the zone | ~~801~~ ~~793~~ **445** |
+| `write_zone_file` then `PolicyZone::load` | ~~1 351~~ **1 200-1 420** |
 
 The first row is now a *nothing* rather than a small number: the whole IXFR
-round trip is 783 ms and applying an **empty** difference sequence to a zone
-this size is 793, so the wire and the assembly are smaller than what separates
-two runs of this harness. Same conclusion as the 7, at a size where the
-subtraction no longer has a sign.
+round trip is 453 ms and applying an **empty** difference sequence to a zone
+this size is 445-458, so the wire and the assembly are smaller than what
+separates two runs of this harness. Same conclusion as the 7, at a size where
+the subtraction no longer has a sign.
+
+The second row halved again on 2026-09-16, and that is **71c**: the rebuild was
+growing a two-million-entry index from empty when both counts were sitting in
+the zone it was rebuilding. The third is a band because it writes 38 MB to disk.
 
 Only the first is the size of the change. The third is shape A's trade and not
 a defect — the file is the store (#57d), so an install serializes a zone this
@@ -3903,12 +3920,30 @@ a correction and not a retraction.
   removing `rrsets_of`'s clone took that pass down 25% and the total nowhere,
   because the clone was laying the RDATA out in the order the signing loop
   reads it. #65's five shared passes are 4.4 s at a million records. Two rows
-  naming one type is how both get half-done (§18); the numbers to beat are
-  793 ms here — 801 as first recorded, and the difference is the contention the
-  section head describes — and 4.4 s there, and 64g's result says what a remedy
-  has to keep: the order the reader walks in. **71b closing changes nothing
-  about this row**: the `Arc<PolicyZone>` it landed shares a zone that nobody
-  edits, which is the same fact stated the other way round.
+  naming one type is how both get half-done (§18), and 64g's result says what a
+  remedy has to keep: the order the reader walks in.
+
+  **The number to beat is 445 ms, not 793**, and the difference is why this row
+  was filed a size too large. ~~801~~ ~~793~~: the first was contention (the
+  section head), and **71c** took 793 to 445 with a capacity hint. This row
+  called the problem "a core type's shape and its call sites, not a loop", and
+  the larger half of it turned out to be neither — one `reserve` at one line.
+  What is left at a million records, measured after 71c:
+
+  | | ms |
+  |---|---|
+  | `apply_changes`, whole | ~445 |
+  | of which cloning every record of the base | ~125 |
+  | of which the index: 2M keys hashed, filed, and their ancestors walked | ~320 |
+
+  So the type change is worth ~445 ms here and 4.4 s in #65, and **the clone is
+  not the half worth taking** — the same result #64g got from the signing side,
+  now measured from this one. A remedy that removes the rebuild removes both;
+  one that only stops the clone buys 28% of this row and nothing of #65's.
+
+  **71b closing changes nothing about this row**: the `Arc<PolicyZone>` it
+  landed shares a zone that nobody edits, which is the same fact stated the
+  other way round.
 - **71b. One feed changing re-reads every feed — filed 2026-09-16, closed the
   same day.** `PolicyStore::reload` was `PolicyZones::load(&self.feeds)`:
   all-or-nothing over the whole set, which is right for what it was written for
@@ -3968,6 +4003,53 @@ a correction and not a retraction.
     hang this on and the A/B was a throwaway, which is why the numbers are here
     rather than in a committed harness.
 
+- **71c. Three of four zone rebuilds never got #61b's `reserve` — filed and
+  closed 2026-09-16.** **793 ms to 445** for `ixfr::Patch::apply` at a million
+  records, and the fix is one line at each. Found while sizing 71a, which is the
+  point of the row: 71a was filed as a type problem and over half of its number
+  was a missing capacity hint.
+
+  `Zone::new` starts with an empty `HashMap`, so a rebuild grows the index by
+  doubling and rehashes every key already in it at each step — and for a feed
+  of `<name>.<origin>` rules the index reaches **two** entries per record, one
+  for the owner and one for the empty non-terminal above it (#61's own
+  measurement). **#61b built `Zone::reserve` for exactly this** and wired one
+  caller, `zone/parse.rs`. Four call sites build a zone record by record; the
+  other three all knew their counts and none of them passed them:
+
+  | site | what it rebuilds | before | after |
+  |---|---|---|---|
+  | `ixfr::Patch::apply` | a delta onto the base | 793 ms | **445 ms** |
+  | `xfr::AxfrAccumulator::into_zone` | a whole transfer | 1 450 ms | **1 134 ms** |
+  | `update::Applied::into_zone` | an UPDATE's result | 381 ms | **302 ms** |
+  | `zone/parse.rs` | a zone file | — | done by #61b |
+
+  Each is an A/B on the committed harness with the one line reverted and
+  restored, not a before-and-after of the tree.
+
+  **`reserve_like` and not `reserve` at the three**, because a caller holding
+  the base knows both counts where #61b's caller could only estimate one from
+  the other. 61b's hint is `2 * records`, which is right for a feed of rules and
+  "one doubling of the table too many for a zone whose names are all children of
+  the apex" — its own words. The exact form measured 15 ms better at a million
+  records and, more to the point, sizes the table right for every zone shape.
+  The UPDATE site is the flat zone 61b warned about, which is why its saving is
+  the smallest of the three.
+
+  **The signer was tried and is declined on the measurement.**
+  `zone_signer::sign_zone_inner` builds a `Zone` from a base the same way, so it
+  looked like a fifth site. A signed million-record load is 27.5-28.2 s with the
+  reserve and 27.2-27.9 s without — the path is ECDSA-bound and a ~350 ms index
+  saving is 1.3% of it, which is under what the only harness that reaches it
+  (`reload_cost_against_zone_size`) can resolve. Reverted rather than landed
+  under a comment claiming a benefit nothing showed (§4). If #65 ever gets a
+  harness that isolates that zone build, this is one line.
+
+  **What this says about #61b, and it is not that it was wrong**: the
+  measurement was right and the fix was right, and it reached one of four
+  instances. §18 asks for the count *before* fixing one, and this is the shape
+  that rule exists for — a `grep` for `Zone::new` would have found all four the
+  day 61b landed.
 ---
 
 ### 21. The deviations and the not-implemented list — decisions, not open work

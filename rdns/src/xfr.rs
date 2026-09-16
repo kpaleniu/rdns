@@ -182,6 +182,10 @@ impl AxfrAssembler {
             )));
         }
         let mut zone = Zone::new(self.zone.clone());
+        // The records came off the wire, so there is no base to take an index
+        // count from: `reserve`'s estimate rather than `reserve_like`'s exact
+        // pair. 1 450 ms to 1 134 at a million records (`TODO.md` #71c).
+        zone.reserve(self.records.len());
         for rr in self.records {
             zone.add_record(ZoneRecord {
                 name: rr.name,

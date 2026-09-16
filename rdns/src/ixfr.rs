@@ -436,6 +436,10 @@ impl Patch {
     /// secondary on a version it can never leave.
     pub fn apply(mut self, base: &Zone, new_soa: &ResourceRecord) -> (Zone, usize) {
         let mut zone = Zone::new(base.origin().to_owned());
+        // The rebuild is the whole of what applying a delta costs (`TODO.md`
+        // #71a), and growing the index from empty rehashes every key already in
+        // it at each doubling. Both counts are `base`'s, give or take the delta.
+        zone.reserve_like(base, self.append.len());
         let mut removed = self.cancelled;
         for record in base.records() {
             // The patch's own SOA replaces this one; the framing carries it, so

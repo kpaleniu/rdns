@@ -14,9 +14,15 @@
 //! | | ms |
 //! |---|---|
 //! | the serial probe, which is all an unchanged feed costs | 0.3 |
-//! | a whole zone (AXFR) | 1 596 |
-//! | the difference from the version in force (IXFR) | 808 |
-//! | writing the file and reading it back | 1 351 |
+//! | a whole zone (AXFR) | 1 160 |
+//! | the difference from the version in force (IXFR) | 453 |
+//! | writing the file and reading it back | 1 200-1 420 |
+//!
+//! Re-measured 2026-09-16. The first figures — 1 596, 808 and 1 351 — were
+//! taken with three million-rule measurements running at once (`TODO.md` #71's
+//! head); the transfer rows then halved again when #71c gave the zone rebuild
+//! the record count it already had. The last row is a band because it writes
+//! 38 MB to disk.
 //!
 //! So an unchanged million-rule feed costs one round trip where it used to cost
 //! a transfer and a reload, and a changed one asks for what changed. The
