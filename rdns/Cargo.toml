@@ -11,6 +11,13 @@ rdns-core.workspace = true
 rdns-present.workspace = true
 rdns-tsig.workspace = true
 thiserror = "2.0"
+# `HashTable` for the zone's name index (`TODO.md` #71d): a table whose entries
+# need not own their key, which is the raw API std keeps behind the unstable
+# `hash_raw_entry`. Already in `Cargo.lock` through indexmap <- toml and already
+# linked into both daemons, so the lock gains an edge and no package — 218
+# either side. `default-features = false` drops the default hasher, which
+# nothing here uses: every probe passes its own hash.
+hashbrown = { version = "0.17", default-features = false }
 rand = "0.8"
 
 # DNSSEC crypto

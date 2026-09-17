@@ -48,13 +48,20 @@ and it is neither the wire nor the format. **71b closed 2026-09-16** — a reloa
 keeps every feed whose file did not move, so a three-feed set costs 781 ms for
 one publication where it cost 2 200, and a quiet SIGHUP 62 ms. **71c closed the
 same day**: three of the four sites that rebuild a zone never got #61b's
-`reserve`, which is 793 ms to 445 on the one 71a is filed against. What is left
-is **71a**, now measured at 445 ms rather than the 793 it was filed at — over
-half of that row was a capacity hint and not the type. Two by-products worth
-the trip: `rpz_install.rs` had no turnstile, so every number #57e and #71
-recorded was taken with two other million-rule measurements running (#64b's
-defect, found twice), and the clone inside the rebuild is 125 ms of the 445 —
-#64g's result reached from the other side. **#64 is closed** — 64c, 64e and 64f
+`reserve`, which is 793 ms to 445 on the one 71a is filed against. **71d closed
+2026-09-17**: the index keyed every name on a `Box<[u8]>` because a `HashMap`
+reaches its key only through `Borrow` — an artifact of the collection, not of
+`Name` — so `hashbrown::HashTable` and one arena took `Zone::clone` from 318 ms
+to 120 and a query miss from 114 ns to 76, at zero packages. What is left is
+**71a**, now 407 ms rather than the 793 it was filed at, and **71e**, the same
+`Box`-per-value question for `ZoneRecord`. Three by-products worth the trip:
+`rpz_install.rs` had no turnstile, so every number #57e and #71 recorded was
+taken with two other million-rule measurements running (#64b's defect, found
+twice); Linux clippy caught a lint the Windows one does not have, on a change
+touching no `cfg`-gated file (§1 paying out sideways); and the hand-rolled
+collision chain 71d started with had a bug that `bench_zone_lookup` caught on
+its first run, after the logic had been read through twice and called correct
+(§19). **#64 is closed** — 64c, 64e and 64f
 all went the same day, and 64c is the one whose remedy was declined on its own
 re-measurement; **64g closed with it**, and its own filing was the thing it
 refuted — the "core type's shape and its call sites" it was not taken for is a
@@ -3932,14 +3939,25 @@ a correction and not a retraction.
 
   | | ms |
   |---|---|
-  | `apply_changes`, whole | ~445 |
-  | of which cloning every record of the base | ~125 |
-  | of which the index: 2M keys hashed, filed, and their ancestors walked | ~320 |
+  | `apply_changes`, whole | ~~445~~ **407** |
+  | of which cloning every record of the base | ~120 |
+  | of which the index: 2M names hashed, filed, and their ancestors walked | ~~320~~ **~280** |
 
-  So the type change is worth ~445 ms here and 4.4 s in #65, and **the clone is
+  So the type change is worth ~407 ms here and 4.4 s in #65, and **the clone is
   not the half worth taking** — the same result #64g got from the signing side,
   now measured from this one. A remedy that removes the rebuild removes both;
-  one that only stops the clone buys 28% of this row and nothing of #65's.
+  one that only stops the clone buys 30% of this row and nothing of #65's.
+
+  **71d changed the arithmetic this row is decided on, and the direction is
+  towards copy-and-patch.** Before it, a `Zone::clone` was 318 ms against a
+  445 ms rebuild — 71% — which is why an earlier reading of this row called
+  tombstones dead on arrival: no shape that *copies* could beat one that
+  rebuilds. After it the clone is 120 ms and dropping the old one 43, so
+  copy-and-patch is 163 ms against 407, and the family is alive again.
+  Tombstones become worth about 2.5x rather than nothing, and 71e would take
+  the copy to roughly 30 ms, which is where O(delta) starts to be the honest
+  description. **Whoever takes this row takes 71e first**, or measures the
+  same wall twice.
 
   **71b closing changes nothing about this row**: the `Arc<PolicyZone>` it
   landed shares a zone that nobody edits, which is the same fact stated the
@@ -4002,6 +4020,110 @@ a correction and not a retraction.
     452-474 after, a hit 252-258 against 255-263. There is no RPZ benchmark to
     hang this on and the A/B was a throwaway, which is why the numbers are here
     rather than in a committed harness.
+
+- **71d. The index key was a `Box<[u8]>` per name, and `std`'s `HashMap` is why
+  — filed and closed 2026-09-17.** **`Zone::clone` 318 ms to 120** at a million
+  records, and a query miss **114 ns to 76**. Out of asking what 71a's copy is
+  made of, and the answer was: the key type.
+
+  A `HashMap` reaches its key only through `Borrow`, so the key must own and
+  hash its own bytes. That is why the index was keyed on `Box<[u8]>` and not on
+  `Name` — `rdns_core::name_keys` makes the same argument for the same reason,
+  and `Name` is a `Box<[u8]>` anyway, so keying on it would have cost the same
+  allocation and lost borrowed probing as well. **The owned key is an artifact
+  of the collection, not of the name type and not of the data.**
+
+  `hashbrown::HashTable` takes the hash and an equality closure from the
+  caller, so an entry can be a range into an arena and nothing allocates per
+  name. It is the API `std` keeps behind the unstable `hash_raw_entry`.
+
+  | at 1M records | before | after |
+  |---|---|---|
+  | `Zone::clone` | 314-321 ms | **119-122 ms** |
+  | dropping that clone | 104-108 ms | **43-44 ms** |
+  | query miss | 114-121 ns | **75-77 ns** |
+  | query hit | 381-392 ns | **213-254 ns** |
+  | `ixfr::Patch::apply` | 445 ms | **407 ms** |
+  | AXFR assemble | 1 160 ms | **1 132 ms** |
+  | reload set, one publisher | 781 ms | **710 ms** |
+  | `size_of::<Zone>()` | 168 B | 176 B |
+
+  **The dependency costs nothing and that was checked, not assumed.**
+  `hashbrown 0.17.1` was already in `Cargo.lock` through `indexmap` <- `toml`
+  (#15) and already linked into both daemons, so the lock gains **one line** —
+  an edge from `rdns`, not a `[[package]]`. **218 packages either side**, which
+  is the number §14 says to count.
+  `default-features = false`, because every probe passes its own hash and the
+  default hasher would be dead weight.
+
+  **FxHash, not SipHash, and the argument is about who can insert.** A weak
+  hash is dangerous where an attacker chooses what shares a bucket; here every
+  key is one of the operator's own zone names and a query only *probes*, so a
+  chosen QNAME reaches at worst the longest collision cluster among names
+  already loaded — a load-time property no packet can grow. Measured: Fx
+  collides on 50 400 of a million-rule feed's 2M names (**2.5%**, against zero
+  for FNV-with-avalanche) and the longest cluster is **2**.
+
+  **Four shapes were built before this one** (§19), on 2M entries:
+
+  | | clone | probe 200k |
+  |---|---|---|
+  | `HashMap<Box<[u8]>, Slot>`, SipHash — what this replaced | 244 ms | 47 ms |
+  | the same, FxHash | 242 ms | 20 ms |
+  | a 40-byte inline key | 61 ms | 33 ms |
+  | arena + hash key, `enum` bucket | 42 ms | 28 ms |
+  | arena + hash key, POD entry — **this** | 11 ms | 15 ms |
+
+  The second row is the one worth keeping: **the whole copy cost is the
+  per-key `Box`**, and the same table keyed on a `u64` clones 41x faster.
+  Nothing about the table's shape matters.
+
+  **The hand-rolled version had a bug and the dependency is what removed it.**
+  Before reaching for `HashTable`, the arena index carried its own collision
+  chain; on an insert it handed back the *incumbent's* slot, so two names'
+  records were filed under one of them — 236 of the 10 000 names
+  `bench_zone_lookup` builds came back with two records. The logic was read
+  through twice and called correct both times; the benchmark caught it on the
+  first run (§19: arguing costs more than compiling).
+  `an_index_keeps_two_names_that_hash_alike_apart` is that pair, and it fails
+  against an index that trusts the hash, as does `bench_zone_lookup`.
+
+  **`usize` offsets, not `u32`, at 6% of the clone.** `u32` was 114 ms against
+  120 and `names.len() as u32` silently truncates on an arena past 4 GB —
+  reachable on a zone of a few hundred million names, which is well after
+  `records` has exhausted the machine but is not never. `usize` removes the
+  truncation instead of guarding it, and a guard on a load path would have to
+  be a panic or a new error on `add_record` (§2's "`as` is a bug until proven
+  otherwise", §4 on what a load path may do).
+
+  **Allocation counts moved *up* on a small zone and that is the trade**: 87 ->
+  88 to parse an eight-record zone and 566 -> 570 to sign one, because the
+  arena is one allocation a zone pays whatever its size, against two per name
+  it stops paying. The reason is written beside both assertions (§17).
+
+  **What this does not do is close 71a.** A rebuild is 407 ms, not O(delta),
+  because `Patch::apply` re-hashes every name rather than copying the index —
+  and nothing on any measured path clones a `Zone` today. What it changes is
+  the arithmetic 71a is decided on: see that row. The next stage is 71e.
+
+- **71e. `ZoneRecord` is two allocations per record — filed 2026-09-17.** What
+  is left of the copy after 71d: `Name(Box<[u8]>)` and
+  `RecordData { rdata: Box<[u8]> }` are one heap allocation each, so cloning a
+  million-record zone is still two million of them. That is **~108 ms of the
+  120** `Zone::clone` now costs — the index is the other ~12, and it is a
+  memcpy of two vectors.
+
+  The same remedy applies and it is the one `CLAUDE.md` §13 already argues for
+  the name compressor: one arena plus ranges. It would take the clone to
+  roughly the 11 ms the index table measures.
+
+  **No remedy claimed, because the blast radius is real and unmeasured here.**
+  `ZoneRecord` is `pub` with `pub name` and `pub rdata`, and `records()` hands
+  out `&[ZoneRecord]` at 103 call sites. Whoever takes it should read #64g
+  first: the clone it removed was buying the signing loop its RDATA order, so
+  an arena has to be laid out in the order the reader walks, not the order the
+  writer wrote. That is the same sentence #65's unowned half needs, which is
+  why this is the row that reaches #65's 4.4 s and 71a's 407 ms at once.
 
 - **71c. Three of four zone rebuilds never got #61b's `reserve` — filed and
   closed 2026-09-16.** **793 ms to 445** for `ixfr::Patch::apply` at a million

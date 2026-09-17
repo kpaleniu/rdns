@@ -34,8 +34,7 @@ use crate::Serial;
 use crate::Ttl;
 use crate::{Name, NameRef, Qtype, RecordData, ResourceRecord};
 use std::borrow::Cow;
-use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 mod checks;
 mod parse;
@@ -114,10 +113,171 @@ impl FileDigest {
     }
 }
 
-/// Positions in [`Zone::records`], by the folded wire form of the owner name.
-/// Named so that [`Zone::note_non_terminals`] can take it apart from the rest
-/// of the zone.
-type NameIndex = HashMap<Box<[u8]>, Slot>;
+/// Positions in [`Zone::records`], by the folded wire form of the owner name:
+/// every name in one arena, and a table whose entries do not own their key.
+///
+/// A name that exists only because something below it does — an empty
+/// non-terminal (RFC 4592 §2.2.2) — is an entry with **no positions**. It was a
+/// second `HashSet` until 2026-09-05, which made every level of a miss walk
+/// hash the name twice to ask two halves of one question (`TODO.md` #22): "is
+/// this a node of the zone, and does it have records". An ENT costs no arena
+/// bytes either: it is a suffix of a name already interned, so it is a range
+/// into that one.
+///
+/// **Why not a `HashMap`, which is what this was until `TODO.md` #71d.** A
+/// `HashMap` reaches its key only through `Borrow`, so the key must own and
+/// hash its own bytes — `Box<[u8]>` here, because `Name` cannot borrow to
+/// `NameRef` without the `unsafe` cast `str` uses (`rdns_core::name_keys`
+/// makes the same argument for the same reason). That is a `Box` per name,
+/// which is a heap allocation per name to load and another per name to copy:
+/// cloning a million-record zone's index was two million of them, 244 ms where
+/// the same table keyed on a `u64` takes 6.
+///
+/// [`hashbrown::HashTable`] takes the hash and an equality closure from the
+/// caller, so an entry can be a range into the arena and nothing here allocates
+/// per name. It is the API `std` keeps behind the unstable `hash_raw_entry`,
+/// and hashbrown is what `std::collections::HashMap` is built on — already in
+/// `Cargo.lock` through `toml`, and already linked into both daemons, so
+/// naming it costs no package.
+///
+/// A hash collision is hashbrown's business rather than this type's: the
+/// closure compares the arena bytes, so two names that hash alike stay two
+/// names. See `an_index_keeps_two_names_that_hash_alike_apart`.
+#[derive(Debug, Clone, Default)]
+struct NameIndex {
+    names: Vec<u8>,
+    table: hashbrown::HashTable<Interned>,
+}
+
+/// One name in the index: where its bytes are, and what is at it.
+#[derive(Debug, Clone, Copy)]
+struct Interned {
+    off: usize,
+    len: u32,
+    slot: Slot,
+}
+
+/// FxHash, as rustc uses, over the folded name.
+///
+/// **Not collision-resistant, and that is a decision rather than an oversight.**
+/// A weak hash is dangerous where an attacker can *insert*, because they choose
+/// what shares a bucket; here every key is one of the operator's own zone names,
+/// and a query only probes. So a chosen QNAME reaches at worst the longest
+/// collision cluster among names already loaded — a load-time property of the
+/// zone, which no packet can grow. Measured over a million-rule feed, where Fx
+/// collides on 2.5% of names, that cluster is 2.
+///
+/// The names are the reason it is not the default hasher: SipHash over ~38
+/// octets, twice per label of an ancestor walk, is the single largest thing a
+/// miss pays. 114 ns against 82 for a miss on a million-record zone
+/// (`TODO.md` #71d).
+fn name_hash(key: &[u8]) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h: u64 = 0;
+    let (chunks, remainder) = key.as_chunks::<8>();
+    for c in chunks {
+        h = (h.rotate_left(5) ^ u64::from_le_bytes(*c)).wrapping_mul(K);
+    }
+    let mut tail = 0u64;
+    for (i, b) in remainder.iter().enumerate() {
+        tail |= u64::from(*b) << (i * 8);
+    }
+    (h.rotate_left(5) ^ tail).wrapping_mul(K)
+}
+
+impl Interned {
+    fn range(&self) -> std::ops::Range<usize> {
+        self.off..self.off + self.len as usize
+    }
+}
+
+impl NameIndex {
+    fn find(&self, key: &[u8]) -> Option<&Interned> {
+        let names = &self.names;
+        self.table
+            .find(name_hash(key), |at| &names[at.range()] == key)
+    }
+
+    fn get(&self, key: &[u8]) -> Option<&Slot> {
+        self.find(key).map(|at| &at.slot)
+    }
+
+    fn contains_key(&self, key: &[u8]) -> bool {
+        self.find(key).is_some()
+    }
+
+    fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &Slot> {
+        self.table.iter().map(|at| &at.slot)
+    }
+
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = (&[u8], &Slot)> {
+        self.table
+            .iter()
+            .map(|at| (&self.names[at.range()], &at.slot))
+    }
+
+    fn clear(&mut self) {
+        self.names.clear();
+        self.table.clear();
+    }
+
+    fn reserve(&mut self, entries: usize, bytes: usize) {
+        let names = &self.names;
+        self.table
+            .reserve(entries, |at| name_hash(&names[at.range()]));
+        self.names.reserve(bytes);
+    }
+
+    /// The slot at `key`, inserting [`Slot::Ent`] if the name is new.
+    ///
+    /// `bytes` is where `key` already lives in the arena, for a caller that has
+    /// just interned it or knows it is a suffix of something interned; `None`
+    /// appends a copy.
+    fn slot_mut(&mut self, key: &[u8], bytes: Option<(usize, u32)>) -> &mut Slot {
+        // Destructured, so the closures can borrow the arena while the table is
+        // borrowed mutably beside it.
+        let NameIndex { names, table } = self;
+        let entry = table.entry(
+            name_hash(key),
+            |at| &names[at.range()] == key,
+            |at| name_hash(&names[at.range()]),
+        );
+        match entry {
+            hashbrown::hash_table::Entry::Occupied(at) => &mut at.into_mut().slot,
+            hashbrown::hash_table::Entry::Vacant(slot) => {
+                let (off, len) = bytes.unwrap_or_else(|| {
+                    let off = names.len();
+                    names.extend_from_slice(key);
+                    (off, key.len() as u32)
+                });
+                &mut slot
+                    .insert(Interned {
+                        off,
+                        len,
+                        slot: Slot::Ent,
+                    })
+                    .into_mut()
+                    .slot
+            }
+        }
+    }
+
+    /// Copy `key` into the arena and give back its range, or the range it
+    /// already has.
+    fn intern(&mut self, key: &[u8]) -> (usize, u32) {
+        if let Some(at) = self.find(key) {
+            return (at.off, at.len);
+        }
+        let off = self.names.len();
+        self.names.extend_from_slice(key);
+        (off, key.len() as u32)
+    }
+}
 
 /// Where one owner name's records are.
 ///
@@ -126,7 +286,7 @@ type NameIndex = HashMap<Box<[u8]>, Slot>;
 /// record, so that was a million allocations of one element (`TODO.md` #61e).
 /// The single case is handed out through `slice::from_ref`, so it has nothing on
 /// the heap and one fewer pointer to chase.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum Slot {
     /// An empty non-terminal: a node of the zone with no records of its own
     /// (RFC 4592 §2.2.2). Distinct from `One`/`Spilled` because "does this name
@@ -314,7 +474,7 @@ impl Zone {
         Zone {
             origin,
             records: Vec::new(),
-            index: HashMap::new(),
+            index: NameIndex::default(),
             spills: Vec::new(),
             nsec_chain: BTreeMap::new(),
             nsec3_chain: BTreeMap::new(),
@@ -366,7 +526,9 @@ impl Zone {
     /// all children of the apex.
     pub(crate) fn reserve(&mut self, records: usize) {
         self.records.reserve(records);
-        self.index.reserve(2 * records);
+        // A name is ~25 bytes on the wire for an ordinary zone; the arena grows
+        // past a low guess without moving a key, so this is a hint not a bound.
+        self.index.reserve(2 * records, 25 * records);
     }
 
     /// Room for a rebuild of `base`, plus `extra` records it will gain.
@@ -384,7 +546,8 @@ impl Zone {
     /// and stopped at one of four sites (#71c).
     pub(crate) fn reserve_like(&mut self, base: &Zone, extra: usize) {
         self.records.reserve(base.records.len() + extra);
-        self.index.reserve(base.index.len() + extra);
+        self.index
+            .reserve(base.index.len() + extra, base.index.names.len());
         self.spills.reserve(base.spills.len());
     }
 
@@ -399,9 +562,10 @@ impl Zone {
         let origin_key = self.origin.as_ref().folded();
         let at_apex = key == *origin_key;
         self.shortcuts.note(&key, record.rdata.rtype(), at_apex);
-        Zone::note_non_terminals(&mut self.index, &key, &origin_key);
+        let at = self.index.intern(&key);
+        Zone::note_non_terminals(&mut self.index, &key, at, &origin_key);
         drop(origin_key);
-        self.file(key.into_boxed_slice(), position);
+        self.file(&key, at, position);
         match self.chain_key(&record) {
             Some(ChainKey::Nsec(k)) => {
                 self.nsec_chain.insert(k, position);
@@ -764,22 +928,19 @@ impl Zone {
     /// An owner name with one record keeps its position in the table; the names
     /// that hold an RRset of several, or several types, get a list. Which way a
     /// zone leans decides the cost, and a policy feed leans entirely one way.
-    fn file(&mut self, key: Box<[u8]>, position: usize) {
-        match self.index.entry(key) {
-            Entry::Vacant(slot) => {
-                slot.insert(Slot::One(position));
+    fn file(&mut self, key: &[u8], at: (usize, u32), position: usize) {
+        // The spill list is pushed before the slot is taken mutably, because
+        // both borrow `self`.
+        match *self.index.slot_mut(key, Some(at)) {
+            // Vacant, or a name noted as an ancestor that now has a record of
+            // its own.
+            Slot::Ent => *self.index.slot_mut(key, Some(at)) = Slot::One(position),
+            Slot::One(first) => {
+                self.spills.push(vec![first, position]);
+                let list = self.spills.len() - 1;
+                *self.index.slot_mut(key, Some(at)) = Slot::Spilled(list);
             }
-            Entry::Occupied(mut slot) => match *slot.get() {
-                // A name noted as an ancestor now has a record of its own.
-                Slot::Ent => {
-                    slot.insert(Slot::One(position));
-                }
-                Slot::One(first) => {
-                    self.spills.push(vec![first, position]);
-                    slot.insert(Slot::Spilled(self.spills.len() - 1));
-                }
-                Slot::Spilled(list) => self.spills[list].push(position),
-            },
+            Slot::Spilled(list) => self.spills[list].push(position),
         }
     }
 
@@ -806,7 +967,8 @@ impl Zone {
     /// so the walk can slice `key` in place: owning each ancestor to satisfy one
     /// `&mut self` cost four allocations per record and 0.65 s of a million-rule
     /// load.
-    fn note_non_terminals(index: &mut NameIndex, key: &[u8], origin: &[u8]) {
+    fn note_non_terminals(index: &mut NameIndex, key: &[u8], at: (usize, u32), origin: &[u8]) {
+        let (off, len) = at;
         let mut name = key;
         while let Some(parent) = parent_key(name) {
             if parent.len() < origin.len() {
@@ -814,13 +976,14 @@ impl Zone {
                 // are somebody else's names and do not exist here.
                 return;
             }
-            // `contains_key` then `insert` hashes twice on the miss, which is
-            // the one that also allocates; `entry` would hash once and allocate
-            // on the *hit* too, which is the commoner of the two here.
             if index.contains_key(parent) {
                 return;
             }
-            index.insert(parent.into(), Slot::Ent);
+            // A suffix of a name already in the arena, so it stores no bytes of
+            // its own — which is half the arena for a feed whose every rule
+            // brings one ancestor with it.
+            let skipped = len as usize - parent.len();
+            index.slot_mut(parent, Some((off + skipped, len - skipped as u32)));
             if parent == origin {
                 return;
             }
@@ -853,8 +1016,9 @@ impl Zone {
         self.shortcuts = Shortcuts::default();
         for (position, (key, rtype, at_apex)) in keys.into_iter().enumerate() {
             self.shortcuts.note(&key, rtype, at_apex);
-            Zone::note_non_terminals(&mut self.index, &key, &origin_key);
-            self.file(key.into_boxed_slice(), position);
+            let at = self.index.intern(&key);
+            Zone::note_non_terminals(&mut self.index, &key, at, &origin_key);
+            self.file(&key, at, position);
         }
 
         // The chains are not rebuilt. [`Zone::chain_key`] reads the record's own
@@ -940,6 +1104,55 @@ mod tests {
         // too. Deliberate and stated in the doc comment: erring towards a
         // re-parse is the direction that cannot lose an edit.
         assert!(FileDigest::of_self_contained(b"$INCLUDED IN TXT nope\n").is_none());
+    }
+
+    /// Two names whose folded octets hash to the same `u64` are still two
+    /// names — `TODO.md` #71d.
+    ///
+    /// Not hypothetical and not synthetic: FxHash collides on 2.5% of a
+    /// million-rule feed's names, and this pair is one of 236 found in the ten
+    /// thousand `bench_zone_lookup` already builds. The first version of the
+    /// arena index filed both records under one of them, because its
+    /// hand-rolled collision chain handed back the *incumbent's* slot on an
+    /// insert — `bench_zone_lookup` failed on the first run and this test names
+    /// the reason. The shipped index leaves collisions to hashbrown, which is
+    /// the argument for using it.
+    #[test]
+    fn an_index_keeps_two_names_that_hash_alike_apart() {
+        let a = nm("host1319.example.com.");
+        let b = nm("host1392.example.com.");
+        assert_eq!(
+            name_hash(&a.as_ref().folded()),
+            name_hash(&b.as_ref().folded()),
+            "this pair has to still collide, or the test is a regression for nothing"
+        );
+
+        let mut zone = Zone::new(nm("example.com."));
+        for name in [&a, &b] {
+            zone.add_record(ZoneRecord {
+                name: name.clone(),
+                ttl: Ttl::from_secs(3600),
+                class: Class::new(1),
+                rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1)))
+                    .expect("an A record"),
+            });
+        }
+
+        for name in [&a, &b] {
+            let found = zone.query(name.as_ref(), Qtype::of(record_types::A));
+            assert_eq!(
+                found.len(),
+                1,
+                "{} answered with {} records",
+                name.as_ref().to_presentation(),
+                found.len()
+            );
+            assert_eq!(found[0].name, *name, "and with the other name's record");
+        }
+
+        // The ancestor they share is one node, not two: an empty non-terminal
+        // is interned as a range into whichever name reached it first.
+        assert!(zone.name_exists(nm("example.com.").as_ref()));
     }
 
     #[test]

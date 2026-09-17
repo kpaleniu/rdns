@@ -820,6 +820,13 @@ fn one_zone_load_and_sign() {
     // a one-field RDATA text are borrowed from the file unless a comment, a
     // quote, an escape or a parenthesis means they are not a contiguous run of
     // it. 89 here, and 325 ms of a million-rule RPZ load.
+    //
+    // **87 -> 88 with `TODO.md` #71d, and up is the right direction here.** The
+    // name index holds its keys in one arena instead of a `Box<[u8]>` each, so
+    // it allocates once for the arena and then not per name: this zone has
+    // eight records and pays the one, where a million-record zone stops paying
+    // two million. §17 asks for the reason either way, and this is the shape of
+    // it — a fixed cost traded against a per-record one.
     within("parse an eight-record zone", parse_count, 60..=200);
 
     let keys = vec![
@@ -852,6 +859,12 @@ fn one_zone_load_and_sign() {
     // the map — two per record, and the one measurement of that change that
     // does not depend on what else the machine is doing. Downward, and §17 asks
     // for a reason either way.
+    //
+    // **566 -> 570 with `TODO.md` #71d**, for the reason above the parse
+    // assertion: `sign_zone_inner` builds its output zone without a `reserve`,
+    // so the name arena grows from empty and doubles a few times. Four
+    // allocations on an eight-record zone, against two per name saved on a
+    // large one.
     within("sign an eight-record zone", sign_count, 400..=1_400);
 }
 
