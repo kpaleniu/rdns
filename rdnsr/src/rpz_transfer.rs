@@ -4,9 +4,9 @@
 //! One task per transferred feed, on the zone's own SOA timers. A refresh asks
 //! the master for its serial first and stops there unless it moved; what
 //! arrives otherwise is a [`rdns::zone::Zone`], serialized, written where
-//! `[[rpz.feeds]].file` says, and read back by the existing reload path.
-//! Nothing in the answer path changes, and `PolicyStore` learns of a transfer
-//! only by being asked which version it holds.
+//! `[[rpz.feeds]].file` says, and handed to the store beside the digest of
+//! those bytes, so the reload installs it rather than parsing the file back
+//! (`TODO.md` #71f). Nothing in the answer path changes.
 //!
 //! **What a refresh costs, measured** (`rdns/tests/rpz_install.rs`, a million
 //! QNAME rules, release, the development machine, `TODO.md` #57e):
@@ -14,23 +14,25 @@
 //! | | ms |
 //! |---|---|
 //! | the serial probe, which is all an unchanged feed costs | 0.3 |
-//! | a whole zone (AXFR) | 1 160 |
-//! | the difference from the version in force (IXFR) | 453 |
-//! | writing the file and reading it back | 1 200-1 420 |
+//! | a whole zone (AXFR) | 1 061-1 102 |
+//! | the difference from the version in force (IXFR) | 383-395 |
+//! | writing the file and installing the zone | 526 |
 //!
-//! Re-measured 2026-09-16. The first figures — 1 596, 808 and 1 351 — were
-//! taken with three million-rule measurements running at once (`TODO.md` #71's
-//! head); the transfer rows then halved again when #71c gave the zone rebuild
-//! the record count it already had. The last row is a band because it writes
-//! 38 MB to disk.
+//! Re-measured 2026-09-18, the last row having been 1 141-1 261 before: it
+//! is the serialization (247 ms), the write of 38 MB, the read and digest that
+//! proves the file is still that zone (21 ms), and the index (41 ms). What it
+//! no longer contains is a parse of what this process had already built, which
+//! was 613 ms of it.
+//!
+//! The figures before that — 1 596, 808 and 1 351 — were taken with three
+//! million-rule measurements running at once (`TODO.md` #71's head); the
+//! transfer rows then halved again when #71c gave the zone rebuild the record
+//! count it already had.
 //!
 //! So an unchanged million-rule feed costs one round trip where it used to cost
-//! a transfer and a reload, and a changed one asks for what changed. The
-//! install is the half that is still zone-sized whatever arrives, because the
-//! file is the store (`TODO.md` #57d's shape A). It is that feed's size and no
-//! more: a reload keeps every feed whose file has not moved, so one publisher
-//! no longer re-reads the others (`TODO.md` #71b). What is left zone-sized is
-//! #71a.
+//! a transfer and a reload, and a changed one asks for what changed. What is
+//! left zone-sized is the serialization and the write — the file is the store
+//! (`TODO.md` #57d's shape A) — and, on the transfer side, #71a's rebuild.
 //!
 //! **What it buys**, and the reason the row called it the one that argues for
 //! itself: the file is the thing that survives a restart. A resolver that
@@ -42,9 +44,9 @@
 //! of [`PolicyStore`] rather than kept beside it: that zone is the file's
 //! contents, already parsed for the answer path, so a refresh holds no second
 //! copy of a feed. It can be one reload behind the file — a transfer installs
-//! by writing and asking for a re-read — which only means asking from an older
-//! serial, and RFC 1995 §4 lets a master answer that with a longer chain or
-//! with the whole zone.
+//! by offering the zone and asking for a reload — which only means asking from
+//! an older serial, and RFC 1995 §4 lets a master answer that with a longer
+//! chain or with the whole zone.
 //!
 //! The transfer is signed when the feed's master names a key with `#name`
 //! (`TODO.md` #57f). The key is resolved out of `[keys]` at startup, so a name
@@ -73,7 +75,7 @@ use rdns::secondary::{MasterSpec, RefreshTimers};
 use rdns::shutdown::{Busy, Stop};
 use rdns::tsig::TsigKey;
 use rdns::xfr::{self, Master};
-use rdns::zone_writer::write_zone_file;
+use rdns::zone_writer::{write_zone_text, zone_to_string};
 use tokio::sync::Notify;
 
 use crate::reload::PolicyReload;
@@ -326,12 +328,34 @@ async fn fetch_and_write(
     let timers = RefreshTimers::from_zone(&zone).unwrap_or_default();
     let records = zone.records().len();
 
-    // Serializing and writing is 1 130 ms of the 1 894 a millon-rule refresh
-    // costs here, and both halves are blocking — the write especially, which is
-    // an fsync and a rename (`rdns::persist`). Off the workers, as the reload
-    // itself has been since #57b.
+    // Serializing and writing is blocking — the write especially, which is an
+    // fsync and a rename (`rdns::persist`) — and so is the indexing that
+    // follows. Off the workers, as the reload itself has been since #57b.
+    //
+    // The zone goes to the store as well as to the file: the reload below reads
+    // the file either way, but with the digest of what was written in hand it
+    // installs this zone instead of parsing 38 MB back into the one it already
+    // has (`TODO.md` #71f).
     let path = feed.file.clone();
-    tokio::task::spawn_blocking(move || write_zone_file(&zone, &path)).await??;
+    let store = policy.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let text = zone_to_string(&zone)?;
+        write_zone_text(&text, &path)?;
+        // Warned and not propagated: the transfer's job was to get the zone on
+        // disk and it is done, so a store that cannot place the zone costs the
+        // reload a parse — the route this refresh took before #71f — rather
+        // than a failed refresh and a retry. Only a feed nobody reads gets
+        // here, which the configuration makes unreachable: `[[rpz.feeds]]`
+        // builds both lists.
+        if let Err(e) = store.offer(&path, zone, &text) {
+            tracing::warn!(
+                "the transferred zone will be parsed back from {}: {e}",
+                path.display()
+            );
+        }
+        Ok(())
+    })
+    .await??;
 
     tracing::info!(
         "policy zone {} transferred from {master}{how}: {records} records written to {}",
@@ -542,6 +566,16 @@ mod tests {
         assert!(
             reload_queued(&reload).await,
             "a feed that changed has to be re-read before it is in force"
+        );
+
+        // And the reload it asked for installs the zone this task already had,
+        // rather than parsing the file it just wrote (`TODO.md` #71f). Fails
+        // against the version that only wrote the file: `reread` would be 1.
+        let reloaded = store.reload().expect("the reload runs");
+        assert_eq!(
+            (reloaded.reread, reloaded.installed),
+            (0, 1),
+            "the transferred zone is installed from the copy the task held"
         );
     }
 

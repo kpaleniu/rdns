@@ -913,10 +913,15 @@ pub(crate) fn reload_policy(serving: &Resolving) {
             // kept whole (`TODO.md` #71b), so an operator whose edit did not
             // register sees "0 of 3" here rather than a line that reads the
             // same either way.
+            // Both counts, because they differ only in cost: a feed this
+            // process transferred and wrote is installed from the copy it
+            // already held (`TODO.md` #71f), and reporting that as "0 changed"
+            // would send an operator to look at a file that is in force.
             tracing::info!(
-                "policy zones re-read: {} of {} feeds had changed",
+                "policy zones re-read: {} of {} feeds had changed, {} installed from a transfer",
                 reloaded.reread,
-                reloaded.zones.zones().len()
+                reloaded.zones.zones().len(),
+                reloaded.installed,
             );
             log_policy(&reloaded.zones);
             // The one thing a new rule cannot reach on its own. A QNAME or

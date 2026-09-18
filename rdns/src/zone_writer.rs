@@ -63,8 +63,17 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
 /// a zone being rewritten, and a record that cannot be expressed leaves the
 /// previous file untouched.
 pub fn write_zone_file(zone: &Zone, path: &Path) -> Result<(), ZoneError> {
-    let text = zone_to_string(zone)?;
-    crate::persist::write_atomically_str(path, &text).map_err(|source| ZoneError::Io {
+    write_zone_text(&zone_to_string(zone)?, path)
+}
+
+/// The same, for a caller that needs the text as well as the file.
+///
+/// A digest of what was written is how the next reader knows it need not parse
+/// the file back (`TODO.md` #71f, `rdns::rpz::PolicyStore::offer`), and
+/// serializing a million-record zone twice to get it is 249 ms
+/// (`rdns/tests/record_storage.rs`).
+pub fn write_zone_text(text: &str, path: &Path) -> Result<(), ZoneError> {
+    crate::persist::write_atomically_str(path, text).map_err(|source| ZoneError::Io {
         path: path.display().to_string(),
         source,
     })

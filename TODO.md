@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#71** and **#21**, as of 2026-09-16. **#57 is
+**#58**, **#68**, **#71** and **#21**, as of 2026-09-18. **#57 is
 closed**: 57e was the last of it, and the measurement that
 could have refuted it did — IXFR as this tree had it was *slower* than a whole
 transfer, because applying forty records to a million-record zone cost 1 018 ms
@@ -52,9 +52,18 @@ same day**: three of the four sites that rebuild a zone never got #61b's
 2026-09-17**: the index keyed every name on a `Box<[u8]>` because a `HashMap`
 reaches its key only through `Borrow` — an artifact of the collection, not of
 `Name` — so `hashbrown::HashTable` and one arena took `Zone::clone` from 318 ms
-to 120 and a query miss from 114 ns to 76, at zero packages. What is left is
-**71a**, now 407 ms rather than the 793 it was filed at, and **71e**, the same
-`Box`-per-value question for `ZoneRecord`. Three by-products worth the trip:
+to 120 and a query miss from 114 ns to 76, at zero packages. **71f closed
+2026-09-18 and is the largest number this row had**: the install wrote the file
+and then *parsed it back*, re-deriving a zone the process was still holding —
+1 141-1 261 ms to 526 at a million rules, on a digest `rdnsd`'s UPDATE path has used
+since #64b and on an equality that turned out to be asserted nowhere — the
+assertion cited for it compares record *counts*, which is §4 arriving in a
+row's evidence rather than in its code. The sentence calling that row "shape A's trade and not a defect" is struck
+in place, because reading it as a trade is why it sat. What is left is
+**71a**, now 372-395 ms rather than the 793 it was filed at, and **71e**, whose
+remedy and blast radius are now both measured — an arena wins on every axis, it
+costs 98 compiler errors in `rdns` and ~21 in the binaries, and its last live
+caller went away with 71f, so it waits on 71a. Three by-products worth the trip:
 `rpz_install.rs` had no turnstile, so every number #57e and #71 recorded was
 taken with two other million-rule measurements running (#64b's defect, found
 twice); Linux clippy caught a lint the Windows one does not have, on a change
@@ -708,6 +717,18 @@ cargo bench -p rdns -- --baseline before        # and compare against it
 # same measurement.
 cargo test --release -p rdns --test scale -- --ignored --nocapture
 RDNS_SCALE_RECORDS=100000 RDNS_SCALE_VERIFY=1000 cargo test --release -p rdns --test scale -- --ignored --nocapture
+
+# What a policy feed costs to install and to refresh (#57d, #57e, #71). Three
+# measurements that take turns, because the recipe selects all of them and
+# libtest would otherwise run three million-rule runs at once (#71b).
+cargo test --release -p rdns --test rpz_install -- --ignored --nocapture
+RDNS_RPZ_RULES=100000 cargo test --release -p rdns --test rpz_install -- --ignored --nocapture
+
+# What a zone's records cost to hold, to copy and to parse (#71e, #71f): what a
+# `Zone::clone` is made of against an arena's floor, and what a feed's load is
+# made of — 613 ms and eight allocations per record at a million rules.
+cargo test --release -p rdns --test record_storage -- --ignored --nocapture
+RDNS_RECORDS=100000 cargo test --release -p rdns --test record_storage -- --ignored --nocapture
 
 # The two probes, which measure one thing each and are not part of any suite.
 # Their headers carry what they measured and when; read those before quoting a
@@ -1646,7 +1667,8 @@ refresh that only asks for what moved.
   the 808~~ **the whole of the 783** is rebuilding a `Zone` whose index holds
   positions and cannot be edited — an empty difference sequence costs 793 on the
   same zone, which is the same number back — and the ~~1 351 ms~~ **1 190 ms**
-  install is shape A writing out what this process already holds. Both are
+  install is shape A writing out what this process already holds (**526 ms**
+  since #71f, which is what happened to the half of it that read the file back). Both are
   measured there, and 71a is the same obstacle #64g and #65 reach from the
   UPDATE and signing sides.
 
@@ -3878,7 +3900,7 @@ Prometheus and the `image` job's probes all send a `Host` and are unaffected.
 
 ---
 
-### 71. A forty-record change rebuilds a zone and re-reads a file — **filed 2026-09-16, 71b closed the same day**
+### 71. A forty-record change rebuilds a zone and re-reads a file — **filed 2026-09-16; 71b, 71c, 71d and 71f closed**
 
 Out of 57e, which took the wire down to what actually changed and left
 everything after it sized by the zone. Measured on the development machine,
@@ -3888,23 +3910,37 @@ release, a million-rule QNAME feed
 | applying a forty-rule change at 1M rules | ms |
 |---|---|
 | the difference off the wire and assembled | ~~about 7~~ **below the noise** |
-| `ixfr::Patch::apply`, rebuilding the zone | ~~801~~ ~~793~~ **445** |
-| `write_zone_file` then `PolicyZone::load` | ~~1 351~~ **1 200-1 420** |
+| `ixfr::Patch::apply`, rebuilding the zone | ~~801~~ ~~793~~ ~~445~~ **372-395** |
+| serializing, writing, and putting the zone in force | ~~1 351~~ ~~1 200-1 420~~ **526** |
 
 The first row is now a *nothing* rather than a small number: the whole IXFR
 round trip is 453 ms and applying an **empty** difference sequence to a zone
 this size is 445-458, so the wire and the assembly are smaller than what
 separates two runs of this harness. Same conclusion as the 7, at a size where
-the subtraction no longer has a sign.
+the subtraction no longer has a sign. Both halves fell together after 71d and
+the subtraction is still nothing: 383-395 against 372-395 on 2026-09-18.
 
 The second row halved again on 2026-09-16, and that is **71c**: the rebuild was
 growing a two-million-entry index from empty when both counts were sitting in
-the zone it was rebuilding. The third is a band because it writes 38 MB to disk.
+the zone it was rebuilding; 71d took the last 38 ms off it. The third stopped
+being a band when it stopped containing a parse (**71f**): it is 247 ms of
+serialization, a 38 MB write, 21 ms to read the file back and digest it, and
+41 ms to index.
 
-Only the first is the size of the change. The third is shape A's trade and not
-a defect — the file is the store (#57d), so an install serializes a zone this
-process holds and parses it back, which is what buys a restart its rules — and
-it is in the table so that 71a's number is not read as the whole cost.
+Only the first is the size of the change. ~~The third is shape A's trade and
+not a defect — the file is the store (#57d), so an install serializes a zone
+this process holds and parses it back, which is what buys a restart its rules —
+and it is in the table so that 71a's number is not read as the whole cost.~~
+
+**Half of that was wrong, and it is the largest thing this row turned out to
+hold.** What buys a restart its rules is the *write*; the parse back was this
+process re-deriving a zone it was holding, 613 ms of it. Putting it in
+the table so 71a would not be read as the whole cost is what made it visible —
+and then the sentence said "not a defect" about a row nobody had decomposed.
+Taken as **71f**. The property it rests on — that the zone written and the zone
+the file parses back to are one zone — turned out to be asserted nowhere: the
+line that looked like it compares record *counts*. It is a test now, and the
+row says how that was found.
 
 **The struck figures were measured against themselves**, and finding that is
 71b's by-product rather than its point. `rpz_install.rs` holds three
@@ -4111,19 +4147,118 @@ a correction and not a retraction.
   `RecordData { rdata: Box<[u8]> }` are one heap allocation each, so cloning a
   million-record zone is still two million of them. That is **~108 ms of the
   120** `Zone::clone` now costs — the index is the other ~12, and it is a
-  memcpy of two vectors.
+  memcpy of two vectors. Re-measured on its own harness the next day, on a zone
+  of shorter names: 79-82 ms of 96-99, plus 32-38 to drop the copy. The same
+  85%.
 
   The same remedy applies and it is the one `CLAUDE.md` §13 already argues for
   the name compressor: one arena plus ranges. It would take the clone to
   roughly the 11 ms the index table measures.
 
-  **No remedy claimed, because the blast radius is real and unmeasured here.**
-  `ZoneRecord` is `pub` with `pub name` and `pub rdata`, and `records()` hands
-  out `&[ZoneRecord]` at 103 call sites. Whoever takes it should read #64g
-  first: the clone it removed was buying the signing loop its RDATA order, so
-  an arena has to be laid out in the order the reader walks, not the order the
-  writer wrote. That is the same sentence #65's unowned half needs, which is
-  why this is the row that reaches #65's 4.4 s and 71a's 407 ms at once.
+  ~~**No remedy claimed, because the blast radius is real and unmeasured here.**~~
+  **Both measured 2026-09-18**, and the remedy the row named is the one to take
+  *if* the row is taken at all — which is now a smaller if than it was. Whoever
+  takes it should still read #64g first: the clone it removed was buying the
+  signing loop its RDATA order, so an arena has to be laid out in the order the
+  reader walks, not the order the writer wrote. That is the same sentence #65's
+  unowned half needs.
+
+  **The shapes, built and timed** (1M records, release, the development
+  machine; `rdns/tests/record_storage.rs` holds the two that measure the real
+  type, and the four-way comparison was a throwaway A/B as #71b's was):
+
+  | how a record holds its two byte strings | fill | allocations | held | clone | drop | `size_of` |
+  |---|---|---|---|---|---|---|
+  | a `Box` per field — **today** | 80.4 ms | 2 000 001 | 64.7 MiB | 83-87 ms | 32-33 ms | 40 B |
+  | an `Arc` per field | 97.4 ms | 2 000 001 | 99.2 MiB | 12-13 ms | 10-11 ms | 40 B |
+  | 40 octets inline, longer on the heap | 34.0 ms | 1 | 99.2 MiB | 16-19 ms | 4.3-4.4 ms | 104 B |
+  | 23/15 octets inline | 62.7 ms | 900 001 | 81.6 MiB | 54-56 ms | 17 ms | 64 B |
+  | **one arena plus ranges** | 22.3 ms | 41 | 58.0 MiB | 3.8-4.1 ms | 0.9-1.0 ms | 24 B |
+
+  The arena is the only shape that wins on every axis, so there is nothing to
+  argue about the *shape*. `Arc` buys the copy and costs 34 MiB and a slower
+  fill; inline at 40 costs the same memory and a 104-byte record on the query
+  path; inline at 23/15 is neither, and the feed it was measured on has 900 000
+  of its million names over 23 octets.
+
+  **The blast radius, counted the way 63a counted its own** — seal
+  `Zone::records` and let the compiler name what cannot be done without it:
+  **98 errors in `rdns` across 13 files**, and ~21 more in the binaries, which
+  stop compiling behind it. It is not only `records()`: 41 of those sites are
+  `.len()`/`.is_empty()` and survive an iterator, but a borrowed record means a
+  borrowed `RecordData` as well, and 14 signatures take `&RecordData` today.
+  That type's fields are sealed in a module of their own *on purpose* (§17), so
+  the ref type has to reach the same decoders rather than get a constructor
+  that skips them.
+
+  **And the measurement that could refute the row did, on the load path.**
+  Parsing a million-rule feed is 613 ms and **8 000 062 allocations** — eight
+  per record, of which the record's own two are a quarter. So an arena is worth
+  ~60 ms of a 613 ms parse, not the load path's problem, and what is left of
+  71e's value is the copy: 96 ms of `Zone::clone` plus 37 to drop it, on a path
+  **nothing measured takes today** (71d said so and it is still true). 71f took
+  the parse out of the install altogether, so 71e no longer has a live caller
+  at all — its whole case is 71a, and 71a's is the 372-395 ms rebuild.
+
+  **So: open, with the remedy named and priced, and nobody should take it
+  before 71a is decided.** The other six allocations per record are their own
+  question and nobody has asked it; this row is not it.
+
+- **71f. The install parsed back the zone it was holding — filed and closed
+  2026-09-18.** **1 141-1 261 ms to 526** at a million rules, which is the third
+  row of the table above and the largest number this section had. The band is
+  the old route's: it writes 38 MB and then parses it, and two runs an hour
+  apart read 1 141 and 1 261. The new one read 526.0 and 526.2.
+
+  A transfer serialized its zone, wrote the file, and asked for a reload; the
+  reload read that file and parsed 38 MB into a zone byte-for-byte identical to
+  the one the transfer task was still holding. 613 ms of re-derivation per
+  refresh, under a comment calling it shape A's trade.
+
+  **It is not shape A's trade.** What buys a restart its rules is the write.
+  57d's A and B were framed as write-and-re-read against install-in-memory, and
+  the third thing — write *and* install — was not one of the three. The file is
+  still the store, still written first, still the only thing that survives.
+
+  **The digest is the whole mechanism, and it already existed.** `PolicyZone`
+  has carried the digest of the bytes it was read from since 71b; a zone
+  written out now carries the digest of the bytes written, and
+  `PolicyStore::offer` keeps it for the next reload. The reload still reads
+  every file — a `stat` cannot see an edit that preserves length and timestamp
+  (§4) — and takes the offered zone only where the file's bytes are still those
+  bytes, so a feed a cron job rewrote in between is parsed as it always was.
+  One door: the offer is consulted inside `PolicyZones::reload`, beside the
+  held set, and is all-or-nothing with it.
+
+  **`rdnsd` has done exactly this all along**, which is what makes it §7 rather
+  than an idea: its secondary writes the zone file and then calls `install_zone`
+  with the zone it fetched (`replication.rs`), and its UPDATE path remembers the
+  digest of what it wrote so the next update need not parse (#64b). One install
+  path of the three re-read its own output, and it was the newest.
+
+  **Verified by provoking it** (§1, §4): the regression test asserts the reload
+  parsed *nothing* and installed one feed, and fails with `reread` 1 against
+  the version before this; a second test rewrites the file behind the offer and
+  asserts the parse happens and the file's rules win; a third refuses a path no
+  feed reads; a fourth compares the installed zone with a parse of the same
+  file, field by field.
+
+  **That fourth one is here because the row's own evidence was not what it
+  said.** This was filed on `rpz_install.rs`'s "the two shapes must install the
+  same zone, or the comparison is of two things" —
+  `assert_eq!(a_zone.records(), b_zone.records())`, at a million rules, since
+  57d. `PolicyZone::records` returns a **count**. The assertion compares two
+  `usize`s and five trigger counts, and `ZoneRecord` has no `PartialEq` at all,
+  so the line could not have meant what it was read as. Caught by writing the
+  comparison the row claimed already existed and having it refuse to compile
+  (§4: never state what a function does without opening it — including an
+  assertion, and including one being cited as a reason to act). The comparison
+  is field by field and not a round trip through the writer, which would hide
+  anything the writer drops.
+
+  **What it does not do**: the serialization (247 ms) and the write are what is
+  left, and both are the price of the file being the store. The reload's read
+  and digest of 21 ms per feed stays, because that is the honest test.
 
 - **71c. Three of four zone rebuilds never got #61b's `reserve` — filed and
   closed 2026-09-16.** **793 ms to 445** for `ixfr::Patch::apply` at a million

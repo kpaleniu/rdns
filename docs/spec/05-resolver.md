@@ -350,9 +350,12 @@ RPZ wildcard rule is RFC 1034 §4.3.3's.
   timers, woken early by a NOTIFY naming that zone. A refresh asks for the
   master's serial first and stops there unless it moved; otherwise it asks for
   the difference from the version in force (IXFR, RFC 1995) or for the whole
-  zone when it holds none. What arrives is written to the feed's own file and
-  read back by the reload above, so a restart begins with the last transfer
-  rather than with nothing. Signed when the master names a key with `#name`,
+  zone when it holds none. What arrives is written to the feed's own file — so
+  a restart begins with the last transfer rather than with nothing — and handed
+  to the store beside the digest of the bytes written, so the reload above
+  installs that zone instead of parsing the file back into a copy of it
+  (`TODO.md` #71f). The reload still reads every file; the digest is what
+  decides, and a feed somebody else rewrote in between is parsed. Signed when the master names a key with `#name`,
   resolved from `[keys]` at startup so an undefined name stops the process
   rather than sending an unsigned request. A feed without a `master` is still
   delivered by whatever writes the file; `rdnsr` has no zone map either way.

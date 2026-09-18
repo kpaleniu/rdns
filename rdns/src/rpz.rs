@@ -431,6 +431,19 @@ impl PolicyZone {
         let fallback = crate::zone::origin_from_path(&path.to_string_lossy());
         let zone = parse_zone_text_at(text, &fallback, path)
             .map_err(|e| ConfigError::new(format!("RPZ {}: {e}", path.display())))?;
+        PolicyZone::from_text(zone, policy, path, text)
+    }
+
+    /// Index a zone this process holds, as read from the text it was written
+    /// as — [`PolicyZones::reload`]'s test is over the file's bytes, so a zone
+    /// carries the digest of the bytes that represent it whether it was parsed
+    /// out of them or serialized into them (`TODO.md` #71f).
+    fn from_text(
+        zone: Zone,
+        policy: PolicyOverride,
+        path: &Path,
+        text: &str,
+    ) -> ConfigResult<PolicyZone> {
         let mut indexed = PolicyZone::new(zone, policy)?;
         indexed.read_from = FileDigest::of_self_contained(text.as_bytes()).map(|digest| ReadFrom {
             path: path.to_path_buf(),
@@ -520,6 +533,13 @@ impl PolicyZone {
             nsdname_root,
             nsdname,
         })
+    }
+
+    /// Whether this zone is what `path` held when it was last read or written.
+    fn was_read_from(&self, path: &Path) -> bool {
+        self.read_from
+            .as_ref()
+            .is_some_and(|from| from.path == path)
     }
 
     pub fn origin(&self) -> NameRef<'_> {
@@ -809,7 +829,7 @@ impl PolicyZones {
     /// All-or-nothing: a feed that does not parse must not leave the resolver
     /// enforcing a policy shorter than the one configured (`CLAUDE.md` §4).
     pub fn load(feeds: &[Feed]) -> ConfigResult<PolicyZones> {
-        PolicyZones::reload(feeds, &PolicyZones::default())
+        PolicyZones::reload(feeds, &PolicyZones::default(), &PolicyZones::default())
     }
 
     /// The same, keeping every feed whose file has not moved since `held` read
@@ -830,12 +850,24 @@ impl PolicyZones {
     /// §4). Measured at a million rules: read and digest 21 ms per feed against
     /// ~720 for the parse and index it replaces — the same argument `rdnsd`'s
     /// reload path makes (#64f), where it was 1.8%.
-    pub fn reload(feeds: &[Feed], held: &PolicyZones) -> ConfigResult<PolicyZones> {
+    ///
+    /// `offered` is what this process wrote and did not throw away
+    /// (`TODO.md` #71f): a zone from there is taken only when its digest is the
+    /// digest of the bytes just read, so a file somebody else rewrote in the
+    /// meantime is parsed as it would have been.
+    pub fn reload(
+        feeds: &[Feed],
+        held: &PolicyZones,
+        offered: &PolicyZones,
+    ) -> ConfigResult<PolicyZones> {
         let mut zones = Vec::with_capacity(feeds.len());
         for feed in feeds {
             let text = read_feed(&feed.path)?;
             let digest = FileDigest::of_self_contained(text.as_bytes());
-            match held.kept(feed, digest) {
+            match held
+                .kept(feed, digest)
+                .or_else(|| offered.kept(feed, digest))
+            {
                 Some(zone) => zones.push(zone),
                 None => zones.push(Arc::new(PolicyZone::parse(&feed.path, &text, feed.policy)?)),
             }
@@ -1028,6 +1060,9 @@ impl PolicyZones {
 pub struct PolicyStore {
     feeds: Vec<Feed>,
     current: RwLock<Arc<PolicyZones>>,
+    /// Zones this process wrote to a feed's file and has not installed yet —
+    /// [`PolicyStore::offer`].
+    offered: Mutex<Vec<Arc<PolicyZone>>>,
 }
 
 impl PolicyStore {
@@ -1037,6 +1072,7 @@ impl PolicyStore {
         Ok(Arc::new(PolicyStore {
             feeds: feeds.to_vec(),
             current: RwLock::new(Arc::new(zones)),
+            offered: Mutex::new(Vec::new()),
         }))
     }
 
@@ -1046,7 +1082,59 @@ impl PolicyStore {
         Arc::new(PolicyStore {
             feeds: Vec::new(),
             current: RwLock::new(Arc::new(zones)),
+            offered: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Index a zone this process just wrote to `path`, and keep it for the next
+    /// reload to install without parsing the file back — `TODO.md` #71f.
+    ///
+    /// The caller writes `text` to `path` first and passes the same bytes here.
+    /// A reload still reads every file, and takes this zone only if the file's
+    /// bytes are still the bytes named here, so a feed somebody else rewrote in
+    /// between is parsed as it would have been: the digest is the whole test
+    /// and it is the same one `rdnsd`'s UPDATE path applies to a zone it wrote
+    /// (`TODO.md` #64b, `CLAUDE.md` §7).
+    ///
+    /// **Blocking**: indexing a million-rule feed is ~40 ms, so this belongs
+    /// where the write does, off the workers (`CLAUDE.md` §9).
+    ///
+    /// The feed's policy comes from the configured list rather than from the
+    /// caller — a zone offered under the wrong override would answer a query
+    /// differently than the same file read back (§15's rule about two sources
+    /// for one setting).
+    pub fn offer(&self, path: &Path, zone: Zone, text: &str) -> ConfigResult<()> {
+        let Some(feed) = self.feeds.iter().find(|feed| feed.path == path) else {
+            // Refused rather than dropped: writing a policy zone to a path no
+            // feed reads is a configuration nobody gets an answer from, and a
+            // silent `Ok` here is the reload quietly costing what this exists
+            // to save (`CLAUDE.md` §4).
+            return Err(ConfigError::new(format!(
+                "no policy feed reads {}, so a zone written there is never in force",
+                path.display()
+            )));
+        };
+        let indexed = Arc::new(PolicyZone::from_text(zone, feed.policy, path, text)?);
+        let mut offered = match self.offered.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // One per path and policy: an older offer for the same feed is a zone
+        // the file no longer holds.
+        offered.retain(|zone| !zone.was_read_from(path) || zone.policy != feed.policy);
+        offered.push(indexed);
+        Ok(())
+    }
+
+    /// Everything offered since the last reload, leaving none behind.
+    fn take_offered(&self) -> PolicyZones {
+        let mut offered = match self.offered.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        PolicyZones {
+            zones: std::mem::take(&mut offered),
+        }
     }
 
     /// Whether any feed was named, and so whether a reload has anything to do.
@@ -1079,12 +1167,22 @@ impl PolicyStore {
         // second to finish would win, which is what happens today as well; the
         // resolver's reload task runs one at a time.
         let held = self.in_force();
-        let zones = Arc::new(PolicyZones::reload(&self.feeds, &held)?);
-        let reread = zones
+        // Taken, not borrowed: a zone offered for a file that has since changed
+        // is a zone nothing can use, and holding a million-rule feed against
+        // the chance of a later match is the memory this saves. A reload that
+        // fails costs the next one a parse.
+        let offered = self.take_offered();
+        let zones = Arc::new(PolicyZones::reload(&self.feeds, &held, &offered)?);
+        let new: Vec<&Arc<PolicyZone>> = zones
             .zones()
             .iter()
             .filter(|zone| !held.zones().iter().any(|was| Arc::ptr_eq(zone, was)))
+            .collect();
+        let installed = new
+            .iter()
+            .filter(|zone| offered.zones().iter().any(|was| Arc::ptr_eq(zone, was)))
             .count();
+        let reread = new.len() - installed;
         let mut guard = match self.current.write() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -1095,6 +1193,7 @@ impl PolicyStore {
             zones,
             delegation_rules_changed,
             reread,
+            installed,
         })
     }
 }
@@ -1112,6 +1211,14 @@ pub struct Reloaded {
     /// an operator whose edit did not register sees "0 of 3" and knows to look
     /// at the file rather than at the rule (`CLAUDE.md` §14).
     pub reread: usize,
+    /// How many feeds came from a zone this process had written and kept
+    /// (`TODO.md` #71f) — changed, but not parsed again.
+    ///
+    /// Counted apart from `reread` because the two differ only in cost: a
+    /// transferred feed that installed without a parse *did* change, and a log
+    /// line that said "0 of 3 changed" would send an operator to look at a file
+    /// that is in force.
+    pub installed: usize,
     /// Whether any zone that has something to say about a delegation is at a
     /// different version than the one it replaced.
     ///
@@ -2133,6 +2240,170 @@ evil.example.com IN CNAME .
         assert!(
             !Arc::ptr_eq(&before, &reloaded.zones.zones()[0]),
             "the parent file's digest cannot speak for the included one"
+        );
+    }
+
+    /// What #71f is: a zone this process wrote is installed from the copy it
+    /// already holds, and the file is read only to prove it is still that zone.
+    ///
+    /// Fails against the shape this replaced, where the transfer wrote the file
+    /// and the reload parsed all of it back — `reread` would be 1 and the
+    /// installed zone a different allocation from the one offered. At a million
+    /// rules that parse is 622 ms (`rdns/tests/record_storage.rs`).
+    #[test]
+    fn a_zone_this_process_wrote_is_installed_without_parsing_it_back() {
+        let dir = ScratchDir::new("rpz-offer");
+        let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("it loads");
+
+        // What a transfer holds: a zone, and the text it wrote to the file.
+        let arrived =
+            crate::zone::parse_zone_file(&feed(2, "second.example.com", None), "rpz.invalid.")
+                .expect("the transferred zone parses");
+        let text = crate::zone_writer::zone_to_string(&arrived).expect("it serializes");
+        crate::zone_writer::write_zone_text(&text, &path).expect("it is written");
+        store
+            .offer(&path, arrived, &text)
+            .expect("the feed is ours");
+
+        let reloaded = store.reload().expect("it re-reads");
+        assert_eq!(reloaded.reread, 0, "nothing had to be parsed");
+        assert_eq!(reloaded.installed, 1, "one feed came from what was written");
+        assert_eq!(
+            action_for(&store.in_force(), "second.example.com.", Qtype::of(rt::A)),
+            Some(Action::Nxdomain),
+            "the rule that arrived is what the next query is decided by"
+        );
+        assert_eq!(
+            action_for(&store.in_force(), "first.example.com.", Qtype::of(rt::A)),
+            None,
+            "and the rule it replaced is gone"
+        );
+
+        // Consumed: a second reload has nothing offered and nothing changed.
+        let again = store.reload().expect("it re-reads");
+        assert_eq!((again.reread, again.installed), (0, 0));
+    }
+
+    /// The property #71f rests on: the zone installed from an offer is the
+    /// zone the file parses to, record for record.
+    ///
+    /// Nothing asserted it before this: `rpz_install.rs`'s "the two shapes must
+    /// install the same zone" compares `PolicyZone::records`, which is a
+    /// *count*, and five trigger counts beside it — a claim read off a method
+    /// name instead of out of the method (`CLAUDE.md` §4). That one is also
+    /// `#[ignore]`d, so it guards nothing a suite runs.
+    ///
+    /// Field by field rather than comparing the two serializations: a
+    /// round-trip through the writer would hide anything the writer drops,
+    /// which is the half of this worth testing.
+    #[test]
+    fn what_is_installed_is_what_the_file_would_have_parsed_to() {
+        let dir = ScratchDir::new("rpz-offer-equal");
+        let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("it loads");
+
+        let arrived = crate::zone::parse_zone_file(
+            &feed(2, "second.example.com", Some("ns.bad.example")),
+            "rpz.invalid.",
+        )
+        .expect("the transferred zone parses");
+        let text = crate::zone_writer::zone_to_string(&arrived).expect("it serializes");
+        crate::zone_writer::write_zone_text(&text, &path).expect("it is written");
+        store
+            .offer(&path, arrived, &text)
+            .expect("the feed is ours");
+        let reloaded = store.reload().expect("it installs");
+        assert_eq!(
+            reloaded.installed, 1,
+            "the offer has to be what was installed, or this compares a parse with itself"
+        );
+
+        let parsed = PolicyZone::load(&path, PolicyOverride::Given).expect("the file parses");
+        let in_force = store.in_force();
+        let installed = in_force.zones()[0].zone();
+        let from_file = parsed.zone();
+        assert_eq!(installed.records().len(), from_file.records().len());
+        for (theirs, ours) in from_file.records().iter().zip(installed.records()) {
+            assert_eq!(theirs.name.as_ref(), ours.name.as_ref());
+            assert_eq!(theirs.ttl, ours.ttl);
+            assert_eq!(theirs.class, ours.class);
+            assert_eq!(theirs.rdata, ours.rdata);
+        }
+        assert_eq!(installed.origin(), from_file.origin());
+        assert_eq!(
+            in_force.zones()[0].trigger_counts(),
+            parsed.trigger_counts(),
+            "and the triggers derived from them"
+        );
+    }
+
+    /// The digest is the whole test, so a file somebody else rewrote between
+    /// the write and the reload is parsed rather than papered over with the
+    /// zone this process meant to be there.
+    ///
+    /// The failure it prevents is an edit silently not taken (`CLAUDE.md` §4) —
+    /// the same one `of_self_contained` exists for, arriving from the other
+    /// direction.
+    #[test]
+    fn an_offer_is_declined_when_the_file_no_longer_holds_it() {
+        let dir = ScratchDir::new("rpz-offer-stale");
+        let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("it loads");
+
+        let arrived =
+            crate::zone::parse_zone_file(&feed(2, "second.example.com", None), "rpz.invalid.")
+                .expect("the transferred zone parses");
+        let text = crate::zone_writer::zone_to_string(&arrived).expect("it serializes");
+        crate::zone_writer::write_zone_text(&text, &path).expect("it is written");
+        store
+            .offer(&path, arrived, &text)
+            .expect("the feed is ours");
+
+        // Somebody else — a cron job, an operator — writes the file after the
+        // transfer did.
+        std::fs::write(&path, feed(3, "third.example.com", None)).expect("rewrite");
+
+        let reloaded = store.reload().expect("it re-reads");
+        assert_eq!(
+            reloaded.installed, 0,
+            "the offer no longer matches the file"
+        );
+        assert_eq!(reloaded.reread, 1, "so the file was parsed");
+        assert_eq!(
+            action_for(&store.in_force(), "third.example.com.", Qtype::of(rt::A)),
+            Some(Action::Nxdomain),
+            "what is in force is what the file says"
+        );
+        assert_eq!(
+            action_for(&store.in_force(), "second.example.com.", Qtype::of(rt::A)),
+            None
+        );
+    }
+
+    /// A path no feed reads is refused rather than dropped: the zone would
+    /// never be in force, and the caller is the one that can say so.
+    #[test]
+    fn a_zone_written_where_no_feed_reads_is_refused() {
+        let dir = ScratchDir::new("rpz-offer-unknown");
+        let path = dir.write("feed.zone", &feed(1, "first.example.com", None));
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("it loads");
+
+        let stray =
+            crate::zone::parse_zone_file(&feed(2, "second.example.com", None), "rpz.invalid.")
+                .expect("it parses");
+        let text = crate::zone_writer::zone_to_string(&stray).expect("it serializes");
+        let elsewhere = dir.join("other.zone");
+        let refused = store
+            .offer(&elsewhere, stray, &text)
+            .expect_err("no feed reads that path");
+        assert!(
+            refused.to_string().contains("other.zone"),
+            "the message names the path: {refused}"
         );
     }
 

@@ -8,6 +8,13 @@
 //! rather than transferred, because what is being compared is what happens
 //! *after* the last envelope arrives.
 //!
+//! **`installing_a_transferred_policy_zone` is that comparison as it was
+//! taken**, and A is no longer what the resolver does: #71f writes the file and
+//! installs the zone the process holds, so the reload reads the file to prove
+//! it is still that zone rather than to parse it. The live cost is the `#71f`
+//! column of `refreshing_a_transferred_policy_zone` below. Kept as it was
+//! because it is the measurement 57d was decided on.
+//!
 //! ```sh
 //! cargo test --release -p rdns --test rpz_install -- --ignored --nocapture
 //! ```
@@ -32,7 +39,7 @@ use std::time::{Duration, Instant};
 
 use rdns::rpz::{Feed, PolicyOverride, PolicyStore, PolicyZone};
 use rdns::zone::{parse_zone_file_at, Zone};
-use rdns::zone_writer::{write_zone_file, zone_to_string};
+use rdns::zone_writer::{write_zone_file, write_zone_text, zone_to_string};
 
 #[global_allocator]
 static ALLOC: Tracking = Tracking;
@@ -216,10 +223,15 @@ fn installing_a_transferred_policy_zone() {
         let (b_zone, indexed) =
             measure(|| PolicyZone::new(zone, PolicyOverride::Given).expect("indexes"));
 
+        // Counts: `PolicyZone::records` is a record count and not the records.
+        // Record-for-record equality is
+        // `rpz::tests::what_is_installed_is_what_the_file_would_have_parsed_to`,
+        // which is in the suite because #71f rests on it — this line read as
+        // that for a day and was not it (`CLAUDE.md` §4).
         assert_eq!(
             a_zone.records(),
             b_zone.records(),
-            "the two shapes must install the same zone, or the comparison is of two things"
+            "the two shapes must install a zone of the same size"
         );
         assert_eq!(a_zone.trigger_counts(), b_zone.trigger_counts());
 
@@ -294,10 +306,10 @@ fn refreshing_a_transferred_policy_zone() {
         .expect("a runtime");
 
     println!(
-        "\n{:>9} | {:>9} {:>9} | {:>9} {:>9} | {:>9}",
-        "rules", "SOA probe", "AXFR", "IXFR", "of which apply", "install"
+        "\n{:>9} | {:>9} {:>9} | {:>9} {:>9} | {:>9} {:>9}",
+        "rules", "SOA probe", "AXFR", "IXFR", "of which apply", "re-read", "#71f"
     );
-    println!("{:->9}-+-{:->19}-+-{:->19}-+-{:->9}", "", "", "", "");
+    println!("{:->9}-+-{:->19}-+-{:->19}-+-{:->19}", "", "", "", "");
 
     for rules in sizes {
         let dir = scratch(&format!("refresh-{rules}"));
@@ -367,20 +379,47 @@ fn refreshing_a_transferred_policy_zone() {
 
         // What either route pays afterwards, and the reason #57e is a question
         // about the whole refresh rather than about the format: shape A writes
-        // the file and the reload reads it back.
+        // the file, and the two columns are whether it then parses it back.
         let path = dir.join("feed.zone");
         let (_, installed) = measure(|| {
             write_zone_file(&after, &path).expect("written");
             PolicyZone::load(&path, PolicyOverride::Given).expect("loads")
         });
 
+        // #71f: the same file, written the same way, and a reload that reads
+        // it to prove it is still the zone this process holds rather than to
+        // parse it.
+        //
+        // Its own file, holding the *previous* version: a store already at the
+        // new one keeps what it has and the column would measure neither route
+        // (the assertion below is what caught that).
+        let path = dir.join("feed-71f.zone");
+        write_zone_file(&before, &path).expect("the previous version is on disk");
+        let store =
+            PolicyStore::load(&[Feed::new(&path, PolicyOverride::Given)]).expect("the feed loads");
+        let held = after.clone();
+        let (_, offered) = measure(|| {
+            let text = zone_to_string(&held).expect("serializes");
+            write_zone_text(&text, &path).expect("written");
+            store
+                .offer(&path, held, &text)
+                .expect("the feed is configured");
+            let reloaded = store.reload().expect("re-reads");
+            assert_eq!(
+                (reloaded.reread, reloaded.installed),
+                (0, 1),
+                "the install must be the offered zone, or this measures a parse"
+            );
+        });
+
         println!(
-            "{rules:>9} | {:>9.1} {:>9.1} | {:>9.1} {:>9.1} | {:>9.1}",
+            "{rules:>9} | {:>9.1} {:>9.1} | {:>9.1} {:>9.1} | {:>9.1} {:>9.1}",
             ms(probe),
             ms(axfr),
             ms(ixfr),
             ms(applied),
             ms(installed.elapsed),
+            ms(offered.elapsed),
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
