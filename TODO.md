@@ -37,8 +37,31 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68** and **#21**, as of 2026-09-19. **#72 closed the day it
-was filed**: seven allocations a record on the zone load path, not the two it
+**#58**, **#68**, **#77** through **#84**, and **#21**, as of 2026-09-19.
+
+**#73, #74, #75 and #76 were filed and closed the same day**, out of an
+architecture review that asked what the shape of this code costs a reader rather
+than what it gets wrong — and found three defects on the way. #73 is the one on
+the wire: a denial's TTL was MINIMUM alone where RFC 9077 §3 says the lesser of
+MINIMUM and the SOA's own TTL, so for a zone whose SOA TTL is the smaller, every
+denial outlived the SOA beside it — which this tree's own RFC 8198 cache is the
+other half of. Every fixture here is `$TTL 3600` with `minimum 300`, the masking
+direction, which is §1 arriving through the fixtures rather than the assertions.
+#74: `--check-config` printed "encrypted transports disabled" for a DoH-only
+server, because a second copy of a banner was written where the right function
+existed and could not be reached. #75: `record_dnstap` sat behind `finish`, which
+the transfer and UPDATE branches returned past, so a capture held neither while
+two `MessageType` arms had been written for nobody. #76: three copies of
+`ScratchDir`, two of them citing a reason that stopped being true at #66c — and
+each citing the other.
+
+**#77 through #84 are what the same review turned up and did not fix**, one
+number per thing rather than a list in prose (§18). Two of them are #73's and
+#75's own remainders. Three rows in #78 and most of #79 are the review's reading
+rather than a measurement taken here, and each says which it is: re-check before
+acting on one.
+
+**#72 closed the day it was filed**: seven allocations a record on the zone load path, not the two it
 named, and after 72a and 72b a zone of A records parses with none at all — 480
 ns a record to ~263. **#57 is
 closed**: 57e was the last of it, and the measurement that
@@ -1072,7 +1095,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68** and **#71**, plus **#21** — see
+**#58**, **#68**, **#77**-**#84**, plus **#21** — see
 "What is open" above, which is the same list and the only place it is written
 down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -4657,6 +4680,310 @@ parser already built, so `add_parsed` has nothing to offer them either.
 
 ---
 
+### 77. What #73 and #75 left behind — **filed 2026-09-19**
+
+Two remainders, named here because a sentence in a commit message is not a
+queue (`CLAUDE.md` §18).
+
+- **77a. The answer-time half of RFC 9077 §3.** #73 caps a denial's TTL where
+  this server *signs*. A zone whose signatures arrived from elsewhere — a
+  replicated signed zone, or one with an imported DNSKEY signature — is served
+  with the TTLs the other signer chose, and `push_negative_proof` does not cap
+  them. A TTL is not covered by the RRSIG (the signature commits to the
+  *original* TTL), so lowering one at answer time is ordinary and safe.
+
+  **The measurement to take first**: does any other implementation cap at
+  answer time, or do they all fix it at signing? BIND, Knot, PowerDNS and NSD,
+  quoted, the way #8 was settled. If the answer is "signers only", this row is
+  a decision to decline and not work — and it should be declined in writing
+  rather than left open.
+
+- **77b. #75 has no test.** `record_dnstap` is now reachable from all three
+  answering paths by construction, and nothing checks that it is. What it needs
+  is a dnstap target on `spawn_updatable` — a `file:` sink, an UPDATE over TCP,
+  and the capture read back, which `dnstap.rs`'s own
+  `a_file_target_is_capped_rather_than_allowed_to_fill_the_disk` already shows
+  how to do. ~40 lines. Watched failing means reverting #75's tail and seeing
+  an empty capture.
+
+---
+
+### 78. `rdnsr`'s query path loses work at three of its exits — **filed 2026-09-19**
+
+`handle_query` is 420 lines with 15 exits and a tail that does five things.
+Three of the exits skip something the tail does. The first was verified here by
+reading every exit; **b and c are the review's reading and have not been
+re-checked against the code** — do that before touching either.
+
+- **78a. A prefetch is discarded by `.into()`.** `refresh` is set at
+  `answer.rs:422` when the answer cache says the entry is in the last tenth of
+  its TTL. `impl From<Option<Vec<u8>>> for Answered` fills `refresh: None`, and
+  the `on_answer` exit at `:599` is `return reply.into()`. So an `rpz-ip` rule
+  matching a cache-hit answer silently disables prefetch for that name: the
+  entry ages out, the next client pays a full recursion, and nothing counts it.
+
+  **Exactly one live exit, not three.** The other two `.into()`s that follow
+  `:422` in the file (`:496`, `:544`) are inside the cache-*miss* arm, where
+  `refresh` cannot have been set. Counted before proposing anything (§18).
+
+  One line fixes it. The type-level version — delete the `From` and let the
+  compiler enumerate all 15 exits, or hand `&mut Option<QuerySection>` in from
+  the socket loop so the value never travels through a return at all — is the
+  §17 shape and is ~15 sites. **Build both before choosing**; the second makes
+  the whole class unrepresentable and the first only makes it visible.
+
+- **78b. Forward mode returns the upstream's header verbatim.** `recurse.rs`
+  normalizes a recursed answer — `response.queries = vec![query.clone()]` and
+  `authoritive = false` — and `Resolver::forward` does not. `handle_query` sets
+  `id`, `response`, `recursion` and `recursion_ok`, and neither of the other
+  two. Two consequences if it holds: a recursive resolver relays an upstream's
+  AA=1, and `zero_x20` being on by default means the echoed question carries
+  the **scrambled case this resolver sent upstream** rather than the case the
+  client asked in. The remedy named is three lines in `resolve_validated`,
+  after the mode match, so both modes get it — not in `handle_query`, which is
+  the call-site fix §17 says recurs.
+
+- **78c. QDCOUNT=0 is dropped here and answered by `rdnsd`.** RFC 9619 §4 says
+  two things; #30r copied the first into `rdnsr` and not the second. `rdnsd`
+  answers an empty NOERROR and has a test asserting it; `rdnsr` drops the
+  datagram. One packet, two daemons, two behaviours, and only one of them wrote
+  down why. **The RFC does not settle it** — §4's second sentence is addressed
+  to firewalls, not responders — so this is "the two disagree and one is
+  silent", which is a smaller claim than "rdnsr is wrong". #47 records that
+  NSD 4.12 answers a QDCOUNT=0 NOTIFY rather than dropping it; ask the peers
+  properly before changing either.
+
+---
+
+### 79. Claims and code that outlived each other — **filed 2026-09-19**
+
+§4's failure mode has shifted here. The old one was "the claim was never true";
+these are claims that *were* true and whose subject moved. Nothing fails when
+they diverge, which is the whole of §18's "dead code is a finding".
+
+- **79a. Four `pub fn` with no caller, and an unreachable error variant.**
+  Verified here: `Name::relative_to`, `dnssec::canonical_name_of`,
+  `Nat64Prefix::bits` and `TransferError::refused` are named nowhere but their
+  own definitions. The last is the only constructor of
+  `TransferError::Refused`, so that variant is unreachable and nothing matches
+  on it either.
+
+  `relative_to` is the one that costs a reader: its doc says "the join below is
+  the only allocation: **this is the zone parser's per-record cost**", the zone
+  parser stopped calling it at `33461d3` (#72), and the replacement
+  `Name::absolutized_in` sits eight lines below with a comment explaining that
+  the allocation is gone. Two adjacent doc comments, contradicting each other,
+  and the dead one comes first.
+
+  `canonical_name_of`'s doc calls it "the boundary between a record's name and
+  DNSSEC's own bookkeeping" and "the property a name refactor must not quietly
+  change (#13e)". That sentence is still worth something; move it onto
+  `canonical_name`, which is the live one, rather than deleting it with the
+  function. §18: file, then delete.
+
+- **79b. `CLAUDE.md` §17's list is five-sevenths stale.** It opens "The smells,
+  all currently in this tree" and points at "`TODO.md` §13", which closed on
+  2026-08-02 and now lives in `docs/CLOSED_WORK.md`. Measured here:
+  `num_derive` is gone from the workspace entirely (one comment in `deny.toml`
+  survives it) and no wire-field parse uses `unwrap_or`. The review's own table
+  makes it five of the seven — OPT out of the record list, the QTYPE/RTYPE and
+  QCLASS/CLASS newtypes, `Serial` without `PartialOrd`, the TTL clamp and
+  `num_derive` — leaving only "the same normalization per module" and "an
+  invariant asserted in a doc comment" live. **Re-measure each of the seven
+  before editing the section**, then correct it in place with the reasoning
+  kept (§11: it is a claim, not a status line).
+
+- **79c. `rdns/src/lib.rs:62` documents the wrong module.** "Scratch
+  directories, for tests only." sits above `pub mod tls_identity;`. It
+  documented `mod testutil;` until #66c moved that module out from under it.
+  `cargo doc` cannot catch this — it resolves, it is simply false — and it
+  renders as `tls_identity`'s summary on the crate page. One line.
+
+- **79d. `ede.rs`'s module header names the wrong guarantor.** It says
+  "`ClientEdns::mirror` is the only way to a reply's OPT … so an EDE with no
+  OPT to ride in is not expressible (§17)". `ResponseWriter::set_edns` is
+  `pub` and is used without `mirror` at five sites. The *conclusion* still
+  holds, by `ResponseWriter::finish`'s `if let Some(mut edns) = self.edns.take()`
+  — and `set_extended_error`'s own doc states it correctly. So the codebase has
+  the right claim in one file and a wrong mechanism for it in another. Cite the
+  guard; a test that sets an EDE with no OPT and asserts nothing reaches the
+  wire would make it a fact rather than a citation.
+
+- **79e. `dnssec_answer.rs:200` holds on four of six paths.** It says
+  `*.<closest encloser>` is "guaranteed absent by `Zone::name_kind`". Of
+  `name_kind_of_key`'s six `NotFound` returns, four establish it, one is
+  vacuous, and the delegation one (`zone.rs:1246`) does not — it returns
+  `NotFound` because RFC 4592 §2.2.1 forbids synthesis below a cut, which says
+  nothing about the index. The invariant appears to hold anyway, via
+  `resolve_in_zone` answering a referral first, so the remedy is a sentence
+  naming the real guarantor and **not** a check. Confirm with a zone that has a
+  delegation at `sub.` and a wildcard at `*.sub.` before writing it.
+
+- **79f. Two config claims about where a rule is enforced.**
+  `rdns/src/config.rs`'s macro says a listener with no certificate "is refused
+  by each daemon's `check`" — true of `rdnsr`, false of `rdnsd`, which refuses
+  it in `main`. And `rdnsd/src/config.rs`'s header names the flags exempt from
+  `--config` as three where clap has six. Both are three-line corrections; the
+  first has the option of making the claim true instead, which would also give
+  a config-file user a line number.
+
+---
+
+### 80. Two bools where the enum is already imported — **filed 2026-09-19**
+
+`dnssec_validation_mode::validate_rrset` returns `(bool, bool)`, documented as
+`(is_valid, is_signed)` in prose and nowhere in the type. Seven bare tuple
+literals inside the file. **All four call sites discard the second element**,
+because each already holds the `ZoneKeys` that answers it — so the bool is
+redundant by construction rather than by accident. `validate_response` beside it
+has zero callers and carries an unused `_query_name` in a public signature.
+
+The function converts an `RrsetProof` — a four-variant enum imported at line 8
+of the same file — into two bools, one of which nobody reads.
+
+§17's own controlled experiment is the argument: the two defects fixed by
+changing a type have not recurred and every one fixed at a call site has. Return
+the proof, or a three-variant verdict; delete `validate_response`. ~30 lines,
+four call sites.
+
+**The refuting check**: a caller that needs `is_signed` *without* already
+holding the keys. The review found none; confirm it, because if one exists the
+remedy is naming the fields rather than collapsing them.
+
+---
+
+### 81. What #63h's macro did not reach, and one more copy — **filed 2026-09-19**
+
+- **81a. The `[keys]` TSIG table is declared twice.** #63h put the 22 shared
+  `[server]` keys in `rdns::server_table!` and `[keys]` was not in its scope:
+  two `Key` structs, two default-algorithm functions with different names and
+  the same value, two validators that differ only in a brace, and **two
+  hardcoded copies of the algorithm list in the error text** — which is the one
+  that can go stale in silence, since nothing compares either to
+  `TsigAlgorithm::from_name`.
+
+  **Take #63h's own measurement first**, which is the one that could refute
+  this: do the two tables co-move? `git log` over `rdnsd/src/config.rs`
+  intersected with commits touching `rdnsr/src/config.rs`, filtered to diffs
+  that touch a `Key` field or the list. #63h got 12 of 23 for `[server]`. If
+  `[keys]` does not co-move, take the `NAMES` const alone and decline the rest.
+
+- **81b. FNV-1a over ASCII-folded bytes, twice.** `compression::folded_hash` and
+  the loop inside `zone_signer::expiry_for`, same offset, same prime, same fold,
+  each with its own comment stating the same requirement in different words.
+  They agree today. The asymmetry is what a drift would cost: one loses a
+  compression pointer, the other moves every RRSIG expiry in every zone at once,
+  and §8 requires that two servers holding the zone agree about it.
+
+  Assert the two agree on one input before merging them — if they disagree, the
+  finding is wrong and both comments are missing the reason why.
+
+---
+
+### 82. Two modules in the wrong place, and a `pub` with no ratchet — **filed 2026-09-19**
+
+- **82a. `readiness` is in `rdns` and `rdns` never uses it.** `grep` over
+  `rdns/src` returns one line: the `pub mod` declaration. Its five consumers are
+  `rdns-transport`'s metrics server — which *serves* `/readyz` — and the two
+  daemons. One dependency, `rdns_core::text_names::ascii_lowered`, which
+  `rdns-transport` already has. File move, five `use` edits, one `mod` line, no
+  manifest change.
+
+  This is the one piece of "the furniture is in the wrong crate" that survives
+  its own refuting measurement. The larger version — an `rdns-ops` crate under
+  `rdns-transport` holding `shutdown`, `metrics`, `security`, `logging`,
+  `tls_identity` and `readiness` — takes **no package off any binary**
+  (`cargo tree -p rdnsd` is 120 either way), which is the limit #67 wrote down.
+  Revive it only with a rebuild-time measurement, which nobody has taken.
+
+- **82b. Five `pub fn` on private structs in `xfr.rs`, and the ratchet question
+  behind them.** `AxfrAssembler` and `IxfrAssembler` are private and their
+  `new`/`accept`/`into_zone` are `pub` — #38's exact shape, in a module #38
+  swept. Five lines.
+
+  File the ratchet with them, because the measurement is already taken:
+  `RUSTFLAGS="-W unreachable_pub" cargo check --workspace --all-targets` gives
+  44 warnings, **5 real** (these) and 39 from two `#[cfg(test)]` fixture
+  modules. The lint asks "is this reachable" and #38 asked "is this *named*
+  from outside" — two different questions, and rustc only has the first. So
+  either take that trade deliberately or write down that #38's criterion has no
+  compiler behind it and needs re-running. It is worth knowing that it has not
+  been: `pub` in `rdns/src` has gone 517 → 651 across 77 commits since the
+  sweep, with `pub(crate)` flat.
+
+---
+
+### 83. `rdnsd/src/main.rs` has grown two seams — **filed 2026-09-19**
+
+Not a defect, and filed so the judgement stops being carried silently.
+
+#20's criterion is explicitly *not* line count — "subsystems that have an owner
+and a lifetime … the review led with the line count and that turned out to be
+the weakest part of its case" — and its closing judgement was that splitting
+further was not worth doing. #38d overruled that once, on evidence, by doing the
+split and counting what sealed.
+
+Taking #20's own measurement — count what each name drags behind it — two
+clusters now return "seam":
+
+- **NOTIFY going out** (`parse_notify_peers`, `build_notify_policy`,
+  `announce_zones`, `announce_transfer`, `send_notify`): one reach-back into
+  `main`, and it is removable — `build_notify_policy` takes `&Cli` to read one
+  field. It has an owner and a lifetime, and `replication.rs` already imports
+  `crate::announce_transfer` across a module boundary.
+- **The reload cluster** (`Reloading`, `ReloadTrigger`, `ReloadContext`,
+  `reload_once`, `spawn_zone_maintenance`, `sleep_for`): reaches `main` for
+  exactly one thing, `announce_zones`, which the first move removes.
+
+The file's code half — everything before `#[cfg(test)]`, non-blank,
+non-comment — has gone **1015 → 1584 lines since #38d/#39b measured it**, with
+no seam taken.
+
+**The method is #38d's**: do the split, count what seals, revert if the new
+module needs more `pub(crate)` than it makes private, and write *that* number
+into this row. `Cli` is **not** a candidate and moving it would be a straight
+loss: ~40 fields would need `pub(crate)`, which reopens 63a's sealing sweep to
+buy file length.
+
+---
+
+### 84. `to_prometheus_format` is 337 lines of one idiom — **filed 2026-09-19**
+
+Thirty hand-unrolled HELP/TYPE/value blocks, 102 `push_str`, one line of doc
+that restates the function's name. The three rules that are *not* obvious — and
+that `CLAUDE.md` §14 spends five bullets on — are at the bottom, past 250 lines
+a reader has to scroll: omit-don't-zero for an absent gauge, `escape_label` on
+an operator-supplied zone name, and seconds as the base unit.
+
+Nothing is currently missing: all 35 counter fields are rendered, and the three
+series with no `# HELP` of their own are the histogram's `_bucket`, `_count` and
+`_sum`, which correctly share one. **That is the point** — the agreement between
+the struct and the renderer is held by hand, and a counter added without its
+block would be invisible with nothing failing.
+
+Two things the shape hid, both verified here:
+
+- The `# HELP dns_catalog_members` line carries **22 stray spaces** before its
+  text, and three `push_str` calls in that block use embedded newlines where the
+  other 99 use `\n`. Cosmetic — Prometheus takes HELP as free text — and exactly
+  §12's named hazard, since rustfmt does not touch string literals. No test
+  looks at a HELP line.
+- `metrics.rs`'s two `if let Ok(...)` guards on the zone tables are the only
+  lock-guard sites in the tree that drop output on a poisoned lock with no
+  commented decision. A poisoned `zones` makes every `dns_zone_serial` and
+  `dns_zone_last_refresh_timestamp_seconds` series vanish at once — the
+  `absent()` condition §14 built the omit-don't-zero rule around, arriving for
+  the wrong reason. The sibling `set_zone_serial` states its decision properly.
+
+A `fn counter(out, name, help, v)` collapses the 250 lines to ~30 call lines and
+makes the rest visible; a table or a macro declaring field, series name and help
+together would make the disagreement unrepresentable, which is what §17 would
+ask for. **Capture the output before and after and `diff` it** — byte-identical
+except the `dns_catalog_members` HELP line, or a block was not as uniform as it
+looked.
+
+---
+
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -4806,6 +5133,10 @@ the week; the record is under "How the queue kept going stale" in
 | **69** | four accept loops ended on any error, where the UDP side had a helper | **filed and closed 2026-09-16**, out of #68. Filed with no remedy on purpose (§18), and both missing measurements were taken the same day — which reversed the reason. **The remote provocation does not exist**: four `SO_LINGER 0` resets before the accept come back as `Ok` on Windows and on Linux, so §4's *remote* kill switch does not apply. **Descriptor exhaustion does, and needs nobody**: at `ulimit -n`, `accept` returns `EMFILE`, `Uncategorized`/raw 24, invisible to every portable kind — and both daemons' `JoinSet` ends the process when its first task ends, so `accepted?` turned a self-clearing condition into a whole-server outage across every transport. Windows could not be made to reach it (100 000 handles, no failure). Provoked before and after against a real `tcp::serve`: the old code's next write is a reset, the new one answers. One shared `survive_accept_error` at all four sites — retry the aborted kinds, log and back off 100 ms on exhaustion, still fatal otherwise |
 | **71** | applying a forty-record change was sized by the zone, twice over | **filed 2026-09-16, closed 2026-09-19**, seven rows, out of 57e — which had taken the *wire* down to what changed and left everything after it O(the zone). **801 ms to 44.3** for a forty-rule change at a million rules. 71b: a reload keeps every feed whose file did not move. 71c: three of four zone rebuilds never got #61b's `reserve`, which was over half of what 71a was filed at — a row filed as a type problem whose larger half was one line. 71d: the index keyed every name on a `Box<[u8]>` because a `HashMap` reaches its key only through `Borrow`, an artifact of the collection and not of `Name`. 71f: the install wrote the file and then *parsed it back*, 613 ms of re-deriving a zone the process was holding, under a comment calling it a trade — and the assertion cited as evidence compared two `usize`s. **71a**: not the tombstones it named — a count of direct children makes a name removable without turning a NODATA into an NXDOMAIN, and `swap_remove` leaves exactly one stale position. **71e**: two arenas, so a copy is a memcpy and six allocations rather than two million; `Zone::clone` 97.6 ms to 18.7, the whole answer path −6.1% and the lookup alone +5.4%. Two rows had their order the wrong way round (71a said to take 71e first; it was the reverse) and both blast-radius counts were measured by deleting an API rather than replacing it. Filed **#72** on the way out |
 | **72** | a zone's arena was filled from what the caller had just allocated | **filed and closed 2026-09-19**, three passes, out of 71e. Filed at two allocations a record and the copy between them; there were **seven**, and the two it named were the smallest — the largest was one line of `Zone::add_record` itself, folding an index key `intern` copies into its own arena a moment later. A million-record zone of A records now parses with **no heap allocation per record at all**, **480 ns a record to ~263** (`rdns/tests/scale.rs`), and a mixed-type one 535 to 438. `Zone::add` and `Zone::add_parsed` are the borrowed and the not-yet-encoded doors beside `add_record`; `Name::absolutized_in` settles a zone file's three spellings of an owner name in one place; `RdataArena::push_parsed` encodes into the arena under the same argument `RecordData::from_parsed` already stands on. **72a** was filed as §7 and was §4: the two field lists `rdata_from_fields` took were `tokens` and `tokens.iter().map(Cow::as_ref)`, the same strings by construction, under a comment saying one kept its quotes. **72b** went to zero rather than the one it predicted, and its first version moved an *exact* count **up** — `Vec` takes a byte vector's capacity to 8 whatever it holds, so the shrink to a `Box` cost a reallocation per record on the **message** path; sized from the RDLENGTH that arrived, it is 15 again. An exact count is what caught it. Two refutations recorded on the way: none of the three other build sites the row named gains from the borrowed door, and the signer's seven sites stay, because signing is ~27 µs a record |
+| **73** | a denial outlived the SOA beside it | **filed and closed 2026-09-19**, `35b1e8f`, out of an architecture review. RFC 9077 §3: an NSEC or NSEC3 TTL is the *lesser* of the SOA's MINIMUM and the SOA record's own TTL, and the signer used MINIMUM alone. RFC 4034 §4.1.1's older "same as MINIMUM" predates aggressive use, under which the denial's own TTL is how long a resolver goes on synthesizing that "no" — and this tree implements that other half (`rdns::nsec_cache`). Measured on `$TTL 300` with `minimum 3600`: SOA 300, NSEC **3600**, its RRSIG **3600**; all 300 after. The fix is one `.min(soa_ttl)`, on a value bound six lines above and used for the DNSKEY TTL only. **Why the suite never saw it**: every fixture is `$TTL 3600` with `minimum 300`, the direction where the `min` is invisible — and `rdnsd/src/answer.rs` asserts "capped at MINIMUM, not the `$TTL`", which is right only because 300 < 3600. RFC 9077 is cited nowhere else in the tree. Left **77a** |
+| **74** | `--check-config` did not name DoH | **filed and closed 2026-09-19**, `20b8dc8`. The dry run matched on `--tls-listen` and `--quic-listen`, so a DoH-only server was told "encrypted transports disabled" by the one command whose whole job is to be believed before a restart — while the `encrypted` predicate eighteen lines above, which decides whether to read the certificate at all, has named all three since DoH landed. Provoked rather than read (§4). **Why the second copy existed**: `describe_encrypted` had all three right and took a `TlsPolicy`, which is not built until after the dry run returns — a function that is correct and unreachable is how §7's second copy gets written. It takes the three addresses now. `--check-config`'s output still has no test at all, which is how a hand-written banner stayed wrong |
+| **75** | two of three answering paths returned past the epilogue | **filed and closed 2026-09-19**, `74019de`. `record_dnstap` was reachable only through `finish`, and the transfer and UPDATE branches `return`ed above it — so a dnstap capture held neither, while `--dnstap` says "every answered request" and `MessageType::UpdateQuery`/`UpdateResponse` were arms nothing could reach. §7's named shape, and this file's second instance of it after the NOTIMP branch that returned past `make_response`'s OPT mirroring; the tell here was cheaper, because the unreachable arms had been *written*. `finish` returns what it sent, `answer` has one tail, and a serialization failure joins them for the reason a dropped reply already did. A transfer records the query alone: no one envelope is the reply. Left **77b** — there is no test |
+| **76** | `ScratchDir` existed three times | **filed and closed 2026-09-19**, `ab2ae3b`. `rdns-core::testutil` is `pub` rather than `#[cfg(test)]` for one stated purpose — "the choice was this or a second `ScratchDir`, which is the thing this module exists to have stopped" — and both binaries wrote one anyway, each citing the other, on a premise that stopped being true at #66c. `rdnsd` carried both at once: `dispatch.rs` already reached for the shared one. 57 lines deleted, 9 added, no behaviour. What it is worth is not the lines: §7 says the reason is what stops the next copy, and here the reason was copied along with the code and went on justifying it after it had expired |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

@@ -92,6 +92,7 @@ each row exists (`CLAUDE.md` §11).
 | 7344 | CDS and CDNSKEY | **yes** (2026-09-13, `TODO.md` #55). Both types carried by name, sharing DS's and DNSKEY's formats (§3.1, §3.2); generated at the apex for every key inside its `SyncPublish`/`SyncDelete` window, with SHA-256 (RFC 8624 §3.3) and signed by the SEP keys as §4.1 requires. RFC 8078 §4's algorithm-0 "withdraw the DS" record parses and is deliberately never generated | `rdns/src/zone_signer.rs`, `rdns/src/dnssec_key.rs` |
 | 8080 | Ed25519 | yes, generate and verify |
 | 8198 | aggressive use of validated denials | yes, both halves |
+| 9077 §3 | denial TTL = min(MINIMUM, the SOA's own TTL) | **partial, since 2026-09-19** (`TODO.md` #73). At signing, so every zone this server signs; a zone whose signatures arrived already made keeps the other signer's TTLs, which is **77a**. It was MINIMUM alone until #73, per RFC 4034 §4.1.1's older wording — which 9077 updates precisely because of the row above |
 | 8624 §3.1 | RSA/SHA-1 NOT RECOMMENDED | accepted for **verification** only, deliberately |
 | 9276 §3.1 | empty NSEC3 salt, zero iterations | yes, and signing above the cap is refused |
 | 9156 §2.3 | QNAME minimisation, QTYPE=A, cap 10 | yes |

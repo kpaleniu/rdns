@@ -8642,3 +8642,132 @@ one. Same code, same zone, same absolute cost; only the denominator moves.
 **Not filed: making the five shared passes cheaper.** 16% of a full sign and
 48% of an incremental one, and 64e already owns the incremental side of it.
 Splitting the same work across two numbers is how both get half-done.
+
+---
+
+### 73. A denial outlives the SOA beside it — ~~**filed 2026-09-19**~~ **closed the same day**, `35b1e8f`
+
+RFC 9077 §3: the NSEC or NSEC3 TTL is the *lesser* of the SOA's MINIMUM field
+and the SOA record's own TTL. `sign_zone_inner` used MINIMUM alone.
+
+RFC 4034 §4.1.1's older "SHOULD have the same TTL value as the SOA minimum TTL
+field" is what the code followed, and it predates aggressive use. Under
+RFC 8198 the denial's *own* TTL is how long a resolver may go on synthesizing
+that "no" out of its cache — so for a zone whose SOA TTL is below its MINIMUM,
+every denial and every denial signature outlived the SOA that says how long the
+negative answer lives. This tree implements the other side of that bargain
+(`rdns::nsec_cache`), which is what makes it concrete rather than theoretical.
+
+**Measured, because reading the loop would not have settled it.** A zone with
+`$TTL 300` and `minimum 3600`, NXDOMAIN with DO set, both chains:
+
+| | SOA | NSEC/NSEC3 | RRSIGs |
+|---|---|---|---|
+| before | 300 | **3600** | 300 and **3600** |
+| after | 300 | 300 | 300 |
+
+The fix is `Ttl::from_secs(minimum).min(soa_ttl)`. `soa_ttl` was bound six lines
+above by `carry_over_records` and used for `dnskey_ttl` only.
+
+**Why a green suite never saw it.** Every fixture in the tree is `$TTL 3600`
+with `minimum 300` — the masking direction, where the `min` is invisible and
+MINIMUM is already the smaller. `rdnsd/src/answer.rs`'s own test asserts
+"capped at MINIMUM, not the `$TTL`", which is the right answer only because
+300 < 3600. `CLAUDE.md` §1, from the fixture end rather than the assertion end.
+The regression test was watched failing against the old line.
+
+RFC 9077 is cited nowhere else in the tree.
+
+**Left behind: 77a**, the answer-time half — a zone whose signatures arrived
+from somewhere else is served with the TTLs the other signer chose.
+
+---
+
+### 74. `--check-config` does not name DoH — ~~**filed 2026-09-19**~~ **closed the same day**, `20b8dc8`
+
+The dry run matched on `--tls-listen` and `--quic-listen`, so a server
+configured for DoH and nothing else printed `encrypted transports disabled` —
+in the one command whose whole job is to be believed before a restart. The
+`encrypted` predicate eighteen lines above, which decides whether to read the
+certificate at all, has named all three since DoH landed.
+
+**Provoked rather than read** (`CLAUDE.md` §4), with a DoH-only configuration
+and a certificate that loads:
+
+```
+before: configuration is valid: 1 zone(s), 0 TSIG key(s), signing disabled, encrypted transports disabled
+after:  ... encrypted transports on 127.0.0.1:8443/dns-query DoH, certificate loads
+```
+
+**Why the second copy existed, which is the part worth keeping.**
+`describe_encrypted` had all three right the whole time and could not be
+reached: it took a `TlsPolicy`, and a `TlsPolicy` is not built until after the
+dry run has returned. A function that is correct and unreachable is how §7's
+second copy gets written. It takes the three addresses now, and
+`TlsPolicy::describe` is the wrapper the startup banner uses.
+
+`--check-config`'s output has **no test at all** — `grep -rn "check.config"`
+over `rdnsd/`, `rdnsr/` and `tests/` finds one comment and nothing executable —
+which is how a hand-written copy of a banner stayed wrong. That is not fixed
+here.
+
+The dry run's separator for two transports moves from " and " to ", ", which is
+the banner's, because there is one function now.
+
+---
+
+### 75. Three answering paths, one epilogue, and two of them returned past it — ~~**filed 2026-09-19**~~ **closed the same day**, `74019de`
+
+`record_dnstap` was reachable only through `finish`, and `answer`'s transfer and
+UPDATE branches `return`ed above it. So a dnstap capture held neither, while
+`--dnstap`'s own documentation says "Stream every answered request" and
+`dnstap::MessageType::UpdateQuery` and `UpdateResponse` were two match arms
+nothing could reach.
+
+`CLAUDE.md` §7 names this shape — "an early `return` that jumps over a shared
+epilogue" — and names this file's own earlier instance of it: the NOTIMP branch
+that returned past `make_response`'s OPT mirroring, so the one reply that
+dropped the client's EDNS was the one for an opcode we do not implement. Here
+the tell was cheaper still: the unreachable arms had been *written*, so the
+intent was on the page beside the code that defeated it.
+
+- `finish` returns what it sent rather than recording it, which makes it charge,
+  sign, send — what its doc comment already claimed it was.
+- `answer` routes the three ways to answer into one `sent` binding and records
+  once. A serialization failure joins them, for the reason a dropped reply is
+  recorded: the request arrived and got nothing.
+- A transfer records the query with no response. No one envelope is the reply,
+  and buffering the zone to name one would undo the shape `answer_transfer`
+  exists for.
+
+**Left behind: 77b.** There is no test. Driving an UPDATE through a file-backed
+sink needs a dnstap target on `spawn_updatable`, which nothing in the suite
+builds; the change rests on `record_dnstap` having one caller and that caller
+one call site, which is a property it establishes rather than one anything
+checks.
+
+---
+
+### 76. `ScratchDir` exists three times, behind a reason that expired — ~~**filed 2026-09-19**~~ **closed the same day**, `ab2ae3b`
+
+`rdns-core::testutil` is `pub` rather than `#[cfg(test)]` for one stated
+purpose, in its own header: "the choice was this or a second `ScratchDir` —
+which is the thing this module exists to have stopped (§7)". Both binaries had
+written one anyway.
+
+Each cited the other. `rdnsd/src/testutil.rs`: "a `#[cfg(test)]` item is
+invisible to another crate … One copy per crate is the floor without a `testkit`
+feature." `rdnsr/src/testutil.rs`: "A third copy of `rdns`'s … which is what
+`rdnsd`'s copy says too." The premise stopped being true at #66c, when
+`persist` moved to `rdns-core` and took `testutil` with it as a `pub` module.
+`rdnsd` was already using both — `dispatch.rs` reaches for
+`rdns::testutil::ScratchDir` while the rest of the crate used the local copy.
+
+57 lines deleted, 9 added, no behaviour anywhere. The shared one has every
+method either caller used, plus `write` and `entries`.
+
+**What it is worth is not the lines.** §7 says the reason in a doc comment is
+what stops the next copy being written; here the reason was copied along with
+the code and went on justifying it after it had stopped being true. A stated
+reason needs re-reading when the thing it refers to moves, and nothing does
+that.
