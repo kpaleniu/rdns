@@ -92,7 +92,7 @@ pub fn push_proof_of_absence(
         return Ok(());
     }
     let qname = qname.to_folded();
-    absence(zone, qname.as_ref(), &mut Written::default(), w)
+    absence(zone, qname.as_ref(), &mut Written::for_zone(zone), w)
 }
 
 /// Write the authority records a negative answer needs beyond the SOA.
@@ -112,8 +112,8 @@ pub fn push_negative_proof(
         return Ok(());
     }
     let qname = qname.to_folded();
-    let written = &mut Written::default();
-    push_soa_signatures(zone, w)?;
+    let written = &mut Written::for_zone(zone);
+    push_soa_signatures(zone, written.cap, w)?;
 
     match kind {
         NameKind::NotFound => deny_the_name_and_its_wildcard(zone, qname.as_ref(), written, w),
@@ -163,7 +163,7 @@ pub fn push_delegation_proof(
     }
 
     // No DS: the record at the cut says so by listing NS and not DS.
-    let written = &mut Written::default();
+    let written = &mut Written::for_zone(zone);
     if !match_at_name(zone, cut.as_ref(), written, w)? && zone.has_nsec3_chain() {
         // Under opt-out an insecure delegation has no NSEC3 of its own
         // (RFC 5155 §7.2.9), so the closest-encloser pair is the proof.
@@ -258,18 +258,35 @@ fn match_at_name<'z>(
 /// The apex SOA's signatures, capped as the SOA itself is —
 /// `min(MINIMUM, the record's own TTL)`, RFC 2308 §3. A signature outliving the
 /// record it covers leaves a cache holding an RRSIG with nothing to check.
-fn push_soa_signatures(zone: &Zone, w: &mut ResponseWriter) -> Result<(), WireError> {
-    let cap = negative_ttl_cap(zone);
-    push_signatures_at(zone, zone.origin(), rt::SOA, Some(cap), w)
+fn push_soa_signatures(
+    zone: &Zone,
+    cap: Option<Ttl>,
+    w: &mut ResponseWriter,
+) -> Result<(), WireError> {
+    push_signatures_at(zone, zone.origin(), rt::SOA, cap, w)
 }
 
-/// The zone's MINIMUM, the ceiling a negative answer's TTLs take (RFC 2308 §3).
-fn negative_ttl_cap(zone: &Zone) -> Ttl {
-    zone.locate(zone.origin())
+/// The ceiling every record in a negative answer takes: `min(MINIMUM, the SOA
+/// record's own TTL)`.
+///
+/// Both terms, and RFC 9077 §3 rather than RFC 2308 §3, because this is applied
+/// to the *denial* as well as to the SOA: "the TTL of the NSEC RR that is
+/// returned MUST be the lesser of the MINIMUM field of the SOA record and the
+/// TTL of the SOA itself" (§§3.1-3.3, which say the same of NSEC3). The
+/// requirement is on what is returned, so it belongs here as well as in the
+/// signer — a zone whose signatures arrived from somewhere else is answered
+/// from this path too, and its chain was built by a signer this server does not
+/// control (`TODO.md` #73, #77a).
+///
+/// `None` for a zone with no apex SOA, which is no cap rather than a cap of
+/// zero: such a zone owes no negative answer either, and a ceiling of zero
+/// would be a wrong number where an absent one is right (`CLAUDE.md` §14).
+fn negative_ttl_cap(zone: &Zone) -> Option<Ttl> {
+    let soa = zone
+        .locate(zone.origin())
         .of_type(Qtype::of(rt::SOA))
-        .next()
-        .and_then(|soa| soa.rdata.soa_minimum())
-        .map_or(Ttl::ZERO, Ttl::from_secs)
+        .next()?;
+    Some(Ttl::from_secs(soa.rdata.soa_minimum()?).min(soa.ttl))
 }
 
 /// The RRSIGs at `name` covering `rtype`, each capped at `cap` if there is one.
@@ -311,14 +328,18 @@ fn push_with_signatures<'z>(
     if !written.claim(record) {
         return Ok(false);
     }
+    // RFC 9077 §3: capped as the SOA beside it is. Under RFC 8198 this TTL is
+    // how long a resolver may go on synthesizing this "no" from its cache, so a
+    // denial outliving the SOA outlives the negative answer it belongs to.
+    let ttl = written.cap.map_or(record.ttl, |cap| record.ttl.min(cap));
     w.push(
         Section::Authority,
         record.name,
         record.class,
-        record.ttl,
+        ttl,
         record.rdata,
     )?;
-    push_signatures_at(zone, record.name, record.rdata.rtype(), None, w)?;
+    push_signatures_at(zone, record.name, record.rdata.rtype(), written.cap, w)?;
     Ok(true)
 }
 
@@ -332,13 +353,26 @@ fn push_with_signatures<'z>(
 /// plus the wildcard's. Past that it stops recording rather than growing, so an
 /// unforeseen fourth costs bytes and not correctness — hence a `debug_assert`
 /// and not a panic on a query path.
-#[derive(Default)]
 struct Written<'z> {
     seen: [Option<ZoneRecordRef<'z>>; 3],
     filled: usize,
+    /// The ceiling every record of this proof takes. See [`negative_ttl_cap`].
+    ///
+    /// Here rather than looked up per record, because it is an apex lookup and
+    /// a proof writes up to three denial records plus their signatures — and
+    /// every record of one answer has to take the same ceiling anyway.
+    cap: Option<Ttl>,
 }
 
 impl<'z> Written<'z> {
+    fn for_zone(zone: &Zone) -> Written<'z> {
+        Written {
+            seen: [None; 3],
+            filled: 0,
+            cap: negative_ttl_cap(zone),
+        }
+    }
+
     /// True if `record` has not been written before, recording it if so.
     fn claim(&mut self, record: ZoneRecordRef<'z>) -> bool {
         if self.seen[..self.filled].contains(&Some(record)) {
@@ -658,6 +692,56 @@ deep.a.b IN TXT "down here"
     /// RRSIG read 3600 beside an SOA of 300. Every other fixture in this tree is
     /// `$TTL 3600` with `minimum 300`, which is the masking direction — the
     /// `min` is invisible unless the SOA's own TTL is the smaller of the two.
+    /// A zone signed somewhere else is capped when it is *answered*, not only
+    /// when it is signed.
+    ///
+    /// `TODO.md` #77a. #73 fixed the signer, which covers every zone this
+    /// server signs and none that arrives already signed — a replicated one, or
+    /// one whose chain another operator's signer built. RFC 9077 §§3.1-3.3 put
+    /// the requirement on "the TTL of the NSEC RR **that is returned**", so it
+    /// belongs on this path as well.
+    ///
+    /// The fixture is what a signer following RFC 4034 §4.1.1's older wording
+    /// produces: NSEC records at MINIMUM, 3600, above the SOA's own TTL of 300.
+    /// Watched failing against the cap that read MINIMUM alone — the NSEC went
+    /// out at 3600 beside an SOA of 300.
+    #[test]
+    fn a_denial_from_another_signer_is_capped_when_it_is_answered() {
+        const SIGNED_ELSEWHERE: &str = concat!(
+            "$ORIGIN example.com.\n",
+            "$TTL 300\n",
+            "@   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 3600 )\n",
+            "@   IN NS  ns1.example.com.\n",
+            "@   3600 IN DNSKEY 257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3\n",
+            "@   3600 IN NSEC www.example.com. NS SOA RRSIG NSEC DNSKEY\n",
+            "ns1 IN A 192.0.2.1\n",
+            "www IN A 192.0.2.10\n",
+            "www 3600 IN NSEC example.com. A RRSIG NSEC\n",
+        );
+        let zone = parse_zone_file(SIGNED_ELSEWHERE, ORIGIN).expect("the fixture parses");
+        let soa_ttl = zone
+            .query(zone.origin(), Qtype::of(rt::SOA))
+            .into_iter()
+            .next()
+            .expect("the apex SOA")
+            .ttl;
+        assert_eq!(soa_ttl.as_secs(), 300, "the SOA is the shorter of the two");
+
+        let records = negative(&zone, "nope.example.com.", &NameKind::NotFound);
+        assert!(
+            !records.is_empty(),
+            "the apex NSEC covers the name and the wildcard"
+        );
+        for record in records {
+            assert!(
+                record.ttl <= soa_ttl,
+                "a denial this server did not sign left at {} beside an SOA of {}",
+                record.ttl.as_secs(),
+                soa_ttl.as_secs()
+            );
+        }
+    }
+
     #[test]
     fn a_denial_is_capped_by_the_soa_ttl_and_not_by_minimum_alone() {
         const SHORT_TTL_LONG_MINIMUM: &str = "$ORIGIN example.com.\n\
