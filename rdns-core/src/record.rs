@@ -442,31 +442,64 @@ impl ParsedRecord {
     /// Encode into `(rtype, uncompressed wire-format RDATA)` — the inverse of
     /// [`ParsedRecord::decode`] for the types we parse.
     pub(crate) fn encode(&self) -> Result<(Rtype, Vec<u8>), WireError> {
-        let out = match self {
-            ParsedRecord::A(addr) => (record_types::A, addr.octets().to_vec()),
-            ParsedRecord::AAAA(addr) => (record_types::AAAA, addr.octets().to_vec()),
-            ParsedRecord::NS(name) => (record_types::NS, name.as_ref().as_wire().to_vec()),
-            ParsedRecord::CNAME(name) => (record_types::CNAME, name.as_ref().as_wire().to_vec()),
-            ParsedRecord::PTR(name) => (record_types::PTR, name.as_ref().as_wire().to_vec()),
-            ParsedRecord::DNAME(name) => (record_types::DNAME, name.as_ref().as_wire().to_vec()),
+        let mut out = Vec::new();
+        let rtype = self.encode_into(&mut out)?;
+        Ok((rtype, out))
+    }
+
+    /// The same, appended to `out`, which is how a zone writes RDATA straight
+    /// into its arena rather than into a `Box` it then copies and frees
+    /// (`TODO.md` #72b). Whatever `out` already holds is left alone; this
+    /// record is what gets appended.
+    ///
+    /// An error leaves what it had appended behind — TXT's length ceiling and
+    /// SVCB's parameters are the two arms that can fail — so a caller writing
+    /// into a buffer it shares truncates back to where it started.
+    /// [`crate::RdataArena::push_parsed`] does.
+    pub(crate) fn encode_into(&self, out: &mut Vec<u8>) -> Result<Rtype, WireError> {
+        let rtype = match self {
+            ParsedRecord::A(addr) => {
+                out.extend_from_slice(&addr.octets());
+                record_types::A
+            }
+            ParsedRecord::AAAA(addr) => {
+                out.extend_from_slice(&addr.octets());
+                record_types::AAAA
+            }
+            ParsedRecord::NS(name) => {
+                out.extend_from_slice(name.as_ref().as_wire());
+                record_types::NS
+            }
+            ParsedRecord::CNAME(name) => {
+                out.extend_from_slice(name.as_ref().as_wire());
+                record_types::CNAME
+            }
+            ParsedRecord::PTR(name) => {
+                out.extend_from_slice(name.as_ref().as_wire());
+                record_types::PTR
+            }
+            ParsedRecord::DNAME(name) => {
+                out.extend_from_slice(name.as_ref().as_wire());
+                record_types::DNAME
+            }
             ParsedRecord::SVCB {
                 rtype,
                 priority,
                 target,
                 params,
             } => {
-                let mut v = priority.to_be_bytes().to_vec();
-                v.extend_from_slice(target.as_ref().as_wire());
-                v.extend_from_slice(&encode_svc_params(params)?);
-                (*rtype, v)
+                out.extend_from_slice(&priority.to_be_bytes());
+                out.extend_from_slice(target.as_ref().as_wire());
+                out.extend_from_slice(&encode_svc_params(params)?);
+                *rtype
             }
             ParsedRecord::MX {
                 preference,
                 exchange,
             } => {
-                let mut v = preference.to_be_bytes().to_vec();
-                v.extend_from_slice(exchange.as_ref().as_wire());
-                (record_types::MX, v)
+                out.extend_from_slice(&preference.to_be_bytes());
+                out.extend_from_slice(exchange.as_ref().as_wire());
+                record_types::MX
             }
             ParsedRecord::TXT(strings) => {
                 if strings.is_empty() {
@@ -475,7 +508,6 @@ impl ParsedRecord {
                         "it must carry at least one character-string",
                     ));
                 }
-                let mut v = Vec::new();
                 for s in strings {
                     // One length byte, so 255 is the ceiling. Splitting a longer
                     // string in two would change what the record says.
@@ -484,10 +516,10 @@ impl ParsedRecord {
                         limit: 255,
                         actual: s.len(),
                     })?;
-                    v.push(len);
-                    v.extend_from_slice(s);
+                    out.push(len);
+                    out.extend_from_slice(s);
                 }
-                (record_types::TXT, v)
+                record_types::TXT
             }
             ParsedRecord::SOA {
                 mname,
@@ -498,14 +530,14 @@ impl ParsedRecord {
                 expire,
                 minimum,
             } => {
-                let mut v = mname.as_ref().as_wire().to_vec();
-                v.extend_from_slice(rname.as_ref().as_wire());
-                v.extend_from_slice(&serial.to_u32().to_be_bytes());
-                v.extend_from_slice(&refresh.to_be_bytes());
-                v.extend_from_slice(&retry.to_be_bytes());
-                v.extend_from_slice(&expire.to_be_bytes());
-                v.extend_from_slice(&minimum.to_be_bytes());
-                (record_types::SOA, v)
+                out.extend_from_slice(mname.as_ref().as_wire());
+                out.extend_from_slice(rname.as_ref().as_wire());
+                out.extend_from_slice(&serial.to_u32().to_be_bytes());
+                out.extend_from_slice(&refresh.to_be_bytes());
+                out.extend_from_slice(&retry.to_be_bytes());
+                out.extend_from_slice(&expire.to_be_bytes());
+                out.extend_from_slice(&minimum.to_be_bytes());
+                record_types::SOA
             }
             ParsedRecord::DNSKEY {
                 rtype,
@@ -514,11 +546,11 @@ impl ParsedRecord {
                 algorithm,
                 public_key,
             } => {
-                let mut v = flags.to_be_bytes().to_vec();
-                v.push(*protocol);
-                v.push(*algorithm);
-                v.extend_from_slice(public_key);
-                (*rtype, v)
+                out.extend_from_slice(&flags.to_be_bytes());
+                out.push(*protocol);
+                out.push(*algorithm);
+                out.extend_from_slice(public_key);
+                *rtype
             }
             ParsedRecord::RRSIG {
                 type_covered,
@@ -531,17 +563,17 @@ impl ParsedRecord {
                 signer_name,
                 signature,
             } => {
-                let mut v = type_covered.to_u16().to_be_bytes().to_vec();
-                v.push(*algorithm);
-                v.push(*labels);
-                v.extend_from_slice(&original_ttl.to_be_bytes());
+                out.extend_from_slice(&type_covered.to_u16().to_be_bytes());
+                out.push(*algorithm);
+                out.push(*labels);
+                out.extend_from_slice(&original_ttl.to_be_bytes());
                 // Expiration first, then inception (RFC 4034 §3.1).
-                v.extend_from_slice(&expiration.to_be_bytes());
-                v.extend_from_slice(&inception.to_be_bytes());
-                v.extend_from_slice(&key_tag.to_be_bytes());
-                v.extend_from_slice(signer_name.as_ref().as_wire());
-                v.extend_from_slice(signature);
-                (record_types::RRSIG, v)
+                out.extend_from_slice(&expiration.to_be_bytes());
+                out.extend_from_slice(&inception.to_be_bytes());
+                out.extend_from_slice(&key_tag.to_be_bytes());
+                out.extend_from_slice(signer_name.as_ref().as_wire());
+                out.extend_from_slice(signature);
+                record_types::RRSIG
             }
             ParsedRecord::DS {
                 rtype,
@@ -550,19 +582,19 @@ impl ParsedRecord {
                 digest_type,
                 digest,
             } => {
-                let mut v = key_tag.to_be_bytes().to_vec();
-                v.push(*algorithm);
-                v.push(*digest_type);
-                v.extend_from_slice(digest);
-                (*rtype, v)
+                out.extend_from_slice(&key_tag.to_be_bytes());
+                out.push(*algorithm);
+                out.push(*digest_type);
+                out.extend_from_slice(digest);
+                *rtype
             }
             ParsedRecord::NSEC {
                 next_domain_name,
                 type_bitmap,
             } => {
-                let mut v = next_domain_name.as_ref().as_wire().to_vec();
-                v.extend_from_slice(type_bitmap);
-                (record_types::NSEC, v)
+                out.extend_from_slice(next_domain_name.as_ref().as_wire());
+                out.extend_from_slice(type_bitmap);
+                record_types::NSEC
             }
             ParsedRecord::NSEC3 {
                 hash_algorithm,
@@ -572,23 +604,20 @@ impl ParsedRecord {
                 next_hashed_owner,
                 type_bitmap,
             } => {
-                let mut v = Vec::with_capacity(
-                    6 + salt.len() + next_hashed_owner.len() + type_bitmap.len(),
-                );
-                v.push(*hash_algorithm);
-                v.push(*flags);
-                v.extend_from_slice(&iterations.to_be_bytes());
-                v.push(salt.len() as u8);
-                v.extend_from_slice(salt);
-                v.push(next_hashed_owner.len() as u8);
-                v.extend_from_slice(next_hashed_owner);
-                v.extend_from_slice(type_bitmap);
-                (record_types::NSEC3, v)
+                out.push(*hash_algorithm);
+                out.push(*flags);
+                out.extend_from_slice(&iterations.to_be_bytes());
+                out.push(salt.len() as u8);
+                out.extend_from_slice(salt);
+                out.push(next_hashed_owner.len() as u8);
+                out.extend_from_slice(next_hashed_owner);
+                out.extend_from_slice(type_bitmap);
+                record_types::NSEC3
             }
             // Stored verbatim by `RecordData::from_wire`; nothing to re-encode.
-            ParsedRecord::Unknown(rtype) => (*rtype, Vec::new()),
+            ParsedRecord::Unknown(rtype) => *rtype,
         };
-        Ok(out)
+        Ok(rtype)
     }
 }
 

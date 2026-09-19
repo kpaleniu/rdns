@@ -37,8 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#72** (down to 72a and 72b) and **#21**, as of
-2026-09-19. **#57 is
+**#58**, **#68** and **#21**, as of 2026-09-19. **#72 closed the day it
+was filed**: seven allocations a record on the zone load path, not the two it
+named, and after 72a and 72b a zone of A records parses with none at all — 480
+ns a record to ~263. **#57 is
 closed**: 57e was the last of it, and the measurement that
 could have refuted it did — IXFR as this tree had it was *slower* than a whole
 transfer, because applying forty records to a million-record zone cost 1 018 ms
@@ -4505,7 +4507,7 @@ a correction and not a retraction.
   day 61b landed.
 ---
 
-### 72. A zone's arena is filled from something the caller already allocated — **filed 2026-09-19, five of seven allocations gone the same day; 72a and 72b open**
+### 72. A zone's arena is filled from something the caller already allocated — **filed and closed 2026-09-19**, seven allocations a record to none
 
 Out of 71e, whose measurement said the load path would not move and was right
 about why: a zone keeps its owner names and its RDATA in two arenas now, but
@@ -4587,24 +4589,71 @@ production call site**: `rdnsd/src/zones.rs` and `rdnsd/src/main.rs` have one
 each, both under `#[cfg(test)]` and both cloning twice, and `Zone::rebuild`
 already goes arena to arena.
 
-#### What is left
+#### 72a and 72b, and the last allocation — **both closed 2026-09-19**
 
-- **72a. `rdata_from_fields` takes the same field list twice**,
-  `fields: &[&str]` beside `text_fields: &[Cow<str>]`, which is why `parts`
-  cannot be refilled per line the way `tokens` now is — it borrows `tokens`.
-  §7's shape: 8 uses across 3 signatures in `zone/rdata.rs`. The allocation is
-  worth **~13 ns a record**, measured by a throwaway that is wrong for a quoted
-  line, and it is the smaller half of the reason to merge them.
-- **72b. The RDATA half of this row**, the one allocation of the original two
-  still standing. It wants `ParsedRecord::encode_into(&mut Vec<u8>)` — 16 match
-  arms, several building a sub-`Vec` of their own — and an
-  `RdataArena::push_parsed` door, which is as trustworthy as
-  `RecordData::from_parsed` already is, since that trusts `encode` rather than
-  checking it. **~30 ns a record, estimated from the calibration above and not
-  measured**; whoever takes it measures first. It reaches zero only for types
-  whose `ParsedRecord` owns no heap — A and AAAA. CNAME, NS, MX, PTR and SOA
-  hold a `Name` inside the `ParsedRecord` and would halve, so the ratio is a
-  property of the zone's type mix.
+- **72a. `rdata_from_fields` took the same field list twice**, `fields: &[&str]`
+  beside `text_fields: &[Cow<str>]`, which is why `parts` could not be refilled
+  per line the way `tokens` is — it borrowed `tokens`. Filed as §7's shape and
+  worth ~13 ns; what it actually was is §4's, and one `let` settled it: `parts`
+  is `tokens.iter().map(Cow::as_ref).collect()`, so the two are the same
+  strings by construction, and the doc comment saying one kept its quotes was
+  wrong about both — `tokenize` consumes a quote, never pushes it.
+  One list now. `rdns_present::svcb::parse_params` takes `S: AsRef<str>`
+  rather than the parser's token type, which is the one thing the other crate
+  should not have to know.
+- **72b. The RDATA half**, and it went to **zero allocations a record**, not to
+  the one the row predicted. `rdata_from_fields` hands back a `ParsedRecord`
+  and `Zone::add_parsed` encodes it into the zone's own arena through
+  `RdataArena::push_parsed` — a door as trustworthy as
+  `RecordData::from_parsed`, which also takes its TYPE and its octets from one
+  `ParsedRecord` and checks neither, because `encode` is `decode`'s inverse.
+  What neither door allows is a TYPE paired with octets of the caller's
+  choosing (§17). `ParsedRecord::encode` is now a wrapper over `encode_into`,
+  its 16 arms appending rather than each building a `Vec`. A failed encode
+  truncates the arena back, so a refused record leaves nothing behind.
+
+  The three doors — `add_record`, `add` and `add_parsed` — are one filing path
+  with three ways in, and `chain_key` stopped taking a whole record for the two
+  fields it reads.
+
+**On `rdns/tests/scale.rs`'s zone at a million records.** The last two rows are
+one session minutes apart, which is the pair that prices this change; the first
+is the figure the row was filed at, and 332 is what the same tree reads today,
+so the box is a few per cent slower than it was and the *allocation* counts are
+what to compare across the whole table:
+
+| | ns/rec | allocs |
+|---|---|---|
+| as #72 was filed | 480 | 7 |
+| after #72's first pass, then | 322 | 2 |
+| **after #72's first pass, today** | **332** | 2 |
+| after 72a | — | 1 |
+| **after 72a and 72b** | **~263** | **0** |
+
+A zone of A records now parses with **no heap allocation per record at all**:
+what is left is the arenas growing. A mixed zone — A, AAAA, CNAME, MX and TXT
+in equal parts — is 535 ns and 6.38 allocations to **438 and 3.58**, and the
+remainder is `ParsedRecord`'s own owned fields, which is where 72b said the
+ratio would live. `parse an eight-record zone` is 91 allocations to **34**,
+reading the same on Windows and on Linux.
+
+**The measurement that nearly went the other way** (§10, §19). 72b's first
+version moved an *exact* count **up**: `parse a response with compressed names`
+15 to 18, one per record, on the message path — which is per query where the
+zone parse is per load. The cause was not the design but `Vec`: growing one from
+empty takes a byte vector's capacity to 8 whatever it holds, where the arms'
+old `to_vec()` sized exactly, so `into_boxed_slice` then had to reallocate to
+shrink. `RecordData::from_wire` sizes its buffer from the RDLENGTH
+that arrived — re-encoding changes the length only where a compression pointer
+was expanded, and then upwards — and the count is 15 again. Had the range been
+a floor rather than an exact number, this would have shipped.
+
+**What is deliberately left.** The signer has seven `add_record` sites, all fed
+by `RecordData::from_parsed`, and two of them scale with the zone: an NSEC per
+name and an RRSIG per RRset. They are 72b's shape exactly and they stay, for
+the reason measured above: signing is ~27 µs a record, so an allocation is
+0.1% of it. `xfr`, `update` and `ixfr` hold a `RecordData` that the message
+parser already built, so `add_parsed` has nothing to offer them either.
 
 ---
 
@@ -4756,6 +4805,7 @@ the week; the record is under "How the queue kept going stale" in
 | **57** | a policy zone arrived as a file somebody else wrote, not as a transfer | **filed 2026-09-13, closed 2026-09-16**, five rows, left behind by 45a — and the delivery half needed no code in `rdnsd` at all: `announce_transfer` had notified every `--also-notify` peer after every transfer since it was written, and what was missing was `rdnsr`'s ear (57c). 57a's reload found a resolver with `--rpz` and no DoT that had no reload task at all; 57b measured the reload *on* a worker and a one-core resolver answering nothing for 2.7 s. 57d built both shapes and was decided by neither's install cost: A keeps the file, so a restart begins with yesterday's rules. 57e is the one whose own measurement refuted it — IXFR was **slower than AXFR** here, 1 485 ms against 1 372 at a million rules, because applying forty records built a key per record of the base; and the bigger miss was that a refresh had no SOA probe at all, so an unchanged feed cost a transfer and a reload every REFRESH. Both daemons share `xfr::refresh_zone` now (§7). **#71** is what is left, and it is neither the wire nor the format — and every figure in this row was taken under the libtest contention #71 found, so they are the shape and not the clock |
 | **69** | four accept loops ended on any error, where the UDP side had a helper | **filed and closed 2026-09-16**, out of #68. Filed with no remedy on purpose (§18), and both missing measurements were taken the same day — which reversed the reason. **The remote provocation does not exist**: four `SO_LINGER 0` resets before the accept come back as `Ok` on Windows and on Linux, so §4's *remote* kill switch does not apply. **Descriptor exhaustion does, and needs nobody**: at `ulimit -n`, `accept` returns `EMFILE`, `Uncategorized`/raw 24, invisible to every portable kind — and both daemons' `JoinSet` ends the process when its first task ends, so `accepted?` turned a self-clearing condition into a whole-server outage across every transport. Windows could not be made to reach it (100 000 handles, no failure). Provoked before and after against a real `tcp::serve`: the old code's next write is a reset, the new one answers. One shared `survive_accept_error` at all four sites — retry the aborted kinds, log and back off 100 ms on exhaustion, still fatal otherwise |
 | **71** | applying a forty-record change was sized by the zone, twice over | **filed 2026-09-16, closed 2026-09-19**, seven rows, out of 57e — which had taken the *wire* down to what changed and left everything after it O(the zone). **801 ms to 44.3** for a forty-rule change at a million rules. 71b: a reload keeps every feed whose file did not move. 71c: three of four zone rebuilds never got #61b's `reserve`, which was over half of what 71a was filed at — a row filed as a type problem whose larger half was one line. 71d: the index keyed every name on a `Box<[u8]>` because a `HashMap` reaches its key only through `Borrow`, an artifact of the collection and not of `Name`. 71f: the install wrote the file and then *parsed it back*, 613 ms of re-deriving a zone the process was holding, under a comment calling it a trade — and the assertion cited as evidence compared two `usize`s. **71a**: not the tombstones it named — a count of direct children makes a name removable without turning a NODATA into an NXDOMAIN, and `swap_remove` leaves exactly one stale position. **71e**: two arenas, so a copy is a memcpy and six allocations rather than two million; `Zone::clone` 97.6 ms to 18.7, the whole answer path −6.1% and the lookup alone +5.4%. Two rows had their order the wrong way round (71a said to take 71e first; it was the reverse) and both blast-radius counts were measured by deleting an API rather than replacing it. Filed **#72** on the way out |
+| **72** | a zone's arena was filled from what the caller had just allocated | **filed and closed 2026-09-19**, three passes, out of 71e. Filed at two allocations a record and the copy between them; there were **seven**, and the two it named were the smallest — the largest was one line of `Zone::add_record` itself, folding an index key `intern` copies into its own arena a moment later. A million-record zone of A records now parses with **no heap allocation per record at all**, **480 ns a record to ~263** (`rdns/tests/scale.rs`), and a mixed-type one 535 to 438. `Zone::add` and `Zone::add_parsed` are the borrowed and the not-yet-encoded doors beside `add_record`; `Name::absolutized_in` settles a zone file's three spellings of an owner name in one place; `RdataArena::push_parsed` encodes into the arena under the same argument `RecordData::from_parsed` already stands on. **72a** was filed as §7 and was §4: the two field lists `rdata_from_fields` took were `tokens` and `tokens.iter().map(Cow::as_ref)`, the same strings by construction, under a comment saying one kept its quotes. **72b** went to zero rather than the one it predicted, and its first version moved an *exact* count **up** — `Vec` takes a byte vector's capacity to 8 whatever it holds, so the shrink to a `Box` cost a reallocation per record on the **message** path; sized from the RDLENGTH that arrived, it is 15 again. An exact count is what caught it. Two refutations recorded on the way: none of the three other build sites the row named gains from the borrowed door, and the signer's seven sites stay, because signing is ~27 µs a record |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

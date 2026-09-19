@@ -15,7 +15,7 @@ use super::checks::{check_cname_exclusivity, check_dname_rules};
 use super::rdata::{parse_generic_rdata, rdata_from_fields};
 use super::{Zone, ZoneRecordRef};
 use crate::error::{WireError, ZoneError};
-use crate::{Class, Name, NameRef, RecordData, Ttl};
+use crate::{Class, Name, NameRef, Ttl};
 use rdns_core::dname::MAX_NAME_LEN;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -334,22 +334,20 @@ fn parse_into(
     // An upper bound on the records this file adds, and the only cheap one
     // there is: directives and blank lines are the slack.
     zone.reserve(lines.len());
-    // Refilled per line rather than rebuilt: these were one `Vec` each per
-    // record, 96 and 64 octets, the two largest allocations on the load path
-    // and together larger than the name and the RDATA.
+    // Refilled per line rather than rebuilt, which is one `Vec` for the file
+    // and not one per record. It could not be until #72a: there was a second
+    // vector of `&str` borrowed from this one, so this one could not be
+    // touched while it lived.
     let mut tokens: Vec<Cow<'_, str>> = Vec::new();
     for logical in &lines {
         let ln = logical.line_no;
-        // Quoted strings stay whole; `parts` is the plain view of the same
-        // fields, which is all any record but TXT needs.
         tokenize_into(&logical.text, &mut tokens);
-        let parts: Vec<&str> = tokens.iter().map(Cow::as_ref).collect();
-        let Some(&first) = parts.first() else {
+        let Some(first) = tokens.first().map(Cow::as_ref) else {
             continue;
         };
 
         if first.eq_ignore_ascii_case("$ORIGIN") {
-            if let Some(new_origin) = parts.get(1) {
+            if let Some(new_origin) = tokens.get(1) {
                 state.origin = name_at(new_origin, state.origin.as_ref(), ln)?;
                 // Only the top-level file may move the apex: RFC 1035 §5.1 keeps
                 // an include's origin to the included file.
@@ -374,7 +372,7 @@ fn parse_into(
         }
 
         if first.eq_ignore_ascii_case("$TTL") {
-            if let Some(value) = parts.get(1) {
+            if let Some(value) = tokens.get(1) {
                 state.ttl = value
                     .parse::<u32>()
                     .map(Ttl::from_secs)
@@ -385,7 +383,7 @@ fn parse_into(
 
         // `$INCLUDE <file> [origin]`
         if first.eq_ignore_ascii_case("$INCLUDE") {
-            let Some(&file) = parts.get(1) else {
+            let Some(file) = tokens.get(1).map(Cow::as_ref) else {
                 return Err(ZoneError::syntax(ln, "$INCLUDE needs a file name"));
             };
             if depth + 1 >= MAX_INCLUDE_DEPTH {
@@ -405,7 +403,7 @@ fn parse_into(
             // state goes in as a copy and none of it comes back. The owner name
             // does not carry across either.
             let mut inner = ParseState {
-                origin: match parts.get(2) {
+                origin: match tokens.get(2) {
                     Some(o) => name_at(o, state.origin.as_ref(), ln)?,
                     None => state.origin.clone(),
                 },
@@ -459,22 +457,22 @@ fn parse_into(
         // apex and its own place in the zone map.
         let mut class = Class::IN;
 
-        while idx < parts.len() {
-            if let Ok(parsed_ttl) = parts[idx].parse::<i32>() {
+        while idx < tokens.len() {
+            if let Ok(parsed_ttl) = tokens[idx].parse::<i32>() {
                 ttl = Ttl::from_wire(parsed_ttl);
                 state.ttl = ttl;
                 idx += 1;
-            } else if parts[idx].eq_ignore_ascii_case("IN")
-                || parts[idx].eq_ignore_ascii_case("CH")
-                || parts[idx].eq_ignore_ascii_case("HS")
+            } else if tokens[idx].eq_ignore_ascii_case("IN")
+                || tokens[idx].eq_ignore_ascii_case("CH")
+                || tokens[idx].eq_ignore_ascii_case("HS")
             {
-                if !parts[idx].eq_ignore_ascii_case("IN") {
+                if !tokens[idx].eq_ignore_ascii_case("IN") {
                     return Err(ZoneError::syntax(
                         ln,
                         format!(
                             "class {} is not served: a zone here is IN, and a record of another \
                              class in it would answer IN queries with a class it never matched",
-                            parts[idx].to_uppercase()
+                            tokens[idx].to_uppercase()
                         ),
                     ));
                 }
@@ -485,7 +483,7 @@ fn parse_into(
             }
         }
 
-        if idx >= parts.len() {
+        if idx >= tokens.len() {
             continue;
         }
 
@@ -493,12 +491,12 @@ fn parse_into(
         // almost always one or two octets. A token too long or not ASCII is no
         // type name either way, so it goes on unchanged to the same error.
         let mut type_buf = [0u8; 32];
-        let record_type: &str = upper_into(parts[idx], &mut type_buf).unwrap_or(parts[idx]);
+        let record_type: &str = upper_into(&tokens[idx], &mut type_buf).unwrap_or(&tokens[idx]);
         idx += 1;
         // One field is the whole RDATA text, which is most records; joining a
         // one-element slice copies it for nothing.
-        let rdata: Cow<'_, str> = match &parts[idx..] {
-            [one] => Cow::Borrowed(one),
+        let rdata: Cow<'_, str> = match &tokens[idx..] {
+            [one] => Cow::Borrowed(one.as_ref()),
             rest => Cow::Owned(rest.join(" ")),
         };
 
@@ -506,8 +504,8 @@ fn parse_into(
         // a type with no parser here, and what the zone writer emits when the
         // type-specific spelling would not read back as the same bytes. §5
         // permits it for known types too, so it is accepted for them.
-        if parts.get(idx).is_some_and(|token| *token == "\\#") {
-            let rdata = parse_generic_rdata(record_type, &parts[idx + 1..])
+        if tokens.get(idx).is_some_and(|token| token == "\\#") {
+            let rdata = parse_generic_rdata(record_type, &tokens[idx + 1..])
                 .map_err(|e| ZoneError::syntax(ln, format!("{record_type} record: {e}")))?;
             zone.add(ZoneRecordRef {
                 name: state.owner().expect("an owner name"),
@@ -518,21 +516,20 @@ fn parse_into(
             continue;
         }
 
-        let rdata: RecordData = rdata_from_fields(
+        let parsed = rdata_from_fields(
             record_type,
             rdata,
-            &parts[idx..],
             &tokens[idx..],
             state.origin.as_ref(),
             ln,
         )?;
 
-        zone.add(ZoneRecordRef {
-            name: state.owner().expect("an owner name"),
-            ttl,
-            class,
-            rdata: rdata.as_ref(),
-        });
+        // Encoded into the zone's own arena. The `RecordData` this used to
+        // build was a heap allocation and a free per record for octets the
+        // zone copies either way (`TODO.md` #72b), and the line number is what
+        // the encode's own error has no way to carry.
+        zone.add_parsed(state.owner().expect("an owner name"), ttl, class, &parsed)
+            .map_err(|e| ZoneError::syntax(ln, format!("{record_type} record: {e}")))?;
     }
 
     Ok(())

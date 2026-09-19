@@ -27,14 +27,15 @@
 //! answer at query time.
 
 use crate::denial_wire::{base32hex_decode, canonical_sort_key, CanonicalKey, Nsec3Hash};
+use crate::error::WireError;
 use crate::record_types as rt;
 use crate::Class;
 use crate::Rtype;
 use crate::Serial;
 use crate::Ttl;
 use crate::{
-    Name, NameArena, NameRef, NameSpan, Qtype, RdataArena, RdataSpan, RecordData, RecordDataRef,
-    ResourceRecord,
+    Name, NameArena, NameRef, NameSpan, ParsedRecord, Qtype, RdataArena, RdataSpan, RecordData,
+    RecordDataRef, ResourceRecord,
 };
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -820,27 +821,54 @@ impl Zone {
     /// Add a record to the zone.
     ///
     /// The owned door. A caller that already holds the octets borrowed wants
-    /// [`Zone::add`]: a zone copies both fields into its arenas either way, so
-    /// building a `ZoneRecord` to hand over is a heap allocation and a free per
-    /// record for a value nothing keeps.
+    /// [`Zone::add`], and one holding a [`ParsedRecord`] wants
+    /// [`Zone::add_parsed`]: a zone copies the name and the RDATA into its
+    /// arenas whichever door is used, so anything built only to be handed over
+    /// is a heap allocation and a free per record for a value nothing keeps.
     pub fn add_record(&mut self, record: ZoneRecord) {
         self.add(record.as_ref());
     }
 
     /// Add a record whose name and RDATA the caller only borrows.
     pub fn add(&mut self, record: ZoneRecordRef<'_>) {
+        let rdata = self.rdata.push(record.rdata);
+        self.take_in(record.name, record.ttl, record.class, rdata);
+    }
+
+    /// Add a record whose RDATA has not been encoded yet, encoding it straight
+    /// into the zone's arena (`TODO.md` #72b).
+    ///
+    /// For a caller that *builds* the RDATA — the zone parser, which reads
+    /// presentation fields into a [`ParsedRecord`] and would otherwise encode
+    /// them into a `Box` this copies and frees. The zone is unchanged if the
+    /// encode fails.
+    pub fn add_parsed(
+        &mut self,
+        name: NameRef<'_>,
+        ttl: Ttl,
+        class: Class,
+        parsed: &ParsedRecord,
+    ) -> Result<(), WireError> {
+        let rdata = self.rdata.push_parsed(parsed)?;
+        self.take_in(name, ttl, class, rdata);
+        Ok(())
+    }
+
+    /// Take in a record whose RDATA is already in the arena: the name, the
+    /// index and the chains, which all three doors share.
+    fn take_in(&mut self, name: NameRef<'_>, ttl: Ttl, class: Class, rdata: RdataSpan) {
         // Folded onto the stack, not into an allocation: `into_owned` here was
         // one heap allocation and one free per record for a copy nothing keeps
         // — `intern` copies the octets into the index's own arena.
         let mut fold = [0u8; rdns_core::dname::MAX_NAME_LEN];
-        let key = record.name.folded_into(&mut fold);
+        let key = name.folded_into(&mut fold);
         let key = key.as_wire();
         let position = self.records.len();
         // Through the field rather than `origin_key()`, so the borrow is of
         // `self.origin` alone and `self.index` can be taken mutably beside it.
         let origin_key = self.origin.as_ref().folded();
         let at_apex = key == &*origin_key;
-        self.shortcuts.note(key, record.rdata.rtype(), at_apex);
+        self.shortcuts.note(key, rdata.rtype(), at_apex);
         let at = self.index.intern(key);
         // Ancestors only when the name is new to the index: one name notes them
         // and every later record at it would find them present. That probe was
@@ -850,7 +878,7 @@ impl Zone {
             Zone::note_non_terminals(&mut self.index, key, at, &origin_key);
         }
         drop(origin_key);
-        match self.chain_key(record) {
+        match Zone::chain_key(name, rdata.rtype()) {
             Some(ChainKey::Nsec(k)) => {
                 self.nsec_chain.insert(k, position);
             }
@@ -860,10 +888,10 @@ impl Zone {
             None => {}
         }
         let stored = Stored {
-            name: self.names.push(record.name),
-            ttl: record.ttl,
-            class: record.class,
-            rdata: self.rdata.push(record.rdata),
+            name: self.names.push(name),
+            ttl,
+            class,
+            rdata,
         };
         self.records.push(stored);
     }
@@ -904,7 +932,10 @@ impl Zone {
     pub(crate) fn remove_record(&mut self, position: usize) -> ZoneRecord {
         let record = self.record(position).to_owned();
         let key = self.record(position).name.folded().into_owned();
-        match self.chain_key(self.record(position)) {
+        match Zone::chain_key(
+            self.record(position).name,
+            self.records[position].rdata.rtype(),
+        ) {
             Some(ChainKey::Nsec(k)) => {
                 self.nsec_chain.remove(&k);
             }
@@ -919,7 +950,10 @@ impl Zone {
         if moved_from != position {
             let moved = self.record(position).name.folded().into_owned();
             self.refile(&moved, moved_from, position);
-            match self.chain_key(self.record(position)) {
+            match Zone::chain_key(
+                self.record(position).name,
+                self.records[position].rdata.rtype(),
+            ) {
                 Some(ChainKey::Nsec(k)) => {
                     self.nsec_chain.insert(k, position);
                 }
@@ -1044,14 +1078,14 @@ impl Zone {
     /// An NSEC is filed under its owner name; an NSEC3 under the hash in its
     /// owner's first label, which is what the chain is ordered by. A label that
     /// will not decode is left out rather than filed under something wrong.
-    fn chain_key(&self, record: ZoneRecordRef<'_>) -> Option<ChainKey> {
-        match record.rdata.rtype() {
-            crate::record_types::NSEC => Some(ChainKey::Nsec(canonical_sort_key(record.name))),
+    fn chain_key(name: NameRef<'_>, rtype: Rtype) -> Option<ChainKey> {
+        match rtype {
+            crate::record_types::NSEC => Some(ChainKey::Nsec(canonical_sort_key(name))),
             crate::record_types::NSEC3 => {
                 // The hash is the first label, and a label is octets — so it is
                 // taken as octets rather than by splitting text on a `.` that
                 // may be inside one.
-                let label = record.name.labels().next()?;
+                let label = name.labels().next()?;
                 let decoded = base32hex_decode(std::str::from_utf8(label).ok()?).ok()?;
                 Some(ChainKey::Nsec3(Nsec3Hash::from_wire(&decoded)?))
             }
@@ -3457,20 +3491,21 @@ $TTL 3600
     /// regression test.
     #[test]
     fn the_rdata_half_can_be_tested_without_a_zone_file() {
-        let fields = ["10", "mx.example.com."];
-        let text: Vec<Cow<'_, str>> = fields.iter().map(|s| Cow::Borrowed(*s)).collect();
+        let fields: Vec<Cow<'_, str>> = ["10", "mx.example.com."]
+            .iter()
+            .map(|s| Cow::Borrowed(*s))
+            .collect();
         let origin = nm("example.com.");
         let mx = rdata_from_fields(
             "MX",
             Cow::Borrowed("10 mx.example.com."),
             &fields,
-            &text,
             origin.as_ref(),
             1,
         )
         .expect("a well-formed MX");
         assert_eq!(
-            mx.parse().unwrap(),
+            mx,
             ParsedRecord::MX {
                 preference: 10,
                 exchange: nm("mx.example.com."),
@@ -3479,13 +3514,14 @@ $TTL 3600
 
         // The line number travels with the error: the helpers return a detail
         // and this function attaches the position.
-        let bad = ["notanumber", "mx.example.com."];
-        let text: Vec<Cow<'_, str>> = bad.iter().map(|s| Cow::Borrowed(*s)).collect();
+        let bad: Vec<Cow<'_, str>> = ["notanumber", "mx.example.com."]
+            .iter()
+            .map(|s| Cow::Borrowed(*s))
+            .collect();
         let err = rdata_from_fields(
             "MX",
             Cow::Borrowed("notanumber mx.example.com."),
             &bad,
-            &text,
             origin.as_ref(),
             42,
         )

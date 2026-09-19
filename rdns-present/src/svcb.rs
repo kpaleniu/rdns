@@ -86,13 +86,21 @@ pub(crate) fn svc_param_key_from_name(name: &str) -> Option<u16> {
 /// in the strictly increasing order the wire needs (RFC 9460 §2.2), so an
 /// operator may write them in any order. A repeated key is refused *here*
 /// rather than there, because here is where the line number is.
-pub fn parse_params(fields: &[&str], ln: usize) -> Result<Vec<(u16, Vec<u8>)>, ZoneError> {
+///
+/// Generic over the field type rather than taking `&[&str]`, because how a zone
+/// parser spells a token is the parser's business: `rdns`'s are `Cow`s borrowed
+/// from the file unless a quote or an escape means they cannot be.
+pub fn parse_params<S: AsRef<str>>(
+    fields: &[S],
+    ln: usize,
+) -> Result<Vec<(u16, Vec<u8>)>, ZoneError> {
     let mut params: Vec<(u16, Vec<u8>)> = Vec::new();
     for field in fields {
+        let field = field.as_ref();
         let (name, value) = match field.split_once('=') {
             Some((name, value)) => (name, Some(value)),
             // "no-default-alpn" and friends: the key alone, no "=" at all.
-            None => (*field, None),
+            None => (field, None),
         };
         let Some(code) = svc_param_key_from_name(name) else {
             return Err(ZoneError::syntax(

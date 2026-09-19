@@ -848,7 +848,15 @@ fn one_zone_load_and_sign() {
     // stack; the type name is upper-cased there; and the token vector is
     // refilled per line rather than rebuilt. At a million records the parse is
     // 480 ns a record to 322 (`rdns/tests/scale.rs`).
-    within("parse an eight-record zone", parse_count, 40..=200);
+    //
+    // **54 -> 45 with #72a** — one field list where there were two, so the
+    // second vector per line is gone — **and 45 -> 34 with #72b**, which is the
+    // last of them: `rdata_from_fields` hands back a `ParsedRecord` and
+    // `Zone::add_parsed` encodes it into the zone's RDATA arena, where it used
+    // to be encoded into a `Box` the zone copied and freed. A million-record
+    // zone of A records now parses with **no allocation per record at all** and
+    // in 257 ns; the eight here are the file's fixed costs.
+    within("parse an eight-record zone", parse_count, 20..=200);
 
     let keys = vec![
         SigningKey::generate(

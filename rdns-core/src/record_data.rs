@@ -92,7 +92,17 @@ impl RecordData {
                 rdata: rdata.to_vec().into_boxed_slice(),
             });
         }
-        Self::from_parsed(&parsed)
+        // Sized from what arrived, because re-encoding changes the length only
+        // where a compression pointer was expanded — and then upwards. An
+        // exactly-sized `Vec` is a `Box` without a second allocation to shrink
+        // it, which growing from empty would need: `extend_from_slice` on an
+        // empty `Vec<u8>` takes capacity to 8 whatever the record is.
+        let mut out = Vec::with_capacity(rdata.len());
+        let rtype = parsed.encode_into(&mut out)?;
+        Ok(RecordData {
+            rtype,
+            rdata: out.into_boxed_slice(),
+        })
     }
 
     /// Encode a typed record into compact, uncompressed wire-format storage.
@@ -341,6 +351,39 @@ impl RdataArena {
             len: data.rdata.len() as u16,
             rtype: data.rtype,
         }
+    }
+
+    /// Encode `parsed` straight into the arena and give back where it went.
+    ///
+    /// The allocation-free spelling of `push(RecordData::from_parsed(..))`, and
+    /// exactly as trustworthy: neither checks, because both take the TYPE and
+    /// the octets from one `ParsedRecord` and `encode` is `decode`'s inverse.
+    /// What a caller cannot do through either is pair a TYPE with octets of its
+    /// own choosing (`CLAUDE.md` §17).
+    ///
+    /// A failed encode leaves the arena as it found it, so a zone that refuses
+    /// a record does not carry its half-written RDATA for the life of the
+    /// process.
+    pub fn push_parsed(&mut self, parsed: &ParsedRecord) -> Result<RdataSpan, WireError> {
+        let off = self.bytes.len();
+        let rtype = match parsed.encode_into(&mut self.bytes) {
+            Ok(rtype) => rtype,
+            Err(e) => {
+                self.bytes.truncate(off);
+                return Err(e);
+            }
+        };
+        let len = self.bytes.len() - off;
+        Ok(RdataSpan {
+            // The same two bounds `push` states, for the same reasons.
+            off: u32::try_from(off).expect("an RDATA arena under 4 GiB"),
+            len: u16::try_from(len).map_err(|_| WireError::TooLong {
+                what: "a record's RDATA",
+                limit: u16::MAX as usize,
+                actual: len,
+            })?,
+            rtype,
+        })
     }
 
     /// The RDATA at `at`.

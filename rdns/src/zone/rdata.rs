@@ -49,7 +49,7 @@ fn construct_type_bitmap(types: &[String]) -> Result<Vec<u8>, String> {
 /// record fails the load rather than waiting to fail a query.
 pub(super) fn parse_generic_rdata(
     record_type: &str,
-    fields: &[&str],
+    fields: &[Cow<'_, str>],
 ) -> Result<RecordData, String> {
     let rtype = crate::record_types::record_type_name_to_code(record_type)
         .ok_or_else(|| format!("unknown record type {record_type:?}"))?;
@@ -79,9 +79,9 @@ pub(super) fn parse_generic_rdata(
 /// the `key=value` fields that follow them (RFC 9460 §2.1).
 fn split_svcb_head<'a>(
     record_type: &str,
-    fields: &'a [&'a str],
+    fields: &'a [Cow<'a, str>],
     ln: usize,
-) -> Result<(u16, String, &'a [&'a str]), ZoneError> {
+) -> Result<(u16, String, &'a [Cow<'a, str>]), ZoneError> {
     let [priority, target, rest @ ..] = fields else {
         return Err(ZoneError::syntax(
             ln,
@@ -94,7 +94,7 @@ fn split_svcb_head<'a>(
             format!("the {record_type} priority {priority:?} is not a number 0-65535: {e}"),
         )
     })?;
-    Ok((priority, (*target).to_string(), rest))
+    Ok((priority, target.to_string(), rest))
 }
 
 /// The RDATA half of a zone-file line: everything after the owner name, TTL,
@@ -102,37 +102,35 @@ fn split_svcb_head<'a>(
 /// `parse_into`, which
 /// mutates parser state.
 ///
-/// Three views of the fields: `rdata` joined by a space (what every type but TXT
-/// wants), `fields` unquoted, and `text_fields` still quoted — a TXT RR is a
-/// sequence of character-strings and the quotes say where each ends
-/// (RFC 1035 §3.3.14).
+/// Two views of one list: `rdata` is the fields joined by a space, which is what
+/// every type but TXT wants, and `fields` is them separate — a TXT RR is a
+/// sequence of character-strings and a field boundary is where each ends
+/// (RFC 1035 §3.3.14). It was three until `TODO.md` #72a: `fields` and
+/// `text_fields` were `tokens.iter().map(Cow::as_ref)` and `tokens`, the same
+/// strings in two types, under a comment saying one kept its quotes. Neither
+/// does — `tokenize` consumes them.
 pub(super) fn rdata_from_fields(
     record_type: &str,
     rdata: Cow<'_, str>,
-    fields: &[&str],
-    text_fields: &[Cow<'_, str>],
+    fields: &[Cow<'_, str>],
     origin: NameRef<'_>,
     ln: usize,
-) -> Result<RecordData, ZoneError> {
+) -> Result<ParsedRecord, ZoneError> {
     Ok(match record_type {
         "A" => {
             let addr = rdata
                 .parse::<Ipv4Addr>()
                 .map_err(|e| ZoneError::syntax(ln, format!("invalid A address {rdata:?}: {e}")))?;
-            RecordData::from_parsed(&ParsedRecord::A(addr))
-                .map_err(|e| ZoneError::syntax(ln, format!("A record: {e}")))?
+            ParsedRecord::A(addr)
         }
         "AAAA" => {
             let addr = rdata.parse::<Ipv6Addr>().map_err(|e| {
                 ZoneError::syntax(ln, format!("invalid AAAA address {rdata:?}: {e}"))
             })?;
-            RecordData::from_parsed(&ParsedRecord::AAAA(addr))
-                .map_err(|e| ZoneError::syntax(ln, format!("AAAA record: {e}")))?
+            ParsedRecord::AAAA(addr)
         }
-        "NS" => RecordData::from_parsed(&ParsedRecord::NS(name_at(&rdata, origin, ln)?))
-            .map_err(|e| ZoneError::syntax(ln, format!("NS record: {e}")))?,
-        "CNAME" => RecordData::from_parsed(&ParsedRecord::CNAME(name_at(&rdata, origin, ln)?))
-            .map_err(|e| ZoneError::syntax(ln, format!("CNAME record: {e}")))?,
+        "NS" => ParsedRecord::NS(name_at(&rdata, origin, ln)?),
+        "CNAME" => ParsedRecord::CNAME(name_at(&rdata, origin, ln)?),
         "MX" => {
             let mx_parts: Vec<&str> = rdata.split_whitespace().collect();
             if mx_parts.len() < 2 {
@@ -144,17 +142,16 @@ pub(super) fn rdata_from_fields(
             let preference = mx_parts[0].parse::<u16>().map_err(|e| {
                 ZoneError::syntax(ln, format!("invalid MX preference {:?}: {e}", mx_parts[0]))
             })?;
-            RecordData::from_parsed(&ParsedRecord::MX {
+            ParsedRecord::MX {
                 preference,
                 exchange: name_at(&mx_parts[1..].join(" "), origin, ln)?,
-            })
-            .map_err(|e| ZoneError::syntax(ln, format!("MX record: {e}")))?
+            }
         }
         "TXT" => {
             // Every field after the type is one `<character-string>`
             // (RFC 1035 §3.3.14): `"a b" c` is two, `a b c` is three. The
             // 255-byte ceiling is the encoder's, for every caller.
-            let strings: Vec<Vec<u8>> = text_fields
+            let strings: Vec<Vec<u8>> = fields
                 .iter()
                 .map(|t| crate::codecs::char_string_decode(t))
                 .collect::<Result<_, _>>()
@@ -162,13 +159,10 @@ pub(super) fn rdata_from_fields(
             if strings.is_empty() {
                 return Err(ZoneError::syntax(ln, "TXT record has no text"));
             }
-            RecordData::from_parsed(&ParsedRecord::TXT(strings))
-                .map_err(|e| ZoneError::syntax(ln, format!("TXT record: {e}")))?
+            ParsedRecord::TXT(strings)
         }
-        "PTR" => RecordData::from_parsed(&ParsedRecord::PTR(name_at(&rdata, origin, ln)?))
-            .map_err(|e| ZoneError::syntax(ln, format!("PTR record: {e}")))?,
-        "DNAME" => RecordData::from_parsed(&ParsedRecord::DNAME(name_at(&rdata, origin, ln)?))
-            .map_err(|e| ZoneError::syntax(ln, format!("DNAME record: {e}")))?,
+        "PTR" => ParsedRecord::PTR(name_at(&rdata, origin, ln)?),
+        "DNAME" => ParsedRecord::DNAME(name_at(&rdata, origin, ln)?),
         // One arm for two type codes: "the same encoding, format, and
         // high-level semantics" (RFC 9460 §6). Only the owner name differs
         // between them, and that is the caller's (§9.1).
@@ -195,13 +189,12 @@ pub(super) fn rdata_from_fields(
             } else {
                 rt::HTTPS
             };
-            RecordData::from_parsed(&ParsedRecord::SVCB {
+            ParsedRecord::SVCB {
                 rtype,
                 priority,
                 target,
                 params,
-            })
-            .map_err(|e| ZoneError::syntax(ln, format!("{record_type} record: {e}")))?
+            }
         }
         "SOA" => {
             let soa_parts: Vec<&str> = rdata.split_whitespace().collect();
@@ -226,7 +219,7 @@ pub(super) fn rdata_from_fields(
             let minimum = soa_parts[6].parse::<u32>().map_err(|e| {
                 ZoneError::syntax(ln, format!("invalid SOA minimum {:?}: {e}", soa_parts[6]))
             })?;
-            RecordData::from_parsed(&ParsedRecord::SOA {
+            ParsedRecord::SOA {
                 mname: name_at(soa_parts[0], origin, ln)?,
                 rname: name_at(soa_parts[1], origin, ln)?,
                 serial,
@@ -234,8 +227,7 @@ pub(super) fn rdata_from_fields(
                 retry,
                 expire,
                 minimum,
-            })
-            .map_err(|e| ZoneError::syntax(ln, format!("SOA record: {e}")))?
+            }
         }
         "DNSKEY" | "CDNSKEY" => {
             let key_parts = fields;
@@ -263,7 +255,7 @@ pub(super) fn rdata_from_fields(
             let b64_key = key_parts[3..].join("");
             let public_key = base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_key)
                 .map_err(|e| ZoneError::syntax(ln, format!("invalid DNSKEY base64 key: {e}")))?;
-            RecordData::from_parsed(&ParsedRecord::DNSKEY {
+            ParsedRecord::DNSKEY {
                 // Which of the two codes the operator wrote. `kind` is the
                 // mnemonic from the line, so this cannot drift from it.
                 rtype: if record_type == "CDNSKEY" {
@@ -275,8 +267,7 @@ pub(super) fn rdata_from_fields(
                 protocol,
                 algorithm,
                 public_key,
-            })
-            .map_err(|e| ZoneError::syntax(ln, format!("DNSKEY record: {e}")))?
+            }
         }
         "DS" | "CDS" => {
             let ds_parts = fields;
@@ -298,7 +289,7 @@ pub(super) fn rdata_from_fields(
             let hex_digest = ds_parts[3..].join("");
             let digest = hex_decode(&hex_digest)
                 .map_err(|e| ZoneError::syntax(ln, format!("invalid DS digest: {e}")))?;
-            RecordData::from_parsed(&ParsedRecord::DS {
+            ParsedRecord::DS {
                 rtype: if record_type == "CDS" {
                     crate::record_types::CDS
                 } else {
@@ -308,8 +299,7 @@ pub(super) fn rdata_from_fields(
                 algorithm,
                 digest_type,
                 digest,
-            })
-            .map_err(|e| ZoneError::syntax(ln, format!("DS record: {e}")))?
+            }
         }
         "RRSIG" => {
             let rrsig_parts = fields;
@@ -319,13 +309,15 @@ pub(super) fn rdata_from_fields(
                     format!("RRSIG record needs 9 fields, got {}", rrsig_parts.len()),
                 ));
             }
-            let type_covered = crate::record_types::record_type_name_to_code(rrsig_parts[0])
-                .ok_or_else(|| {
-                    ZoneError::syntax(
-                        ln,
-                        format!("unknown RRSIG type covered {:?}", rrsig_parts[0]),
-                    )
-                })?;
+            let type_covered = crate::record_types::record_type_name_to_code(
+                rrsig_parts[0].as_ref(),
+            )
+            .ok_or_else(|| {
+                ZoneError::syntax(
+                    ln,
+                    format!("unknown RRSIG type covered {:?}", rrsig_parts[0]),
+                )
+            })?;
             let algorithm = rrsig_parts[1].parse::<u8>().map_err(|e| {
                 ZoneError::syntax(
                     ln,
@@ -344,13 +336,13 @@ pub(super) fn rdata_from_fields(
                     format!("invalid RRSIG original TTL {:?}: {e}", rrsig_parts[3]),
                 )
             })?;
-            let expiration = parse_dnssec_time(rrsig_parts[4]).map_err(|e| {
+            let expiration = parse_dnssec_time(rrsig_parts[4].as_ref()).map_err(|e| {
                 ZoneError::syntax(
                     ln,
                     format!("invalid RRSIG expiration {:?}: {e}", rrsig_parts[4]),
                 )
             })?;
-            let inception = parse_dnssec_time(rrsig_parts[5]).map_err(|e| {
+            let inception = parse_dnssec_time(rrsig_parts[5].as_ref()).map_err(|e| {
                 ZoneError::syntax(
                     ln,
                     format!("invalid RRSIG inception {:?}: {e}", rrsig_parts[5]),
@@ -362,13 +354,13 @@ pub(super) fn rdata_from_fields(
                     format!("invalid RRSIG key tag {:?}: {e}", rrsig_parts[6]),
                 )
             })?;
-            let signer_name = name_at(rrsig_parts[7], origin, ln)?;
+            let signer_name = name_at(rrsig_parts[7].as_ref(), origin, ln)?;
             let b64_sig = rrsig_parts[8..].join("");
             let signature = base64::Engine::decode(&base64::prelude::BASE64_STANDARD, &b64_sig)
                 .map_err(|e| {
                     ZoneError::syntax(ln, format!("invalid RRSIG base64 signature: {e}"))
                 })?;
-            RecordData::from_parsed(&ParsedRecord::RRSIG {
+            ParsedRecord::RRSIG {
                 type_covered,
                 algorithm,
                 labels,
@@ -378,8 +370,7 @@ pub(super) fn rdata_from_fields(
                 key_tag,
                 signer_name,
                 signature,
-            })
-            .map_err(|e| ZoneError::syntax(ln, format!("RRSIG record: {e}")))?
+            }
         }
         "NSEC" => {
             let nsec_parts = fields;
@@ -392,15 +383,14 @@ pub(super) fn rdata_from_fields(
                     ),
                 ));
             }
-            let next_domain_name = name_at(nsec_parts[0], origin, ln)?;
+            let next_domain_name = name_at(nsec_parts[0].as_ref(), origin, ln)?;
             let type_names: Vec<String> = nsec_parts[1..].iter().map(|s| s.to_string()).collect();
             let type_bitmap = construct_type_bitmap(&type_names)
                 .map_err(|e| ZoneError::syntax(ln, format!("NSEC record: {e}")))?;
-            RecordData::from_parsed(&ParsedRecord::NSEC {
+            ParsedRecord::NSEC {
                 next_domain_name,
                 type_bitmap,
-            })
-            .map_err(|e| ZoneError::syntax(ln, format!("NSEC record: {e}")))?
+            }
         }
         "NSEC3" => {
             let nsec3_parts = fields;
@@ -428,7 +418,7 @@ pub(super) fn rdata_from_fields(
                     format!("invalid NSEC3 iterations {:?}: {e}", nsec3_parts[2]),
                 )
             })?;
-            let salt_str = nsec3_parts[3];
+            let salt_str = nsec3_parts[3].as_ref();
             let salt = if salt_str == "-" {
                 Vec::new()
             } else {
@@ -439,7 +429,7 @@ pub(super) fn rdata_from_fields(
             // `denial_wire`'s decoder, not a second one: the copy that used to
             // live here folded case with `str::to_uppercase`, which is the
             // Unicode fold RFC 4343 forbids (`TODO.md` #26b).
-            let next_hashed_owner = base32hex_decode(nsec3_parts[4]).map_err(|e| {
+            let next_hashed_owner = base32hex_decode(nsec3_parts[4].as_ref()).map_err(|e| {
                 ZoneError::syntax(
                     ln,
                     format!("invalid NSEC3 next hashed owner {:?}: {e}", nsec3_parts[4]),
@@ -448,15 +438,14 @@ pub(super) fn rdata_from_fields(
             let type_names: Vec<String> = nsec3_parts[5..].iter().map(|s| s.to_string()).collect();
             let type_bitmap = construct_type_bitmap(&type_names)
                 .map_err(|e| ZoneError::syntax(ln, format!("NSEC3 record: {e}")))?;
-            RecordData::from_parsed(&ParsedRecord::NSEC3 {
+            ParsedRecord::NSEC3 {
                 hash_algorithm,
                 flags,
                 iterations,
                 salt,
                 next_hashed_owner,
                 type_bitmap,
-            })
-            .map_err(|e| ZoneError::syntax(ln, format!("NSEC3 record: {e}")))?
+            }
         }
         other => {
             return Err(ZoneError::syntax(
