@@ -37,7 +37,38 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#78** through **#84**, and **#21**, as of 2026-09-20.
+**#58**, **#68**, **#78** through **#90**, and **#21**, as of 2026-09-20.
+
+**#85 through #90 came out of a second architecture review on 2026-09-20**, this
+one asking what the ideal shape would be and where the tree differs. **Ten
+findings, six rows**, and what happened to the other four is the half worth
+reading:
+
+- **The two UDP loops are duplicated on purpose.** #30's "What must not be
+  unified" decided it — a fixed worker pool against a task per datagram, with
+  #27b's 1 536 bytes behind the first — and the admission sequence they share
+  *is* `ServeContext::allow_source` + `accept_packet`, composed per site so the
+  differences stay visible. The finding was written before that page was read.
+- **An `rdns-ops` crate is #82a**, already declined there on a package count.
+  The rebuild measurement 82a asked for and said nobody had taken is now taken,
+  in place, and agrees.
+- **The reload seam in `rdnsd/src/main.rs` is #83**, which already carries the
+  same count this review re-derived: #20 declined the move on nine reach-backs
+  into `main`, and there is one.
+- **`handle_query`'s 432 lines are answered** by `finish_dns64`'s own header,
+  which names §7's epilogue hazard and says why the split is deliberate. Folded
+  into #88 as context rather than filed, because the measurement is what would
+  decide it.
+
+A fifth was cut to two thirds: `ZoneError` cannot leave `rdns-core`, because
+`rdns-present` uses it and does not depend on `rdns`. That is #86's own
+refutation and is recorded in it.
+
+What the review got right about the tree is a negative result: `rdns`'s 40
+modules have 70 production cross-module edges and **zero cycles**, fan-in
+concentrated on `error` (23) and `zone` (14). Splitting that crate is a
+packaging question, not a comprehension one — which is why #85 and #86 are the
+only two pieces of it worth money.
 
 **#73, #74, #75 and #76 were filed and closed the same day**, out of an
 architecture review that asked what the shape of this code costs a reader rather
@@ -4872,7 +4903,19 @@ remedy is naming the fields rather than collapsing them.
   `rdns-transport` holding `shutdown`, `metrics`, `security`, `logging`,
   `tls_identity` and `readiness` — takes **no package off any binary**
   (`cargo tree -p rdnsd` is 120 either way), which is the limit #67 wrote down.
-  Revive it only with a rebuild-time measurement, which nobody has taken.
+  ~~Revive it only with a rebuild-time measurement, which nobody has taken.~~
+
+  **Taken 2026-09-20, and it agrees: still decline.** What the
+  `rdns-transport` → `rdns` edge costs is one crate's rebuild whenever `rdns`
+  changes, and `rdns-transport` does not name the module that changed. Windows,
+  warm `target/`, `cargo build --workspace`: no-op 160 ms; touching
+  `rdns/src/zone.rs` rebuilds `rdns`, `rdns-transport`, `rdnsd`, `rdnsr` at
+  **3 271-3 437 ms**; touching `rdns-transport/src/tcp.rs` (transport plus both
+  binaries) 2 766-2 826 ms; touching both binaries alone 2 244-2 392 ms. So the
+  transport link is **~450 ms of a ~3.3 s rebuild, 14%** — and that is the
+  ceiling, not the saving, because the binaries still depend on both crates and
+  a split only lets them start on `rdns`'s metadata sooner. Not worth six
+  modules and a manifest. 82a's own move stands on the measurement above it.
 
 - **82b. Five `pub fn` on private structs in `xfr.rs`, and the ratchet question
   behind them.** `AxfrAssembler` and `IxfrAssembler` are private and their
@@ -4959,6 +5002,174 @@ together would make the disagreement unrepresentable, which is what §17 would
 ask for. **Capture the output before and after and `diff` it** — byte-identical
 except the `dns_catalog_members` HELP line, or a block was not as uniform as it
 looked.
+
+---
+
+### 85. `rdns::logging::init` puts a subscriber in the library — **filed 2026-09-20**
+
+`logging::init` installs the process-global `tracing-subscriber`. Both binaries
+call it (`rdnsd/src/main.rs:1982`, `rdnsr/src/main.rs:497`) and nothing else
+does, and it is the only use of `tracing_subscriber` in `rdns`
+(`logging.rs:87`, `:94`).
+
+Two files state the rule it breaks. The workspace manifest, on the `tracing`
+entry: "The library only emits; the binaries choose where it goes."
+`rdns-transport/src/lib.rs`'s header, explaining why it is not part of `rdns`:
+"everything here reports to a human reading a log line … which the library may
+not depend on".
+
+**Measured on Windows.** Seven packages reach the graph only through this
+dependency — `tracing-subscriber`, `matchers`, `regex-automata`, `regex-syntax`,
+`sharded-slab`, `thread_local`, `lazy_static` — each confirmed with
+`cargo tree -i`, every path running through `rdns`. `rdns`'s normal dependency
+closure is 55 packages and would be 48. The seven units cost 7.98 s of compile.
+
+**The refuting measurement, taken.** They are **off the critical path**: all
+seven finish by 7.87 s of a 21.08 s fresh `--timings` build whose path is `rdns`
+(8.67→13.66) then `rdnsd` (13.66→21.08). And `Cargo.lock` does not shrink
+wherever `init` lands, because both daemons need it. So this buys nothing for a
+workspace build. It buys `cargo build -p rdns` seven fewer crates, and a library
+that does not make a process-global decision on its caller's behalf.
+
+`LogLevel` moves with `init` — both binaries hold one as a clap-parsed field.
+`rdns-transport` is the home its own header argues for.
+
+#30n recorded the fact in passing — "`Cargo.lock` loses one edge and no package,
+because `rdns::logging` still installs the subscriber" — and moved on. §18: that
+sentence is this number.
+
+---
+
+### 86. Two error enums are in the crate that cannot reach them — **filed 2026-09-20**
+
+`DnssecError` (`rdns-core/src/error.rs:141`, 57 lines with its impl) and
+`BrokenCatalog` (`:198`, 43 lines) are defined in `rdns-core` and **named by no
+module in `rdns-core`** — `grep` over `rdns-core/src` returns `error.rs` and
+nothing else. Their only consumer is `rdns`, which already holds `TransferError`
+for a reason written at the top of `rdns/src/error.rs`. Together they are 100 of
+that file's 265 lines.
+
+`rdns-core` is the crate a client links alone, which is the whole of #31:
+`rdnsctl` takes it and nothing else, and its header calls it "the DNS wire
+format".
+
+**The refuting measurement, taken, and it removes a third of the finding.**
+`ZoneError` looked identical and **must stay**: `rdns-present` uses it
+(`record_text.rs:21`, `svcb.rs:16`) and does not depend on `rdns`, so moving it
+would require `rdns-present` → `rdns`, which is a cycle. Presentation-format
+parsing failing as a `ZoneError` is the reason `ZoneError` is core's, and it is
+written down nowhere — put it on the enum when the other two move, or the next
+sweep re-derives this.
+
+Nothing blocks the other two: their only dependency is `WireError`, which stays,
+and `rdns::error`'s `pub use rdns_core::error::*` keeps every downstream path
+spelled as it is today.
+
+---
+
+### 87. `rdnsd`'s UDP path reads the wall clock, not `ServeContext`'s — **filed 2026-09-20**
+
+#52 made `Clock` the seam so a rate-limit test is not decided by whether two
+connects straddled a second boundary, and recorded its sweep as "the four accept
+loops read `ctx.clock.now()`". Two request-path sites are neither an accept loop
+nor `rdnsr`'s UDP loop, so the criterion did not reach them:
+
+- `rdnsd/src/main.rs:1310` — `udp_loop`'s `let now = tsig::now()`, which is an
+  alias for `current_unix_timestamp`. That instant is threaded into the limiter,
+  the admission check, the TSIG check and the response budget, so a
+  `Clock::fixed` reaches none of `rdnsd`'s UDP path. `rdnsr/src/serve.rs:65` is
+  the same line of the same loop, written `ctx.clock.now()`.
+- `rdnsd/src/dispatch.rs:841` — `signed_error` signs with a second wall-clock
+  read, where `finish` 464 lines up signs with the `now` that verified the
+  request. `answer_transfer` takes `now`; `answer_update`, which reaches 11 of
+  `signed_error`'s 12 call sites, does not.
+
+**The refuting measurement, taken: it is latent.** `Clock::System` *is*
+`current_unix_timestamp`, so nothing differs in production, and the TSIG fudge is
+300 s. No `rdnsd` test asks for a fixed clock today —
+`a_worker_answers_a_datagram_it_received` (`main.rs:3288`) drives the real loop
+over a real socket and asserts nothing time-dependent. So this is §17's shape
+rather than a defect: the invariant is a seam, so it is re-asserted per site, and
+one site sat outside the sweep's criterion.
+
+---
+
+### 88. Nothing measures `rdnsr`'s answer path — **filed 2026-09-20**
+
+Every benchmark (`rdns/benches/answer_path.rs`) and every allocation assertion
+(`rdns/tests/allocations.rs`) lives in `rdns` and measures the authoritative
+path. `rdnsr` has neither. #45a's row already says it in prose —
+"No benchmark covers `rdnsr::answer::handle_query`, so that number is a probe
+rather than a bench" — which §18 says is this number.
+
+Two things it leaves *unknown*, rather than wrong:
+
+- **The two daemons build a reply two ways.** `ResponseWriter` — streaming, zero
+  allocations per record, which is what #27b bought — is named by
+  `rdnsd/src/answer.rs` and `rdns::dnssec_answer` and nowhere else. `rdnsr`
+  builds a `DnsMessage`, fills `answers`, and serializes in `finish`. Whether
+  that costs anything is unmeasured, and it is not obviously the same question:
+  a resolver serving from cache re-serializes records it has already parsed,
+  where an authoritative answer is written once from the zone.
+- **`handle_query` is 432 lines** (`rdnsr/src/answer.rs:189-620`) with 15
+  `return`s over ~15 documented stages, against `write_response`'s 112 lines
+  over a four-case `Outcome`. §7's epilogue-skipping hazard is **answered** —
+  `finish_dns64`'s header says which paths end where and why — so this is shape,
+  not a defect. It is filed here because the measurement is what would decide
+  whether to touch it.
+
+The measurement: an allocation count for one cached `rdnsr` answer, beside
+`rdnsd`'s. It needs a home first — `rdns/tests/allocations.rs` cannot reach
+`rdnsr`, and a `#[global_allocator]` belongs in its own `tests/` file (§10).
+
+---
+
+### 89. A moved module left its doc comment on the next one — **filed 2026-09-20**
+
+`rdns/src/lib.rs:62` reads `/// Scratch directories, for tests only.` above
+`pub mod tls_identity;`. `e26a479` (#66c) moved `rdns/src/testutil.rs` into
+`rdns-core` and left the comment behind. `cargo doc` cannot catch it — a wrong
+doc comment is a valid one — so it renders on the crate index today.
+
+#20's closing note named this hazard exactly, having hit it twice in one sitting:
+"deleting a function or a module leaves its doc comment behind, silently attached
+to whatever follows … After any move, grep the seam for an orphaned `///`." It
+was advice in prose, so nobody ran it.
+
+**Counted before fixing one** (§18): comparing every `mod X;` that carries a
+`///` against that module's own `//!` first line finds **8 in the tree and
+exactly one mismatch** — this one. The other seven agree. That comparison is the
+check, and it is worth having as one rather than as the same sentence a third
+time.
+
+---
+
+### 90. No test spawns either binary — **filed 2026-09-20**
+
+`grep -rn 'CARGO_BIN_EXE\|Command::new'` over all nine crates: zero hits outside
+`rdns-core/build.rs`. Every `rdnsd` and `rdnsr` test calls into the process it is
+already running in — over real sockets, which is why this is a gap in the middle
+and not a hole.
+
+What has no test in consequence: `main()`'s startup ordering, where every comment
+is an argument about why a step is where it is; `--check-config`, whose whole job
+is to be believed before a restart; the flag-conflict refusals §15 requires.
+
+The only process-level coverage is CI's `image` job — serve, `/healthz`,
+`/readyz`, a `dns_zone_serial` scrape, one query through `rdnsc`, and a
+`docker stop` drain asserting exit 0. It covers `rdnsd` only, needs a container
+runtime, and lives in YAML rather than beside the code. It is also the job that
+was red for four pushes under a green tree (see the CI note above).
+
+#74 already wrote the sentence: "`--check-config`'s output has **no test at
+all** … That is not fixed here." §4's rule is the argument — "when a change is
+about what happens to a *process*, the test has to involve a process" — and
+`CARGO_BIN_EXE_rdnsd` needs no container and works on both platforms.
+
+**The refuting check, not taken**: whether the startup sequence can be tested
+without a process by lifting it out of `main` into a function, the way
+`Config::load` already is. If it can, that is cheaper and this row names the
+wrong remedy.
 
 ---
 
