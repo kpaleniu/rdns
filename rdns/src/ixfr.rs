@@ -429,29 +429,57 @@ impl Patch {
         true
     }
 
-    /// Rebuild `base` with the staged steps applied and `new_soa` at the apex.
+    /// Apply the staged steps to a copy of `base`, with `new_soa` at the apex.
     ///
     /// Returns the zone and the deletions no record answered — not an error:
     /// the record is meant to be gone either way, and refusing would strand a
     /// secondary on a version it can never leave.
+    ///
+    /// **A copy and then an edit, not a rebuild** (`TODO.md` #71a). Nothing
+    /// here walks a record the difference sequence did not name: the copy is a
+    /// memcpy of two vectors and an allocation per record, where a rebuild
+    /// re-hashed every name of the base and walked its ancestors. 386.9 ms
+    /// against 146.3 for a forty-record change at a million records, of which
+    /// 139.3 is the copy — so what is left to take is
+    /// [`crate::zone::ZoneRecord`]'s two allocations (#71e) and not this.
+    ///
+    /// The record *order* is no longer the base's, because a removal fills its
+    /// hole from the end; `Zone::remove_record` says why nothing reads one.
     pub fn apply(mut self, base: &Zone, new_soa: &ResourceRecord) -> (Zone, usize) {
-        let mut zone = Zone::new(base.origin().to_owned());
-        // The rebuild is the whole of what applying a delta costs (`TODO.md`
-        // #71a), and growing the index from empty rehashes every key already in
-        // it at each doubling. Both counts are `base`'s, give or take the delta.
-        zone.reserve_like(base, self.append.len());
+        let mut zone = base.clone();
         let mut removed = self.cancelled;
-        for record in base.records() {
-            // The patch's own SOA replaces this one; the framing carries it, so
-            // it is never among the deletions.
-            if base.is_apex_soa(record) {
-                continue;
+
+        // First, as `apply` skips it before offering anything to the
+        // deletions: the patch's own SOA replaces the base's, the framing
+        // carries one per step, and it is never among the deletions.
+        if let Some(at) = zone.apex_soa_position() {
+            zone.remove_record(at);
+        }
+
+        // One name at a time, and its positions read *after* the previous
+        // name's removals: a `swap_remove` moves the last record, so a position
+        // taken before one is a position about the zone as it was.
+        let mut doomed: Vec<usize> = Vec::new();
+        for (key, bucket) in &mut self.withhold {
+            doomed.clear();
+            let key: &[u8] = std::borrow::Borrow::borrow(key);
+            for at in zone.positions_of(key) {
+                let record = &zone.records()[*at];
+                let held = bucket
+                    .iter_mut()
+                    .find(|held| held.matches(record.class, record.ttl, &record.rdata));
+                if let Some(held) = held {
+                    held.count -= 1;
+                    doomed.push(*at);
+                }
             }
-            if !self.withhold.is_empty() && self.withhold_one(record) {
+            // Largest first: `swap_remove` relocates the record at the end,
+            // which is never one of the smaller positions still to go.
+            doomed.sort_unstable_by(|a, b| b.cmp(a));
+            for at in &doomed {
+                zone.remove_record(*at);
                 removed += 1;
-                continue;
             }
-            zone.add_record(record.clone());
         }
 
         zone.add_record(ZoneRecord {
@@ -471,36 +499,10 @@ impl Patch {
 
         (zone, self.requested - removed)
     }
-
-    /// Whether this record of the base is one of the copies being withheld, and
-    /// takes it off the count if so.
-    ///
-    /// Probed with the octets the record already holds: `folded` borrows unless
-    /// the name carries upper case (RFC 4343), so the ordinary record costs a
-    /// hash and nothing else.
-    fn withhold_one(&mut self, record: &ZoneRecord) -> bool {
-        let Some(bucket) = self.withhold.get_mut(&*record.name.as_ref().folded()) else {
-            return false;
-        };
-        match bucket
-            .iter_mut()
-            .find(|held| held.matches(record.class, record.ttl, &record.rdata))
-        {
-            Some(held) => {
-                held.count -= 1;
-                true
-            }
-            None => false,
-        }
-    }
 }
 
 /// Apply one difference sequence to a zone, returning the result and how many
 /// of its deletions found a record.
-///
-/// The zone is rebuilt rather than edited, which is why `Zone` has no
-/// record-removal API: its index holds *positions* into the record vector, so an
-/// in-place removal invalidates every later one.
 pub fn apply_changes(
     base: &Zone,
     deleted: &[ResourceRecord],
@@ -698,6 +700,16 @@ mod tests {
             .collect()
     }
 
+    /// A zone's record as a difference sequence carries it.
+    fn record_of(record: &ZoneRecord) -> ResourceRecord {
+        ResourceRecord {
+            name: record.name.clone(),
+            class: record.class,
+            ttl: record.ttl,
+            rdata: record.rdata.clone(),
+        }
+    }
+
     fn contents(zone: &Zone) -> Vec<String> {
         let mut out: Vec<String> = zone
             .records()
@@ -746,6 +758,117 @@ mod tests {
         assert_eq!(staged.serial(), Some(Serial::new(4)));
     }
 
+    /// What every name the two zones know anything about answers to, so a
+    /// comparison is of the index as well as of the record vector.
+    ///
+    /// `contents` alone would pass against a zone whose empty non-terminals
+    /// were left over a deleted subtree — a NODATA where the zone has nothing,
+    /// which is the whole of what a removal can get wrong (`CLAUDE.md` §8).
+    fn name_kinds(zone: &Zone) -> Vec<(String, crate::zone::NameKind)> {
+        let mut names: Vec<Name> = vec![zone.origin().to_owned()];
+        for record in zone.records() {
+            let mut name = record.name.as_ref();
+            names.push(name.to_owned());
+            while let Some(parent) = name.parent() {
+                names.push(parent.to_owned());
+                if parent == zone.origin() {
+                    break;
+                }
+                name = parent;
+            }
+        }
+        // Names neither zone holds, so "everything exists" fails this too.
+        for absent in ["nowhere.example.com.", "deep.nowhere.example.com."] {
+            names.push(nm(absent));
+        }
+        let mut out: Vec<(String, crate::zone::NameKind)> = names
+            .iter()
+            .map(|name| (name.to_string(), zone.name_kind(name.as_ref())))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
+        out
+    }
+
+    /// A patch applied to a copy has to arrive at the zone a load of the same
+    /// records builds (`TODO.md` #71a).
+    ///
+    /// The reference is a parse and not the rebuild this replaced, because a
+    /// parse is the one thing that cannot share a mistake with it. Every
+    /// record, and every name-kind the index answers — the edit walks none of
+    /// the base's records, so the index is where it could differ without the
+    /// record vector showing it. Not a comparison of two counts: that is what
+    /// the assertion #71f was filed on turned out to be.
+    ///
+    /// Fails against a removal that leaves an empty non-terminal over a
+    /// deleted subtree, and against one that drops an ancestor another name
+    /// still needs.
+    #[test]
+    fn a_patch_applied_to_a_copy_builds_the_zone_a_load_would() {
+        let base = zone_at(
+            1,
+            "www IN A 192.0.2.1\n\
+             mail IN A 192.0.2.2\n\
+             mail IN MX 10 mail.example.com.\n\
+             deep.a.b IN TXT \"down here\"\n\
+             other.a.b IN TXT \"still here\"\n",
+        );
+        let final_soa = zone_at(9, "").apex_soa_record().expect("an apex SOA");
+
+        // A record at a name that keeps one, a subtree deleted down to one
+        // surviving leaf, a name that arrives with an ancestor of its own, and
+        // an addition a later step takes back.
+        let gone: Vec<ResourceRecord> = base
+            .records()
+            .iter()
+            .filter(|r| {
+                r.name == nm("deep.a.b.example.com.") || r.rdata.rtype() == crate::record_types::MX
+            })
+            .map(record_of)
+            .collect();
+        assert_eq!(gone.len(), 2, "the fixture holds both");
+        let arrived: Vec<ResourceRecord> = zone_at(2, "ftp IN A 192.0.2.3\nc.d IN A 192.0.2.4\n")
+            .records()
+            .iter()
+            .filter(|r| r.rdata.rtype() == crate::record_types::A)
+            .map(record_of)
+            .collect();
+        assert_eq!(arrived.len(), 2);
+
+        let mut patch = Patch::new();
+        patch.step(&gone, &arrived);
+        // The second step takes back what the first added, which is the case
+        // `cancelled` counts and no record of the base answers.
+        patch.step(&arrived[..1], &[]);
+        let (edited, missing) = patch.apply(&base, &final_soa);
+
+        let loaded = zone_at(
+            9,
+            "www IN A 192.0.2.1\n\
+             mail IN A 192.0.2.2\n\
+             other.a.b IN TXT \"still here\"\n\
+             c.d IN A 192.0.2.4\n",
+        );
+        assert_eq!(contents(&edited), contents(&loaded));
+        assert_eq!(name_kinds(&edited), name_kinds(&loaded));
+        assert_eq!(missing, 0, "every deletion here names a record");
+        assert_eq!(edited.serial(), Some(Serial::new(9)));
+        assert_eq!(
+            edited.name_kind(nm("a.b.example.com.").as_ref()),
+            crate::zone::NameKind::EmptyNonTerminal,
+            "one leaf of the subtree survives, so its ancestors do"
+        );
+        assert_eq!(
+            edited.name_kind(nm("deep.a.b.example.com.").as_ref()),
+            crate::zone::NameKind::NotFound
+        );
+        assert_eq!(
+            edited.name_kind(nm("d.example.com.").as_ref()),
+            crate::zone::NameKind::EmptyNonTerminal,
+            "and the added name brings its own"
+        );
+    }
+
     /// A deletion naming a record nobody holds is counted, not refused:
     /// refusing would strand a secondary on a version it can never leave.
     #[test]
@@ -755,12 +878,7 @@ mod tests {
             .records()
             .iter()
             .find(|r| r.name == nm("gone.example.com."))
-            .map(|r| ResourceRecord {
-                name: r.name.clone(),
-                class: r.class,
-                ttl: r.ttl,
-                rdata: r.rdata.clone(),
-            })
+            .map(record_of)
             .expect("the fixture holds it");
         let soa = zone_at(2, "").apex_soa_record().expect("an apex SOA");
 
@@ -778,12 +896,7 @@ mod tests {
             .records()
             .iter()
             .find(|r| r.name == nm("www.example.com."))
-            .map(|r| ResourceRecord {
-                name: r.name.clone(),
-                class: r.class,
-                ttl: r.ttl,
-                rdata: r.rdata.clone(),
-            })
+            .map(record_of)
             .expect("the fixture holds two");
 
         let (zone, removed) = apply_changes(&base, &[one], &[], &soa);

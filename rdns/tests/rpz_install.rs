@@ -305,11 +305,15 @@ fn refreshing_a_transferred_policy_zone() {
         .build()
         .expect("a runtime");
 
-    println!(
+    print!(
         "\n{:>9} | {:>9} {:>9} | {:>9} {:>9} | {:>9} {:>9}",
         "rules", "SOA probe", "AXFR", "IXFR", "of which apply", "re-read", "#71f"
     );
-    println!("{:->9}-+-{:->19}-+-{:->19}-+-{:->19}", "", "", "", "");
+    println!(" | {:>9} {:>9} {:>9}", "apply", "of which copy", "drop");
+    println!(
+        "{:->9}-+-{:->19}-+-{:->19}-+-{:->19}-+-{:->29}",
+        "", "", "", "", ""
+    );
 
     for rules in sizes {
         let dir = scratch(&format!("refresh-{rules}"));
@@ -377,6 +381,27 @@ fn refreshing_a_transferred_policy_zone() {
             (probe, axfr, ixfr, applied)
         });
 
+        // What applying the *real* difference costs, and what it is made of.
+        // #71a took the rebuild out of this, and what is left is nearly all the
+        // copy: the next stage is the copy's two allocations per record (#71e),
+        // not anything in `Patch`.
+        let delta = rdns::ixfr::diff(&before, &after).expect("both versions have an SOA");
+        let new_soa = after.apex_soa_record().expect("an apex SOA");
+        let mut patch = rdns::ixfr::Patch::new();
+        patch.step(&delta.deleted, &delta.added);
+        let start = Instant::now();
+        let (patched, missing) = patch.apply(&before, &new_soa);
+        let edit = start.elapsed();
+        assert_eq!(missing, 0, "the fixture's deletions all name records");
+        assert_eq!(patched.records().len(), after.records().len());
+
+        let start = Instant::now();
+        let copy = before.clone();
+        let cloned = start.elapsed();
+        let start = Instant::now();
+        drop(copy);
+        let dropped = start.elapsed();
+
         // What either route pays afterwards, and the reason #57e is a question
         // about the whole refresh rather than about the format: shape A writes
         // the file, and the two columns are whether it then parses it back.
@@ -412,7 +437,7 @@ fn refreshing_a_transferred_policy_zone() {
             );
         });
 
-        println!(
+        print!(
             "{rules:>9} | {:>9.1} {:>9.1} | {:>9.1} {:>9.1} | {:>9.1} {:>9.1}",
             ms(probe),
             ms(axfr),
@@ -420,6 +445,12 @@ fn refreshing_a_transferred_policy_zone() {
             ms(applied),
             ms(installed.elapsed),
             ms(offered.elapsed),
+        );
+        println!(
+            " | {:>9.1} {:>9.1} {:>9.1}",
+            ms(edit),
+            ms(cloned),
+            ms(dropped)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

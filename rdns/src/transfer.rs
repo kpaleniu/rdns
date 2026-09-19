@@ -53,8 +53,9 @@ pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<Dn
     Ok(axfr_envelopes(request, zone)?.collect())
 }
 
-/// The records of an AXFR in wire order: the apex SOA, the zone in load order
-/// without that SOA, then the apex SOA again (RFC 5936 §2.2).
+/// The records of an AXFR in wire order: the apex SOA, the zone's own order
+/// without that SOA, then the apex SOA again (RFC 5936 §2.2), which puts no
+/// constraint on the middle.
 ///
 /// Skipping the middle one keeps the count at two; a client that saw the closing
 /// SOA early would stop reading there.

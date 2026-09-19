@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#71** and **#21**, as of 2026-09-18. **#57 is
+**#58**, **#68**, **#71** and **#21**, as of 2026-09-19. **#57 is
 closed**: 57e was the last of it, and the measurement that
 could have refuted it did — IXFR as this tree had it was *slower* than a whole
 transfer, because applying forty records to a million-record zone cost 1 018 ms
@@ -59,18 +59,35 @@ and then *parsed it back*, re-deriving a zone the process was still holding —
 since #64b and on an equality that turned out to be asserted nowhere — the
 assertion cited for it compares record *counts*, which is §4 arriving in a
 row's evidence rather than in its code. The sentence calling that row "shape A's trade and not a defect" is struck
-in place, because reading it as a trade is why it sat. What is left is
-**71a**, now 372-395 ms rather than the 793 it was filed at, and **71e**, whose
-remedy and blast radius are now both measured — an arena wins on every axis, it
-costs 98 compiler errors in `rdns` and ~21 in the binaries, and its last live
-caller went away with 71f, so it waits on 71a. Three by-products worth the trip:
-`rpz_install.rs` had no turnstile, so every number #57e and #71 recorded was
-taken with two other million-rule measurements running (#64b's defect, found
-twice); Linux clippy caught a lint the Windows one does not have, on a change
-touching no `cfg`-gated file (§1 paying out sideways); and the hand-rolled
-collision chain 71d started with had a bug that `bench_zone_lookup` caught on
-its first run, after the logic had been read through twice and called correct
-(§19). **#64 is closed** — 64c, 64e and 64f
+in place, because reading it as a trade is why it sat. **71a closed
+2026-09-19**: a delta is applied to a *copy* now rather than rebuilt from one,
+**386.9 ms to 146.3** at a million rules and the whole IXFR round trip 402 to
+149 — and it is not the tombstones the row named. An index entry counts the
+names directly below it, which is what makes a name removable at all without
+turning a NODATA into an NXDOMAIN, and `swap_remove` leaves exactly one stale
+position, which the index reaches by that record's own owner name.
+`Zone::records` is untouched and no public signature moved. What its refuting
+measurement found is that the index is append-only, so applying deltas forever
+grew a zone that was not growing — 4 000 changes to a 1 000-name zone took the
+arena from 24 031 octets to 120 031 with every answer unchanged — and a rebuild
+when removals reach half the record count bounds it.
+
+What is left of #71 is **71e**, whose remedy and blast radius are both
+measured: an arena wins on every axis and costs 98 compiler errors in `rdns`
+and ~21 in the binaries. Its last live caller went away with 71f and 71a gave
+it one back — the row's instruction to take 71e *first* was backwards, and 71e
+is now **138-143 ms of the 138-146** an apply costs.
+
+Four by-products worth the trip: `rpz_install.rs` had no turnstile, so every
+number #57e and #71 recorded was taken with two other million-rule measurements
+running (#64b's defect, found twice); Linux clippy caught a lint the Windows one
+does not have, on a change touching no `cfg`-gated file (§1 paying out
+sideways); the hand-rolled collision chain 71d started with had a bug that
+`bench_zone_lookup` caught on its first run, after the logic had been read
+through twice and called correct (§19); and two `usize`s added to `Zone` took
+`xfr::Refresh` from exactly 200 bytes to 216, past clippy's variant threshold —
+the only thing in this tree that says a field added to `Zone` is a field added
+to every enum carrying one by value. **#64 is closed** — 64c, 64e and 64f
 all went the same day, and 64c is the one whose remedy was declined on its own
 re-measurement; **64g closed with it**, and its own filing was the thing it
 refuted — the "core type's shape and its call sites" it was not taken for is a
@@ -3900,7 +3917,7 @@ Prometheus and the `image` job's probes all send a `Host` and are unaffected.
 
 ---
 
-### 71. A forty-record change rebuilds a zone and re-reads a file — **filed 2026-09-16; 71b, 71c, 71d and 71f closed**
+### 71. A forty-record change rebuilds a zone and re-reads a file — **filed 2026-09-16; 71a, 71b, 71c, 71d and 71f closed**
 
 Out of 57e, which took the wire down to what actually changed and left
 everything after it sized by the zone. Measured on the development machine,
@@ -3910,7 +3927,7 @@ release, a million-rule QNAME feed
 | applying a forty-rule change at 1M rules | ms |
 |---|---|
 | the difference off the wire and assembled | ~~about 7~~ **below the noise** |
-| `ixfr::Patch::apply`, rebuilding the zone | ~~801~~ ~~793~~ ~~445~~ **372-395** |
+| `ixfr::Patch::apply`, ~~rebuilding~~ **copying and editing** the zone | ~~801~~ ~~793~~ ~~445~~ ~~372-395~~ **138-146** |
 | serializing, writing, and putting the zone in force | ~~1 351~~ ~~1 200-1 420~~ **526** |
 
 The first row is now a *nothing* rather than a small number: the whole IXFR
@@ -3922,7 +3939,9 @@ the subtraction is still nothing: 383-395 against 372-395 on 2026-09-18.
 
 The second row halved again on 2026-09-16, and that is **71c**: the rebuild was
 growing a two-million-entry index from empty when both counts were sitting in
-the zone it was rebuilding; 71d took the last 38 ms off it. The third stopped
+the zone it was rebuilding; 71d took the last 38 ms off it, and **71a** took
+the rebuild away on 2026-09-19 — the zone is copied and edited now, and the
+copy is 138-143 ms of the 138-146 left. The third stopped
 being a band when it stopped containing a parse (**71f**): it is 247 ms of
 serialization, a 38 MB write, 21 ms to read the file back and digest it, and
 41 ms to index.
@@ -3954,17 +3973,17 @@ and both call it. The re-measured column above is what these cost with the
 binary to themselves; the *shape* of the row is unchanged, which is why this is
 a correction and not a retraction.
 
-- **71a. `Zone` cannot be edited, so any change rebuilds it.** `Patch::apply`
-  walks every record and `add_record` folds a key and files a position for
-  each, because the index holds *positions* into the record vector — which is
-  why removal has no API, and `ixfr.rs` says so. **No remedy claimed**: it is a
-  core type's shape and its call sites, not a loop. Whoever takes it takes it
-  with **#65**'s unowned half, and with what **#64g** measured on its way out:
-  removing `rrsets_of`'s clone took that pass down 25% and the total nowhere,
-  because the clone was laying the RDATA out in the order the signing loop
-  reads it. #65's five shared passes are 4.4 s at a million records. Two rows
-  naming one type is how both get half-done (§18), and 64g's result says what a
-  remedy has to keep: the order the reader walks in.
+- **71a. `Zone` cannot be edited, so any change rebuilds it — closed
+  2026-09-19.** **386.9 ms to 146.3** for a forty-rule change at a million
+  rules, which takes the whole IXFR round trip from 402 to 149. A throwaway A/B
+  in one run of the committed harness, as 71b's and 71e's were; the column that
+  stayed reads 138.2-146.3 over four runs, of which the copy is 138.3-143.0.
+
+  As filed: `Patch::apply` walked every record and `add_record` folded a key
+  and filed a position for each, because the index holds *positions* into the
+  record vector — which is why removal had no API, and `ixfr.rs` said so.
+  **No remedy was claimed**: "it is a core type's shape and its call sites, not
+  a loop."
 
   **The number to beat is 445 ms, not 793**, and the difference is why this row
   was filed a size too large. ~~801~~ ~~793~~: the first was contention (the
@@ -3975,29 +3994,117 @@ a correction and not a retraction.
 
   | | ms |
   |---|---|
-  | `apply_changes`, whole | ~~445~~ **407** |
-  | of which cloning every record of the base | ~120 |
-  | of which the index: 2M names hashed, filed, and their ancestors walked | ~~320~~ **~280** |
+  | `apply_changes`, whole | ~~445~~ ~~**407**~~ **138-146** |
+  | of which cloning every record of the base | ~~about 120~~ **138-143** |
+  | of which the index: 2M names hashed, filed, and their ancestors walked | ~~320~~ ~~**~280**~~ **gone** |
 
-  So the type change is worth ~407 ms here and 4.4 s in #65, and **the clone is
-  not the half worth taking** — the same result #64g got from the signing side,
-  now measured from this one. A remedy that removes the rebuild removes both;
-  one that only stops the clone buys 30% of this row and nothing of #65's.
+  ~~So the type change is worth ~407 ms here and 4.4 s in #65, and **the clone
+  is not the half worth taking** — the same result #64g got from the signing
+  side, now measured from this one. A remedy that removes the rebuild removes
+  both; one that only stops the clone buys 30% of this row and nothing of
+  #65's.~~
+
+  **The last sentence is exactly backwards about what would be left, and that
+  is the useful part.** "The clone is not the half worth taking" was true of
+  the 407 ms as it stood and became false the moment the rebuild went: a remedy
+  that removes the rebuild does not remove the clone, it *promotes* it, and the
+  copy is now 95% of what an apply costs. The two were read as one because both
+  are O(zone) and a rebuild was assumed to subsume a copy; they are two
+  different O(zone) costs, 120 ms apart, and only one of them is a memcpy. What
+  is true and survives is the #65 half — its five shared passes are 4.4 s at a
+  million records and nothing here touched them.
 
   **71d changed the arithmetic this row is decided on, and the direction is
   towards copy-and-patch.** Before it, a `Zone::clone` was 318 ms against a
   445 ms rebuild — 71% — which is why an earlier reading of this row called
   tombstones dead on arrival: no shape that *copies* could beat one that
   rebuilds. After it the clone is 120 ms and dropping the old one 43, so
-  copy-and-patch is 163 ms against 407, and the family is alive again.
-  Tombstones become worth about 2.5x rather than nothing, and 71e would take
-  the copy to roughly 30 ms, which is where O(delta) starts to be the honest
-  description. **Whoever takes this row takes 71e first**, or measures the
-  same wall twice.
+  copy-and-patch is 163 ms against 407, and the family is alive again. That is
+  the prediction this row closed on, and it held: 146.3 against 386.9 measured,
+  where the arithmetic said 163 against 407.
 
-  **71b closing changes nothing about this row**: the `Arc<PolicyZone>` it
+  **That framing was wrong twice, both times in the direction of the work being
+  larger than it is.** 71c had already taken the larger half of the number with
+  one `reserve`, and the row said so. The rest is two things, neither of them a
+  call site: an index entry counts the names directly below it, which is what
+  makes a name removable at all; and `swap_remove` leaves exactly one stale
+  position, which the index reaches by that record's own owner name.
+  `Zone::records` is untouched, no public signature changed, and the diff is
+  `zone.rs` and `ixfr.rs`.
+
+  ~~**Whoever takes this row takes 71e first**, or measures the same wall
+  twice.~~ **The order is the other way round.** Taken alone this is 2.6x, and
+  71f had taken away 71e's last live caller — this row is what gives it one
+  back. 71e is now worth 138-143 ms of the 138-146 this leaves.
+
+  **Tombstones were the shape the row named** — "worth about 2.5x rather than
+  nothing", which the 2.6x measured is — **and they are not needed.** A
+  tombstone keeps record order and costs `records()` its slice, which is the
+  98-error blast radius 71e counted. `swap_remove` costs the order instead, and
+  the order was load-bearing nowhere: the serializer writes the apex SOA itself
+  and then the rest, and an AXFR brackets its own (RFC 5936 §2.2, which puts no
+  constraint on the middle). The three comments that claimed load order are
+  corrected rather than left to be true-ish (§4).
+
+  **The positions were not the hard part; the empty non-terminal was.** A name
+  is in the index because it owns records or because something below it does
+  (RFC 4592 §2.2.2), and dropping the last record at a name may not drop the
+  name while a descendant still needs it. Left behind, it answers NODATA where
+  the zone has nothing, and an RFC 8020 resolver caches that for the subtree.
+  **Direct children, not descendants**, because that is the count an insertion
+  keeps in O(1): a new name credits its parent and only a parent that was
+  itself new walks on up, which is the rule `note_non_terminals` already had.
+  It fits in `len`'s padding, so the table is the same 32 bytes.
+
+  **The measurement that could refute it did, on a question the row never
+  asked.** Everything under the index is append-only, so applying deltas
+  forever grows a zone that is not growing: a difference sequence spells a
+  changed record as a deletion and an addition (RFC 1995 §2), so the name's
+  octets are appended again every publication and a name that falls back to one
+  record leaves its position list behind. 4 000 changes to a 1 000-name zone
+  took the arena from 24 031 octets to 120 031 and the spill list from 1 entry
+  to 101, with the entry count, the record count and every answer unchanged —
+  invisible except as a process that grows for a year and then is restarted.
+  A rebuild when removals reach half the record count reclaims both and
+  re-shares the arena suffixes an empty non-terminal borrows, which a
+  compaction written for the purpose would not. **Against `records` and not the
+  entry count**: a zone of one name with a million records would otherwise
+  rebuild all of them on every removal, which is the O(n²) this row exists to
+  remove. Amortized O(1) a removal, and the test is a ratio (§10) — four times
+  the rounds and the same peak.
+
+  **One by-product worth the trip.** Two counters for the two append-only
+  vectors took `Zone` from 176 bytes to 192, and `xfr::Refresh` — which holds
+  one by value and sat *exactly* at clippy's 200-byte `large_enum_variant`
+  threshold — from 200 to 216. A field added to `Zone` is a field added to
+  every enum that carries one, and that lint is the only thing in this tree
+  that says so. One `u32` counter does both jobs, because the rebuild is what
+  has to be paid for and it rebuilds both vectors, and it fits in the padding
+  `Shortcuts` leaves: 176 and 200 again.
+
+  **What this does not touch**, and the reason the row named them: **#65**'s
+  unowned half, five shared passes at 4.4 s a million records, and what
+  **#64g** measured on its way out — removing `rrsets_of`'s clone took that
+  pass down 25% and the total nowhere, because the clone was laying the RDATA
+  out in the order the signing loop reads it. Both are about the signer's
+  passes over a zone, not about applying a delta to one, and a remedy for
+  either still has to keep the order its reader walks in.
+
+  Verified by provoking each half (§1): the removal tests fail against a build
+  with the ancestor prune removed (three of them) or the position repair
+  removed (three), the denial-chain test against either half of its repair, and
+  the bound test against the rebuild — each reverted, run, restored. The
+  patch-applied zone is compared against a *parse* of the same records rather
+  than against the rebuild it replaced, record by record and name-kind by
+  name-kind, because a parse is the one reference that cannot share a mistake
+  with it.
+
+  ~~**71b closing changes nothing about this row**: the `Arc<PolicyZone>` it
   landed shares a zone that nobody edits, which is the same fact stated the
-  other way round.
+  other way round.~~ Still the same fact, and now worth saying the other way:
+  a `PolicyZone` is shared behind an `Arc` and a patch builds a *new* zone from
+  a copy, so nothing here edits a zone anybody else can see.
+
 - **71b. One feed changing re-reads every feed — filed 2026-09-16, closed the
   same day.** `PolicyStore::reload` was `PolicyZones::load(&self.feeds)`:
   all-or-nothing over the whole set, which is right for what it was written for
@@ -4196,13 +4303,21 @@ a correction and not a retraction.
   per record, of which the record's own two are a quarter. So an arena is worth
   ~60 ms of a 613 ms parse, not the load path's problem, and what is left of
   71e's value is the copy: 96 ms of `Zone::clone` plus 37 to drop it, on a path
-  **nothing measured takes today** (71d said so and it is still true). 71f took
-  the parse out of the install altogether, so 71e no longer has a live caller
-  at all — its whole case is 71a, and 71a's is the 372-395 ms rebuild.
+  ~~**nothing measured takes today** (71d said so and it is still true). 71f
+  took the parse out of the install altogether, so 71e no longer has a live
+  caller at all — its whole case is 71a, and 71a's is the 372-395 ms rebuild.~~
 
-  **So: open, with the remedy named and priced, and nobody should take it
-  before 71a is decided.** The other six allocations per record are their own
-  question and nobody has asked it; this row is not it.
+  ~~**So: open, with the remedy named and priced, and nobody should take it
+  before 71a is decided.**~~ **71a is closed and this row is the whole of what
+  is left of #71**, 2026-09-19. Applying a delta is a copy and an edit now, so
+  the copy that had no live caller is the *only* thing on the path: **138-143
+  ms of the 138-146** an apply costs at a million rules over four runs, and
+  47-59 more to drop the version it replaced. The shapes above say an arena takes that to 3.8-4.1 ms,
+  which is where O(delta) stops being a figure of speech. The blast radius is
+  unchanged and is the reason this is still a row and not a commit.
+
+  The other six allocations per record are their own question and nobody has
+  asked it; this row is not it.
 
 - **71f. The install parsed back the zone it was holding — filed and closed
   2026-09-18.** **1 141-1 261 ms to 526** at a million rules, which is the third

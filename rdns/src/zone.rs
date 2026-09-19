@@ -149,11 +149,27 @@ struct NameIndex {
     table: hashbrown::HashTable<Interned>,
 }
 
-/// One name in the index: where its bytes are, and what is at it.
+/// One name in the index: where its bytes are, what is at it, and how many
+/// names directly below it the index holds.
+///
+/// `children` is what makes a record removable. A name is in the index either
+/// because it owns records or because something below it does (RFC 4592
+/// §2.2.2), and dropping the last record at a name may not drop the name while
+/// a descendant still needs it to exist — an empty non-terminal that vanishes
+/// turns a NODATA into an NXDOMAIN, which an RFC 8020 resolver then extends
+/// over the whole subtree (`CLAUDE.md` §8).
+///
+/// Direct children rather than all descendants, because that is the count an
+/// insertion can keep in O(1): a new name credits its parent, and only a parent
+/// that was itself new walks on up. Counting descendants would make every
+/// insertion walk to the apex, which is the cost
+/// [`Zone::note_non_terminals`] exists to avoid. It fits in `len`'s padding, so
+/// the table is the same size it was.
 #[derive(Debug, Clone, Copy)]
 struct Interned {
     off: usize,
     len: u32,
+    children: u32,
     slot: Slot,
 }
 
@@ -233,37 +249,87 @@ impl NameIndex {
         self.names.reserve(bytes);
     }
 
-    /// The slot at `key`, inserting [`Slot::Ent`] if the name is new.
+    /// The entry at `key`, inserting an empty non-terminal with no children if
+    /// the name is new, and saying which of the two happened.
+    ///
+    /// One probe for a caller that wants to read the slot and write it back —
+    /// [`Zone::file`] spent two or three doing that through the `&mut Slot`
+    /// this replaced.
     ///
     /// `bytes` is where `key` already lives in the arena, for a caller that has
     /// just interned it or knows it is a suffix of something interned; `None`
     /// appends a copy.
-    fn slot_mut(&mut self, key: &[u8], bytes: Option<(usize, u32)>) -> &mut Slot {
+    fn node_mut(&mut self, key: &[u8], bytes: Option<(usize, u32)>) -> (&mut Interned, bool) {
         // Destructured, so the closures can borrow the arena while the table is
         // borrowed mutably beside it.
-        let NameIndex { names, table } = self;
+        let NameIndex { names, table, .. } = self;
         let entry = table.entry(
             name_hash(key),
             |at| &names[at.range()] == key,
             |at| name_hash(&names[at.range()]),
         );
         match entry {
-            hashbrown::hash_table::Entry::Occupied(at) => &mut at.into_mut().slot,
+            hashbrown::hash_table::Entry::Occupied(at) => (at.into_mut(), false),
             hashbrown::hash_table::Entry::Vacant(slot) => {
                 let (off, len) = bytes.unwrap_or_else(|| {
                     let off = names.len();
                     names.extend_from_slice(key);
                     (off, key.len() as u32)
                 });
-                &mut slot
-                    .insert(Interned {
+                (
+                    slot.insert(Interned {
                         off,
                         len,
+                        children: 0,
                         slot: Slot::Ent,
                     })
-                    .into_mut()
-                    .slot
+                    .into_mut(),
+                    true,
+                )
             }
+        }
+    }
+
+    /// Take `key` out of the table, leaving its octets in the arena.
+    ///
+    /// The arena is append-only: a name's bytes may be a suffix another entry
+    /// still points into ([`Zone::note_non_terminals`]), so nothing here can
+    /// know whether they are free. A removal therefore costs a few octets that
+    /// come back on the next rebuild — bounded by what the *deltas* since that
+    /// rebuild named, never by the zone.
+    fn remove(&mut self, key: &[u8]) {
+        let names = &self.names;
+        if let Ok(at) = self
+            .table
+            .find_entry(name_hash(key), |at| &names[at.range()] == key)
+        {
+            at.remove();
+        }
+    }
+
+    /// The slot at `key`, for a caller that must not create the name.
+    ///
+    /// [`NameIndex::node_mut`] inserts; every removal path here is about a name
+    /// the index already holds, and a probe that could conjure an empty
+    /// non-terminal out of a typo is the wrong tool for it.
+    fn slot_of_mut(&mut self, key: &[u8]) -> Option<&mut Slot> {
+        let names = &self.names;
+        self.table
+            .find_mut(name_hash(key), |at| &names[at.range()] == key)
+            .map(|at| &mut at.slot)
+    }
+
+    /// Add `by` to the count of names directly below `key`.
+    ///
+    /// A no-op for a name the index does not hold, which is the foreign-owner
+    /// case [`Zone::parent_in_zone`] stops at.
+    fn credit(&mut self, key: &[u8], by: i32) {
+        let names = &self.names;
+        if let Some(at) = self
+            .table
+            .find_mut(name_hash(key), |at| &names[at.range()] == key)
+        {
+            at.children = at.children.saturating_add_signed(by);
         }
     }
 
@@ -338,6 +404,25 @@ pub struct Zone {
     /// The position lists of the names that own more than one record. See
     /// [`Slot`]; a name that owns one keeps its position in the table.
     spills: Vec<Vec<usize>>,
+    /// Removals since the index was last built, which is when what they left
+    /// behind is worth rebuilding it for.
+    ///
+    /// Everything under `index` is append-only. A name removed and added again
+    /// — which is what a *changed* record is, since a difference sequence
+    /// spells one as a deletion and an addition (RFC 1995 §2) — appends a
+    /// second copy of its octets to the arena, and a name that falls back to
+    /// one record leaves its position list behind. Measured: 4 000 changes to
+    /// a 1 000-name zone took the arena from 24 031 octets to 120 031 and the
+    /// spill list from 1 entry to 101, with the entry count, the record count
+    /// and every answer unchanged. Unbounded in a process that refreshes a
+    /// feed for a year without restarting (`TODO.md` #71a).
+    ///
+    /// One counter and not one per vector, because [`Zone::reindex`] rebuilds
+    /// both and a removal can only ever add to either — and because it is the
+    /// *rebuild* that has to be paid for. Against `records`, which is what a
+    /// rebuild costs: against the entry count instead, a zone of one name with
+    /// a million records would rebuild all of them on every removal.
+    removed_since_rebuild: u32,
     /// The NSEC chain, keyed by canonical sort order, and the NSEC3 chain,
     /// keyed by hash — both empty for an unsigned zone.
     ///
@@ -476,6 +561,7 @@ impl Zone {
             records: Vec::new(),
             index: NameIndex::default(),
             spills: Vec::new(),
+            removed_since_rebuild: 0,
             nsec_chain: BTreeMap::new(),
             nsec3_chain: BTreeMap::new(),
             shortcuts: Shortcuts::default(),
@@ -487,7 +573,10 @@ impl Zone {
         self.origin.as_ref()
     }
 
-    /// Every record in the zone, in load order.
+    /// Every record in the zone.
+    ///
+    /// Load order, until something is removed: a removal fills its hole from
+    /// the end, and `Zone::remove_record` says why nothing reads one.
     pub fn records(&self) -> &[ZoneRecord] {
         &self.records
     }
@@ -543,7 +632,9 @@ impl Zone {
     ///
     /// The three callers that rebuild a zone record by record all had the
     /// counts and none of them passed them — `TODO.md` #61b reserved the parse
-    /// and stopped at one of four sites (#71c).
+    /// and stopped at one of four sites (#71c). One caller is left:
+    /// `ixfr::Patch::apply` copies the base now instead of rebuilding it
+    /// (#71a), and `xfr::AxfrAccumulator` has no base to be like.
     pub(crate) fn reserve_like(&mut self, base: &Zone, extra: usize) {
         self.records.reserve(base.records.len() + extra);
         self.index
@@ -563,9 +654,14 @@ impl Zone {
         let at_apex = key == *origin_key;
         self.shortcuts.note(&key, record.rdata.rtype(), at_apex);
         let at = self.index.intern(&key);
-        Zone::note_non_terminals(&mut self.index, &key, at, &origin_key);
+        // Ancestors only when the name is new to the index: one name notes them
+        // and every later record at it would find them present. That probe was
+        // the walk's own first step until #71a moved it here, where it is the
+        // insertion's answer rather than a second lookup.
+        if Zone::file(&mut self.index, &mut self.spills, &key, at, position) {
+            Zone::note_non_terminals(&mut self.index, &key, at, &origin_key);
+        }
         drop(origin_key);
-        self.file(&key, at, position);
         match self.chain_key(&record) {
             Some(ChainKey::Nsec(k)) => {
                 self.nsec_chain.insert(k, position);
@@ -576,6 +672,117 @@ impl Zone {
             None => {}
         }
         self.records.push(record);
+    }
+
+    /// The positions of the records at exactly this folded owner name, empty
+    /// for a name that is an empty non-terminal or is not here at all.
+    ///
+    /// The index's grouping, for a caller that means to *change* those records
+    /// and so cannot hold the `&ZoneRecord`s [`Zone::locate`] hands out.
+    pub(crate) fn positions_of(&self, key: &[u8]) -> &[usize] {
+        match self.index.get(key) {
+            Some(slot) => self.positions(slot),
+            None => &[],
+        }
+    }
+
+    /// Take the record at `position` out of the zone and give it back.
+    ///
+    /// **O(the name's labels), not O(the zone)**, which is what lets a delta be
+    /// applied to a copy rather than rebuilt from one (`TODO.md` #71a). The
+    /// index holds positions into `records`, so a removal that shifted them
+    /// would invalidate every later one; `swap_remove` shifts exactly one — the
+    /// record that was last — and the index reaches that one entry by that
+    /// record's own owner name.
+    ///
+    /// **What it costs is the record order.** `records()` is no longer load
+    /// order once anything has been removed. Nothing reads it as one: the
+    /// serializer writes the apex SOA itself and then the rest
+    /// ([`crate::zone_writer`]), and an AXFR brackets its own SOA
+    /// (RFC 5936 §2.2, [`crate::transfer`]). The alternative that keeps order
+    /// is a tombstone per removed record, and it was not built: it buys an
+    /// order nothing reads, and costs `records()` its slice — which is the
+    /// blast radius `TODO.md` #71e counted at 98 compiler errors.
+    ///
+    /// [`Zone::shortcuts`] is not recomputed. Each one stale in the *true*
+    /// direction costs a walk that finds nothing; stale in the false direction
+    /// would serve a wrong answer, and removal cannot move one that way.
+    pub(crate) fn remove_record(&mut self, position: usize) -> ZoneRecord {
+        let key = self.records[position].name.as_ref().folded().into_owned();
+        match self.chain_key(&self.records[position]) {
+            Some(ChainKey::Nsec(k)) => {
+                self.nsec_chain.remove(&k);
+            }
+            Some(ChainKey::Nsec3(k)) => {
+                self.nsec3_chain.remove(&k);
+            }
+            None => {}
+        }
+        let records_left = self.unfile(&key, position);
+        let moved_from = self.records.len() - 1;
+        let record = self.records.swap_remove(position);
+        if moved_from != position {
+            let moved = self.records[position].name.as_ref().folded().into_owned();
+            self.refile(&moved, moved_from, position);
+            match self.chain_key(&self.records[position]) {
+                Some(ChainKey::Nsec(k)) => {
+                    self.nsec_chain.insert(k, position);
+                }
+                Some(ChainKey::Nsec3(k)) => {
+                    self.nsec3_chain.insert(k, position);
+                }
+                None => {}
+            }
+        }
+        if !records_left {
+            self.prune(&key);
+        }
+        // Neither vector under `index` gives anything back on its own, so a
+        // long-lived process applying deltas grows whatever its zone does. A
+        // rebuild reclaims both, and it re-shares the arena suffixes an empty
+        // non-terminal borrows — which is why it is `reindex` and not a
+        // compaction written here. See `removed_since_rebuild`.
+        self.removed_since_rebuild = self.removed_since_rebuild.saturating_add(1);
+        if self.removed_since_rebuild as usize * 2 >= self.records.len() {
+            self.reindex();
+        }
+        record
+    }
+
+    /// Drop `key` from the index if nothing needs it, and its ancestors after
+    /// it.
+    ///
+    /// A name is in the index because it owns records or because something
+    /// below it does (RFC 4592 §2.2.2). The first is gone by the time this is
+    /// called; the second is [`Interned::children`], and a name that loses its
+    /// last child may be the last child of its own parent, so the walk carries
+    /// on up.
+    ///
+    /// Leaving the name behind instead would answer NODATA where the zone has
+    /// nothing at all, which is a different answer with a different proof
+    /// (`CLAUDE.md` §8) — and leaving an ancestor behind after a subtree is
+    /// deleted leaves an empty non-terminal over nothing.
+    fn prune(&mut self, key: &[u8]) {
+        // Through the field, so the borrow is of `self.origin` alone and
+        // `self.index` can be taken mutably beside it — `add_record` does the
+        // same and for the same reason. `origin_key()` would borrow all of
+        // `self`, and owning a copy is an allocation per removal.
+        let origin_key = self.origin.as_ref().folded();
+        let mut name = key;
+        loop {
+            let Some(at) = self.index.find(name) else {
+                return;
+            };
+            if at.children > 0 || !matches!(at.slot, Slot::Ent) {
+                return;
+            }
+            self.index.remove(name);
+            let Some(parent) = Zone::parent_in_zone(name, &origin_key) else {
+                return;
+            };
+            self.index.credit(parent, -1);
+            name = parent;
+        }
     }
 
     /// Whether the zone holds records at exactly this name — no wildcard.
@@ -711,6 +918,16 @@ impl Zone {
         self.query(self.origin(), Qtype::of(rt::SOA))
             .first()
             .copied()
+    }
+
+    /// Where the apex SOA sits in `records`, for a caller that means to replace
+    /// it ([`Zone::remove_record`]).
+    pub(crate) fn apex_soa_position(&self) -> Option<usize> {
+        let origin = self.origin_key();
+        self.positions_of(&origin)
+            .iter()
+            .copied()
+            .find(|at| self.records[*at].rdata.rtype() == rt::SOA)
     }
 
     /// The apex SOA as a standalone record, owner name absolute — the form that
@@ -923,24 +1140,108 @@ impl Zone {
             .find(|r| r.rdata.rtype() == rtype)
     }
 
-    /// File `position` under `key`, spilling at the *second* record.
+    /// File `position` under `key`, spilling at the *second* record. Says
+    /// whether `key` was new to the index, which is what tells the caller its
+    /// ancestors have yet to be noted.
     ///
     /// An owner name with one record keeps its position in the table; the names
     /// that hold an RRset of several, or several types, get a list. Which way a
     /// zone leans decides the cost, and a policy feed leans entirely one way.
-    fn file(&mut self, key: &[u8], at: (usize, u32), position: usize) {
-        // The spill list is pushed before the slot is taken mutably, because
-        // both borrow `self`.
-        match *self.index.slot_mut(key, Some(at)) {
+    ///
+    /// The two fields rather than `&mut self`, as [`Zone::note_non_terminals`]
+    /// takes them and for the same reason: the caller holds the folded origin,
+    /// which borrows `self.origin`.
+    fn file(
+        index: &mut NameIndex,
+        spills: &mut Vec<Vec<usize>>,
+        key: &[u8],
+        at: (usize, u32),
+        position: usize,
+    ) -> bool {
+        let next_list = spills.len();
+        let (node, fresh) = index.node_mut(key, Some(at));
+        match node.slot {
             // Vacant, or a name noted as an ancestor that now has a record of
             // its own.
-            Slot::Ent => *self.index.slot_mut(key, Some(at)) = Slot::One(position),
+            Slot::Ent => node.slot = Slot::One(position),
             Slot::One(first) => {
-                self.spills.push(vec![first, position]);
-                let list = self.spills.len() - 1;
-                *self.index.slot_mut(key, Some(at)) = Slot::Spilled(list);
+                node.slot = Slot::Spilled(next_list);
+                spills.push(vec![first, position]);
             }
-            Slot::Spilled(list) => self.spills[list].push(position),
+            Slot::Spilled(list) => spills[list].push(position),
+        }
+        fresh
+    }
+
+    /// Take `position` out of whatever `key`'s slot holds, and say whether the
+    /// name has records left.
+    ///
+    /// The inverse of [`Zone::file`] down to the spill list, which is *not*
+    /// given back: a `Slot::Spilled` that falls to one record leaves its `Vec`
+    /// in `self.spills` unreferenced. Reclaiming it would mean either moving
+    /// the last list into the hole — which renumbers a `Slot` somewhere else —
+    /// or a free list, and a delta's worth of empty `Vec`s costs less than
+    /// either. They come back on the next rebuild.
+    fn unfile(&mut self, key: &[u8], position: usize) -> bool {
+        let slot = self
+            .index
+            .slot_of_mut(key)
+            .expect("a record's owner name is in the index");
+        match *slot {
+            Slot::Ent => false,
+            Slot::One(only) => {
+                debug_assert_eq!(only, position, "the index disagrees with the record vector");
+                *slot = Slot::Ent;
+                false
+            }
+            Slot::Spilled(list) => {
+                let positions = &mut self.spills[list];
+                let found = positions
+                    .iter()
+                    .rposition(|held| *held == position)
+                    .expect("the index disagrees with the record vector");
+                positions.remove(found);
+                let left = match positions.len() {
+                    0 => Slot::Ent,
+                    1 => Slot::One(positions[0]),
+                    _ => return true,
+                };
+                // Nothing names this list now. The buffer goes back at once;
+                // the header waits for the rebuild, which is what renumbers
+                // every `Slot::Spilled`.
+                positions.clear();
+                positions.shrink_to_fit();
+                *self
+                    .index
+                    .slot_of_mut(key)
+                    .expect("a record's owner name is in the index") = left;
+                !matches!(left, Slot::Ent)
+            }
+        }
+    }
+
+    /// Point `key`'s slot at `to` where it pointed at `from`.
+    ///
+    /// What a `swap_remove` owes: the record that was last is now somewhere
+    /// else, and exactly one name's slot names it.
+    fn refile(&mut self, key: &[u8], from: usize, to: usize) {
+        let slot = self
+            .index
+            .slot_of_mut(key)
+            .expect("a record's owner name is in the index");
+        match *slot {
+            Slot::Ent => debug_assert!(false, "a record's owner name is not an empty non-terminal"),
+            Slot::One(only) => {
+                debug_assert_eq!(only, from, "the index disagrees with the record vector");
+                *slot = Slot::One(to);
+            }
+            Slot::Spilled(list) => {
+                let at = self.spills[list]
+                    .iter_mut()
+                    .find(|held| **held == from)
+                    .expect("the index disagrees with the record vector");
+                *at = to;
+            }
         }
     }
 
@@ -954,15 +1255,37 @@ impl Zone {
         }
     }
 
-    /// Record every ancestor of `key`, up to the apex, as a name that exists.
+    /// The parent of `name` when this zone is the one that holds it.
     ///
-    /// Stops at the first ancestor already known: ancestors are always noted
-    /// all the way to the apex, so one present means the rest are. Keeps index
-    /// construction linear in the zone rather than in names × labels.
+    /// `None` at the apex, and `None` for an owner outside the zone — foreign
+    /// glue, say, whose ancestors are somebody else's names. One function
+    /// because the insertion walk and the removal walk have to stop in the same
+    /// place or a name's `children` count outlives its children
+    /// (`CLAUDE.md` §7).
+    fn parent_in_zone<'a>(name: &'a [u8], origin: &[u8]) -> Option<&'a [u8]> {
+        if name == origin {
+            return None;
+        }
+        let parent = parent_key(name)?;
+        (parent.len() >= origin.len()).then_some(parent)
+    }
+
+    /// Record every ancestor of `key`, up to the apex, as a name that exists,
+    /// and credit each one with the child below it.
     ///
-    /// "Known" now includes an ancestor that has records of its own, which is
-    /// the same guarantee for the same reason — a record's own insertion noted
+    /// Called only for a `key` the index did not already hold, since an
+    /// ancestor is noted by the first name under it and by nobody else.
+    ///
+    /// Stops at the first ancestor already known, and credits that one for the
+    /// new name below it: ancestors are always noted all the way to the apex,
+    /// so one present means the rest are, and one present means *its* own
+    /// parent has already counted it. Keeps index construction linear in the
+    /// zone rather than in names × labels.
+    ///
+    /// "Known" includes an ancestor that has records of its own, which is the
+    /// same guarantee for the same reason — a record's own insertion noted
     /// *its* ancestors.
+    ///
     /// A free function taking the two fields it needs rather than `&mut self`,
     /// so the walk can slice `key` in place: owning each ancestor to satisfy one
     /// `&mut self` cost four allocations per record and 0.65 s of a million-rule
@@ -970,21 +1293,14 @@ impl Zone {
     fn note_non_terminals(index: &mut NameIndex, key: &[u8], at: (usize, u32), origin: &[u8]) {
         let (off, len) = at;
         let mut name = key;
-        while let Some(parent) = parent_key(name) {
-            if parent.len() < origin.len() {
-                // An owner outside the zone — foreign glue, say. Its ancestors
-                // are somebody else's names and do not exist here.
-                return;
-            }
-            if index.contains_key(parent) {
-                return;
-            }
+        while let Some(parent) = Zone::parent_in_zone(name, origin) {
             // A suffix of a name already in the arena, so it stores no bytes of
             // its own — which is half the arena for a feed whose every rule
             // brings one ancestor with it.
             let skipped = len as usize - parent.len();
-            index.slot_mut(parent, Some((off + skipped, len - skipped as u32)));
-            if parent == origin {
+            let (node, fresh) = index.node_mut(parent, Some((off + skipped, len - skipped as u32)));
+            node.children += 1;
+            if !fresh {
                 return;
             }
             name = parent;
@@ -1011,14 +1327,16 @@ impl Zone {
             .collect();
         self.index.clear();
         self.spills.clear();
+        self.removed_since_rebuild = 0;
         // Recomputed, not carried: `set_origin` turns an apex NS RRset into a
         // zone cut, and a wildcard at the old apex into one below the new.
         self.shortcuts = Shortcuts::default();
         for (position, (key, rtype, at_apex)) in keys.into_iter().enumerate() {
             self.shortcuts.note(&key, rtype, at_apex);
             let at = self.index.intern(&key);
-            Zone::note_non_terminals(&mut self.index, &key, at, &origin_key);
-            self.file(&key, at, position);
+            if Zone::file(&mut self.index, &mut self.spills, &key, at, position) {
+                Zone::note_non_terminals(&mut self.index, &key, at, &origin_key);
+            }
         }
 
         // The chains are not rebuilt. [`Zone::chain_key`] reads the record's own
@@ -1972,6 +2290,377 @@ deep.a.b IN TXT \"x\"
     /// The index as a sorted list, for comparing two zones that must be one
     /// zone. `Slot` is three shapes for one answer, so it is the answer that is
     /// compared.
+    /// Every name the index holds and the records at each, in a form two zones
+    /// built different ways compare by.
+    ///
+    /// Not `index_of`: a removal fills its hole from the end, so positions are
+    /// a permutation of a straight load's and nothing reads a zone in load
+    /// order ([`Zone::remove_record`]).
+    fn shape_of(zone: &Zone) -> Vec<(Vec<u8>, Vec<String>)> {
+        let mut out: Vec<(Vec<u8>, Vec<String>)> = zone
+            .index
+            .iter()
+            .map(|(key, slot)| {
+                let mut records: Vec<String> = zone
+                    .positions(slot)
+                    .iter()
+                    .map(|at| format!("{:?}", zone.records[*at]))
+                    .collect();
+                records.sort();
+                (key.to_vec(), records)
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Every position the index names is a record of that name, and every
+    /// record is named once. What a `swap_remove` can get wrong and a query
+    /// would not notice for a hundred more removals.
+    fn index_agrees_with_records(zone: &Zone, when: &str) {
+        let mut seen = vec![0usize; zone.records.len()];
+        for (key, slot) in zone.index.iter() {
+            for at in zone.positions(slot) {
+                assert!(*at < zone.records.len(), "{when}: position past the end");
+                assert_eq!(
+                    &*zone.records[*at].name.as_ref().folded(),
+                    key,
+                    "{when}: the index files a record under the wrong name"
+                );
+                seen[*at] += 1;
+            }
+        }
+        for (at, count) in seen.iter().enumerate() {
+            assert_eq!(
+                *count, 1,
+                "{when}: record {at} ({}) is filed {count} times",
+                zone.records[at].name
+            );
+        }
+    }
+
+    /// The position of the one record of `rtype` at `name`.
+    fn position_of(zone: &Zone, name: &str, rtype: Rtype) -> usize {
+        let key = nm(name).as_ref().folded().into_owned();
+        zone.positions_of(&key)
+            .iter()
+            .copied()
+            .find(|at| zone.records[*at].rdata.rtype() == rtype)
+            .unwrap_or_else(|| panic!("{name} holds a record of that type"))
+    }
+
+    const REMOVAL_ZONE: &str = "@   IN SOA ns admin 1 3600 600 86400 300
+@   IN NS  ns
+ns  IN A   192.0.2.1
+w   IN A   192.0.2.2
+w   IN A   192.0.2.3
+w   IN MX  10 ns
+deep.a.b IN TXT \"down here\"
+";
+
+    const DEEP_LINE: &str = "deep.a.b IN TXT \"down here\"\n";
+
+    #[test]
+    fn removing_the_last_record_at_a_name_takes_its_empty_non_terminals_with_it() {
+        let mut zone = parse_zone_file(REMOVAL_ZONE, "example.com.").unwrap();
+        let at = position_of(&zone, "deep.a.b.example.com.", record_types::TXT);
+        zone.remove_record(at);
+        index_agrees_with_records(&zone, "after the TXT went");
+
+        // NXDOMAIN, not NODATA: an empty non-terminal left over a name with
+        // nothing under it says a subtree exists that does not
+        // (RFC 4592 §2.2.2).
+        for gone in [
+            "deep.a.b.example.com.",
+            "a.b.example.com.",
+            "b.example.com.",
+        ] {
+            assert_eq!(
+                zone.name_kind(nm(gone).as_ref()),
+                NameKind::NotFound,
+                "{gone} has nothing under it any more"
+            );
+        }
+        assert_eq!(
+            zone.name_kind(nm("example.com.").as_ref()),
+            NameKind::Exact,
+            "the apex still holds its own records"
+        );
+
+        let without =
+            parse_zone_file(&REMOVAL_ZONE.replace(DEEP_LINE, ""), "example.com.").unwrap();
+        assert_eq!(
+            shape_of(&zone),
+            shape_of(&without),
+            "a zone with the record removed is the zone that never held it"
+        );
+    }
+
+    #[test]
+    fn removing_a_name_that_still_has_descendants_leaves_an_empty_non_terminal() {
+        let text = format!("{REMOVAL_ZONE}a.b IN A 192.0.2.9\n");
+        let mut zone = parse_zone_file(&text, "example.com.").unwrap();
+        let at = position_of(&zone, "a.b.example.com.", record_types::A);
+        zone.remove_record(at);
+        index_agrees_with_records(&zone, "after the A went");
+
+        assert_eq!(
+            zone.name_kind(nm("a.b.example.com.").as_ref()),
+            NameKind::EmptyNonTerminal,
+            "deep.a.b is still under it"
+        );
+        assert!(!zone.holds_name(nm("a.b.example.com.").as_ref()));
+        assert_eq!(
+            zone.name_kind(nm("deep.a.b.example.com.").as_ref()),
+            NameKind::Exact
+        );
+        assert_eq!(
+            shape_of(&zone),
+            shape_of(&parse_zone_file(REMOVAL_ZONE, "example.com.").unwrap())
+        );
+    }
+
+    #[test]
+    fn removing_one_record_of_an_rrset_leaves_the_rest_where_they_were() {
+        let mut zone = parse_zone_file(REMOVAL_ZONE, "example.com.").unwrap();
+        let at = position_of(&zone, "w.example.com.", record_types::MX);
+        zone.remove_record(at);
+        index_agrees_with_records(&zone, "after the MX went");
+
+        assert_eq!(
+            zone.query(nm("w.example.com.").as_ref(), Qtype::of(record_types::A))
+                .len(),
+            2,
+            "both A records survive"
+        );
+        assert!(zone
+            .query(nm("w.example.com.").as_ref(), Qtype::of(record_types::MX))
+            .is_empty());
+        assert_eq!(
+            zone.name_kind(nm("w.example.com.").as_ref()),
+            NameKind::Exact
+        );
+    }
+
+    /// The one a missing `refile` fails: removing anything but the last record
+    /// moves the last one, and its index entry still names where it was.
+    #[test]
+    fn the_record_a_removal_relocates_is_still_found_under_its_own_name() {
+        let mut zone = parse_zone_file(REMOVAL_ZONE, "example.com.").unwrap();
+        let last = zone.records.len() - 1;
+        let moved = zone.records[last].name.clone();
+        let rtype = zone.records[last].rdata.rtype();
+
+        let at = position_of(&zone, "ns.example.com.", record_types::A);
+        assert_ne!(at, last, "this test is about a removal from the middle");
+        zone.remove_record(at);
+        index_agrees_with_records(&zone, "after the middle went");
+
+        assert!(
+            !zone.query(moved.as_ref(), Qtype::of(rtype)).is_empty(),
+            "{moved} moved into the hole, and the index has to have followed it"
+        );
+    }
+
+    #[test]
+    fn a_name_removed_and_added_again_is_an_ordinary_name() {
+        let mut zone = parse_zone_file(REMOVAL_ZONE, "example.com.").unwrap();
+        let at = position_of(&zone, "deep.a.b.example.com.", record_types::TXT);
+        let record = zone.remove_record(at);
+        assert_eq!(
+            zone.name_kind(nm("b.example.com.").as_ref()),
+            NameKind::NotFound
+        );
+
+        zone.add_record(record);
+        index_agrees_with_records(&zone, "after it came back");
+        assert_eq!(
+            shape_of(&zone),
+            shape_of(&parse_zone_file(REMOVAL_ZONE, "example.com.").unwrap()),
+            "the ancestors have to be counted again, and counted once"
+        );
+        assert_eq!(
+            zone.name_kind(nm("b.example.com.").as_ref()),
+            NameKind::EmptyNonTerminal
+        );
+    }
+
+    /// The chains hold positions too, so a removal owes them both halves: the
+    /// entry of the record that went, and the entry of the record that moved
+    /// into its place.
+    ///
+    /// An NSEC and an NSEC3 together, because they are two maps and a fix that
+    /// reached one of them would pass a test that asked about the other.
+    #[test]
+    fn a_removal_moves_the_denial_chains_with_the_records() {
+        let text = "$TTL 3600\n\
+                    @ IN SOA ns1.example.com. admin.example.com. 1 3600 600 86400 3600\n\
+                    @ IN NSEC www.example.com. A SOA RRSIG NSEC\n\
+                    www IN A 192.0.2.1\n\
+                    www IN NSEC example.com. A RRSIG NSEC\n\
+                    1avvmb2l1oba4jvim8ie7t8ml1l7ch7c IN NSEC3 1 0 0 - \
+                    2avvmb2l1oba4jvim8ie7t8ml1l7ch7c A RRSIG\n\
+                    2avvmb2l1oba4jvim8ie7t8ml1l7ch7c IN NSEC3 1 0 0 - \
+                    1avvmb2l1oba4jvim8ie7t8ml1l7ch7c A RRSIG\n";
+        let mut zone = parse_zone_file(text, "example.com.").unwrap();
+        let hash_of = |name: &str| {
+            let label = nm(name).as_ref().labels().next().expect("a label").to_vec();
+            let decoded =
+                base32hex_decode(std::str::from_utf8(&label).expect("base32 is ASCII")).unwrap();
+            Nsec3Hash::from_wire(&decoded).expect("a hash")
+        };
+        let probe = hash_of("3avvmb2l1oba4jvim8ie7t8ml1l7ch7c.example.com.");
+        assert_eq!(
+            zone.nsec3_covering(probe).map(|r| r.name.to_string()),
+            Some("2avvmb2l1oba4jvim8ie7t8ml1l7ch7c.example.com.".to_string()),
+            "the chain answers before anything is removed"
+        );
+
+        // The A at www is neither a denial record nor the last one, so removing
+        // it moves the last NSEC3 and leaves both chains to be repaired.
+        let at = position_of(&zone, "www.example.com.", record_types::A);
+        assert!(
+            at < zone.records.len() - 1,
+            "this test needs a denial record after the one it removes"
+        );
+        zone.remove_record(at);
+        index_agrees_with_records(&zone, "after the A went");
+
+        assert_eq!(
+            zone.nsec3_covering(probe).map(|r| r.name.to_string()),
+            Some("2avvmb2l1oba4jvim8ie7t8ml1l7ch7c.example.com.".to_string()),
+            "the NSEC3 that moved has to still be the one its hash names"
+        );
+        assert_eq!(
+            zone.nsec_covering(nm("mail.example.com.").as_ref())
+                .map(|r| r.name.to_string()),
+            Some("example.com.".to_string()),
+            "and so does the NSEC"
+        );
+
+        // And the record that went takes its own chain entry with it.
+        let at = position_of(&zone, "www.example.com.", record_types::NSEC);
+        zone.remove_record(at);
+        index_agrees_with_records(&zone, "after the NSEC went");
+        assert_eq!(
+            zone.nsec_covering(nm("zzz.example.com.").as_ref())
+                .map(|r| r.name.to_string()),
+            Some("example.com.".to_string()),
+            "the only NSEC left is the apex's"
+        );
+    }
+
+    /// Every record out, one at a time, starting from each position in turn:
+    /// the child counts have to come back to nothing whichever way the walk
+    /// went.
+    #[test]
+    fn removing_every_record_empties_the_index() {
+        let template = parse_zone_file(REMOVAL_ZONE, "example.com.").unwrap();
+        for first in 0..template.records.len() {
+            let mut zone = template.clone();
+            for step in 0..template.records.len() {
+                let at = (first + step) % zone.records.len();
+                zone.remove_record(at);
+                index_agrees_with_records(&zone, &format!("from {first}, step {step}"));
+            }
+            assert_eq!(zone.records.len(), 0, "from {first}");
+            assert_eq!(
+                zone.index.len(),
+                0,
+                "from {first}: an index entry outlived every record under it"
+            );
+            assert_eq!(
+                zone.name_kind(nm("example.com.").as_ref()),
+                NameKind::NotFound,
+                "from {first}"
+            );
+        }
+    }
+
+    /// Applying deltas forever must not grow a zone that is not growing.
+    ///
+    /// Everything under the index is append-only, and a difference sequence
+    /// spells a changed record as a deletion and an addition (RFC 1995 §2), so
+    /// the same name's octets are appended again every publication and a name
+    /// that falls back to one record leaves its position list behind.
+    /// Unbounded in a process that refreshes a feed for a year without
+    /// restarting, and invisible: the entry count, the record count and every
+    /// answer stay right while the process grows.
+    ///
+    /// Four times the rounds and the same peak, rather than a size: a bound is
+    /// a statement about what a number does *not* depend on (`CLAUDE.md` §10).
+    /// The peak and not the final figure, because the rebuild is periodic and
+    /// where a run stops between two of them is not the question.
+    ///
+    /// Against the version without the rebuild `remove_record` triggers, the
+    /// arena peaks at 120 031 octets over 100 rounds and 408 031 over 400; with
+    /// it, 35 647 and 35 719, and the spill list 14 either way.
+    #[test]
+    fn applying_deltas_forever_does_not_grow_the_index() {
+        fn churn(rounds: u32) -> (usize, usize, usize, usize) {
+            let mut text = String::from("$TTL 3600\n@ IN SOA ns admin 1 3600 600 86400 300\n");
+            for i in 0..1000 {
+                text.push_str(&format!("host{i:06} IN A 192.0.2.1\n"));
+            }
+            // One name with an RRset, which is what leaves a list behind.
+            text.push_str("many IN A 192.0.2.7\nmany IN A 192.0.2.8\n");
+            let mut zone = parse_zone_file(&text, "example.com.").unwrap();
+            let mut peak_arena = zone.index.names.len();
+            let mut peak_spills = zone.spills.len();
+
+            for round in 0..rounds {
+                // Forty rules change, each the only record at its own name,
+                // plus one of the two at `many`.
+                for i in 0..40 {
+                    let name = format!("host{i:06}.example.com.");
+                    let at = position_of(&zone, &name, record_types::A);
+                    let mut record = zone.remove_record(at);
+                    record.ttl = Ttl::from_secs(3600 + round);
+                    zone.add_record(record);
+                }
+                let at = position_of(&zone, "many.example.com.", record_types::A);
+                let mut record = zone.remove_record(at);
+                record.ttl = Ttl::from_secs(3600 + round);
+                zone.add_record(record);
+                index_agrees_with_records(&zone, &format!("round {round}"));
+                // The peak, not the end: the rebuild is periodic, so where a
+                // run stops between two of them moves the final figure and not
+                // the bound this is about.
+                peak_arena = peak_arena.max(zone.index.names.len());
+                peak_spills = peak_spills.max(zone.spills.len());
+            }
+            (
+                peak_arena,
+                peak_spills,
+                zone.index.len(),
+                zone.records.len(),
+            )
+        }
+
+        let short = churn(100);
+        let long = churn(400);
+        assert_eq!(
+            (short.2, short.3),
+            (long.2, long.3),
+            "no name and no record arrived or left"
+        );
+        // Within a few parts in a thousand: which names a cycle happens to
+        // re-intern before the rebuild moves the peak a little, and the
+        // question is whether it moves with the *rounds*.
+        assert!(
+            100 * long.0 <= 105 * short.0,
+            "the arena's peak grew with the number of publications: {} then {}",
+            short.0,
+            long.0
+        );
+        assert!(
+            long.1 <= short.1 + 1,
+            "the spill list's peak grew with the number of publications: {} then {}",
+            short.1,
+            long.1
+        );
+    }
+
     fn index_of(zone: &Zone) -> Vec<(Vec<u8>, Vec<usize>)> {
         let mut out: Vec<(Vec<u8>, Vec<usize>)> = zone
             .index

@@ -40,8 +40,11 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
     out.push_str(&format!("$ORIGIN {}\n", zone.origin().to_presentation()));
     out.push_str(&format!("$TTL {}\n\n", default_ttl(zone)));
 
-    // The SOA first, as a transfer sends it. The rest keep load order, so
-    // rewriting an unchanged zone produces an unchanged file.
+    // The SOA first, as a transfer sends it. The rest in the order the zone
+    // holds them, so rewriting an unchanged zone produces an unchanged file —
+    // a zone a delta has been applied to holds a permutation of its old order
+    // (`Zone::remove_record`), which is a different file for the same records
+    // and not a reason to sort a million of them.
     //
     // Through `Zone::is_apex_soa` rather than comparing `record.name`, which is
     // the same question five other places ask (`TODO.md` #33f). A `Name` is
