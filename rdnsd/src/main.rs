@@ -4000,13 +4000,14 @@ mod tests {
 
     /// A server serving `example.com.` out of a real directory it can write.
     async fn spawn_updatable(dir: &Path, key: TsigKey) -> SocketAddr {
-        spawn_updatable_with_journal(dir, key, None).await
+        spawn_updatable_with(dir, key, None, None).await
     }
 
-    async fn spawn_updatable_with_journal(
+    async fn spawn_updatable_with(
         dir: &Path,
         key: TsigKey,
         journal: Option<Arc<rdns::journal::Journal>>,
+        dnstap: Option<crate::dnstap::Sink>,
     ) -> SocketAddr {
         std::fs::write(dir.join("example.com.zone"), UPDATE_ZONE).expect("write the zone file");
         let source = ZoneSource::Directory(dir.to_string_lossy().to_string());
@@ -4029,7 +4030,7 @@ mod tests {
                 applying: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             }),
             journal,
-            dnstap: None,
+            dnstap,
         });
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -4241,6 +4242,126 @@ mod tests {
         );
     }
 
+    /// Data frames in a Frame Streams capture, START and STOP skipped.
+    ///
+    /// A control frame is escaped by a zero length and carries its own length
+    /// after it; anything else is a payload. Counted rather than decoded: what
+    /// #77b is about is which paths reach the stream, and the payloads
+    /// themselves are `rdns::dnstap`'s own tests.
+    fn data_frames(capture: &[u8]) -> usize {
+        let word = |at: usize| -> Option<usize> {
+            let bytes: [u8; 4] = capture.get(at..at + 4)?.try_into().ok()?;
+            Some(u32::from_be_bytes(bytes) as usize)
+        };
+        let (mut at, mut frames) = (0, 0);
+        while let Some(len) = word(at) {
+            at += 4;
+            match len {
+                0 => match word(at) {
+                    Some(control) => at += 4 + control,
+                    None => break,
+                },
+                len => {
+                    at += len;
+                    frames += 1;
+                }
+            }
+        }
+        frames
+    }
+
+    /// All three answering paths reach the query stream, not just the ordinary
+    /// one.
+    ///
+    /// `TODO.md` #77b, the test #75 landed without. `record_dnstap` used to sit
+    /// behind `finish`, which the transfer and UPDATE branches returned above,
+    /// so a capture held neither — while `--dnstap` says "every answered
+    /// request" and `MessageType::UpdateQuery` was an arm nothing could reach.
+    /// Watched failing against that shape: one data frame, not three.
+    ///
+    /// The transfer is refused, because this server has no ACL. That is the
+    /// case worth capturing anyway — `answer_transfer` logs every attempt for
+    /// the same reason — and it exercises the branch rather than the zone.
+    #[tokio::test]
+    async fn every_answering_path_reaches_the_dnstap_stream() {
+        let dir = ScratchDir::new("dnstap-paths");
+        let capture = dir.join("capture.fstrm");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        // Its own `Shutdown`: the pump flushes when it stops, and
+        // `test_shutdown` is one static that every other test's accept loop is
+        // holding.
+        let shutdown = Shutdown::new();
+        let sink = crate::dnstap::Sink::spawn(
+            &crate::dnstap::Target::File(capture.clone()),
+            0,
+            Vec::new(),
+            Vec::new(),
+            DnsMetrics::new(),
+            shutdown.stop_handle(),
+        )
+        .await
+        .expect("the capture file opens");
+        let addr = spawn_updatable_with(dir.path(), key.clone(), None, Some(sink)).await;
+
+        let asked = round_trip(
+            addr,
+            query("www.example.com.", Qtype::of(record_types::A), false)
+                .to_bytes_within(4096)
+                .expect("serialize"),
+        )
+        .await;
+        assert_eq!(asked.rcode, ResponseCode::Ok, "an ordinary query");
+
+        let update = update_message(
+            "example.com.",
+            vec![a_record("new.example.com.", "192.0.2.50")],
+        );
+        let bytes = update.to_bytes_within(4096).expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::Ok,
+            "RFC 2136 §3.4.2.5"
+        );
+
+        let transfer = round_trip(
+            addr,
+            query("example.com.", Qtype::AXFR, false)
+                .to_bytes_within(4096)
+                .expect("serialize"),
+        )
+        .await;
+        assert_eq!(
+            transfer.rcode,
+            ResponseCode::Refused,
+            "an empty ACL refuses everyone"
+        );
+
+        // Polled rather than slept: the pump writes STOP and flushes as it
+        // stops, so the capture is closed when it ends with one, and a fixed
+        // sleep would make a loaded machine decide the result.
+        shutdown.begin();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let capture = loop {
+            let bytes = std::fs::read(&capture).expect("the capture file");
+            if bytes.ends_with(&rdns::dnstap::stop_frame()) {
+                break bytes;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the capture never closed: {} octets, {} data frames",
+                bytes.len(),
+                data_frames(&bytes)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            data_frames(&capture),
+            3,
+            "a query, an UPDATE and a transfer attempt"
+        );
+    }
+
     /// The refusal says why, to a client that sent an OPT to hear it in
     /// (RFC 8914 §2).
     ///
@@ -4390,8 +4511,7 @@ mod tests {
         let dir = ScratchDir::new("update-journal");
         let key = update_key(rdns::tsig::UpdatePolicy::Any);
         let journal = Arc::new(rdns::journal::Journal::new(dir.path().to_path_buf()));
-        let addr =
-            spawn_updatable_with_journal(dir.path(), key.clone(), Some(journal.clone())).await;
+        let addr = spawn_updatable_with(dir.path(), key.clone(), Some(journal.clone()), None).await;
 
         for (n, addr_text) in [(1u8, "192.0.2.51"), (2, "192.0.2.52")] {
             let bytes = update_message(

@@ -8740,11 +8740,14 @@ intent was on the page beside the code that defeated it.
   and buffering the zone to name one would undo the shape `answer_transfer`
   exists for.
 
-**Left behind: 77b.** There is no test. Driving an UPDATE through a file-backed
+~~**Left behind: 77b.** There is no test. Driving an UPDATE through a file-backed
 sink needs a dnstap target on `spawn_updatable`, which nothing in the suite
 builds; the change rests on `record_dnstap` having one caller and that caller
 one call site, which is a property it establishes rather than one anything
-checks.
+checks.~~ **77b closed 2026-09-19**, and what it found is that the estimate in
+the sentence above was wrong: the pre-#75 shape does not produce an empty
+capture, it produces the ordinary query and drops the other two. **3 data
+frames against 1.**
 
 ---
 

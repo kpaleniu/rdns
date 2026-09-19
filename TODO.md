@@ -4698,13 +4698,31 @@ queue (`CLAUDE.md` §18).
   a decision to decline and not work — and it should be declined in writing
   rather than left open.
 
-- **77b. #75 has no test.** `record_dnstap` is now reachable from all three
+- ~~**77b. #75 has no test.** `record_dnstap` is now reachable from all three
   answering paths by construction, and nothing checks that it is. What it needs
   is a dnstap target on `spawn_updatable` — a `file:` sink, an UPDATE over TCP,
   and the capture read back, which `dnstap.rs`'s own
   `a_file_target_is_capped_rather_than_allowed_to_fill_the_disk` already shows
   how to do. ~40 lines. Watched failing means reverting #75's tail and seeing
-  an empty capture.
+  an empty capture.~~ **Done 2026-09-19.**
+
+  A query, a signed UPDATE and a transfer attempt down one connection, then
+  the frames in the capture counted: **3 against 1** with #75's tail reverted,
+  which is what the estimate above got wrong — the old shape does not produce
+  an *empty* capture, it produces the ordinary query and drops the other two.
+  A guess about a failure is not the failure (§4); the number came from
+  running it.
+
+  Two things it needed that the row did not say. The sink is stopped through a
+  `Shutdown` of its own, because the pump flushes when it stops and
+  `test_shutdown` is one static that every other test's accept loop holds —
+  calling `begin` on that one would end them all. And the capture is polled
+  until it ends with a STOP frame rather than slept on, so a loaded machine
+  does not decide the result (§10).
+
+  The transfer is refused (the ACL is empty), which is the branch and not the
+  zone — and a refused attempt is what a reader wants to see anyway, for the
+  reason `answer_transfer` already logs every one of them.
 
 ---
 
@@ -5135,7 +5153,7 @@ the week; the record is under "How the queue kept going stale" in
 | **72** | a zone's arena was filled from what the caller had just allocated | **filed and closed 2026-09-19**, three passes, out of 71e. Filed at two allocations a record and the copy between them; there were **seven**, and the two it named were the smallest — the largest was one line of `Zone::add_record` itself, folding an index key `intern` copies into its own arena a moment later. A million-record zone of A records now parses with **no heap allocation per record at all**, **480 ns a record to ~263** (`rdns/tests/scale.rs`), and a mixed-type one 535 to 438. `Zone::add` and `Zone::add_parsed` are the borrowed and the not-yet-encoded doors beside `add_record`; `Name::absolutized_in` settles a zone file's three spellings of an owner name in one place; `RdataArena::push_parsed` encodes into the arena under the same argument `RecordData::from_parsed` already stands on. **72a** was filed as §7 and was §4: the two field lists `rdata_from_fields` took were `tokens` and `tokens.iter().map(Cow::as_ref)`, the same strings by construction, under a comment saying one kept its quotes. **72b** went to zero rather than the one it predicted, and its first version moved an *exact* count **up** — `Vec` takes a byte vector's capacity to 8 whatever it holds, so the shrink to a `Box` cost a reallocation per record on the **message** path; sized from the RDLENGTH that arrived, it is 15 again. An exact count is what caught it. Two refutations recorded on the way: none of the three other build sites the row named gains from the borrowed door, and the signer's seven sites stay, because signing is ~27 µs a record |
 | **73** | a denial outlived the SOA beside it | **filed and closed 2026-09-19**, `35b1e8f`, out of an architecture review. RFC 9077 §3: an NSEC or NSEC3 TTL is the *lesser* of the SOA's MINIMUM and the SOA record's own TTL, and the signer used MINIMUM alone. RFC 4034 §4.1.1's older "same as MINIMUM" predates aggressive use, under which the denial's own TTL is how long a resolver goes on synthesizing that "no" — and this tree implements that other half (`rdns::nsec_cache`). Measured on `$TTL 300` with `minimum 3600`: SOA 300, NSEC **3600**, its RRSIG **3600**; all 300 after. The fix is one `.min(soa_ttl)`, on a value bound six lines above and used for the DNSKEY TTL only. **Why the suite never saw it**: every fixture is `$TTL 3600` with `minimum 300`, the direction where the `min` is invisible — and `rdnsd/src/answer.rs` asserts "capped at MINIMUM, not the `$TTL`", which is right only because 300 < 3600. RFC 9077 is cited nowhere else in the tree. Left **77a** |
 | **74** | `--check-config` did not name DoH | **filed and closed 2026-09-19**, `20b8dc8`. The dry run matched on `--tls-listen` and `--quic-listen`, so a DoH-only server was told "encrypted transports disabled" by the one command whose whole job is to be believed before a restart — while the `encrypted` predicate eighteen lines above, which decides whether to read the certificate at all, has named all three since DoH landed. Provoked rather than read (§4). **Why the second copy existed**: `describe_encrypted` had all three right and took a `TlsPolicy`, which is not built until after the dry run returns — a function that is correct and unreachable is how §7's second copy gets written. It takes the three addresses now. `--check-config`'s output still has no test at all, which is how a hand-written banner stayed wrong |
-| **75** | two of three answering paths returned past the epilogue | **filed and closed 2026-09-19**, `74019de`. `record_dnstap` was reachable only through `finish`, and the transfer and UPDATE branches `return`ed above it — so a dnstap capture held neither, while `--dnstap` says "every answered request" and `MessageType::UpdateQuery`/`UpdateResponse` were arms nothing could reach. §7's named shape, and this file's second instance of it after the NOTIMP branch that returned past `make_response`'s OPT mirroring; the tell here was cheaper, because the unreachable arms had been *written*. `finish` returns what it sent, `answer` has one tail, and a serialization failure joins them for the reason a dropped reply already did. A transfer records the query alone: no one envelope is the reply. Left **77b** — there is no test |
+| **75** | two of three answering paths returned past the epilogue | **filed and closed 2026-09-19**, `74019de`. `record_dnstap` was reachable only through `finish`, and the transfer and UPDATE branches `return`ed above it — so a dnstap capture held neither, while `--dnstap` says "every answered request" and `MessageType::UpdateQuery`/`UpdateResponse` were arms nothing could reach. §7's named shape, and this file's second instance of it after the NOTIMP branch that returned past `make_response`'s OPT mirroring; the tell here was cheaper, because the unreachable arms had been *written*. `finish` returns what it sent, `answer` has one tail, and a serialization failure joins them for the reason a dropped reply already did. A transfer records the query alone: no one envelope is the reply. Left **77b**, ~~which is that there is no test~~ **closed the same day**: a query, an UPDATE and a transfer attempt down one connection, **3 data frames against 1** with this tail reverted — so the pre-#75 shape drops two of three rather than capturing nothing, which is what the row had guessed |
 | **76** | `ScratchDir` existed three times | **filed and closed 2026-09-19**, `ab2ae3b`. `rdns-core::testutil` is `pub` rather than `#[cfg(test)]` for one stated purpose — "the choice was this or a second `ScratchDir`, which is the thing this module exists to have stopped" — and both binaries wrote one anyway, each citing the other, on a premise that stopped being true at #66c. `rdnsd` carried both at once: `dispatch.rs` already reached for the shared one. 57 lines deleted, 9 added, no behaviour. What it is worth is not the lines: §7 says the reason is what stops the next copy, and here the reason was copied along with the code and went on justifying it after it had expired |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
