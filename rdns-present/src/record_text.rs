@@ -20,7 +20,7 @@ use std::borrow::Cow;
 use rdns_core::codecs::{base64_encode, hex_encode};
 use rdns_core::error::ZoneError;
 use rdns_core::record_types::record_type_name;
-use rdns_core::{Class, NameRef, ParsedRecord, RecordData, ResourceRecord, Ttl};
+use rdns_core::{Class, NameRef, ParsedRecord, RecordData, RecordDataRef, ResourceRecord, Ttl};
 
 use crate::denial_wire::{base32hex_encode, bitmap_types_exact};
 use crate::dnssec_time::format_dnssec_time;
@@ -38,7 +38,7 @@ pub fn record_line(
     name: NameRef<'_>,
     ttl: Ttl,
     class: Class,
-    rdata: &RecordData,
+    rdata: RecordDataRef<'_>,
 ) -> Result<String, ZoneError> {
     let mut out = String::new();
     record_line_into(&mut out, name, ttl, class, rdata)?;
@@ -60,7 +60,7 @@ pub fn record_line_into(
     name: NameRef<'_>,
     ttl: Ttl,
     class: Class,
-    rdata: &RecordData,
+    rdata: RecordDataRef<'_>,
 ) -> Result<(), ZoneError> {
     use std::fmt::Write;
     let owner = writable_name(name);
@@ -85,7 +85,7 @@ pub fn resource_record_line(record: &ResourceRecord) -> Result<String, ZoneError
         record.name.as_ref(),
         record.ttl,
         record.class,
-        &record.rdata,
+        record.rdata.as_ref(),
     )
 }
 
@@ -94,7 +94,7 @@ pub fn resource_record_line(record: &ResourceRecord) -> Result<String, ZoneError
 /// Type-specific when that is faithful, generic when it is not. "Faithful" is
 /// decided by re-encoding what we parsed and comparing the bytes, so the cases
 /// need not be enumerated here.
-fn rdata_to_string(stored: &RecordData) -> (Cow<'static, str>, String) {
+fn rdata_to_string(stored: RecordDataRef<'_>) -> (Cow<'static, str>, String) {
     let name = record_type_name(stored.rtype());
     // Lazily, which is `TODO.md` #64c's first measurement: this was built for
     // every record and thrown away whenever the type-specific form worked,
@@ -116,7 +116,7 @@ fn rdata_to_string(stored: &RecordData) -> (Cow<'static, str>, String) {
 }
 
 /// `\# <length> <hex>` (RFC 3597 §5) — the form that is exact for anything.
-fn generic_rdata(stored: &RecordData) -> String {
+fn generic_rdata(stored: RecordDataRef<'_>) -> String {
     use std::fmt::Write;
     let bytes = stored.bytes();
     // Two hex digits an octet, plus the prefix: one allocation, not one per

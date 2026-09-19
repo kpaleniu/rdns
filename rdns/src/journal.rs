@@ -186,10 +186,10 @@ fn read_delta(block: &str, origin: NameRef<'_>) -> Result<ZoneDelta, ZoneError> 
         .records()
         .iter()
         .map(|r| ResourceRecord {
-            name: r.name.clone(),
+            name: r.name.to_owned(),
             class: r.class,
             ttl: r.ttl,
-            rdata: r.rdata.clone(),
+            rdata: r.rdata.to_owned(),
         })
         .collect();
 

@@ -18,8 +18,8 @@ use std::collections::HashMap;
 
 use crate::record_types as rt;
 use crate::transfer::{axfr_messages, pack_transfer_messages};
-use crate::zone::{Zone, ZoneRecord};
-use crate::{DnsMessage, Name, NameRef, RecordData, ResourceRecord};
+use crate::zone::{Zone, ZoneRecord, ZoneRecordRef};
+use crate::{DnsMessage, Name, NameRef, RecordData, RecordDataRef, ResourceRecord};
 
 /// How many version steps to remember per zone. Past this a full transfer is
 /// both correct and probably cheaper than the chain.
@@ -293,16 +293,15 @@ impl RecordKey {
     }
 }
 
-fn record_key(_zone: &Zone, record: &ZoneRecord) -> RecordKey {
+fn record_key(_zone: &Zone, record: ZoneRecordRef<'_>) -> RecordKey {
     // No normalizing: a `Name` is absolute, and the folded copy is what the
     // key is for.
-    let name = record.name.clone();
     RecordKey {
-        lowercase_name: name.as_ref().folded().into_owned(),
+        lowercase_name: record.name.folded().into_owned(),
         class: record.class,
         ttl: record.ttl,
-        rdata: record.rdata.clone(),
-        name,
+        rdata: record.rdata.to_owned(),
+        name: record.name.to_owned(),
     }
 }
 
@@ -354,8 +353,8 @@ impl Withheld {
     /// record that can change. The TTL included — a secondary re-serves that
     /// number, so a TTL change is a deletion plus an addition, as BIND's
     /// `ixfr-from-differences` produces.
-    fn matches(&self, class: Class, ttl: Ttl, rdata: &RecordData) -> bool {
-        self.count > 0 && self.class == class && self.ttl == ttl && &self.rdata == rdata
+    fn matches(&self, class: Class, ttl: Ttl, rdata: RecordDataRef<'_>) -> bool {
+        self.count > 0 && self.class == class && self.ttl == ttl && self.rdata == rdata
     }
 }
 
@@ -380,7 +379,7 @@ impl Patch {
             let bucket = self.withhold.entry(key).or_default();
             match bucket
                 .iter_mut()
-                .find(|held| held.matches(record.class, record.ttl, &record.rdata))
+                .find(|held| held.matches(record.class, record.ttl, record.rdata.as_ref()))
             {
                 Some(held) => held.count += 1,
                 None => bucket.push(Withheld {
@@ -464,10 +463,10 @@ impl Patch {
             doomed.clear();
             let key: &[u8] = std::borrow::Borrow::borrow(key);
             for at in zone.positions_of(key) {
-                let record = &zone.records()[*at];
+                let record = zone.record(*at);
                 let held = bucket
                     .iter_mut()
-                    .find(|held| held.matches(record.class, record.ttl, &record.rdata));
+                    .find(|held| held.matches(record.class, record.ttl, record.rdata));
                 if let Some(held) = held {
                     held.count -= 1;
                     doomed.push(*at);
@@ -701,12 +700,12 @@ mod tests {
     }
 
     /// A zone's record as a difference sequence carries it.
-    fn record_of(record: &ZoneRecord) -> ResourceRecord {
+    fn record_of(record: ZoneRecordRef<'_>) -> ResourceRecord {
         ResourceRecord {
-            name: record.name.clone(),
+            name: record.name.to_owned(),
             class: record.class,
             ttl: record.ttl,
-            rdata: record.rdata.clone(),
+            rdata: record.rdata.to_owned(),
         }
     }
 
@@ -767,7 +766,7 @@ mod tests {
     fn name_kinds(zone: &Zone) -> Vec<(String, crate::zone::NameKind)> {
         let mut names: Vec<Name> = vec![zone.origin().to_owned()];
         for record in zone.records() {
-            let mut name = record.name.as_ref();
+            let mut name = record.name;
             names.push(name.to_owned());
             while let Some(parent) = name.parent() {
                 names.push(parent.to_owned());

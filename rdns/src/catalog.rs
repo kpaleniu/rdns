@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 
 use crate::error::{BrokenCatalog, WireError};
 use crate::record_types as rt;
-use crate::zone::{Zone, ZoneRecord};
+use crate::zone::{Zone, ZoneRecordRef};
 use crate::{Name, NameRef, ParsedRecord};
 
 /// The schema version this build implements (§4.2.1). Version "1" was the draft
@@ -130,7 +130,7 @@ impl Catalog {
         let mut nodes: BTreeMap<Vec<u8>, Node> = BTreeMap::new();
 
         for record in zone.records() {
-            let name = record.name.as_ref();
+            let name = record.name;
             if !name.is_at_or_under(origin) {
                 continue;
             }
@@ -303,7 +303,7 @@ fn node_of(property: NameRef<'_>) -> NameRef<'_> {
 }
 
 /// A PTR's target.
-fn target(record: &ZoneRecord) -> Result<Name, BrokenCatalog> {
+fn target(record: ZoneRecordRef<'_>) -> Result<Name, BrokenCatalog> {
     match record.rdata.parse() {
         Ok(ParsedRecord::PTR(name)) => Ok(name),
         // `RecordData::parse` dispatches on the same rtype this was matched on,
@@ -322,7 +322,7 @@ fn target(record: &ZoneRecord) -> Result<Name, BrokenCatalog> {
 /// Joined because §4.2.1 and §4.3.2 both speak of the value of the *record*
 /// rather than of a string within it, and §4.3.2's own example writes one group
 /// value as two strings (`"operator-y" "bar"`).
-fn text(record: &ZoneRecord) -> Result<Vec<u8>, BrokenCatalog> {
+fn text(record: ZoneRecordRef<'_>) -> Result<Vec<u8>, BrokenCatalog> {
     match record.rdata.parse() {
         Ok(ParsedRecord::TXT(strings)) => Ok(strings.concat()),
         Ok(_) => Err(undecodable(
@@ -333,9 +333,9 @@ fn text(record: &ZoneRecord) -> Result<Vec<u8>, BrokenCatalog> {
     }
 }
 
-fn undecodable(record: &ZoneRecord, source: WireError) -> BrokenCatalog {
+fn undecodable(record: ZoneRecordRef<'_>, source: WireError) -> BrokenCatalog {
     BrokenCatalog::Undecodable {
-        name: record.name.clone(),
+        name: record.name.to_owned(),
         source,
     }
 }

@@ -28,13 +28,13 @@ use crate::dnssec_key::SigningKey;
 use crate::error::DnssecError;
 use crate::error::DnssecResult as Result;
 use crate::record_types as rt;
-use crate::zone::{Zone, ZoneRecord};
+use crate::zone::{Zone, ZoneRecord, ZoneRecordRef};
 use crate::Class;
 use crate::Qtype;
 use crate::Rtype;
 use crate::Serial;
 use crate::Ttl;
-use crate::{Name, NameRef, ParsedRecord, RecordData};
+use crate::{Name, NameRef, ParsedRecord, RecordData, RecordDataRef};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Where the apex DNSKEY RRset's signature comes from.
@@ -434,7 +434,7 @@ type ByName<'a, V> = BTreeMap<Cow<'a, [u8]>, Vec<(Rtype, V)>>;
 
 /// An RRset as the previous run signed it: its TTL, and its RDATA borrowed from
 /// that run's zone.
-type SignedRrset<'a> = (Ttl, Vec<&'a RecordData>);
+type SignedRrset<'a> = (Ttl, Vec<RecordDataRef<'a>>);
 
 /// The entry for `rtype` under an owner, or a new empty one.
 ///
@@ -452,7 +452,7 @@ fn slot<V: Default>(types: &mut Vec<(Rtype, V)>, rtype: Rtype) -> &mut V {
 /// One RRSIG from the previous run, with the two fields the reuse decision
 /// turns on read out once rather than per lookup.
 struct CarriedSignature<'a> {
-    rdata: &'a RecordData,
+    rdata: RecordDataRef<'a>,
     expiration: u32,
     key_tag: u16,
 }
@@ -466,7 +466,7 @@ impl<'a> PreviousSignatures<'a> {
             // A `Cow`, so a name already folded — which every name a previous
             // run wrote is, `carry_over_records` having normalized it — costs
             // nothing.
-            let name = record.name.as_ref().folded();
+            let name = record.name.folded();
             if record.rdata.rtype() == rt::RRSIG {
                 // Not offered for reuse; the RRset gets a fresh signature.
                 if let Ok(ParsedRecord::RRSIG {
@@ -478,7 +478,7 @@ impl<'a> PreviousSignatures<'a> {
                 {
                     slot(signatures.entry(name).or_default(), type_covered).push(
                         CarriedSignature {
-                            rdata: &record.rdata,
+                            rdata: record.rdata,
                             expiration,
                             key_tag,
                         },
@@ -491,7 +491,7 @@ impl<'a> PreviousSignatures<'a> {
             // The TTL of the first record of the RRset, as the previous run
             // normalized it; `reuse` compares it against this run's.
             rrset.0 = record.ttl;
-            rrset.1.push(&record.rdata);
+            rrset.1.push(record.rdata);
         }
 
         PreviousSignatures { rrsets, signatures }
@@ -520,7 +520,7 @@ impl<'a> PreviousSignatures<'a> {
         name: NameRef<'_>,
         rtype: Rtype,
         ttl: Ttl,
-        rdatas: &[&RecordData],
+        rdatas: &[RecordDataRef<'_>],
         key_tags: &[u16],
         signed_at: u64,
     ) -> Option<&[CarriedSignature<'a>]> {
@@ -629,13 +629,13 @@ fn carry_over_records(
                 record.name, record.class,
             )));
         }
-        let name = record.name.as_ref();
+        let name = record.name;
         if !name.is_at_or_under(origin) {
             return Err(DnssecError::signing(format!(
                 "{name} is not in {origin}, so this zone has no authority to sign it",
             )));
         }
-        let mut record = record.clone();
+        let mut record = record.to_owned();
         if record.rdata.rtype() == rt::SOA && name == origin {
             let ParsedRecord::SOA {
                 mname,
@@ -699,13 +699,13 @@ fn is_signer_output(rtype: Rtype) -> bool {
 /// keeping those is how a zone comes to publish two generations of signature
 /// over the same RRset.
 fn is_imported_dnskey_rrsig(
-    record: &ZoneRecord,
+    record: ZoneRecordRef<'_>,
     origin: NameRef<'_>,
     policy: &SigningPolicy,
 ) -> bool {
     policy.dnskey_signature == DnskeySignature::Imported
         && record.rdata.rtype() == rt::RRSIG
-        && record.name.as_ref() == origin
+        && record.name == origin
         && matches!(
             record.rdata.parse(),
             Ok(ParsedRecord::RRSIG { type_covered, .. }) if type_covered == rt::DNSKEY
@@ -790,7 +790,7 @@ fn publish_dnskeys(
     let existing: Vec<RecordData> = signed
         .query(origin, Qtype::of(rt::DNSKEY))
         .iter()
-        .map(|r| r.rdata.clone())
+        .map(|r| r.rdata.to_owned())
         .collect();
     // An RRset has one TTL: keys already published set it, since changing it
     // would be changing records the operator put there.
@@ -860,7 +860,7 @@ fn publish_sync_records(
         .query(origin, Qtype::of(rt::CDS))
         .iter()
         .chain(signed.query(origin, Qtype::of(rt::CDNSKEY)).iter())
-        .map(|r| r.rdata.clone())
+        .map(|r| r.rdata.to_owned())
         .collect();
 
     let wanted: Vec<&SigningKey> = keys
@@ -876,7 +876,7 @@ fn publish_sync_records(
     // telling the parent two things, and which one the parent acts on is its
     // choice — so this is a failed run rather than a zone served with both
     // (`CLAUDE.md` §4). The operator resolves it by clearing one side.
-    if existing.iter().any(is_go_insecure) {
+    if existing.iter().any(|rdata| is_go_insecure(rdata.as_ref())) {
         return Err(DnssecError::signing(format!(
             "{origin} carries a CDS or CDNSKEY with algorithm 0, which asks the parent to \
              withdraw the DS (RFC 8078 §4), and {} key(s) are inside a SyncPublish window \
@@ -926,7 +926,7 @@ fn publish_sync_records(
 /// the algorithm in different places — a CDS is DS-shaped (key tag, algorithm,
 /// digest type, digest) and a CDNSKEY is DNSKEY-shaped (flags, protocol,
 /// algorithm, key), so the offset is 2 in one and 3 in the other.
-fn is_go_insecure(rdata: &RecordData) -> bool {
+fn is_go_insecure(rdata: RecordDataRef<'_>) -> bool {
     let at = match rdata.rtype() {
         rt::CDS => 2,
         rt::CDNSKEY => 3,
@@ -999,10 +999,10 @@ impl Layout {
     fn of(zone: &Zone, origin: NameRef<'_>) -> Self {
         let mut names: BTreeMap<CanonicalKey, (Name, NameEntry)> = BTreeMap::new();
         for record in zone.records() {
-            let key = canonical_sort_key(record.name.as_ref());
+            let key = canonical_sort_key(record.name);
             let entry = names
                 .entry(key)
-                .or_insert_with(|| (record.name.as_ref().to_folded(), NameEntry::default()));
+                .or_insert_with(|| (record.name.to_folded(), NameEntry::default()));
             entry.1.types.insert(record.rdata.rtype());
         }
         for (name, entry) in names.values_mut() {
@@ -1210,7 +1210,7 @@ fn nsec3param_rdata(salt: &[u8], iterations: u16) -> RecordData {
 /// One signing run's RRsets: keyed in canonical order (RFC 4034 §6.1), so the
 /// signatures come out in a deterministic order, with the owner carried in the
 /// value because a `Name` has no `Ord`.
-type Rrsets<'a> = BTreeMap<(CanonicalKey, Rtype), (&'a Name, Ttl, Vec<&'a RecordData>)>;
+type Rrsets<'a> = BTreeMap<(CanonicalKey, Rtype), (NameRef<'a>, Ttl, Vec<RecordDataRef<'a>>)>;
 
 /// The RRsets of `signed`, in RFC 4034 §6.1 order.
 ///
@@ -1237,11 +1237,11 @@ fn rrsets_of(signed: &Zone) -> Rrsets<'_> {
     // RDATA for this.
     let mut rrsets: Rrsets<'_> = BTreeMap::new();
     for record in signed.records() {
-        let key = canonical_sort_key(record.name.as_ref());
+        let key = canonical_sort_key(record.name);
         let entry = rrsets
             .entry((key, record.rdata.rtype()))
-            .or_insert_with(|| (&record.name, record.ttl, Vec::new()));
-        entry.2.push(&record.rdata);
+            .or_insert_with(|| (record.name, record.ttl, Vec::new()));
+        entry.2.push(record.rdata);
     }
     rrsets
 }
@@ -1265,12 +1265,7 @@ fn signatures_for(
         // deriving it again and cloning the entry to read two bools: two
         // allocations per RRset, four million on a million-record zone
         // (`TODO.md` #64e).
-        if !signable(
-            layout.at(&key),
-            name.as_ref(),
-            rtype,
-            layout.origin.as_ref(),
-        ) {
+        if !signable(layout.at(&key), name, rtype, layout.origin.as_ref()) {
             continue;
         }
         let signers = if rtype == rt::DNSKEY {
@@ -1300,14 +1295,14 @@ fn signatures_for(
         if let Some(previous) = previous {
             let tags: Vec<u16> = signers.iter().map(|k| k.key_tag()).collect();
             if let Some(carried) =
-                previous.reuse(name.as_ref(), rtype, ttl, &rdatas, &tags, policy.signed_at)
+                previous.reuse(name, rtype, ttl, &rdatas, &tags, policy.signed_at)
             {
                 for signature in carried {
                     signatures.push(ZoneRecord {
-                        name: name.clone(),
+                        name: name.to_owned(),
                         ttl,
                         class: Class::new(1),
-                        rdata: signature.rdata.clone(),
+                        rdata: signature.rdata.to_owned(),
                     });
                 }
                 continue;
@@ -1315,10 +1310,10 @@ fn signatures_for(
         }
 
         let original_ttl = ttl.as_secs();
-        let rrset = Rrset::new(name.as_ref(), rtype, Class::new(1), &rdatas);
+        let rrset = Rrset::new(name, rtype, Class::new(1), &rdatas);
         // Spread back from the window's end so the zone degrades over a slope
         // rather than one cliff — see `SigningPolicy::expiry_for`.
-        let expiration = policy.expiry_for(name.as_ref(), rtype);
+        let expiration = policy.expiry_for(name, rtype);
         for key in signers.iter() {
             let sig = key
                 .sign_rrset(&rrset, original_ttl, policy.inception, expiration)
@@ -1326,7 +1321,7 @@ fn signatures_for(
                     DnssecError::key(format!("signing the {rtype} RRset at {name}: {e}"))
                 })?;
             signatures.push(ZoneRecord {
-                name: name.clone(),
+                name: name.to_owned(),
                 ttl,
                 class: Class::new(1),
                 rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
@@ -2365,10 +2360,10 @@ a\.b    IN A   192.0.2.50
         zone.records()
             .iter()
             .map(|r| ResourceRecord {
-                name: r.name.clone(),
+                name: r.name.to_owned(),
                 class: r.class,
                 ttl: r.ttl,
-                rdata: r.rdata.clone(),
+                rdata: r.rdata.to_owned(),
             })
             .collect()
     }
@@ -2388,7 +2383,7 @@ a\.b    IN A   192.0.2.50
         for record in zone.records() {
             out.entry((record.name.to_string(), record.rdata.rtype()))
                 .or_default()
-                .push(record.rdata.clone());
+                .push(record.rdata.to_owned());
         }
         out
     }
@@ -2397,7 +2392,7 @@ a\.b    IN A   192.0.2.50
         let rdatas: Vec<RecordData> = zone
             .query(nm(name).as_ref(), Qtype::of(rtype))
             .iter()
-            .map(|r| r.rdata.clone())
+            .map(|r| r.rdata.to_owned())
             .collect();
         assert!(!rdatas.is_empty(), "no records of type {rtype} at {name}");
         let sigs: Vec<_> = rrsigs_in(&resources(zone))
@@ -2768,7 +2763,7 @@ a\.b    IN A   192.0.2.50
         let rdatas: Vec<RecordData> = zone
             .query(nm("*.example.com.").as_ref(), Qtype::of(rt::A))
             .iter()
-            .map(|r| r.rdata.clone())
+            .map(|r| r.rdata.to_owned())
             .collect();
         let sigs: Vec<_> = rrsigs_in(&resources(&zone))
             .into_iter()
@@ -3088,7 +3083,7 @@ a\.b    IN A   192.0.2.50
                             Ok(ParsedRecord::RRSIG { type_covered, .. }) if type_covered == covered
                         )
                 })
-                .map(|r| r.rdata.clone())
+                .map(|r| r.rdata.to_owned())
                 .collect()
         };
 
@@ -3119,7 +3114,7 @@ a\.b    IN A   192.0.2.50
                 ttl: Ttl::from_secs(60),
                 rdata: zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))[0]
                     .rdata
-                    .clone(),
+                    .to_owned(),
             })],
         );
         let signed = sign_zone_incrementally(&before, &retimed.zone, &keys, &later).unwrap();
@@ -3629,11 +3624,11 @@ a\.b    IN A   192.0.2.50
         drop(full);
 
         let rrsig = crate::record_types::RRSIG;
-        let was: std::collections::HashSet<(&Name, &[u8])> = previous
+        let was: std::collections::HashSet<(NameRef<'_>, &[u8])> = previous
             .records()
             .iter()
             .filter(|r| r.rdata.rtype() == rrsig)
-            .map(|r| (&r.name, r.rdata.bytes()))
+            .map(|r| (r.name, r.rdata.bytes()))
             .collect();
 
         println!(
@@ -3650,7 +3645,7 @@ a\.b    IN A   192.0.2.50
             for changed in [1usize, 1_000, 10_000, 100_000] {
                 let mut edited = Zone::new(source.origin().to_folded());
                 for (i, record) in source.records().iter().enumerate() {
-                    let mut record = record.clone();
+                    let mut record = record.to_owned();
                     if !adding && i >= source.records().len() - changed {
                         record.rdata = RecordData::from_parsed(&ParsedRecord::A(
                             std::net::Ipv4Addr::new(198, 51, 100, 2),
@@ -3682,7 +3677,7 @@ a\.b    IN A   192.0.2.50
                     .records()
                     .iter()
                     .filter(|r| r.rdata.rtype() == rrsig)
-                    .filter(|r| !was.contains(&(&r.name, r.rdata.bytes())))
+                    .filter(|r| !was.contains(&(r.name, r.rdata.bytes())))
                     .count();
                 println!(
                     "{:>6} {changed:>9}  {:>10.1}ms {:>8.1}ms {:>7.1}% {:>11}",

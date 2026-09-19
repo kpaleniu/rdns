@@ -309,7 +309,7 @@ impl DnsMessage {
                     rr.name.as_ref(),
                     rr.class,
                     rr.ttl,
-                    &rr.rdata,
+                    rr.rdata.as_ref(),
                 )?;
             }
         }

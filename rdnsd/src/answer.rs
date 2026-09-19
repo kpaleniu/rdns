@@ -18,7 +18,7 @@ use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::name::{dname_redirect, Redirect};
 use rdns::record_types;
 use rdns::response::{ResponseWriter, Section};
-use rdns::zone::{Located, NameKind, Zone, ZoneRecord};
+use rdns::zone::{Located, NameKind, Zone, ZoneRecordRef};
 use rdns::Class;
 use rdns::Qtype;
 use rdns::Ttl;
@@ -189,7 +189,7 @@ fn answer_question(
                         zone.origin(),
                         soa.class,
                         soa.ttl,
-                        &soa.rdata,
+                        soa.rdata,
                     )?;
                 }
             }
@@ -380,8 +380,7 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome
             // with both on one path — an NS below a DNAME owner is a record at
             // a subdomain of it (RFC 6672 §2.4) — so this decides only for a
             // zone that arrived by transfer or was built by UPDATE (§5.2).
-            let occluded =
-                redirect.is_some_and(|dname| cut.as_ref().is_at_or_under(dname.name.as_ref()));
+            let occluded = redirect.is_some_and(|dname| cut.as_ref().is_at_or_under(dname.name));
             // The DS *at* the cut is the parent's own statement about the
             // child, which the child does not hold and could not be asked
             // (RFC 4035 §3.1.4.1).
@@ -467,7 +466,7 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome
 /// RCODE to answer with, and the chain still carries the DNAME, which is what
 /// RFC 6672 §2.2 sends "as proof for the YXDOMAIN (value 6) RCODE".
 fn redirect_through(
-    dname: &ZoneRecord,
+    dname: ZoneRecordRef<'_>,
     from: Name,
     chain: &mut Vec<Hop>,
 ) -> Result<Name, ResponseCode> {
@@ -479,7 +478,7 @@ fn redirect_through(
         // `RecordData::parse` is what built it.
         return Err(ResponseCode::ServerFailure);
     };
-    let to = match dname_redirect(from.as_ref(), dname.name.as_ref(), target.as_ref()) {
+    let to = match dname_redirect(from.as_ref(), dname.name, target.as_ref()) {
         Redirect::To(next) => Some(next),
         Redirect::TooLong => None,
         // `Zone::dname_above` found this DNAME strictly above the name, so the
@@ -489,7 +488,7 @@ fn redirect_through(
         Redirect::NoMatch => return Err(ResponseCode::ServerFailure),
     };
     chain.push(Hop::Dname {
-        owner: dname.name.clone(),
+        owner: dname.name.to_owned(),
         from,
         to: to.clone(),
         ttl: dname.ttl,
@@ -534,7 +533,7 @@ fn add_answer(
             name,
             record.class,
             record.ttl,
-            &record.rdata,
+            record.rdata,
         )?;
     }
 
@@ -589,7 +588,7 @@ fn add_chain(
         } = hop
         {
             let rdata = RecordData::from_parsed(&ParsedRecord::CNAME(to.clone()))?;
-            w.push(Section::Answer, from.as_ref(), *class, *ttl, &rdata)?;
+            w.push(Section::Answer, from.as_ref(), *class, *ttl, rdata.as_ref())?;
         }
     }
     Ok(owed)
@@ -638,7 +637,7 @@ fn add_negative(
             zone.origin(),
             soa.class,
             negative_ttl(soa),
-            &soa.rdata,
+            soa.rdata,
         )?;
     }
 
@@ -663,7 +662,7 @@ fn add_negative(
 /// the NSEC/NSEC3 TTL at MINIMUM (`zone_signer::sign_zone`), so the SOA and the
 /// proof beside it in the same section disagreed about how long the "no" was
 /// good for.
-fn negative_ttl(soa: &rdns::zone::ZoneRecord) -> Ttl {
+fn negative_ttl(soa: ZoneRecordRef<'_>) -> Ttl {
     match soa.rdata.soa_minimum() {
         Some(minimum) => soa.ttl.min(Ttl::from_secs(minimum)),
         // An apex SOA that will not parse is a zone that should not have loaded.
@@ -693,7 +692,7 @@ fn refer_to_child(
         if let Ok(rdns::ParsedRecord::NS(target)) = ns.rdata.parse() {
             targets.push(target);
         }
-        w.push(Section::Authority, cut, ns.class, ns.ttl, &ns.rdata)?;
+        w.push(Section::Authority, cut, ns.class, ns.ttl, ns.rdata)?;
     }
 
     // Written here rather than after the glue: both are the same section
@@ -719,7 +718,7 @@ fn refer_to_child(
                     target.as_ref(),
                     glue.class,
                     glue.ttl,
-                    &glue.rdata,
+                    glue.rdata,
                 )?;
             }
         }

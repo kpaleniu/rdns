@@ -1,8 +1,16 @@
-//! [`RecordData`] and nothing else.
+//! [`RecordData`], its borrowed form, and the arena that stores one.
 //!
 //! A field is sealed only against the module declaring it — private in the crate
 //! root means visible to the whole library — so a type whose fields must be
 //! sealed against its own crate needs a file of its own.
+//!
+//! [`RdataArena`] is here for that reason and no other. It hands out
+//! [`RecordDataRef`]s over octets it holds, which means minting one without
+//! going through a checking constructor; doing that from another module would
+//! need a `pub(crate)` constructor, and a `pub(crate)` hole is open to every
+//! module in the library rather than to the one that needs it. What seals the
+//! arena instead is its own door: the only way in is a [`RecordDataRef`], so
+//! what comes out was checked on the way in (`CLAUDE.md` §17).
 
 use crate::dname::{skip_uncompressed_name, DNameUnpacker};
 use crate::error::WireError;
@@ -31,7 +39,30 @@ pub struct RecordData {
     rdata: Box<[u8]>,
 }
 
+/// A borrowed [`RecordData`]: a TYPE and octets that decode as it.
+///
+/// The same invariant as the owned form and the same way in — nothing here
+/// constructs one from parts, so every `RecordDataRef` came from a
+/// `RecordData` or from an [`RdataArena`] that was handed one.
+///
+/// Every read-only accessor lives here and [`RecordData`] delegates to it, so
+/// the offset arithmetic that reads an SOA's SERIAL or an RRSIG's TYPE COVERED
+/// exists once (`CLAUDE.md` §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordDataRef<'a> {
+    rtype: Rtype,
+    rdata: &'a [u8],
+}
+
 impl RecordData {
+    /// Borrow the type and the octets.
+    pub fn as_ref(&self) -> RecordDataRef<'_> {
+        RecordDataRef {
+            rtype: self.rtype,
+            rdata: &self.rdata,
+        }
+    }
+
     pub fn rtype(&self) -> Rtype {
         self.rtype
     }
@@ -94,8 +125,70 @@ impl RecordData {
     /// Records only cached and re-served never need this. Stored names are
     /// uncompressed, so the unpacker over the rdata itself suffices.
     pub fn parse(&self) -> Result<ParsedRecord, WireError> {
-        let unpacker = DNameUnpacker::new(&self.rdata);
-        ParsedRecord::decode(self.rtype, &self.rdata, &unpacker)
+        self.as_ref().parse()
+    }
+
+    /// The SOA's SERIAL (RFC 1035 §3.3.13), or `None` if this is not an SOA.
+    pub fn soa_serial(&self) -> Option<Serial> {
+        self.as_ref().soa_serial()
+    }
+
+    /// The SOA's MINIMUM: the ceiling on how long a negative answer about this
+    /// zone may be cached (RFC 2308 §3).
+    pub fn soa_minimum(&self) -> Option<u32> {
+        self.as_ref().soa_minimum()
+    }
+
+    /// The RRSIG's TYPE COVERED, the first two octets of its RDATA
+    /// (RFC 4034 §3.1.1), or `None` if this is not an RRSIG.
+    ///
+    /// Every signature lookup on the answer path filters a name's RRSIGs by
+    /// this field alone, and [`RecordData::parse`] answers it by decoding the
+    /// signer's name and copying the signature out. A signed negative answer
+    /// paid that once per RRSIG at the apex — five of them for the zone the
+    /// tests use, and the field is at a fixed offset.
+    pub fn rrsig_type_covered(&self) -> Option<Rtype> {
+        self.as_ref().rrsig_type_covered()
+    }
+
+    /// The NSEC3's iteration count and salt (RFC 5155 §3.2), or `None` if this
+    /// is not an NSEC3.
+    ///
+    /// Both fields sit at a fixed offset ahead of the two variable-length ones,
+    /// so reading them is arithmetic. Every negative answer over an NSEC3 zone
+    /// asks the chain what it was built with, and [`RecordData::parse`] answers
+    /// by copying out the salt, the next hashed owner and the type bitmap.
+    pub fn nsec3_parameters(&self) -> Option<(u16, &[u8])> {
+        self.as_ref().nsec3_parameters()
+    }
+}
+
+impl<'a> RecordDataRef<'a> {
+    pub fn rtype(&self) -> Rtype {
+        self.rtype
+    }
+
+    /// The octets: uncompressed wire-format RDATA, borrowed for as long as
+    /// whatever holds them.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.rdata
+    }
+
+    /// A copy that owns its octets.
+    pub fn to_owned(&self) -> RecordData {
+        RecordData {
+            rtype: self.rtype,
+            rdata: self.rdata.to_vec().into_boxed_slice(),
+        }
+    }
+
+    /// Parse the octets into a typed [`ParsedRecord`] on demand.
+    ///
+    /// Records only cached and re-served never need this. Stored names are
+    /// uncompressed, so the unpacker over the rdata itself suffices.
+    pub fn parse(&self) -> Result<ParsedRecord, WireError> {
+        let unpacker = DNameUnpacker::new(self.rdata);
+        ParsedRecord::decode(self.rtype, self.rdata, &unpacker)
     }
 
     /// The SOA's SERIAL (RFC 1035 §3.3.13), or `None` if this is not an SOA.
@@ -113,12 +206,6 @@ impl RecordData {
 
     /// The RRSIG's TYPE COVERED, the first two octets of its RDATA
     /// (RFC 4034 §3.1.1), or `None` if this is not an RRSIG.
-    ///
-    /// Every signature lookup on the answer path filters a name's RRSIGs by
-    /// this field alone, and [`RecordData::parse`] answers it by decoding the
-    /// signer's name and copying the signature out. A signed negative answer
-    /// paid that once per RRSIG at the apex — five of them for the zone the
-    /// tests use, and the field is at a fixed offset.
     pub fn rrsig_type_covered(&self) -> Option<Rtype> {
         if self.rtype != crate::record_types::RRSIG {
             return None;
@@ -129,12 +216,7 @@ impl RecordData {
 
     /// The NSEC3's iteration count and salt (RFC 5155 §3.2), or `None` if this
     /// is not an NSEC3.
-    ///
-    /// Both fields sit at a fixed offset ahead of the two variable-length ones,
-    /// so reading them is arithmetic. Every negative answer over an NSEC3 zone
-    /// asks the chain what it was built with, and [`RecordData::parse`] answers
-    /// by copying out the salt, the next hashed owner and the type bitmap.
-    pub fn nsec3_parameters(&self) -> Option<(u16, &[u8])> {
+    pub fn nsec3_parameters(&self) -> Option<(u16, &'a [u8])> {
         if self.rtype != crate::record_types::NSEC3 {
             return None;
         }
@@ -145,17 +227,142 @@ impl RecordData {
 
     /// The five 32-bit fields an SOA carries after MNAME and RNAME.
     ///
-    /// [`RecordData::parse`] answers the same questions and allocates a `String`
-    /// for each of the two names on the way, both discarded by every caller that
-    /// wanted a number. Every negative answer reads MINIMUM, which is the shape
-    /// a random-subdomain flood generates.
-    fn soa_scalars(&self) -> Option<&[u8; 20]> {
+    /// [`RecordDataRef::parse`] answers the same questions and allocates a
+    /// `String` for each of the two names on the way, both discarded by every
+    /// caller that wanted a number. Every negative answer reads MINIMUM, which
+    /// is the shape a random-subdomain flood generates.
+    fn soa_scalars(&self) -> Option<&'a [u8; 20]> {
         if self.rtype != crate::record_types::SOA {
             return None;
         }
-        let after_mname = skip_uncompressed_name(&self.rdata)?;
+        let after_mname = skip_uncompressed_name(self.rdata)?;
         let after_rname = skip_uncompressed_name(after_mname)?;
         after_rname.get(..20)?.try_into().ok()
+    }
+}
+
+impl PartialEq<RecordData> for RecordDataRef<'_> {
+    fn eq(&self, other: &RecordData) -> bool {
+        self.rtype == other.rtype && self.rdata == &*other.rdata
+    }
+}
+
+impl PartialEq<RecordDataRef<'_>> for RecordData {
+    fn eq(&self, other: &RecordDataRef<'_>) -> bool {
+        other == self
+    }
+}
+
+/// What an RRset's elements have in common: each can name its own RDATA.
+///
+/// The bound the DNSSEC code carries, and it used to be `Borrow<RecordData>` —
+/// which cannot reach a [`RecordDataRef`], since there is no `RecordData` for it
+/// to hand back a reference to. This is the same requirement stated as what the
+/// callers actually do with it: a zone's records are spans into an arena
+/// (`TODO.md` #71e) and an answer's are owned, and canonical form is built from
+/// the TYPE and the octets either way.
+pub trait AsRdata {
+    fn rdata(&self) -> RecordDataRef<'_>;
+}
+
+impl AsRdata for RecordData {
+    fn rdata(&self) -> RecordDataRef<'_> {
+        self.as_ref()
+    }
+}
+
+impl AsRdata for RecordDataRef<'_> {
+    fn rdata(&self) -> RecordDataRef<'_> {
+        *self
+    }
+}
+
+/// Where one record's RDATA sits in an [`RdataArena`], and what TYPE it is.
+///
+/// The TYPE travels with the span rather than beside it, because the two
+/// together are the invariant: octets that decode as *that* type. Two fields a
+/// caller could pair up wrongly is the shape `CLAUDE.md` §17 opens with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RdataSpan {
+    off: u32,
+    len: u16,
+    rtype: Rtype,
+}
+
+impl RdataSpan {
+    /// The TYPE, without needing the arena — the one question a caller can ask
+    /// of a stored record without touching its octets, and the one a zone's
+    /// index asks per record.
+    pub fn rtype(&self) -> Rtype {
+        self.rtype
+    }
+}
+
+/// Every record's RDATA in one allocation.
+///
+/// The store behind a zone (`TODO.md` #71e). A `Box<[u8]>` per record is a heap
+/// allocation to make, one to copy and one to free per record; an arena is one
+/// of each per zone, and a record shrinks to a span. Measured at a million
+/// records: cloning them was 78 ms and 2 000 001 allocations, and the same
+/// octets in an arena are 3.8 ms and two.
+///
+/// **Append-only, and spans belong to the arena that minted them.** Nothing
+/// here removes or rewrites octets: a span handed back after a removal would
+/// otherwise name something else. Reclaiming the octets of a record that has
+/// gone means rebuilding the arena, which is the owner's business —
+/// `rdns::zone::Zone` does it on a counter.
+#[derive(Debug, Clone, Default)]
+pub struct RdataArena {
+    bytes: Vec<u8>,
+}
+
+impl RdataArena {
+    pub fn new() -> RdataArena {
+        RdataArena::default()
+    }
+
+    /// Copy `data`'s octets in and give back where they went.
+    ///
+    /// The only way to make an [`RdataSpan`], which is what lets [`get`] be
+    /// infallible and unchecked: what comes out was a [`RecordDataRef`] on the
+    /// way in.
+    ///
+    /// [`get`]: RdataArena::get
+    pub fn push(&mut self, data: RecordDataRef<'_>) -> RdataSpan {
+        let off = self.bytes.len();
+        self.bytes.extend_from_slice(data.rdata);
+        RdataSpan {
+            // RDLENGTH is 16 bits, so `len` cannot overflow; `off` is checked
+            // because an arena past 4 GiB is reachable on a zone big enough to
+            // exhaust the machine and a silent truncation there is §2's "`as`
+            // is a bug until proven otherwise" with a wrong answer at the end
+            // of it.
+            off: u32::try_from(off).expect("an RDATA arena under 4 GiB"),
+            len: data.rdata.len() as u16,
+            rtype: data.rtype,
+        }
+    }
+
+    /// The RDATA at `at`.
+    pub fn get(&self, at: RdataSpan) -> RecordDataRef<'_> {
+        let off = at.off as usize;
+        RecordDataRef {
+            rtype: at.rtype,
+            rdata: &self.bytes[off..off + at.len as usize],
+        }
+    }
+
+    /// Octets held, for a caller sizing a rebuild.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn reserve(&mut self, octets: usize) {
+        self.bytes.reserve(octets);
     }
 }
 

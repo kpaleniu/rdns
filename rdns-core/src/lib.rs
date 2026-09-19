@@ -32,10 +32,10 @@ pub mod validation;
 pub mod zone_scope;
 
 /// [`RecordData`] lives in its own module so its fields are private to it.
-pub use record_data::RecordData;
+pub use record_data::{AsRdata, RdataArena, RdataSpan, RecordData, RecordDataRef};
 
 /// A domain name is the wire's, not presentation text — see [`name`].
-pub use name::{Name, NameRef};
+pub use name::{Name, NameArena, NameRef, NameSpan};
 
 mod codes;
 mod edns;

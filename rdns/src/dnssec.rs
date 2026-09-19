@@ -11,15 +11,13 @@
 //! original TTL rather than the received one, embedded names down-cased for the
 //! RFC 4034 §6.2 types, RRs sorted by canonical RDATA, duplicates dropped.
 
-use std::borrow::Borrow;
-
 use crate::ede::InfoCode;
 use crate::error::WireError;
 use crate::error::{DnssecError, DnssecResult};
 use crate::record_types as rt;
 use crate::Class;
 use crate::Rtype;
-use crate::{Name, NameRef, ParsedRecord, RecordData, ResourceRecord};
+use crate::{AsRdata, Name, NameRef, ParsedRecord, RecordData, RecordDataRef, ResourceRecord};
 use ring::signature;
 
 /// DNSKEY flags bit 7 (0x0100): a zone key, which may sign RRsets in its own
@@ -321,7 +319,7 @@ pub fn rrsig_labels_of(owner: NameRef<'_>) -> u8 {
 /// received. Of the listed types we parse NS, CNAME, SOA, PTR, MX, RRSIG and
 /// NSEC; the rest are obsolete or unparsed and pass through unchanged — a
 /// signature failure rather than a false accept, should one arrive mixed-case.
-fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
+fn canonical_rdata(record: RecordDataRef<'_>) -> DnssecResult<Vec<u8>> {
     let lowered = match record.rtype() {
         rt::NS | rt::CNAME | rt::PTR | rt::SOA | rt::MX | rt::RRSIG | rt::NSEC => {
             match record.parse()? {
@@ -404,7 +402,7 @@ fn canonical_rdata(record: &RecordData) -> DnssecResult<Vec<u8>> {
 /// RRSIG's *original* TTL, not the received one; the owner is down-cased and,
 /// for a wildcard-expanded answer, replaced by the wildcard really signed; and
 /// the records are sorted by canonical RDATA with duplicates removed.
-pub fn signed_data<R: Borrow<RecordData>>(
+pub fn signed_data<R: AsRdata>(
     rrsig: &Rrsig,
     owner: NameRef<'_>,
     class: Class,
@@ -438,7 +436,7 @@ pub fn signed_data<R: Borrow<RecordData>>(
     // RDATA, so sorting encoded RRs orders by length first.
     let mut canonical: Vec<Vec<u8>> = rdatas
         .iter()
-        .map(|rdata| canonical_rdata(rdata.borrow()))
+        .map(|rdata| canonical_rdata(rdata.rdata()))
         .collect::<Result<_, _>>()?;
     canonical.sort_unstable();
     canonical.dedup();
@@ -689,9 +687,9 @@ impl std::fmt::Display for Bogus {
 /// is the granularity everything in DNSSEC works at — including the attacks,
 /// which are mostly about adding a record to a set or removing one from it.
 /// `R` is what holds one record's RDATA: `RecordData` for a caller that owns
-/// the set, `&RecordData` for one that has it inside something else. The zone
-/// signer is the second — grouping a million-record zone into RRsets cost a
-/// clone per record, which was 944 ms of an 8 s incremental sign (`TODO.md`
+/// the set, [`RecordDataRef`] for one reading it out of a zone's arena. The
+/// zone signer is the second — grouping a million-record zone into RRsets cost
+/// a clone per record, which was 944 ms of an 8 s incremental sign (`TODO.md`
 /// #64g) — and a default type parameter is what keeps that off the 40 call
 /// sites that do own their RDATA.
 #[derive(Debug)]
@@ -733,7 +731,7 @@ impl<'a, R> Rrset<'a, R> {
 /// must be the zone we think we are talking to (or any name could sign for any
 /// other), the key must be a zone key at that name, the signature must be
 /// current, and the label count must not claim more labels than the name has.
-pub fn verify_rrset<R: Borrow<RecordData>>(
+pub fn verify_rrset<R: AsRdata>(
     rrset: &Rrset<'_, R>,
     rrsigs: &[Rrsig],
     keys: &[Dnskey],
@@ -982,7 +980,7 @@ mod tests {
     #[test]
     fn test_canonical_rdata_downcases_only_the_listed_types() {
         let ns = RecordData::from_parsed(&ParsedRecord::NS(nm("NS1.Example.COM."))).unwrap();
-        let lowered = canonical_rdata(&ns).unwrap();
+        let lowered = canonical_rdata(ns.as_ref()).unwrap();
         let want = RecordData::from_parsed(&ParsedRecord::NS(nm("ns1.example.com."))).unwrap();
         assert_eq!(
             lowered,
@@ -993,7 +991,10 @@ mod tests {
         // TXT is not on the list, so its bytes pass through untouched — length
         // prefix (RFC 1035 §3.3.14) and case both.
         let txt = RecordData::from_parsed(&ParsedRecord::TXT(vec!["MiXeD".into()])).unwrap();
-        assert_eq!(canonical_rdata(&txt).unwrap(), b"\x05MiXeD".to_vec());
+        assert_eq!(
+            canonical_rdata(txt.as_ref()).unwrap(),
+            b"\x05MiXeD".to_vec()
+        );
     }
 
     /// A signed TXT RRset, including one with several `<character-string>`s.

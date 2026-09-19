@@ -149,7 +149,7 @@ fn what_a_copy_is_made_of() {
 
     // The records alone, without the index: the vector is `Copy`-shaped apart
     // from the two `Box`es per record, so this is 71e's whole question.
-    let records: Vec<ZoneRecord> = zone.records().to_vec();
+    let records: Vec<ZoneRecord> = zone.records().iter().map(|r| r.to_owned()).collect();
     for _ in 0..3 {
         let a0 = allocs();
         let started = Instant::now();

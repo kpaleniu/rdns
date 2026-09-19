@@ -153,7 +153,7 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
                 name: nm(name),
                 class: record.class,
                 ttl: record.ttl,
-                rdata: record.rdata.clone(),
+                rdata: record.rdata.to_owned(),
             });
         }
     }
@@ -179,7 +179,7 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
                 name: nm(name),
                 class: record.class,
                 ttl: record.ttl,
-                rdata: record.rdata.clone(),
+                rdata: record.rdata.to_owned(),
             });
         }
     }
@@ -195,7 +195,7 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
             name: nm(&nm("example.com.").to_string()),
             class: soa.class,
             ttl: soa.ttl,
-            rdata: soa.rdata.clone(),
+            rdata: soa.rdata.to_owned(),
         });
     }
     out.push((

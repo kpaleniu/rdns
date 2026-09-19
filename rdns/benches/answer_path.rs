@@ -67,7 +67,7 @@ fn owned(zone: &Zone, name: &str, qtype: Qtype) -> Vec<ResourceRecord> {
             name: name.clone(),
             class: r.class,
             ttl: r.ttl,
-            rdata: r.rdata.clone(),
+            rdata: r.rdata.to_owned(),
         })
         .collect()
 }

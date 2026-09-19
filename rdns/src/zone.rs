@@ -32,7 +32,10 @@ use crate::Class;
 use crate::Rtype;
 use crate::Serial;
 use crate::Ttl;
-use crate::{Name, NameRef, Qtype, RecordData, ResourceRecord};
+use crate::{
+    Name, NameArena, NameRef, NameSpan, Qtype, RdataArena, RdataSpan, RecordData, RecordDataRef,
+    ResourceRecord,
+};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
@@ -365,13 +368,156 @@ enum Slot {
     Spilled(usize),
 }
 
-/// A single DNS resource record stored in a zone
+/// A single DNS resource record, owned — what a caller builds to hand
+/// [`Zone::add_record`], and what `Zone::remove_record` gives back.
+///
+/// Not what a zone stores. A zone keeps every owner name in one arena and every
+/// RDATA in another, and hands out [`ZoneRecordRef`], which borrows both:
+/// a `Box` per field was two heap allocations per record to build, two to copy
+/// and two to free, which at a million records was 78 ms and 2 000 001
+/// allocations to copy a zone against 3.8 ms and two (`TODO.md` #71e).
 #[derive(Debug, Clone)]
 pub struct ZoneRecord {
     pub name: Name,
     pub ttl: Ttl,
     pub class: Class,
     pub rdata: RecordData,
+}
+
+/// One record of a zone, borrowed from its arenas.
+///
+/// The same four fields as [`ZoneRecord`] in the borrowed forms, so a reader
+/// writes `record.name` and `record.rdata` as it always did. `Copy`, because it
+/// is two slices and two scalars.
+///
+/// Equality is the four fields, the owner name case-insensitively (RFC 4343) as
+/// [`NameRef`]'s own is. Not pointer identity: a record is a pair of spans, so
+/// there is no `&ZoneRecord` to compare addresses of, and two records that
+/// agree on all four fields are the same record for every purpose a reader has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoneRecordRef<'a> {
+    pub name: NameRef<'a>,
+    pub ttl: Ttl,
+    pub class: Class,
+    pub rdata: RecordDataRef<'a>,
+}
+
+impl ZoneRecord {
+    /// Borrow the name and the octets, for a caller that has an owned record
+    /// and wants to ask a zone's questions of it.
+    pub fn as_ref(&self) -> ZoneRecordRef<'_> {
+        ZoneRecordRef {
+            name: self.name.as_ref(),
+            ttl: self.ttl,
+            class: self.class,
+            rdata: self.rdata.as_ref(),
+        }
+    }
+}
+
+impl ZoneRecordRef<'_> {
+    /// A copy that owns its name and its octets.
+    pub fn to_owned(&self) -> ZoneRecord {
+        ZoneRecord {
+            name: self.name.to_owned(),
+            ttl: self.ttl,
+            class: self.class,
+            rdata: self.rdata.to_owned(),
+        }
+    }
+}
+
+/// What a zone keeps per record: two spans and two scalars, 24 bytes against
+/// the 48 an owned [`ZoneRecord`] takes, and nothing on the heap of its own.
+#[derive(Debug, Clone, Copy)]
+struct Stored {
+    name: NameSpan,
+    ttl: Ttl,
+    class: Class,
+    rdata: RdataSpan,
+}
+
+/// A zone's records, in the order it holds them.
+///
+/// A view rather than a slice, because the records are spans into two arenas
+/// and a `&[ZoneRecord]` would mean materializing them. It answers what a slice
+/// answered — [`len`], [`is_empty`], [`iter`], and `for record in ..` — so a
+/// reader that only counted or walked reads the same.
+///
+/// [`len`]: Records::len
+/// [`is_empty`]: Records::is_empty
+/// [`iter`]: Records::iter
+#[derive(Debug, Clone, Copy)]
+pub struct Records<'a> {
+    zone: &'a Zone,
+}
+
+impl<'a> Records<'a> {
+    pub fn len(&self) -> usize {
+        self.zone.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.zone.records.is_empty()
+    }
+
+    /// The record at `at`, or `None` past the end.
+    pub fn get(&self, at: usize) -> Option<ZoneRecordRef<'a>> {
+        (at < self.len()).then(|| self.zone.record(at))
+    }
+
+    pub fn iter(&self) -> RecordIter<'a> {
+        RecordIter {
+            zone: self.zone,
+            at: 0,
+            end: self.len(),
+        }
+    }
+}
+
+impl<'a> IntoIterator for Records<'a> {
+    type Item = ZoneRecordRef<'a>;
+    type IntoIter = RecordIter<'a>;
+
+    fn into_iter(self) -> RecordIter<'a> {
+        self.iter()
+    }
+}
+
+/// [`Records::iter`]'s iterator: a position and the zone behind it.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordIter<'a> {
+    zone: &'a Zone,
+    at: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for RecordIter<'a> {
+    type Item = ZoneRecordRef<'a>;
+
+    fn next(&mut self) -> Option<ZoneRecordRef<'a>> {
+        (self.at < self.end).then(|| {
+            let record = self.zone.record(self.at);
+            self.at += 1;
+            record
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.end - self.at;
+        (left, Some(left))
+    }
+}
+
+impl ExactSizeIterator for RecordIter<'_> {}
+
+impl DoubleEndedIterator for RecordIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        (self.at < self.end).then(|| {
+            self.end -= 1;
+            self.zone.record(self.end)
+        })
+    }
 }
 
 /// In-memory DNS zone storage.
@@ -387,7 +533,13 @@ pub struct ZoneRecord {
 #[derive(Debug, Clone)]
 pub struct Zone {
     origin: Name,
-    records: Vec<ZoneRecord>,
+    records: Vec<Stored>,
+    /// Every owner name's octets, and every RDATA's, one allocation each.
+    ///
+    /// Append-only: a span names octets that do not move, so a removal leaves
+    /// what it held behind and `removed_since_rebuild` is what reclaims it.
+    names: NameArena,
+    rdata: RdataArena,
     /// Positions in `records`, by the folded wire form of the owner name.
     ///
     /// A name that exists only because something below it does — an empty
@@ -507,12 +659,12 @@ impl<'a> Located<'a> {
 
     /// The records here that `qtype` selects. What ANY means, and why the DNSSEC
     /// meta types are excluded, is [`Qtype::matches`]'s to say.
-    pub fn of_type(&self, qtype: Qtype) -> impl Iterator<Item = &'a ZoneRecord> + '_ {
+    pub fn of_type(&self, qtype: Qtype) -> impl Iterator<Item = ZoneRecordRef<'a>> + '_ {
         let zone = self.zone;
         self.positions
             .iter()
-            .map(move |&i| &zone.records[i])
-            .filter(move |r| qtype.matches(r.rdata.rtype()))
+            .filter(move |&&i| qtype.matches(zone.records[i].rdata.rtype()))
+            .map(move |&i| zone.record(i))
     }
 
     /// Whether anything here is of `qtype`. The question `query(..).is_empty()`
@@ -559,6 +711,8 @@ impl Zone {
         Zone {
             origin,
             records: Vec::new(),
+            names: NameArena::new(),
+            rdata: RdataArena::new(),
             index: NameIndex::default(),
             spills: Vec::new(),
             removed_since_rebuild: 0,
@@ -577,8 +731,23 @@ impl Zone {
     ///
     /// Load order, until something is removed: a removal fills its hole from
     /// the end, and `Zone::remove_record` says why nothing reads one.
-    pub fn records(&self) -> &[ZoneRecord] {
-        &self.records
+    pub fn records(&self) -> Records<'_> {
+        Records { zone: self }
+    }
+
+    /// The record at `at`, which must be one this zone holds.
+    ///
+    /// Panics past the end, as indexing a slice did, and every caller holds a
+    /// position [`Zone::positions_of`] gave it — the same visibility, for the
+    /// same reason. [`Records::get`] is the checked door for anyone else.
+    pub(crate) fn record(&self, at: usize) -> ZoneRecordRef<'_> {
+        let stored = self.records[at];
+        ZoneRecordRef {
+            name: self.names.get(stored.name),
+            ttl: stored.ttl,
+            class: stored.class,
+            rdata: self.rdata.get(stored.rdata),
+        }
     }
 
     /// The records at each owner name, as positions in [`Zone::records`]: the
@@ -615,6 +784,10 @@ impl Zone {
     /// all children of the apex.
     pub(crate) fn reserve(&mut self, records: usize) {
         self.records.reserve(records);
+        // A name is ~25 octets and an RPZ rule's CNAME RDATA one; both arenas
+        // grow past a low guess without moving a span, so these are hints.
+        self.names.reserve(25 * records);
+        self.rdata.reserve(8 * records);
         // A name is ~25 bytes on the wire for an ordinary zone; the arena grows
         // past a low guess without moving a key, so this is a hint not a bound.
         self.index.reserve(2 * records, 25 * records);
@@ -637,6 +810,8 @@ impl Zone {
     /// (#71a), and `xfr::AxfrAccumulator` has no base to be like.
     pub(crate) fn reserve_like(&mut self, base: &Zone, extra: usize) {
         self.records.reserve(base.records.len() + extra);
+        self.names.reserve(base.names.len());
+        self.rdata.reserve(base.rdata.len());
         self.index
             .reserve(base.index.len() + extra, base.index.names.len());
         self.spills.reserve(base.spills.len());
@@ -662,7 +837,7 @@ impl Zone {
             Zone::note_non_terminals(&mut self.index, &key, at, &origin_key);
         }
         drop(origin_key);
-        match self.chain_key(&record) {
+        match self.chain_key(record.as_ref()) {
             Some(ChainKey::Nsec(k)) => {
                 self.nsec_chain.insert(k, position);
             }
@@ -671,7 +846,13 @@ impl Zone {
             }
             None => {}
         }
-        self.records.push(record);
+        let stored = Stored {
+            name: self.names.push(record.name.as_ref()),
+            ttl: record.ttl,
+            class: record.class,
+            rdata: self.rdata.push(record.rdata.as_ref()),
+        };
+        self.records.push(stored);
     }
 
     /// The positions of the records at exactly this folded owner name, empty
@@ -708,8 +889,9 @@ impl Zone {
     /// direction costs a walk that finds nothing; stale in the false direction
     /// would serve a wrong answer, and removal cannot move one that way.
     pub(crate) fn remove_record(&mut self, position: usize) -> ZoneRecord {
-        let key = self.records[position].name.as_ref().folded().into_owned();
-        match self.chain_key(&self.records[position]) {
+        let record = self.record(position).to_owned();
+        let key = self.record(position).name.folded().into_owned();
+        match self.chain_key(self.record(position)) {
             Some(ChainKey::Nsec(k)) => {
                 self.nsec_chain.remove(&k);
             }
@@ -720,11 +902,11 @@ impl Zone {
         }
         let records_left = self.unfile(&key, position);
         let moved_from = self.records.len() - 1;
-        let record = self.records.swap_remove(position);
+        self.records.swap_remove(position);
         if moved_from != position {
-            let moved = self.records[position].name.as_ref().folded().into_owned();
+            let moved = self.record(position).name.folded().into_owned();
             self.refile(&moved, moved_from, position);
-            match self.chain_key(&self.records[position]) {
+            match self.chain_key(self.record(position)) {
                 Some(ChainKey::Nsec(k)) => {
                     self.nsec_chain.insert(k, position);
                 }
@@ -737,14 +919,15 @@ impl Zone {
         if !records_left {
             self.prune(&key);
         }
-        // Neither vector under `index` gives anything back on its own, so a
+        // Nothing under this type gives an octet back on its own — not the
+        // two record arenas, not the index's, not the spill lists — so a
         // long-lived process applying deltas grows whatever its zone does. A
-        // rebuild reclaims both, and it re-shares the arena suffixes an empty
-        // non-terminal borrows — which is why it is `reindex` and not a
-        // compaction written here. See `removed_since_rebuild`.
+        // rebuild reclaims all of them, and it re-shares the index arena's
+        // suffixes an empty non-terminal borrows, which a compaction written
+        // for the purpose would not. See `removed_since_rebuild`.
         self.removed_since_rebuild = self.removed_since_rebuild.saturating_add(1);
         if self.removed_since_rebuild as usize * 2 >= self.records.len() {
-            self.reindex();
+            self.rebuild();
         }
         record
     }
@@ -811,11 +994,11 @@ impl Zone {
 
     /// Any one record from the NSEC3 chain, for reading the salt and iteration
     /// count the chain was built with.
-    pub fn any_nsec3(&self) -> Option<&ZoneRecord> {
+    pub fn any_nsec3(&self) -> Option<ZoneRecordRef<'_>> {
         self.nsec3_chain
             .values()
             .next()
-            .map(|position| &self.records[*position])
+            .map(|position| self.record(*position))
     }
 
     /// The NSEC whose span contains `name` — the record that denies it exists.
@@ -823,24 +1006,24 @@ impl Zone {
     /// Exclusive at the low end: an NSEC *at* `name` proves the opposite. When
     /// nothing sorts before `name` the answer is the last record, because the
     /// chain is a loop back to the apex (RFC 4034 §4.1.1).
-    pub fn nsec_covering(&self, name: NameRef<'_>) -> Option<&ZoneRecord> {
+    pub fn nsec_covering(&self, name: NameRef<'_>) -> Option<ZoneRecordRef<'_>> {
         let key = canonical_sort_key(name);
         let position = self
             .nsec_chain
             .range(..key)
             .next_back()
             .or_else(|| self.nsec_chain.iter().next_back())?;
-        Some(&self.records[*position.1])
+        Some(self.record(*position.1))
     }
 
     /// The NSEC3 whose span contains `hash`. Same rule, in hash order.
-    pub fn nsec3_covering(&self, hash: Nsec3Hash) -> Option<&ZoneRecord> {
+    pub fn nsec3_covering(&self, hash: Nsec3Hash) -> Option<ZoneRecordRef<'_>> {
         let position = self
             .nsec3_chain
             .range(..hash)
             .next_back()
             .or_else(|| self.nsec3_chain.iter().next_back())?;
-        Some(&self.records[*position.1])
+        Some(self.record(*position.1))
     }
 
     /// Where a denial record belongs in the ordered chains, if it is one.
@@ -848,16 +1031,14 @@ impl Zone {
     /// An NSEC is filed under its owner name; an NSEC3 under the hash in its
     /// owner's first label, which is what the chain is ordered by. A label that
     /// will not decode is left out rather than filed under something wrong.
-    fn chain_key(&self, record: &ZoneRecord) -> Option<ChainKey> {
+    fn chain_key(&self, record: ZoneRecordRef<'_>) -> Option<ChainKey> {
         match record.rdata.rtype() {
-            crate::record_types::NSEC => {
-                Some(ChainKey::Nsec(canonical_sort_key(record.name.as_ref())))
-            }
+            crate::record_types::NSEC => Some(ChainKey::Nsec(canonical_sort_key(record.name))),
             crate::record_types::NSEC3 => {
                 // The hash is the first label, and a label is octets — so it is
                 // taken as octets rather than by splitting text on a `.` that
                 // may be inside one.
-                let label = record.name.as_ref().labels().next()?;
+                let label = record.name.labels().next()?;
                 let decoded = base32hex_decode(std::str::from_utf8(label).ok()?).ok()?;
                 Some(ChainKey::Nsec3(Nsec3Hash::from_wire(&decoded)?))
             }
@@ -871,7 +1052,7 @@ impl Zone {
     /// all: an existing name shadows it entirely, types it does not carry
     /// included, and so does an empty non-terminal (RFC 1034 §4.3.3,
     /// RFC 4592 §2.2.1 and §4.4).
-    pub fn query(&self, name: NameRef<'_>, qtype: Qtype) -> Vec<&ZoneRecord> {
+    pub fn query(&self, name: NameRef<'_>, qtype: Qtype) -> Vec<ZoneRecordRef<'_>> {
         self.query_with_kind(name, qtype).1
     }
 
@@ -883,9 +1064,13 @@ impl Zone {
     /// ancestors a second time and folds the name a second time to do it —
     /// twice per negative answer, which is the shape a random-subdomain flood
     /// sends.
-    fn query_with_kind(&self, name: NameRef<'_>, qtype: Qtype) -> (NameKind, Vec<&ZoneRecord>) {
+    fn query_with_kind(
+        &self,
+        name: NameRef<'_>,
+        qtype: Qtype,
+    ) -> (NameKind, Vec<ZoneRecordRef<'_>>) {
         let located = self.locate(name);
-        let records: Vec<&ZoneRecord> = located.of_type(qtype).collect();
+        let records: Vec<ZoneRecordRef<'_>> = located.of_type(qtype).collect();
         (located.kind, records)
     }
 
@@ -914,7 +1099,7 @@ impl Zone {
     ///
     /// `Option` because a `Zone` can be built record by record; one that came
     /// from a file has an SOA or it did not load.
-    fn apex_soa(&self) -> Option<&ZoneRecord> {
+    fn apex_soa(&self) -> Option<ZoneRecordRef<'_>> {
         self.query(self.origin(), Qtype::of(rt::SOA))
             .first()
             .copied()
@@ -941,7 +1126,7 @@ impl Zone {
             name: self.origin.clone(),
             class: soa.class,
             ttl: soa.ttl,
-            rdata: soa.rdata.clone(),
+            rdata: soa.rdata.to_owned(),
         })
     }
 
@@ -960,8 +1145,8 @@ impl Zone {
     /// [`ZoneRecord::name`] raw (`TODO.md` #33f). Callers holding a
     /// [`ResourceRecord`] off the wire and a zone *name* — `xfr`, `journal` —
     /// have no `Zone` to ask and still write it out.
-    pub fn is_apex_soa(&self, record: &ZoneRecord) -> bool {
-        record.rdata.rtype() == rt::SOA && record.name == self.origin
+    pub fn is_apex_soa(&self, record: ZoneRecordRef<'_>) -> bool {
+        record.rdata.rtype() == rt::SOA && record.name == self.origin.as_ref()
     }
 
     /// Whether the zone holds anything at `name` — by that name, because
@@ -1088,7 +1273,7 @@ impl Zone {
     /// Returns the record, not the name: the caller needs its owner to echo,
     /// its target to substitute and its TTL for the synthesized CNAME (§3.1),
     /// and looking any of them up again is the repeat `TODO.md` #25a removed.
-    pub fn dname_above(&self, name: NameRef<'_>) -> Option<&ZoneRecord> {
+    pub fn dname_above(&self, name: NameRef<'_>) -> Option<ZoneRecordRef<'_>> {
         // Before the fold, as `delegation_for` does it: with no DNAME in the
         // zone the folded copy is made for nothing.
         if !self.shortcuts.dnames {
@@ -1099,7 +1284,7 @@ impl Zone {
     }
 
     /// [`Zone::dname_above`] for a name already folded.
-    fn dname_above_key(&self, key: NameRef<'_>) -> Option<&ZoneRecord> {
+    fn dname_above_key(&self, key: NameRef<'_>) -> Option<ZoneRecordRef<'_>> {
         if !self.shortcuts.dnames {
             return None;
         }
@@ -1133,10 +1318,10 @@ impl Zone {
     /// [`Zone::has_type`] is this question with the answer thrown away. DNAME
     /// is a singleton type (RFC 6672 §2.4), so for that one "the first" is
     /// "the one".
-    fn first_of_type(&self, key: NameRef<'_>, rtype: Rtype) -> Option<&ZoneRecord> {
+    fn first_of_type(&self, key: NameRef<'_>, rtype: Rtype) -> Option<ZoneRecordRef<'_>> {
         self.positions(self.index.get(key.as_wire())?)
             .iter()
-            .map(|&i| &self.records[i])
+            .map(|&i| self.record(i))
             .find(|r| r.rdata.rtype() == rtype)
     }
 
@@ -1313,16 +1498,42 @@ impl Zone {
         self.origin.as_ref().folded()
     }
 
+    /// Rebuild both record arenas and then the index, dropping whatever
+    /// removals left behind.
+    ///
+    /// Everything a zone holds under `records` is append-only, so this is the
+    /// only thing that gives an octet back: the records are copied into fresh
+    /// arenas in the order they are held, which is O(the zone) and amortized
+    /// against the removals that paid for it (`removed_since_rebuild`).
+    fn rebuild(&mut self) {
+        let mut names = NameArena::new();
+        let mut rdata = RdataArena::new();
+        names.reserve(self.names.len());
+        rdata.reserve(self.rdata.len());
+        for at in 0..self.records.len() {
+            let stored = self.records[at];
+            let moved = Stored {
+                name: names.push(self.names.get(stored.name)),
+                ttl: stored.ttl,
+                class: stored.class,
+                rdata: rdata.push(self.rdata.get(stored.rdata)),
+            };
+            self.records[at] = moved;
+        }
+        self.names = names;
+        self.rdata = rdata;
+        self.reindex();
+    }
+
     /// Rebuild the index from `records`.
     fn reindex(&mut self) {
         let origin_key = self.origin_key().into_owned();
-        let keys: Vec<(Vec<u8>, Rtype, bool)> = self
-            .records
-            .iter()
-            .map(|r| {
-                let key = r.name.as_ref().folded().into_owned();
+        let keys: Vec<(Vec<u8>, Rtype, bool)> = (0..self.records.len())
+            .map(|at| {
+                let record = self.record(at);
+                let key = record.name.folded().into_owned();
                 let at_apex = key == origin_key;
-                (key, r.rdata.rtype(), at_apex)
+                (key, record.rdata.rtype(), at_apex)
             })
             .collect();
         self.index.clear();
@@ -1667,7 +1878,7 @@ timed 60 IN A 192.0.2.3
     fn test_fully_qualified_owner_name_parses() {
         let zone = parse_zone_file("www.example.com. IN A 192.0.2.5\n", "example.com.").unwrap();
         assert_eq!(zone.records.len(), 1);
-        assert_eq!(zone.records[0].name, nm("www.example.com."));
+        assert_eq!(zone.record(0).name, nm("www.example.com."));
         assert_eq!(
             zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
                 .len(),
@@ -1679,7 +1890,7 @@ timed 60 IN A 192.0.2.3
     fn test_owner_name_may_contain_digits() {
         let zone = parse_zone_file("www2 IN A 192.0.2.6\n", "example.com.").unwrap();
         assert_eq!(
-            zone.records[0].name,
+            zone.record(0).name,
             nm("www2.example.com."),
             "stored absolute"
         );
@@ -1694,7 +1905,7 @@ timed 60 IN A 192.0.2.3
     fn test_owner_name_may_look_like_a_record_type() {
         // Position, not the token's spelling, decides what the first field is.
         let zone = parse_zone_file("ns IN A 192.0.2.7\n", "example.com.").unwrap();
-        assert_eq!(zone.records[0].name, nm("ns.example.com."));
+        assert_eq!(zone.record(0).name, nm("ns.example.com."));
         assert_eq!(
             zone.query(nm("ns.example.com.").as_ref(), Qtype::of(rt::A))
                 .len(),
@@ -1709,7 +1920,7 @@ timed 60 IN A 192.0.2.3
         let zone_content = "www IN A 192.0.2.1\n    IN A 192.0.2.2\n";
         let zone = parse_zone_file(zone_content, "example.com.").unwrap();
         assert_eq!(zone.records.len(), 2);
-        assert_eq!(zone.records[1].name, nm("www.example.com."));
+        assert_eq!(zone.record(1).name, nm("www.example.com."));
         assert_eq!(
             zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
                 .len(),
@@ -2255,7 +2466,7 @@ deep.a.b IN TXT \"x\"
             let by_scan = zone
                 .records()
                 .iter()
-                .any(|r| zone.matches_query(r.name.as_ref(), nm(name).as_ref()));
+                .any(|r| zone.matches_query(r.name, nm(name).as_ref()));
             assert_eq!(
                 zone.name_exists(nm(name).as_ref()),
                 by_scan,
@@ -2304,7 +2515,7 @@ deep.a.b IN TXT \"x\"
                 let mut records: Vec<String> = zone
                     .positions(slot)
                     .iter()
-                    .map(|at| format!("{:?}", zone.records[*at]))
+                    .map(|at| format!("{:?}", zone.record(*at)))
                     .collect();
                 records.sort();
                 (key.to_vec(), records)
@@ -2323,7 +2534,7 @@ deep.a.b IN TXT \"x\"
             for at in zone.positions(slot) {
                 assert!(*at < zone.records.len(), "{when}: position past the end");
                 assert_eq!(
-                    &*zone.records[*at].name.as_ref().folded(),
+                    &*zone.record(*at).name.folded(),
                     key,
                     "{when}: the index files a record under the wrong name"
                 );
@@ -2332,9 +2543,10 @@ deep.a.b IN TXT \"x\"
         }
         for (at, count) in seen.iter().enumerate() {
             assert_eq!(
-                *count, 1,
+                *count,
+                1,
                 "{when}: record {at} ({}) is filed {count} times",
-                zone.records[at].name
+                zone.record(at).name
             );
         }
     }
@@ -2345,7 +2557,7 @@ deep.a.b IN TXT \"x\"
         zone.positions_of(&key)
             .iter()
             .copied()
-            .find(|at| zone.records[*at].rdata.rtype() == rtype)
+            .find(|at| zone.record(*at).rdata.rtype() == rtype)
             .unwrap_or_else(|| panic!("{name} holds a record of that type"))
     }
 
@@ -2448,8 +2660,8 @@ deep.a.b IN TXT \"down here\"
     fn the_record_a_removal_relocates_is_still_found_under_its_own_name() {
         let mut zone = parse_zone_file(REMOVAL_ZONE, "example.com.").unwrap();
         let last = zone.records.len() - 1;
-        let moved = zone.records[last].name.clone();
-        let rtype = zone.records[last].rdata.rtype();
+        let moved = zone.record(last).name.to_owned();
+        let rtype = zone.record(last).rdata.rtype();
 
         let at = position_of(&zone, "ns.example.com.", record_types::A);
         assert_ne!(at, last, "this test is about a removal from the middle");
@@ -2579,11 +2791,12 @@ deep.a.b IN TXT \"down here\"
 
     /// Applying deltas forever must not grow a zone that is not growing.
     ///
-    /// Everything under the index is append-only, and a difference sequence
-    /// spells a changed record as a deletion and an addition (RFC 1995 §2), so
-    /// the same name's octets are appended again every publication and a name
-    /// that falls back to one record leaves its position list behind.
-    /// Unbounded in a process that refreshes a feed for a year without
+    /// **All four of the append-only stores**: the index's name arena, the
+    /// spill lists, and — since `TODO.md` #71e — the record name and RDATA
+    /// arenas. A difference sequence spells a changed record as a deletion and
+    /// an addition (RFC 1995 §2), so every publication appends the same octets
+    /// again and a name that falls back to one record leaves its position list
+    /// behind. Unbounded in a process that refreshes a feed for a year without
     /// restarting, and invisible: the entry count, the record count and every
     /// answer stay right while the process grows.
     ///
@@ -2593,11 +2806,13 @@ deep.a.b IN TXT \"down here\"
     /// where a run stops between two of them is not the question.
     ///
     /// Against the version without the rebuild `remove_record` triggers, the
-    /// arena peaks at 120 031 octets over 100 rounds and 408 031 over 400; with
-    /// it, 35 647 and 35 719, and the spill list 14 either way.
+    /// index arena peaks at 120 031 octets over 100 rounds and 408 031 over
+    /// 400; against one that reindexes without compacting the record arenas,
+    /// the name arena reads 121 849 and 415 249. With both, 35 647 and 35 719,
+    /// and the spill list 14 either way.
     #[test]
     fn applying_deltas_forever_does_not_grow_the_index() {
-        fn churn(rounds: u32) -> (usize, usize, usize, usize) {
+        fn churn(rounds: u32) -> (usize, usize, usize, usize, usize, usize) {
             let mut text = String::from("$TTL 3600\n@ IN SOA ns admin 1 3600 600 86400 300\n");
             for i in 0..1000 {
                 text.push_str(&format!("host{i:06} IN A 192.0.2.1\n"));
@@ -2607,6 +2822,8 @@ deep.a.b IN TXT \"down here\"
             let mut zone = parse_zone_file(&text, "example.com.").unwrap();
             let mut peak_arena = zone.index.names.len();
             let mut peak_spills = zone.spills.len();
+            let mut peak_names = zone.names.len();
+            let mut peak_rdata = zone.rdata.len();
 
             for round in 0..rounds {
                 // Forty rules change, each the only record at its own name,
@@ -2628,12 +2845,16 @@ deep.a.b IN TXT \"down here\"
                 // the bound this is about.
                 peak_arena = peak_arena.max(zone.index.names.len());
                 peak_spills = peak_spills.max(zone.spills.len());
+                peak_names = peak_names.max(zone.names.len());
+                peak_rdata = peak_rdata.max(zone.rdata.len());
             }
             (
                 peak_arena,
                 peak_spills,
                 zone.index.len(),
                 zone.records.len(),
+                peak_names,
+                peak_rdata,
             )
         }
 
@@ -2652,6 +2873,18 @@ deep.a.b IN TXT \"down here\"
             "the arena's peak grew with the number of publications: {} then {}",
             short.0,
             long.0
+        );
+        assert!(
+            100 * long.4 <= 105 * short.4,
+            "the name arena's peak grew with the number of publications: {} then {}",
+            short.4,
+            long.4
+        );
+        assert!(
+            100 * long.5 <= 105 * short.5,
+            "the RDATA arena's peak grew with the number of publications: {} then {}",
+            short.5,
+            long.5
         );
         assert!(
             long.1 <= short.1 + 1,
@@ -2695,7 +2928,7 @@ deep.a.b IN TXT \"down here\"
 
         let mut direct = Zone::new(nm("old.test."));
         for record in parsed.records() {
-            direct.add_record(record.clone());
+            direct.add_record(record.to_owned());
         }
 
         assert_eq!(index_of(&parsed), index_of(&direct), "the same index");
@@ -2725,7 +2958,7 @@ deep.a.b IN TXT \"down here\"
         let mut zone = parse_zone_file(text, "example.com.").unwrap();
         let covering = |zone: &Zone, name: &str| {
             zone.nsec_covering(nm(name).as_ref())
-                .map(|r| r.name.clone())
+                .map(|r| r.name.to_owned())
         };
         let before = covering(&zone, "mail.example.com.");
         assert!(before.is_some(), "the chain answers before the move");
@@ -2874,7 +3107,7 @@ $TTL 3600
                 .unwrap()
                 .records()
                 .iter()
-                .map(|r| (r.name.as_ref().to_presentation(), r.rdata.bytes().to_vec()))
+                .map(|r| (r.name.to_presentation(), r.rdata.bytes().to_vec()))
                 .collect()
         };
         assert_eq!(of(bare), of(commented));
@@ -3268,7 +3501,13 @@ $TTL 3600
         ] {
             let zone = parse_zone_file(line, "example.com.")
                 .unwrap_or_else(|e| panic!("{line:?} should load: {e}"));
-            let ParsedRecord::CNAME(target) = zone.records()[0].rdata.parse().expect("a CNAME")
+            let ParsedRecord::CNAME(target) = zone
+                .records()
+                .get(0)
+                .expect("a record of the zone")
+                .rdata
+                .parse()
+                .expect("a CNAME")
             else {
                 panic!("not a CNAME");
             };
@@ -3287,22 +3526,15 @@ $TTL 3600
     fn an_escaped_dot_is_one_label_not_two() {
         let zone = parse_zone_file("a\\.b IN A 192.0.2.1\n", "example.com.")
             .expect("an escaped dot in an owner name");
-        let name = &zone.records()[0].name;
-        assert_eq!(
-            name.as_ref().label_count(),
-            3,
-            "`a.b`, `example`, `com` — not four"
-        );
-        assert_eq!(
-            name.as_ref().labels().next().expect("a first label"),
-            b"a.b"
-        );
+        let name = zone.records().get(0).expect("a record of the zone").name;
+        assert_eq!(name.label_count(), 3, "`a.b`, `example`, `com` — not four");
+        assert_eq!(name.labels().next().expect("a first label"), b"a.b");
         // It goes back out as it came in, so a zone file round trips.
         assert_eq!(name.to_string(), "a\\.b.example.com.");
 
         // And it is reachable under the name it really has, not under `a.b...`.
         assert_eq!(
-            zone.query(name.as_ref(), Qtype::of(rt::A)).len(),
+            zone.query(name, Qtype::of(rt::A)).len(),
             1,
             "reachable under the name it was stored as"
         );

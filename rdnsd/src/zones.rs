@@ -1270,10 +1270,10 @@ pub(crate) fn signed_rrsets(zone: &Zone) -> Vec<(Name, Rtype)> {
         .filter(|r| r.rdata.rtype() == record_types::RRSIG)
         .filter_map(|r| {
             rdns::dnssec::Rrsig::from_record(&ResourceRecord {
-                name: r.name.clone(),
+                name: r.name.to_owned(),
                 class: r.class,
                 ttl: r.ttl,
-                rdata: r.rdata.clone(),
+                rdata: r.rdata.to_owned(),
             })
         })
         .map(|sig| (sig.owner, sig.type_covered))
@@ -2004,7 +2004,7 @@ mod tests {
             let zone = zones.values().next().expect("the zone");
             let mut edited = Zone::new(nm("example.com."));
             for record in zone.records() {
-                let mut record = record.clone();
+                let mut record = record.to_owned();
                 if record.name == nm("ns1.example.com.") && record.rdata.rtype() == record_types::A
                 {
                     record.rdata = rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
@@ -2012,7 +2012,7 @@ mod tests {
                     ))
                     .unwrap();
                 }
-                edited.add_record(record);
+                edited.add_record(record.to_owned());
             }
             edited
         };

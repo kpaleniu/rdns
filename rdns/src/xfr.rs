@@ -685,7 +685,12 @@ pub enum Refresh {
         answering_the_transfer: bool,
     },
     /// A version newer than the one we hold, however it arrived.
-    Fetched(Fetched),
+    ///
+    /// Boxed because `Fetched` holds a whole [`Zone`], which is 224 bytes of
+    /// vectors and maps — and the *common* case is `Current`, since #57e made a
+    /// refresh probe the serial first. Every `Refresh` moved would otherwise
+    /// carry the big variant to say nothing changed.
+    Fetched(Box<Fetched>),
 }
 
 /// A version the master handed over, and what it cost to get.
@@ -746,11 +751,11 @@ pub async fn refresh_zone(
     }
 
     let Some(base) = base else {
-        return Ok(Refresh::Fetched(Fetched {
+        return Ok(Refresh::Fetched(Box::new(Fetched {
             zone: fetch_zone(master, zone, key).await?,
             steps: None,
             missing_deletions: 0,
-        }));
+        })));
     };
 
     match fetch_changes(master, base, key).await? {
@@ -762,16 +767,16 @@ pub async fn refresh_zone(
             zone,
             steps,
             missing_deletions,
-        } => Ok(Refresh::Fetched(Fetched {
+        } => Ok(Refresh::Fetched(Box::new(Fetched {
             zone,
             steps: Some(steps),
             missing_deletions,
-        })),
-        IxfrOutcome::FullTransfer(zone) => Ok(Refresh::Fetched(Fetched {
+        }))),
+        IxfrOutcome::FullTransfer(zone) => Ok(Refresh::Fetched(Box::new(Fetched {
             zone,
             steps: None,
             missing_deletions: 0,
-        })),
+        }))),
     }
 }
 
@@ -1197,12 +1202,12 @@ mod tests {
         let mut got: Vec<_> = zone
             .records()
             .iter()
-            .map(|r| (r.name.as_ref().to_folded().to_string(), r.rdata.clone()))
+            .map(|r| (r.name.to_folded().to_string(), r.rdata))
             .collect();
         let mut want: Vec<_> = v2
             .records()
             .iter()
-            .map(|r| (r.name.as_ref().to_folded().to_string(), r.rdata.clone()))
+            .map(|r| (r.name.to_folded().to_string(), r.rdata))
             .collect();
         got.sort_by_key(|r| (r.0.clone(), r.1.rtype()));
         want.sort_by_key(|r| (r.0.clone(), r.1.rtype()));

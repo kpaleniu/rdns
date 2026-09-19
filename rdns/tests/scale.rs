@@ -421,10 +421,10 @@ fn verifying_a_signed_zone() {
             .filter(|r| r.rdata.rtype() == rdns::record_types::RRSIG)
             .filter_map(|r| {
                 Rrsig::from_record(&ResourceRecord {
-                    name: r.name.clone(),
+                    name: r.name.to_owned(),
                     class: r.class,
                     ttl: r.ttl,
-                    rdata: r.rdata.clone(),
+                    rdata: r.rdata.to_owned(),
                 })
             })
             .map(|sig| (sig.owner, sig.type_covered))

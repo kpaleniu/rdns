@@ -19,7 +19,7 @@ use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, Nsec3Hash};
 use crate::error::WireError;
 use crate::record_types as rt;
 use crate::response::{ResponseWriter, Section};
-use crate::zone::{Located, NameKind, Zone, ZoneRecord};
+use crate::zone::{Located, NameKind, Zone, ZoneRecordRef};
 use crate::Rtype;
 use crate::Ttl;
 use crate::{Name, NameRef, Qtype};
@@ -66,13 +66,13 @@ pub fn push_answer_signatures(
         }
         // An RRSIG's owner is the record's own name, so this is the wildcard
         // test without the parse: `locate` fell back to `*.<encloser>`.
-        wildcard |= record.name.as_ref() != qname;
+        wildcard |= record.name != qname;
         w.push(
             Section::Answer,
             qname,
             record.class,
             record.ttl,
-            &record.rdata,
+            record.rdata,
         )?;
     }
     Ok(wildcard)
@@ -156,13 +156,7 @@ pub fn push_delegation_proof(
     let mut delegated = false;
     for ds in at.of_type(Qtype::of(rt::DS)) {
         delegated = true;
-        w.push(
-            Section::Authority,
-            ds.name.as_ref(),
-            ds.class,
-            ds.ttl,
-            &ds.rdata,
-        )?;
+        w.push(Section::Authority, ds.name, ds.class, ds.ttl, ds.rdata)?;
     }
     if delegated {
         return push_signatures_at(zone, cut.as_ref(), rt::DS, None, w);
@@ -298,10 +292,10 @@ fn push_signatures_at(
         let ttl = cap.map_or(record.ttl, |cap| record.ttl.min(cap));
         w.push(
             Section::Authority,
-            record.name.as_ref(),
+            record.name,
             record.class,
             ttl,
-            &record.rdata,
+            record.rdata,
         )?;
     }
     Ok(())
@@ -310,7 +304,7 @@ fn push_signatures_at(
 /// A record and every signature over it, unless it has gone out already.
 fn push_with_signatures<'z>(
     zone: &'z Zone,
-    record: &'z ZoneRecord,
+    record: ZoneRecordRef<'z>,
     written: &mut Written<'z>,
     w: &mut ResponseWriter,
 ) -> Result<bool, WireError> {
@@ -319,12 +313,12 @@ fn push_with_signatures<'z>(
     }
     w.push(
         Section::Authority,
-        record.name.as_ref(),
+        record.name,
         record.class,
         record.ttl,
-        &record.rdata,
+        record.rdata,
     )?;
-    push_signatures_at(zone, record.name.as_ref(), record.rdata.rtype(), None, w)?;
+    push_signatures_at(zone, record.name, record.rdata.rtype(), None, w)?;
     Ok(true)
 }
 
@@ -340,17 +334,14 @@ fn push_with_signatures<'z>(
 /// and not a panic on a query path.
 #[derive(Default)]
 struct Written<'z> {
-    seen: [Option<&'z ZoneRecord>; 3],
+    seen: [Option<ZoneRecordRef<'z>>; 3],
     filled: usize,
 }
 
 impl<'z> Written<'z> {
     /// True if `record` has not been written before, recording it if so.
-    fn claim(&mut self, record: &'z ZoneRecord) -> bool {
-        if self.seen[..self.filled]
-            .iter()
-            .any(|seen| seen.is_some_and(|seen| std::ptr::eq(seen, record)))
-        {
+    fn claim(&mut self, record: ZoneRecordRef<'z>) -> bool {
+        if self.seen[..self.filled].contains(&Some(record)) {
             return false;
         }
         debug_assert!(
@@ -525,12 +516,12 @@ fn child_towards<'n>(qname: NameRef<'n>, encloser: NameRef<'_>) -> Option<NameRe
 }
 
 #[cfg(test)]
-fn to_resource(record: &ZoneRecord) -> crate::ResourceRecord {
+fn to_resource(record: ZoneRecordRef<'_>) -> crate::ResourceRecord {
     crate::ResourceRecord {
-        name: record.name.clone(),
+        name: record.name.to_owned(),
         class: record.class,
         ttl: record.ttl,
-        rdata: record.rdata.clone(),
+        rdata: record.rdata.to_owned(),
     }
 }
 
@@ -632,7 +623,7 @@ deep.a.b IN TXT "down here"
         let rdatas = zone
             .query(nm(qname).as_ref(), qtype)
             .into_iter()
-            .map(|r| r.rdata.clone())
+            .map(|r| r.rdata.to_owned())
             .collect();
         (rdatas, signatures_for(zone, qname, qtype).0)
     }

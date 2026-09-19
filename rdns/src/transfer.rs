@@ -40,7 +40,7 @@ pub fn axfr_envelopes<'a>(
             name: apex.to_owned(),
             class: zr.class,
             ttl: zr.ttl,
-            rdata: zr.rdata.clone(),
+            rdata: zr.rdata.to_owned(),
         })
         .ok_or_else(|| TransferError::malformed(format!("zone {apex} has no SOA at its apex")))?;
 
@@ -95,10 +95,10 @@ impl Iterator for AxfrRecords<'_> {
                 continue;
             }
             return Some(ResourceRecord {
-                name: zr.name.clone(),
+                name: zr.name.to_owned(),
                 class: zr.class,
                 ttl: zr.ttl,
-                rdata: zr.rdata.clone(),
+                rdata: zr.rdata.to_owned(),
             });
         }
         if !self.closed {

@@ -9,14 +9,15 @@
 //! declines to transfer while its signatures expire.
 
 use crate::record_types as rt;
-use crate::zone::{Zone, ZoneRecord};
+use crate::zone::{Zone, ZoneRecord, ZoneRecordRef};
 use crate::ParsedRecord;
 use crate::Qtype;
 use crate::Rtype;
 use crate::Serial;
 use crate::Ttl;
 use crate::{
-    DnsMessage, Name, NameRef, OpCode, QueryClass, RecordData, ResourceRecord, ResponseCode,
+    DnsMessage, Name, NameRef, OpCode, QueryClass, RecordData, RecordDataRef, ResourceRecord,
+    ResponseCode,
 };
 
 /// Why an UPDATE was refused, and the RCODE that says so on the wire.
@@ -353,7 +354,7 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
         let held: Vec<RecordData> = zone
             .query(name.as_ref(), Qtype::of(rtype))
             .into_iter()
-            .map(|r| r.rdata.clone())
+            .map(|r| r.rdata.to_owned())
             .collect();
         if held.is_empty() {
             return Err(Rejected::new(
@@ -477,7 +478,7 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 // answer undefined — ignoring is the safe direction.
                 if rtype == rt::SOA {
                     let current = work.soa_serial_at(name.as_ref());
-                    let offered = serial_of(&record.rdata);
+                    let offered = serial_of(record.rdata.as_ref());
                     let acceptable = matches!(
                         (current, offered),
                         (Some(current), Some(offered)) if offered.is_newer_than(current)
@@ -508,9 +509,9 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 // §3.4.2.2's third rule, matching WKS on ADDRESS and PROTOCOL,
                 // is not implementable: WKS has no decoder, so its RDATA is
                 // opaque RFC 3597 bytes and two such records sit side by side.
-                match work.position_to_replace(name.as_ref(), rtype, &record.rdata) {
+                match work.position_to_replace(name.as_ref(), rtype, record.rdata.as_ref()) {
                     Some(position) => {
-                        if !same_record(&work.records[position], &replacement) {
+                        if !same_record(work.records[position].as_ref(), &replacement) {
                             changed += 1;
                         }
                         work.records[position] = replacement;
@@ -538,9 +539,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                     });
                     continue;
                 }
-                changed += work.remove(|record| {
-                    record.name.as_ref() == name && record.rdata.rtype() == *rtype
-                });
+                changed +=
+                    work.remove(|record| record.name == name && record.rdata.rtype() == *rtype);
             }
 
             // §3.4.2.3, first half: every RR of that name goes, except the apex
@@ -549,7 +549,7 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 let name = name.clone();
                 let apex = work.is_apex(name.as_ref());
                 changed += work.remove(|record| {
-                    record.name.as_ref() == name
+                    record.name == name
                         && !(apex
                             && (record.rdata.rtype() == rt::SOA || record.rdata.rtype() == rt::NS))
                 });
@@ -583,7 +583,7 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 // deletion matching nothing empties nothing.
                 if work.is_apex(name.as_ref()) && *rtype == rt::NS {
                     let held = work.count(name.as_ref(), rt::NS);
-                    let matching = work.count_matching(name.as_ref(), rdata);
+                    let matching = work.count_matching(name.as_ref(), rdata.as_ref());
                     if matching > 0 && held == matching {
                         ignored.push(Ignored {
                             name,
@@ -594,8 +594,7 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                         continue;
                     }
                 }
-                changed +=
-                    work.remove(|record| record.name.as_ref() == name && record.rdata == *rdata);
+                changed += work.remove(|record| record.name == name && record.rdata == *rdata);
             }
         }
     }
@@ -633,7 +632,7 @@ impl<'a> Working<'a> {
             // ones and every comparison below had to be against a settled form.
             // A `Name` is absolute by construction, so there is nothing to
             // settle.
-            records: base.records().to_vec(),
+            records: base.records().iter().map(|r| r.to_owned()).collect(),
             base,
         }
     }
@@ -671,10 +670,10 @@ impl<'a> Working<'a> {
             .count()
     }
 
-    fn count_matching(&self, name: NameRef<'_>, rdata: &RecordData) -> usize {
+    fn count_matching(&self, name: NameRef<'_>, rdata: RecordDataRef<'_>) -> usize {
         self.records
             .iter()
-            .filter(|r| r.name.as_ref() == name && r.rdata == *rdata)
+            .filter(|r| r.name.as_ref() == name && r.rdata == rdata)
             .count()
     }
 
@@ -690,12 +689,12 @@ impl<'a> Working<'a> {
         &self,
         name: NameRef<'_>,
         rtype: Rtype,
-        rdata: &RecordData,
+        rdata: RecordDataRef<'_>,
     ) -> Option<usize> {
         self.records.iter().position(|r| {
             r.name.as_ref() == name
                 && r.rdata.rtype() == rtype
-                && (matches!(rtype, rt::CNAME | rt::SOA | rt::DNAME) || r.rdata == *rdata)
+                && (matches!(rtype, rt::CNAME | rt::SOA | rt::DNAME) || r.rdata == rdata)
         })
     }
 
@@ -711,7 +710,7 @@ impl<'a> Working<'a> {
         self.records
             .iter()
             .find(|r| r.name.as_ref() == name && r.rdata.rtype() == rt::SOA)
-            .and_then(|r| serial_of(&r.rdata))
+            .and_then(|r| serial_of(r.rdata.as_ref()))
     }
 
     /// RFC 2136 §3.6's automatic increment, applied to the apex SOA.
@@ -772,14 +771,14 @@ impl<'a> Working<'a> {
 /// The TTL counts, the same identity [`crate::ixfr::diff`] uses: a secondary
 /// caches and re-serves that number. The name is not compared — the caller
 /// found this record *by* name.
-fn same_record(held: &ZoneRecord, replacement: &ZoneRecord) -> bool {
+fn same_record(held: ZoneRecordRef<'_>, replacement: &ZoneRecord) -> bool {
     held.ttl == replacement.ttl
         && held.class == replacement.class
         && held.rdata == replacement.rdata
 }
 
 /// The serial inside an SOA's RDATA, if it is one and it parses.
-fn serial_of(rdata: &RecordData) -> Option<Serial> {
+fn serial_of(rdata: RecordDataRef<'_>) -> Option<Serial> {
     match rdata.parse() {
         Ok(ParsedRecord::SOA { serial, .. }) => Some(serial),
         _ => None,
@@ -1530,7 +1529,7 @@ mail IN MX  10 mx.example.com.
                 rtype: rt::SOA,
                 rdata: zone.query(nm(apex).as_ref(), Qtype::of(rt::SOA))[0]
                     .rdata
-                    .clone(),
+                    .to_owned(),
             }],
         );
         assert_eq!(applied.zone.serial(), Some(Serial::new(1)));
@@ -1711,9 +1710,7 @@ mail IN MX  10 mx.example.com.
     fn an_soa_is_ignored_unless_its_serial_is_newer() {
         let zone = zone();
 
-        let original = zone.query(nm("example.com.").as_ref(), Qtype::of(rt::SOA))[0]
-            .rdata
-            .clone();
+        let original = zone.query(nm("example.com.").as_ref(), Qtype::of(rt::SOA))[0].rdata;
 
         for (offered, accepted, what) in [
             (1, false, "equal to the current serial"),
@@ -1724,8 +1721,7 @@ mail IN MX  10 mx.example.com.
             let installed = applied
                 .zone
                 .query(nm("example.com.").as_ref(), Qtype::of(rt::SOA))[0]
-                .rdata
-                .clone();
+                .rdata;
             if accepted {
                 assert_eq!(installed, soa_with(offered), "{what}");
                 assert_eq!(applied.changed, 1);
@@ -1856,15 +1852,12 @@ mail IN MX  10 mx.example.com.
     #[test]
     fn the_automatic_bump_rewrites_four_octets_and_nothing_else() {
         let zone = zone();
-        let before = zone.query(nm("example.com.").as_ref(), Qtype::of(rt::SOA))[0]
-            .rdata
-            .clone();
+        let before = zone.query(nm("example.com.").as_ref(), Qtype::of(rt::SOA))[0].rdata;
         let applied = apply(&zone, &[add("new.example.com.", 3600, a("192.0.2.50"))]);
         let after = applied
             .zone
             .query(nm("example.com.").as_ref(), Qtype::of(rt::SOA))[0]
-            .rdata
-            .clone();
+            .rdata;
 
         assert_eq!(before.bytes().len(), after.bytes().len());
         let differing: Vec<usize> = before

@@ -44,7 +44,7 @@
 use crate::error::{ConfigError, ConfigResult};
 use crate::record_types as rt;
 use crate::resolver::NameserverPolicy;
-use crate::zone::{parse_zone_text_at, FileDigest, Located, NameKind, Zone, ZoneRecord};
+use crate::zone::{parse_zone_text_at, FileDigest, Located, NameKind, Zone, ZoneRecordRef};
 use crate::{Name, NameRef, ParsedRecord, Qtype, ResourceRecord, Serial};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -475,12 +475,12 @@ impl PolicyZone {
         // `Hash` is the ASCII fold (RFC 4343), the comparison the scan made.
         let mut seen: HashSet<Name> = HashSet::new();
         for record in zone.records() {
-            let owner = record.name.as_ref();
+            let owner = record.name;
             let Some(kind) = trigger_subtree(owner, origin) else {
                 continue;
             };
             // One rule per owner name, however many records sit at it.
-            if !seen.insert(record.name.clone()) {
+            if !seen.insert(record.name.to_owned()) {
                 continue;
             }
             // An NSDNAME trigger's labels are a name, not an address; the
@@ -504,7 +504,7 @@ impl PolicyZone {
             let trigger = IpTrigger {
                 addr,
                 prefix,
-                owner: record.name.clone(),
+                owner: record.name.to_owned(),
             };
             match kind {
                 b"rpz-client-ip" => client_ip.push(trigger),
@@ -707,12 +707,12 @@ fn read_action(located: &Located<'_>, qname: NameRef<'_>, qtype: Qtype) -> Optio
 
 /// The record as it goes into the answer: the trigger's RDATA under the name
 /// the client asked about.
-fn rewritten(record: &ZoneRecord, qname: NameRef<'_>) -> ResourceRecord {
+fn rewritten(record: ZoneRecordRef<'_>, qname: NameRef<'_>) -> ResourceRecord {
     ResourceRecord {
         name: qname.to_owned(),
         class: record.class,
         ttl: record.ttl,
-        rdata: record.rdata.clone(),
+        rdata: record.rdata.to_owned(),
     }
 }
 
@@ -2327,7 +2327,7 @@ evil.example.com IN CNAME .
         let from_file = parsed.zone();
         assert_eq!(installed.records().len(), from_file.records().len());
         for (theirs, ours) in from_file.records().iter().zip(installed.records()) {
-            assert_eq!(theirs.name.as_ref(), ours.name.as_ref());
+            assert_eq!(theirs.name, ours.name);
             assert_eq!(theirs.ttl, ours.ttl);
             assert_eq!(theirs.class, ours.class);
             assert_eq!(theirs.rdata, ours.rdata);

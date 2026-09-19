@@ -19,7 +19,7 @@ use crate::Ttl;
 use std::path::Path;
 
 use crate::record_types;
-use crate::zone::{Zone, ZoneRecord};
+use crate::zone::{Zone, ZoneRecordRef};
 use crate::ParsedRecord;
 
 /// Serialize a zone to the text presentation format.
@@ -50,10 +50,10 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
     // the same question five other places ask (`TODO.md` #33f). A `Name` is
     // absolute and compares case-insensitively, so the two now agree — which is
     // the point of asking one of them.
-    for record in zone.records().iter().filter(|r| zone.is_apex_soa(r)) {
+    for record in zone.records().iter().filter(|r| zone.is_apex_soa(*r)) {
         record_into(&mut out, record)?;
     }
-    for record in zone.records().iter().filter(|r| !zone.is_apex_soa(r)) {
+    for record in zone.records().iter().filter(|r| !zone.is_apex_soa(*r)) {
         record_into(&mut out, record)?;
     }
 
@@ -83,26 +83,15 @@ pub fn write_zone_text(text: &str, path: &Path) -> Result<(), ZoneError> {
 }
 
 /// One record and its newline, appended to a zone being written.
-fn record_into(out: &mut String, record: &ZoneRecord) -> Result<(), ZoneError> {
-    crate::record_text::record_line_into(
-        out,
-        record.name.as_ref(),
-        record.ttl,
-        record.class,
-        &record.rdata,
-    )?;
+fn record_into(out: &mut String, record: ZoneRecordRef<'_>) -> Result<(), ZoneError> {
+    crate::record_text::record_line_into(out, record.name, record.ttl, record.class, record.rdata)?;
     out.push('\n');
     Ok(())
 }
 
 /// One record as a zone-file line.
-pub fn record_to_string(record: &ZoneRecord) -> Result<String, ZoneError> {
-    record_line(
-        record.name.as_ref(),
-        record.ttl,
-        record.class,
-        &record.rdata,
-    )
+pub fn record_to_string(record: ZoneRecordRef<'_>) -> Result<String, ZoneError> {
+    record_line(record.name, record.ttl, record.class, record.rdata)
 }
 
 /// What to put in `$TTL`. Every record written states its own, so this exists
@@ -117,7 +106,7 @@ fn default_ttl(zone: &Zone) -> Ttl {
         return Ttl::from_secs(minimum);
     }
     zone.records()
-        .first()
+        .get(0)
         .map(|r| r.ttl)
         .unwrap_or(Ttl::from_secs(3600))
 }
@@ -129,6 +118,7 @@ mod tests {
     use crate::test_records::nm;
     use crate::testutil::ScratchDir;
     use crate::zone::parse_zone_file;
+    use crate::zone::ZoneRecord;
     use crate::Name;
     use crate::Rtype;
     use crate::Serial;
@@ -145,12 +135,12 @@ mod tests {
         let mut before: Vec<_> = first
             .records()
             .iter()
-            .map(|r| (r.name.clone(), r.ttl, r.class, r.rdata.clone()))
+            .map(|r| (r.name, r.ttl, r.class, r.rdata))
             .collect();
         let mut after: Vec<_> = second
             .records()
             .iter()
-            .map(|r| (r.name.clone(), r.ttl, r.class, r.rdata.clone()))
+            .map(|r| (r.name, r.ttl, r.class, r.rdata))
             .collect();
         // Sorted only to make the comparison order-independent; `Name` has no
         // `Ord` because canonical DNS order is not byte order (RFC 4034 §6.1).
@@ -464,7 +454,10 @@ mod tests {
                 1,
                 "{name}: {written}"
             );
-            assert_eq!(reread.records()[0].name, name);
+            assert_eq!(
+                reread.records().get(0).expect("a record of the zone").name,
+                name
+            );
         }
     }
 

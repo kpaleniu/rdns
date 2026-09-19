@@ -37,14 +37,14 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#71** and **#21**, as of 2026-09-19. **#57 is
+**#58**, **#68**, **#72** and **#21**, as of 2026-09-19. **#57 is
 closed**: 57e was the last of it, and the measurement that
 could have refuted it did — IXFR as this tree had it was *slower* than a whole
 transfer, because applying forty records to a million-record zone cost 1 018 ms
 building a key per record of the *base*. What the row was actually missing was
 smaller and older: the refresh had no SOA probe at all, so an unchanged feed
-cost a transfer and a reload every REFRESH. **#71** is what is left after both,
-and it is neither the wire nor the format. **71b closed 2026-09-16** — a reload
+cost a transfer and a reload every REFRESH. **#71 was what was left after both,
+and it was neither the wire nor the format; it closed 2026-09-19.** **71b closed 2026-09-16** — a reload
 keeps every feed whose file did not move, so a three-feed set costs 781 ms for
 one publication where it cost 2 200, and a quiet SIGHUP 62 ms. **71c closed the
 same day**: three of the four sites that rebuild a zone never got #61b's
@@ -72,11 +72,17 @@ grew a zone that was not growing — 4 000 changes to a 1 000-name zone took the
 arena from 24 031 octets to 120 031 with every answer unchanged — and a rebuild
 when removals reach half the record count bounds it.
 
-What is left of #71 is **71e**, whose remedy and blast radius are both
-measured: an arena wins on every axis and costs 98 compiler errors in `rdns`
-and ~21 in the binaries. Its last live caller went away with 71f and 71a gave
-it one back — the row's instruction to take 71e *first* was backwards, and 71e
-is now **138-143 ms of the 138-146** an apply costs.
+**71e closed the same day and #71 with it.** A zone keeps every owner name in
+one arena and every RDATA in another, so a copy is a memcpy and **six**
+allocations rather than two million: `Zone::clone` **97.6 ms to 18.7**, and the
+apply 71a had left at 143.4 ms is **44.3** — 801 as the section was filed. The
+answer path's whole answer went **−6.1%** with it, the lookup alone **+5.4%**,
+and a parsed million-record zone holds 18 MB less. Its blast-radius figure was
+the one thing it got wrong: 98 errors was measured by *sealing* `Zone::records`
+where the change had to *replace* it, and a `Records` view with `len`, `iter`
+and `IntoIterator` came out at 66. **#72** came out of it — filling an arena
+from an owned `ZoneRecord` copies what the caller just allocated, 50 ms a
+million records against the 79 ms a million every copy stops paying.
 
 Four by-products worth the trip: `rpz_install.rs` had no turnstile, so every
 number #57e and #71 recorded was taken with two other million-rule measurements
@@ -3917,7 +3923,7 @@ Prometheus and the `image` job's probes all send a `Host` and are unaffected.
 
 ---
 
-### 71. A forty-record change rebuilds a zone and re-reads a file — **filed 2026-09-16; 71a, 71b, 71c, 71d and 71f closed**
+### 71. A forty-record change rebuilds a zone and re-reads a file — **filed 2026-09-16, closed 2026-09-19**
 
 Out of 57e, which took the wire down to what actually changed and left
 everything after it sized by the zone. Measured on the development machine,
@@ -3927,7 +3933,7 @@ release, a million-rule QNAME feed
 | applying a forty-rule change at 1M rules | ms |
 |---|---|
 | the difference off the wire and assembled | ~~about 7~~ **below the noise** |
-| `ixfr::Patch::apply`, ~~rebuilding~~ **copying and editing** the zone | ~~801~~ ~~793~~ ~~445~~ ~~372-395~~ **138-146** |
+| `ixfr::Patch::apply`, ~~rebuilding~~ **copying and editing** the zone | ~~801~~ ~~793~~ ~~445~~ ~~372-395~~ ~~138-146~~ **44.3** |
 | serializing, writing, and putting the zone in force | ~~1 351~~ ~~1 200-1 420~~ **526** |
 
 The first row is now a *nothing* rather than a small number: the whole IXFR
@@ -3940,8 +3946,10 @@ the subtraction is still nothing: 383-395 against 372-395 on 2026-09-18.
 The second row halved again on 2026-09-16, and that is **71c**: the rebuild was
 growing a two-million-entry index from empty when both counts were sitting in
 the zone it was rebuilding; 71d took the last 38 ms off it, and **71a** took
-the rebuild away on 2026-09-19 — the zone is copied and edited now, and the
-copy is 138-143 ms of the 138-146 left. The third stopped
+the rebuild away on 2026-09-19 — the zone is copied and edited now. **71e then
+took the copy**, the same day: a zone's owner names and its RDATA are one arena
+each, so the copy is a memcpy and six allocations rather than two million.
+**801 ms as filed, 44.3 now**, of which 37.5 is the copy. The third stopped
 being a band when it stopped containing a parse (**71f**): it is 247 ms of
 serialization, a 38 MB write, 21 ms to read the file back and digest it, and
 41 ms to index.
@@ -4249,7 +4257,13 @@ a correction and not a retraction.
   and nothing on any measured path clones a `Zone` today. What it changes is
   the arithmetic 71a is decided on: see that row. The next stage is 71e.
 
-- **71e. `ZoneRecord` is two allocations per record — filed 2026-09-17.** What
+- **71e. `ZoneRecord` is two allocations per record — filed 2026-09-17, closed
+  2026-09-19.** **`Zone::clone` 97.6 ms and 2 000 004 allocations to 18.7 ms
+  and 6**, and dropping the copy 35.5 ms to 4.0, at a million records
+  (`rdns/tests/record_storage.rs`). On the path that pays for it, applying a
+  forty-rule change to a million-rule feed is **143.4 ms to 44.3**, of which
+  the copy is 142.3 to 37.5 — the feed's names are twice the length of that
+  harness's, which is the whole of the difference. What
   is left of the copy after 71d: `Name(Box<[u8]>)` and
   `RecordData { rdata: Box<[u8]> }` are one heap allocation each, so cloning a
   million-record zone is still two million of them. That is **~108 ms of the
@@ -4276,11 +4290,16 @@ a correction and not a retraction.
 
   | how a record holds its two byte strings | fill | allocations | held | clone | drop | `size_of` |
   |---|---|---|---|---|---|---|
-  | a `Box` per field — **today** | 80.4 ms | 2 000 001 | 64.7 MiB | 83-87 ms | 32-33 ms | 40 B |
+  | a `Box` per field — ~~**today**~~ **until 2026-09-19** | 80.4 ms | 2 000 001 | 64.7 MiB | 83-87 ms | 32-33 ms | ~~40 B~~ **48 B** |
   | an `Arc` per field | 97.4 ms | 2 000 001 | 99.2 MiB | 12-13 ms | 10-11 ms | 40 B |
   | 40 octets inline, longer on the heap | 34.0 ms | 1 | 99.2 MiB | 16-19 ms | 4.3-4.4 ms | 104 B |
   | 23/15 octets inline | 62.7 ms | 900 001 | 81.6 MiB | 54-56 ms | 17 ms | 64 B |
   | **one arena plus ranges** | 22.3 ms | 41 | 58.0 MiB | 3.8-4.1 ms | 0.9-1.0 ms | 24 B |
+
+  The two `size_of`s in the first row were wrong by eight: an owned
+  `ZoneRecord` is 48 bytes, not 40, and so is the `ZoneRecordRef` that replaced
+  it — `Name` is 16 and `RecordData` 24 with its `Rtype`. The arena row's 24 was
+  right and `Stored` measures 24.
 
   The arena is the only shape that wins on every axis, so there is nothing to
   argue about the *shape*. `Arc` buys the copy and costs 34 MiB and a slower
@@ -4288,15 +4307,42 @@ a correction and not a retraction.
   path; inline at 23/15 is neither, and the feed it was measured on has 900 000
   of its million names over 23 octets.
 
-  **The blast radius, counted the way 63a counted its own** — seal
+  ~~**The blast radius, counted the way 63a counted its own** — seal
   `Zone::records` and let the compiler name what cannot be done without it:
   **98 errors in `rdns` across 13 files**, and ~21 more in the binaries, which
-  stop compiling behind it. It is not only `records()`: 41 of those sites are
-  `.len()`/`.is_empty()` and survive an iterator, but a borrowed record means a
-  borrowed `RecordData` as well, and 14 signatures take `&RecordData` today.
-  That type's fields are sealed in a module of their own *on purpose* (§17), so
-  the ref type has to reach the same decoders rather than get a constructor
-  that skips them.
+  stop compiling behind it.~~ **It came out at 66 in `rdns` and 12 in the
+  binaries**, and the difference is the one thing this row got wrong in a
+  useful direction: the count was taken by *sealing* `records`, which is not
+  what the change had to do. `Records<'_>` is a view with `len`, `is_empty`,
+  `get`, `iter` and `IntoIterator`, so every reader that counted a zone or
+  walked one reads the same — and the row's own "41 of those sites are
+  `.len()`/`.is_empty()` and survive an iterator" is the sentence that should
+  have said so. A blast radius measured by deleting an API is an upper bound on
+  one measured by replacing it (§19: the measurement that could refute the
+  finding).
+
+  The rest of the count held. A borrowed record means a borrowed `RecordData`,
+  and that type's fields are sealed in a module of its own *on purpose* (§17),
+  so `RecordDataRef` lives there with it and every read-only accessor moved onto
+  it — `RecordData` delegates, so the offset arithmetic that reads an SOA's
+  SERIAL exists once (§7). 14 signatures took `&RecordData` and take
+  `RecordDataRef<'_>` now.
+
+  **The arenas are sealed by their own door, not by a `pub(crate)` hole.**
+  `NameArena` lives in `name.rs` and `RdataArena` in `record_data.rs`, because
+  handing out a `NameRef` over octets an arena holds means minting one without
+  `NameRef::from_wire_slice`'s label walk — and a `pub(crate)` constructor for
+  that would be open to every module in `rdns-core` rather than to the one
+  caller. The only way *into* an arena is a checked value, so what comes out was
+  checked on the way in. The span carries the TYPE for the same reason: two
+  fields a caller could pair up wrongly is what §17 opens with.
+
+  **One bound had to change.** `signed_data` and `verify_rrset` took
+  `R: Borrow<RecordData>`, which cannot reach a `RecordDataRef` — there is no
+  `RecordData` for it to hand back a reference to. It is `R: AsRdata` now: the
+  same requirement stated as what the callers do with it, one method, two
+  impls. #64g's default type parameter still keeps it off the 40 call sites
+  that own their RDATA.
 
   **And the measurement that could refute the row did, on the load path.**
   Parsing a million-rule feed is 613 ms and **8 000 062 allocations** — eight
@@ -4308,16 +4354,45 @@ a correction and not a retraction.
   caller at all — its whole case is 71a, and 71a's is the 372-395 ms rebuild.~~
 
   ~~**So: open, with the remedy named and priced, and nobody should take it
-  before 71a is decided.**~~ **71a is closed and this row is the whole of what
-  is left of #71**, 2026-09-19. Applying a delta is a copy and an edit now, so
-  the copy that had no live caller is the *only* thing on the path: **138-143
-  ms of the 138-146** an apply costs at a million rules over four runs, and
-  47-59 more to drop the version it replaced. The shapes above say an arena takes that to 3.8-4.1 ms,
-  which is where O(delta) stops being a figure of speech. The blast radius is
-  unchanged and is the reason this is still a row and not a commit.
+  before 71a is decided.**~~ **71a closed first and handed this row its
+  caller**, 2026-09-19. Applying a delta is a copy and an edit now, so the copy
+  that had no live caller was the only thing left on the path.
+
+  **The shapes table's 3.8-4.1 ms is the records alone, and `Zone::clone` is
+  18.7.** The difference is the index, which #71d already made a memcpy of two
+  vectors: two million entries at 32 bytes is 64 MB to copy, against 24 for the
+  records, 24 for the name arena and 9 for the RDATA. Six allocations for the
+  whole zone. That is memcpy-bound, and the table was right about the part it
+  measured — a row that quoted it as the *zone's* figure would have been the
+  §19 mistake in the other direction.
+
+  **What it cost, and both numbers are real.** The answer path's whole answer is
+  **460.3 ns to 430.1, −6.1%** — one allocation fewer, because `ZoneRecordRef`
+  and `ResourceRecord` are both 48 bytes and `Vec`'s in-place collection now
+  reuses the vector `Zone::query` returns where a `Vec<&ZoneRecord>` at 8 bytes
+  an element could not. The *lookup* alone is **+5.4%** (54.2 ns to 57.1 on a
+  10k-record zone), because a 48-byte `ZoneRecordRef` is built per record where
+  an 8-byte pointer was copied. Net −6% end to end, and the two are in the
+  commit message because quoting only the first would be a benchmark chosen to
+  agree (§1).
+
+  **Memory, which the row had not asked about**: a parsed million-record zone
+  is **228.2 MB to 210.2** (239 to 220 bytes a record), a signed one **732.5 MB
+  to 658.0**, and `rdnsd`'s ten thousand small zones 24.7 MB to 24.0
+  (`rdns/tests/scale.rs`). `Stored` is 24 bytes against the owned
+  `ZoneRecord`'s 48, exactly as the shapes table said.
+
+  **The load path did not move and that was the row's own prediction**: a
+  million-rule parse is 599.8 ms before and 588.8 after, 8 000 062 allocations
+  and 8 000 065. The parser builds an owned `Name` and `RecordData` per record
+  and `add_record` copies both into the arenas, so the record's two allocations
+  are still made — by the caller — and one copy is added. That copy is
+  **#72**.
 
   The other six allocations per record are their own question and nobody has
-  asked it; this row is not it.
+  asked it; this row is not it. Two of them are **#72**.
+
+
 
 - **71f. The install parsed back the zone it was holding — filed and closed
   2026-09-18.** **1 141-1 261 ms to 526** at a million rules, which is the third
@@ -4422,6 +4497,39 @@ a correction and not a retraction.
   instances. §18 asks for the count *before* fixing one, and this is the shape
   that rule exists for — a `grep` for `Zone::new` would have found all four the
   day 61b landed.
+---
+
+### 72. A zone's arena is filled from something the caller already allocated — **filed 2026-09-19**
+
+Out of 71e, whose measurement said the load path would not move and was right
+about why: a zone keeps its owner names and its RDATA in two arenas now, but
+`Zone::add_record` takes an owned `ZoneRecord`, so building a zone record by
+record costs the caller's two allocations *and* a copy into the arena.
+
+**227 ns a record to 277** on the "built, not parsed" line of
+`rdns/tests/scale.rs` at a million records — 50 ms a million, against the 79 ms
+a million every *copy* of that zone stops paying (#71e). A parse does not show
+it: 599.8 ms before and 588.8 after, 8 000 062 allocations and 8 000 065,
+because the parse is dominated by the eight allocations a record already costs
+it.
+
+**No remedy claimed, and the obvious one is not it.** A borrowed
+`Zone::add(NameRef, Ttl, Class, RecordDataRef)` saves the copy and not the
+allocation: the parser builds a `Name` out of presentation text and a
+`RecordData` out of parsed fields before it has anything to hand over, so the
+allocation belongs to the parse. What would remove it is a parser that writes a
+name straight into the arena — a change to how names are *built*, not to how
+zones store them, and one that has to keep `Name`'s invariant on the way
+(`CLAUDE.md` §17).
+
+**Whoever takes it measures first**, because the ratio is what decides it: the
+record's own two allocations are a quarter of the eight a parsed record costs,
+and #71e's refuting measurement — that an arena is worth ~60 ms of a 600 ms
+parse — still holds. The three other build sites are
+`xfr::AxfrAccumulator::into_zone`, `update::Applied::into_zone` and
+`ixfr::Patch::apply`'s appends, and each has the same shape (§18: count the
+instances before fixing one).
+
 ---
 
 ### 21. The deviations and the not-implemented list — decisions, not open work
@@ -4571,6 +4679,7 @@ the week; the record is under "How the queue kept going stale" in
 | **70** | the metrics endpoint did not enforce RFC 9112 §3.2, and its header said it did | **filed and closed 2026-09-16**, out of #68. Both of the header's claims about hyper were estimates of somebody else's code and both were wrong — no `Host` was **200**, not 400, and an over-long request line is **414 past 64 KiB**, not 431 past 8 KB — and four tests in that same file had disproved the first on the day it was written. Filed as a decision rather than a defect and taken by the owner: `bad_host` now answers 400 to all **three** of §3.2's MUSTs, which the row had read as one, and hyper answered 200 to every one of them. The count was wrong too — "four tests" was six tests and eleven requests (§18). The probe it costs is paid back in the refusal's body: §3.2 exempts HTTP/1.0, and `curl`, Prometheus and CI's own probes all send a `Host` |
 | **57** | a policy zone arrived as a file somebody else wrote, not as a transfer | **filed 2026-09-13, closed 2026-09-16**, five rows, left behind by 45a — and the delivery half needed no code in `rdnsd` at all: `announce_transfer` had notified every `--also-notify` peer after every transfer since it was written, and what was missing was `rdnsr`'s ear (57c). 57a's reload found a resolver with `--rpz` and no DoT that had no reload task at all; 57b measured the reload *on* a worker and a one-core resolver answering nothing for 2.7 s. 57d built both shapes and was decided by neither's install cost: A keeps the file, so a restart begins with yesterday's rules. 57e is the one whose own measurement refuted it — IXFR was **slower than AXFR** here, 1 485 ms against 1 372 at a million rules, because applying forty records built a key per record of the base; and the bigger miss was that a refresh had no SOA probe at all, so an unchanged feed cost a transfer and a reload every REFRESH. Both daemons share `xfr::refresh_zone` now (§7). **#71** is what is left, and it is neither the wire nor the format — and every figure in this row was taken under the libtest contention #71 found, so they are the shape and not the clock |
 | **69** | four accept loops ended on any error, where the UDP side had a helper | **filed and closed 2026-09-16**, out of #68. Filed with no remedy on purpose (§18), and both missing measurements were taken the same day — which reversed the reason. **The remote provocation does not exist**: four `SO_LINGER 0` resets before the accept come back as `Ok` on Windows and on Linux, so §4's *remote* kill switch does not apply. **Descriptor exhaustion does, and needs nobody**: at `ulimit -n`, `accept` returns `EMFILE`, `Uncategorized`/raw 24, invisible to every portable kind — and both daemons' `JoinSet` ends the process when its first task ends, so `accepted?` turned a self-clearing condition into a whole-server outage across every transport. Windows could not be made to reach it (100 000 handles, no failure). Provoked before and after against a real `tcp::serve`: the old code's next write is a reset, the new one answers. One shared `survive_accept_error` at all four sites — retry the aborted kinds, log and back off 100 ms on exhaustion, still fatal otherwise |
+| **71** | applying a forty-record change was sized by the zone, twice over | **filed 2026-09-16, closed 2026-09-19**, seven rows, out of 57e — which had taken the *wire* down to what changed and left everything after it O(the zone). **801 ms to 44.3** for a forty-rule change at a million rules. 71b: a reload keeps every feed whose file did not move. 71c: three of four zone rebuilds never got #61b's `reserve`, which was over half of what 71a was filed at — a row filed as a type problem whose larger half was one line. 71d: the index keyed every name on a `Box<[u8]>` because a `HashMap` reaches its key only through `Borrow`, an artifact of the collection and not of `Name`. 71f: the install wrote the file and then *parsed it back*, 613 ms of re-deriving a zone the process was holding, under a comment calling it a trade — and the assertion cited as evidence compared two `usize`s. **71a**: not the tombstones it named — a count of direct children makes a name removable without turning a NODATA into an NXDOMAIN, and `swap_remove` leaves exactly one stale position. **71e**: two arenas, so a copy is a memcpy and six allocations rather than two million; `Zone::clone` 97.6 ms to 18.7, the whole answer path −6.1% and the lookup alone +5.4%. Two rows had their order the wrong way round (71a said to take 71e first; it was the reverse) and both blast-radius counts were measured by deleting an API rather than replacing it. Filed **#72** on the way out |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

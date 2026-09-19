@@ -4827,13 +4827,7 @@ mod tests {
             let mut rows: Vec<_> = z
                 .records()
                 .iter()
-                .map(|r| {
-                    (
-                        r.name.as_ref().to_folded().to_string(),
-                        r.ttl,
-                        r.rdata.clone(),
-                    )
-                })
+                .map(|r| (r.name.to_folded().to_string(), r.ttl, r.rdata.to_owned()))
                 .collect();
             rows.sort_by_key(|r| (r.0.clone(), r.2.rtype()));
             rows
@@ -6065,10 +6059,10 @@ deep.a.b IN TXT "down here"
                     .query(nm("example.com.").as_ref(), Qtype::of(record_types::DNSKEY))
                     .into_iter()
                     .map(|r| ResourceRecord {
-                        name: r.name.clone(),
+                        name: r.name.to_owned(),
                         class: r.class,
                         ttl: r.ttl,
-                        rdata: r.rdata.clone(),
+                        rdata: r.rdata.to_owned(),
                     })
                     .collect::<Vec<_>>(),
             )
@@ -6586,7 +6580,7 @@ ns.plain  IN A   192.0.2.30
                     .expect("the signed zone");
                 let mut edited = Zone::new(nm(&zone.origin().to_string()));
                 for record in zone.records() {
-                    let mut record = record.clone();
+                    let mut record = record.to_owned();
                     if record.name == nm("www.example.com.")
                         && record.rdata.rtype() == record_types::A
                     {
@@ -6595,7 +6589,7 @@ ns.plain  IN A   192.0.2.30
                         ))
                         .unwrap();
                     }
-                    edited.add_record(record);
+                    edited.add_record(record.to_owned());
                 }
                 edited
             };

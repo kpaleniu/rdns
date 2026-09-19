@@ -2,7 +2,7 @@
 //!
 //! An answer used to be a [`DnsMessage`] of owned `String`s and cloned RDATA
 //! that was then serialized. [`ResponseWriter`] appends each record to the wire
-//! as it is found instead: [`RecordData`] already holds uncompressed wire-format
+//! as it is found instead: [`crate::RecordData`] already holds uncompressed wire-format
 //! bytes, so a record costs a copy into the buffer and nothing from the
 //! allocator.
 //!
@@ -18,7 +18,7 @@ use crate::dname::write_bytes;
 use crate::ede::ExtendedError;
 use crate::error::WireError;
 use crate::{
-    Class, DnsMessage, Edns, NameRef, OpCode, QuerySection, RecordData, ResponseCode, Ttl,
+    Class, DnsMessage, Edns, NameRef, OpCode, QuerySection, RecordDataRef, ResponseCode, Ttl,
     CLASSIC_UDP_SIZE, OPT_RECORD_TYPE,
 };
 
@@ -179,7 +179,7 @@ impl<'a> ResponseWriter<'a> {
         name: NameRef<'_>,
         class: Class,
         ttl: Ttl,
-        rdata: &RecordData,
+        rdata: RecordDataRef<'_>,
     ) -> Result<(), WireError> {
         if self.truncated {
             return Ok(());
@@ -362,7 +362,7 @@ pub(crate) fn write_rr(
     name: NameRef<'_>,
     class: Class,
     ttl: Ttl,
-    rdata: &RecordData,
+    rdata: RecordDataRef<'_>,
 ) -> Result<usize, WireError> {
     let mut pos = compressor.write_name(name, buf, pos)?;
     pos = write_bytes(buf, pos, &rdata.rtype().to_u16().to_be_bytes())?;
@@ -522,6 +522,7 @@ pub fn client_edns(request: &DnsMessage) -> Result<ClientEdns, ResponseCode> {
 
 #[cfg(test)]
 mod tests {
+    use crate::RecordData;
 
     use super::*;
     use crate::ede::InfoCode;
@@ -720,7 +721,7 @@ mod tests {
                 rr.name.as_ref(),
                 rr.class,
                 rr.ttl,
-                &rr.rdata,
+                rr.rdata.as_ref(),
             )
             .unwrap();
         }
@@ -729,7 +730,7 @@ mod tests {
             ns.name.as_ref(),
             ns.class,
             ns.ttl,
-            &ns.rdata,
+            ns.rdata.as_ref(),
         )
         .unwrap();
         w.set_edns(Edns::with_payload_size(1232));
@@ -755,7 +756,7 @@ mod tests {
                 name.as_ref(),
                 Class::IN,
                 Ttl::from_secs(300),
-                &a_record([192, 0, 2, i]),
+                a_record([192, 0, 2, i]).as_ref(),
             )
             .unwrap();
         }
@@ -787,7 +788,7 @@ mod tests {
                 nm("one.example.org.").as_ref(),
                 Class::IN,
                 Ttl::from_secs(300),
-                &a_record([192, 0, 2, 9]),
+                a_record([192, 0, 2, 9]).as_ref(),
             )
             .unwrap();
             w.set_edns(Edns::with_payload_size(1232));
@@ -805,7 +806,7 @@ mod tests {
                     name.as_ref(),
                     Class::IN,
                     Ttl::from_secs(300),
-                    &a_record([192, 0, 2, i]),
+                    a_record([192, 0, 2, i]).as_ref(),
                 )
                 .unwrap();
             }
@@ -840,7 +841,7 @@ mod tests {
             nm("example.com.").as_ref(),
             Class::IN,
             Ttl::from_secs(300),
-            &mx,
+            mx.as_ref(),
         )
         .unwrap();
         w.finish().unwrap();

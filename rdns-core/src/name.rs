@@ -296,6 +296,82 @@ fn decode_escape(bytes: &[u8]) -> WireResult<(u8, usize)> {
     Ok((byte, 4))
 }
 
+/// Where one name's octets sit in a [`NameArena`].
+///
+/// A name is at most 255 octets (RFC 1035 §2.3.4), so the length is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NameSpan {
+    off: u32,
+    len: u8,
+}
+
+/// Every owner name in one allocation.
+///
+/// The store behind a zone (`TODO.md` #71e), and here rather than in a module
+/// of its own for the reason [`RdataArena`] is in `record_data.rs`: handing out
+/// a [`NameRef`] over octets it holds means minting one without the label walk
+/// [`NameRef::from_wire_slice`] does, and a `pub(crate)` constructor for that
+/// would be open to every module in the library rather than to the one caller.
+/// What seals this instead is its own door — the only way in is a `NameRef`, so
+/// what comes out was a name on the way in (`CLAUDE.md` §17).
+///
+/// **Append-only, and spans belong to the arena that minted them.** Nothing
+/// here removes or rewrites octets: a span handed back after a removal would
+/// otherwise name something else. Reclaiming what a removed record held means
+/// rebuilding the arena, which is the owner's business — `rdns::zone::Zone`
+/// does it on a counter.
+///
+/// [`RdataArena`]: crate::RdataArena
+#[derive(Debug, Clone, Default)]
+pub struct NameArena {
+    bytes: Vec<u8>,
+}
+
+impl NameArena {
+    pub fn new() -> NameArena {
+        NameArena::default()
+    }
+
+    /// Copy `name`'s octets in and give back where they went.
+    ///
+    /// The only way to make a [`NameSpan`], which is what lets [`get`] be
+    /// infallible and skip the walk.
+    ///
+    /// [`get`]: NameArena::get
+    pub fn push(&mut self, name: NameRef<'_>) -> NameSpan {
+        let off = self.bytes.len();
+        self.bytes.extend_from_slice(name.0);
+        NameSpan {
+            // `check_name_len` bounds a name at 255 octets, so `len` cannot
+            // overflow; `off` is checked because an arena past 4 GiB is
+            // reachable on a zone big enough to exhaust the machine, and a
+            // silent truncation there is §2's "`as` is a bug until proven
+            // otherwise" with a wrong answer at the end of it.
+            off: u32::try_from(off).expect("a name arena under 4 GiB"),
+            len: name.0.len() as u8,
+        }
+    }
+
+    /// The name at `at`.
+    pub fn get(&self, at: NameSpan) -> NameRef<'_> {
+        let off = at.off as usize;
+        NameRef(&self.bytes[off..off + at.len as usize])
+    }
+
+    /// Octets held, for a caller sizing a rebuild.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn reserve(&mut self, octets: usize) {
+        self.bytes.reserve(octets);
+    }
+}
+
 impl<'a> NameRef<'a> {
     /// Borrow a name from octets that already hold one.
     ///

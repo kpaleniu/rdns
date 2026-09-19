@@ -27,7 +27,7 @@
 use super::Zone;
 use crate::error::ZoneError;
 use crate::record_types as rt;
-use crate::{Name, Rtype};
+use crate::{NameRef, Rtype};
 
 /// RFC 1034 §3.6.2: a CNAME must be the only type at its owner name. Refused at
 /// load, because there is no correct answer to give at query time.
@@ -49,7 +49,7 @@ pub(super) fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
         let mut has_cname = false;
         let mut others: Vec<Rtype> = Vec::new();
         for &position in positions {
-            let rtype = zone.records()[position].rdata.rtype();
+            let rtype = zone.record(position).rdata.rtype();
             if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3) {
                 continue;
             }
@@ -60,7 +60,7 @@ pub(super) fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
             }
         }
         if has_cname && !others.is_empty() {
-            let name = &zone.records()[positions[0]].name;
+            let name = zone.record(positions[0]).name;
             let others: Vec<String> = others.iter().map(Rtype::to_string).collect();
             return Err(ZoneError::invalid(format!(
                 "{name} has a CNAME and also type(s) {} — RFC 1034 §3.6.2 allows a CNAME to be \
@@ -90,21 +90,21 @@ pub(super) fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
 /// however it got here.
 pub(super) fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
     let apex = zone.origin();
-    let mut owners: Vec<&Name> = Vec::new();
+    let mut owners: Vec<NameRef<'_>> = Vec::new();
 
     for record in zone.records() {
         if record.rdata.rtype() != rt::DNAME {
             continue;
         }
-        let key = &record.name;
+        let key = record.name;
         // Only for the message: comparisons below are the name's own.
-        let shown = key.as_ref().to_presentation();
+        let shown = key.to_presentation();
 
         // §3.3: "records of the form `*.example.com DNAME example.net` SHOULD
         // NOT be used", because "the interaction between the expansion of the
         // wildcard and the redirection of the DNAME is non-deterministic".
         // Non-deterministic is not a thing a server can be asked to serve.
-        if key.as_ref().labels().next() == Some(b"*") {
+        if key.labels().next() == Some(b"*") {
             return Err(ZoneError::invalid(format!(
                 "{shown} is a wildcard DNAME — RFC 6672 §3.3 says the interaction between \
                  wildcard expansion and DNAME redirection is non-deterministic, so there is \
@@ -130,7 +130,7 @@ pub(super) fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
         // then the NS RR signifies a delegation point, and the DNAME RR must in
         // that case appear below the zone cut at the zone apex of the child
         // zone."
-        if key.as_ref() != apex && zone.has_type(key.as_ref(), rt::NS) {
+        if key != apex && zone.has_type(key, rt::NS) {
             return Err(ZoneError::invalid(format!(
                 "{shown} has both a DNAME and an NS RRset below the apex — RFC 6672 §2.3 \
                  forbids it, because the NS makes this a zone cut and the DNAME then belongs \
@@ -158,10 +158,10 @@ pub(super) fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
         if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3 | rt::NSEC3PARAM) {
             continue;
         }
-        let key = record.name.as_ref();
-        for owner in &owners {
-            if key != owner.as_ref() && key.is_at_or_under(owner.as_ref()) {
-                let (key, owner) = (key.to_presentation(), owner.as_ref().to_presentation());
+        let key = record.name;
+        for &owner in &owners {
+            if key != owner && key.is_at_or_under(owner) {
+                let (key, owner) = (key.to_presentation(), owner.to_presentation());
                 return Err(ZoneError::invalid(format!(
                     "{key} is below the DNAME at {owner} — RFC 6672 §2.4 says resource \
                      records must not exist at any subdomain of a DNAME owner, and this one \

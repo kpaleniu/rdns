@@ -8,8 +8,8 @@
 use crate::clock::current_unix_timestamp;
 use crate::dnssec::{verify_rrset, Dnskey, Rrset, RrsetProof, Rrsig};
 use crate::record_types;
-use crate::zone::{Zone, ZoneRecord};
-use crate::{Qtype, RecordData, ResourceRecord};
+use crate::zone::{Zone, ZoneRecordRef};
+use crate::{Qtype, RecordDataRef, ResourceRecord};
 
 /// The keys every RRset in one zone is checked against, collected once.
 ///
@@ -43,10 +43,10 @@ impl ZoneKeys {
             .inspect(|_| signed = true)
             .filter_map(|r| {
                 Dnskey::from_record(&ResourceRecord {
-                    name: r.name.clone(),
+                    name: r.name.to_owned(),
                     class: r.class,
                     ttl: r.ttl,
-                    rdata: r.rdata.clone(),
+                    rdata: r.rdata.to_owned(),
                 })
             })
             .collect();
@@ -103,7 +103,7 @@ impl DnssecValidator {
     pub fn validate_response(
         &self,
         zone: &Zone,
-        records: &[&ZoneRecord],
+        records: &[ZoneRecordRef<'_>],
         _query_name: &str,
     ) -> (bool, bool) {
         if !self.enabled {
@@ -124,7 +124,7 @@ impl DnssecValidator {
         &self,
         zone: &Zone,
         keys: &ZoneKeys,
-        records: &[&ZoneRecord],
+        records: &[ZoneRecordRef<'_>],
     ) -> (bool, bool) {
         if !self.enabled {
             return (true, false);
@@ -145,21 +145,23 @@ impl DnssecValidator {
 
         // `verify_rrset` picks the ones covering this RRset by owner and type,
         // and rejects a signer outside the zone.
-        let owner = first.name.as_ref();
+        let owner = first.name;
         let rrsigs: Vec<Rrsig> = zone
             .query(owner, Qtype::of(record_types::RRSIG))
             .into_iter()
             .filter_map(|r| {
                 Rrsig::from_record(&ResourceRecord {
-                    name: r.name.clone(),
+                    name: r.name.to_owned(),
                     class: r.class,
                     ttl: r.ttl,
-                    rdata: r.rdata.clone(),
+                    rdata: r.rdata.to_owned(),
                 })
             })
             .collect();
 
-        let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
+        // Borrowed, not copied: the RRset is the zone's own arena (`TODO.md`
+        // #71e), and `Rrset` is generic over what holds one record's RDATA.
+        let rdatas: Vec<RecordDataRef<'_>> = records.iter().map(|r| r.rdata).collect();
         let proof = verify_rrset(
             &Rrset::new(owner, first.rdata.rtype(), first.class, &rdatas),
             &rrsigs,
@@ -186,6 +188,7 @@ mod tests {
     use crate::zone::ZoneRecord;
     use crate::Class;
     use crate::ParsedRecord;
+    use crate::RecordData;
     use crate::Ttl;
     use std::net::Ipv4Addr;
 

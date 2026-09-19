@@ -491,25 +491,24 @@ mod tests {
             .records()
             .iter()
             .find(|r| r.rdata.rtype() == rt::SOA)
-            .expect("an apex SOA")
-            .clone();
-        let as_wire = |r: &rdns::zone::ZoneRecord| rdns_core::ResourceRecord {
-            name: r.name.clone(),
+            .expect("an apex SOA");
+        let as_wire = |r: rdns::zone::ZoneRecordRef<'_>| rdns_core::ResourceRecord {
+            name: r.name.to_owned(),
             class: r.class,
             ttl: r.ttl,
-            rdata: r.rdata.clone(),
+            rdata: r.rdata.to_owned(),
         };
 
         let mut first = DnsMessageBuilder::new().build();
-        first.answers.push(as_wire(&soa));
+        first.answers.push(as_wire(soa));
         for r in zone.records().iter().filter(|r| r.rdata.rtype() != rt::SOA) {
             first.answers.push(as_wire(r));
         }
         let mut last = DnsMessageBuilder::new().build();
         // The end marker, and a record after it that a correct reader never
         // sees — if the loop kept going it would be in the output.
-        last.answers.push(as_wire(&soa));
-        last.answers.push(as_wire(&soa));
+        last.answers.push(as_wire(soa));
+        last.answers.push(as_wire(soa));
         (vec![first, last], zone)
     }
 
@@ -549,7 +548,7 @@ mod tests {
                         && after.rdata.rtype() == before.rdata.rtype()
                         && after.rdata.bytes() == before.rdata.bytes()),
                 "{} {} did not survive",
-                before.name.as_ref().to_presentation(),
+                before.name.to_presentation(),
                 record_type_name(before.rdata.rtype())
             );
         }

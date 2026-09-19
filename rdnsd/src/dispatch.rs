@@ -1835,11 +1835,11 @@ pub(crate) mod tests {
             );
 
             let rrsig = rdns::record_types::RRSIG;
-            let was: HashSet<(&rdns::Name, &[u8])> = previous
+            let was: HashSet<(rdns::NameRef<'_>, &[u8])> = previous
                 .records()
                 .iter()
                 .filter(|r| r.rdata.rtype() == rrsig)
-                .map(|r| (&r.name, r.rdata.bytes()))
+                .map(|r| (r.name, r.rdata.bytes()))
                 .collect();
             let now: Vec<_> = installed
                 .records()
@@ -1848,7 +1848,7 @@ pub(crate) mod tests {
                 .collect();
             let carried = now
                 .iter()
-                .filter(|r| was.contains(&(&r.name, r.rdata.bytes())))
+                .filter(|r| was.contains(&(r.name, r.rdata.bytes())))
                 .count();
             // Made fresh, not carried: what the run actually paid ECDSA for.
             let made = now.len() - carried;

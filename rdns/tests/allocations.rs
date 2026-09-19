@@ -153,33 +153,35 @@ fn writing_a_record_as_text_borrows_it() {
         .records()
         .iter()
         .find(|r| r.rdata.rtype() == rdns::record_types::A)
-        .expect("an A record")
-        .clone();
+        .expect("an A record");
     let wire = rdns::ResourceRecord {
-        name: record.name.clone(),
+        name: record.name.to_owned(),
         class: record.class,
         ttl: record.ttl,
-        rdata: record.rdata.clone(),
+        rdata: record.rdata.to_owned(),
     };
 
     // The first call in a process picks up one-off initialization
     // (`CLAUDE.md` §10).
-    let _ = rdns::zone_writer::record_to_string(&record);
+    let _ = rdns::zone_writer::record_to_string(record);
 
     let (from_zone, zone_blocks) =
-        allocations(|| rdns::zone_writer::record_to_string(&record).expect("a line"));
+        allocations(|| rdns::zone_writer::record_to_string(record).expect("a line"));
     let (from_wire, wire_blocks) =
         allocations(|| rdns::record_text::resource_record_line(&wire).expect("a line"));
 
     // The shape this replaced, measured rather than asserted in prose: the
     // journal held a `ResourceRecord` and built a `ZoneRecord` to render it.
     let (from_copy, copy_blocks) = allocations(|| {
-        rdns::zone_writer::record_to_string(&rdns::zone::ZoneRecord {
-            name: wire.name.clone(),
-            ttl: wire.ttl,
-            class: wire.class,
-            rdata: wire.rdata.clone(),
-        })
+        rdns::zone_writer::record_to_string(
+            rdns::zone::ZoneRecord {
+                name: wire.name.clone(),
+                ttl: wire.ttl,
+                class: wire.class,
+                rdata: wire.rdata.clone(),
+            }
+            .as_ref(),
+        )
         .expect("a line")
     });
 
@@ -395,19 +397,25 @@ fn one_query_end_to_end() {
         zone.query(qname.as_ref(), Qtype::of(record_types::A))
             .into_iter()
             .map(|r| ResourceRecord {
-                name: r.name.clone(),
+                name: r.name.to_owned(),
                 class: r.class,
                 ttl: r.ttl,
-                rdata: r.rdata.clone(),
+                rdata: r.rdata.to_owned(),
             })
             .collect::<Vec<_>>()
     });
     assert_eq!(answers.len(), 1);
-    // Four, all of them the `ResourceRecord` this closure builds: two `Vec`s,
-    // the cloned owner name, the cloned rdata. `Zone::query` contributes only
-    // the first. Exact, because nothing here is input-dependent or hash-ordered:
-    // a fifth would be the lookup key becoming an owned `String` again.
-    within("look up one A record in the zone", lookup_count, 4..=4);
+    // Three: `Zone::query`'s vector, the owner name copied out of the zone's
+    // arena, and the RDATA copied out of the other one. Exact, because nothing
+    // here is input-dependent or hash-ordered: a fourth would be the lookup key
+    // becoming an owned `String` again.
+    //
+    // **It was four until `TODO.md` #71e**, and the one that went is the
+    // `collect` at the end of this closure: `ZoneRecordRef` and
+    // `ResourceRecord` are both 48 bytes, so `Vec`'s in-place collection reuses
+    // the allocation `query` returned instead of making a second. A
+    // `Vec<&ZoneRecord>` is 8 bytes an element and could not.
+    within("look up one A record in the zone", lookup_count, 3..=3);
 
     let mut response = parsed.clone();
     response.response = true;
@@ -486,7 +494,7 @@ fn writing_a_response_costs_nothing_per_record() {
         let mut w = ResponseWriter::start(out, compressor, 4096, &request).expect("start");
         w.set_authoritative(true);
         for r in &records {
-            w.push(Section::Answer, qname.as_ref(), r.class, r.ttl, &r.rdata)
+            w.push(Section::Answer, qname.as_ref(), r.class, r.ttl, r.rdata)
                 .expect("push");
         }
         w.set_edns(Edns::with_payload_size(1232));
@@ -665,7 +673,7 @@ fn reading_one_integer_out_of_an_soa() {
         .expect("the apex SOA");
 
     // The shape this replaced, kept as a measurement rather than as code.
-    let old = |soa: &rdns::zone::ZoneRecord| match soa.rdata.parse() {
+    let old = |soa: rdns::zone::ZoneRecordRef<'_>| match soa.rdata.parse() {
         Ok(rdns::ParsedRecord::SOA { minimum, .. }) => minimum,
         _ => panic!("the apex SOA parses"),
     };
@@ -776,7 +784,7 @@ fn a_response_full_of_shared_suffixes() {
                 name: nm(name),
                 class: record.class,
                 ttl: record.ttl,
-                rdata: record.rdata.clone(),
+                rdata: record.rdata.to_owned(),
             });
         }
     }
@@ -827,6 +835,11 @@ fn one_zone_load_and_sign() {
     // eight records and pays the one, where a million-record zone stops paying
     // two million. §17 asks for the reason either way, and this is the shape of
     // it — a fixed cost traded against a per-record one.
+    //
+    // **88 -> 91 with #71e**, the same trade twice more: a zone's owner names
+    // and its RDATA are each one arena now rather than a `Box` per record, so
+    // eight records pay two arenas and their growth where a million records
+    // stop paying two million `Box`es.
     within("parse an eight-record zone", parse_count, 60..=200);
 
     let keys = vec![
@@ -865,6 +878,11 @@ fn one_zone_load_and_sign() {
     // so the name arena grows from empty and doubles a few times. Four
     // allocations on an eight-record zone, against two per name saved on a
     // large one.
+    //
+    // **570 -> 583 with #71e**, the same shape a third and fourth time: the
+    // signer builds two zones, each with a name arena and an RDATA arena
+    // growing from empty. Thirteen fixed allocations here against four million
+    // on a million-record zone.
     within("sign an eight-record zone", sign_count, 400..=1_400);
 }
 
@@ -1205,7 +1223,7 @@ fn answering_a_signed_query() {
                 qname,
                 record.class,
                 record.ttl,
-                &record.rdata,
+                record.rdata,
             )
             .expect("the record writes");
         }
@@ -1441,10 +1459,10 @@ fn verifying_an_rrset_against_two_candidate_signatures() {
             .query(nm(name).as_ref(), Qtype::of(rtype))
             .into_iter()
             .map(|r| ResourceRecord {
-                name: r.name.clone(),
+                name: r.name.to_owned(),
                 class: r.class,
                 ttl: r.ttl,
-                rdata: r.rdata.clone(),
+                rdata: r.rdata.to_owned(),
             })
             .collect()
     };
