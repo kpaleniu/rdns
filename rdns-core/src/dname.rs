@@ -375,7 +375,7 @@ impl<'a> DNameUnpacker<'a> {
 
     /// The same name as uncompressed wire octets, for [`crate::Name`].
     ///
-    /// The sibling of [`DNameUnpacker::decode`]: same walk, same pointer
+    /// The sibling of [`DNameUnpacker::unpack`]: same walk, same pointer
     /// resolution, and it keeps the octets instead of spelling them. Here
     /// rather than in `name.rs` because resolving a pointer needs the message
     /// and the depth cap, both of which are this type's.
@@ -464,7 +464,7 @@ pub(crate) fn name_wire_from_bytes_in<'a>(
 ///
 /// For stored RDATA, which [`crate::RecordData`] keeps uncompressed: a pointer
 /// here is a malformed record rather than something to follow, since there is no
-/// message to resolve it against. [`dname_from_bytes`] is the reading form; this
+/// message to resolve it against. [`name_wire_from_bytes`] is the reading form; this
 /// exists for a caller that wants a field *after* a name and would otherwise
 /// allocate the name to get past it.
 ///
