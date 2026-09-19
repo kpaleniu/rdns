@@ -115,6 +115,41 @@ impl Name {
         Name::joined(&buf[..len - 1], origin)
     }
 
+    /// A zone file's owner-name text resolved against `origin`, into `buf`.
+    ///
+    /// The three spellings RFC 1035 §5.1 gives one name — `@`, a trailing dot,
+    /// and anything else — decided in one place, because a second copy of that
+    /// rule is a zone whose apex records land under a different name than its
+    /// relative ones.
+    ///
+    /// Into the caller's buffer, because the parser resolves one of these per
+    /// record and keeps none of them: a zone copies the octets into its own
+    /// arena, so the `Name` between the two was a heap allocation and a free
+    /// per record (`TODO.md` #72).
+    pub fn absolutized_in<'b>(
+        text: &str,
+        origin: NameRef<'_>,
+        buf: &'b mut [u8; MAX_NAME_LEN],
+    ) -> WireResult<NameRef<'b>> {
+        let text = text.trim();
+        if text.is_empty() || text == "@" {
+            let len = origin.0.len();
+            buf[..len].copy_from_slice(origin.0);
+            return Ok(NameRef(&buf[..len]));
+        }
+        let len = presentation_wire_in(text, buf)?;
+        if text.ends_with('.') {
+            return Ok(NameRef(&buf[..len]));
+        }
+        // Relative: the root terminator `presentation_wire_in` wrote is where
+        // the origin's own octets go.
+        let head = len - 1;
+        let joined = head + origin.0.len();
+        check_name_len(joined)?;
+        buf[head..joined].copy_from_slice(origin.0);
+        Ok(NameRef(&buf[..joined]))
+    }
+
     /// `head`'s labels, then `tail`'s: how an RPZ trigger name is built from a
     /// QNAME and the policy zone's origin (`rdns::rpz`, `TODO.md` #45a).
     ///
@@ -491,6 +526,24 @@ impl<'a> NameRef<'a> {
         self.ancestors()
             .find(|ancestor| ancestor.0.len() <= other.0.len())
             .is_some_and(|ancestor| ancestor == other)
+    }
+
+    /// [`NameRef::folded_in`] over a fixed buffer: a name is at most 255 octets
+    /// (RFC 1035 §2.3.4), so a caller folding one per record can keep the
+    /// buffer on its stack and allocate nothing at all.
+    pub fn folded_into<'b>(self, buf: &'b mut [u8; MAX_NAME_LEN]) -> NameRef<'b>
+    where
+        'a: 'b,
+    {
+        if self.0.iter().any(u8::is_ascii_uppercase) {
+            let n = self.0.len();
+            for (out, &b) in buf[..n].iter_mut().zip(self.0) {
+                *out = b.to_ascii_lowercase();
+            }
+            NameRef(&buf[..n])
+        } else {
+            NameRef(self.0)
+        }
     }
 
     /// This name folded to lower case, as a name.

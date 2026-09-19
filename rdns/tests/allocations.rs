@@ -840,7 +840,15 @@ fn one_zone_load_and_sign() {
     // and its RDATA are each one arena now rather than a `Box` per record, so
     // eight records pay two arenas and their growth where a million records
     // stop paying two million `Box`es.
-    within("parse an eight-record zone", parse_count, 60..=200);
+    //
+    // **91 -> 54 with #72**, which is the other direction and four allocations
+    // a record: the owner name is resolved into the parser's own buffer and
+    // handed to `Zone::add` borrowed, so neither the `Name` nor the `Name` the
+    // state carried to the next line exists; the index key is folded onto the
+    // stack; the type name is upper-cased there; and the token vector is
+    // refilled per line rather than rebuilt. At a million records the parse is
+    // 480 ns a record to 322 (`rdns/tests/scale.rs`).
+    within("parse an eight-record zone", parse_count, 40..=200);
 
     let keys = vec![
         SigningKey::generate(

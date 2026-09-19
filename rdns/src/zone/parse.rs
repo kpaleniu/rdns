@@ -13,9 +13,10 @@
 
 use super::checks::{check_cname_exclusivity, check_dname_rules};
 use super::rdata::{parse_generic_rdata, rdata_from_fields};
-use super::{Zone, ZoneRecord};
+use super::{Zone, ZoneRecordRef};
 use crate::error::{WireError, ZoneError};
 use crate::{Class, Name, NameRef, RecordData, Ttl};
+use rdns_core::dname::MAX_NAME_LEN;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
@@ -26,14 +27,13 @@ use std::path::{Path, PathBuf};
 /// Only the relative case allocates, and it is the zone parser's; a name off
 /// the wire is absolute, and a query takes four of these.
 pub(super) fn absolutize(name: &str, origin: NameRef<'_>) -> Result<Name, WireError> {
-    let name = name.trim();
-    if name.is_empty() || name == "@" {
-        Ok(origin.to_owned())
-    } else if name.ends_with('.') {
-        Name::from_presentation(name)
-    } else {
-        Name::relative_to(name, origin)
-    }
+    let mut buf = [0u8; MAX_NAME_LEN];
+    Ok(Name::absolutized_in(name, origin, &mut buf)?.to_owned())
+}
+
+/// What a name that is not one reads as, wherever a zone file spells one.
+fn not_a_name(name: &str, ln: usize, e: WireError) -> ZoneError {
+    ZoneError::syntax(ln, format!("the name {name:?} is not a name: {e}"))
 }
 
 /// The same, as a zone error that names the line.
@@ -42,8 +42,7 @@ pub(super) fn absolutize(name: &str, origin: NameRef<'_>) -> Result<Name, WireEr
 /// inside RDATA, which RFC 1035 §5.1 makes relative to the origin in exactly
 /// the same way ("domain names in the RDATA section... are also relative").
 pub(super) fn name_at(name: &str, origin: NameRef<'_>, ln: usize) -> Result<Name, ZoneError> {
-    absolutize(name, origin)
-        .map_err(|e| ZoneError::syntax(ln, format!("the name {name:?} is not a name: {e}")))
+    absolutize(name, origin).map_err(|e| not_a_name(name, ln, e))
 }
 
 /// One record or directive, assembled from as many physical lines as it spans.
@@ -181,11 +180,12 @@ fn logical_lines(content: &str) -> Result<Vec<LogicalLine<'_>>, ZoneError> {
 ///
 /// Borrowed unless a quote or an escape means the token is not a contiguous
 /// run of the input: a `String` per token was 240 ms of a million-rule load.
-fn tokenize(text: &str) -> Vec<Cow<'_, str>> {
+fn tokenize_into<'a>(text: &'a str, out: &mut Vec<Cow<'a, str>>) {
+    out.clear();
     if !text.bytes().any(|b| matches!(b, b'"' | b'\\')) {
-        return text.split_whitespace().map(Cow::Borrowed).collect();
+        out.extend(text.split_whitespace().map(Cow::Borrowed));
+        return;
     }
-    let mut out = Vec::new();
     let mut current = String::new();
     let mut started = false;
     let mut in_quotes = false;
@@ -227,7 +227,18 @@ fn tokenize(text: &str) -> Vec<Cow<'_, str>> {
     if started {
         out.push(Cow::Owned(current));
     }
-    out
+}
+
+/// `text` upper-cased into `buf`, or `None` if it does not fit or is not ASCII.
+fn upper_into<'b>(text: &str, buf: &'b mut [u8; 32]) -> Option<&'b str> {
+    if !text.is_ascii() || text.len() > buf.len() {
+        return None;
+    }
+    let n = text.len();
+    for (out, &b) in buf[..n].iter_mut().zip(text.as_bytes()) {
+        *out = b.to_ascii_uppercase();
+    }
+    std::str::from_utf8(&buf[..n]).ok()
 }
 
 /// How deep `$INCLUDE` may nest. A file that includes itself is otherwise a
@@ -241,8 +252,20 @@ struct ParseState {
     origin: Name,
     /// The default TTL for records that do not state one (`$TTL`).
     ttl: Ttl,
-    /// The last owner name seen, for lines that omit theirs.
-    owner: Option<Name>,
+    /// The last owner name seen, for lines that omit theirs: wire octets in a
+    /// buffer the parser refills, `owner_len` 0 for none yet. A `Name` here was
+    /// an allocation per record for a value the zone copies into its arena
+    /// anyway (`TODO.md` #72).
+    owner: [u8; MAX_NAME_LEN],
+    owner_len: usize,
+}
+
+impl ParseState {
+    /// The owner name in force, or `None` before the file's first record.
+    fn owner(&self) -> Option<NameRef<'_>> {
+        (self.owner_len > 0)
+            .then(|| NameRef::from_wire_slice(&self.owner[..self.owner_len]).expect("a name in"))
+    }
 }
 
 /// Parse a BIND-format zone file.
@@ -282,7 +305,8 @@ fn parse_zone_file_with_base(
     let mut state = ParseState {
         origin: apex,
         ttl: Ttl::from_secs(3600),
-        owner: None,
+        owner: [0u8; MAX_NAME_LEN],
+        owner_len: 0,
     };
     let mut moved_apex = None;
     parse_into(&mut zone, content, &mut state, base_dir, 0, &mut moved_apex)?;
@@ -310,11 +334,15 @@ fn parse_into(
     // An upper bound on the records this file adds, and the only cheap one
     // there is: directives and blank lines are the slack.
     zone.reserve(lines.len());
-    for logical in lines {
+    // Refilled per line rather than rebuilt: these were one `Vec` each per
+    // record, 96 and 64 octets, the two largest allocations on the load path
+    // and together larger than the name and the RDATA.
+    let mut tokens: Vec<Cow<'_, str>> = Vec::new();
+    for logical in &lines {
         let ln = logical.line_no;
         // Quoted strings stay whole; `parts` is the plain view of the same
         // fields, which is all any record but TXT needs.
-        let tokens = tokenize(&logical.text);
+        tokenize_into(&logical.text, &mut tokens);
         let parts: Vec<&str> = tokens.iter().map(Cow::as_ref).collect();
         let Some(&first) = parts.first() else {
             continue;
@@ -382,7 +410,8 @@ fn parse_into(
                     None => state.origin.clone(),
                 },
                 ttl: state.ttl,
-                owner: None,
+                owner: [0u8; MAX_NAME_LEN],
+                owner_len: 0,
             };
             parse_into(
                 zone,
@@ -402,23 +431,26 @@ fn parse_into(
         // Resolved against the origin in force here, which is what makes
         // `$ORIGIN` apply to the lines below it only.
         let mut idx = 0;
-        let record_name = if logical.omits_owner {
-            state.owner.clone().ok_or_else(|| {
-                ZoneError::syntax(
-                    ln,
-                    "record omits its owner name but no previous record supplies one",
-                )
-            })?
-        } else {
+        if !logical.omits_owner {
             // RFC 1035 §5.1's escapes are resolved here, `a\.b` included —
             // one label of three octets. This was refused at load until names
             // became wire form, because presentation storage with `.` as the
             // separator could not tell that name from two labels (D-1).
-            let name = name_at(first, state.origin.as_ref(), ln)?;
-            state.owner = Some(name.clone());
+            let mut buf = [0u8; MAX_NAME_LEN];
+            let len = Name::absolutized_in(first, state.origin.as_ref(), &mut buf)
+                .map_err(|e| not_a_name(first, ln, e))?
+                .as_wire()
+                .len();
+            state.owner[..len].copy_from_slice(&buf[..len]);
+            state.owner_len = len;
             idx += 1;
-            name
-        };
+        }
+        if state.owner_len == 0 {
+            return Err(ZoneError::syntax(
+                ln,
+                "record omits its owner name but no previous record supplies one",
+            ));
+        }
 
         let mut ttl = state.ttl;
         // Always IN: the branch below refuses any other class outright. A zone
@@ -457,7 +489,11 @@ fn parse_into(
             continue;
         }
 
-        let record_type = parts[idx].to_uppercase();
+        // Upper-cased on the stack: a `String` per record for a token that is
+        // almost always one or two octets. A token too long or not ASCII is no
+        // type name either way, so it goes on unchanged to the same error.
+        let mut type_buf = [0u8; 32];
+        let record_type: &str = upper_into(parts[idx], &mut type_buf).unwrap_or(parts[idx]);
         idx += 1;
         // One field is the whole RDATA text, which is most records; joining a
         // one-element slice copies it for nothing.
@@ -471,19 +507,19 @@ fn parse_into(
         // type-specific spelling would not read back as the same bytes. §5
         // permits it for known types too, so it is accepted for them.
         if parts.get(idx).is_some_and(|token| *token == "\\#") {
-            let rdata = parse_generic_rdata(&record_type, &parts[idx + 1..])
+            let rdata = parse_generic_rdata(record_type, &parts[idx + 1..])
                 .map_err(|e| ZoneError::syntax(ln, format!("{record_type} record: {e}")))?;
-            zone.add_record(ZoneRecord {
-                name: record_name,
+            zone.add(ZoneRecordRef {
+                name: state.owner().expect("an owner name"),
                 ttl,
                 class,
-                rdata,
+                rdata: rdata.as_ref(),
             });
             continue;
         }
 
         let rdata: RecordData = rdata_from_fields(
-            &record_type,
+            record_type,
             rdata,
             &parts[idx..],
             &tokens[idx..],
@@ -491,11 +527,11 @@ fn parse_into(
             ln,
         )?;
 
-        zone.add_record(ZoneRecord {
-            name: record_name,
+        zone.add(ZoneRecordRef {
+            name: state.owner().expect("an owner name"),
             ttl,
             class,
-            rdata,
+            rdata: rdata.as_ref(),
         });
     }
 

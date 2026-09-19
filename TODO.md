@@ -37,7 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#72** and **#21**, as of 2026-09-19. **#57 is
+**#58**, **#68**, **#72** (down to 72a and 72b) and **#21**, as of
+2026-09-19. **#57 is
 closed**: 57e was the last of it, and the measurement that
 could have refuted it did — IXFR as this tree had it was *slower* than a whole
 transfer, because applying forty records to a million-record zone cost 1 018 ms
@@ -82,7 +83,10 @@ the one thing it got wrong: 98 errors was measured by *sealing* `Zone::records`
 where the change had to *replace* it, and a `Records` view with `len`, `iter`
 and `IntoIterator` came out at 66. **#72** came out of it — filling an arena
 from an owned `ZoneRecord` copies what the caller just allocated, 50 ms a
-million records against the 79 ms a million every copy stops paying.
+million records against the 79 ms a million every copy stops paying. It was
+right about the count and wrong about which: seven allocations a record, not
+the two it named, and the largest of them is one line of `Zone::add_record`
+itself.
 
 Four by-products worth the trip: `rpz_install.rs` had no turnstile, so every
 number #57e and #71 recorded was taken with two other million-rule measurements
@@ -4389,8 +4393,10 @@ a correction and not a retraction.
   are still made — by the caller — and one copy is added. That copy is
   **#72**.
 
-  The other six allocations per record are their own question and nobody has
-  asked it; this row is not it. Two of them are **#72**.
+  The other six allocations per record are their own question and ~~nobody has
+  asked it~~ **#72 asked it on 2026-09-19**: on `scale.rs`'s zone there are
+  seven in all, five of them came out, and the largest was `add_record`'s own.
+  This row is not it. Two of them are **#72**.
 
 
 
@@ -4499,7 +4505,7 @@ a correction and not a retraction.
   day 61b landed.
 ---
 
-### 72. A zone's arena is filled from something the caller already allocated — **filed 2026-09-19**
+### 72. A zone's arena is filled from something the caller already allocated — **filed 2026-09-19, five of seven allocations gone the same day; 72a and 72b open**
 
 Out of 71e, whose measurement said the load path would not move and was right
 about why: a zone keeps its owner names and its RDATA in two arenas now, but
@@ -4510,25 +4516,95 @@ record costs the caller's two allocations *and* a copy into the arena.
 `rdns/tests/scale.rs` at a million records — 50 ms a million, against the 79 ms
 a million every *copy* of that zone stops paying (#71e). A parse does not show
 it: 599.8 ms before and 588.8 after, 8 000 062 allocations and 8 000 065,
-because the parse is dominated by the eight allocations a record already costs
-it.
+~~because the parse is dominated by the eight allocations a record already costs
+it.~~
 
-**No remedy claimed, and the obvious one is not it.** A borrowed
+**The count was right and it pointed the wrong way** (2026-09-19). Seven
+allocations a record on the load line of `rdns/tests/scale.rs` — a different
+input from 71e's million-*rule* RPZ figure above, which is why the two counts
+differ — and the two this row names are the two smallest:
+
+| | what | per record |
+|---|---|---|
+| 96 B | `tokenize`'s `Vec<Cow<str>>`, one per line | 1.00 |
+| 64 B | `parts: Vec<&str>` — a second copy of that same list | 1.00 |
+| 24 B | the owner `Name` from `name_at` | 1.00 |
+| 24 B | `state.owner = Some(name.clone())` | 1.00 |
+| 24 B | **`Zone::add_record`'s own index key**, which this row did not count | 1.00 |
+| 4 B | the `RecordData` box | 1.00 |
+| 1 B | `parts[idx].to_uppercase()` | 1.00 |
+
+Five came out without touching how an RDATA is built. Cumulative, on the load
+line of `rdns/tests/scale.rs` at a million records, Windows release:
+
+| | ns/rec | allocs |
+|---|---|---|
+| as filed | **480** | 7 |
+| fold the index key onto the stack (`NameRef::folded_into`) | 432 | 6 |
+| refill the token vector per line instead of rebuilding it | 419 | 5 |
+| `Zone::add(ZoneRecordRef)`, owner carried as octets not cloned | 380 | 4 |
+| upper-case the type name on the stack | 348 | 3 |
+| `Name::absolutized_in` — this row's name half | **322** | 2 |
+
+An alloc-and-free pair is **~32 ns** for the small ones and **~13 ns** for the
+two per-line `Vec`s: it is the count that costs, not the octets. `Zone::clone`
+is unchanged at 30.6 ns and `parse an eight-record zone` is 91 allocations to
+54, the 54 read on Windows and on Linux (`rdns/tests/allocations.rs`).
+
+**The row's own headline was not the copy.** "Built, not parsed" reads 257 ns
+to **211** from the index-key fold alone — 46 of the 50 ns this row was filed
+at, from one line in the same function, and the copy is still there.
+
+~~**No remedy claimed, and the obvious one is not it.** A borrowed
 `Zone::add(NameRef, Ttl, Class, RecordDataRef)` saves the copy and not the
-allocation: the parser builds a `Name` out of presentation text and a
-`RecordData` out of parsed fields before it has anything to hand over, so the
-allocation belongs to the parse. What would remove it is a parser that writes a
-name straight into the arena — a change to how names are *built*, not to how
-zones store them, and one that has to keep `Name`'s invariant on the way
-(`CLAUDE.md` §17).
+allocation~~ — right about the parser as it stood, wrong about the order.
+`Zone::add` is the *prerequisite*: it is what lets the owner name live in the
+parser's own buffer rather than in a `Name`, which is what removes both 24-octet
+name allocations. On its own it takes a zone-to-zone copy from 229 ns and two
+allocations to 146 and none. The rest of the paragraph stands — what removes the
+last of it is a parser that writes straight into the arena, and `Name`'s
+invariant survived it because `Name::absolutized_in` hands back a `NameRef` and
+`presentation_wire_in` was already the no-allocation primitive underneath
+`Name::relative_to` (`CLAUDE.md` §17). `Name::absolutized_in` would have been a
+second copy of `zone::parse::absolutize`'s three spellings of an owner name —
+`@`, a trailing dot, everything else — so `absolutize` delegates to it and the
+rule is still written once (§7).
 
-**Whoever takes it measures first**, because the ratio is what decides it: the
-record's own two allocations are a quarter of the eight a parsed record costs,
-and #71e's refuting measurement — that an arena is worth ~60 ms of a 600 ms
-parse — still holds. The three other build sites are
-`xfr::AxfrAccumulator::into_zone`, `update::Applied::into_zone` and
-`ixfr::Patch::apply`'s appends, and each has the same shape (§18: count the
-instances before fixing one).
+~~The three other build sites are `xfr::AxfrAccumulator::into_zone`,
+`update::Applied::into_zone` and `ixfr::Patch::apply`'s appends, and each has
+the same shape (§18: count the instances before fixing one).~~ **Counted, and
+none of them gains from the borrowed door** (§19): all three consume owned
+`ResourceRecord`s that the *message* parser already allocated, so
+`Zone::add(rr.as_ref())` still drops them — the same argument this row makes
+about the zone parser, one layer out. And the site with the most calls is the
+one to leave alone: the signer's seven `add_record`s add an RRSIG per RRset and
+an NSEC per name at **~27 µs a record** (#44c's full sign, 26.9–27.3 s in #64d),
+so 30 ns is 0.1% of it. One `grep` and one table, neither taken when the row was
+filed.
+
+The zone-to-zone `to_owned()` shape the borrowed door is worth most to has **no
+production call site**: `rdnsd/src/zones.rs` and `rdnsd/src/main.rs` have one
+each, both under `#[cfg(test)]` and both cloning twice, and `Zone::rebuild`
+already goes arena to arena.
+
+#### What is left
+
+- **72a. `rdata_from_fields` takes the same field list twice**,
+  `fields: &[&str]` beside `text_fields: &[Cow<str>]`, which is why `parts`
+  cannot be refilled per line the way `tokens` now is — it borrows `tokens`.
+  §7's shape: 8 uses across 3 signatures in `zone/rdata.rs`. The allocation is
+  worth **~13 ns a record**, measured by a throwaway that is wrong for a quoted
+  line, and it is the smaller half of the reason to merge them.
+- **72b. The RDATA half of this row**, the one allocation of the original two
+  still standing. It wants `ParsedRecord::encode_into(&mut Vec<u8>)` — 16 match
+  arms, several building a sub-`Vec` of their own — and an
+  `RdataArena::push_parsed` door, which is as trustworthy as
+  `RecordData::from_parsed` already is, since that trusts `encode` rather than
+  checking it. **~30 ns a record, estimated from the calibration above and not
+  measured**; whoever takes it measures first. It reaches zero only for types
+  whose `ParsedRecord` owns no heap — A and AAAA. CNAME, NS, MX, PTR and SOA
+  hold a `Name` inside the `ParsedRecord` and would halve, so the ratio is a
+  property of the zone's type mix.
 
 ---
 

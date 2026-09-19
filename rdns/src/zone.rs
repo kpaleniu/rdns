@@ -817,27 +817,40 @@ impl Zone {
         self.spills.reserve(base.spills.len());
     }
 
-    /// Add a record to the zone
+    /// Add a record to the zone.
+    ///
+    /// The owned door. A caller that already holds the octets borrowed wants
+    /// [`Zone::add`]: a zone copies both fields into its arenas either way, so
+    /// building a `ZoneRecord` to hand over is a heap allocation and a free per
+    /// record for a value nothing keeps.
     pub fn add_record(&mut self, record: ZoneRecord) {
-        // Owned: the key becomes an index entry, and the statements below need
-        // `&mut self`.
-        let key = record.name.as_ref().folded().into_owned();
+        self.add(record.as_ref());
+    }
+
+    /// Add a record whose name and RDATA the caller only borrows.
+    pub fn add(&mut self, record: ZoneRecordRef<'_>) {
+        // Folded onto the stack, not into an allocation: `into_owned` here was
+        // one heap allocation and one free per record for a copy nothing keeps
+        // — `intern` copies the octets into the index's own arena.
+        let mut fold = [0u8; rdns_core::dname::MAX_NAME_LEN];
+        let key = record.name.folded_into(&mut fold);
+        let key = key.as_wire();
         let position = self.records.len();
         // Through the field rather than `origin_key()`, so the borrow is of
         // `self.origin` alone and `self.index` can be taken mutably beside it.
         let origin_key = self.origin.as_ref().folded();
-        let at_apex = key == *origin_key;
-        self.shortcuts.note(&key, record.rdata.rtype(), at_apex);
-        let at = self.index.intern(&key);
+        let at_apex = key == &*origin_key;
+        self.shortcuts.note(key, record.rdata.rtype(), at_apex);
+        let at = self.index.intern(key);
         // Ancestors only when the name is new to the index: one name notes them
         // and every later record at it would find them present. That probe was
         // the walk's own first step until #71a moved it here, where it is the
         // insertion's answer rather than a second lookup.
-        if Zone::file(&mut self.index, &mut self.spills, &key, at, position) {
-            Zone::note_non_terminals(&mut self.index, &key, at, &origin_key);
+        if Zone::file(&mut self.index, &mut self.spills, key, at, position) {
+            Zone::note_non_terminals(&mut self.index, key, at, &origin_key);
         }
         drop(origin_key);
-        match self.chain_key(record.as_ref()) {
+        match self.chain_key(record) {
             Some(ChainKey::Nsec(k)) => {
                 self.nsec_chain.insert(k, position);
             }
@@ -847,10 +860,10 @@ impl Zone {
             None => {}
         }
         let stored = Stored {
-            name: self.names.push(record.name.as_ref()),
+            name: self.names.push(record.name),
             ttl: record.ttl,
             class: record.class,
-            rdata: self.rdata.push(record.rdata.as_ref()),
+            rdata: self.rdata.push(record.rdata),
         };
         self.records.push(stored);
     }
