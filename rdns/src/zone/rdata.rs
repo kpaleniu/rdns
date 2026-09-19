@@ -98,7 +98,8 @@ fn split_svcb_head<'a>(
 }
 
 /// The RDATA half of a zone-file line: everything after the owner name, TTL,
-/// class and type have been read off it. Pure, unlike [`parse_into`], which
+/// class and type have been read off it. Pure, unlike `super::parse`'s
+/// `parse_into`, which
 /// mutates parser state.
 ///
 /// Three views of the fields: `rdata` joined by a space (what every type but TXT
