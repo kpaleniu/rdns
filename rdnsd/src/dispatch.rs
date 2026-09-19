@@ -273,70 +273,79 @@ impl Server {
             None => ceiling,
         };
 
-        // Answered here rather than in `make_response`: a sequence of messages,
-        // gated on an ACL, and the answer can be the whole zone. Only where a
-        // sequence can be carried — AXFR is TCP alone (RFC 5936 §4.2) and an
-        // IXFR over UDP is answered with a single SOA (RFC 1995 §2), both of
-        // which `write_response` does below.
-        if matches!(qtype, Some(Qtype::AXFR) | Some(Qtype::IXFR)) {
-            if let Wire::Framed(out, arrival) = wire {
-                self.answer_transfer(&msg, peer, session.as_mut(), now, arrival, out)
-                    .await;
-                return;
-            }
-        }
+        let incoming = Incoming {
+            msg: &msg,
+            bytes: packet,
+            arrived,
+        };
 
-        // Likewise, plus: an UPDATE installs a new zone, and `make_response`
-        // holds a read guard on the zone map that installing would deadlock
-        // against. RFC 2136 §1 permits it on either transport, and the checks,
-        // the ordering and the persistence are the request's, not the
-        // transport's.
-        if msg.opcode == OpCode::Update {
-            if let Some(reply) = self
+        // Three ways to answer and one tail, because the first two used to
+        // `return` past it: `record_dnstap` was reachable only through
+        // `finish`, so a capture held no UPDATE and no transfer while
+        // `--dnstap` says "every answered request" and `MessageType` carried
+        // `UpdateQuery` for nobody (`CLAUDE.md` §7's early return over a shared
+        // epilogue).
+        let transfer = matches!(qtype, Some(Qtype::AXFR) | Some(Qtype::IXFR));
+        let sent = if let (true, Wire::Framed(out, arrival)) = (transfer, wire) {
+            // A sequence of messages, gated on an ACL, and the answer can be
+            // the whole zone. Only where a sequence can be carried — AXFR is
+            // TCP alone (RFC 5936 §4.2) and an IXFR over UDP is answered with a
+            // single SOA (RFC 1995 §2), both of which `write_response` does
+            // below.
+            self.answer_transfer(&msg, peer, session.as_mut(), now, arrival, out)
+                .await;
+            // No one envelope is the reply, and buffering the zone to name one
+            // would undo what `answer_transfer` is shaped to avoid. The entry
+            // says a transfer arrived, which is what a reader cannot get
+            // anywhere else.
+            None
+        } else if msg.opcode == OpCode::Update {
+            // Likewise, plus: an UPDATE installs a new zone, and
+            // `make_response` holds a read guard on the zone map that
+            // installing would deadlock against. RFC 2136 §1 permits it on
+            // either transport, and the checks, the ordering and the
+            // persistence are the request's, not the transport's.
+            let reply = self
                 .answer_update(&msg, peer, session.as_mut(), max_len)
-                .await
-            {
-                wire.send(&reply, &self.ctx.logger, ip).await;
+                .await;
+            if let Some(reply) = &reply {
+                wire.send(reply, &self.ctx.logger, ip).await;
             }
-            return;
-        }
-
-        // Never hold the zone lock across a socket write: a SIGHUP reload would
-        // queue behind a slow client for the life of its connection.
-        let serialized = {
-            let zones = self.zone_map.read().await;
-            if msg.opcode == OpCode::Notify {
-                notify_reply(&msg, &zones, &self.secondaries, peer, advertised)
-                    .to_bytes_within_buf_with(max_len, &mut scratch.out, &mut scratch.compressor)
+            reply.map(Cow::Owned)
+        } else {
+            // Never hold the zone lock across a socket write: a SIGHUP reload
+            // would queue behind a slow client for the life of its connection.
+            let serialized = {
+                let zones = self.zone_map.read().await;
+                if msg.opcode == OpCode::Notify {
+                    notify_reply(&msg, &zones, &self.secondaries, peer, advertised)
+                        .to_bytes_within_buf_with(
+                            max_len,
+                            &mut scratch.out,
+                            &mut scratch.compressor,
+                        )
+                } else {
+                    write_response(
+                        &msg,
+                        &zones,
+                        &self.ctx.metrics,
+                        max_len,
+                        advertised,
+                        scratch,
+                    )
+                }
+            };
+            if let Err(e) = serialized {
+                serving_error!(self.ctx.logger, ip, "serialization error: {e}");
+                // Recorded all the same, for the reason a dropped reply is: the
+                // request arrived and got nothing.
+                None
             } else {
-                write_response(
-                    &msg,
-                    &zones,
-                    &self.ctx.metrics,
-                    max_len,
-                    advertised,
-                    scratch,
-                )
+                self.finish(wire, &msg, session.as_mut(), peer, now, scratch)
+                    .await
             }
         };
-        if let Err(e) = serialized {
-            serving_error!(self.ctx.logger, ip, "serialization error: {e}");
-            return;
-        }
-
-        self.finish(
-            wire,
-            Incoming {
-                msg: &msg,
-                bytes: packet,
-                arrived,
-            },
-            session.as_mut(),
-            peer,
-            now,
-            scratch,
-        )
-        .await;
+        self.record_dnstap(wire, incoming, peer, sent.as_deref());
     }
 
     /// The epilogue every ordinary answer leaves through: charge it, sign it,
@@ -351,16 +360,15 @@ impl Server {
     /// `Cow` so the ordinary answer — no budget trouble, no TSIG — goes out of
     /// the caller's scratch buffer with nothing allocated. The two exceptions
     /// build a message of their own and own it.
-    async fn finish(
+    async fn finish<'s>(
         &self,
         wire: &Wire<'_>,
-        incoming: Incoming<'_>,
+        request: &DnsMessage,
         session: Option<&mut TsigSession>,
         peer: SocketAddr,
         now: u64,
-        scratch: &Scratch,
-    ) {
-        let request = incoming.msg;
+        scratch: &'s Scratch,
+    ) -> Option<Cow<'s, [u8]>> {
         let ip = peer.ip();
         let advertised = self.ctx.udp.advertised();
         // The ceiling `answer` wrote the body against, signature reserved and
@@ -412,14 +420,15 @@ impl Server {
             },
             (reply, _) => reply,
         };
+        // `None` is a request answered with silence — over the response
+        // budget. The caller records it either way: a query-only entry says it
+        // arrived and got nothing, which is the one thing a log line at DEBUG
+        // cannot tell an analytics pipeline.
         if let Some(reply) = reply {
             wire.send(&reply, &self.ctx.logger, ip).await;
-            self.record_dnstap(wire, incoming, peer, Some(&reply));
+            Some(reply)
         } else {
-            // A request we answered with silence — over the response budget.
-            // A query-only entry says it arrived and got nothing, which is the
-            // one thing a log line at DEBUG cannot tell an analytics pipeline.
-            self.record_dnstap(wire, incoming, peer, None);
+            None
         }
     }
 
