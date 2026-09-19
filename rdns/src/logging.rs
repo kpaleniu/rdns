@@ -1,10 +1,13 @@
 //! What a daemon says about itself, and when it says it unprompted.
 //!
-//! Three things, and the membership rule is that every one of them is read by a
-//! *human*: the level and the subscriber ([`LogLevel`], [`init`]), the counts a
-//! log line is drawn from ([`QueryStats`], [`QueryLogger`]), and the thresholds
-//! that turn those counts into a warning nobody had to ask for ([`Anomaly`],
-//! [`watch_anomalies`]).
+//! Two things, and the membership rule is that both are read by a *human*: the
+//! counts a log line is drawn from ([`QueryStats`], [`QueryLogger`]), and the
+//! thresholds that turn those counts into a warning nobody had to ask for
+//! ([`Anomaly`], [`watch_anomalies`]).
+//!
+//! Where those lines *go* is not here. Choosing a subscriber is a decision
+//! about the process, so it moved to `rdns_transport::logging` with the crate
+//! whose only consumers are the two daemons (`TODO.md` #85).
 //!
 //! Not [`crate::metrics`], which is the same traffic counted for a *scrape*. The
 //! two are not a duplicate: a scrape is pulled on somebody else's schedule and
@@ -22,82 +25,8 @@ use crate::shutdown::Stop;
 use crate::Qtype;
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-/// How much a daemon says.
-///
-/// The level stops the work, not just the output: `tracing`'s macros only build
-/// their arguments when a subscriber is interested, which is what keeps a
-/// malformed-packet flood from costing a `format!` per packet.
-///
-/// Volume beyond that is journald's job (`LogRateLimitIntervalSec`,
-/// `LogRateLimitBurst`); a second limiter here would hide what the first did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogLevel {
-    Error,
-    Warn,
-    Info,
-    Debug,
-    Trace,
-}
-
-impl LogLevel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            LogLevel::Error => "error",
-            LogLevel::Warn => "warn",
-            LogLevel::Info => "info",
-            LogLevel::Debug => "debug",
-            LogLevel::Trace => "trace",
-        }
-    }
-}
-
-impl FromStr for LogLevel {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_ascii_lowercase().as_str() {
-            "error" => Ok(LogLevel::Error),
-            "warn" | "warning" => Ok(LogLevel::Warn),
-            "info" => Ok(LogLevel::Info),
-            "debug" => Ok(LogLevel::Debug),
-            "trace" => Ok(LogLevel::Trace),
-            other => Err(format!(
-                "unknown log level {other:?}: expected error, warn, info, debug or trace"
-            )),
-        }
-    }
-}
-
-/// Send this process's log lines to stderr at `level`, honouring `RUST_LOG`.
-///
-/// Called once, by a binary; library code only emits. Shared so that `rdnsd` and
-/// `rdnsr` cannot end up configured differently.
-///
-/// `RUST_LOG` wins where it is set — reaching for it means a server misbehaving
-/// under a level chosen in a unit file, and editing the unit is a restart.
-/// `--quiet` and `--log-level` set the fallback.
-///
-/// No timestamps and no ANSI: journald stamps every line, and two stamps
-/// disagreeing is worse than losing one in a terminal.
-pub fn init(level: LogLevel) {
-    use tracing_subscriber::EnvFilter;
-
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.as_str()));
-
-    // `try_init`: a second call is a caller bug, not grounds for panicking a
-    // healthy server, and the tests here share a process.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .without_time()
-        .with_target(true)
-        .try_init();
-}
 
 /// How many source addresses are counted individually at once.
 ///

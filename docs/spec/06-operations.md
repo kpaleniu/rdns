@@ -353,7 +353,7 @@ Timestamps are exposed as instants, not as elapsed times.
 ## 6.4 Logging
 
 The same flag, levels and default on both daemons, through one initialiser
-(`rdns::logging::init`).
+(`rdns_transport::logging::init`).
 
 | level | what appears |
 |---|---|

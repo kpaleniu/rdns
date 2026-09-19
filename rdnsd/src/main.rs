@@ -61,7 +61,7 @@ use rdns::{
     dnssec_validation_mode::DnssecValidator,
     ixfr::DeltaLog,
     journal::Journal,
-    logging::{watch_anomalies, AnomalyThresholds, LogLevel, QueryLogger},
+    logging::{watch_anomalies, AnomalyThresholds, QueryLogger},
     metrics::DnsMetrics,
     notify::{self, NotifyOutcome, NotifyPeer, NotifyPolicy},
     readiness::Readiness,
@@ -80,6 +80,7 @@ use rdns::{Name, NameRef, UdpSizes};
 #[cfg(test)]
 use rdns::{clock::current_unix_timestamp, zone::parse_zone_file_at};
 use rdns_transport::https;
+use rdns_transport::logging::LogLevel;
 use rdns_transport::metrics_server;
 use rdns_transport::quic;
 use rdns_transport::tcp;
@@ -1979,8 +1980,8 @@ async fn main() -> Result<()> {
     // Before anything that might have something to say. `--quiet` is the same
     // as `--log-level error`; clap refuses the two together, so this is a
     // rename and not a precedence rule (`CLAUDE.md` §15).
-    rdns::logging::init(if cli.quiet {
-        rdns::logging::LogLevel::Error
+    rdns_transport::logging::init(if cli.quiet {
+        LogLevel::Error
     } else {
         cli.log_level
     });

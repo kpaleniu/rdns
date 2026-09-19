@@ -37,7 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#78** through **#90**, and **#21**, as of 2026-09-20.
+**#58**, **#68**, **#78** through **#84**, **#86** through **#90**, and
+**#21**, as of 2026-09-20.
 
 **#85 through #90 came out of a second architecture review on 2026-09-20**, this
 one asking what the ideal shape would be and where the tree differs. **Ten
@@ -5005,7 +5006,7 @@ looked.
 
 ---
 
-### 85. `rdns::logging::init` puts a subscriber in the library — **filed 2026-09-20**
+### 85. `rdns::logging::init` puts a subscriber in the library — **filed and closed 2026-09-20**
 
 `logging::init` installs the process-global `tracing-subscriber`. Both binaries
 call it (`rdnsd/src/main.rs:1982`, `rdnsr/src/main.rs:497`) and nothing else
@@ -5037,6 +5038,15 @@ that does not make a process-global decision on its caller's behalf.
 #30n recorded the fact in passing — "`Cargo.lock` loses one edge and no package,
 because `rdns::logging` still installs the subscriber" — and moved on. §18: that
 sentence is this number.
+
+**Done**, `LogLevel` and `init` moved verbatim into `rdns_transport::logging`.
+Both predictions held exactly: `cargo tree -p rdns -e normal` is **48 packages**
+where it was 55, and `Cargo.lock` moves one edge from `rdns` to `rdns-transport`
+and loses no package — the whole diff is two lines. **1 248 tests on Windows
+and 1 269 on Linux**, none failing, clippy clean on both sides and `cargo doc`
+clean. `rdnsd` keeps its own `tracing-subscriber` **dev**-dependency for
+the two tests that build a subscriber to assert what a level emits, which is
+what #30n put it there for.
 
 ---
 
@@ -5327,6 +5337,7 @@ the week; the record is under "How the queue kept going stale" in
 | **75** | two of three answering paths returned past the epilogue | **filed and closed 2026-09-19**, `74019de`. `record_dnstap` was reachable only through `finish`, and the transfer and UPDATE branches `return`ed above it — so a dnstap capture held neither, while `--dnstap` says "every answered request" and `MessageType::UpdateQuery`/`UpdateResponse` were arms nothing could reach. §7's named shape, and this file's second instance of it after the NOTIMP branch that returned past `make_response`'s OPT mirroring; the tell here was cheaper, because the unreachable arms had been *written*. `finish` returns what it sent, `answer` has one tail, and a serialization failure joins them for the reason a dropped reply already did. A transfer records the query alone: no one envelope is the reply. Left **77b**, ~~which is that there is no test~~ **closed the same day**: a query, an UPDATE and a transfer attempt down one connection, **3 data frames against 1** with this tail reverted — so the pre-#75 shape drops two of three rather than capturing nothing, which is what the row had guessed |
 | **76** | `ScratchDir` existed three times | **filed and closed 2026-09-19**, `ab2ae3b`. `rdns-core::testutil` is `pub` rather than `#[cfg(test)]` for one stated purpose — "the choice was this or a second `ScratchDir`, which is the thing this module exists to have stopped" — and both binaries wrote one anyway, each citing the other, on a premise that stopped being true at #66c. `rdnsd` carried both at once: `dispatch.rs` already reached for the shared one. 57 lines deleted, 9 added, no behaviour. What it is worth is not the lines: §7 says the reason is what stops the next copy, and here the reason was copied along with the code and went on justifying it after it had expired |
 | **77** | what #73 and #75 left behind | **filed 2026-09-19, closed 2026-09-20**, `1a0422c` and `2d72c4c`. **77b**: the test #75 landed without — a query, an UPDATE and a transfer attempt down one connection, **3 data frames against 1** with that tail reverted, so the old shape dropped two of three rather than capturing nothing, which is what the row had guessed. **77a**: the survey the row asked for, and it did not decide what the row expected. Knot fixes it in the signer ("TTL of *generated* NSEC(3) records"), PowerDNS in its own signing, NSD has no entry at all because it never signs, and BIND cites 9077 nowhere — while RFC 9077 §§3.1-3.3 each put the MUST on the TTL "that is returned" and §4 addresses "signers **and** DNS servers". The field and the specification disagree; `rdnsd` is both, so a zone it did not sign reaches the same answer path as one it did, and the cap is taken there too. Counted rather than timed: the NXDOMAIN path takes the same apex lookups as before, the two DO-only paths take one more each, and no benchmark covers a signed negative answer |
+| **85** | the library installed the process's log subscriber | **filed and closed 2026-09-20**, out of a second architecture review. `rdns::logging::init` chose a global subscriber on its caller's behalf, against a rule two files state — the workspace manifest's `tracing` entry ("the library only emits; the binaries choose where it goes") and `rdns-transport`'s own header. Moved verbatim to `rdns_transport::logging`, the crate whose only consumers are the two daemons, so there is still one copy and not one per binary (§7). The refuting measurement was taken first and **narrowed the claim**: the seven packages this drops from `rdns` (55 → **48**) are off a fresh build's critical path — all seven finish by 7.87 s of a 21.08 s build whose path is `rdns` then `rdnsd` — and `Cargo.lock` keeps every one of them, because both daemons need the subscriber wherever it lives. So it buys `cargo build -p rdns` and the boundary, not workspace build time |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

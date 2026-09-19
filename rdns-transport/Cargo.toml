@@ -15,6 +15,10 @@ tracing.workspace = true
 # returns typed errors and only a binary may use `anyhow`. A crate whose only
 # consumers are the two daemons may (`TODO.md` #30c, #30d, #31).
 anyhow.workspace = true
+# `logging::init`, on the same argument: installing a subscriber is a decision
+# about the process, which a library may not make for its caller (`TODO.md`
+# #85). One copy, not one per binary, so the two cannot drift apart.
+tracing-subscriber.workspace = true
 # DoT (#42a). Here rather than in `rdns` because a TLS stack belongs at the
 # socket layer: the zone parser and the signer have no business linking one.
 # RFC 8484 $4.1's GET form is base64url. Already in the tree (`rdns` decodes

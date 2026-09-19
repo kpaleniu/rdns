@@ -34,11 +34,9 @@ rustls-pki-types.workspace = true
 # `rustls`, so naming it costs no package and saves a second X.509 parser.
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
 tokio-rustls.workspace = true
+# Emitting only. No `tracing-subscriber`: installing one is a decision about the
+# process, so it lives in `rdns-transport` with the two daemons (`TODO.md` #85).
 tracing.workspace = true
-# The subscriber is here, but nothing in this crate installs one: `logging::init`
-# exists so that `rdnsd` and `rdnsr` configure logging identically rather than
-# each growing their own copy to drift (`CLAUDE.md` §7). A binary calls it, once.
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
 # Benchmarks that measure optimized code, in `benches/`. A dev-dependency, so

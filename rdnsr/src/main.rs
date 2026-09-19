@@ -29,7 +29,7 @@ use rdns::cache::StalePolicy;
 use rdns::clock::current_unix_timestamp;
 use rdns::dns64::{Dns64, Nat64Prefix};
 use rdns::dnssec_chain::TrustAnchors;
-use rdns::logging::{watch_anomalies, AnomalyThresholds, LogLevel, QueryLogger};
+use rdns::logging::{watch_anomalies, AnomalyThresholds, QueryLogger};
 use rdns::metrics::DnsMetrics;
 use rdns::readiness::Readiness;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
@@ -40,6 +40,7 @@ use rdns::shutdown::Shutdown;
 use rdns::validation::{AdmissionCheck, AdmissionLimits};
 use rdns::UdpSizes;
 use rdns_transport::https;
+use rdns_transport::logging::LogLevel;
 use rdns_transport::metrics_server;
 use rdns_transport::quic;
 use rdns_transport::tls::{self, CertificateStore};
@@ -494,7 +495,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Before anything with something to say, and through the same initialiser
     // `rdnsd` uses so the two cannot format or filter differently.
-    rdns::logging::init(if cli.quiet {
+    rdns_transport::logging::init(if cli.quiet {
         LogLevel::Error
     } else {
         cli.log_level

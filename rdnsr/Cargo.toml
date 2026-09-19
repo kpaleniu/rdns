@@ -19,5 +19,5 @@ tracing.workspace = true
 # already pays for, so the workspace lock is unchanged.
 toml = "1.1.4"
 serde = { version = "1.0.229", features = ["derive"] }
-# No `tracing-subscriber`: `rdns::logging::init` installs the subscriber and
-# this binary never names the crate (`TODO.md` #30n).
+# No `tracing-subscriber`: `rdns_transport::logging::init` installs the
+# subscriber and this binary never names the crate (`TODO.md` #30n, #85).

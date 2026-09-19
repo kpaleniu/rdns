@@ -18,6 +18,7 @@
 //! answering it is each daemon's.
 
 pub mod https;
+pub mod logging;
 pub mod metrics_server;
 pub mod quic;
 pub mod tcp;
