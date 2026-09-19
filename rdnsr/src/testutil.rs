@@ -124,37 +124,11 @@ pub(crate) fn serving_notified(
     (serving, reload)
 }
 
-/// A directory under `TEMP`, removed when it goes out of scope.
+/// `rdns-core`'s, re-exported so a test here writes one name.
 ///
-/// A third copy of `rdns`'s: a `#[cfg(test)]` item is invisible to another
-/// crate, which is what `rdnsd`'s copy says too (`TODO.md` #38e). One per
-/// crate is the floor without a `testkit` feature.
-pub(crate) struct ScratchDir(std::path::PathBuf);
-
-impl ScratchDir {
-    pub(crate) fn new(tag: &str) -> ScratchDir {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("rdnsr-{tag}-{unique}"));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        ScratchDir(dir)
-    }
-
-    /// Write a file into it, and give back its path.
-    pub(crate) fn write(&self, name: &str, content: &str) -> std::path::PathBuf {
-        let path = self.0.join(name);
-        std::fs::write(&path, content).expect("write scratch file");
-        path
-    }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+/// Not a third copy: that module is `pub` rather than `#[cfg(test)]` for
+/// exactly this reason (`CLAUDE.md` §7, `TODO.md` #38e, #66c).
+pub(crate) use rdns::testutil::ScratchDir;
 
 /// A NOTIFY for `zone`, shaped the way `rdnsd` sends one: QTYPE SOA, no answer
 /// section. The serial is deliberately absent, because nothing here reads it.

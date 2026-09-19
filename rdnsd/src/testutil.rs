@@ -4,10 +4,6 @@
 //! Builders only. A helper that asserts, or that knows what a correct answer
 //! looks like, belongs beside the tests that care — that knowledge is what a
 //! reader is checking.
-//!
-//! `rdns` has its own `ScratchDir`, identical: a `#[cfg(test)]` item is
-//! invisible to another crate, which is the whole of `TODO.md` #38e. One copy
-//! per crate is the floor without a `testkit` feature.
 
 use rdns::metrics::DnsMetrics;
 use rdns::{DnsMessage, DnsMessageBuilder, Qtype};
@@ -63,36 +59,9 @@ pub(crate) fn query(qname: &str, qtype: Qtype, dnssec_ok: bool) -> DnsMessage {
         .build()
 }
 
-/// A directory under `TEMP`, removed when it goes out of scope.
+/// `rdns-core`'s, re-exported so a test here writes one name.
 ///
-/// `main.rs` had this inside its own `mod tests`, where `control.rs` and
-/// `zones.rs` could not reach it and wrote the half that creates a directory
-/// without the half that removes it.
-pub(crate) struct ScratchDir(std::path::PathBuf);
-
-impl ScratchDir {
-    pub(crate) fn new(tag: &str) -> ScratchDir {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("rdnsd-{tag}-{unique}"));
-        std::fs::create_dir_all(&dir).expect("scratch dir");
-        ScratchDir(dir)
-    }
-
-    pub(crate) fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-
-    /// A path inside it. Nothing is created.
-    pub(crate) fn join(&self, name: impl AsRef<std::path::Path>) -> std::path::PathBuf {
-        self.0.join(name)
-    }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+/// Not a copy: that module is `pub` rather than `#[cfg(test)]` for exactly
+/// this reason, and a second copy is what it exists to have stopped
+/// (`CLAUDE.md` §7, `TODO.md` #38e, #66c).
+pub(crate) use rdns::testutil::ScratchDir;
