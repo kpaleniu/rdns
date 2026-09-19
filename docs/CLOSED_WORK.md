@@ -8774,3 +8774,99 @@ what stops the next copy being written; here the reason was copied along with
 the code and went on justifying it after it had stopped being true. A stated
 reason needs re-reading when the thing it refers to moves, and nothing does
 that.
+
+---
+
+### 77. What #73 and #75 left behind — ~~**filed 2026-09-19**~~ **77b closed the same day, 77a on 2026-09-20**
+
+Two remainders, named here because a sentence in a commit message is not a
+queue (`CLAUDE.md` §18).
+
+- **77a. The answer-time half of RFC 9077 §3.** #73 caps a denial's TTL where
+  this server *signs*. A zone whose signatures arrived from elsewhere — a
+  replicated signed zone, or one with an imported DNSKEY signature — is served
+  with the TTLs the other signer chose, and `push_negative_proof` does not cap
+  them. A TTL is not covered by the RRSIG (the signature commits to the
+  *original* TTL), so lowering one at answer time is ordinary and safe.
+
+  ~~**The measurement to take first**: does any other implementation cap at
+  answer time, or do they all fix it at signing? BIND, Knot, PowerDNS and NSD,
+  quoted, the way #8 was settled. If the answer is "signers only", this row is
+  a decision to decline and not work — and it should be declined in writing
+  rather than left open.~~ **Taken 2026-09-20, and it did not decide what the
+  row expected it to.** `2d72c4c.
+
+  **The peers all fix it where they sign.** Knot DNS 3.1.0 (2021-08-02), in
+  `NEWS`: "knotd: TTL of *generated* NSEC(3) records is set to min(SOA TTL, SOA
+  minimum)". PowerDNS, in its DNSSEC operational documentation:
+  "NSEC/NSEC3 records get the negative TTL (which is the lowest of the SOA TTL
+  and the SOA minimum), which means their TTL matches that of a response such
+  as NXDOMAIN", and "This conforms to RFC 9077" — with "Prior to version
+  4.3.0, the behaviour was based on language in RFC 4034 and RFC 5155", which
+  is the same wording #73 was following. NSD's `doc/ChangeLog` has no RFC 9077
+  entry and no NSEC-TTL entry at all, which fits: NSD never signs. BIND cites
+  9077 nowhere in its source — the four hits are the number appearing as data
+  in test zone files — and the change it documents in this area is
+  NSEC3PARAM's TTL.
+
+  **So "signers only" is where the field is, and it is not what the RFC says.**
+  §§3.1-3.3 each put the requirement on the answer: "The TTL of the NSEC RR
+  *that is returned* MUST be the lesser of the MINIMUM field of the SOA record
+  and the TTL of the SOA itself." §4 addresses "signers **and** DNS servers for
+  a zone", and §3.4 gives the *resolver* a MAY, not a MUST — so the duty is on
+  the authoritative side and it is written about what leaves. A survey that
+  agrees with the option you were going to take is not the measurement (§19);
+  this one disagreed with the RFC, and the RFC is the one that says MUST.
+
+  That decided it, and this tree has a reason the survey does not cover: NSD
+  has nothing to cap because it has no signer, and Knot and PowerDNS cap in
+  theirs. `rdnsd` is both, and the zone it does *not* sign — a replicated one,
+  or one whose chain another operator's signer built — reaches the same answer
+  path as the ones it does.
+
+  **What landed**: `negative_ttl_cap` takes both terms and returns `Option`
+  (`None` for a zone with no apex SOA is no cap, not a cap of zero — §14),
+  and the cap rides on the proof's own tracker so it is computed once per
+  answer rather than once per record. Every denial and every denial signature
+  takes it, because `push_with_signatures` is the one place they are written.
+
+  **Cost, counted rather than timed**: the NXDOMAIN and NODATA path takes the
+  *same* number of apex lookups as before — the cap replaced the one
+  `push_soa_signatures` was already taking — and the two DO-only paths that had
+  none, a wildcard answer's extra proof and a signed referral, take one each.
+  The allocation counts do not move. No benchmark covers a signed negative
+  answer, which is why this is an argument about call sites and not a timing;
+  if one is ever added, this is the row it checks.
+
+  The regression test is a fixture in the shape RFC 4034 §4.1.1's older wording
+  produces — NSEC records at MINIMUM, 3600, above an SOA TTL of 300 — parsed
+  rather than signed here, which is what "signed elsewhere" means. Watched
+  failing against the cap that read MINIMUM alone.
+
+- ~~**77b. #75 has no test.** `record_dnstap` is now reachable from all three
+  answering paths by construction, and nothing checks that it is. What it needs
+  is a dnstap target on `spawn_updatable` — a `file:` sink, an UPDATE over TCP,
+  and the capture read back, which `dnstap.rs`'s own
+  `a_file_target_is_capped_rather_than_allowed_to_fill_the_disk` already shows
+  how to do. ~40 lines. Watched failing means reverting #75's tail and seeing
+  an empty capture.~~ **Done 2026-09-19.**
+
+  A query, a signed UPDATE and a transfer attempt down one connection, then
+  the frames in the capture counted: **3 against 1** with #75's tail reverted,
+  which is what the estimate above got wrong — the old shape does not produce
+  an *empty* capture, it produces the ordinary query and drops the other two.
+  A guess about a failure is not the failure (§4); the number came from
+  running it.
+
+  Two things it needed that the row did not say. The sink is stopped through a
+  `Shutdown` of its own, because the pump flushes when it stops and
+  `test_shutdown` is one static that every other test's accept loop holds —
+  calling `begin` on that one would end them all. And the capture is polled
+  until it ends with a STOP frame rather than slept on, so a loaded machine
+  does not decide the result (§10).
+
+  The transfer is refused (the ACL is empty), which is the branch and not the
+  zone — and a refused attempt is what a reader wants to see anyway, for the
+  reason `answer_transfer` already logs every one of them.
+
+---

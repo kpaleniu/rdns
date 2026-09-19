@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#77** through **#84**, and **#21**, as of 2026-09-19.
+**#58**, **#68**, **#78** through **#84**, and **#21**, as of 2026-09-20.
 
 **#73, #74, #75 and #76 were filed and closed the same day**, out of an
 architecture review that asked what the shape of this code costs a reader rather
@@ -55,13 +55,19 @@ two `MessageType` arms had been written for nobody. #76: three copies of
 `ScratchDir`, two of them citing a reason that stopped being true at #66c — and
 each citing the other.
 
-**#77 through #84 are what the same review turned up and did not fix**, one
-number per thing rather than a list in prose (§18). Two of them are #73's and
-#75's own remainders. Three rows in #78 and most of #79 are the review's reading
-rather than a measurement taken here, and each says which it is: re-check before
-acting on one.
+**#77 through #84 were what the same review turned up and did not fix**, one
+number per thing rather than a list in prose (§18). **#77 — #73's and #75's own
+remainders — closed 2026-09-19 and 2026-09-20**, and 77a is the one worth
+reading: the survey it asked for came back "every implementation fixes it in
+its signer",
+and RFC 9077 §§3.1-3.3 put the MUST on the TTL "that is returned" anyway. The
+field and the specification disagree, and `rdnsd` is the case that decides it,
+being both a signer and a server for zones it did not sign. Three rows in #78
+and most of #79 are the review's reading rather than a measurement taken here,
+and each says which it is: re-check before acting on one.
 
-**#72 closed the day it was filed**: seven allocations a record on the zone load path, not the two it
+**#72 closed the day it was filed**: seven allocations a record on the zone load
+path, not the two it
 named, and after 72a and 72b a zone of A records parses with none at all — 480
 ns a record to ~263. **#57 is
 closed**: 57e was the last of it, and the measurement that
@@ -1095,7 +1101,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#77**-**#84**, plus **#21** — see
+**#58**, **#68**, **#78**-**#84**, plus **#21** — see
 "What is open" above, which is the same list and the only place it is written
 down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -4680,52 +4686,6 @@ parser already built, so `add_parsed` has nothing to offer them either.
 
 ---
 
-### 77. What #73 and #75 left behind — **filed 2026-09-19**
-
-Two remainders, named here because a sentence in a commit message is not a
-queue (`CLAUDE.md` §18).
-
-- **77a. The answer-time half of RFC 9077 §3.** #73 caps a denial's TTL where
-  this server *signs*. A zone whose signatures arrived from elsewhere — a
-  replicated signed zone, or one with an imported DNSKEY signature — is served
-  with the TTLs the other signer chose, and `push_negative_proof` does not cap
-  them. A TTL is not covered by the RRSIG (the signature commits to the
-  *original* TTL), so lowering one at answer time is ordinary and safe.
-
-  **The measurement to take first**: does any other implementation cap at
-  answer time, or do they all fix it at signing? BIND, Knot, PowerDNS and NSD,
-  quoted, the way #8 was settled. If the answer is "signers only", this row is
-  a decision to decline and not work — and it should be declined in writing
-  rather than left open.
-
-- ~~**77b. #75 has no test.** `record_dnstap` is now reachable from all three
-  answering paths by construction, and nothing checks that it is. What it needs
-  is a dnstap target on `spawn_updatable` — a `file:` sink, an UPDATE over TCP,
-  and the capture read back, which `dnstap.rs`'s own
-  `a_file_target_is_capped_rather_than_allowed_to_fill_the_disk` already shows
-  how to do. ~40 lines. Watched failing means reverting #75's tail and seeing
-  an empty capture.~~ **Done 2026-09-19.**
-
-  A query, a signed UPDATE and a transfer attempt down one connection, then
-  the frames in the capture counted: **3 against 1** with #75's tail reverted,
-  which is what the estimate above got wrong — the old shape does not produce
-  an *empty* capture, it produces the ordinary query and drops the other two.
-  A guess about a failure is not the failure (§4); the number came from
-  running it.
-
-  Two things it needed that the row did not say. The sink is stopped through a
-  `Shutdown` of its own, because the pump flushes when it stops and
-  `test_shutdown` is one static that every other test's accept loop holds —
-  calling `begin` on that one would end them all. And the capture is polled
-  until it ends with a STOP frame rather than slept on, so a loaded machine
-  does not decide the result (§10).
-
-  The transfer is refused (the ACL is empty), which is the branch and not the
-  zone — and a refused attempt is what a reader wants to see anyway, for the
-  reason `answer_transfer` already logs every one of them.
-
----
-
 ### 78. `rdnsr`'s query path loses work at three of its exits — **filed 2026-09-19**
 
 `handle_query` is 420 lines with 15 exits and a tail that does five things.
@@ -5155,6 +5115,7 @@ the week; the record is under "How the queue kept going stale" in
 | **74** | `--check-config` did not name DoH | **filed and closed 2026-09-19**, `20b8dc8`. The dry run matched on `--tls-listen` and `--quic-listen`, so a DoH-only server was told "encrypted transports disabled" by the one command whose whole job is to be believed before a restart — while the `encrypted` predicate eighteen lines above, which decides whether to read the certificate at all, has named all three since DoH landed. Provoked rather than read (§4). **Why the second copy existed**: `describe_encrypted` had all three right and took a `TlsPolicy`, which is not built until after the dry run returns — a function that is correct and unreachable is how §7's second copy gets written. It takes the three addresses now. `--check-config`'s output still has no test at all, which is how a hand-written banner stayed wrong |
 | **75** | two of three answering paths returned past the epilogue | **filed and closed 2026-09-19**, `74019de`. `record_dnstap` was reachable only through `finish`, and the transfer and UPDATE branches `return`ed above it — so a dnstap capture held neither, while `--dnstap` says "every answered request" and `MessageType::UpdateQuery`/`UpdateResponse` were arms nothing could reach. §7's named shape, and this file's second instance of it after the NOTIMP branch that returned past `make_response`'s OPT mirroring; the tell here was cheaper, because the unreachable arms had been *written*. `finish` returns what it sent, `answer` has one tail, and a serialization failure joins them for the reason a dropped reply already did. A transfer records the query alone: no one envelope is the reply. Left **77b**, ~~which is that there is no test~~ **closed the same day**: a query, an UPDATE and a transfer attempt down one connection, **3 data frames against 1** with this tail reverted — so the pre-#75 shape drops two of three rather than capturing nothing, which is what the row had guessed |
 | **76** | `ScratchDir` existed three times | **filed and closed 2026-09-19**, `ab2ae3b`. `rdns-core::testutil` is `pub` rather than `#[cfg(test)]` for one stated purpose — "the choice was this or a second `ScratchDir`, which is the thing this module exists to have stopped" — and both binaries wrote one anyway, each citing the other, on a premise that stopped being true at #66c. `rdnsd` carried both at once: `dispatch.rs` already reached for the shared one. 57 lines deleted, 9 added, no behaviour. What it is worth is not the lines: §7 says the reason is what stops the next copy, and here the reason was copied along with the code and went on justifying it after it had expired |
+| **77** | what #73 and #75 left behind | **filed 2026-09-19, closed 2026-09-20**, `1a0422c` and `2d72c4c`. **77b**: the test #75 landed without — a query, an UPDATE and a transfer attempt down one connection, **3 data frames against 1** with that tail reverted, so the old shape dropped two of three rather than capturing nothing, which is what the row had guessed. **77a**: the survey the row asked for, and it did not decide what the row expected. Knot fixes it in the signer ("TTL of *generated* NSEC(3) records"), PowerDNS in its own signing, NSD has no entry at all because it never signs, and BIND cites 9077 nowhere — while RFC 9077 §§3.1-3.3 each put the MUST on the TTL "that is returned" and §4 addresses "signers **and** DNS servers". The field and the specification disagree; `rdnsd` is both, so a zone it did not sign reaches the same answer path as one it did, and the cap is taken there too. Counted rather than timed: the NXDOMAIN path takes the same apex lookups as before, the two DO-only paths take one more each, and no benchmark covers a signed negative answer |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
