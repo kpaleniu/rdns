@@ -8794,7 +8794,7 @@ queue (`CLAUDE.md` §18).
   quoted, the way #8 was settled. If the answer is "signers only", this row is
   a decision to decline and not work — and it should be declined in writing
   rather than left open.~~ **Taken 2026-09-20, and it did not decide what the
-  row expected it to.** `2d72c4c.
+  row expected it to.** `2d72c4c`.
 
   **The peers all fix it where they sign.** Knot DNS 3.1.0 (2021-08-02), in
   `NEWS`: "knotd: TTL of *generated* NSEC(3) records is set to min(SOA TTL, SOA
