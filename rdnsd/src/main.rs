@@ -823,19 +823,35 @@ fn hostname_bytes() -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// "853 (DoT), 853 (DoQ)", or whichever of the two is configured.
-fn describe_encrypted(policy: &TlsPolicy) -> String {
+/// "853 DoT, 853 DoQ", or whichever of the three is configured.
+///
+/// Takes the addresses rather than a [`TlsPolicy`] because `--check-config`
+/// answers before one is built and so had written its own copy — a copy that
+/// matched on DoT and DoQ alone, so a DoH-only server was reported as
+/// "encrypted transports disabled" by the one command whose whole job is to be
+/// believed before a restart (`CLAUDE.md` §7).
+fn describe_encrypted(dot: Option<&str>, doq: Option<&str>, doh: Option<(&str, &str)>) -> String {
     let mut parts = Vec::new();
-    if let Some(addr) = &policy.dot {
+    if let Some(addr) = dot {
         parts.push(format!("{addr} DoT"));
     }
-    if let Some(addr) = &policy.doq {
+    if let Some(addr) = doq {
         parts.push(format!("{addr} DoQ"));
     }
-    if let Some((addr, path)) = &policy.doh {
+    if let Some((addr, path)) = doh {
         parts.push(format!("{addr}{path} DoH"));
     }
     parts.join(", ")
+}
+
+impl TlsPolicy {
+    fn describe(&self) -> String {
+        describe_encrypted(
+            self.dot.as_deref(),
+            self.doq.as_deref(),
+            self.doh.as_ref().map(|(a, p)| (a.as_str(), p.as_str())),
+        )
+    }
 }
 
 /// A DoT listener: the address, and the certificate it presents.
@@ -1093,7 +1109,7 @@ async fn serve(
                 let (cert, key) = policy.store.paths();
                 format!(
                     "{} (cert {}, key {})",
-                    describe_encrypted(policy),
+                    policy.describe(),
                     cert.display(),
                     key.display()
                 )
@@ -2291,15 +2307,17 @@ async fn main() -> Result<()> {
             // matched against its key above — a dry run has to run everything
             // that does not bind a socket (`CLAUDE.md` §15), and saying nothing
             // about it would leave an operator unable to tell whether it did.
-            match (&cli.tls_listen, &cli.quic_listen, &tls_store) {
-                (None, None, _) | (_, _, None) => "disabled".to_string(),
-                (dot, doq, Some(_)) => format!(
+            match &tls_store {
+                None => "disabled".to_string(),
+                Some(_) => format!(
                     "on {}, certificate loads",
-                    [dot.as_deref().map(|a| format!("{a} DoT")), doq.as_deref().map(|a| format!("{a} DoQ"))]
-                        .into_iter()
-                        .flatten()
-                        .collect::<Vec<_>>()
-                        .join(" and ")
+                    describe_encrypted(
+                        cli.tls_listen.as_deref(),
+                        cli.quic_listen.as_deref(),
+                        cli.https_listen
+                            .as_deref()
+                            .map(|addr| (addr, cli.https_path.as_str())),
+                    )
                 ),
             }
         );
