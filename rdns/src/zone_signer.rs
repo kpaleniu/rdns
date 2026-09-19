@@ -387,7 +387,13 @@ fn sign_zone_inner(
 
     let layout = Layout::of(&signed, origin.as_ref());
 
-    let denial_ttl = Ttl::from_secs(minimum);
+    // RFC 9077 §3: the denial's TTL is the *lesser* of MINIMUM and the SOA's own
+    // TTL, not MINIMUM alone. RFC 4034 §4.1.1's "same as MINIMUM" predates
+    // aggressive use (RFC 8198), under which the NSEC's own TTL is how long a
+    // resolver may keep synthesizing this "no" — so a zone with a short SOA TTL
+    // and a long MINIMUM had its denials cached twelve times longer than the SOA
+    // beside them said the negative answer lived.
+    let denial_ttl = Ttl::from_secs(minimum).min(soa_ttl);
     match &policy.chain {
         DenialChain::Nsec => build_nsec_chain(&layout, denial_ttl, &mut signed)?,
         DenialChain::Nsec3 {

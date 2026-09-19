@@ -647,6 +647,50 @@ deep.a.b IN TXT "down here"
         )
     }
 
+    /// A denial never outlives the SOA beside it, whatever MINIMUM says.
+    ///
+    /// RFC 9077 §3: the NSEC or NSEC3 TTL is the *lesser* of the SOA's MINIMUM
+    /// and the SOA record's own TTL. RFC 4034 §4.1.1's older "same as MINIMUM"
+    /// predates RFC 8198, under which the denial's own TTL is how long a
+    /// resolver may keep synthesizing this "no" out of its cache.
+    ///
+    /// Watched failing against the old `denial_ttl = MINIMUM`: the NSEC and its
+    /// RRSIG read 3600 beside an SOA of 300. Every other fixture in this tree is
+    /// `$TTL 3600` with `minimum 300`, which is the masking direction — the
+    /// `min` is invisible unless the SOA's own TTL is the smaller of the two.
+    #[test]
+    fn a_denial_is_capped_by_the_soa_ttl_and_not_by_minimum_alone() {
+        const SHORT_TTL_LONG_MINIMUM: &str = "$ORIGIN example.com.\n\
+$TTL 300\n\
+@       IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 3600 )\n\
+@       IN NS  ns1.example.com.\n\
+ns1     IN A   192.0.2.1\n\
+www     IN A   192.0.2.10\n";
+        for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
+            let zone = parse_zone_file(SHORT_TTL_LONG_MINIMUM, ORIGIN).unwrap();
+            let zone = sign_zone(
+                &zone,
+                &signing_keys(ORIGIN),
+                &signing_policy(NOW, chain.clone()),
+            )
+            .unwrap();
+            let soa_ttl = zone
+                .query(zone.origin(), Qtype::of(rt::SOA))
+                .into_iter()
+                .next()
+                .expect("the apex SOA")
+                .ttl;
+            for record in negative(&zone, "nope.example.com.", &NameKind::NotFound) {
+                assert!(
+                    record.ttl <= soa_ttl,
+                    "{chain:?}: a proof record lives {} where the SOA lives {}",
+                    record.ttl.as_secs(),
+                    soa_ttl.as_secs()
+                );
+            }
+        }
+    }
+
     #[test]
     fn an_ordinary_answer_goes_out_with_the_signature_that_covers_it() {
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
