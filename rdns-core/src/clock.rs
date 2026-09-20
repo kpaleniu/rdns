@@ -38,6 +38,26 @@ pub fn current_unix_timestamp() -> u64 {
 /// reason this is an enum rather than a boxed closure: the ordinary path stays
 /// a branch and a direct call, and `Fixed` names what a test wants — an instant
 /// it can move — rather than leaving each test to assemble one.
+///
+/// **The seam stops at the request path, and that is a decision rather than a
+/// place nobody got to** (`TODO.md` #92). Twelve wall-clock reads in `rdnsd`
+/// are outside one — the load path's `signed_at`, the NOTIFY client's TSIG
+/// timestamps, the REFRESH/RETRY/EXPIRE timers, the re-signing policy and
+/// `status`'s ages — and the question that was asked of each is whether it
+/// decides a test's outcome. None does, because every one of them already takes
+/// its instant as a parameter one level down: `resign_interval_at`,
+/// `policy_for`, `apply_keeping`, `has_expired`, `expire_if_out_of_contact`.
+/// Threading a `Clock` through `Reloading`, the NOTIFY task, the replication
+/// timer and `Control` would add four constructor parameters to duplicate a
+/// seam that is already there and already used.
+///
+/// The closest candidate declines for a different reason, which is the one
+/// worth knowing. `send_notify` signs with `tsig::now()`, and RFC 8945
+/// §5.2.3's fudge makes a skewed clock visible on the wire — #87's argument
+/// exactly, in the outbound direction #87 did not sweep. But it retries over
+/// minutes, so each attempt has to sign with a *current* timestamp: a seam
+/// there has to be a `Clock` and not an instant, and passing an instant in
+/// would be the defect rather than the fix.
 #[derive(Clone, Debug)]
 pub enum Clock {
     /// [`current_unix_timestamp`].

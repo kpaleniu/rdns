@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#92**, and **#21**, as of 2026-09-20.
+**#58**, **#68**, and **#21**, as of 2026-09-20.
 **#93 closed** on a measurement that refuted it. **#95 and #96 closed
 together**: #95's survey said §3's example of a branch was invented, and found
 the branch that was real, which is #96 — a master that refuses the SOA probe was
@@ -5849,7 +5849,7 @@ the `rand` upgrade, unchanged from before it.
 
 ---
 
-### 92. Twelve wall-clock reads outside any request path — **filed 2026-09-20**
+### 92. Twelve wall-clock reads outside any request path — **filed and closed 2026-09-20**
 
 #87's count, kept because §18 says a sentence naming remaining work is a row or
 it is deleted. None of the twelve is a defect and none is on a path a stranger
@@ -5857,10 +5857,17 @@ can reach:
 
 | where | how many | what reads it |
 |---|---|---|
-| `rdnsd/src/main.rs` | 4 | two reload `signed_at`, two in the NOTIFY *client* |
+| ~~`rdnsd/src/main.rs`~~ | ~~4~~ **2** | ~~two reload `signed_at`, two in the NOTIFY *client*~~ the load path's `signed_at`, at startup and at reload |
+| **`rdnsd/src/notify_out.rs`** | **2** | the NOTIFY client's TSIG timestamps — **in `main.rs` when this was filed, moved by #83 the same day.** A table that names files goes stale when a file moves; the count did not |
 | `rdnsd/src/replication.rs` | 4 | the REFRESH/RETRY/EXPIRE timers |
 | `rdnsd/src/zones.rs` | 3 | the re-signing policy |
 | `rdnsd/src/control.rs` | 1 | `status`'s "last heard from" ages |
+
+Re-counted on closing: still **12**, by a script that strips `#[cfg(test)]`
+modules and counts both spellings, `current_unix_timestamp()` and
+`tsig::now()`. Two sites that look like production are not — `dispatch.rs:1803`
+sits under a `#[cfg(test)]` and `response_size` is a whole module `main.rs`
+declares `#[cfg(test)]`.
 
 **No remedy is named on purpose** (§18: a row naming a wrong remedy costs more
 than one naming none). "Give them a `Clock` too" is the obvious answer and it is
@@ -5870,16 +5877,44 @@ replication timer and `Control` would each need the seam threaded through a
 constructor, which is four new parameters for a seam nothing is currently asking
 for.
 
-**The measurement that would decide it**, and it is the one #52 and #87 both
-turned on: *is any of the twelve deciding a test's outcome today?* #52's row
-existed because a rate-limit assertion was a coin toss, and #87's because a TSIG
-fudge made a wrong clock visible on the wire. Neither is true here on the face of
-it — the re-signing tests pass an explicit instant (`resign_interval_at`,
-`policy_for`), and the replication timers are tested through `has_expired`, which
-takes both numbers. So the row to write next is "which of these twelve has a test
-that would be simpler, or an assertion that would stop being timing-dependent",
-and if the answer is none, the finding is that the seam should stop at the
-request path and say so in `Clock`'s own doc comment.
+~~**The measurement that would decide it**~~ **Taken, and the answer is
+none** — so the finding is the one the row named as the alternative: the seam
+stops at the request path, and `Clock`'s own doc comment says so now.
+
+**Site by site, what the question was**: does this read decide a test's outcome,
+or would a seam here make a test simpler or an assertion less timing-dependent?
+
+- **`zones.rs`'s three.** `resign_interval` is one line over `resign_interval_at`
+  and `apply` one over `apply_keeping`; `policy_for` takes the instant. The `_at`
+  form's own doc comment says why it exists — "which is what makes it testable
+  without waiting ten days" — so the seam is there and is the one the tests use.
+- **`replication.rs`'s four.** `expire_if_out_of_contact` takes `started_at` and
+  reads the clock again for the comparison, which looks like the defect and is
+  not: the parameter is the *fallback* for a zone with no recorded contact, and
+  the comparison wants real elapsed time. The tests drive expiry through the
+  recorded `refreshed_at` and the margin is EXPIRE, which is hours, so nothing
+  here is a coin toss. `withdraw_unvouched_zones` reads one instant for the whole
+  sweep, which is what it should do.
+- **`main.rs`'s two.** `signed_at` feeds `Keepable`, and a test of the load path
+  passes its own.
+- **`control.rs`'s one.** `status` renders "`{at}` (`{ago}` ago)", and the two
+  tests that read `status` assert on zone names, serials, and the *absence* of a
+  contact time. Nothing asserts a rendered age. It is the one site where a future
+  test would want the seam, and that test does not exist.
+
+**The closest candidate declines for a different reason, and that is the part
+worth keeping.** The NOTIFY client's two `tsig::now()` carry #87's own argument:
+RFC 8945 §5.2.3's fudge makes a skewed clock visible on the wire, and #87 fixed
+exactly that for the inbound direction. But `send_notify` retries over minutes,
+so every attempt has to sign with a *current* timestamp — a seam there has to be
+a `Clock` and not an instant, and passing an instant in would be the defect
+rather than the fix. #87's remedy does not generalize to its own other half, and
+that is why this is written on `Clock` rather than left to be re-derived.
+
+**No code changed.** The output of this row is a paragraph in
+`rdns-core/src/clock.rs` saying where the seam ends and why, which is what §4
+asks for when the answer is "nothing is wrong here": a claim somebody checked,
+recorded, so the next reader does not check it again.
 
 ---
 
@@ -6351,6 +6386,7 @@ the week; the record is under "How the queue kept going stale" in
 | **89** | a moved module left its doc comment on the next one | **filed and closed 2026-09-20**, and it is **#79c** filed a second time a day later. `e26a479` (#66c) moved `rdns/src/testutil.rs` to `rdns-core` and left `/// Scratch directories, for tests only.` attached to the `pub mod tls_identity;` below it, where it rendered on the crate index. `cargo doc` cannot catch a doc comment that is wrong rather than broken, and #20 had already written the remedy as prose ("after any move, grep the seam for an orphaned `///`"), so nobody ran it. Deleted, and the grep is now `rdns/tests/module_doc_comments.rs`: a `///` on a `mod X;` that shares no content word with the module's name or the first paragraph of its own `//!`. **Weak on purpose** — the seven that agree measure 4, 1, 4, 5, 2, 1 and 4 shared words against the orphan's 0, so a threshold of two would flag `mod eviction` (which agrees only through its own name) and `mod dispatch`. The one recursive `.rs` walk in the tree moved to `rdns_core::testutil` rather than being written a second time (§7), and both scans assert on what it hands back. It reads source as data, so it covers `rdnsd/src/control.rs` on Windows, where that file never compiles |
 | **79** | claims and code that outlived each other | **filed 2026-09-19, closed 2026-09-20**, five rows. **79a**: six dead `pub fn`, not four — a sweep of the workspace's 713 `pub fn` definitions finds four, and misses `Nat64Prefix::bits` and `TransferError::refused` because a string literal and an unrelated struct field carry those words, which is #82b's point about a name-based criterion from the other side. Two of the six were not dead code: `Rtype::is_meta` is the RFC-citing copy of a predicate `update.rs`'s RFC 2136 §3.4.1 prescan spells by hand, so it was wired in rather than deleted; `TransferError::Refused` was unreachable because the site that should build it builds `Malformed`, which left **#95**. **79b**: §17 re-measured, five fixed and two live. **79c**: closed as #89, which was it filed twice. **79d**: `set_edns` is `pub` and three answer paths use it without `mirror`, so the guarantor is `finish`'s guard, now cited and asserted. **79e**: three of six `NotFound` returns establish the wildcard invariant, not four, and the guarantor is `rdnsd`'s `resolve_in_zone` ordering — confirmed with the zone the row asked for. **79f**: 40 of `Cli`'s 46 `#[arg]` fields conflict with `--config`, so six are exempt and not three; the certificate check stays in `main` over the merged view, with the reason written in |
 | **80** | two bools where the enum was already imported | **filed 2026-09-19, closed 2026-09-20**. `validate_rrset` returned `(is_valid, is_signed)`, documented in prose and nowhere in the type, with seven bare tuple literals in the file. The refuting check — a caller needing `is_signed` without already holding the `ZoneKeys` that answers it — came back empty: both production sites are in `verify_zones`, and the first calls `keys.is_signed()` one line above. `Verdict::{Unchecked, Valid, Invalid(String)}` now, and the `Invalid` carries what the pair could not: `verify_zones` said "does not verify against the zone's own keys" for an expiry, a missing signature and an unreadable algorithm alike. `validate_response` and `is_zone_signed` deleted with it, both dead and both #79a's shape in the same module; five doc comments naming the first were reworded rather than left to rot (#89). Allocation counts 33 either side; one test caught agreeing with the code for the wrong reason, which is **#94** |
+| **92** | twelve wall-clock reads outside any request path | **filed and closed 2026-09-20**, and it closed with **no code change**, which was one of the two outcomes it was filed with. The deciding measurement — does any of the twelve decide a test's outcome — came back **none**: every one already takes its instant as a parameter one level down (`resign_interval_at`, `policy_for`, `apply_keeping`, `has_expired`, `expire_if_out_of_contact`), and threading a `Clock` through `Reloading`, the NOTIFY task, the replication timer and `Control` would add four constructor parameters to duplicate a seam already in use. **The closest candidate declines for a different reason and that is the keeper**: the NOTIFY client's `tsig::now()` carries #87's own argument — RFC 8945 §5.2.3's fudge makes skew visible on the wire — but `send_notify` retries over minutes, so each attempt must sign with a *current* timestamp and a seam there has to be a `Clock`, not an instant. #87's remedy does not generalize to its own other half. Written on `Clock` rather than left to be re-derived. Re-counted on closing: still 12, and the table's *files* had moved — #83 took the two NOTIFY reads out of `main.rs` the same day |
 | **90** | no test spawned either binary | **filed and closed 2026-09-20**. **The refuting check the row asked for went first and came back the other way**: lifting the startup sequence out of `main` is possible and is not cheaper — `main` holds **28** top-level bindings before the dry-run exit and about twenty are live after it, so the lifted function hands back a struct built in one place and destructured in another, which is #83's reload cluster measured and declined a day earlier. One of the row's three items was **already covered** and the row had not checked: #63i's clap-introspection test has held the flag-conflict set since 2026-09-15. 15 tests landed, and they found **two defects on their first run**. A `--zone-file` that will not parse reported `line 2: ...` and **no file name**, where both sibling branches of `load_zones` name theirs — §7's second copy, and the one the smallest deployment hits. And `rdnsd --check-config` demanded a config file it does not need: `requires = "config"` was inert where it mattered (`--zone-file` conflicts with `--config`, so clap never enforced it) and misleading where it fired. That stopped being a judgement call when `rdnsr` was read — its `check_config` carries the argument against the attribute in a comment and has never had it, so one binary held the reasoning and the other held the attribute |
 | **83** | `rdnsd/src/main.rs` had grown two seams | **filed 2026-09-19, closed 2026-09-20**, one taken and one declined. The method was #38d's and **the criterion had to be read first**: it counts `pub(crate)` annotations, and `main.rs` is the crate root, where §17 already records that private is not private. The NOTIFY cluster is 3 annotations against 2 sealed — a revert on the letter — while what changed is **2 items unreachable from the rest of the crate and 0 newly reachable**. Taken on the second reading. `main.rs`'s code half **1597 → 1434**, 8 imports off its non-test surface, 4 of 5 tests moved with the code. The row's "one reach-back, and it is removable" was right about the one and wrong that removing it leaves none: `&Cli` went and `absolute_name` appeared, net zero. The fifth test could not move — it needs seven `main.rs` fixtures, because it is a replication test wearing a NOTIFY test's name. **The reload cluster is declined 18 against 1**: 5 items plus 13 struct fields, since `serve` builds `Reloading` and `ReloadContext` as literals — `Cli`'s shape at a third of the size, which the row had ruled out for `Cli` without noticing the two structs beside it |
 | **96** | a master that refuses the SOA probe was treated as unreachable | **filed and closed 2026-09-20**, out of #95's survey. `fetch_soa` mapped every non-NOERROR rcode to `TransferError::malformed` and `refresh_zone` propagated it with `?` before ever asking for the transfer, so a master that refuses queries and allows transfers — separate ACLs in BIND, Knot and NSD, and an ordinary hardening posture — took the zone to EXPIRE. BIND branches on exactly this rcode, with the reason in a comment: "Perhaps AXFR/IXFR is allowed even if SOA queries aren't". **#57 opened the window** by adding the probe. The variant is `Rcode(ResponseCode)` and not the `Refused` #79a deleted: the caller branches on *which* code, so it has to carry the value it caught (§2). Both rcode sites build it, and neither says "malformed" about a well-formed refusal. Two decisions settled by the survey rather than by taste: a refusal to the *transfer* still fails, and the refusal is **not** remembered per master, because BIND does not remember it either — `SOABEFOREAXFR` is cleared every `xfrdone` and NSD's per-master memory is for a bad IXFR. The measurement the row named was not needed and the row says why: it would have priced the remembering, which the field declined first |
