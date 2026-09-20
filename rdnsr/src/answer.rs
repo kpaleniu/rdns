@@ -278,10 +278,6 @@ pub(crate) async fn handle_query(
         return unsupported_opcode(&msg, ctx.udp.advertised(), client_max).into();
     }
 
-    // No question at all: nothing to answer and nothing to say about it.
-    let Some(query) = msg.queries.first().cloned() else {
-        return None.into();
-    };
     let id = msg.id;
     let recursion = msg.recursion;
 
@@ -296,6 +292,37 @@ pub(crate) async fn handle_query(
             return edns_error(&msg, rcode, client_max, ctx.udp.advertised()).into();
         }
     };
+    // Exactly one question, or FORMERR — after the EDNS-level rejections above,
+    // which is the order `rdnsd` answers these two in.
+    //
+    // RFC 9619 §4: "A DNS message with OPCODE = 0 MUST NOT include a QDCOUNT
+    // parameter whose value is greater than 1", and one that does "MUST be
+    // treated as an incorrectly formatted message" — one RCODE and one set of
+    // sections cannot describe two lookups. This answered the first question
+    // and echoed one, so the reply did not match the request either
+    // (`TODO.md` #30r).
+    //
+    // QDCOUNT = 0 was *dropped* here until `TODO.md` #78c, where `rdnsd`
+    // answered it: one packet, two daemons, two behaviours. §4's QDCOUNT = 0
+    // sentence settles neither, since it binds firewalls rather than
+    // responders. RFC 7873 §5.4 is what such a query is for, extends the QUERY
+    // opcode to it only "for servers with DNS Cookies enabled", and says a
+    // server without them "will normally send FORMERR". Measured: BIND
+    // 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all answer it and
+    // none drops it.
+    let [query] = msg.queries.as_slice() else {
+        ctx.record_answer(ResponseCode::FormatError, timer);
+        return empty_error(
+            &msg,
+            ResponseCode::FormatError,
+            None,
+            ctx.udp.advertised(),
+            client_max,
+        )
+        .into();
+    };
+    let query = query.clone();
+
     // DO means "send me the signatures", AD "tell me whether you checked"; CD
     // means "don't withhold anything on my behalf, I validate myself", which is
     // the message's own bit.
@@ -308,17 +335,6 @@ pub(crate) async fn handle_query(
         edns: client_edns,
         max_len: client_max,
     };
-
-    // RFC 9619 §4: "A DNS message with OPCODE = 0 MUST NOT include a QDCOUNT
-    // parameter whose value is greater than 1", and one that does "MUST be
-    // treated as an incorrectly formatted message" — one RCODE and one set of
-    // sections cannot describe two lookups. `rdnsd` has refused it since #9f;
-    // this answered the first question and echoed one, so the reply did not
-    // match the request either (`TODO.md` #30r).
-    if msg.queries.len() > 1 {
-        let resp = build_response(&msg, Vec::new(), ResponseCode::FormatError);
-        return finish(resp, false, None, &client, &query, ctx, timer).into();
-    }
 
     // Names that must not leave this machine (RFC 6761, 6762, 6303). Before
     // every cache: the table *is* the answer, and consulting anything else means
@@ -1145,7 +1161,8 @@ fn edns_error(
     resp.to_bytes_within(client_max).ok()
 }
 
-/// NOTIMP for an opcode this resolver does not implement.
+/// An empty reply carrying `rcode` and `why`, for the rejections decided before
+/// anything is resolved.
 ///
 /// The opcode is echoed, not replaced with QUERY (RFC 1035 §4.1.1): a NOTIFY
 /// answered with `opcode = QUERY` is a reply its sender cannot match. Same
@@ -1153,15 +1170,33 @@ fn edns_error(
 ///
 /// The question is echoed and the OPT record mirrored if the client used EDNS
 /// (RFC 6891 §6.1.1) — a reply with no OPT may get us cached as a server that
-/// does not do EDNS.
-fn unsupported_opcode(msg: &DnsMessage, advertised: u16, max_len: usize) -> Option<Vec<u8>> {
-    const WHY: ExtendedError =
-        ExtendedError::new(InfoCode::NOT_SUPPORTED, "this opcode is not implemented");
-    let mut resp = build_response(msg, Vec::new(), ResponseCode::NotImplemented);
-    if let Some(edns) = ClientEdns::of(msg).mirror_with(advertised, Some(WHY)) {
+/// does not do EDNS. Unlike [`edns_error`], which answers a *broken* OPT and so
+/// must send one of its own whatever the client sent.
+fn empty_error(
+    msg: &DnsMessage,
+    rcode: ResponseCode,
+    why: Option<ExtendedError>,
+    advertised: u16,
+    max_len: usize,
+) -> Option<Vec<u8>> {
+    let mut resp = build_response(msg, Vec::new(), rcode);
+    if let Some(edns) = ClientEdns::of(msg).mirror_with(advertised, why) {
         resp.set_edns(edns);
     }
     resp.to_bytes_within(max_len).ok()
+}
+
+/// NOTIMP for an opcode this resolver does not implement.
+fn unsupported_opcode(msg: &DnsMessage, advertised: u16, max_len: usize) -> Option<Vec<u8>> {
+    const WHY: ExtendedError =
+        ExtendedError::new(InfoCode::NOT_SUPPORTED, "this opcode is not implemented");
+    empty_error(
+        msg,
+        ResponseCode::NotImplemented,
+        Some(WHY),
+        advertised,
+        max_len,
+    )
 }
 
 /// Answer a NOTIFY about a policy zone, and queue the re-read it asks for
@@ -2893,6 +2928,79 @@ mod tests {
         assert!(
             reply.answers.is_empty(),
             "there is no answer to two questions"
+        );
+    }
+
+    /// No question at all is answered, not dropped (`TODO.md` #78c).
+    ///
+    /// This dropped the datagram while `rdnsd` answered an empty NOERROR: one
+    /// packet, two daemons, two behaviours. RFC 9619 §4 settles neither — its
+    /// QDCOUNT = 0 sentence is addressed to firewalls, not responders — so the
+    /// peers were asked. All four answer and none drops; three of them, and the
+    /// fourth without an OPT, answer FORMERR, which is also what RFC 7873 §5.4
+    /// says a server without DNS Cookies "will normally send" to the cookie
+    /// probe that is the reason such a query exists.
+    ///
+    /// | | no OPT | OPT, no COOKIE | OPT + COOKIE |
+    /// |---|---|---|---|
+    /// | BIND 9.20.27 | FORMERR | FORMERR | NOERROR + cookie |
+    /// | Knot 3.6.0 | FORMERR | FORMERR | FORMERR |
+    /// | NSD 4.12.0 | FORMERR | NOERROR | NOERROR |
+    /// | Unbound 1.23.1 | FORMERR | FORMERR | FORMERR + cookie |
+    ///
+    /// Watched failing against the old code: `handle_query` returned `None`.
+    #[tokio::test]
+    async fn a_query_with_no_question_is_answered_not_dropped() {
+        let serving = context();
+        let bytes = handle_query(
+            query_for("localhost.", 0, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("answered, not dropped");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::FormatError);
+        assert!(reply.queries.is_empty(), "nothing to echo");
+        assert!(reply.answers.is_empty());
+        assert!(
+            reply.edns().is_none(),
+            "an unsolicited OPT is not mirroring (RFC 6891 §6.1.1)"
+        );
+    }
+
+    /// ...and the client's OPT comes back on it, which is the case that
+    /// matters: RFC 7873 §5.4's probe carries one, and a reply without one may
+    /// be remembered as a server that does not do EDNS.
+    #[tokio::test]
+    async fn the_empty_questions_formerr_mirrors_the_clients_opt() {
+        let serving = context();
+        let mut msg =
+            DnsMessage::try_from_bytes(&query_for("localhost.", 0, false)).expect("parses");
+        msg.set_edns(Edns::with_payload_size(1232));
+        let mut buf = vec![0u8; 512];
+        let n = msg.to_bytes(&mut buf).expect("serialize");
+        buf.truncate(n);
+
+        let bytes = handle_query(
+            buf,
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .reply
+        .expect("answered, not dropped");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::FormatError);
+        assert_eq!(
+            reply.edns().expect("an OPT").udp_payload_size,
+            serving.ctx.udp.advertised(),
+            "mirrored with what this resolver advertises"
         );
     }
 

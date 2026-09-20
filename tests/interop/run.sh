@@ -760,6 +760,50 @@ s43e() {
   check "kdig's EDNS padding does not break the answer" "192.0.2.10" \
     <<< "$(t kdig +short +padding=128 -p 5353 @10.53.0.2 www.example.com A 2>&1)"
 
+  # ---- #78c: a QUERY with no question, which dig cannot send --------------
+  #
+  # RFC 9619 sec 4 settles QDCOUNT > 1 and not QDCOUNT = 0: its only sentence
+  # about 0 is addressed to firewalls deciding what to forward, not to
+  # responders deciding what to answer. So the peers decide. What such a query
+  # is *for* is RFC 7873 sec 5.4's cookie probe, which extends the QUERY opcode
+  # to an empty question section "for servers with DNS Cookies enabled" and says
+  # a server without them "will normally send FORMERR".
+  #
+  # The refutation (sec 19): "answer it" is only right if the peers answer it.
+  # One of them dropping it would make rdnsr's old behaviour the majority.
+  qd0() {  # qd0 <addr> <port> <edns:0|1>  ->  "RCODE AA|noAA opt|noopt"
+    t python3 - "$1" "$2" "$3" <<'PY'
+import socket, struct, sys
+host, port, edns = sys.argv[1], int(sys.argv[2]), sys.argv[3] == "1"
+RC = {0:"NOERROR",1:"FORMERR",2:"SERVFAIL",3:"NXDOMAIN",4:"NOTIMP",5:"REFUSED",23:"BADCOOKIE"}
+opt = b"\x00" + struct.pack("!HHIH", 41, 4096, 0, 0) if edns else b""
+q = struct.pack("!HHHHHH", 0x7878, 0x0100, 0, 0, 0, 1 if edns else 0) + opt
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(4)
+s.sendto(q, (host, port))
+try:
+    d = s.recv(4096)
+except socket.timeout:
+    print("DROPPED"); raise SystemExit
+_i, fl, _qd, _an, _ns, ar = struct.unpack("!HHHHHH", d[:12])
+print(RC.get(fl & 0xF, "RCODE%d" % (fl & 0xF)),
+      "AA" if fl & 0x0400 else "noAA",
+      "opt" if ar else "noopt")
+PY
+  }
+
+  check "rdnsd answers a QDCOUNT=0 query FORMERR, AA clear" "FORMERR noAA"     <<< "$(qd0 10.53.0.2 5353 0)"
+  check "...and mirrors the OPT the probe carried (RFC 6891 sec 6.1.1)" "FORMERR noAA opt"     <<< "$(qd0 10.53.0.2 5353 1)"
+
+  local peer got
+  for peer in "BIND=10.53.0.3" "Knot=10.53.0.4" "NSD=10.53.0.5" "Unbound=10.53.0.6"; do
+    got="$(qd0 "${peer#*=}" 53 0)"
+    if [ "$got" = "DROPPED" ]; then
+      bad "${peer%%=*} dropped a QDCOUNT=0 query - answering one is not the majority after all"
+    else
+      ok "${peer%%=*} answers a QDCOUNT=0 query: $got"
+    fi
+  done
+
   # ---- #46: a NOTIFY the peer's ACL demands be signed ---------------------
   #
   # NSD's `allow-notify: <addr> <key>` and Knot's `acl: { key: ..., action:

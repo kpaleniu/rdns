@@ -92,19 +92,27 @@ pub(crate) fn write_response(
         return w.finish();
     }
 
-    // RFC 9619 §4: "A DNS message with OPCODE = 0 MUST NOT include a QDCOUNT
-    // parameter whose value is greater than 1", and one that does "MUST be
-    // treated as an incorrectly formatted message" — FORMERR. There is no answer
-    // to give two questions: one RCODE, one AA bit and one set of sections
-    // cannot describe two lookups. BIND, NSD, Knot and Unbound all refuse it.
+    // Exactly one question, or FORMERR. RFC 9619 §4: "A DNS message with
+    // OPCODE = 0 MUST NOT include a QDCOUNT parameter whose value is greater
+    // than 1", and one that does "MUST be treated as an incorrectly formatted
+    // message" — one RCODE, one AA bit and one set of sections cannot describe
+    // two lookups.
     //
-    // QDCOUNT = 0 is left alone; §4 says a firewall "MUST NOT treat messages
-    // with OPCODE = 0 and QDCOUNT = 0 as malformed".
-    if msg.queries.len() > 1 {
-        w.set_rcode(ResponseCode::FormatError);
-        w.set_authoritative(false);
-    } else if let Some(query) = msg.queries.first() {
-        answer_question(query, zones, dnssec_ok, key, &mut w)?;
+    // QDCOUNT = 0 was NOERROR here until `TODO.md` #78c, on the strength of
+    // §4's other sentence — which binds *firewalls* ("Such firewalls MUST NOT
+    // treat messages with OPCODE = 0 and QDCOUNT = 0 as malformed"), not
+    // responders, and left AA set over a question section naming nothing to be
+    // authoritative for. RFC 7873 §5.4 is what such a query is for and extends
+    // the QUERY opcode to it only "for servers with DNS Cookies enabled";
+    // without cookies it says such a server "will normally send FORMERR".
+    // Measured: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all
+    // answer FORMERR to one carrying no OPT, and none of them sets AA.
+    match msg.queries.as_slice() {
+        [query] => answer_question(query, zones, dnssec_ok, key, &mut w)?,
+        _ => {
+            w.set_rcode(ResponseCode::FormatError);
+            w.set_authoritative(false);
+        }
     }
 
     // Count the answer by what it says. REFUSED climbing means a zone went
@@ -1350,9 +1358,13 @@ x.sub2   IN A   192.0.2.30
     /// value is greater than 1", to "be treated as an incorrectly formatted
     /// message" — and BIND, NSD, Knot and Unbound all did this already.
     ///
-    /// QDCOUNT = 0 stays a plain empty NOERROR: the same section says a
-    /// firewall "MUST NOT treat messages with OPCODE = 0 and QDCOUNT = 0 as
-    /// malformed".
+    /// So is no question at all, and that is the half this test had wrong
+    /// (`TODO.md` #78c). It asserted an empty NOERROR on the strength of §4's
+    /// other sentence — "Such firewalls MUST NOT treat messages with
+    /// OPCODE = 0 and QDCOUNT = 0 as malformed" — which is addressed to
+    /// middleboxes deciding what to forward, not to responders deciding what to
+    /// answer, and which said nothing about the AA bit this server was setting
+    /// over an empty question section.
     #[test]
     fn two_questions_in_one_query_are_a_format_error() {
         let mut msg = query("www.example.com.", Qtype::of(record_types::A), false);
@@ -1373,7 +1385,11 @@ x.sub2   IN A   192.0.2.30
             msg.queries.clear();
             make_response(&msg, &server(), &DnsMetrics::new())
         };
-        assert_eq!(none.rcode, ResponseCode::Ok, "no question is not malformed");
+        assert_eq!(none.rcode, ResponseCode::FormatError, "nothing to look up");
+        assert!(
+            !none.authoritive,
+            "AA names the question section's domain (RFC 1035 §4.1.1), and there is none"
+        );
         assert!(none.answers.is_empty());
     }
 

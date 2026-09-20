@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#78**, **#81**, **#82**, **#83**, **#84**, **#90**, **#92**,
-**#93**, **#94**, **#95**, and **#21**, as of 2026-09-20.
+**#58**, **#68**, **#81**, **#82**, **#83**, **#84**, **#90**, **#92**, **#93**,
+**#94**, **#95**, and **#21**, as of 2026-09-20.
 
 **#85 through #90 came out of a second architecture review on 2026-09-20**, this
 one asking what the ideal shape would be and where the tree differs. **Ten
@@ -95,8 +95,9 @@ its signer",
 and RFC 9077 §§3.1-3.3 put the MUST on the TTL "that is returned" anyway. The
 field and the specification disagree, and `rdnsd` is the case that decides it,
 being both a signer and a server for zones it did not sign. Three rows in #78
-and most of #79 are the review's reading rather than a measurement taken here,
-and each says which it is: re-check before acting on one.
+and most of #79 were the review's reading rather than a measurement taken here;
+all of them were re-checked against the code before being acted on, and all of
+them held.
 
 **#72 closed the day it was filed**: seven allocations a record on the zone load
 path, not the two it
@@ -1133,7 +1134,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#78**, **#81**-**#84**, **#90**, **#92**, **#93**, **#94**,
+**#58**, **#68**, **#81**-**#84**, **#90**, **#92**, **#93**, **#94**,
 **#95**, plus **#21** —
 see "What is open" above, which is the same list and the only place it is
 written down.
@@ -4734,12 +4735,12 @@ parser already built, so `add_parsed` has nothing to offer them either.
 
 ---
 
-### 78. `rdnsr`'s query path loses work at three of its exits — **filed 2026-09-19**
+### 78. `rdnsr`'s query path loses work at three of its exits — **filed 2026-09-19, closed 2026-09-20**
 
 `handle_query` is 420 lines with 15 exits and a tail that does five things.
 Three of the exits skip something the tail does. The first was verified here by
-reading every exit; **b and c are the review's reading and have not been
-re-checked against the code** — do that before touching either.
+reading every exit; b and c were the review's reading, and both were
+re-checked against the code before being touched — both held.
 
 - **78a. A prefetch is discarded by `.into()`.** `refresh` is set at
   `answer.rs:422` when the answer cache says the entry is in the last tenth of
@@ -4823,15 +4824,63 @@ re-checked against the code** — do that before touching either.
   **Left behind: #93**, the same scramble in the answer records' *owner*
   names, which is data rather than a header and is not the same fix.
 
-- **78c. QDCOUNT=0 is dropped here and answered by `rdnsd`.** RFC 9619 §4 says
-  two things; #30r copied the first into `rdnsr` and not the second. `rdnsd`
-  answers an empty NOERROR and has a test asserting it; `rdnsr` drops the
-  datagram. One packet, two daemons, two behaviours, and only one of them wrote
-  down why. **The RFC does not settle it** — §4's second sentence is addressed
-  to firewalls, not responders — so this is "the two disagree and one is
-  silent", which is a smaller claim than "rdnsr is wrong". #47 records that
-  NSD 4.12 answers a QDCOUNT=0 NOTIFY rather than dropping it; ask the peers
-  properly before changing either.
+- **78c. QDCOUNT=0 is dropped here and answered by `rdnsd`.** ~~The review's
+  reading, not re-checked.~~ **Verified and closed 2026-09-20**, and both
+  halves were live: `rdnsr`'s `handle_query` bailed with `return None.into()`
+  on `queries.first()`, `rdnsd`'s `make_response` fell past its
+  `queries.len() > 1` check into the tail and answered an empty NOERROR. One
+  packet, two daemons, two behaviours, and only one of them wrote down why.
+
+  **The RFC does not settle it**, as the row said: §4's only sentence about
+  QDCOUNT = 0 is "Such firewalls MUST NOT treat messages with OPCODE = 0 and
+  QDCOUNT = 0 as malformed" — addressed to middleboxes deciding what to
+  forward, not to responders deciding what to answer. `rdnsd`'s comment and its
+  test had read it as the second, which is how an empty NOERROR came to be
+  asserted.
+
+  **What settles it is RFC 7873 §5.4**, which is the only place that says what
+  such a query is *for*: a cookie probe. It extends the QUERY opcode to an
+  empty question section "for servers with DNS Cookies enabled" — neither
+  daemon is, `EDNS_OPTION_COOKIE` is a constant and nothing implements the
+  option — and ends "servers that don't support the COOKIE option will
+  normally send FORMERR in response to such a query, though REFUSED, NOTIMP,
+  and NOERROR without a COOKIE option are also possible". So `rdnsd`'s NOERROR
+  was permitted and `rdnsr`'s drop was not on the list at all.
+
+  **So the peers were asked** (43e's QDCOUNT = 0 block, which dig cannot send):
+
+  | | no OPT | OPT, no COOKIE | OPT + COOKIE |
+  |---|---|---|---|
+  | BIND 9.20.27 | FORMERR | FORMERR | NOERROR + cookie |
+  | Knot 3.6.0 | FORMERR | FORMERR | FORMERR |
+  | NSD 4.12.0 | FORMERR | NOERROR | NOERROR |
+  | Unbound 1.23.1 | FORMERR | FORMERR | FORMERR + cookie |
+
+  **All four answer; none drops.** That is the finding, and it is the
+  measurement that could have refuted it (§19): one peer dropping would have
+  made `rdnsr`'s behaviour the majority rather than the outlier. FORMERR is
+  unanimous for the probe with no OPT, and NSD's NOERROR is §5.4's extension
+  relaxed from "an OPT with a COOKIE" to "an OPT" — a reading available only to
+  a server that implements cookies. Both daemons answer FORMERR now, at both
+  question counts, which is one `match msg.queries.as_slice()` in `rdnsd` and
+  one `let [query] = … else` in `rdnsr`, placed after the EDNS-level
+  rejections so the two agree on which error wins.
+
+  **A second defect the probe found and the review did not**: `rdnsd` set
+  **AA** on that NOERROR. `w.set_authoritative(true)` is the first line of
+  `write_response` and only the branches that decide otherwise clear it, so the
+  one reply with no question section carried a claim of authority over no name
+  (RFC 1035 §4.1.1, "the responding name server is an authority for the domain
+  name in question section"). No peer sets it. `CLAUDE.md` §7's
+  `truncated_reply` bullet is the same shape.
+
+  Left as it was: `rdnsr` is not in the interop network, so the peer comparison
+  covers `rdnsd` and the resolver's half is three unit tests — two new, watched
+  failing against the old code (`None`, and no OPT mirrored), and #30r's
+  two-question one, which the restructure re-routed. `unsupported_opcode` is
+  now a call to `empty_error`, since "an empty reply that mirrors the client's
+  OPT" was about to be written twice (§7). Measured: 1 262 tests on Windows and
+  1 283 on Linux, clippy and `cargo doc` clean on both; 43e 35 passed 0 failed.
 
 ---
 
@@ -5904,6 +5953,7 @@ the week; the record is under "How the queue kept going stale" in
 | **89** | a moved module left its doc comment on the next one | **filed and closed 2026-09-20**, and it is **#79c** filed a second time a day later. `e26a479` (#66c) moved `rdns/src/testutil.rs` to `rdns-core` and left `/// Scratch directories, for tests only.` attached to the `pub mod tls_identity;` below it, where it rendered on the crate index. `cargo doc` cannot catch a doc comment that is wrong rather than broken, and #20 had already written the remedy as prose ("after any move, grep the seam for an orphaned `///`"), so nobody ran it. Deleted, and the grep is now `rdns/tests/module_doc_comments.rs`: a `///` on a `mod X;` that shares no content word with the module's name or the first paragraph of its own `//!`. **Weak on purpose** — the seven that agree measure 4, 1, 4, 5, 2, 1 and 4 shared words against the orphan's 0, so a threshold of two would flag `mod eviction` (which agrees only through its own name) and `mod dispatch`. The one recursive `.rs` walk in the tree moved to `rdns_core::testutil` rather than being written a second time (§7), and both scans assert on what it hands back. It reads source as data, so it covers `rdnsd/src/control.rs` on Windows, where that file never compiles |
 | **79** | claims and code that outlived each other | **filed 2026-09-19, closed 2026-09-20**, five rows. **79a**: six dead `pub fn`, not four — a sweep of the workspace's 713 `pub fn` definitions finds four, and misses `Nat64Prefix::bits` and `TransferError::refused` because a string literal and an unrelated struct field carry those words, which is #82b's point about a name-based criterion from the other side. Two of the six were not dead code: `Rtype::is_meta` is the RFC-citing copy of a predicate `update.rs`'s RFC 2136 §3.4.1 prescan spells by hand, so it was wired in rather than deleted; `TransferError::Refused` was unreachable because the site that should build it builds `Malformed`, which left **#95**. **79b**: §17 re-measured, five fixed and two live. **79c**: closed as #89, which was it filed twice. **79d**: `set_edns` is `pub` and three answer paths use it without `mirror`, so the guarantor is `finish`'s guard, now cited and asserted. **79e**: three of six `NotFound` returns establish the wildcard invariant, not four, and the guarantor is `rdnsd`'s `resolve_in_zone` ordering — confirmed with the zone the row asked for. **79f**: 40 of `Cli`'s 46 `#[arg]` fields conflict with `--config`, so six are exempt and not three; the certificate check stays in `main` over the merged view, with the reason written in |
 | **80** | two bools where the enum was already imported | **filed 2026-09-19, closed 2026-09-20**. `validate_rrset` returned `(is_valid, is_signed)`, documented in prose and nowhere in the type, with seven bare tuple literals in the file. The refuting check — a caller needing `is_signed` without already holding the `ZoneKeys` that answers it — came back empty: both production sites are in `verify_zones`, and the first calls `keys.is_signed()` one line above. `Verdict::{Unchecked, Valid, Invalid(String)}` now, and the `Invalid` carries what the pair could not: `verify_zones` said "does not verify against the zone's own keys" for an expiry, a missing signature and an unreadable algorithm alike. `validate_response` and `is_zone_signed` deleted with it, both dead and both #79a's shape in the same module; five doc comments naming the first were reworded rather than left to rot (#89). Allocation counts 33 either side; one test caught agreeing with the code for the wrong reason, which is **#94** |
+| **78** | `rdnsr`'s query path lost work at three of its exits | **filed 2026-09-19, closed 2026-09-20**, three rows, and the first was verified here while b and c were the review's reading — both held. **78a**: an `rpz-ip` rule over a cache hit dropped the prefetch the answer cache had just asked for, because `impl From<Option<Vec<u8>>> for Answered` fills `refresh: None`. Three shapes built (§19) and the one that shipped is in neither the row nor the review: delete the early `return`, since the hazard is §7's jump over a shared epilogue. **78b**: `Resolver::forward` returned the upstream's AA bit and echoed question verbatim where `recurse` normalized both, so an `rdnsr` in front of an `rdnsr` running 0x20 would have rejected its own answer (RFC 5452 §9.1) — left **#93**. **78c**: QDCOUNT = 0 was dropped by `rdnsr` and answered NOERROR *with AA set* by `rdnsd`. RFC 9619 §4 settles only QDCOUNT > 1; its QDCOUNT = 0 sentence binds firewalls, not responders. RFC 7873 §5.4 says what the query is for and that a server without cookies "will normally send FORMERR", and the peers agree: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all answer it, all FORMERR with no OPT, and none drops it — which is the measurement that could have refuted the finding |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
