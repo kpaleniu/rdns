@@ -558,10 +558,19 @@ impl Resolver {
         policy: Option<&dyn NameserverPolicy>,
     ) -> Result<(DnsMessage, ValidationState), ResolveError> {
         let mut state = Resolution::new(self.config.query_budget, policy);
-        let response = match self.config.mode {
+        let mut response = match self.config.mode {
             ResolverMode::Forward => self.forward(query, &mut state).await?,
             ResolverMode::Recurse => self.recurse(query, &mut state).await?,
         };
+        // Past both modes, because `recurse` did this and `forward` relayed
+        // the upstream's header verbatim (`TODO.md` #78b). The question is the
+        // client's byte for byte: 0x20 sent a different case upstream, and a
+        // downstream resolver checks the echoed question case-sensitively
+        // (RFC 5452 §9.1 — `response_matches` below is that check). And this
+        // resolver is authoritative for nothing (RFC 1035 §4.1.1); with AA
+        // set, RFC 8020 reads an NXDOMAIN as a claim about the whole subtree.
+        response.queries = vec![query.clone()];
+        response.authoritive = false;
 
         let Some(anchors) = &self.config.dnssec else {
             return Ok((
@@ -2610,6 +2619,73 @@ this line has no record and is skipped
         assert!(
             result.is_err(),
             "a mismatched transaction id must be rejected"
+        );
+    }
+
+    /// A fake upstream that answers `example.com.` **authoritatively** and
+    /// echoes the question exactly as it arrived, which is what a real server
+    /// does — and with 0x20 on, what arrived is the case this resolver
+    /// scrambled. Gives back the answer and the name the upstream saw.
+    async fn resolve_against_an_authoritative_upstream() -> (DnsMessage, String) {
+        let (udp, _tcp, addr) = bind_fake_upstream();
+        let udp_thread = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let (n, peer) = udp.recv_from(&mut buf).unwrap();
+            let query = DnsMessage::try_from_bytes(&buf[..n]).unwrap();
+            let asked = query.queries[0].qname.to_string();
+            let mut resp = response_to(&query);
+            resp.authoritive = true;
+            resp.answers.push(a_record(&asked, [10, 0, 0, 5]));
+            let mut out = vec![0u8; 512];
+            let len = resp.to_bytes(&mut out).unwrap();
+            udp.send_to(&out[..len], peer).unwrap();
+            asked
+        });
+
+        let resolver = Resolver::new(test_config(addr));
+        let answer = resolver
+            .resolve(&test_query())
+            .await
+            .expect("the upstream answered");
+        let asked = udp_thread.join().unwrap();
+        (answer, asked)
+    }
+
+    /// A forwarder is not authoritative for what its upstream is authoritative
+    /// for (RFC 1035 §4.1.1), and relaying AA costs more than a wrong bit:
+    /// with AA set, RFC 8020 lets a downstream resolver read an NXDOMAIN as a
+    /// claim about the whole subtree.
+    ///
+    /// `recurse` cleared this and `forward` did not (`TODO.md` #78b), so the
+    /// clearing is in `resolve_validated`, past both.
+    #[tokio::test]
+    async fn a_forwarded_answer_does_not_carry_the_upstreams_aa_bit() {
+        let (answer, _) = resolve_against_an_authoritative_upstream().await;
+        assert!(
+            !answer.authoritive,
+            "a forwarded answer must not claim authority"
+        );
+    }
+
+    /// The question handed back is the client's, byte for byte.
+    ///
+    /// Not a cosmetic point: with 0x20 on by default the question sent
+    /// upstream carries a scrambled case, and a downstream resolver running
+    /// its own 0x20 check compares the echoed question *case-sensitively*
+    /// (RFC 5452 §9.1) — this crate's own `response_matches` is that check.
+    /// Relaying the upstream's copy makes our answer unacceptable to it.
+    ///
+    /// A `QuerySection` compares case-insensitively (RFC 4343), so the
+    /// assertion is on the text. Before the fix this failed unless the
+    /// scramble happened to leave all ten letters alone, which is 1 in 1 024;
+    /// after it, it cannot fail.
+    #[tokio::test]
+    async fn a_forwarded_answer_echoes_the_clients_question_not_the_one_sent() {
+        let (answer, asked) = resolve_against_an_authoritative_upstream().await;
+        assert_eq!(
+            answer.queries[0].qname.to_string(),
+            "example.com.",
+            "the client asked `example.com.` and the upstream was asked `{asked}`"
         );
     }
 

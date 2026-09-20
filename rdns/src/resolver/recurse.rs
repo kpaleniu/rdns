@@ -164,10 +164,10 @@ impl Resolver {
 
         let mut response = last
             .ok_or_else(|| ResolveError::no_response(format!("no response for {}", query.qname)))?;
-        // Present the whole chain under the question the client actually asked.
-        response.queries = vec![query.clone()];
+        // The whole chain, not just the last step's answers. The question and
+        // the AA bit are `resolve_validated`'s, which does them for both modes
+        // (`TODO.md` #78b).
         response.answers = answers;
-        response.authoritive = false;
         Ok(response)
     }
 

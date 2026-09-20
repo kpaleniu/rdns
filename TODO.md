@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#78** through **#84**, **#90**, **#92**, and
+**#58**, **#68**, **#78** through **#84**, **#90**, **#92**, **#93**, and
 **#21**, as of 2026-09-20.
 
 **#85 through #90 came out of a second architecture review on 2026-09-20**, this
@@ -1133,7 +1133,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#78**-**#84**, **#90**, **#92**, plus **#21** —
+**#58**, **#68**, **#78**-**#84**, **#90**, **#92**, **#93**, plus **#21** —
 see "What is open" above, which is the same list and the only place it is
 written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -4757,16 +4757,32 @@ re-checked against the code** — do that before touching either.
   §17 shape and is ~15 sites. **Build both before choosing**; the second makes
   the whole class unrepresentable and the first only makes it visible.
 
-- **78b. Forward mode returns the upstream's header verbatim.** `recurse.rs`
-  normalizes a recursed answer — `response.queries = vec![query.clone()]` and
-  `authoritive = false` — and `Resolver::forward` does not. `handle_query` sets
-  `id`, `response`, `recursion` and `recursion_ok`, and neither of the other
-  two. Two consequences if it holds: a recursive resolver relays an upstream's
-  AA=1, and `zero_x20` being on by default means the echoed question carries
-  the **scrambled case this resolver sent upstream** rather than the case the
-  client asked in. The remedy named is three lines in `resolve_validated`,
-  after the mode match, so both modes get it — not in `handle_query`, which is
-  the call-site fix §17 says recurs.
+- **78b. Forward mode returns the upstream's header verbatim.** ~~The
+  review's reading, not re-checked.~~ **Verified and closed 2026-09-20**, and
+  both consequences were live. `recurse.rs` normalized a recursed answer —
+  `response.queries = vec![query.clone()]` and `authoritive = false` — and
+  `Resolver::forward` did not; `handle_query` sets `id`, `response`,
+  `recursion` and `recursion_ok`, and `finish` always sets `ad`, so AA and the
+  question were the two nobody owned.
+
+  Provoked before fixing (§1, §4): a fake upstream that answers
+  authoritatively and echoes the question as it arrived — what a real server
+  does — made `resolve` hand back AA=1 and the question `EXaMple.COm.` for a
+  client that asked `example.com.`. The case matters more than it looks: a
+  downstream resolver running its own 0x20 compares the echoed question
+  **case-sensitively** (RFC 5452 §9.1), and this crate's `response_matches` is
+  that check — so an `rdnsr` in front of an `rdnsr` would have rejected the
+  answer. AA=1 is the RFC 8020 hazard §8 already names, on a resolver that is
+  authoritative for nothing (RFC 1035 §4.1.1).
+
+  Fixed where the row said, in `resolve_validated` past the mode match, and
+  `recurse`'s two lines are gone rather than left as a second copy (§7). One
+  production site sets AA on this path now, and a `QuerySection` compares
+  case-insensitively (RFC 4343), so the test asserts on the text — the
+  assertion a `==` would have passed.
+
+  **Left behind: #93**, the same scramble in the answer records' *owner*
+  names, which is data rather than a header and is not the same fix.
 
 - **78c. QDCOUNT=0 is dropped here and answered by `rdnsd`.** RFC 9619 §4 says
   two things; #30r copied the first into `rdnsr` and not the second. `rdnsd`
@@ -5405,6 +5421,39 @@ takes both numbers. So the row to write next is "which of these twelve has a tes
 that would be simpler, or an assertion that would stop being timing-dependent",
 and if the answer is none, the finding is that the seam should stop at the
 request path and say so in `Clock`'s own doc comment.
+
+---
+
+### 93. An answer's owner names carry this resolver's 0x20 scramble — **filed 2026-09-20**
+
+Found while closing #78b and deliberately not folded into it: that was the
+header this resolver writes, and this is data it copies.
+
+**Measured**, with a fake upstream that copies the QNAME into the answer's
+owner name — which is what an authoritative server does, and the reason 0x20
+works at all: a client asking `example.com.` gets `EXaMPLe.cOm. A 10.0.0.5`.
+Both modes reach it, `forward` with one scrambled name and `recurse` with one
+per hop, and `rdnsr` caches `upstream.answers` verbatim, so one resolution's
+scramble is what every later client is served for the life of the entry.
+
+**Why it is not obviously a defect.** Case is insignificant (RFC 4343) and
+every name comparison in this tree folds ASCII — `Name`'s `PartialEq`, its
+`Hash`, `cname_chain_shape`, the caches' keys — so nothing here reads it.
+#78b's case-sensitive compare is on the *question*, which is now the client's.
+
+**No remedy named** (§18). Rewriting an owner name is an allocation per record
+on the answer path, and only a name we asked for may be rewritten: a CNAME
+target's case belongs to the zone that published it, not to us.
+
+**The measurements that would decide it**, neither taken:
+
+- What do the implementations that ship 0x20 do with the owner names —
+  Unbound's `use-caps-for-id` and BIND's — normalize to the client's question,
+  or relay? §4's rule: read them and quote them, rather than reasoning about
+  what is polite.
+- What would normalizing cost on the answer path? #88 priced one cached answer
+  at 13 allocations, so a per-record rewrite is measurable against a number
+  that already exists.
 
 ---
 
