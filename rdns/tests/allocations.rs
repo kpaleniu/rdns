@@ -1075,7 +1075,21 @@ fn building_the_metrics_registry() {
 
     let (clone, clone_count) = allocations(|| metrics.clone());
     within("clone one", clone_count, 0..=0);
-    drop((metrics, clone));
+
+    // One scrape: 65 before `TODO.md` #84, where 102 `push_str` calls were fed
+    // by a `format!` that built a `String` to copy out of and drop. What is left
+    // is the output buffer growing, plus a `to_string` and an `escape_label` per
+    // zone. The bytes out are identical either way.
+    for zone in ["example.com.", "example.net."] {
+        metrics.set_zone_serial(
+            zone.parse::<rdns::Name>().expect("a zone name").as_ref(),
+            rdns::Serial::new(7),
+        );
+    }
+    let _warm_scrape = metrics.to_prometheus_format();
+    let (scrape, scrape_count) = allocations(|| metrics.to_prometheus_format());
+    within("render one scrape", scrape_count, 16..=16);
+    drop((metrics, clone, scrape));
 }
 
 /// DNSSEC canonical ordering (RFC 4034 §6.1) is a question about bytes.

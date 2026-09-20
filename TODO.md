@@ -37,8 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#81**, **#82**, **#83**, **#84**, **#90**, **#92**, **#93**,
-**#95**, and **#21**, as of 2026-09-20.
+**#58**, **#68**, **#83**, **#90**, **#92**, **#93**, **#95**, and **#21**, as
+of 2026-09-20. **#81, #82 and #84 closed that day**; #81's and #82's remaining
+sub-items went with them (81b, 82a), and #84's own remainder is named in it
+rather than left as a sentence (§18).
 
 **#85 through #90 came out of a second architecture review on 2026-09-20**, this
 one asking what the ideal shape would be and where the tree differs. **Ten
@@ -5130,7 +5132,7 @@ Measured: `cargo test -p rdns --test allocations` reads 33 either side, and
 
 ---
 
-### 81. What #63h's macro did not reach, and one more copy — **filed 2026-09-19**
+### 81. What #63h's macro did not reach, and one more copy — **filed 2026-09-19, closed 2026-09-20**
 
 - **81a. The `[keys]` TSIG table is declared twice — measured and mostly
   declined, 2026-09-20.** #63h put the 22 shared `[server]` keys in
@@ -5195,7 +5197,7 @@ Measured: `cargo test -p rdns --test allocations` reads 33 either side, and
 
 ---
 
-### 82. Two modules in the wrong place, and a `pub` with no ratchet — **filed 2026-09-19**
+### 82. Two modules in the wrong place, and a `pub` with no ratchet — **filed 2026-09-19, closed 2026-09-20**
 
 - **82a. `readiness` is in `rdns` and `rdns` never uses it — closed
   2026-09-20.** `grep` over `rdns/src` returns one line: the `pub mod`
@@ -5303,7 +5305,7 @@ buy file length.
 
 ---
 
-### 84. `to_prometheus_format` is 337 lines of one idiom — **filed 2026-09-19**
+### 84. `to_prometheus_format` is 337 lines of one idiom — **filed 2026-09-19, closed 2026-09-20**
 
 Thirty hand-unrolled HELP/TYPE/value blocks, 102 `push_str`, one line of doc
 that restates the function's name. The three rules that are *not* obvious — and
@@ -5331,12 +5333,54 @@ Two things the shape hid, both verified here:
   `absent()` condition §14 built the omit-don't-zero rule around, arriving for
   the wrong reason. The sibling `set_zone_serial` states its decision properly.
 
-A `fn counter(out, name, help, v)` collapses the 250 lines to ~30 call lines and
-makes the rest visible; a table or a macro declaring field, series name and help
-together would make the disagreement unrepresentable, which is what §17 would
-ask for. **Capture the output before and after and `diff` it** — byte-identical
-except the `dns_catalog_members` HELP line, or a block was not as uniform as it
-looked.
+~~A `fn counter(out, name, help, v)` collapses the 250 lines to ~30 call lines
+and makes the rest visible;~~ **that estimate was wrong by an order of
+magnitude, and the reason is `cargo fmt`.** Both shapes were built (§19): the
+helper-call shape came out at **278** lines and the table shape at **276**,
+against **337**. Stock rustfmt breaks *every* element of an array or argument
+list when any one of them exceeds 100 columns, and these names and help texts
+do, so a four-argument call is five lines whatever it is spelled as. §12 forbids
+a `rustfmt.toml`, so the length is not available to be fixed and was never the
+finding worth acting on.
+
+**What landed is the table shape, chosen on what it makes unrepresentable
+rather than on the two lines between them.** A series' name, its help text and
+the field it reads are one row, so the disagreement
+`every_encrypted_transport_counter_reaches_the_scrape` exists to catch — a
+counter declared in `Counters`, incremented, and rendered nowhere — is a missing
+*row* rather than a missing block among thirty identical ones. `declare`,
+`counter` and `labelled` are the three helpers; 102 `push_str` and every
+`format!` are gone.
+
+**The measurement the row asked for, taken.** Captured before and after and
+diffed: **byte-identical except the `dns_catalog_members` HELP line**, exactly
+as predicted, so the thirty blocks really were uniform. The three blocks using
+an embedded newline instead of `\n` produced the same bytes and are gone with
+the rest.
+
+**And one it did not ask for.** A scrape was **65 allocations** and is **16**,
+for the same 4 775 bytes — most of the 65 were a `format!` building a `String`
+to copy out of and drop. Pinned in `rdns/tests/allocations.rs` beside the
+registry counts, stable across `--test-threads` 1, 2 and 4 and on both
+platforms.
+
+**Both sub-findings fixed.** The 22 stray spaces are gone, and
+`the_scrape_is_well_formed` is why they will not come back: it asserts the shape
+Prometheus requires — one `# HELP` and one `# TYPE` per family in that order, a
+kind from the three that exist, no sample whose family was never declared, no
+padded help text — and it fails against the padded line when it is put back. The
+two `if let Ok(...)` lock guards now read **through** a poisoned lock rather than
+past it, with the decision written down: every writer in the file had already
+chosen "a poisoned lock costs a stale gauge and the server keeps answering", and
+dropping the series instead made every zone look withdrawn at once, which is the
+condition the staleness alert exists to catch. A `BTreeMap` of `Copy` values is
+valid after a writer panics, so there is nothing half-written to read.
+
+**Not taken**: the macro that would declare field, series name and help together
+and make the two lists one. It is what §17 would ask for, and it is a change to
+`Counters` rather than to its renderer, so it wants a number of its own if
+anybody wants it — the tripwire test is what stands in for it today, and it has
+caught this once already.
 
 ---
 
@@ -6031,6 +6075,9 @@ the week; the record is under "How the queue kept going stale" in
 | **79** | claims and code that outlived each other | **filed 2026-09-19, closed 2026-09-20**, five rows. **79a**: six dead `pub fn`, not four — a sweep of the workspace's 713 `pub fn` definitions finds four, and misses `Nat64Prefix::bits` and `TransferError::refused` because a string literal and an unrelated struct field carry those words, which is #82b's point about a name-based criterion from the other side. Two of the six were not dead code: `Rtype::is_meta` is the RFC-citing copy of a predicate `update.rs`'s RFC 2136 §3.4.1 prescan spells by hand, so it was wired in rather than deleted; `TransferError::Refused` was unreachable because the site that should build it builds `Malformed`, which left **#95**. **79b**: §17 re-measured, five fixed and two live. **79c**: closed as #89, which was it filed twice. **79d**: `set_edns` is `pub` and three answer paths use it without `mirror`, so the guarantor is `finish`'s guard, now cited and asserted. **79e**: three of six `NotFound` returns establish the wildcard invariant, not four, and the guarantor is `rdnsd`'s `resolve_in_zone` ordering — confirmed with the zone the row asked for. **79f**: 40 of `Cli`'s 46 `#[arg]` fields conflict with `--config`, so six are exempt and not three; the certificate check stays in `main` over the merged view, with the reason written in |
 | **80** | two bools where the enum was already imported | **filed 2026-09-19, closed 2026-09-20**. `validate_rrset` returned `(is_valid, is_signed)`, documented in prose and nowhere in the type, with seven bare tuple literals in the file. The refuting check — a caller needing `is_signed` without already holding the `ZoneKeys` that answers it — came back empty: both production sites are in `verify_zones`, and the first calls `keys.is_signed()` one line above. `Verdict::{Unchecked, Valid, Invalid(String)}` now, and the `Invalid` carries what the pair could not: `verify_zones` said "does not verify against the zone's own keys" for an expiry, a missing signature and an unreadable algorithm alike. `validate_response` and `is_zone_signed` deleted with it, both dead and both #79a's shape in the same module; five doc comments naming the first were reworded rather than left to rot (#89). Allocation counts 33 either side; one test caught agreeing with the code for the wrong reason, which is **#94** |
 | **94** | nothing enforced a DNSKEY's protocol field | **filed and closed 2026-09-20**, out of #80's tests. RFC 4034 §2.1.2 makes a DNSKEY with protocol ≠ 3 "invalid during signature verification"; `Dnskey::from_record` copied the octet and only `key_tag` read it afterwards, so `rdnsr` called Secure what a conforming validator calls Bogus. Both shapes built (§19) and **the measurement declined the one the row leaned towards**: rejecting in `from_record` fixes nothing, because `verify_rrset` takes `&[Dnskey]` and every field of `Dnskey` is `pub` — shape A passed the whole suite and left the new test failing, which is §17's "a `pub` field beside a checking constructor" arriving as a measurement. What landed is the predicate: `is_zone_key` wants the flag **and** protocol 3, so its three callers — the candidate-key filter, DS matching, RFC 5011 anchor candidacy — inherit it. §4's survey agrees and settled the one open choice: BIND's `dns_dnssec_iszonekey()` folds the two tests the same way, Unbound checks it in `dnskey_verify_rrset_sig` and Knot in `dnskey_rdata_to_crypto_key`; BIND alone also accepts RFC 2535's protocol 255, which is not copied. The test passed against the unfixed tree on its first draft, for a reason §1 predicts — the key tag is inside the RRSIG RDATA `signed_data` hashes, so repointing the tag after signing breaks the crypto instead of testing the field |
+| **81** | what #63h's macro did not reach, and one more copy | **filed 2026-09-19, closed 2026-09-20**, two rows. **81a** measured and mostly declined: of the 27 commits touching `rdnsd/src/config.rs`, 8 touch its TSIG lines and 1 of those also touches `rdnsr`'s — and that one *created* the copy — so the two tables do not co-move and the shared struct is declined; three fields of five are shared, not five, because a resolver authorizes nothing. What was taken is the list and the default under it: `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES`, `::DEFAULT`, with `TsigKey::parse` coming out better than it went in. **81b** merged the two FNV-1a loops into `rdns_core::folded_hash`, and the check was the row's own instruction taken through the observable rather than by comparing the copies: six `expiry_for` offsets measured before the merge, unchanged after it, so no signature's expiry moved |
+| **82** | two modules in the wrong place, and a `pub` with no ratchet | **filed 2026-09-19, closed 2026-09-20**, two rows. **82b** took the ratchet: 43 sites, 38 of them `#[cfg(test)]` fixtures that always meant `pub(crate)`, and `#![warn(unreachable_pub)]` is in all nine crate roots with what it does *not* answer written on the lint. **82a** moved `readiness` to `rdns-transport`, whose metrics server serves `/readyz`; the estimate held except that a move is two `mod` lines, not one. Both halves of the *larger* version stay declined on measurements taken in place: an `rdns-ops` crate takes no package off any binary (`cargo tree -p rdnsd` is 150 either way) and the transport link is ~450 ms of a ~3.3 s rebuild, which is a ceiling and not a saving |
+| **84** | `to_prometheus_format` was 337 lines of one idiom | **filed 2026-09-19, closed 2026-09-20**, and the row's own remedy was wrong by an order of magnitude. Both shapes built (§19): helper calls 278 lines, a table 276, against 337 — because stock rustfmt breaks *every* element of an argument list when one exceeds 100 columns, and §12 forbids a `rustfmt.toml`, so the length was never available to be fixed. The table shipped on what it makes unrepresentable instead: name, help and field on one row, so a counter rendered nowhere is a missing row rather than a missing block among thirty. The `diff` the row asked for came back **byte-identical except the `dns_catalog_members` HELP line**, its 22 stray spaces, exactly as predicted. One it did not ask for: a scrape was **65 allocations and is 16** for the same 4 775 bytes, pinned. Both sub-findings fixed — `the_scrape_is_well_formed` asserts one HELP and one TYPE per family, no undeclared sample and no padded help text, and fails against the padded line put back; the two lock guards read *through* a poisoned lock now, matching the decision every writer in the file had already made, because dropping the series made every zone look withdrawn at once |
 | **78** | `rdnsr`'s query path lost work at three of its exits | **filed 2026-09-19, closed 2026-09-20**, three rows, and the first was verified here while b and c were the review's reading — both held. **78a**: an `rpz-ip` rule over a cache hit dropped the prefetch the answer cache had just asked for, because `impl From<Option<Vec<u8>>> for Answered` fills `refresh: None`. Three shapes built (§19) and the one that shipped is in neither the row nor the review: delete the early `return`, since the hazard is §7's jump over a shared epilogue. **78b**: `Resolver::forward` returned the upstream's AA bit and echoed question verbatim where `recurse` normalized both, so an `rdnsr` in front of an `rdnsr` running 0x20 would have rejected its own answer (RFC 5452 §9.1) — left **#93**. **78c**: QDCOUNT = 0 was dropped by `rdnsr` and answered NOERROR *with AA set* by `rdnsd`. RFC 9619 §4 settles only QDCOUNT > 1; its QDCOUNT = 0 sentence binds firewalls, not responders. RFC 7873 §5.4 says what the query is for and that a server without cookies "will normally send FORMERR", and the peers agree: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all answer it, all FORMERR with no OPT, and none drops it — which is the measurement that could have refuted the finding |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly

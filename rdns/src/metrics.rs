@@ -9,6 +9,7 @@ use crate::NameRef;
 use crate::Qtype;
 use crate::Serial;
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
@@ -61,6 +62,30 @@ fn escape_label(value: &str) -> String {
         }
     }
     out
+}
+
+/// `# HELP` and `# TYPE` for one metric family.
+///
+/// One of each per family, whatever the label values: a second `# TYPE` line
+/// for a name already declared makes the rest of the scrape unparseable.
+fn declare(out: &mut String, name: &str, kind: &str, help: &str) {
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} {kind}");
+}
+
+/// A whole counter: its declaration and its one unlabelled value.
+fn counter(out: &mut String, name: &str, help: &str, value: u64) {
+    declare(out, name, "counter", help);
+    let _ = writeln!(out, "{name} {value}");
+}
+
+/// One sample of an already-[`declare`]d family, under one label.
+///
+/// `value` is pre-escaped or known safe — this does not call [`escape_label`],
+/// because the caller is the one that knows whether the string came from an
+/// operator's zone file or from a `match` arm in this crate.
+fn labelled(out: &mut String, name: &str, label: &str, value: &str, n: impl std::fmt::Display) {
+    let _ = writeln!(out, "{name}{{{label}=\"{value}\"}} {n}");
 }
 
 /// One zone's gauges, named, as [`DnsMetrics::zone_facts`] hands them out.
@@ -436,343 +461,305 @@ impl DnsMetrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Generate Prometheus format metrics output
+    /// The Prometheus text for one scrape.
+    ///
+    /// Three rules that are not obvious, and that thirty hand-unrolled blocks
+    /// buried 250 lines down (`TODO.md` #84):
+    ///
+    /// - **Omit, do not zero, a gauge with no answer.** A zone we are primary
+    ///   for has no last-transfer time and neither has a secondary that has
+    ///   never fetched; zero is 1970 and fires every staleness alert there is.
+    ///   `absent()` is a question the query language can ask. A *counter* is
+    ///   the opposite case and is always emitted: zero handshakes is a fact.
+    /// - **Escape every label value.** Zone names come from a file an operator
+    ///   wrote and RFC 1035 §5.1 allows escapes, so one stray quote makes the
+    ///   rest of the scrape unparseable. The `labelled` helper does not do it
+    ///   for its caller — only the caller knows whether the string came from an
+    ///   operator's file or from a `match` arm in this crate.
+    /// - **Seconds, not microseconds.** Prometheus convention is base units,
+    ///   and the histogram stores integer microseconds.
+    ///
+    /// The tables are the point rather than the length: a series' name, its
+    /// help text and the field it reads sit on one line, so the disagreement
+    /// that `every_encrypted_transport_counter_reaches_the_scrape` exists to
+    /// catch — a counter declared in [`Counters`], incremented, and rendered
+    /// nowhere — is a missing row rather than a missing block among thirty
+    /// identical ones.
     pub fn to_prometheus_format(&self) -> String {
-        let mut output = String::new();
+        let mut out = String::new();
 
-        output.push_str("# HELP dns_queries_received_total Total DNS queries received\n");
-        output.push_str("# TYPE dns_queries_received_total counter\n");
-        output.push_str(&format!(
-            "dns_queries_received_total {}\n",
-            self.queries_received.load(Ordering::Relaxed)
-        ));
+        for (name, help, value) in [
+            (
+                "dns_queries_received_total",
+                "Total DNS queries received",
+                &self.queries_received,
+            ),
+            (
+                "dns_queries_authoritative_total",
+                "Authoritative queries handled",
+                &self.queries_authoritative,
+            ),
+            (
+                "dns_queries_recursive_total",
+                "Recursive queries handled",
+                &self.queries_recursive,
+            ),
+            (
+                "dns_responses_sent_total",
+                "Total DNS responses sent",
+                &self.responses_sent,
+            ),
+            (
+                "dns_responses_nxdomain_total",
+                "NXDOMAIN responses",
+                &self.responses_nxdomain,
+            ),
+            (
+                "dns_responses_servfail_total",
+                "SERVFAIL responses",
+                &self.responses_servfail,
+            ),
+            (
+                "dns_responses_refused_total",
+                "REFUSED responses",
+                &self.responses_refused,
+            ),
+            (
+                "dns_responses_noerror_total",
+                "NOERROR responses",
+                &self.responses_noerror,
+            ),
+            (
+                "dns_synthesized_total",
+                "AAAA records synthesized by DNS64",
+                &self.synthesized,
+            ),
+            (
+                "dns_prefetches_total",
+                "Names re-resolved before expiry",
+                &self.prefetches,
+            ),
+            (
+                "dns_stale_answers_total",
+                "Answers served from expired cache",
+                &self.stale_answers,
+            ),
+        ] {
+            counter(&mut out, name, help, value.load(Ordering::Relaxed));
+        }
 
-        output.push_str("# HELP dns_queries_authoritative_total Authoritative queries handled\n");
-        output.push_str("# TYPE dns_queries_authoritative_total counter\n");
-        output.push_str(&format!(
-            "dns_queries_authoritative_total {}\n",
-            self.queries_authoritative.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_queries_recursive_total Recursive queries handled\n");
-        output.push_str("# TYPE dns_queries_recursive_total counter\n");
-        output.push_str(&format!(
-            "dns_queries_recursive_total {}\n",
-            self.queries_recursive.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_responses_sent_total Total DNS responses sent\n");
-        output.push_str("# TYPE dns_responses_sent_total counter\n");
-        output.push_str(&format!(
-            "dns_responses_sent_total {}\n",
-            self.responses_sent.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_responses_nxdomain_total NXDOMAIN responses\n");
-        output.push_str("# TYPE dns_responses_nxdomain_total counter\n");
-        output.push_str(&format!(
-            "dns_responses_nxdomain_total {}\n",
-            self.responses_nxdomain.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_responses_servfail_total SERVFAIL responses\n");
-        output.push_str("# TYPE dns_responses_servfail_total counter\n");
-        output.push_str(&format!(
-            "dns_responses_servfail_total {}\n",
-            self.responses_servfail.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_responses_refused_total REFUSED responses\n");
-        output.push_str("# TYPE dns_responses_refused_total counter\n");
-        output.push_str(&format!(
-            "dns_responses_refused_total {}\n",
-            self.responses_refused.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_responses_noerror_total NOERROR responses\n");
-        output.push_str("# TYPE dns_responses_noerror_total counter\n");
-        output.push_str(&format!(
-            "dns_responses_noerror_total {}\n",
-            self.responses_noerror.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_synthesized_total AAAA records synthesized by DNS64\n");
-        output.push_str("# TYPE dns_synthesized_total counter\n");
-        output.push_str(&format!(
-            "dns_synthesized_total {}\n",
-            self.synthesized.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_prefetches_total Names re-resolved before expiry\n");
-        output.push_str("# TYPE dns_prefetches_total counter\n");
-        output.push_str(&format!(
-            "dns_prefetches_total {}\n",
-            self.prefetches.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_stale_answers_total Answers served from expired cache\n");
-        output.push_str("# TYPE dns_stale_answers_total counter\n");
-        output.push_str(&format!(
-            "dns_stale_answers_total {}\n",
-            self.stale_answers.load(Ordering::Relaxed)
-        ));
-
-        output.push_str(
-            "# HELP dns_slow_resolutions_total \
-Resolutions past RFC 8767's client response timer\n",
+        // One family, two label values, one declaration between them.
+        declare(
+            &mut out,
+            "dns_slow_resolutions_total",
+            "counter",
+            "Resolutions past RFC 8767's client response timer",
         );
-        output.push_str("# TYPE dns_slow_resolutions_total counter\n");
-        output.push_str(&format!(
-            "dns_slow_resolutions_total{{outcome=\"completed\"}} {}\n",
-            self.slow_resolutions_completed.load(Ordering::Relaxed)
-        ));
-        output.push_str(&format!(
-            "dns_slow_resolutions_total{{outcome=\"failed\"}} {}\n",
-            self.slow_resolutions_failed.load(Ordering::Relaxed)
-        ));
+        for (outcome, value) in [
+            ("completed", &self.slow_resolutions_completed),
+            ("failed", &self.slow_resolutions_failed),
+        ] {
+            labelled(
+                &mut out,
+                "dns_slow_resolutions_total",
+                "outcome",
+                outcome,
+                value.load(Ordering::Relaxed),
+            );
+        }
 
-        output.push_str(
-            "# HELP dns_policy_rewrites_total Answers replaced by a response policy zone\n",
+        // The four handshake counters and the two dnstap ones are emitted even
+        // at zero, on a server with no DoT listener and no collector. A series
+        // that appears only once something has happened cannot be alerted on
+        // before it does, and `absent()` is the wrong question for them: zero
+        // handshakes is a fact, not a missing measurement. Contrast the
+        // per-zone gauges at the bottom, which are omitted on purpose.
+        for (name, help, value) in [
+            (
+                "dns_policy_rewrites_total",
+                "Answers replaced by a response policy zone",
+                &self.policy_rewrites,
+            ),
+            (
+                "dns_policy_drops_total",
+                "Queries dropped by a response policy zone",
+                &self.policy_drops,
+            ),
+            ("dns_cache_hits_total", "Cache hits", &self.cache_hits),
+            ("dns_cache_misses_total", "Cache misses", &self.cache_misses),
+            (
+                "dns_rate_limited_total",
+                "Rate limited queries",
+                &self.rate_limited,
+            ),
+            (
+                "dns_validation_errors_total",
+                "Validation errors",
+                &self.validation_errors,
+            ),
+            (
+                "dns_queries_dropped_total",
+                "Dropped queries",
+                &self.queries_dropped,
+            ),
+            (
+                "dns_tls_handshakes_total",
+                "DoT handshakes completed",
+                &self.tls_handshakes,
+            ),
+            (
+                "dns_tls_handshake_failures_total",
+                "DoT handshakes that did not complete",
+                &self.tls_handshake_failures,
+            ),
+            (
+                "dns_quic_handshakes_total",
+                "DoQ handshakes completed",
+                &self.quic_handshakes,
+            ),
+            (
+                "dns_quic_handshake_failures_total",
+                "DoQ handshakes that did not complete",
+                &self.quic_handshake_failures,
+            ),
+            (
+                "dns_dnstap_frames_total",
+                "dnstap payloads queued for the sink",
+                &self.dnstap_frames,
+            ),
+            (
+                "dns_dnstap_dropped_total",
+                "dnstap payloads the bounded queue had no room for",
+                &self.dnstap_dropped,
+            ),
+        ] {
+            counter(&mut out, name, help, value.load(Ordering::Relaxed));
+        }
+
+        declare(
+            &mut out,
+            "dns_queries_type",
+            "counter",
+            "Total queries by type",
         );
-        output.push_str("# TYPE dns_policy_rewrites_total counter\n");
-        output.push_str(&format!(
-            "dns_policy_rewrites_total {}\n",
-            self.policy_rewrites.load(Ordering::Relaxed)
-        ));
+        for (label, value) in [
+            ("A", &self.queries_type_a),
+            ("AAAA", &self.queries_type_aaaa),
+            ("MX", &self.queries_type_mx),
+            ("NS", &self.queries_type_ns),
+            ("CNAME", &self.queries_type_cname),
+            ("TXT", &self.queries_type_txt),
+            ("SOA", &self.queries_type_soa),
+            ("PTR", &self.queries_type_ptr),
+            ("OTHER", &self.queries_type_other),
+        ] {
+            labelled(
+                &mut out,
+                "dns_queries_type",
+                "type",
+                label,
+                value.load(Ordering::Relaxed),
+            );
+        }
 
-        output
-            .push_str("# HELP dns_policy_drops_total Queries dropped by a response policy zone\n");
-        output.push_str("# TYPE dns_policy_drops_total counter\n");
-        output.push_str(&format!(
-            "dns_policy_drops_total {}\n",
-            self.policy_drops.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_cache_hits_total Cache hits\n");
-        output.push_str("# TYPE dns_cache_hits_total counter\n");
-        output.push_str(&format!(
-            "dns_cache_hits_total {}\n",
-            self.cache_hits.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_cache_misses_total Cache misses\n");
-        output.push_str("# TYPE dns_cache_misses_total counter\n");
-        output.push_str(&format!(
-            "dns_cache_misses_total {}\n",
-            self.cache_misses.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_rate_limited_total Rate limited queries\n");
-        output.push_str("# TYPE dns_rate_limited_total counter\n");
-        output.push_str(&format!(
-            "dns_rate_limited_total {}\n",
-            self.rate_limited.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_validation_errors_total Validation errors\n");
-        output.push_str("# TYPE dns_validation_errors_total counter\n");
-        output.push_str(&format!(
-            "dns_validation_errors_total {}\n",
-            self.validation_errors.load(Ordering::Relaxed)
-        ));
-
-        output.push_str("# HELP dns_queries_dropped_total Dropped queries\n");
-        output.push_str("# TYPE dns_queries_dropped_total counter\n");
-        output.push_str(&format!(
-            "dns_queries_dropped_total {}\n",
-            self.queries_dropped.load(Ordering::Relaxed)
-        ));
-
-        // Always emitted, including as a pair of zeroes on a server with no DoT
-        // listener. A series that appears only once something has happened
-        // cannot be alerted on before it does, and `absent()` is the wrong
-        // question here: zero handshakes is a fact, not a missing measurement
-        // (contrast the per-zone gauges below, which are omitted on purpose).
-        output.push_str("# HELP dns_tls_handshakes_total DoT handshakes completed\n");
-        output.push_str("# TYPE dns_tls_handshakes_total counter\n");
-        output.push_str(&format!(
-            "dns_tls_handshakes_total {}\n",
-            self.tls_handshakes.load(Ordering::Relaxed)
-        ));
-        output.push_str(
-            "# HELP dns_tls_handshake_failures_total DoT handshakes that did not complete\n",
+        declare(
+            &mut out,
+            "dns_answer_latency_seconds",
+            "histogram",
+            "Time to build one answer",
         );
-        output.push_str("# TYPE dns_tls_handshake_failures_total counter\n");
-        output.push_str(&format!(
-            "dns_tls_handshake_failures_total {}\n",
-            self.tls_handshake_failures.load(Ordering::Relaxed)
-        ));
-        output.push_str(
-            "# HELP dns_quic_handshakes_total DoQ handshakes completed
-",
-        );
-        output.push_str(
-            "# TYPE dns_quic_handshakes_total counter
-",
-        );
-        output.push_str(&format!(
-            "dns_quic_handshakes_total {}
-",
-            self.quic_handshakes.load(Ordering::Relaxed)
-        ));
-        output.push_str(
-            "# HELP dns_quic_handshake_failures_total DoQ handshakes that did not complete
-",
-        );
-        output.push_str(
-            "# TYPE dns_quic_handshake_failures_total counter
-",
-        );
-        output.push_str(&format!(
-            "dns_quic_handshake_failures_total {}
-",
-            self.quic_handshake_failures.load(Ordering::Relaxed)
-        ));
-
-        output.push_str(
-            "# HELP dns_dnstap_frames_total dnstap payloads queued for the sink
-",
-        );
-        output.push_str(
-            "# TYPE dns_dnstap_frames_total counter
-",
-        );
-        output.push_str(&format!(
-            "dns_dnstap_frames_total {}
-",
-            self.dnstap_frames.load(Ordering::Relaxed)
-        ));
-        output.push_str(
-            "# HELP dns_dnstap_dropped_total dnstap payloads the bounded queue had no room for
-",
-        );
-        output.push_str(
-            "# TYPE dns_dnstap_dropped_total counter
-",
-        );
-        output.push_str(&format!(
-            "dns_dnstap_dropped_total {}
-",
-            self.dnstap_dropped.load(Ordering::Relaxed)
-        ));
-
-        // Record type metrics
-        output.push_str("# HELP dns_queries_type Total queries by type\n");
-        output.push_str("# TYPE dns_queries_type counter\n");
-        output.push_str(&format!(
-            "dns_queries_type{{type=\"A\"}} {}\n",
-            self.queries_type_a.load(Ordering::Relaxed)
-        ));
-        output.push_str(&format!(
-            "dns_queries_type{{type=\"AAAA\"}} {}\n",
-            self.queries_type_aaaa.load(Ordering::Relaxed)
-        ));
-        output.push_str(&format!(
-            "dns_queries_type{{type=\"MX\"}} {}\n",
-            self.queries_type_mx.load(Ordering::Relaxed)
-        ));
-        output.push_str(&format!(
-            "dns_queries_type{{type=\"NS\"}} {}\n",
-            self.queries_type_ns.load(Ordering::Relaxed)
-        ));
-        output.push_str(&format!(
-            "dns_queries_type{{type=\"CNAME\"}} {}\n",
-            self.queries_type_cname.load(Ordering::Relaxed)
-        ));
-        output.push_str(&format!(
-            "dns_queries_type{{type=\"TXT\"}} {}\n",
-            self.queries_type_txt.load(Ordering::Relaxed)
-        ));
-        output.push_str(&format!(
-            "dns_queries_type{{type=\"SOA\"}} {}\n",
-            self.queries_type_soa.load(Ordering::Relaxed)
-        ));
-        output.push_str(&format!(
-            "dns_queries_type{{type=\"PTR\"}} {}\n",
-            self.queries_type_ptr.load(Ordering::Relaxed)
-        ));
-        output.push_str(&format!(
-            "dns_queries_type{{type=\"OTHER\"}} {}\n",
-            self.queries_type_other.load(Ordering::Relaxed)
-        ));
-
-        // Seconds: Prometheus convention is base units.
-        output.push_str("# HELP dns_answer_latency_seconds Time to build one answer\n");
-        output.push_str("# TYPE dns_answer_latency_seconds histogram\n");
         // Cumulated here rather than on the write path. Buckets are read one at
         // a time, so a scrape racing an answer can see a total an instant old —
         // true of every counter in this file, and what Prometheus expects.
         let mut cumulative = 0u64;
         for (bound, bucket) in LATENCY_BUCKETS_US.iter().zip(self.latency_buckets.iter()) {
             cumulative += bucket.load(Ordering::Relaxed);
-            output.push_str(&format!(
-                "dns_answer_latency_seconds_bucket{{le=\"{}\"}} {}\n",
-                *bound as f64 / 1_000_000.0,
-                cumulative
-            ));
+            let _ = writeln!(
+                out,
+                "dns_answer_latency_seconds_bucket{{le=\"{}\"}} {cumulative}",
+                *bound as f64 / 1_000_000.0
+            );
         }
         let count = self.latency_count.load(Ordering::Relaxed);
-        output.push_str(&format!(
-            "dns_answer_latency_seconds_bucket{{le=\"+Inf\"}} {count}\n"
-        ));
-        output.push_str(&format!(
-            "dns_answer_latency_seconds_sum {}\n",
+        let _ = writeln!(
+            out,
+            "dns_answer_latency_seconds_bucket{{le=\"+Inf\"}} {count}"
+        );
+        let _ = writeln!(
+            out,
+            "dns_answer_latency_seconds_sum {}",
             self.latency_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0
-        ));
-        output.push_str(&format!("dns_answer_latency_seconds_count {count}\n"));
+        );
+        let _ = writeln!(out, "dns_answer_latency_seconds_count {count}");
 
-        if let Ok(zones) = self.zones.read() {
-            output.push_str("# HELP dns_zone_serial SOA serial currently served\n");
-            output.push_str("# TYPE dns_zone_serial gauge\n");
-            for (zone, gauge) in zones.iter() {
-                output.push_str(&format!(
-                    "dns_zone_serial{{zone=\"{}\"}} {}\n",
-                    escape_label(&zone.to_string()),
-                    gauge.serial
-                ));
-            }
-
-            // An instant, not a "seconds since": `time() - x` is the query
-            // language's job, and a duration computed here is stale on arrival.
-            //
-            // Zones with no transfer are omitted, not zeroed — zero reads as
-            // 1970. `absent()` is a question the query language can ask.
-            output.push_str(
-                "# HELP dns_zone_last_refresh_timestamp_seconds \
-                 Unix time of the last successful transfer of a replicated zone\n",
+        // Read *through* a poisoned lock rather than past it. Every writer here
+        // already decided that a poisoned lock costs a stale gauge and keeps the
+        // server answering; dropping the series instead makes every zone on the
+        // server look withdrawn at once, which is the condition the staleness
+        // alert exists to catch (`CLAUDE.md` §14). A writer that panicked left a
+        // valid, possibly out-of-date map — these hold `Copy` values, so nothing
+        // is half-written.
+        let zones = self.zones.read().unwrap_or_else(|e| e.into_inner());
+        declare(
+            &mut out,
+            "dns_zone_serial",
+            "gauge",
+            "SOA serial currently served",
+        );
+        for (zone, gauge) in zones.iter() {
+            labelled(
+                &mut out,
+                "dns_zone_serial",
+                "zone",
+                &escape_label(&zone.to_string()),
+                gauge.serial,
             );
-            output.push_str("# TYPE dns_zone_last_refresh_timestamp_seconds gauge\n");
-            for (zone, gauge) in zones.iter() {
-                if let Some(at) = gauge.last_transfer {
-                    output.push_str(&format!(
-                        "dns_zone_last_refresh_timestamp_seconds{{zone=\"{}\"}} {at}\n",
-                        escape_label(&zone.to_string())
-                    ));
-                }
+        }
+
+        // An instant, not a "seconds since": `time() - x` is the query
+        // language's job, and a duration computed here is stale on arrival.
+        //
+        // A zone with no transfer is omitted, not zeroed — zero reads as 1970.
+        declare(
+            &mut out,
+            "dns_zone_last_refresh_timestamp_seconds",
+            "gauge",
+            "Unix time of the last successful transfer of a replicated zone",
+        );
+        for (zone, gauge) in zones.iter() {
+            if let Some(at) = gauge.last_transfer {
+                labelled(
+                    &mut out,
+                    "dns_zone_last_refresh_timestamp_seconds",
+                    "zone",
+                    &escape_label(&zone.to_string()),
+                    at,
+                );
+            }
+        }
+        drop(zones);
+
+        // As above.
+        let catalogs = self.catalogs.read().unwrap_or_else(|e| e.into_inner());
+        if !catalogs.is_empty() {
+            declare(
+                &mut out,
+                "dns_catalog_members",
+                "gauge",
+                "Member zones provisioned from a consumed catalog zone",
+            );
+            for (catalog, members) in catalogs.iter() {
+                labelled(
+                    &mut out,
+                    "dns_catalog_members",
+                    "catalog",
+                    &escape_label(&catalog.to_string()),
+                    members,
+                );
             }
         }
 
-        if let Ok(catalogs) = self.catalogs.read() {
-            if !catalogs.is_empty() {
-                output.push_str(
-                    "# HELP dns_catalog_members                      Member zones provisioned from a consumed catalog zone
-",
-                );
-                output.push_str(
-                    "# TYPE dns_catalog_members gauge
-",
-                );
-                for (catalog, members) in catalogs.iter() {
-                    output.push_str(&format!(
-                        "dns_catalog_members{{catalog=\"{}\"}} {members}
-",
-                        escape_label(&catalog.to_string())
-                    ));
-                }
-            }
-        }
-
-        output
+        out
     }
 }
 
@@ -969,6 +956,138 @@ mod zone_gauge_tests {
 mod tests {
     use super::*;
     use crate::Rtype;
+
+    /// Every counter a distinct value, two zones (one of them primary, one with
+    /// a quote in its name), and one catalog — so a block reading the wrong
+    /// field, or a label reaching the scrape unescaped, is visible.
+    fn a_fully_populated_scrape() -> String {
+        let m = DnsMetrics::new();
+        for (i, c) in [
+            &m.queries_received,
+            &m.queries_authoritative,
+            &m.queries_recursive,
+            &m.responses_sent,
+            &m.responses_nxdomain,
+            &m.responses_servfail,
+            &m.responses_refused,
+            &m.responses_noerror,
+            &m.cache_hits,
+            &m.cache_misses,
+            &m.rate_limited,
+            &m.validation_errors,
+            &m.queries_dropped,
+            &m.tls_handshakes,
+            &m.tls_handshake_failures,
+            &m.quic_handshakes,
+            &m.quic_handshake_failures,
+            &m.policy_rewrites,
+            &m.policy_drops,
+            &m.synthesized,
+            &m.prefetches,
+            &m.slow_resolutions_completed,
+            &m.slow_resolutions_failed,
+            &m.stale_answers,
+            &m.dnstap_frames,
+            &m.dnstap_dropped,
+            &m.queries_type_a,
+            &m.queries_type_aaaa,
+            &m.queries_type_mx,
+            &m.queries_type_ns,
+            &m.queries_type_cname,
+            &m.queries_type_txt,
+            &m.queries_type_soa,
+            &m.queries_type_ptr,
+            &m.queries_type_other,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            c.store(i as u64 + 1, Ordering::Relaxed);
+        }
+        for us in [
+            1, 3, 7, 60, 600, 6_000, 60_000, 600_000, 2_000_000, 9_000_000,
+        ] {
+            m.observe_latency_us(us);
+        }
+        let nm = crate::test_records::nm;
+        m.set_zone_serial(nm("example.com.").as_ref(), Serial::new(7));
+        m.set_zone_serial(nm("ex\"ample.net.").as_ref(), Serial::new(8));
+        m.note_zone_transfer(nm("example.net.").as_ref(), 1_700_000_000);
+        m.set_catalog_members(nm("catalog.example.").as_ref(), 3);
+        m.to_prometheus_format()
+    }
+
+    /// The shape Prometheus requires, asserted rather than eyeballed.
+    ///
+    /// This is what the thirty hand-unrolled blocks could not have: the
+    /// agreement between a family's declaration and its samples was held by
+    /// copying a name into three string literals, so `TODO.md` #84 found 22
+    /// stray spaces in one `# HELP` line and three blocks using an embedded
+    /// newline where the other 99 used `\n`. None of it was visible to a test,
+    /// because no test looked at a HELP line.
+    ///
+    /// It does *not* pin the text. A golden blob would fail on every new
+    /// counter and teach nobody why.
+    #[test]
+    fn the_scrape_is_well_formed() {
+        let scrape = a_fully_populated_scrape();
+        let mut declared: Vec<&str> = Vec::new();
+        let mut typed: Vec<&str> = Vec::new();
+
+        for line in scrape.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let (name, help) = rest.split_once(' ').expect("HELP with no text");
+                assert!(
+                    !help.starts_with(' '),
+                    "{name}'s HELP text is padded: {help:?}"
+                );
+                assert!(!declared.contains(&name), "{name} declared twice");
+                declared.push(name);
+            } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let (name, kind) = rest.split_once(' ').expect("TYPE with no kind");
+                assert!(
+                    matches!(kind, "counter" | "gauge" | "histogram"),
+                    "{name} has kind {kind:?}"
+                );
+                assert!(!typed.contains(&name), "{name} typed twice");
+                typed.push(name);
+            } else {
+                // A sample: `name` or `name{label="v"}`, then a space and a
+                // number. Its family has to be one already declared, or the
+                // scrape names a series nothing described.
+                let head = line.split([' ', '{']).next().expect("a sample name");
+                assert!(
+                    declared.iter().any(|d| head == *d
+                        || head
+                            .strip_prefix(d)
+                            .is_some_and(|s| matches!(s, "_bucket" | "_sum" | "_count"))),
+                    "{head} has no HELP line"
+                );
+            }
+        }
+        assert_eq!(declared, typed, "every family needs both lines, in order");
+
+        // The label escape, end to end: a zone whose name holds a quote would
+        // otherwise make everything after it unparseable (RFC 1035 §5.1 allows
+        // the escape that puts one there).
+        assert!(
+            scrape.contains(r#"dns_zone_serial{zone="ex\\\"ample.net."} 8"#),
+            "a quote in a zone name reached the scrape unescaped"
+        );
+
+        // Omit, do not zero. `example.com.` is primary — no last transfer — and
+        // zero would read as 1970 and fire every staleness alert there is.
+        assert!(scrape
+            .contains("dns_zone_last_refresh_timestamp_seconds{zone=\"example.net.\"} 1700000000"));
+        assert_eq!(
+            scrape
+                .lines()
+                .filter(|l| l.starts_with("dns_zone_last_refresh_timestamp_seconds{"))
+                .count(),
+            1,
+            "a zone with no transfer must be absent, not zero"
+        );
+    }
 
     #[test]
     fn test_metrics_creation() {
