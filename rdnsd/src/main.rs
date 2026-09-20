@@ -67,7 +67,6 @@ use rdns::{
     logging::{watch_anomalies, AnomalyThresholds, QueryLogger},
     metrics::DnsMetrics,
     notify::{self, NotifyOutcome, NotifyPeer, NotifyPolicy},
-    readiness::Readiness,
     secondary::{state_file_path, StateFile},
     security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl, TransferCertificates},
     shutdown::{next_reload, reload_signal, Busy, Lifecycle, Shutdown, Stop},
@@ -86,6 +85,7 @@ use rdns_transport::https;
 use rdns_transport::logging::LogLevel;
 use rdns_transport::metrics_server;
 use rdns_transport::quic;
+use rdns_transport::readiness::Readiness;
 use rdns_transport::tcp;
 use rdns_transport::tls::{self, CertificateStore};
 use rdns_transport::{recv_error_is_transient, ServeContext, TransportLimits, UDP_RECEIVE_BUFFER};

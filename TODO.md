@@ -5197,12 +5197,25 @@ Measured: `cargo test -p rdns --test allocations` reads 33 either side, and
 
 ### 82. Two modules in the wrong place, and a `pub` with no ratchet — **filed 2026-09-19**
 
-- **82a. `readiness` is in `rdns` and `rdns` never uses it.** `grep` over
-  `rdns/src` returns one line: the `pub mod` declaration. Its five consumers are
-  `rdns-transport`'s metrics server — which *serves* `/readyz` — and the two
-  daemons. One dependency, `rdns_core::text_names::ascii_lowered`, which
-  `rdns-transport` already has. File move, five `use` edits, one `mod` line, no
-  manifest change.
+- **82a. `readiness` is in `rdns` and `rdns` never uses it — closed
+  2026-09-20.** `grep` over `rdns/src` returns one line: the `pub mod`
+  declaration. Its five consumers are `rdns-transport`'s metrics server — which
+  *serves* `/readyz` — and the two daemons. One dependency,
+  `rdns_core::text_names::ascii_lowered`, which `rdns-transport` already has.
+  File move, five `use` edits, one `mod` line, no manifest change.
+
+  **The estimate held to the line except one**: five `use` edits, no manifest
+  change, and *two* `mod` lines, because a move is a delete and an add. The
+  dependency reached through `rdns`'s `pub use rdns_core::*` rather than
+  directly, which is why no manifest moved — `rdns-transport` names
+  `rdns::text_names::ascii_lowered` and has no `rdns-core` of its own.
+
+  **What it does not buy, said plainly**, because the measurement above this row
+  is about exactly that: the `rdns-transport` → `rdns` edge is untouched,
+  `cargo tree -p rdnsd` is 150 either way, and nothing rebuilds faster. What
+  changes is that `rdns` stops publishing a module no module in it names, 34
+  `pub mod` where there were 35. The module says why it lives where it does now,
+  so the next reader does not have to find this row.
 
   This is the one piece of "the furniture is in the wrong crate" that survives
   its own refuting measurement. The larger version — an `rdns-ops` crate under

@@ -31,7 +31,6 @@ use rdns::clock::current_unix_timestamp;
 use rdns::metrics::DnsMetrics;
 use rdns::name_keys::NameKeyBuf;
 use rdns::notify::NotifyPolicy;
-use rdns::readiness::Readiness;
 use rdns::secondary::{
     state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile, TransferState,
 };
@@ -43,6 +42,7 @@ use rdns::zone::Zone;
 use rdns::zone_writer::write_zone_file;
 use rdns::NameRef;
 use rdns::Serial;
+use rdns_transport::readiness::Readiness;
 
 use crate::announce_transfer;
 use crate::zones::{install_zone, ZoneContext, Zones};

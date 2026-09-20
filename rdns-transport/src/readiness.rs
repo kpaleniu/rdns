@@ -14,11 +14,14 @@
 //! `dns_zone_last_refresh_timestamp_seconds` and its alert are for.
 //!
 //! No lock: the waiting set is fixed at construction and only shrinks.
+//!
+//! Here rather than in `rdns`, where it was until `TODO.md` #82a: `rdns` never
+//! named it, and what answers `/readyz` with it is this crate's metrics server.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::text_names::ascii_lowered;
+use rdns::text_names::ascii_lowered;
 
 /// One thing that has to arrive before the server is ready.
 struct Pending {

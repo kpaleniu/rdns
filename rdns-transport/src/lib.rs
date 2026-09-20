@@ -24,6 +24,7 @@ pub mod https;
 pub mod logging;
 pub mod metrics_server;
 pub mod quic;
+pub mod readiness;
 pub mod tcp;
 #[cfg(test)]
 mod testutil;

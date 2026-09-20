@@ -1,6 +1,6 @@
 //! A scrape endpoint for [`rdns::metrics::DnsMetrics`], plus the two probes an
 //! orchestrator asks for: `/healthz` (alive) and `/readyz` (finished starting).
-//! [`rdns::readiness`] has the distinction.
+//! [`crate::readiness`] has the distinction.
 //!
 //! **This was hand-rolled, and its own header said why**: "Prometheus needs a
 //! `GET` returning text, and an HTTP stack for one method on one path costs
@@ -55,8 +55,8 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
+use crate::readiness::Readiness;
 use rdns::metrics::DnsMetrics;
-use rdns::readiness::Readiness;
 use rdns::shutdown::{Busy, Stop};
 
 /// Concurrent scrape connections. Smaller than the DNS loops' 128: a scrape is

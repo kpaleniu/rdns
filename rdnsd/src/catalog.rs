@@ -1137,10 +1137,10 @@ mod tests {
     use rdns::ixfr::DeltaLog;
     use rdns::metrics::DnsMetrics;
     use rdns::notify::NotifyPolicy;
-    use rdns::readiness::Readiness;
     use rdns::secondary::{state_file_path, StateFile, TransferState};
     use rdns::shutdown::Shutdown;
     use rdns::zone::{parse_zone_file, Zone};
+    use rdns_transport::readiness::Readiness;
     use std::sync::Mutex as StdMutex;
     use tokio::sync::RwLock;
 
