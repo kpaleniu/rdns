@@ -670,21 +670,37 @@ wrong twice in `resolver.rs`, and the ASCII case fold exists in nine places
 including one in the public API doing the Unicode fold §8 forbids. Same authors,
 same care, same review. The difference is where the invariant lives.
 
+**Those three counts are July 2026's and all three now read zero** (re-measured
+2026-09-20, `TODO.md` #79b). The TTL clamp is `Ttl::from_wire`, whose own
+comment calls it "the only place the sign of the wire field is considered": four
+`.max(0)` are left in the tree and not one is a TTL. `Qtype`, `Rtype`, `Class`
+and `QueryClass` are distinct types, so the wrong comparison stopped compiling.
+No `to_lowercase` touches a name; `Name`'s `PartialEq` and `Hash` fold ASCII and
+`text_names::ascii_lowered` has the rest. The experiment is what this paragraph
+is for and it has not moved — the tree has.
+
 When a fix is about to be a check, ask what would have to be true for the check to
 be unnecessary. Usually the answer is a newtype, and usually it is free.
 
-The smells, all currently in this tree (`TODO.md` §13 plans the staged removal,
-with the measurements each stage has to hold):
+~~The smells, all currently in this tree (`TODO.md` §13 plans the staged
+removal, with the measurements each stage has to hold):~~ **Two of the seven
+are in this tree** (re-measured 2026-09-20, #79b), and §13 closed on
+2026-08-02 — it is in `docs/CLOSED_WORK.md`. Five were taken out by #13a-#13d
+(`b48c799`) and #14 (`eff4fcb`), both that day, and they stay on this list
+because the *shape* is what a review looks for. Each bullet says which it is,
+so a fixed one reads as an example rather than as something to go and find:
 
 - A primitive that means two things depending on a sibling field. OPT's CLASS is a
   UDP payload size and its TTL is a flags word, which is why the TTL cannot be
   clamped at the parse boundary and the clamp goes elsewhere fourteen times
   instead. The fix is to stop storing the pseudo-record in the resource-record
-  list, not to special-case rtype 41.
+  list, not to special-case rtype 41. **Fixed** (#13a-#13d): `DnsMessage::edns`
+  is an `Option<Edns>` field carrying that reason, and the clamp is `Ttl`.
 - Two `u16`s that name different spaces and compare with `==`. A QTYPE is not an
   RTYPE (ANY is 255 and no record *is* that type); a QCLASS is not a CLASS.
   Newtype them and the wrong comparison stops compiling everywhere at once,
-  including the copies nobody knew about.
+  including the copies nobody knew about. **Fixed** (#13a-#13d): all four
+  spaces are newtypes in `rdns-core::codes`.
 - A number whose ordering is not the ordering of the numbers. An SOA serial is
   RFC 1982 sequence space: it wraps, so `a > b` is not "a is later", and a
   secondary reading a wrapped increment as a rollback declines the transfer
@@ -692,16 +708,24 @@ with the measurements each stage has to hold):
   `PartialOrd` and offer `is_newer_than`. §3.2 also leaves the result undefined
   for two serials half the space apart, which an `Ord` would have to invent an
   answer for. See `Serial`, and the one place that still compares raw numbers —
-  with a comment saying why the claim is arithmetical rather than about versions.
+  with a comment saying why the claim is arithmetical rather than about
+  versions. **Done** (#14): no `PartialOrd`, 21 callers of `is_newer_than`, and
+  the one exception is `zone_signer.rs:2332`.
 - `unwrap_or` on the parse of a wire field, and its cause: `num_derive`'s
   `FromPrimitive`. A data-carrying `Other(T)` with hand-rolled, total, mutually
   inverse conversions costs twenty lines and buys a lossless round trip.
+  **Fixed** (#13a-#13d): `num_derive` left the workspace — one `deny.toml`
+  comment survives it — and no wire-field parse spells `unwrap_or`.
 - The same normalization written per module. If two modules fold a name, compare a
   name, or clamp a value their own way, one is already wrong or will be. Move it,
-  and put the reason in the doc comment (§7).
+  and put the reason in the doc comment (§7). **Live**: `TODO.md` #81b, FNV-1a
+  over ASCII-folded bytes written twice, where a drift moves every RRSIG expiry
+  in every zone.
 - An invariant asserted in a doc comment. That is a claim to verify, not
   documentation to trust (§4). If it is worth writing down it is worth making
-  unrepresentable; if it cannot be, say in the comment why not.
+  unrepresentable; if it cannot be, say in the comment why not. **Live**:
+  `TODO.md` #79d, #79e and #79f are three, each naming a guarantor that is not
+  the one enforcing it.
 - A `pub` field beside a checking constructor. `RecordData` had `pub rtype` and
   `pub rdata` plus three checking constructors, so
   `RecordData { rtype: A, rdata: <seventeen bytes> }` was a value nothing objected
@@ -712,7 +736,10 @@ with the measurements each stage has to hold):
   struct in it, on purpose. And going to seal something is the cheapest way to
   find out it is not true: writing down "the RDATA is well formed for its TYPE"
   turned up RFC 2136's RDLENGTH=0 records, and the fact that a legal UPDATE could
-  not be parsed at all.
+  not be parsed at all. **Fixed** (#14): both `RecordData` and `RecordDataRef`
+  hold private fields. The neighbouring shape has a compiler behind it since
+  #82b — `#![warn(unreachable_pub)]` in all nine crate roots — which answers
+  "is it reachable" and not "is it named", so #38's sweep still needs a hand.
 
 Three limits, so this does not become its own kind of damage:
 

@@ -4823,17 +4823,43 @@ they diverge, which is the whole of §18's "dead code is a finding".
   `canonical_name`, which is the live one, rather than deleting it with the
   function. §18: file, then delete.
 
-- **79b. `CLAUDE.md` §17's list is five-sevenths stale.** It opens "The smells,
-  all currently in this tree" and points at "`TODO.md` §13", which closed on
-  2026-08-02 and now lives in `docs/CLOSED_WORK.md`. Measured here:
-  `num_derive` is gone from the workspace entirely (one comment in `deny.toml`
-  survives it) and no wire-field parse uses `unwrap_or`. The review's own table
-  makes it five of the seven — OPT out of the record list, the QTYPE/RTYPE and
-  QCLASS/CLASS newtypes, `Serial` without `PartialOrd`, the TTL clamp and
-  `num_derive` — leaving only "the same normalization per module" and "an
-  invariant asserted in a doc comment" live. **Re-measure each of the seven
-  before editing the section**, then correct it in place with the reasoning
-  kept (§11: it is a claim, not a status line).
+- **79b. `CLAUDE.md` §17's list is five-sevenths stale — closed 2026-09-20.**
+  It opened "The smells, all currently in this tree" and pointed at
+  "`TODO.md` §13", which closed on 2026-08-02 and now lives in
+  `docs/CLOSED_WORK.md`. Measured here: `num_derive` is gone from the workspace
+  entirely (one comment in `deny.toml` survives it) and no wire-field parse
+  uses `unwrap_or`. The review's own table makes it five of the seven — OPT
+  out of the record list, the QTYPE/RTYPE and QCLASS/CLASS newtypes, `Serial`
+  without `PartialOrd`, the TTL clamp and `num_derive` — leaving only "the same
+  normalization per module" and "an invariant asserted in a doc comment" live.
+  **Re-measure each of the seven before editing the section**, then correct it
+  in place with the reasoning kept (§11: it is a claim, not a status line).
+
+  **Re-measured, all seven, and the verdict holds with its itemization
+  corrected.** Five are fixed and two are live, and the two live ones are the
+  two the row named. What the row got wrong is *which* five: it counted "the
+  TTL clamp" as a sixth item when the clamp is the OPT bullet's own
+  consequence, and it left out the seventh bullet, "a `pub` field beside a
+  checking constructor", which #14 closed when it sealed `RecordData`. Five
+  names, four bullets, one missed — the arithmetic worked out only because the
+  two errors cancelled.
+
+  | §17 bullet | today |
+  |---|---|
+  | OPT's CLASS and TTL mean two things | **fixed** #13a-#13d: `DnsMessage::edns` is an `Option<Edns>` field, and `Ttl::from_wire` is the only place the wire field's sign is read. Four `.max(0)` left in the tree, none a TTL, against "fourteen times" |
+  | a QTYPE is not an RTYPE | **fixed** #13a-#13d: `Qtype`, `Rtype`, `Class`, `QueryClass` |
+  | a serial's ordering is not the numbers' | **done** #14: no `PartialOrd`, 21 callers of `is_newer_than`, one arithmetical comparison at `zone_signer.rs:2332` with its reason |
+  | `unwrap_or` on a wire field, and `num_derive` | **fixed** #13a-#13d: no `num_derive` in the workspace, no such `unwrap_or` |
+  | the same normalization per module | **live**: #81b |
+  | an invariant asserted in a doc comment | **live**: #79d, #79e, #79f |
+  | a `pub` field beside a checking constructor | **fixed** #14: `RecordData` and `RecordDataRef` hold private fields — and #82b put a compiler behind the neighbouring shape |
+
+  Two claims in the opening paragraph went with them, and they are kept rather
+  than struck, because that paragraph *is* the controlled experiment §17 argues
+  from: "the ASCII case fold exists in nine places including one in the public
+  API doing the Unicode fold" is now no `to_lowercase` on a name anywhere, with
+  `Name`'s own `PartialEq` and `Hash` folding ASCII. The section says so in a
+  dated note beneath it.
 
 - **79c. `rdns/src/lib.rs:62` documents the wrong module.** "Scratch
   directories, for tests only." sits above `pub mod tls_identity;`. It
