@@ -73,6 +73,8 @@ each row exists (`CLAUDE.md` §11).
 | RFC | subject | status |
 |---|---|---|
 | 4033–4035 | validation, answer shapes, AD/CD | yes |
+| 4034 §2.1.1 | a key without the zone flag validates nothing | yes — `Dnskey::is_zone_key` |
+| 4034 §2.1.2 | a DNSKEY whose protocol is not 3 is invalid during signature verification | **yes since 2026-09-20** (`TODO.md` #94). Folded into `Dnskey::is_zone_key`, which is BIND's shape in `dns_dnssec_iszonekey()`; Unbound checks it in `dnskey_verify_rrset_sig` and Knot in `dnskey_rdata_to_crypto_key`. BIND also accepts protocol 255 (RFC 2535's ANY) and this does not |
 | 4034 §3.1 | RRSIG field order (expiration before inception) | yes |
 | 4034 §4.1.1 | the NSEC chain is a loop | yes — `nsec_covering` wraps |
 | 4034 §6 | canonical form and ordering | yes |

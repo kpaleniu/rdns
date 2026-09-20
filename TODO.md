@@ -38,7 +38,7 @@ every *measurement* and every caveat needed to trust one; those say
 ## What is open
 
 **#58**, **#68**, **#81**, **#82**, **#83**, **#84**, **#90**, **#92**, **#93**,
-**#94**, **#95**, and **#21**, as of 2026-09-20.
+**#95**, and **#21**, as of 2026-09-20.
 
 **#85 through #90 came out of a second architecture review on 2026-09-20**, this
 one asking what the ideal shape would be and where the tree differs. **Ten
@@ -5722,7 +5722,7 @@ target's case belongs to the zone that published it, not to us.
 
 ---
 
-### 94. Nothing enforces a DNSKEY's protocol field — **filed 2026-09-20**
+### 94. Nothing enforces a DNSKEY's protocol field — **filed and closed 2026-09-20**
 
 RFC 4034 §2.1.2: "The Protocol Field MUST have value 3, and the DNSKEY RR MUST
 be treated as invalid during signature verification if it is found to be some
@@ -5743,17 +5743,63 @@ conforming validator calls Bogus, on a zone publishing a protocol≠​3 key. Th
 is the same asymmetry §8 draws for AA and NXDOMAIN: being more permissive than
 the specification is a defect even when nothing breaks here.
 
-**No remedy taken, because the check has a choice in it** (§18): dropping the
+~~**No remedy taken, because the check has a choice in it** (§18): dropping the
 key in `from_record` removes it from DS matching and from the signer's own
 view as well as from verification, and "treated as invalid during signature
 verification" is narrower than that. The two shapes are one line each and
-§19 says build both.
+§19 says build both.~~ **Both built. Shape A — reject in `from_record` — is
+declined, and the measurement is what declined it**: it does not fix the
+defect. `verify_rrset` takes `&[Dnskey]` and `Dnskey`'s fields are all `pub`,
+so a key that never went through the constructor reaches the crypto with no
+check on it; shape A passed every existing test *and* left the new one failing.
+That is §17's "a `pub` field beside a checking constructor", found by building
+the shape rather than by arguing about it.
 
-**The measurement that would decide it**: does any live zone publish one?
-`dnspython` over a handful of signed zones answers it, and so does asking what
-BIND, Unbound and Knot do — §4's "check what the other implementations do, and
-quote them", which is cheap here because all three have the check or visibly
-do not.
+**What landed is shape B**, the predicate at the point of use:
+`Dnskey::is_zone_key` now wants the zone flag *and* protocol 3, so all three
+callers — the candidate-key filter in `verify_rrset`, `validate_dnskeys`'s DS
+matching, and RFC 5011's `is_candidate_anchor` — inherit it, and a fourth
+cannot forget it. One predicate, three sites, no new call-site check (§17).
+
+**The measurement that decided it**, and it is §4's: all three implementations
+reject, and two of the three fold the test in beside the zone flag exactly as
+this now does.
+
+- **BIND**, `lib/dns/dnssec.c`, `dns_dnssec_iszonekey()`:
+  `(key->flags & DNS_KEYOWNER_ZONE) != 0 && (key->protocol == DNS_KEYPROTO_DNSSEC || key->protocol == DNS_KEYPROTO_ANY)`,
+  reached from `validator.c`'s `select_signing_key()`, which `continue`s past
+  a key that fails it. The `KEYPROTO_ANY` arm is RFC 2535's 255 and is **not**
+  copied here: RFC 4034 §2.1.2 states the MUST with no exception, and neither
+  of the other two allows it.
+- **Unbound**, `validator/val_sigcrypt.c`, `dnskey_verify_rrset_sig()`:
+  `if(dnskey_get_protocol(dnskey, dnskey_idx) != LDNS_DNSSEC_KEYPROTO) {` under
+  the comment `/* RFC 4034 says DNSKEY PROTOCOL MUST be 3 */`, returning
+  `sec_status_bogus`.
+- **Knot**, `src/libknot/dnssec/key/dnskey.c`, `dnskey_rdata_to_crypto_key()`:
+  `if (!(flags_hi & 0x1) || protocol != 0x3) return KNOT_INVALID_PUBLIC_KEY;` —
+  the same two tests in one condition, at the point where RDATA becomes a
+  usable verifier.
+
+**The other measurement the row named — does any live zone publish one — was
+not taken**, and it would not have changed the answer: a protocol≠3 key is
+already unusable at BIND, Unbound and Knot, so refusing it here joins the field
+rather than leaving it. Port 53 is intercepted on the development machine
+anyway, so the probe would have measured a middlebox.
+
+**The test, and the way it first passed for the wrong reason** (§1). The
+obvious shape is the one beside it — `test_non_zone_key_cannot_sign` builds a
+signature, edits the key, then repoints `rrsig.key_tag` at the edited key. That
+works for the flag because clearing the flag only changes the tag. It does
+*not* work for the protocol, because the key tag sits inside the RRSIG RDATA
+that `signed_data` hashes: repointing the tag after signing breaks the
+signature, and the test went green against the unfixed tree on a crypto failure
+that had nothing to do with §2.1.2. `test_key_with_wrong_protocol_cannot_sign`
+signs *after* the tag is set, so the signature is genuine and the only thing
+that can reject it is the protocol field. Reverted against the fix it reports
+`Verified { wildcard: None, expires: … }`.
+
+Verified: 1 264 tests on Windows (1 262 before) and 1 285 on Linux, clippy
+clean on both sides, `cargo doc` clean.
 
 ---
 
@@ -5953,6 +5999,7 @@ the week; the record is under "How the queue kept going stale" in
 | **89** | a moved module left its doc comment on the next one | **filed and closed 2026-09-20**, and it is **#79c** filed a second time a day later. `e26a479` (#66c) moved `rdns/src/testutil.rs` to `rdns-core` and left `/// Scratch directories, for tests only.` attached to the `pub mod tls_identity;` below it, where it rendered on the crate index. `cargo doc` cannot catch a doc comment that is wrong rather than broken, and #20 had already written the remedy as prose ("after any move, grep the seam for an orphaned `///`"), so nobody ran it. Deleted, and the grep is now `rdns/tests/module_doc_comments.rs`: a `///` on a `mod X;` that shares no content word with the module's name or the first paragraph of its own `//!`. **Weak on purpose** — the seven that agree measure 4, 1, 4, 5, 2, 1 and 4 shared words against the orphan's 0, so a threshold of two would flag `mod eviction` (which agrees only through its own name) and `mod dispatch`. The one recursive `.rs` walk in the tree moved to `rdns_core::testutil` rather than being written a second time (§7), and both scans assert on what it hands back. It reads source as data, so it covers `rdnsd/src/control.rs` on Windows, where that file never compiles |
 | **79** | claims and code that outlived each other | **filed 2026-09-19, closed 2026-09-20**, five rows. **79a**: six dead `pub fn`, not four — a sweep of the workspace's 713 `pub fn` definitions finds four, and misses `Nat64Prefix::bits` and `TransferError::refused` because a string literal and an unrelated struct field carry those words, which is #82b's point about a name-based criterion from the other side. Two of the six were not dead code: `Rtype::is_meta` is the RFC-citing copy of a predicate `update.rs`'s RFC 2136 §3.4.1 prescan spells by hand, so it was wired in rather than deleted; `TransferError::Refused` was unreachable because the site that should build it builds `Malformed`, which left **#95**. **79b**: §17 re-measured, five fixed and two live. **79c**: closed as #89, which was it filed twice. **79d**: `set_edns` is `pub` and three answer paths use it without `mirror`, so the guarantor is `finish`'s guard, now cited and asserted. **79e**: three of six `NotFound` returns establish the wildcard invariant, not four, and the guarantor is `rdnsd`'s `resolve_in_zone` ordering — confirmed with the zone the row asked for. **79f**: 40 of `Cli`'s 46 `#[arg]` fields conflict with `--config`, so six are exempt and not three; the certificate check stays in `main` over the merged view, with the reason written in |
 | **80** | two bools where the enum was already imported | **filed 2026-09-19, closed 2026-09-20**. `validate_rrset` returned `(is_valid, is_signed)`, documented in prose and nowhere in the type, with seven bare tuple literals in the file. The refuting check — a caller needing `is_signed` without already holding the `ZoneKeys` that answers it — came back empty: both production sites are in `verify_zones`, and the first calls `keys.is_signed()` one line above. `Verdict::{Unchecked, Valid, Invalid(String)}` now, and the `Invalid` carries what the pair could not: `verify_zones` said "does not verify against the zone's own keys" for an expiry, a missing signature and an unreadable algorithm alike. `validate_response` and `is_zone_signed` deleted with it, both dead and both #79a's shape in the same module; five doc comments naming the first were reworded rather than left to rot (#89). Allocation counts 33 either side; one test caught agreeing with the code for the wrong reason, which is **#94** |
+| **94** | nothing enforced a DNSKEY's protocol field | **filed and closed 2026-09-20**, out of #80's tests. RFC 4034 §2.1.2 makes a DNSKEY with protocol ≠ 3 "invalid during signature verification"; `Dnskey::from_record` copied the octet and only `key_tag` read it afterwards, so `rdnsr` called Secure what a conforming validator calls Bogus. Both shapes built (§19) and **the measurement declined the one the row leaned towards**: rejecting in `from_record` fixes nothing, because `verify_rrset` takes `&[Dnskey]` and every field of `Dnskey` is `pub` — shape A passed the whole suite and left the new test failing, which is §17's "a `pub` field beside a checking constructor" arriving as a measurement. What landed is the predicate: `is_zone_key` wants the flag **and** protocol 3, so its three callers — the candidate-key filter, DS matching, RFC 5011 anchor candidacy — inherit it. §4's survey agrees and settled the one open choice: BIND's `dns_dnssec_iszonekey()` folds the two tests the same way, Unbound checks it in `dnskey_verify_rrset_sig` and Knot in `dnskey_rdata_to_crypto_key`; BIND alone also accepts RFC 2535's protocol 255, which is not copied. The test passed against the unfixed tree on its first draft, for a reason §1 predicts — the key tag is inside the RRSIG RDATA `signed_data` hashes, so repointing the tag after signing breaks the crypto instead of testing the field |
 | **78** | `rdnsr`'s query path lost work at three of its exits | **filed 2026-09-19, closed 2026-09-20**, three rows, and the first was verified here while b and c were the review's reading — both held. **78a**: an `rpz-ip` rule over a cache hit dropped the prefetch the answer cache had just asked for, because `impl From<Option<Vec<u8>>> for Answered` fills `refresh: None`. Three shapes built (§19) and the one that shipped is in neither the row nor the review: delete the early `return`, since the hazard is §7's jump over a shared epilogue. **78b**: `Resolver::forward` returned the upstream's AA bit and echoed question verbatim where `recurse` normalized both, so an `rdnsr` in front of an `rdnsr` running 0x20 would have rejected its own answer (RFC 5452 §9.1) — left **#93**. **78c**: QDCOUNT = 0 was dropped by `rdnsr` and answered NOERROR *with AA set* by `rdnsd`. RFC 9619 §4 settles only QDCOUNT > 1; its QDCOUNT = 0 sentence binds firewalls, not responders. RFC 7873 §5.4 says what the query is for and that a server without cookies "will normally send FORMERR", and the peers agree: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all answer it, all FORMERR with no OPT, and none drops it — which is the measurement that could have refuted the finding |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly

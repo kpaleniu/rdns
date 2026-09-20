@@ -24,6 +24,10 @@ use ring::signature;
 /// zone. A DNSKEY without it must not validate anything (RFC 4034 §2.1.1).
 pub const DNSKEY_FLAG_ZONE: u16 = 0x0100;
 
+/// The only legal DNSKEY protocol value (RFC 4034 §2.1.2). Not `pub`: nothing
+/// outside this module has a reason to name it (`TODO.md` #82b).
+const DNSKEY_PROTOCOL_DNSSEC: u8 = 3;
+
 /// DNSKEY flags bit 15 (0x0001): Secure Entry Point. RFC 4034 §2.1.1 makes it
 /// only a hint that a DS points here, and nothing treats it as more.
 pub const DNSKEY_FLAG_SEP: u16 = 0x0001;
@@ -78,6 +82,10 @@ impl std::error::Error for CryptoError {}
 pub struct Dnskey {
     pub owner: Name,
     pub flags: u16,
+    /// RFC 4034 §2.1.2 requires 3. Checked in [`Dnskey::is_zone_key`] rather
+    /// than at the parse: the field is still part of what a DS hashes and what
+    /// the key tag is computed over, so a wrong value has to survive to be
+    /// rejected.
     pub protocol: u8,
     pub algorithm: u8,
     pub public_key: Vec<u8>,
@@ -116,9 +124,10 @@ impl Dnskey {
         key_tag(self.flags, self.protocol, self.algorithm, &self.public_key)
     }
 
-    /// Whether this key may sign RRsets in its zone (RFC 4034 §2.1.1).
+    /// Whether this key may sign RRsets in its zone: the zone flag
+    /// (RFC 4034 §2.1.1) and protocol 3 (§2.1.2).
     pub fn is_zone_key(&self) -> bool {
-        self.flags & DNSKEY_FLAG_ZONE != 0
+        self.flags & DNSKEY_FLAG_ZONE != 0 && self.protocol == DNSKEY_PROTOCOL_DNSSEC
     }
 
     /// Whether the Secure Entry Point hint is set.
@@ -1347,6 +1356,55 @@ mod tests {
             &[rrsig],
             &[dnskey],
             nm("example.com.").as_ref(),
+            current_unix_timestamp(),
+        );
+        assert!(matches!(proof, RrsetProof::Bogus(_)), "{proof:?}");
+    }
+
+    /// The two halves of "may sign", one predicate: BIND folds them the same
+    /// way in `dns_dnssec_iszonekey()`.
+    #[test]
+    fn test_is_zone_key_wants_the_flag_and_the_protocol() {
+        let key = TestKey::generate_p256();
+        let good = key.dnskey("example.com.");
+        assert!(good.is_zone_key());
+
+        let mut no_flag = good.clone();
+        no_flag.flags &= !DNSKEY_FLAG_ZONE;
+        assert!(!no_flag.is_zone_key());
+
+        let mut wrong_protocol = good.clone();
+        wrong_protocol.protocol = 4;
+        assert!(!wrong_protocol.is_zone_key());
+    }
+
+    /// A key whose protocol field is not 3 may not verify a signature
+    /// (RFC 4034 §2.1.2: "the DNSKEY RR MUST be treated as invalid during
+    /// signature verification if it is found to be some value other than 3").
+    #[test]
+    fn test_key_with_wrong_protocol_cannot_sign() {
+        let key = TestKey::generate_p256();
+        let rdatas = vec![a_rdata(1)];
+        let mut dnskey = key.dnskey("example.com.");
+        dnskey.protocol = 4;
+
+        // Signed *after* the tag is pointed at the modified key: the key tag
+        // sits in the RRSIG RDATA that `signed_data` hashes, so retagging a
+        // ready-made signature would break the crypto and the test would pass
+        // without the protocol field being read at all.
+        let owner = nm("example.com.");
+        let rrset = Rrset::new(owner.as_ref(), rt::A, Class::new(1), &rdatas);
+        let mut rrsig = key.rrsig_template(rrset.owner, rt::A, 3600, "example.com.", dnskey.flags);
+        rrsig.key_tag = dnskey.key_tag();
+        rrsig.signature = key.sign(
+            &signed_data(&rrsig, rrset.owner, rrset.class, rrset.rdatas).expect("signed data"),
+        );
+
+        let proof = verify_rrset(
+            &rrset,
+            &[rrsig],
+            &[dnskey],
+            owner.as_ref(),
             current_unix_timestamp(),
         );
         assert!(matches!(proof, RrsetProof::Bogus(_)), "{proof:?}");
