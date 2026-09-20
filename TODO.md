@@ -1220,8 +1220,14 @@ wrong trade when the symptom is already a counter.
 > Windows cannot compile. **Pushing is still the owner's call and not a
 > session's**: `CLAUDE.local.md` says why a push costs something and who makes it.
 >
-> **What the last run says** (`34530980969`, `431acd0`, 2026-09-10): all seven
-> green. msrv passes on toolchain 1.95; `cargo-deny` 0.20.2 reports "advisories
+> **Read again 2026-09-20, and two jobs were red**: `35463448583` (`13f3b47`,
+> 2026-09-19), the first push since the TLS work landed. `image` and `deny`, the
+> two no `cargo` invocation here can stand in for, and the `image` failure was
+> #31's word for word. Both fixed and closed as **#91**, which is also where the
+> `cargo deny` half is written down.
+>
+> **What the last all-green run says** (`34530980969`, `431acd0`, 2026-09-10):
+> all seven green. msrv passes on toolchain 1.95; `cargo-deny` 0.20.2 reports "advisories
 > ok, bans ok, licenses ok, sources ok"; the image builds, answers `--version`
 > with `rdnsd 0.1.0 (g431acd0c3de0)` — so the `RDNS_GIT_DESCRIBE` build-arg works
 > and it is not the bare `0.1.0` a missing one gives — serves `/healthz` and
@@ -3871,6 +3877,15 @@ send, read or the status went wrong. **Left open** on that footing: there is
 one unexplained failure and no explanation, only a smaller cost to seeing the
 next one.
 
+**A second sighting, 2026-09-20, in a different crate and with no name
+captured.** One `cargo test --workspace` run reported `rdnsd` at 190 passed and
+1 failed where every other run reports 191 and 0. Thirteen further workspace
+runs and a `-p rdnsd` run were clean. The name was lost to the *reader*, not to
+the test — the run was filtered to `^test result` lines — which is the same
+evidence failure the paragraph above fixed for one module and is worth
+repeating as advice: never filter a suite run down to its totals when the point
+is to catch something rare.
+
 **Two findings on the way out**, both in the file the row points at and
 neither the flake: **#69**, every accept loop in the crate treats any accept
 error as fatal while the UDP side has `recv_error_is_transient` and a written
@@ -5193,6 +5208,62 @@ wrong remedy.
 
 ---
 
+### 91. Both CI jobs no local `cargo` invocation covers were red — **filed and closed 2026-09-20**
+
+Found while checking the README's own claims, not by a review. `gh run view
+35463448583` (2026-09-19, the first push since the TLS work landed): five green,
+**two red**, and they are the two this repo has already written a paragraph
+about.
+
+- **`container image`**, with `failed to read /src/rdns-present/Cargo.toml`.
+  Character for character the failure #31 caused — the Dockerfile's `COPY` list
+  was never told about the crate split — with `rdns-present` and `rdns-tsig`
+  (#66c, #67) in place of `rdns-core` and `rdns-transport`. The CI note above
+  this file's queue tells that story as a closed one. `.dockerignore` carries
+  the **same list a second time**, said "all seven workspace members", and was
+  stale the same way; both are fixed and both now say why the list keeps going
+  stale. Verified by building the image and running it: `rdnsd 0.1.0
+  (7eeb9ab-dirty)`, so the `RDNS_GIT_DESCRIBE` arg still works.
+
+- **`licences and advisories`**, failing all three of advisories, bans and
+  licences. None had ever failed before because none of it was in the graph
+  before `rustls` was:
+  - **RUSTSEC-2026-0285**, rustls 0.23.44 accepting TLS 1.3 handshake messages
+    at the wrong encryption level (RFC 8446 §5.1). Fixed by `cargo update -p
+    rustls` to 0.23.45, which is the advisory's own remedy. The transcript stays
+    authenticated, so it is not a handshake forgery.
+  - **`subtle` is BSD-3-Clause**, which `deny.toml`'s allow-list did not hold.
+    Added, with the reason, per that file's stated policy of listing every
+    licence the graph actually reaches. `BSD-2-Clause` and `Zlib` are reachable
+    too and are deliberately *not* added: each is an `OR` branch MIT already
+    satisfies.
+  - **Four duplicate versions**, and the measurement split them in half. `rand`
+    and `rand_core` were **ours**: this tree was on `rand` 0.8 and `quinn-proto`
+    on 0.10. Upgrading ours is four lines — `thread_rng().gen()` became
+    `rand::random()` — and it collapsed `getrandom` with them. `Cargo.lock` 218
+    packages → **214**. The two that remain are named exceptions with the
+    condition that clears each one written beside them, which is what `deny.toml`
+    asks for rather than relaxing the check.
+
+**The remainder, with a number rather than a sentence** (§18): `cpufeatures` is
+duplicated because our `sha1` and `sha2` are RustCrypto 0.10 (on `cpufeatures`
+0.2) while `chacha20`, under `rand` 0.10, is on 0.3. `sha1` 0.11.0 and `sha2`
+0.11.0 are released; the migration is `digest` 0.10 → 0.11, which is not four
+lines, so it was not taken here. `getrandom`'s duplicate is not ours at all:
+`ring` 0.17 pins 0.2.
+
+**What this is really a finding about.** Both jobs are the two `CLAUDE.md` §1's
+rule points at and the recipe cannot reach — `image` needs a container runtime,
+`deny` needs a network and an advisory database that changes under a tree that
+did not. Every other job is `cargo` something a developer already runs. The
+first was red for four pushes in September and nobody opened it; this time it
+was red for one push and was found by checking a *README sentence* about
+dependency counts. Verified: `cargo deny check` reports **advisories ok, bans
+ok, licenses ok, sources ok**; 1 248 tests on Windows and 1 269 on Linux after
+the `rand` upgrade, unchanged from before it.
+
+---
+
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -5347,8 +5418,9 @@ the week; the record is under "How the queue kept going stale" in
 | **75** | two of three answering paths returned past the epilogue | **filed and closed 2026-09-19**, `74019de`. `record_dnstap` was reachable only through `finish`, and the transfer and UPDATE branches `return`ed above it — so a dnstap capture held neither, while `--dnstap` says "every answered request" and `MessageType::UpdateQuery`/`UpdateResponse` were arms nothing could reach. §7's named shape, and this file's second instance of it after the NOTIMP branch that returned past `make_response`'s OPT mirroring; the tell here was cheaper, because the unreachable arms had been *written*. `finish` returns what it sent, `answer` has one tail, and a serialization failure joins them for the reason a dropped reply already did. A transfer records the query alone: no one envelope is the reply. Left **77b**, ~~which is that there is no test~~ **closed the same day**: a query, an UPDATE and a transfer attempt down one connection, **3 data frames against 1** with this tail reverted — so the pre-#75 shape drops two of three rather than capturing nothing, which is what the row had guessed |
 | **76** | `ScratchDir` existed three times | **filed and closed 2026-09-19**, `ab2ae3b`. `rdns-core::testutil` is `pub` rather than `#[cfg(test)]` for one stated purpose — "the choice was this or a second `ScratchDir`, which is the thing this module exists to have stopped" — and both binaries wrote one anyway, each citing the other, on a premise that stopped being true at #66c. `rdnsd` carried both at once: `dispatch.rs` already reached for the shared one. 57 lines deleted, 9 added, no behaviour. What it is worth is not the lines: §7 says the reason is what stops the next copy, and here the reason was copied along with the code and went on justifying it after it had expired |
 | **77** | what #73 and #75 left behind | **filed 2026-09-19, closed 2026-09-20**, `1a0422c` and `2d72c4c`. **77b**: the test #75 landed without — a query, an UPDATE and a transfer attempt down one connection, **3 data frames against 1** with that tail reverted, so the old shape dropped two of three rather than capturing nothing, which is what the row had guessed. **77a**: the survey the row asked for, and it did not decide what the row expected. Knot fixes it in the signer ("TTL of *generated* NSEC(3) records"), PowerDNS in its own signing, NSD has no entry at all because it never signs, and BIND cites 9077 nowhere — while RFC 9077 §§3.1-3.3 each put the MUST on the TTL "that is returned" and §4 addresses "signers **and** DNS servers". The field and the specification disagree; `rdnsd` is both, so a zone it did not sign reaches the same answer path as one it did, and the cap is taken there too. Counted rather than timed: the NXDOMAIN path takes the same apex lookups as before, the two DO-only paths take one more each, and no benchmark covers a signed negative answer |
-| **86** | two error enums sat in the crate that could not name them | **filed and closed 2026-09-20**, out of the same review. `DnssecError` and `BrokenCatalog` were defined in `rdns-core` and named by no module in it — 100 of that file's 264 lines, in the crate `rdnsctl` links alone as "the DNS wire format". Moved to `rdns::error` beside `TransferError`, which is there for the reason written at the top of that file; nothing downstream changed, because `pub use rdns_core::error::*` already spelled both paths the same. The refuting measurement removed a third of the finding before any edit: `ZoneError` looks identical and **must stay**, since `rdns-present` returns it and does not depend on `rdns`, so the move would need a cycle. That reason was written down nowhere and is now on the enum |
 | **85** | the library installed the process's log subscriber | **filed and closed 2026-09-20**, out of a second architecture review. `rdns::logging::init` chose a global subscriber on its caller's behalf, against a rule two files state — the workspace manifest's `tracing` entry ("the library only emits; the binaries choose where it goes") and `rdns-transport`'s own header. Moved verbatim to `rdns_transport::logging`, the crate whose only consumers are the two daemons, so there is still one copy and not one per binary (§7). The refuting measurement was taken first and **narrowed the claim**: the seven packages this drops from `rdns` (55 → **48**) are off a fresh build's critical path — all seven finish by 7.87 s of a 21.08 s build whose path is `rdns` then `rdnsd` — and `Cargo.lock` keeps every one of them, because both daemons need the subscriber wherever it lives. So it buys `cargo build -p rdns` and the boundary, not workspace build time |
+| **86** | two error enums sat in the crate that could not name them | **filed and closed 2026-09-20**, out of the same review. `DnssecError` and `BrokenCatalog` were defined in `rdns-core` and named by no module in it — 100 of that file's 264 lines, in the crate `rdnsctl` links alone as "the DNS wire format". Moved to `rdns::error` beside `TransferError`, which is there for the reason written at the top of that file; nothing downstream changed, because `pub use rdns_core::error::*` already spelled both paths the same. The refuting measurement removed a third of the finding before any edit: `ZoneError` looks identical and **must stay**, since `rdns-present` returns it and does not depend on `rdns`, so the move would need a cycle. That reason was written down nowhere and is now on the enum |
+| **91** | both CI jobs no local `cargo` run covers were red | **filed and closed 2026-09-20**, found while checking a README sentence about dependency counts rather than by a review. `image` failed with `failed to read /src/rdns-present/Cargo.toml` — character for character #31's failure, with the #66c/#67 crates in place of the #31 ones, and `.dockerignore` held the same list a second time and was stale the same way. `deny` failed all three of advisories, bans and licences, none of which had ever been in the graph before `rustls` was: RUSTSEC-2026-0285 (fixed by its own remedy, `cargo update -p rustls`), `subtle`'s BSD-3-Clause (added, per that file's policy of listing what the graph reaches), and four duplicate versions — half of them **ours**, `rand` 0.8 against `quinn-proto`'s 0.10, four lines to collapse and `Cargo.lock` 218 → **214** with `getrandom` going too. Left: the RustCrypto 0.11 migration that would collapse `cpufeatures`, which is a `digest` version bump and not four lines |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

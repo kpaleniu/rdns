@@ -10,7 +10,6 @@ use crate::macros::read_be;
 use crate::name::{Name, NameRef};
 use crate::record::{Additional, ResourceRecord};
 use crate::response;
-use rand::Rng;
 
 #[derive(Debug, Clone)]
 pub struct QuerySection {
@@ -71,8 +70,7 @@ fn section_count(len: usize, what: &'static str) -> Result<u16, WireError> {
 /// A random DNS transaction id. The one implementation: an id is not a security
 /// boundary here, but that is no reason to make it predictable.
 pub fn rand_id() -> u16 {
-    use rand::Rng;
-    rand::thread_rng().gen()
+    rand::random()
 }
 
 pub fn framed(bytes: &[u8]) -> Result<Vec<u8>, WireError> {
@@ -585,8 +583,7 @@ impl DnsMessageBuilder {
     pub fn build(&self) -> DnsMessage {
         let mut id = self.id;
         if id == 0 {
-            let mut rng = rand::thread_rng();
-            id = rng.gen::<u16>();
+            id = rand::random::<u16>();
         }
 
         DnsMessage {

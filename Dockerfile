@@ -24,10 +24,17 @@ WORKDIR /src
 # two manifests and nothing else. `rdnsr` is not built into this image, but cargo
 # parses every workspace member's manifest and refuses one whose `src/main.rs` is
 # missing, so it comes along.
+#
+# Nine lines for nine members, and this list has now gone stale on both crate
+# splits — `rdns-core`/`rdns-transport` at #31, `rdns-present`/`rdns-tsig` at
+# #66c/#67 — each time breaking the one CI job no local `cargo` invocation
+# covers. `TODO.md` #91.
 COPY Cargo.toml Cargo.lock ./
 COPY rdns rdns
 COPY rdns-core rdns-core
+COPY rdns-present rdns-present
 COPY rdns-transport rdns-transport
+COPY rdns-tsig rdns-tsig
 COPY rdnsc rdnsc
 COPY rdnsctl rdnsctl
 COPY rdnsd rdnsd

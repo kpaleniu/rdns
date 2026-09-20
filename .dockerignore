@@ -15,12 +15,17 @@
 !Cargo.lock
 !LICENSE
 
-# All seven workspace members. `rdnsr` is not built into the image, but cargo
+# All nine workspace members. `rdnsr` is not built into the image, but cargo
 # parses every member's manifest to resolve the workspace and refuses one whose
-# `src/main.rs` is missing, so it has to be here.
+# `src/main.rs` is missing, so it has to be here. This list and the Dockerfile's
+# `COPY` list are the same list twice, and both went stale on both crate splits:
+# `rdns-core`/`rdns-transport` at #31 broke four pushes, `rdns-present`/
+# `rdns-tsig` at #66c/#67 broke the next one. `TODO.md` #91.
 !rdns
 !rdns-core
+!rdns-present
 !rdns-transport
+!rdns-tsig
 !rdnsc
 !rdnsctl
 !rdnsd

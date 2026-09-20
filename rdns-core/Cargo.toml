@@ -11,5 +11,5 @@ build = "build.rs"
 thiserror = "2.0"
 # A transaction id must not be predictable, and `utils::hex_encode`'s sibling
 # writes the base64 a DNSKEY is spelled in. Neither pulls a runtime in.
-rand = "0.8"
+rand = "0.10"
 base64 = "0.22"

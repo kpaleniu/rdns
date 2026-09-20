@@ -29,14 +29,19 @@ targets = [
 #   Apache-2.0    `mintex` alone requires it, and `ring` needs it *and* ISC
 #   ISC           `ring` (Apache-2.0 AND ISC) and `untrusted`
 #   Unicode-3.0   `unicode-ident` ((MIT OR Apache-2.0) AND Unicode-3.0)
+#   BSD-3-Clause  `subtle`, under `rustls`, which offers nothing else
 #
 # `AND` is why Apache-2.0 and ISC are not optional: an `OR` expression is
-# satisfied by any one branch, an `AND` by all of them.
+# satisfied by any one branch, an `AND` by all of them. `BSD-2-Clause` and
+# `Zlib` are reachable too — `zerocopy`, `lru-slab`, `tinyvec` — and are *not*
+# listed, because each is an `OR` branch MIT already satisfies. Listing a
+# licence nothing requires is how this file stops describing the graph.
 allow = [
     "MIT",
     "Apache-2.0",
     "ISC",
     "Unicode-3.0",
+    "BSD-3-Clause",
 ]
 confidence-threshold = 0.8
 
@@ -62,6 +67,23 @@ skip = [
     # deriving `FromPrimitive` for; the duplicate outlived it because the list
     # was never only those two.
     { crate = "syn", reason = "proc-macro build dependency; clap_derive is on 2, serde_derive on 3" },
+
+    # These two *do* ship in the binary, which is the case the paragraph above
+    # says this check exists for, so each names what would collapse it rather
+    # than only that it is transitive (`TODO.md` #91):
+    #
+    #   getrandom    `ring` 0.17 pins 0.2; our `rand` 0.10 is on 0.4. It
+    #                collapses when `ring` moves, which is not ours to do.
+    #   cpufeatures  our `sha1`/`sha2` 0.10 are on 0.2; `chacha20`, under
+    #                `rand` 0.10, is on 0.3. It collapses when we move to
+    #                RustCrypto 0.11 — which is ours to do, and is #91's
+    #                remainder.
+    #
+    # Both are small: a getrandom shim and a CPU-feature probe. Re-check when
+    # either parent moves; a skip nobody revisits is the thing this file was
+    # written to stop.
+    { crate = "getrandom", reason = "ring 0.17 pins 0.2, rand 0.10 needs 0.4" },
+    { crate = "cpufeatures", reason = "sha1/sha2 0.10 are on 0.2, chacha20 on 0.3" },
 ]
 
 wildcards = "deny"

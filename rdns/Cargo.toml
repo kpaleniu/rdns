@@ -18,7 +18,7 @@ thiserror = "2.0"
 # either side. `default-features = false` drops the default hasher, which
 # nothing here uses: every probe passes its own hash.
 hashbrown = { version = "0.17", default-features = false }
-rand = "0.8"
+rand = "0.10"
 
 # DNSSEC crypto
 ring = "0.17"
