@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#83**, **#90**, **#92**, and **#21**, as of 2026-09-20.
+**#58**, **#68**, **#90**, **#92**, and **#21**, as of 2026-09-20.
 **#93 closed** on a measurement that refuted it. **#95 and #96 closed
 together**: #95's survey said §3's example of a branch was invented, and found
 the branch that was real, which is #96 — a master that refuses the SOA probe was
@@ -5282,7 +5282,7 @@ Measured: `cargo test -p rdns --test allocations` reads 33 either side, and
 
 ---
 
-### 83. `rdnsd/src/main.rs` has grown two seams — **filed 2026-09-19**
+### 83. `rdnsd/src/main.rs` has grown two seams — **filed 2026-09-19, closed 2026-09-20**: one taken, one declined, and the criterion needed reading before either
 
 Not a defect, and filed so the judgement stops being carried silently.
 
@@ -5306,13 +5306,74 @@ clusters now return "seam":
 
 The file's code half — everything before `#[cfg(test)]`, non-blank,
 non-comment — has gone **1015 → 1584 lines since #38d/#39b measured it**, with
-no seam taken.
+no seam taken. (**1597 when the split was taken**, a day later.)
 
 **The method is #38d's**: do the split, count what seals, revert if the new
 module needs more `pub(crate)` than it makes private, and write *that* number
 into this row. `Cli` is **not** a candidate and moving it would be a straight
 loss: ~40 fields would need `pub(crate)`, which reopens 63a's sealing sweep to
 buy file length.
+
+---
+
+**Both splits built, 2026-09-20. NOTIFY is in `notify_out.rs`; the reload
+cluster is declined on its number.**
+
+**The criterion had to be read before it could be applied, and that is the
+first thing this row found.** "More `pub(crate)` than it makes private" counts
+annotations, and `main.rs` is the *crate root*, where §17 already records that
+private is not private: a root-private item is visible to every module in the
+crate. So the five NOTIFY items were reachable from anywhere in `rdnsd` before
+the move and three of them are `pub(crate)` after it — **3 against 2 sealed, a
+revert on the letter** — while what actually changed is that **2 items became
+unreachable from the rest of the crate and 0 became more reachable than they
+already were.** The annotations went up and the visibility went down. Taken on
+the second reading, because that is what the criterion is measuring; a `git
+revert` of the commit is the whole cost of disagreeing.
+
+**The NOTIFY split, measured:**
+
+| | |
+|---|---|
+| moved | `parse_notify_peers`, `build_notify_policy`, `announce_zones`, `announce_transfer`, `send_notify` — 254 lines |
+| `pub(crate)` | 3 — `build_notify_policy`, `announce_zones`, `announce_transfer` |
+| sealed | 2 — `parse_notify_peers`, `send_notify`, which no module outside can now name |
+| newly widened | **0**, for the reason above |
+| `main.rs` code half | **1597 → 1434** |
+| imports freed | 8 left `main.rs`'s non-test surface: `BTreeMap`, `bind_addr_for`, `zone::Zone`, `DnsMessage`, `ResourceRecord`, `NotifyPeer`, and `notify` and `tsig` as modules — five of them to `#[cfg(test)]`, which is where the file's remaining use of them is |
+| tests moved | 4 of 5 |
+
+**The row's "one reach-back into `main`, and it is removable" was right about
+the one and wrong that removing it leaves none.** `build_notify_policy` took
+`&Cli` to read `cli.also_notify` and now takes `&[String]`. What that uncovered
+is `absolute_name`, a one-line wrapper over `rdns::text_names::absolute` that
+was invisible while the code sat in the same file. **Net reach-backs: 1 before,
+1 after.** It is left as `crate::absolute_name` rather than spelled out, because
+`zones.rs` reaches it the same way and a second spelling is §7's whole subject.
+
+**And the fifth test did not move**, which is the sharper finding.
+`test_a_notify_can_be_signed_and_verifies_as_a_request` needs seven of
+`main.rs`'s test fixtures — `ScratchDir`, `spawn_primary`, `zone_text`,
+`replication`, `MasterSpec`, `refresh_once`, `test_shutdown` — because it drives
+a whole replication round and *asserts* about the NOTIFY. It is a replication
+test wearing a NOTIFY test's name, and it stays where its fixtures are. The
+other four are self-contained and sit beside the code now.
+
+**The reload cluster is declined, 18 against 1.** `Reloading`, `ReloadTrigger`,
+`ReloadContext`, `reload_once`, `spawn_zone_maintenance`, `sleep_for` would need
+`pub(crate)` on **5 items plus 13 struct fields** — `Reloading`'s 8 and
+`ReloadContext`'s 5 — because `serve` builds both as struct literals, and
+`control.rs` names `ReloadTrigger`. Exactly one thing seals: `sleep_for`. Unlike
+the NOTIFY count this one widens for real, since those 13 fields are private to
+the root today and would have to be named from outside. **It is `Cli`'s shape at
+a third of the size**, which the row had already ruled out for the same reason
+without noticing the two structs beside it have it too.
+
+**What would change the answer**, so this is a measurement and not a verdict:
+give `Reloading` and `ReloadContext` constructors and the 13 fields stay
+private — 5 `pub(crate)` against 1, still a loss, but a close one. That is a
+different change from moving a file, and it is the one somebody should price if
+this comes back.
 
 ---
 
@@ -6243,6 +6304,7 @@ the week; the record is under "How the queue kept going stale" in
 | **89** | a moved module left its doc comment on the next one | **filed and closed 2026-09-20**, and it is **#79c** filed a second time a day later. `e26a479` (#66c) moved `rdns/src/testutil.rs` to `rdns-core` and left `/// Scratch directories, for tests only.` attached to the `pub mod tls_identity;` below it, where it rendered on the crate index. `cargo doc` cannot catch a doc comment that is wrong rather than broken, and #20 had already written the remedy as prose ("after any move, grep the seam for an orphaned `///`"), so nobody ran it. Deleted, and the grep is now `rdns/tests/module_doc_comments.rs`: a `///` on a `mod X;` that shares no content word with the module's name or the first paragraph of its own `//!`. **Weak on purpose** — the seven that agree measure 4, 1, 4, 5, 2, 1 and 4 shared words against the orphan's 0, so a threshold of two would flag `mod eviction` (which agrees only through its own name) and `mod dispatch`. The one recursive `.rs` walk in the tree moved to `rdns_core::testutil` rather than being written a second time (§7), and both scans assert on what it hands back. It reads source as data, so it covers `rdnsd/src/control.rs` on Windows, where that file never compiles |
 | **79** | claims and code that outlived each other | **filed 2026-09-19, closed 2026-09-20**, five rows. **79a**: six dead `pub fn`, not four — a sweep of the workspace's 713 `pub fn` definitions finds four, and misses `Nat64Prefix::bits` and `TransferError::refused` because a string literal and an unrelated struct field carry those words, which is #82b's point about a name-based criterion from the other side. Two of the six were not dead code: `Rtype::is_meta` is the RFC-citing copy of a predicate `update.rs`'s RFC 2136 §3.4.1 prescan spells by hand, so it was wired in rather than deleted; `TransferError::Refused` was unreachable because the site that should build it builds `Malformed`, which left **#95**. **79b**: §17 re-measured, five fixed and two live. **79c**: closed as #89, which was it filed twice. **79d**: `set_edns` is `pub` and three answer paths use it without `mirror`, so the guarantor is `finish`'s guard, now cited and asserted. **79e**: three of six `NotFound` returns establish the wildcard invariant, not four, and the guarantor is `rdnsd`'s `resolve_in_zone` ordering — confirmed with the zone the row asked for. **79f**: 40 of `Cli`'s 46 `#[arg]` fields conflict with `--config`, so six are exempt and not three; the certificate check stays in `main` over the merged view, with the reason written in |
 | **80** | two bools where the enum was already imported | **filed 2026-09-19, closed 2026-09-20**. `validate_rrset` returned `(is_valid, is_signed)`, documented in prose and nowhere in the type, with seven bare tuple literals in the file. The refuting check — a caller needing `is_signed` without already holding the `ZoneKeys` that answers it — came back empty: both production sites are in `verify_zones`, and the first calls `keys.is_signed()` one line above. `Verdict::{Unchecked, Valid, Invalid(String)}` now, and the `Invalid` carries what the pair could not: `verify_zones` said "does not verify against the zone's own keys" for an expiry, a missing signature and an unreadable algorithm alike. `validate_response` and `is_zone_signed` deleted with it, both dead and both #79a's shape in the same module; five doc comments naming the first were reworded rather than left to rot (#89). Allocation counts 33 either side; one test caught agreeing with the code for the wrong reason, which is **#94** |
+| **83** | `rdnsd/src/main.rs` had grown two seams | **filed 2026-09-19, closed 2026-09-20**, one taken and one declined. The method was #38d's and **the criterion had to be read first**: it counts `pub(crate)` annotations, and `main.rs` is the crate root, where §17 already records that private is not private. The NOTIFY cluster is 3 annotations against 2 sealed — a revert on the letter — while what changed is **2 items unreachable from the rest of the crate and 0 newly reachable**. Taken on the second reading. `main.rs`'s code half **1597 → 1434**, 8 imports off its non-test surface, 4 of 5 tests moved with the code. The row's "one reach-back, and it is removable" was right about the one and wrong that removing it leaves none: `&Cli` went and `absolute_name` appeared, net zero. The fifth test could not move — it needs seven `main.rs` fixtures, because it is a replication test wearing a NOTIFY test's name. **The reload cluster is declined 18 against 1**: 5 items plus 13 struct fields, since `serve` builds `Reloading` and `ReloadContext` as literals — `Cli`'s shape at a third of the size, which the row had ruled out for `Cli` without noticing the two structs beside it |
 | **96** | a master that refuses the SOA probe was treated as unreachable | **filed and closed 2026-09-20**, out of #95's survey. `fetch_soa` mapped every non-NOERROR rcode to `TransferError::malformed` and `refresh_zone` propagated it with `?` before ever asking for the transfer, so a master that refuses queries and allows transfers — separate ACLs in BIND, Knot and NSD, and an ordinary hardening posture — took the zone to EXPIRE. BIND branches on exactly this rcode, with the reason in a comment: "Perhaps AXFR/IXFR is allowed even if SOA queries aren't". **#57 opened the window** by adding the probe. The variant is `Rcode(ResponseCode)` and not the `Refused` #79a deleted: the caller branches on *which* code, so it has to carry the value it caught (§2). Both rcode sites build it, and neither says "malformed" about a well-formed refusal. Two decisions settled by the survey rather than by taste: a refusal to the *transfer* still fails, and the refusal is **not** remembered per master, because BIND does not remember it either — `SOABEFOREAXFR` is cleared every `xfrdone` and NSD's per-master memory is for a bad IXFR. The measurement the row named was not needed and the row says why: it would have priced the remembering, which the field declined first |
 | **95** | nothing branched on a `TransferError` variant | **filed and closed 2026-09-20**, and what it was really about was a sentence in `CLAUDE.md` §3. Measured: 38 constructions of `TransferError::` outside the enum, **not one match**. The survey then said neither of the two answers the row offered was the field's. Nobody gives up on a malformed transfer — BIND, Knot and NSD all retry, and Knot's `event_refresh` has a single `ret != KNOT_EOK` arm where the code reaches nothing but `knot_strerror` — so §3's example was invented and is struck in place. But "they all just wait out RETRY" was wrong too: BIND sets NOIXFR and retries the *same* primary on BADIXFR, NSD counts bad transfers per master and disables IXFR at three. Both branches are "remember something about this master", never "give up", and neither is between REFUSED and malformed. The branch that *is* missing is **#96** |
 | **93** | an answer's owner names carried this resolver's 0x20 scramble | **filed and closed 2026-09-20**, and the measurement refuted the row. The scramble does not reach the client: the question is serialized first in the client's own case and `NameCompressor::lookup` folds ASCII, so an owner name equal to the QNAME goes out as `c0 0c`, two bytes of pointer at the question. A name the client did not send costs **four** bytes of upstream case and then points at the question for its tail — and those labels belong to the zone that published them, which is what the row itself said must not be rewritten. The row's own measurement had read `upstream.answers`, the cache, not the datagram. §4's survey agrees and corrects the row twice: **BIND ships no 0x20 at all**, and **Unbound**, which does, also does not normalize — `dname_lab_cmp` folds with `tolower` and the qname is first into its compression tree. The one implementation that would relay is BIND *authoritative*, which sets `DNS_COMPRESS_CASE` for every client outside `no-case-compress`. Pinned in `rdns/tests/case_on_the_wire.rs`, asserting the pointer rather than the rendered name |

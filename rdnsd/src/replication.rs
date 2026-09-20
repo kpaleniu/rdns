@@ -44,7 +44,7 @@ use rdns::NameRef;
 use rdns::Serial;
 use rdns_transport::readiness::Readiness;
 
-use crate::announce_transfer;
+use crate::notify_out::announce_transfer;
 use crate::zones::{install_zone, ZoneContext, Zones};
 
 /// One refresh task: what it replicates, and the two handles that steer it.
