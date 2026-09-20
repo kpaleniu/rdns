@@ -22,7 +22,6 @@ use tokio::sync::mpsc;
 
 use rdns::dnstap;
 use rdns::{
-    clock::current_unix_timestamp,
     ede::InfoCode,
     error::RequestError,
     ixfr::{ixfr_response, IxfrResponse},
@@ -166,6 +165,36 @@ impl tcp::Handler for Server {
     }
 }
 
+/// The request an error reply is about — everything [`Server::signed_error`]
+/// needs that is not the refusal itself.
+///
+/// Four values that travel together at all twenty call sites: `answer_update`
+/// passes the same four to eleven of them and `answer_transfer` to the other
+/// nine. A struct rather than four parameters because clippy says so at seven
+/// (`CLAUDE.md` §14) — and because one of the four is `now`, the instant that
+/// verified the request. Carrying it here is what stops a thirteenth site
+/// reading the clock a second time, which is what `TODO.md` #87 was.
+#[derive(Clone, Copy)]
+struct Refused<'a> {
+    msg: &'a DnsMessage,
+    ip: IpAddr,
+    now: u64,
+    max_len: usize,
+}
+
+impl<'a> Refused<'a> {
+    /// A transfer's, whose reply is framed and so has the whole 16-bit length
+    /// to spend rather than a datagram's ceiling.
+    fn transfer(msg: &'a DnsMessage, ip: IpAddr, now: u64) -> Self {
+        Refused {
+            msg,
+            ip,
+            now,
+            max_len: u16::MAX as usize,
+        }
+    }
+}
+
 impl Server {
     /// Answer one request, whatever it arrived on.
     ///
@@ -306,7 +335,7 @@ impl Server {
             // either transport, and the checks, the ordering and the
             // persistence are the request's, not the transport's.
             let reply = self
-                .answer_update(&msg, peer, session.as_mut(), max_len)
+                .answer_update(&msg, peer, session.as_mut(), now, max_len)
                 .await;
             if let Some(reply) = &reply {
                 wire.send(reply, &self.ctx.logger, ip).await;
@@ -501,6 +530,9 @@ impl Server {
     ) {
         let privacy = arrival.privacy();
         let ip = peer.ip();
+        // One for all nine ways out of this function, so none of them can pick
+        // a different instant than the one that verified the request.
+        let refused = Refused::transfer(msg, ip, now);
         let qname = msg
             .queries
             .first()
@@ -534,10 +566,9 @@ impl Server {
                 }
             );
             self.send_transfer_error(
-                msg,
+                refused,
                 ResponseCode::Refused,
                 Some(NOT_OVER_TLS),
-                ip,
                 session,
                 out,
             )
@@ -568,10 +599,9 @@ impl Server {
                 "{kind} of {qname} REFUSED: key {key_name} is scoped to other zones"
             );
             self.send_transfer_error(
-                msg,
+                refused,
                 ResponseCode::Refused,
                 Some(NOT_YOURS),
-                ip,
                 session,
                 out,
             )
@@ -597,10 +627,9 @@ impl Server {
                 "{kind} of {qname} REFUSED: certificate {name} is scoped to other zones"
             );
             self.send_transfer_error(
-                msg,
+                refused,
                 ResponseCode::Refused,
                 Some(NOT_YOURS),
-                ip,
                 session,
                 out,
             )
@@ -619,7 +648,7 @@ impl Server {
                  and not in --allow-transfer"
             );
             // No session on this path by construction — it is the "no key" case.
-            self.send_transfer_error(msg, ResponseCode::Refused, Some(NOT_YOURS), ip, None, out)
+            self.send_transfer_error(refused, ResponseCode::Refused, Some(NOT_YOURS), None, out)
                 .await;
             return;
         }
@@ -637,10 +666,9 @@ impl Server {
             let Some(zone) = zones.snapshot(apex.as_ref()) else {
                 tracing::info!(peer = %ip, "{kind} of {qname}: NOTAUTH (not a zone served here)");
                 self.send_transfer_error(
-                    msg,
+                    refused,
                     ResponseCode::NotAuthorized,
                     Some(NOT_OUR_ZONE),
-                    ip,
                     session,
                     out,
                 )
@@ -680,10 +708,9 @@ impl Server {
                     Err(e) => {
                         serving_error!(self.ctx.logger, ip, "{kind} of {qname}: {e}");
                         self.send_transfer_error(
-                            msg,
+                            refused,
                             ResponseCode::ServerFailure,
                             None,
-                            ip,
                             session,
                             out,
                         )
@@ -705,10 +732,9 @@ impl Server {
                     // Nothing sent yet, so an ordinary error response still works.
                     serving_error!(self.ctx.logger, ip, "{kind} of {qname}: {e}");
                     self.send_transfer_error(
-                        msg,
+                        refused,
                         ResponseCode::ServerFailure,
                         None,
-                        ip,
                         session,
                         out,
                     )
@@ -732,7 +758,7 @@ impl Server {
                         ip,
                         "{kind} of {qname}: serialization error: {e}"
                     );
-                    self.abandon_transfer(msg, ip, session, sent, out).await;
+                    self.abandon_transfer(refused, session, sent, out).await;
                     return;
                 }
             };
@@ -750,7 +776,7 @@ impl Server {
                         );
                         // Deliberately unsigned, if anything is sent at all:
                         // signing is what just failed.
-                        self.abandon_transfer(msg, ip, None, sent, out).await;
+                        self.abandon_transfer(refused, None, sent, out).await;
                         return;
                     }
                 },
@@ -759,7 +785,7 @@ impl Server {
             if !send_framed(out, &bytes).await {
                 // Either the frame is impossible or the peer hung up. The first
                 // needs the connection closed; the second closed it already.
-                self.abandon_transfer(msg, ip, None, sent, out).await;
+                self.abandon_transfer(refused, None, sent, out).await;
                 return;
             }
             sent += 1;
@@ -786,19 +812,18 @@ impl Server {
     /// what it holds is not a zone (RFC 5936 §2.2).
     async fn abandon_transfer(
         &self,
-        msg: &DnsMessage,
-        ip: IpAddr,
+        refused: Refused<'_>,
         session: Option<&mut TsigSession>,
         sent: usize,
         out: &mpsc::Sender<Reply>,
     ) {
         if sent == 0 {
-            self.send_transfer_error(msg, ResponseCode::ServerFailure, None, ip, session, out)
+            self.send_transfer_error(refused, ResponseCode::ServerFailure, None, session, out)
                 .await;
             return;
         }
         tracing::error!(
-            peer = %ip,
+            peer = %refused.ip,
             "transfer abandoned after {sent} envelope(s); closing the connection so the \
              client sees an incomplete stream rather than waiting for a closing SOA"
         );
@@ -808,14 +833,13 @@ impl Server {
     /// [`Server::signed_error`], framed and sent.
     async fn send_transfer_error(
         &self,
-        msg: &DnsMessage,
+        refused: Refused<'_>,
         rcode: ResponseCode,
         why: Option<ExtendedError>,
-        ip: IpAddr,
         session: Option<&mut TsigSession>,
         out: &mpsc::Sender<Reply>,
     ) {
-        if let Some(bytes) = self.signed_error(msg, rcode, why, ip, session, u16::MAX as usize) {
+        if let Some(bytes) = self.signed_error(refused, rcode, why, session) {
             send_framed(out, &bytes).await;
         }
     }
@@ -824,21 +848,30 @@ impl Server {
     ///
     /// RFC 8945 §5.3: an error response to a verified request is signed too.
     /// Unsigned, a client cannot tell a refusal from a tampered reply.
+    ///
+    /// `now` is the instant that verified the request, not a second read of the
+    /// clock: [`Server::finish`] already signs with it, and a reply signed off
+    /// a clock the request was not checked against is the one thing here that
+    /// can disagree with itself (`TODO.md` #87).
     fn signed_error(
         &self,
-        msg: &DnsMessage,
+        refused: Refused,
         rcode: ResponseCode,
         why: Option<ExtendedError>,
-        ip: IpAddr,
         session: Option<&mut TsigSession>,
-        max_len: usize,
     ) -> Option<Vec<u8>> {
+        let Refused {
+            msg,
+            ip,
+            now,
+            max_len,
+        } = refused;
         let Some(bytes) = error_reply(msg, rcode, why, max_len, self.ctx.udp.advertised()) else {
             serving_error!(self.ctx.logger, ip, "could not serialize an error response");
             return None;
         };
         match session {
-            Some(session) => match session.sign(bytes, current_unix_timestamp()) {
+            Some(session) => match session.sign(bytes, now) {
                 Ok(signed) => Some(signed),
                 Err(e) => {
                     // Send nothing: an unsigned error is what signing exists to
@@ -865,16 +898,25 @@ impl Server {
         msg: &DnsMessage,
         peer: SocketAddr,
         session: Option<&mut TsigSession>,
+        now: u64,
         max_len: usize,
     ) -> Option<Vec<u8>> {
         let ip = peer.ip();
+        // One for all eleven ways out of this function, for the reason
+        // `answer_transfer` builds its own.
+        let refused = Refused {
+            msg,
+            ip,
+            now,
+            max_len,
+        };
 
         // §3.1: read it, and reject the ways it can be malformed.
         let request = match update::parse(msg) {
             Ok(request) => request,
             Err(rejected) => {
                 serving_error!(self.ctx.logger, ip, "UPDATE rejected: {rejected}");
-                return self.signed_error(msg, rejected.rcode, None, ip, session, max_len);
+                return self.signed_error(refused, rejected.rcode, None, session);
             }
         };
         let zone_name = request.zone.clone();
@@ -889,14 +931,7 @@ impl Server {
                 ip,
                 "UPDATE of {zone_name} REFUSED: unsigned, and an UPDATE needs a TSIG key"
             );
-            return self.signed_error(
-                msg,
-                ResponseCode::Refused,
-                Some(NOT_YOURS),
-                ip,
-                None,
-                max_len,
-            );
+            return self.signed_error(refused, ResponseCode::Refused, Some(NOT_YOURS), None);
         };
         if !session.may_update(&zone_name.as_ref().to_presentation()) {
             serving_error!(
@@ -906,12 +941,10 @@ impl Server {
                 session.key_name()
             );
             return self.signed_error(
-                msg,
+                refused,
                 ResponseCode::Refused,
                 Some(NOT_YOURS),
-                ip,
                 Some(session),
-                max_len,
             );
         }
 
@@ -931,12 +964,10 @@ impl Server {
         let Some(previous) = previous else {
             tracing::info!(peer = %ip, "UPDATE of {zone_name}: NOTAUTH (not a zone served here)");
             return self.signed_error(
-                msg,
+                refused,
                 ResponseCode::NotAuthorized,
                 Some(NOT_OUR_ZONE),
-                ip,
                 Some(session),
-                max_len,
             );
         };
 
@@ -952,12 +983,10 @@ impl Server {
                  so its master owns it"
             );
             return self.signed_error(
-                msg,
+                refused,
                 ResponseCode::Refused,
                 Some(REPLICATED_ZONE),
-                ip,
                 Some(session),
-                max_len,
             );
         }
 
@@ -971,12 +1000,10 @@ impl Server {
                 "UPDATE of {zone_name} REFUSED: this server has no writable zone source"
             );
             return self.signed_error(
-                msg,
+                refused,
                 ResponseCode::Refused,
                 Some(NOT_WRITABLE),
-                ip,
                 Some(session),
-                max_len,
             );
         };
         let Some(path) = source.file_for(&zone_name.as_ref().to_presentation()) else {
@@ -986,12 +1013,10 @@ impl Server {
                 "UPDATE of {zone_name} REFUSED: no zone file to write it back to"
             );
             return self.signed_error(
-                msg,
+                refused,
                 ResponseCode::Refused,
                 Some(NOT_WRITABLE),
-                ip,
                 Some(session),
-                max_len,
             );
         };
 
@@ -1034,12 +1059,10 @@ impl Server {
                     "UPDATE of {zone_name}: the task failed: {e}"
                 );
                 return self.signed_error(
-                    msg,
+                    refused,
                     ResponseCode::ServerFailure,
                     None,
-                    ip,
                     Some(session),
-                    max_len,
                 );
             }
         };
@@ -1051,7 +1074,7 @@ impl Server {
             }
             Err(UpdateFailure::Prerequisite(rejected)) => {
                 tracing::info!(peer = %ip, "UPDATE of {zone_name}: {rejected}");
-                return self.signed_error(msg, rejected.rcode, None, ip, Some(session), max_len);
+                return self.signed_error(refused, rejected.rcode, None, Some(session));
             }
             // §3.4.2.1: a system failure is SERVFAIL with every applied update
             // undone. Nothing to undo here — the write is atomic and the map is
@@ -1059,12 +1082,10 @@ impl Server {
             Err(UpdateFailure::System(e)) => {
                 serving_error!(self.ctx.logger, ip, "UPDATE of {zone_name} failed: {e:#}");
                 return self.signed_error(
-                    msg,
+                    refused,
                     ResponseCode::ServerFailure,
                     None,
-                    ip,
                     Some(session),
-                    max_len,
                 );
             }
         };
@@ -1098,7 +1119,7 @@ impl Server {
         }
 
         drop(digests);
-        self.signed_error(msg, ResponseCode::Ok, None, ip, Some(session), max_len)
+        self.signed_error(refused, ResponseCode::Ok, None, Some(session))
     }
 
     /// The four things `install_zone` moves together — [`ZoneContext`].
@@ -1412,6 +1433,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::testutil::{nm, query};
     use crate::zones::zone_key;
+    use rdns::clock::current_unix_timestamp;
     use rdns::record_types;
     use rdns::zone::parse_zone_file_at;
     use rdns::UdpSizes;

@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#78** through **#84**, **#87** through **#90**, and
-**#21**, as of 2026-09-20.
+**#58**, **#68**, **#78** through **#84**, **#88** through **#90**, **#92**,
+and **#21**, as of 2026-09-20.
 
 **#85 through #90 came out of a second architecture review on 2026-09-20**, this
 one asking what the ideal shape would be and where the tree differs. **Ten
@@ -1133,9 +1133,9 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#78**-**#84**, **#87**-**#90**, plus **#21** — see
-"What is open" above, which is the same list and the only place it is written
-down.
+**#58**, **#68**, **#78**-**#84**, **#88**-**#90**, **#92**, plus **#21** —
+see "What is open" above, which is the same list and the only place it is
+written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
 numbers are stable identifiers referenced from the code, so they move rather
 than being renumbered.
@@ -5102,7 +5102,7 @@ clean.
 
 ---
 
-### 87. `rdnsd`'s UDP path reads the wall clock, not `ServeContext`'s — **filed 2026-09-20**
+### 87. `rdnsd`'s UDP path reads the wall clock, not `ServeContext`'s — **filed and closed 2026-09-20**
 
 #52 made `Clock` the seam so a rate-limit test is not decided by whether two
 connects straddled a second boundary, and recorded its sweep as "the four accept
@@ -5126,6 +5126,37 @@ nor `rdnsr`'s UDP loop, so the criterion did not reach them:
 over a real socket and asserts nothing time-dependent. So this is §17's shape
 rather than a defect: the invariant is a seam, so it is re-asserted per site, and
 one site sat outside the sweep's criterion.
+
+**Done**, and "latent" turned out to be *observable from outside the process*,
+which is what made a test possible after all. TSIG is the one thing on the
+request path that compares the server's instant against a number the client
+chose, with a 300-second fudge (RFC 8945 §5.2.3). Sign at an instant outside
+that window and the two clocks give different answers on the wire:
+
+- `the_udp_loop_signs_and_checks_against_the_context_clock` drives the real
+  `udp_loop` over a real socket with `Clock::fixed(1_700_000_000)` and a TSIG
+  signed at that instant. **Reverting the one line gives NOTAUTH**; restored, it
+  answers the question. Checked both ways rather than read (§1).
+- `a_refused_update_is_signed_at_the_instant_that_verified_it` takes the second
+  site: a valid key scoped to another zone, so the TSIG verifies and §3.3
+  refuses, and the client verifies the *refusal* at the same instant.
+  **Reverting `signed_error`'s clock read gives `BadTime`.**
+
+**The fix is a type, not two careful call sites** (§17). Threading `now` into
+`signed_error` put it at eight arguments, which clippy refuses at seven and
+§14 says to answer with a struct. `Refused { msg, ip, now, max_len }` is the
+four values every one of the twenty call sites was already passing together —
+`answer_update` builds one for its eleven, `answer_transfer` one for its nine —
+so the instant is carried rather than re-fetched, and a twenty-first site cannot
+quietly read the clock again. 1 250 tests on Windows and 1 271 on Linux, clippy
+clean on both sides.
+
+**Counted before fixing one** (§18), and the count is what #92 is: `rdnsd` has
+**twelve** production reads of `current_unix_timestamp`/`tsig::now` left, none
+of them on a request path — `main.rs` 4 (two reload `signed_at`, two in the
+NOTIFY *client*), `replication.rs` 4 (REFRESH/RETRY/EXPIRE timers),
+`zones.rs` 3 (the re-signing policy), `control.rs` 1 (`status`'s ages).
+`response_size.rs`'s read is `#[cfg(test)]` and does not count.
 
 ---
 
@@ -5261,6 +5292,40 @@ was red for one push and was found by checking a *README sentence* about
 dependency counts. Verified: `cargo deny check` reports **advisories ok, bans
 ok, licenses ok, sources ok**; 1 248 tests on Windows and 1 269 on Linux after
 the `rand` upgrade, unchanged from before it.
+
+---
+
+### 92. Twelve wall-clock reads outside any request path — **filed 2026-09-20**
+
+#87's count, kept because §18 says a sentence naming remaining work is a row or
+it is deleted. None of the twelve is a defect and none is on a path a stranger
+can reach:
+
+| where | how many | what reads it |
+|---|---|---|
+| `rdnsd/src/main.rs` | 4 | two reload `signed_at`, two in the NOTIFY *client* |
+| `rdnsd/src/replication.rs` | 4 | the REFRESH/RETRY/EXPIRE timers |
+| `rdnsd/src/zones.rs` | 3 | the re-signing policy |
+| `rdnsd/src/control.rs` | 1 | `status`'s "last heard from" ages |
+
+**No remedy is named on purpose** (§18: a row naming a wrong remedy costs more
+than one naming none). "Give them a `Clock` too" is the obvious answer and it is
+not obviously right: `ServeContext` exists because four accept loops shared one,
+and none of these four callers holds one — `Reloading`, the NOTIFY task, the
+replication timer and `Control` would each need the seam threaded through a
+constructor, which is four new parameters for a seam nothing is currently asking
+for.
+
+**The measurement that would decide it**, and it is the one #52 and #87 both
+turned on: *is any of the twelve deciding a test's outcome today?* #52's row
+existed because a rate-limit assertion was a coin toss, and #87's because a TSIG
+fudge made a wrong clock visible on the wire. Neither is true here on the face of
+it — the re-signing tests pass an explicit instant (`resign_interval_at`,
+`policy_for`), and the replication timers are tested through `has_expired`, which
+takes both numbers. So the row to write next is "which of these twelve has a test
+that would be simpler, or an assertion that would stop being timing-dependent",
+and if the answer is none, the finding is that the seam should stop at the
+request path and say so in `Clock`'s own doc comment.
 
 ---
 
@@ -5421,6 +5486,7 @@ the week; the record is under "How the queue kept going stale" in
 | **85** | the library installed the process's log subscriber | **filed and closed 2026-09-20**, out of a second architecture review. `rdns::logging::init` chose a global subscriber on its caller's behalf, against a rule two files state — the workspace manifest's `tracing` entry ("the library only emits; the binaries choose where it goes") and `rdns-transport`'s own header. Moved verbatim to `rdns_transport::logging`, the crate whose only consumers are the two daemons, so there is still one copy and not one per binary (§7). The refuting measurement was taken first and **narrowed the claim**: the seven packages this drops from `rdns` (55 → **48**) are off a fresh build's critical path — all seven finish by 7.87 s of a 21.08 s build whose path is `rdns` then `rdnsd` — and `Cargo.lock` keeps every one of them, because both daemons need the subscriber wherever it lives. So it buys `cargo build -p rdns` and the boundary, not workspace build time |
 | **86** | two error enums sat in the crate that could not name them | **filed and closed 2026-09-20**, out of the same review. `DnssecError` and `BrokenCatalog` were defined in `rdns-core` and named by no module in it — 100 of that file's 264 lines, in the crate `rdnsctl` links alone as "the DNS wire format". Moved to `rdns::error` beside `TransferError`, which is there for the reason written at the top of that file; nothing downstream changed, because `pub use rdns_core::error::*` already spelled both paths the same. The refuting measurement removed a third of the finding before any edit: `ZoneError` looks identical and **must stay**, since `rdns-present` returns it and does not depend on `rdns`, so the move would need a cycle. That reason was written down nowhere and is now on the enum |
 | **91** | both CI jobs no local `cargo` run covers were red | **filed and closed 2026-09-20**, found while checking a README sentence about dependency counts rather than by a review. `image` failed with `failed to read /src/rdns-present/Cargo.toml` — character for character #31's failure, with the #66c/#67 crates in place of the #31 ones, and `.dockerignore` held the same list a second time and was stale the same way. `deny` failed all three of advisories, bans and licences, none of which had ever been in the graph before `rustls` was: RUSTSEC-2026-0285 (fixed by its own remedy, `cargo update -p rustls`), `subtle`'s BSD-3-Clause (added, per that file's policy of listing what the graph reaches), and four duplicate versions — half of them **ours**, `rand` 0.8 against `quinn-proto`'s 0.10, four lines to collapse and `Cargo.lock` 218 → **214** with `getrandom` going too. Left: the RustCrypto 0.11 migration that would collapse `cpufeatures`, which is a `digest` version bump and not four lines |
+| **87** | the UDP request path read the wall clock, not `ServeContext`'s | **filed and closed 2026-09-20**. #52 made `Clock` the seam and recorded its sweep as "the four accept loops read `ctx.clock.now()`"; two request-path sites are neither an accept loop nor `rdnsr`'s UDP loop, so the criterion did not reach them. Filed as latent — `Clock::System` *is* `current_unix_timestamp` — and that was right about production and wrong about testability: TSIG compares the server's instant against one the client chose, with RFC 8945 §5.2.3's 300-second fudge, so a clock the loop does not read is **visible on the wire**. Two tests, each checked by reverting the line it is about: the UDP loop answers NOTAUTH, and a refused UPDATE's TSIG reads `BadTime`. The fix is a type rather than two careful call sites (§17): threading `now` into `signed_error` reached eight arguments, which clippy refuses at seven, and `Refused { msg, ip, now, max_len }` is the four values all twenty sites already passed together. Left **#92**, the twelve reads outside any request path, with no remedy named because the obvious one is not obviously right |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

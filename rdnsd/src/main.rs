@@ -1307,8 +1307,10 @@ async fn udp_loop(
 
         // One clock read per datagram, shared by the limiter, the logger, the
         // TSIG check and the response budget — each used to fetch its own, at
-        // 24-26 ns a call (`TODO.md` #28a).
-        let now = tsig::now();
+        // 24-26 ns a call (`TODO.md` #28a). Through `ctx`, because a
+        // `Clock::fixed` that reaches only the accept loops reaches nothing a
+        // UDP query touches (`TODO.md` #87).
+        let now = server.ctx.clock.now();
 
         // Both are decisions to do nothing, so they run on `&buf[..size]` with
         // nothing copied and nothing spawned.
@@ -2915,6 +2917,10 @@ mod tests {
     /// Every limit off and throwaway counters: a test about answering must not
     /// also be a test of the rate limiter.
     fn test_context() -> ServeContext {
+        context_at(Clock::system())
+    }
+
+    fn context_at(clock: Clock) -> ServeContext {
         ServeContext {
             limiter: Arc::new(RateLimiter::with_defaults()),
             responses: Arc::new(ResponseLimiter::disabled()),
@@ -2922,7 +2928,7 @@ mod tests {
             logger: Arc::new(QueryLogger::new()),
             metrics: Arc::new(DnsMetrics::new()),
             udp: UdpSizes::default(),
-            clock: Clock::system(),
+            clock,
         }
     }
 
@@ -2931,11 +2937,15 @@ mod tests {
     }
 
     fn server_with_keys(zone: Zone, keys: Vec<TsigKey>) -> Arc<Server> {
+        server_with_keys_at(zone, keys, Clock::system())
+    }
+
+    fn server_with_keys_at(zone: Zone, keys: Vec<TsigKey>, clock: Clock) -> Arc<Server> {
         let mut zones = HashMap::new();
         zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
         Arc::new(Server {
             zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-            ctx: test_context(),
+            ctx: context_at(clock),
             journal: None,
             transfer_acl: Arc::new(TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl")),
             transfer_clients: Arc::new(TransferCertificates::default()),
@@ -3306,6 +3316,59 @@ mod tests {
 
             assert!(reply.response && reply.authoritive);
             assert_eq!(reply.rcode, ResponseCode::Ok);
+            assert_eq!(reply.answers.len(), 1, "the A record for www");
+
+            shutdown.begin();
+            worker
+                .await
+                .expect("the worker joins")
+                .expect("no io error");
+        }
+
+        /// The UDP loop's instant is `ServeContext`'s, not the wall clock's.
+        ///
+        /// What makes this a test rather than an assertion about a call: TSIG
+        /// is the one thing on the request path that *compares* the server's
+        /// instant with a number the client chose, and RFC 8945 §5.2.3 gives
+        /// it a 300-second fudge. So a clock the loop does not read is visible
+        /// from outside the process — sign at an instant far outside that
+        /// window, and a server reading the wall clock answers BADTIME while
+        /// one reading `ctx.clock` answers the question.
+        ///
+        /// Fails against the old `let now = tsig::now()` with
+        /// `rcode: NotAuthorized` (`TODO.md` #87). Checked by reverting that
+        /// one line.
+        #[tokio::test]
+        async fn the_udp_loop_signs_and_checks_against_the_context_clock() {
+            // 2023-11-14, far past any fudge from the real now, and fixed so
+            // this test reads the same in 2030.
+            const WHEN: u64 = 1_700_000_000;
+            let key = TsigKey::new("udp.key.", TsigAlgorithm::HmacSha256, vec![0x5c; 32]);
+            let server =
+                server_with_keys_at(one_record_zone(), vec![key.clone()], Clock::fixed(WHEN));
+
+            let shutdown = Shutdown::new();
+            let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+            let server_addr = socket.local_addr().expect("addr");
+            let worker = tokio::spawn(udp_loop(
+                socket,
+                server,
+                shutdown.stop_handle(),
+                shutdown.busy(),
+            ));
+
+            let signed = rdns::tsig::sign_request(a_query(), &key, WHEN).expect("sign");
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+            client.send_to(&signed, server_addr).await.expect("send");
+            let mut buf = vec![0u8; 4096];
+            let (n, _) = client.recv_from(&mut buf).await.expect("an answer");
+            let reply = DnsMessage::try_from_bytes(&buf[..n]).expect("a parseable answer");
+
+            assert_eq!(
+                reply.rcode,
+                ResponseCode::Ok,
+                "NOTAUTH: the loop checked the TSIG against the wall clock, not `ctx.clock`"
+            );
             assert_eq!(reply.answers.len(), 1, "the A record for www");
 
             shutdown.begin();
@@ -4361,6 +4424,77 @@ mod tests {
             3,
             "a query, an UPDATE and a transfer attempt"
         );
+    }
+
+    /// A refused UPDATE is signed at the instant that verified it.
+    ///
+    /// `signed_error` used to read the wall clock itself, 464 lines below the
+    /// `finish` that signs with the `now` the request was checked against
+    /// (`TODO.md` #87). Latent, because `Clock::System` *is* that read — which
+    /// is why it takes a fixed clock to see, and why the fix is a type
+    /// (`Refused`) rather than a thirteenth careful call site.
+    ///
+    /// Fails against the old `session.sign(bytes, current_unix_timestamp())`
+    /// with `TsigError::BadTime`. Checked by reverting that one call.
+    #[tokio::test]
+    async fn a_refused_update_is_signed_at_the_instant_that_verified_it() {
+        // Fixed, and far outside RFC 8945 §5.2.3's 300-second fudge from any
+        // real now, so the wrong clock cannot pass by luck.
+        const WHEN: u64 = 1_700_000_000;
+        // Valid, and scoped to a zone this server does not hold: the TSIG
+        // verifies, so there is a session to sign the refusal with, and §3.3
+        // refuses it.
+        let key = update_key(rdns::tsig::UpdatePolicy::Zones(vec![
+            "elsewhere.test.".to_string()
+        ]));
+        let zone = rdns::zone::parse_zone_file(
+            "$ORIGIN example.com.\n\
+             $TTL 3600\n\
+             @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+             @   IN NS  ns1.example.com.\n\
+             ns1 IN A   192.0.2.1\n",
+            "example.com.",
+        )
+        .expect("the zone parses");
+        let server = server_with_keys_at(zone, vec![key.clone()], Clock::fixed(WHEN));
+
+        let bytes = update_message(
+            "example.com.",
+            vec![a_record("new.example.com.", "192.0.2.50")],
+        )
+        .to_bytes_within(4096)
+        .expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, WHEN).expect("sign");
+        let request_mac = rdns::tsig::request_mac(&signed).expect("our own MAC");
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+        let peer = client.local_addr().expect("addr");
+        let mut scratch = Scratch::default();
+        server
+            .answer(
+                &signed,
+                peer,
+                WHEN,
+                &Wire::Datagram(&socket, peer),
+                &mut scratch,
+            )
+            .await;
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = client.recv_from(&mut buf).await.expect("a refusal");
+        let reply = &buf[..n];
+        assert_eq!(
+            DnsMessage::try_from_bytes(reply).expect("it parses").rcode,
+            ResponseCode::Refused,
+            "§3.3: the key grants nothing here"
+        );
+        // The whole point: a client whose clock agrees with the server's must
+        // be able to verify the refusal. RFC 8945 §5.3 — unsigned, or signed
+        // off a different instant, a refusal is indistinguishable from a
+        // tampered reply.
+        rdns::tsig::check_response(reply, &key, &request_mac, true, WHEN)
+            .expect("the refusal verifies at the instant it was signed at");
     }
 
     /// The refusal says why, to a client that sent an OPT to hear it in
