@@ -54,6 +54,36 @@ pub enum TsigAlgorithm {
 }
 
 impl TsigAlgorithm {
+    /// Every algorithm, for a caller that has to enumerate them.
+    pub const ALL: [TsigAlgorithm; 4] = [
+        TsigAlgorithm::HmacSha1,
+        TsigAlgorithm::HmacSha256,
+        TsigAlgorithm::HmacSha384,
+        TsigAlgorithm::HmacSha512,
+    ];
+
+    /// What an operator gets by not saying: the config files' `algorithm` key
+    /// and [`TsigKey::parse`]'s two-field form both take it from here, so the
+    /// flag and the file cannot come to mean different algorithms.
+    pub const DEFAULT: TsigAlgorithm = TsigAlgorithm::HmacSha256;
+
+    /// What [`TsigAlgorithm::from_name`] accepts, for the message an operator
+    /// reads when it did not.
+    ///
+    /// Here because both daemons' config parsers had written this list out and
+    /// nothing compared either copy with `from_name`, so a fifth algorithm
+    /// would have been rejected by a message listing four — and the flag
+    /// parser, which had no list at all, said only "unknown"
+    /// (`TODO.md` #81a). `accepted_names_are_the_ones_parsed` is the
+    /// comparison.
+    pub const ACCEPTED_NAMES: &'static str = "hmac-sha1, hmac-sha256, hmac-sha384, hmac-sha512";
+
+    /// The name a config file or a flag spells, without the wire's trailing
+    /// dot.
+    pub fn config_name(&self) -> &'static str {
+        self.wire_name().trim_end_matches('.')
+    }
+
     /// The name that goes on the wire, as an absolute domain name.
     pub fn wire_name(&self) -> &'static str {
         match self {
@@ -219,13 +249,17 @@ impl TsigKey {
     pub fn parse(spec: &str) -> ConfigResult<Self> {
         let parts: Vec<&str> = spec.split(':').collect();
         let named_algorithm = |alg: &str| {
-            TsigAlgorithm::from_name(alg)
-                .ok_or_else(|| ConfigError::new(format!("unknown TSIG algorithm {alg:?}")))
+            TsigAlgorithm::from_name(alg).ok_or_else(|| {
+                ConfigError::new(format!(
+                    "unknown TSIG algorithm {alg:?}: not one of {}",
+                    TsigAlgorithm::ACCEPTED_NAMES
+                ))
+            })
         };
         // `None` for "no field at all" rather than `""`: an empty field reads as
         // a narrowing, and an empty list means the opposite.
         let (algorithm, name, secret, zones, updates) = match parts.as_slice() {
-            [name, secret] => (TsigAlgorithm::HmacSha256, *name, *secret, None, None),
+            [name, secret] => (TsigAlgorithm::DEFAULT, *name, *secret, None, None),
             [alg, name, secret] => (named_algorithm(alg)?, *name, *secret, None, None),
             [alg, name, secret, zones] => {
                 (named_algorithm(alg)?, *name, *secret, Some(*zones), None)
@@ -1096,6 +1130,36 @@ mod tests {
         rdns_core::Name::from_presentation(text).expect("a name")
     }
     use rdns_core::{DnsMessage, DnsMessageBuilder, Qtype, Rtype};
+
+    /// The list an operator is shown is the list the parser accepts.
+    ///
+    /// Both daemons printed their own copy and nothing compared either with
+    /// `from_name` (`TODO.md` #81a), so a fifth algorithm would have been
+    /// refused by a message naming four. Checked both ways, because one
+    /// direction alone allows a name in the message that nothing parses.
+    #[test]
+    fn accepted_names_are_the_ones_parsed() {
+        let listed: Vec<&str> = TsigAlgorithm::ACCEPTED_NAMES.split(", ").collect();
+        let parsed: Vec<TsigAlgorithm> = listed
+            .iter()
+            .map(|name| {
+                TsigAlgorithm::from_name(name)
+                    .unwrap_or_else(|| panic!("{name:?} is listed but does not parse"))
+            })
+            .collect();
+        assert_eq!(
+            parsed,
+            TsigAlgorithm::ALL,
+            "the message and the algorithms disagree"
+        );
+        for alg in TsigAlgorithm::ALL {
+            let name = alg.config_name();
+            assert!(
+                listed.contains(&name),
+                "{alg:?} parses but {name:?} is not in the message"
+            );
+        }
+    }
 
     fn test_key() -> TsigKey {
         // 32 bytes, the natural length for HMAC-SHA256.

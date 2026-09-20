@@ -4902,19 +4902,38 @@ remedy is naming the fields rather than collapsing them.
 
 ### 81. What #63h's macro did not reach, and one more copy — **filed 2026-09-19**
 
-- **81a. The `[keys]` TSIG table is declared twice.** #63h put the 22 shared
-  `[server]` keys in `rdns::server_table!` and `[keys]` was not in its scope:
-  two `Key` structs, two default-algorithm functions with different names and
-  the same value, two validators that differ only in a brace, and **two
-  hardcoded copies of the algorithm list in the error text** — which is the one
-  that can go stale in silence, since nothing compares either to
-  `TsigAlgorithm::from_name`.
+- **81a. The `[keys]` TSIG table is declared twice — measured and mostly
+  declined, 2026-09-20.** #63h put the 22 shared `[server]` keys in
+  `rdns::server_table!` and `[keys]` was not in its scope: two `Key` structs,
+  two default-algorithm functions with different names and the same value, two
+  validators that differ only in a brace, and **two hardcoded copies of the
+  algorithm list in the error text** — the one that can go stale in silence,
+  since nothing compared either to `TsigAlgorithm::from_name`.
 
-  **Take #63h's own measurement first**, which is the one that could refute
-  this: do the two tables co-move? `git log` over `rdnsd/src/config.rs`
-  intersected with commits touching `rdnsr/src/config.rs`, filtered to diffs
-  that touch a `Key` field or the list. #63h got 12 of 23 for `[server]`. If
-  `[keys]` does not co-move, take the `NAMES` const alone and decline the rest.
+  **#63h's measurement, taken.** Of the 27 commits that have touched
+  `rdnsd/src/config.rs`, **8 touch its TSIG lines, and 1 of those 8 also
+  touches `rdnsr`'s** — `64b34d2`, which is the commit that *created*
+  `rdnsr`'s copy rather than an edit to two. Against `[server]`'s 12 of 23,
+  that is the refutation the row asked for: **they do not co-move**, so the
+  shared struct is declined.
+
+  **And a second one the row did not engage** (§19: answer the reason the code
+  states). The two tables are not the same table. `rdnsd`'s `Key` has `zones`
+  and `update-zones`; `rdnsr`'s carries a header saying why a resolver has
+  neither — "a resolver *fetches*, so it authenticates the master and
+  authorizes nothing". Three fields of five are shared, not five.
+
+  **What was taken**, which is the list and the default under it:
+  `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES` and `::DEFAULT` in `rdns-tsig`, with
+  `::config_name()` for the spelling without the wire's dot. Both config
+  parsers print the shared list, and so does `TsigKey::parse`, which **had no
+  list at all** and said only `unknown TSIG algorithm "md5"` — so the flag path
+  came out better than it went in. `accepted_names_are_the_ones_parsed` checks
+  both directions: every listed name parses, and every variant is listed. The
+  two `default_*_algorithm` functions stay, three lines each, but they now read
+  the value from `TsigAlgorithm::DEFAULT` rather than holding a third and
+  fourth copy of `hmac-sha256` — the flag's default and the file's default are
+  one decision.
 
 - **81b. FNV-1a over ASCII-folded bytes, twice.** `compression::folded_hash` and
   the loop inside `zone_signer::expiry_for`, same offset, same prime, same fold,

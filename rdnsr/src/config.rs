@@ -65,7 +65,7 @@ struct Key {
 }
 
 fn default_tsig_algorithm() -> String {
-    "hmac-sha256".to_string()
+    rdns::tsig::TsigAlgorithm::DEFAULT.config_name().to_string()
 }
 
 // `[server]`: the 22 keys both daemons have, from `rdns::server_table!`, then
@@ -288,9 +288,9 @@ impl Config {
             }
             if rdns::tsig::TsigAlgorithm::from_name(&key.algorithm).is_none() {
                 bail!(
-                    "TSIG key {name:?} names algorithm {:?}, which is not one of \
-                     hmac-sha1, hmac-sha256, hmac-sha384, hmac-sha512",
-                    key.algorithm
+                    "TSIG key {name:?} names algorithm {:?}, which is not one of {}",
+                    key.algorithm,
+                    rdns::tsig::TsigAlgorithm::ACCEPTED_NAMES
                 );
             }
         }
