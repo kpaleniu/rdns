@@ -84,6 +84,15 @@ skip = [
     # written to stop.
     { crate = "getrandom", reason = "ring 0.17 pins 0.2, rand 0.10 needs 0.4" },
     { crate = "cpufeatures", reason = "sha1/sha2 0.10 are on 0.2, chacha20 on 0.3" },
+
+    # `rustc-hash` is neither of the two cases above: `dhat` 0.3.3 pins 1, and
+    # `quinn`/`quinn-proto` are on 2. A default `rdnsd` build has one copy —
+    # `cargo tree -p rdnsd -i rustc-hash` shows 2.1.3 alone — because `dhat` is
+    # behind the off-by-default `dhat-heap` feature and is otherwise a dev
+    # dependency. It duplicates only in a profiling or test build, which is why
+    # it took `--all-features` to see it at all. 0.3.3 is the latest `dhat`, so
+    # it collapses when `dhat` moves, which is not ours to do.
+    { crate = "rustc-hash", reason = "dhat 0.3.3 pins 1, quinn is on 2; dhat-heap and tests only" },
 ]
 
 wildcards = "deny"

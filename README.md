@@ -454,4 +454,6 @@ Dependencies: `Cargo.lock` holds 214 packages, nine of them this workspace, so
 205 third-party. Every licence in the graph is permissive and none is copyleft
 — Apache-2.0, MIT, ISC, BSD-3-Clause, Unicode-3.0, Zlib, from `cargo deny
 list`. `deny.toml` holds the allow-list, the duplicate-version exceptions, and
-the reason for each; `cargo deny check` reports all four sections ok.
+the reason for each; `cargo deny --all-features check` reports all four
+sections ok — with `--all-features`, because that is what the CI job passes and
+a plain run checks a narrower graph (#97).

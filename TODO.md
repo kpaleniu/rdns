@@ -37,7 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, and **#21**, as of 2026-09-20.
+**#58**, **#68**, and **#21**, as of 2026-09-21.
+**#97 closed** the day it was filed: `licences and advisories` had been red
+since 2026-09-12 and the reason it was not noticed is that `cargo deny check`
+by hand checks a narrower graph than the job does.
 **#93 closed** on a measurement that refuted it. **#95 and #96 closed
 together**: #95's survey said §3's example of a branch was invented, and found
 the branch that was real, which is #96 — a master that refuses the SOA probe was
@@ -1095,7 +1098,7 @@ cargo build --workspace --all-targets
 cargo test --workspace                          # 905 Windows, 921 Linux
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-cargo deny check                                # needs cargo-deny 0.17+
+cargo deny --all-features check                 # needs cargo-deny 0.17+
 ```
 
 ~~`cargo test --workspace # 603 + 6 + 85 + 2`~~ — that partition was from before
@@ -5843,9 +5846,15 @@ rule points at and the recipe cannot reach — `image` needs a container runtime
 did not. Every other job is `cargo` something a developer already runs. The
 first was red for four pushes in September and nobody opened it; this time it
 was red for one push and was found by checking a *README sentence* about
-dependency counts. Verified: `cargo deny check` reports **advisories ok, bans
-ok, licenses ok, sources ok**; 1 248 tests on Windows and 1 269 on Linux after
-the `rand` upgrade, unchanged from before it.
+dependency counts. ~~Verified: `cargo deny check` reports **advisories ok, bans
+ok, licenses ok, sources ok**~~ — **that run could not see the job's graph, and
+`deny` was red again on the very next push** (#97, 2026-09-21). The action runs
+`--all-features` and the command above does not, so the duplicate this row had
+just finished counting was already in the lockfile and invisible here. The
+reasoning stays because it is the mistake: this row measured duplicates
+carefully and then verified the fix with a weaker invocation than the one that
+had reported them. 1 248 tests on Windows and 1 269 on Linux after the `rand`
+upgrade, unchanged from before it.
 
 ---
 
@@ -6224,6 +6233,48 @@ on both, `cargo doc` clean.
 
 ---
 
+### 97. `cargo deny check` by hand checks less than the job that runs it — **filed and closed 2026-09-21**
+
+`licences and advisories` had been red on all three pushes since 2026-09-12, and
+only on `bans`: two `rustc-hash`, 1.1.0 under `dhat` and 2.1.3 under
+`quinn`/`quinn-proto`. It arrived with `8f1be6e` (#42b, DNS over QUIC), the
+first push after the last green run.
+
+**The finding is not the duplicate.** #91 closed five days earlier on
+"`cargo deny check` reports advisories ok, bans ok, licenses ok, sources ok",
+run here, and the job was red on the next push with the duplicate already in
+the lockfile. `cargo-deny-action` passes `--all-features`; the command by hand
+does not, and `dhat` is behind `rdnsd`'s off-by-default `dhat-heap`. So the
+graph the operator checks has one `rustc-hash` in it and the graph CI checks has
+two, and a green local run stood in for evidence — §1 from the other direction,
+the same shape as a test count that is green on one platform. #91's claim is
+struck in place rather than replaced (§11): what is worth keeping is that the
+row counted duplicates carefully and then verified the fix with a weaker
+invocation than the one that had reported them.
+
+Three changes, and only the first is about the duplicate:
+
+- **`deny.toml`** gets a `skip` in the shape the other two use, naming what
+  collapses it. It is neither of their cases: a default `rdnsd` build has one
+  copy — `cargo tree -p rdnsd -i rustc-hash` is 2.1.3 alone — so it duplicates
+  only in a profiling or test build. `dhat` 0.3.3 is the latest release, so the
+  pin on `rustc-hash` 1 is not ours to move.
+- **`ci.yml`** spells `--all-features` out although it is the action's default.
+  A default that decides what a job checks is load-bearing, and this one was
+  invisible in both directions: nothing in the workflow said the graph was
+  wider, and nothing in the recipe said it was narrower.
+- **The recipe** under "The checks CI runs" is now
+  `cargo deny --all-features check`. Plain `cargo deny check` warns
+  "unnecessary skip configuration" for the new entry, which is the two
+  invocations still disagreeing — in the direction that cannot go wrong quietly.
+
+Verified: `cargo deny --all-features check` reports **advisories ok, bans ok,
+licenses ok, sources ok** on cargo-deny 0.20.2, the version the action pins, and
+the CI failure reproduces command for command against the unfixed `deny.toml`
+(§1). No code changed, so no test count moved.
+
+---
+
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -6393,6 +6444,7 @@ the week; the record is under "How the queue kept going stale" in
 | **95** | nothing branched on a `TransferError` variant | **filed and closed 2026-09-20**, and what it was really about was a sentence in `CLAUDE.md` §3. Measured: 38 constructions of `TransferError::` outside the enum, **not one match**. The survey then said neither of the two answers the row offered was the field's. Nobody gives up on a malformed transfer — BIND, Knot and NSD all retry, and Knot's `event_refresh` has a single `ret != KNOT_EOK` arm where the code reaches nothing but `knot_strerror` — so §3's example was invented and is struck in place. But "they all just wait out RETRY" was wrong too: BIND sets NOIXFR and retries the *same* primary on BADIXFR, NSD counts bad transfers per master and disables IXFR at three. Both branches are "remember something about this master", never "give up", and neither is between REFUSED and malformed. The branch that *is* missing is **#96** |
 | **93** | an answer's owner names carried this resolver's 0x20 scramble | **filed and closed 2026-09-20**, and the measurement refuted the row. The scramble does not reach the client: the question is serialized first in the client's own case and `NameCompressor::lookup` folds ASCII, so an owner name equal to the QNAME goes out as `c0 0c`, two bytes of pointer at the question. A name the client did not send costs **four** bytes of upstream case and then points at the question for its tail — and those labels belong to the zone that published them, which is what the row itself said must not be rewritten. The row's own measurement had read `upstream.answers`, the cache, not the datagram. §4's survey agrees and corrects the row twice: **BIND ships no 0x20 at all**, and **Unbound**, which does, also does not normalize — `dname_lab_cmp` folds with `tolower` and the qname is first into its compression tree. The one implementation that would relay is BIND *authoritative*, which sets `DNS_COMPRESS_CASE` for every client outside `no-case-compress`. Pinned in `rdns/tests/case_on_the_wire.rs`, asserting the pointer rather than the rendered name |
 | **94** | nothing enforced a DNSKEY's protocol field | **filed and closed 2026-09-20**, out of #80's tests. RFC 4034 §2.1.2 makes a DNSKEY with protocol ≠ 3 "invalid during signature verification"; `Dnskey::from_record` copied the octet and only `key_tag` read it afterwards, so `rdnsr` called Secure what a conforming validator calls Bogus. Both shapes built (§19) and **the measurement declined the one the row leaned towards**: rejecting in `from_record` fixes nothing, because `verify_rrset` takes `&[Dnskey]` and every field of `Dnskey` is `pub` — shape A passed the whole suite and left the new test failing, which is §17's "a `pub` field beside a checking constructor" arriving as a measurement. What landed is the predicate: `is_zone_key` wants the flag **and** protocol 3, so its three callers — the candidate-key filter, DS matching, RFC 5011 anchor candidacy — inherit it. §4's survey agrees and settled the one open choice: BIND's `dns_dnssec_iszonekey()` folds the two tests the same way, Unbound checks it in `dnskey_verify_rrset_sig` and Knot in `dnskey_rdata_to_crypto_key`; BIND alone also accepts RFC 2535's protocol 255, which is not copied. The test passed against the unfixed tree on its first draft, for a reason §1 predicts — the key tag is inside the RRSIG RDATA `signed_data` hashes, so repointing the tag after signing breaks the crypto instead of testing the field |
+| **97** | `cargo deny check` by hand checked less than the job that runs it | **filed and closed 2026-09-21**. `licences and advisories` had been red on all three pushes since 2026-09-12, on `bans` alone: two `rustc-hash`, `dhat`'s 1.1.0 against `quinn`'s 2.1.3, in with `8f1be6e` (#42b). **The duplicate is the smaller half.** #91 closed five days earlier on a local `cargo deny check`, and the job was red on the next push with the duplicate already in the lockfile — because the action passes `--all-features` and the command by hand does not, so `dhat` (behind `rdnsd`'s off-by-default `dhat-heap`) is in the job's graph and not in the operator's. §1 from the other direction, and #91's verification is struck in place. Fixed in three places: a `skip` naming what collapses it (a default `rdnsd` has one copy, `dhat` 0.3.3 is the latest, so the pin is not ours), `--all-features` spelled out in `ci.yml` although it is the default, and the recipe changed to match. Plain `cargo deny check` now warns "unnecessary skip configuration", which is the two invocations disagreeing in the direction that cannot go wrong quietly |
 | **81** | what #63h's macro did not reach, and one more copy | **filed 2026-09-19, closed 2026-09-20**, two rows. **81a** measured and mostly declined: of the 27 commits touching `rdnsd/src/config.rs`, 8 touch its TSIG lines and 1 of those also touches `rdnsr`'s — and that one *created* the copy — so the two tables do not co-move and the shared struct is declined; three fields of five are shared, not five, because a resolver authorizes nothing. What was taken is the list and the default under it: `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES`, `::DEFAULT`, with `TsigKey::parse` coming out better than it went in. **81b** merged the two FNV-1a loops into `rdns_core::folded_hash`, and the check was the row's own instruction taken through the observable rather than by comparing the copies: six `expiry_for` offsets measured before the merge, unchanged after it, so no signature's expiry moved |
 | **82** | two modules in the wrong place, and a `pub` with no ratchet | **filed 2026-09-19, closed 2026-09-20**, two rows. **82b** took the ratchet: 43 sites, 38 of them `#[cfg(test)]` fixtures that always meant `pub(crate)`, and `#![warn(unreachable_pub)]` is in all nine crate roots with what it does *not* answer written on the lint. **82a** moved `readiness` to `rdns-transport`, whose metrics server serves `/readyz`; the estimate held except that a move is two `mod` lines, not one. Both halves of the *larger* version stay declined on measurements taken in place: an `rdns-ops` crate takes no package off any binary (`cargo tree -p rdnsd` is 150 either way) and the transport link is ~450 ms of a ~3.3 s rebuild, which is a ceiling and not a saving |
 | **84** | `to_prometheus_format` was 337 lines of one idiom | **filed 2026-09-19, closed 2026-09-20**, and the row's own remedy was wrong by an order of magnitude. Both shapes built (§19): helper calls 278 lines, a table 276, against 337 — because stock rustfmt breaks *every* element of an argument list when one exceeds 100 columns, and §12 forbids a `rustfmt.toml`, so the length was never available to be fixed. The table shipped on what it makes unrepresentable instead: name, help and field on one row, so a counter rendered nowhere is a missing row rather than a missing block among thirty. The `diff` the row asked for came back **byte-identical except the `dns_catalog_members` HELP line**, its 22 stray spaces, exactly as predicted. One it did not ask for: a scrape was **65 allocations and is 16** for the same 4 775 bytes, pinned. Both sub-findings fixed — `the_scrape_is_well_formed` asserts one HELP and one TYPE per family, no undeclared sample and no padded help text, and fails against the padded line put back; the two lock guards read *through* a poisoned lock now, matching the decision every writer in the file had already made, because dropping the series made every zone look withdrawn at once |

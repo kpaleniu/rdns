@@ -90,10 +90,16 @@ jobs:
       # Pinned to something new enough to parse the manifests: cargo-deny 0.16.1
       # fails on this workspace with "unknown variant `2024`", because eleven
       # crates in the graph are edition 2024. `deny.toml` says so too.
+      #
+      # `--all-features` is the action's default, spelled out because it is
+      # load-bearing: it is what puts `dhat` (behind `rdnsd`'s off-by-default
+      # `dhat-heap`) in the graph, and a plain `cargo deny check` run by hand
+      # therefore checks less than this job does. `TODO.md`'s recipe matches.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           rust-version: "1.95"
           command: check
+          arguments: --all-features
 
   # The image is built and *run*, not merely built. A Dockerfile that is only
   # parsed is a deployment artifact nobody has checked — `CLAUDE.md` §4: prove an
