@@ -439,10 +439,7 @@ fn check_envelope(msg: &DnsMessage, closed: bool) -> TransferResult<()> {
         ));
     }
     if msg.rcode != ResponseCode::Ok {
-        return Err(TransferError::malformed(format!(
-            "master answered {:?}",
-            msg.rcode
-        )));
+        return Err(TransferError::Rcode(msg.rcode));
     }
     if !msg.authoritive {
         return Err(TransferError::malformed(
@@ -603,10 +600,7 @@ pub async fn fetch_soa(
 
         let reply = session.next().await?;
         if reply.rcode != ResponseCode::Ok {
-            return Err(TransferError::malformed(format!(
-                "master answered {:?} to the SOA probe",
-                reply.rcode
-            )));
+            return Err(TransferError::Rcode(reply.rcode));
         }
         soa_serial(&reply).ok_or_else(|| TransferError::malformed("master's answer carried no SOA"))
     });
@@ -740,8 +734,25 @@ pub async fn refresh_zone(
     base: Option<&Zone>,
 ) -> TransferResult<Refresh> {
     let held = base.and_then(Zone::serial);
-    let remote = fetch_soa(master, zone, key).await?;
-    if let Some(held) = held {
+
+    // A refused probe is not an unreachable master. RFC 1034 §4.3.5's probe is
+    // an ordinary query, and `allow-query` and `allow-transfer` are separate
+    // ACLs in BIND, Knot and NSD — so "answer queries to my own clients, allow
+    // transfers to my secondaries" is a posture somebody writes on purpose, and
+    // a secondary that treats the refusal as a failure takes the zone off the
+    // air at EXPIRE over a master that would have handed it over. BIND does the
+    // same thing for the same reason and says so: "Perhaps AXFR/IXFR is allowed
+    // even if SOA queries aren't" (`lib/dns/zone.c`, `refresh_callback`).
+    //
+    // Only a refusal. A timeout or a malformed reply is a master that is not
+    // answering, and opening a second connection to ask it something larger is
+    // the wrong move (`TODO.md` #96).
+    let remote = match fetch_soa(master, zone, key).await {
+        Ok(serial) => Some(serial),
+        Err(e) if e.is_refusal() => None,
+        Err(e) => return Err(e),
+    };
+    if let (Some(remote), Some(held)) = (remote, held) {
         if !remote.is_newer_than(held) {
             return Ok(Refresh::Current {
                 serial: held,
@@ -1068,11 +1079,10 @@ mod tests {
         let mut assembler = AxfrAssembler::new(nm("example.com."));
         let mut msg = transfer_of(&source_zone())[0].clone();
         msg.rcode = ResponseCode::Refused;
-        assert!(assembler
-            .accept(&msg)
-            .unwrap_err()
-            .to_string()
-            .contains("Refused"));
+        assert!(matches!(
+            assembler.accept(&msg).unwrap_err(),
+            TransferError::Rcode(ResponseCode::Refused)
+        ));
 
         // Nor is a non-authoritative one.
         let mut not_auth = transfer_of(&source_zone())[0].clone();
@@ -1421,7 +1431,27 @@ mod tests {
     ///
     /// Built from `transfer::axfr_messages`, the same code `rdnsd` answers a
     /// transfer with, so this is the two halves against each other, not a mock.
+    /// What this master declines, so the refusal cases drive the *same* master
+    /// as every other test rather than a second one written beside it (§7).
+    ///
+    /// The two are separate because that is the configuration #96 is about:
+    /// `allow-query` and `allow-transfer` are different ACLs, so a master can
+    /// refuse either without the other.
+    #[derive(Clone, Copy, Default)]
+    struct Refuses {
+        soa_probe: bool,
+        transfer: bool,
+    }
+
     async fn spawn_master(zone: Zone, key: Option<TsigKey>) -> std::net::SocketAddr {
+        spawn_master_that(zone, key, Refuses::default()).await
+    }
+
+    async fn spawn_master_that(
+        zone: Zone,
+        key: Option<TsigKey>,
+        refuses: Refuses,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind a master");
@@ -1434,7 +1464,7 @@ mod tests {
                 };
                 let zone = zone.clone();
                 let key = key.clone();
-                tokio::spawn(answer_one_transfer(stream, zone, key));
+                tokio::spawn(answer_one_transfer(stream, zone, key, refuses));
             }
         });
 
@@ -1450,6 +1480,7 @@ mod tests {
         mut stream: S,
         zone: Zone,
         key: Option<TsigKey>,
+        refuses: Refuses,
     ) {
         {
             let mut length = [0u8; 2];
@@ -1488,7 +1519,21 @@ mod tests {
                     tsig::TsigCheck::Unsigned => return,
                 }
             }
-            let replies: Vec<DnsMessage> = if request.queries[0].qtype == Qtype::of(rt::AXFR) {
+            let is_transfer = request.queries[0].qtype == Qtype::of(rt::AXFR)
+                || request.queries[0].qtype == Qtype::of(rt::IXFR);
+            let refused = if is_transfer {
+                refuses.transfer
+            } else {
+                refuses.soa_probe
+            };
+            let replies: Vec<DnsMessage> = if refused {
+                // What a master with an ACL sends: a well-formed reply with
+                // REFUSED in it, not a hang-up.
+                let mut reply = request.clone();
+                reply.response = true;
+                reply.rcode = ResponseCode::Refused;
+                vec![reply]
+            } else if is_transfer {
                 axfr_messages(&request, &zone).expect("build the transfer")
             } else {
                 let mut reply = request.clone();
@@ -1601,7 +1646,7 @@ mod tests {
                     let Ok(stream) = acceptor.accept(stream).await else {
                         return;
                     };
-                    answer_one_transfer(stream, zone, None).await;
+                    answer_one_transfer(stream, zone, None, Refuses::default()).await;
                 });
             }
         });
@@ -1769,6 +1814,101 @@ mod tests {
                 .query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
                 .len(),
             1
+        );
+    }
+
+    /// A master may refuse the SOA probe and still hand over the zone: the probe
+    /// is an ordinary query and `allow-query` is not `allow-transfer`
+    /// (`TODO.md` #96).
+    ///
+    /// Reverted against the fix this hangs the zone out to EXPIRE: `fetch_soa`
+    /// mapped every rcode to `Malformed` and `refresh_zone` propagated it with
+    /// `?` before ever asking for the transfer.
+    #[tokio::test]
+    async fn a_refused_soa_probe_still_transfers_the_zone() {
+        let source = source_zone();
+        let master = spawn_master_that(
+            source.clone(),
+            None,
+            Refuses {
+                soa_probe: true,
+                transfer: false,
+            },
+        )
+        .await;
+
+        let refresh = refresh_zone(
+            &Master::plain(master),
+            nm("example.com.").as_ref(),
+            None,
+            None,
+        )
+        .await
+        .expect("a master that refuses the probe still serves the transfer");
+
+        let Refresh::Fetched(fetched) = refresh else {
+            panic!("expected the zone, not a serial comparison we could not make");
+        };
+        assert_eq!(fetched.zone.serial(), Some(Serial::new(42)));
+        assert_eq!(fetched.zone.records().len(), source.records().len());
+    }
+
+    /// And when the refusal is real, it is reported as a refusal rather than as
+    /// a parser failure — which is what sends an operator to the wrong file.
+    #[tokio::test]
+    async fn a_master_that_refuses_both_says_so() {
+        let master = spawn_master_that(
+            source_zone(),
+            None,
+            Refuses {
+                soa_probe: true,
+                transfer: true,
+            },
+        )
+        .await;
+
+        let Err(err) = refresh_zone(
+            &Master::plain(master),
+            nm("example.com.").as_ref(),
+            None,
+            None,
+        )
+        .await
+        else {
+            panic!("a master that refuses the transfer too is a failure");
+        };
+
+        assert!(
+            matches!(err, TransferError::Rcode(ResponseCode::Refused)),
+            "got: {err:?}"
+        );
+    }
+
+    /// The probe is still load-bearing for a master that answers it: a zone we
+    /// already hold and whose serial has not moved costs no transfer.
+    #[tokio::test]
+    async fn an_answered_probe_still_skips_the_transfer() {
+        let source = source_zone();
+        let master = spawn_master(source.clone(), None).await;
+
+        let refresh = refresh_zone(
+            &Master::plain(master),
+            nm("example.com.").as_ref(),
+            None,
+            Some(&source),
+        )
+        .await
+        .expect("refreshes");
+
+        assert!(
+            matches!(
+                refresh,
+                Refresh::Current {
+                    answering_the_transfer: false,
+                    ..
+                }
+            ),
+            "the SOA probe answered it, so no transfer was opened"
         );
     }
 

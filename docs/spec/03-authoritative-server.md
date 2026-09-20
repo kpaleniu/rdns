@@ -392,6 +392,14 @@ loop {
 }
 ```
 
+**A master that answers REFUSED to the probe is not a master that is down.**
+The probe is an ordinary query and `allow-query` is not `allow-transfer`, so the
+refusal skips the serial comparison and the transfer is asked for anyway —
+BIND's behaviour and its reason, "Perhaps AXFR/IXFR is allowed even if SOA
+queries aren't" (`TODO.md` #96). Only a refusal: a timeout or a malformed reply
+is a master that is not answering, and is a failure. A refusal to the *transfer*
+is a failure too, and reports as one.
+
 The timers are read after the refresh, because the refresh may have just
 installed the zone that defines them.
 
