@@ -37,8 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#83**, **#90**, **#92**, **#93**, **#95**, and **#21**, as
-of 2026-09-20. **#81, #82 and #84 closed that day**; #81's and #82's remaining
+**#58**, **#68**, **#83**, **#90**, **#92**, **#95**, **#96**, and **#21**, as
+of 2026-09-20. **#93 closed** on a measurement that refuted it; **#95 is
+measured** and what is left of it is a correction to `CLAUDE.md` §3, made
+below. **#96** came out of that survey and is a defect. **#81, #82 and #84 closed that day**; #81's and #82's remaining
 sub-items went with them (81b, 82a), and #84's own remainder is named in it
 rather than left as a sentence (§18).
 
@@ -5764,7 +5766,7 @@ request path and say so in `Clock`'s own doc comment.
 
 ---
 
-### 93. An answer's owner names carry this resolver's 0x20 scramble — **filed 2026-09-20**
+### 93. An answer's owner names carry this resolver's 0x20 scramble — **filed and closed 2026-09-20**
 
 Found while closing #78b and deliberately not folded into it: that was the
 header this resolver writes, and this is data it copies.
@@ -5785,15 +5787,41 @@ every name comparison in this tree folds ASCII — `Name`'s `PartialEq`, its
 on the answer path, and only a name we asked for may be rewritten: a CNAME
 target's case belongs to the zone that published it, not to us.
 
-**The measurements that would decide it**, neither taken:
+~~**The measurements that would decide it**, neither taken.~~ **Both taken
+2026-09-20, and the first one refutes the row.** The scramble does not reach the
+client, and the reason is name compression rather than anything the resolver
+does.
 
-- What do the implementations that ship 0x20 do with the owner names —
-  Unbound's `use-caps-for-id` and BIND's — normalize to the client's question,
-  or relay? §4's rule: read them and quote them, rather than reasoning about
-  what is polite.
-- What would normalizing cost on the answer path? #88 priced one cached answer
-  at 13 allocations, so a per-record rewrite is measurable against a number
-  that already exists.
+**Measured on the wire**, which is where the row's own measurement was not
+taken — it read `upstream.answers`, the parsed structure, and the sentence "a
+client asking `example.com.` gets `EXaMPLe.cOm. A 10.0.0.5`" describes the cache
+rather than the datagram. The question section is written first, in the client's
+case, and `NameCompressor::lookup` folds ASCII (RFC 4343), so an owner name
+equal to the QNAME is emitted as **`c0 0c`** — two bytes of pointer at the
+question — and the client parses back exactly what it asked. A name the client
+did not send, `WwW.eXaMpLe.CoM.`, costs **four bytes** of upstream case
+(`03 W w W`) and then points at the question for the tail. So the only case that
+survives is the labels the row itself said must not be rewritten. Pinned in
+`rdns/tests/case_on_the_wire.rs`, which asserts the pointer rather than the
+rendered name, because the property rests on two things that can move
+independently: the question being written before the answers, and the compressor
+folding.
+
+**The second measurement is therefore moot and is recorded as such**: a
+per-record rewrite would cost an allocation each to change nothing for the names
+that compress and to overwrite the ones that must not be touched.
+
+**What the field does** (§4). The row assumed BIND ships 0x20 and it does not —
+there is no such option and no implementation in `lib/dns/resolver.c`; ISC's
+answer to RFC 5452 §9.1 is source-port randomization and cookies. **Unbound**
+ships it as `use-caps-for-id` and does *not* normalize owner names either; it
+arrives at the same place by the same route, because `dname_lab_cmp`
+(`util/data/dname.c`) compares with `tolower` and `reply_info_encode` stores the
+question's qname in the compression tree first. The one implementation that
+would relay is BIND *as an authoritative server*: `named` sets
+`DNS_COMPRESS_CASE` — case-**sensitive** compression — for every client not
+matched by `no-case-compress` (`lib/ns/client.c`), which is why that knob exists
+at all.
 
 ---
 
@@ -5878,7 +5906,7 @@ clean on both sides, `cargo doc` clean.
 
 ---
 
-### 95. Nothing branches on a `TransferError` variant — **filed 2026-09-20**
+### 95. Nothing branches on a `TransferError` variant — **filed 2026-09-20, measured 2026-09-20**
 
 Found closing #79a, which deleted `TransferError::Refused` because nothing
 constructed it. The question that decided that — would a caller branch on it
@@ -5898,17 +5926,101 @@ retries on RETRY and expires on EXPIRE, which is RFC 1034 §4.3.5's own answer
 and is probably right. So the *variant* may be justified and the *reason
 written down for it* is not the one the code implements.
 
-**No remedy named** (§18), because the choice is a policy question and not a
-refactor: either a secondary should treat a malformed transfer differently
-from a timeout — in which case the branch is missing, and that is a defect
-worth a number of its own — or it should not, in which case §3's example
-needs correcting in place and the enum is carrying distinctions only a log
-line reads.
+~~**No remedy named** (§18), because the choice is a policy question and not a
+refactor~~ — **measured 2026-09-20, and neither of the two answers the row
+offered is the one the field gives.**
 
-**The measurement that would decide it**: what BIND, Knot and NSD do to a
-secondary whose master answers REFUSED versus one that sends a broken stream.
-§4's "check what the other implementations do, and quote them"; if they all
-just wait out RETRY, §3's sentence is the thing to fix.
+| | REFUSED | a malformed stream |
+|---|---|---|
+| **BIND** (`dns__zone_xfrdone`, `lib/dns/zone.c`) | `default:` → `next_primary`, advance to the next master and retry now | `default:` → **the same arm**. What BIND separates out is different: `DNS_R_BADIXFR` retries the *same* primary with `NOIXFR` set, and `DNS_R_TOOMANYRECORDS`/`DNS_R_VERIFYFAILURE` stay on this primary and wait for the ordinary REFRESH |
+| **Knot** (`event_refresh`, `refresh.c`) | `KNOT_EDENIED` | `KNOT_EMALF` — and `event_refresh` has **one** `if (ret != KNOT_EOK)` branch for every failure: RETRY, `knot_strerror(ret)` into a log line, replan. The code reaches nothing but the message |
+| **NSD** (`xfrd.c`) | `xfrd_packet_drop` → next master, no state kept | `xfrd_packet_bad` → **`zone->master->bad_xfr_count++`, and at 3 `xfrd_disable_ixfr(zone)`** for that master |
+
+**So §3's sentence is wrong and is the thing to fix.** "A secondary retries a
+timeout and gives up on a malformed transfer" — *nobody* gives up. All three
+retry, and this tree's retry-then-EXPIRE is RFC 1034 §4.3.5's own answer, as the
+row guessed.
+
+**But "they all just wait out RETRY" is wrong too**, which is the half the row's
+dichotomy could not express. Two of the three *do* branch, and both branches are
+the same shape and it is not "give up": **remember something about this master
+and try a different way with it.** BIND sets `NOIXFR` and retries the same
+primary; NSD counts bad transfers per master and disables IXFR after three.
+Neither distinction is between REFUSED and malformed — both are about whether
+*IXFR* works with this peer.
+
+**And the measurement found a live defect on the way**, filed as **#96** rather
+than folded in here. BIND's SOA-probe path branches on REFUSED specifically:
+
+> ```c
+> /*
+>  * Perhaps AXFR/IXFR is allowed even if SOA queries aren't.
+>  */
+> if (msg->rcode == dns_rcode_refused &&
+>     (zone->type == dns_zone_secondary || ...))
+> {
+>         goto tcp_transfer;
+> }
+> goto next_primary;
+> ```
+
+`fetch_soa` (`rdns/src/xfr.rs:605`) turns *any* non-NOERROR rcode into
+`TransferError::malformed` and `refresh_zone` propagates it with `?`, so a
+master that refuses the SOA probe and would have allowed the transfer takes this
+tree out of contact until EXPIRE. `rdnsd` cannot produce that configuration
+itself — it has `--allow-transfer` and no query ACL — but BIND, Knot and NSD all
+have separate query and transfer ACLs, and a master that answers queries only to
+its own clients while allowing transfers to its secondaries is ordinary
+hardening. #57 opened the window: before it the refresh went straight to the
+transfer.
+
+**It also finds the constructor #79a could not.** `TransferError::Refused` was
+deleted because nothing built it, and the site that should is this one — it
+builds `Malformed` for a rcode, which is a category error as well as a missing
+branch.
+
+---
+
+### 96. A master that refuses the SOA probe is treated as unreachable — **filed 2026-09-20**
+
+Out of #95's survey, and the one thing in it that is a defect rather than a
+difference of taste.
+
+`fetch_soa` (`rdns/src/xfr.rs:605`) maps every non-NOERROR rcode to
+`TransferError::malformed`, and `refresh_zone` propagates it with `?` before it
+ever attempts the transfer. So a master that answers REFUSED to a SOA query but
+would have served the AXFR is, to this secondary, a master that is not there:
+RETRY, RETRY, EXPIRE, and the zone goes off the air with a log line naming a
+"malformed" response that was nothing of the kind.
+
+**BIND handles exactly this**, with the reason in a comment (`lib/dns/zone.c`,
+`refresh_callback`): "Perhaps AXFR/IXFR is allowed even if SOA queries aren't" —
+a REFUSED to the probe goes to `tcp_transfer` rather than to `next_primary`, for
+a secondary, mirror or redirect zone.
+
+**Why the configuration is ordinary rather than exotic.** BIND, Knot and NSD all
+have separate query and transfer ACLs, so "answer queries to my own clients,
+allow transfers to my secondaries" is a hardening posture somebody writes on
+purpose. `rdnsd` cannot produce it — it has `--allow-transfer` and no query ACL —
+so this is an interop defect against the masters this tree is most likely to be
+a secondary for, and it is the half of #43 the harness does not cover.
+
+**#57 opened the window.** The refresh had no SOA probe at all before it, so it
+went straight to the transfer and this could not arise. The row that added the
+probe was measured on the bandwidth it saves and not on what it makes newly
+fatal.
+
+**The remedy is probably one match arm**, and the shape is #95's other half:
+`fetch_soa` should return `TransferError::Refused` — the variant #79a deleted for
+having no constructor — and `refresh_zone` should treat it as "probe unavailable,
+try the transfer" rather than as a failure. What needs deciding first, and is not
+decided here: whether a REFUSED to the *transfer* then means the same thing it
+means today, and whether the probe should be remembered as unavailable for this
+master the way NSD remembers a bad IXFR.
+
+**The measurement that would decide the shape**, not taken: whether a REFUSED
+probe followed by a refused transfer costs more than the probe saves on a feed
+that does answer it. #57's own numbers are the baseline.
 
 ---
 
@@ -6074,6 +6186,7 @@ the week; the record is under "How the queue kept going stale" in
 | **89** | a moved module left its doc comment on the next one | **filed and closed 2026-09-20**, and it is **#79c** filed a second time a day later. `e26a479` (#66c) moved `rdns/src/testutil.rs` to `rdns-core` and left `/// Scratch directories, for tests only.` attached to the `pub mod tls_identity;` below it, where it rendered on the crate index. `cargo doc` cannot catch a doc comment that is wrong rather than broken, and #20 had already written the remedy as prose ("after any move, grep the seam for an orphaned `///`"), so nobody ran it. Deleted, and the grep is now `rdns/tests/module_doc_comments.rs`: a `///` on a `mod X;` that shares no content word with the module's name or the first paragraph of its own `//!`. **Weak on purpose** — the seven that agree measure 4, 1, 4, 5, 2, 1 and 4 shared words against the orphan's 0, so a threshold of two would flag `mod eviction` (which agrees only through its own name) and `mod dispatch`. The one recursive `.rs` walk in the tree moved to `rdns_core::testutil` rather than being written a second time (§7), and both scans assert on what it hands back. It reads source as data, so it covers `rdnsd/src/control.rs` on Windows, where that file never compiles |
 | **79** | claims and code that outlived each other | **filed 2026-09-19, closed 2026-09-20**, five rows. **79a**: six dead `pub fn`, not four — a sweep of the workspace's 713 `pub fn` definitions finds four, and misses `Nat64Prefix::bits` and `TransferError::refused` because a string literal and an unrelated struct field carry those words, which is #82b's point about a name-based criterion from the other side. Two of the six were not dead code: `Rtype::is_meta` is the RFC-citing copy of a predicate `update.rs`'s RFC 2136 §3.4.1 prescan spells by hand, so it was wired in rather than deleted; `TransferError::Refused` was unreachable because the site that should build it builds `Malformed`, which left **#95**. **79b**: §17 re-measured, five fixed and two live. **79c**: closed as #89, which was it filed twice. **79d**: `set_edns` is `pub` and three answer paths use it without `mirror`, so the guarantor is `finish`'s guard, now cited and asserted. **79e**: three of six `NotFound` returns establish the wildcard invariant, not four, and the guarantor is `rdnsd`'s `resolve_in_zone` ordering — confirmed with the zone the row asked for. **79f**: 40 of `Cli`'s 46 `#[arg]` fields conflict with `--config`, so six are exempt and not three; the certificate check stays in `main` over the merged view, with the reason written in |
 | **80** | two bools where the enum was already imported | **filed 2026-09-19, closed 2026-09-20**. `validate_rrset` returned `(is_valid, is_signed)`, documented in prose and nowhere in the type, with seven bare tuple literals in the file. The refuting check — a caller needing `is_signed` without already holding the `ZoneKeys` that answers it — came back empty: both production sites are in `verify_zones`, and the first calls `keys.is_signed()` one line above. `Verdict::{Unchecked, Valid, Invalid(String)}` now, and the `Invalid` carries what the pair could not: `verify_zones` said "does not verify against the zone's own keys" for an expiry, a missing signature and an unreadable algorithm alike. `validate_response` and `is_zone_signed` deleted with it, both dead and both #79a's shape in the same module; five doc comments naming the first were reworded rather than left to rot (#89). Allocation counts 33 either side; one test caught agreeing with the code for the wrong reason, which is **#94** |
+| **93** | an answer's owner names carried this resolver's 0x20 scramble | **filed and closed 2026-09-20**, and the measurement refuted the row. The scramble does not reach the client: the question is serialized first in the client's own case and `NameCompressor::lookup` folds ASCII, so an owner name equal to the QNAME goes out as `c0 0c`, two bytes of pointer at the question. A name the client did not send costs **four** bytes of upstream case and then points at the question for its tail — and those labels belong to the zone that published them, which is what the row itself said must not be rewritten. The row's own measurement had read `upstream.answers`, the cache, not the datagram. §4's survey agrees and corrects the row twice: **BIND ships no 0x20 at all**, and **Unbound**, which does, also does not normalize — `dname_lab_cmp` folds with `tolower` and the qname is first into its compression tree. The one implementation that would relay is BIND *authoritative*, which sets `DNS_COMPRESS_CASE` for every client outside `no-case-compress`. Pinned in `rdns/tests/case_on_the_wire.rs`, asserting the pointer rather than the rendered name |
 | **94** | nothing enforced a DNSKEY's protocol field | **filed and closed 2026-09-20**, out of #80's tests. RFC 4034 §2.1.2 makes a DNSKEY with protocol ≠ 3 "invalid during signature verification"; `Dnskey::from_record` copied the octet and only `key_tag` read it afterwards, so `rdnsr` called Secure what a conforming validator calls Bogus. Both shapes built (§19) and **the measurement declined the one the row leaned towards**: rejecting in `from_record` fixes nothing, because `verify_rrset` takes `&[Dnskey]` and every field of `Dnskey` is `pub` — shape A passed the whole suite and left the new test failing, which is §17's "a `pub` field beside a checking constructor" arriving as a measurement. What landed is the predicate: `is_zone_key` wants the flag **and** protocol 3, so its three callers — the candidate-key filter, DS matching, RFC 5011 anchor candidacy — inherit it. §4's survey agrees and settled the one open choice: BIND's `dns_dnssec_iszonekey()` folds the two tests the same way, Unbound checks it in `dnskey_verify_rrset_sig` and Knot in `dnskey_rdata_to_crypto_key`; BIND alone also accepts RFC 2535's protocol 255, which is not copied. The test passed against the unfixed tree on its first draft, for a reason §1 predicts — the key tag is inside the RRSIG RDATA `signed_data` hashes, so repointing the tag after signing breaks the crypto instead of testing the field |
 | **81** | what #63h's macro did not reach, and one more copy | **filed 2026-09-19, closed 2026-09-20**, two rows. **81a** measured and mostly declined: of the 27 commits touching `rdnsd/src/config.rs`, 8 touch its TSIG lines and 1 of those also touches `rdnsr`'s — and that one *created* the copy — so the two tables do not co-move and the shared struct is declined; three fields of five are shared, not five, because a resolver authorizes nothing. What was taken is the list and the default under it: `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES`, `::DEFAULT`, with `TsigKey::parse` coming out better than it went in. **81b** merged the two FNV-1a loops into `rdns_core::folded_hash`, and the check was the row's own instruction taken through the observable rather than by comparing the copies: six `expiry_for` offsets measured before the merge, unchanged after it, so no signature's expiry moved |
 | **82** | two modules in the wrong place, and a `pub` with no ratchet | **filed 2026-09-19, closed 2026-09-20**, two rows. **82b** took the ratchet: 43 sites, 38 of them `#[cfg(test)]` fixtures that always meant `pub(crate)`, and `#![warn(unreachable_pub)]` is in all nine crate roots with what it does *not* answer written on the lint. **82a** moved `readiness` to `rdns-transport`, whose metrics server serves `/readyz`; the estimate held except that a move is two `mod` lines, not one. Both halves of the *larger* version stay declined on measurements taken in place: an `rdns-ops` crate takes no package off any binary (`cargo tree -p rdnsd` is 150 either way) and the transport link is ~450 ms of a ~3.3 s rebuild, which is a ceiling and not a saving |

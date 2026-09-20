@@ -128,10 +128,23 @@ says nothing about the subject.
   operator gets it unreadable. `Result<_, String>` does not implement `Error`, so
   `?` will not lift it into either.
 - Add a variant when a caller would branch on it, not when a message differs.
-  `TransferError::Timeout` exists because a secondary retries a timeout and gives
-  up on a malformed transfer; `ResolveError::BudgetExhausted` because the
-  NXNSAttack defence firing is an operational signal, not a lookup failure. A
-  variant nobody matches on is a `String` with extra syntax.
+  ~~`TransferError::Timeout` exists because a secondary retries a timeout and
+  gives up on a malformed transfer;~~ **that example was invented, not observed,
+  and this file got caught by its own rule** (`TODO.md` #95, 2026-09-20). No
+  secondary gives up on a malformed transfer: this one retries on RETRY and
+  expires on EXPIRE, which is RFC 1034 §4.3.5's answer, and so do BIND, Knot and
+  NSD. Measured with 38 constructions of `TransferError::` in the tree and **not
+  one match**, and against all three implementations, where Knot's
+  `event_refresh` has a single `if (ret != KNOT_EOK)` arm and the error code
+  reaches nothing but `knot_strerror` in a log line. The example that is real is
+  `ResolveError::BudgetExhausted`, because the NXNSAttack defence firing is an
+  operational signal rather than a lookup failure. A variant nobody matches on is
+  a `String` with extra syntax — which is what `TransferError`'s are, and the
+  reason to keep them is now #96, a branch that *is* missing, rather than a
+  branch that was described and never written.
+- **The way to check this rule is §19's, and it is cheap**: `grep` for a match
+  on the variant. Every distinction this file claims a caller draws is one
+  `grep` from being confirmed, and nobody had taken it for this one.
 - A `String` inside a variant is fine when the *category* is the typed part. The
   structural ways a message can be malformed are open-ended, and dropping the
   text makes a bad packet undiagnosable.
