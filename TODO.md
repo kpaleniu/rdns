@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#78** through **#84**, **#89**, **#90**, **#92**, and
+**#58**, **#68**, **#78** through **#84**, **#90**, **#92**, and
 **#21**, as of 2026-09-20.
 
 **#85 through #90 came out of a second architecture review on 2026-09-20**, this
@@ -1133,7 +1133,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#78**-**#84**, **#89**, **#90**, **#92**, plus **#21** —
+**#58**, **#68**, **#78**-**#84**, **#90**, **#92**, plus **#21** —
 see "What is open" above, which is the same list and the only place it is
 written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -5226,7 +5226,7 @@ by running both sides.
 
 ---
 
-### 89. A moved module left its doc comment on the next one — **filed 2026-09-20**
+### 89. A moved module left its doc comment on the next one — **filed and closed 2026-09-20**
 
 `rdns/src/lib.rs:62` reads `/// Scratch directories, for tests only.` above
 `pub mod tls_identity;`. `e26a479` (#66c) moved `rdns/src/testutil.rs` into
@@ -5243,6 +5243,38 @@ was advice in prose, so nobody ran it.
 exactly one mismatch** — this one. The other seven agree. That comparison is the
 check, and it is worth having as one rather than as the same sentence a third
 time.
+
+**Closed.** The comment is deleted rather than rewritten: `tls_identity` has a
+`//!` of its own and needs no second sentence on the crate index. The
+comparison is `rdns/tests/module_doc_comments.rs`, which flags a `///` on a
+`mod X;` that shares no content word with either the module's name or the
+first paragraph of that module's `//!`.
+
+**Why the check is that weak.** The two comments are written to say different
+things, so overlap is thin by design: the seven that agree measure 4, 1, 4, 5,
+2, 1 and 4 shared words, and the orphan measures 0. The two at 1 are
+`mod eviction`, which agrees only through its own name ("Shared eviction"
+against "Halving a bounded cache, in one place"), and `mod dispatch`, on
+"request" — so a threshold of two flags two correct comments. The margin is one
+word, and that is what the tree has.
+
+Proven by reverting (§1): with the comment back, the test names
+`rdns/src/lib.rs:63`, the `///` and the header it disagrees with. Seven
+declarations carry a `///` after the fix, which is the 8 above less this one.
+
+**The walk is shared, not copied** (§7). `rdns/tests/flattened_messages.rs`
+(#60) already read the workspace's source as data and owned the only recursive
+`.rs` walk; a second scan would have been a second copy, so `rust_sources`
+moved to `rdns_core::testutil` — the module that exists to have stopped exactly
+that (#76) — and both scans call it. Both assert on the count they get back,
+because a walk that returns nothing makes either test pass by reading no input.
+
+One property worth naming: this reads source as *data*, so it checks
+`rdnsd/src/control.rs`'s `mod control;` on Windows, where that file is never
+compiled. §1's platform gap does not apply to it.
+
+Verified: 1 253 tests on Windows (1 252 before) and 1 274 on Linux, clippy
+clean on both sides, `cargo doc --workspace --no-deps` clean.
 
 ---
 
@@ -5524,6 +5556,7 @@ the week; the record is under "How the queue kept going stale" in
 | **91** | both CI jobs no local `cargo` run covers were red | **filed and closed 2026-09-20**, found while checking a README sentence about dependency counts rather than by a review. `image` failed with `failed to read /src/rdns-present/Cargo.toml` — character for character #31's failure, with the #66c/#67 crates in place of the #31 ones, and `.dockerignore` held the same list a second time and was stale the same way. `deny` failed all three of advisories, bans and licences, none of which had ever been in the graph before `rustls` was: RUSTSEC-2026-0285 (fixed by its own remedy, `cargo update -p rustls`), `subtle`'s BSD-3-Clause (added, per that file's policy of listing what the graph reaches), and four duplicate versions — half of them **ours**, `rand` 0.8 against `quinn-proto`'s 0.10, four lines to collapse and `Cargo.lock` 218 → **214** with `getrandom` going too. Left: the RustCrypto 0.11 migration that would collapse `cpufeatures`, which is a `digest` version bump and not four lines |
 | **87** | the UDP request path read the wall clock, not `ServeContext`'s | **filed and closed 2026-09-20**. #52 made `Clock` the seam and recorded its sweep as "the four accept loops read `ctx.clock.now()`"; two request-path sites are neither an accept loop nor `rdnsr`'s UDP loop, so the criterion did not reach them. Filed as latent — `Clock::System` *is* `current_unix_timestamp` — and that was right about production and wrong about testability: TSIG compares the server's instant against one the client chose, with RFC 8945 §5.2.3's 300-second fudge, so a clock the loop does not read is **visible on the wire**. Two tests, each checked by reverting the line it is about: the UDP loop answers NOTAUTH, and a refused UPDATE's TSIG reads `BadTime`. The fix is a type rather than two careful call sites (§17): threading `now` into `signed_error` reached eight arguments, which clippy refuses at seven, and `Refused { msg, ip, now, max_len }` is the four values all twenty sites already passed together. Left **#92**, the twelve reads outside any request path, with no remedy named because the obvious one is not obviously right |
 | **88** | nothing measured `rdnsr`'s answer path | **filed and closed 2026-09-20**. Every allocation assertion and every benchmark lived in `rdns` and measured the *authoritative* path, so "the two daemons build a reply two ways" was an observation nobody could price — #45a had already written the sentence in prose, which §18 says is a number. One cache hit is **13 allocations**, identical on Windows and Linux and across `--test-threads` 1-3, and attributed rather than recorded (§10): 2 parse, 3 serialize — `rdns`'s own two numbers, measured again rather than quoted — and **8** for the cache lookup, the copy out of it and the message. So the two daemons differ by the copy, not by the writing: `ResponseWriter` is 0 with a held buffer and 3 without, `rdnsr`'s serialization is 3. A second test asks §10's ratio question instead of a floor and the 201st hit costs what the first did, so nothing is quadratic in how often it is asked. **The measurement was filed to decide whether to touch `handle_query`'s 432 lines, and it decided no.** Lives in `rdnsr/src/allocations.rs` rather than a `tests/` file, because a binary cannot be reached from one without a `lib.rs` and a handful of `pub`s (#82b's ratchet) — and §10's reason for the separate file is answered by the tally being per-thread, which is what `rdns`'s own file had to invent when the separate file proved neither necessary nor sufficient. That tally moved to `rdns_core::testutil::Counting<A>` rather than being written twice (§7); all 22 of `rdns`'s counts are byte-identical across the move |
+| **89** | a moved module left its doc comment on the next one | **filed and closed 2026-09-20**. `e26a479` (#66c) moved `rdns/src/testutil.rs` to `rdns-core` and left `/// Scratch directories, for tests only.` attached to the `pub mod tls_identity;` below it, where it rendered on the crate index. `cargo doc` cannot catch a doc comment that is wrong rather than broken, and #20 had already written the remedy as prose ("after any move, grep the seam for an orphaned `///`"), so nobody ran it. Deleted, and the grep is now `rdns/tests/module_doc_comments.rs`: a `///` on a `mod X;` that shares no content word with the module's name or the first paragraph of its own `//!`. **Weak on purpose** — the seven that agree measure 4, 1, 4, 5, 2, 1 and 4 shared words against the orphan's 0, so a threshold of two would flag `mod eviction` (which agrees only through its own name) and `mod dispatch`. The one recursive `.rs` walk in the tree moved to `rdns_core::testutil` rather than being written a second time (§7), and both scans assert on what it hands back. It reads source as data, so it covers `rdnsd/src/control.rs` on Windows, where that file never compiles |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

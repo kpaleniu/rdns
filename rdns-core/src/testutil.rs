@@ -64,6 +64,36 @@ impl Drop for ScratchDir {
     }
 }
 
+/// Every `.rs` file under `dir`, `target/` and `.git/` skipped.
+///
+/// Two test binaries read the workspace's own source as data —
+/// `rdns/tests/flattened_messages.rs` (`TODO.md` #60) and
+/// `rdns/tests/module_doc_comments.rs` (#89) — and a walk that silently
+/// returns nothing makes either of them pass by finding no input, so both
+/// assert on the count they get back (§7).
+pub fn rust_sources(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    collect_rust_sources(dir, &mut out);
+    out
+}
+
+fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if path.is_dir() {
+            if name != "target" && name != ".git" {
+                collect_rust_sources(&path, out);
+            }
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
 /// The `#[ignore]`d benchmarks in one test binary take turns.
 ///
 /// libtest runs what a filter selects in parallel, and a benchmark's own

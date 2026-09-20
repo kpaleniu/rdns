@@ -59,7 +59,6 @@ pub mod special_names;
 /// Plain record fixtures, for tests only.
 #[cfg(test)]
 mod test_records;
-/// Scratch directories, for tests only.
 pub mod tls_identity;
 pub mod transfer;
 pub mod update;

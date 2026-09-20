@@ -29,7 +29,7 @@
 //! fix for one would be to give it a `\n` or break the line.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Minimum run of spaces between two non-space characters to report.
 const THRESHOLD: usize = 6;
@@ -185,23 +185,6 @@ fn widest_internal_run(text: &str) -> usize {
     widest
 }
 
-fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        if path.is_dir() {
-            if name != "target" && name != ".git" {
-                rust_sources(&path, out);
-            }
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 #[test]
 fn no_operator_message_carries_a_flattened_line_continuation() {
     // CARGO_MANIFEST_DIR is this crate; the check is workspace-wide.
@@ -209,8 +192,7 @@ fn no_operator_message_carries_a_flattened_line_continuation() {
         .parent()
         .expect("the crate has a workspace root above it")
         .to_path_buf();
-    let mut sources = Vec::new();
-    rust_sources(&root, &mut sources);
+    let sources = rdns::testutil::rust_sources(&root);
     assert!(
         sources.len() > 20,
         "found {} source files under {}: the walk is wrong, not the tree",
