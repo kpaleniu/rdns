@@ -9,6 +9,8 @@
 //! (the two socket loops and the shutdown). One `Resolver` with a mode rather
 //! than two programs; the reasoning is `TODO.md`'s "Architecture: the resolver".
 
+#[cfg(test)]
+mod allocations;
 mod anchors;
 mod answer;
 mod config;
@@ -17,6 +19,14 @@ mod rpz_transfer;
 mod serve;
 #[cfg(test)]
 mod testutil;
+
+/// Allocator calls tallied per thread, for [`allocations`]. `System`, not dhat:
+/// nothing here reads peak bytes, and the profiler is the part that is global
+/// (`TODO.md` #88).
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: rdns::testutil::Counting<std::alloc::System> =
+    rdns::testutil::Counting(std::alloc::System);
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

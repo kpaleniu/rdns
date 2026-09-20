@@ -55,6 +55,21 @@ pub(crate) struct Caches {
 }
 
 impl Caches {
+    /// Put an answer in without resolving for it.
+    ///
+    /// For `crate::allocations`, which measures what *serving* a cached answer
+    /// costs and so must not pay for putting it there. The fields are private
+    /// to this module and stay that way (`TODO.md` #82b's ratchet).
+    #[cfg(test)]
+    pub(crate) fn remember(
+        &self,
+        name: rdns::NameRef<'_>,
+        qtype: Qtype,
+        records: Vec<ResourceRecord>,
+    ) {
+        self.answers.put(name, qtype, records);
+    }
+
     /// `answers` at 0 is a cache that holds nothing (`DnsCache::put` is a
     /// no-op), which is what `--no-cache` means. `denial_zones` is separately 0
     /// without validation: aggressive use rests on the proofs having been

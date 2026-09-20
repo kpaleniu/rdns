@@ -300,6 +300,7 @@ cargo fmt --all                          # before every commit
 cargo test -p rdns --lib dnssec              # one module
 cargo test -p rdnsd                          # one binary's tests
 cargo test -p rdns --test allocations -- --nocapture   # the allocation gate
+cargo test -p rdnsr allocation -- --nocapture          # the resolver's
 cargo bench -p rdns                          # criterion, optimized
 ```
 
@@ -414,7 +415,7 @@ rdnsr --port 5354 --dns64 --rpz /var/lib/rdns/blocklist.rpz --serve-stale 86400
 
 ## Status
 
-1,248 tests passing on Windows and 1,269 on Linux, measured 2026-09-20 on the
+1,252 tests passing on Windows and 1,273 on Linux, measured 2026-09-20 on the
 same tree, none failing. Plus 3 doc-tests marked `ignore`. `cargo test
 --workspace` is the source of truth, and the numbers below are what it printed
 rather than a summary kept beside it.
@@ -428,8 +429,8 @@ rather than a summary kept beside it.
 | `rdns` library | 704 / 705 |
 | `rdns` allocation gate (`tests/allocations.rs`) | 1, printing its measurements — `cargo test -p rdns --test allocations -- --nocapture` shows them, and most are asserted to an exact count |
 | `rdns` fuzz guard (`tests/no_input_panics.rs`) | 1, running mutated messages through the pre-authentication path |
-| `rdnsd` | 191 / 207 |
-| `rdnsr` | 73 |
+| `rdnsd` | 193 / 209 |
+| `rdnsr` | 75, two of them allocation counts for one cached answer |
 | `rdnsc` | 5 / 6 |
 
 The gap between the columns is the `#[cfg(unix)]` tests, which a Windows build

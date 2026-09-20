@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#78** through **#84**, **#88** through **#90**, **#92**,
-and **#21**, as of 2026-09-20.
+**#58**, **#68**, **#78** through **#84**, **#89**, **#90**, **#92**, and
+**#21**, as of 2026-09-20.
 
 **#85 through #90 came out of a second architecture review on 2026-09-20**, this
 one asking what the ideal shape would be and where the tree differs. **Ten
@@ -1133,7 +1133,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#78**-**#84**, **#88**-**#90**, **#92**, plus **#21** —
+**#58**, **#68**, **#78**-**#84**, **#89**, **#90**, **#92**, plus **#21** —
 see "What is open" above, which is the same list and the only place it is
 written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -5160,7 +5160,7 @@ NOTIFY *client*), `replication.rs` 4 (REFRESH/RETRY/EXPIRE timers),
 
 ---
 
-### 88. Nothing measures `rdnsr`'s answer path — **filed 2026-09-20**
+### 88. Nothing measures `rdnsr`'s answer path — **filed and closed 2026-09-20**
 
 Every benchmark (`rdns/benches/answer_path.rs`) and every allocation assertion
 (`rdns/tests/allocations.rs`) lives in `rdns` and measures the authoritative
@@ -5187,6 +5187,42 @@ Two things it leaves *unknown*, rather than wrong:
 The measurement: an allocation count for one cached `rdnsr` answer, beside
 `rdnsd`'s. It needs a home first — `rdns/tests/allocations.rs` cannot reach
 `rdnsr`, and a `#[global_allocator]` belongs in its own `tests/` file (§10).
+
+**Taken, and it decides both halves — against touching anything.** One cache
+hit, datagram in and reply bytes out, is **13 allocations**, the same on Windows
+and Linux and the same across `--test-threads` 1, 2 and 3. Attributed rather
+than merely recorded (§10): **2** are the parse and **3** the serialization,
+which are `rdns`'s own two numbers for the authoritative path measured again
+here rather than quoted, so **8** are what the resolver does in between — the
+cache lookup, the records copied out of it, and the message they go into.
+
+- **On "the two daemons build a reply two ways":** they differ by the copy out
+  of the cache, not by the writing. `ResponseWriter` costs **0** with a held
+  buffer and **3** without, which is what `rdnsd` pays per message on TCP;
+  `rdnsr`'s `DnsMessage` serialization costs **3**. There is no per-record
+  difference to unify away.
+- **On `handle_query`'s 432 lines:** the cost is a constant. A second test asks
+  the ratio question §10 asks for rather than a floor — the 201st cache hit
+  costs exactly what the first did, 13 against 13 — so nothing here is
+  quadratic in how often it is asked, which is the shape that made `log_query`
+  worth rewriting. The row said the measurement would decide; it decided no.
+
+**Where it lives, and why not where §10 says.** `rdnsr` is a binary, so a
+`tests/` file cannot reach `handle_query` without a `lib.rs` and a handful of
+`pub`s — and #82b measured `pub` in `rdns/src` going 517 → 651 across 77
+commits with no ratchet behind it. §10 wants a separate file because a
+`#[global_allocator]` applies to the whole binary; that reason is **answered**
+rather than ignored, because the count is a *per-thread* tally, which is what
+`rdns/tests/allocations.rs` had to invent when its own separate file turned out
+to be neither necessary nor sufficient (a CI run there read 10 for a parse that
+reads 6). So `rdnsr/src/allocations.rs` is a `#[cfg(test)]` module wrapping
+`System`, with no dhat: the profiler is the global part, and nothing here reads
+peak bytes.
+
+That tally moved to `rdns_core::testutil::Counting<A>` rather than being written
+twice (§7) — `rdns/tests/allocations.rs` now wraps `dhat::Alloc` with it and
+**all 22 of its counts are byte-identical** before and after the move, checked
+by running both sides.
 
 ---
 
@@ -5487,6 +5523,7 @@ the week; the record is under "How the queue kept going stale" in
 | **86** | two error enums sat in the crate that could not name them | **filed and closed 2026-09-20**, out of the same review. `DnssecError` and `BrokenCatalog` were defined in `rdns-core` and named by no module in it — 100 of that file's 264 lines, in the crate `rdnsctl` links alone as "the DNS wire format". Moved to `rdns::error` beside `TransferError`, which is there for the reason written at the top of that file; nothing downstream changed, because `pub use rdns_core::error::*` already spelled both paths the same. The refuting measurement removed a third of the finding before any edit: `ZoneError` looks identical and **must stay**, since `rdns-present` returns it and does not depend on `rdns`, so the move would need a cycle. That reason was written down nowhere and is now on the enum |
 | **91** | both CI jobs no local `cargo` run covers were red | **filed and closed 2026-09-20**, found while checking a README sentence about dependency counts rather than by a review. `image` failed with `failed to read /src/rdns-present/Cargo.toml` — character for character #31's failure, with the #66c/#67 crates in place of the #31 ones, and `.dockerignore` held the same list a second time and was stale the same way. `deny` failed all three of advisories, bans and licences, none of which had ever been in the graph before `rustls` was: RUSTSEC-2026-0285 (fixed by its own remedy, `cargo update -p rustls`), `subtle`'s BSD-3-Clause (added, per that file's policy of listing what the graph reaches), and four duplicate versions — half of them **ours**, `rand` 0.8 against `quinn-proto`'s 0.10, four lines to collapse and `Cargo.lock` 218 → **214** with `getrandom` going too. Left: the RustCrypto 0.11 migration that would collapse `cpufeatures`, which is a `digest` version bump and not four lines |
 | **87** | the UDP request path read the wall clock, not `ServeContext`'s | **filed and closed 2026-09-20**. #52 made `Clock` the seam and recorded its sweep as "the four accept loops read `ctx.clock.now()`"; two request-path sites are neither an accept loop nor `rdnsr`'s UDP loop, so the criterion did not reach them. Filed as latent — `Clock::System` *is* `current_unix_timestamp` — and that was right about production and wrong about testability: TSIG compares the server's instant against one the client chose, with RFC 8945 §5.2.3's 300-second fudge, so a clock the loop does not read is **visible on the wire**. Two tests, each checked by reverting the line it is about: the UDP loop answers NOTAUTH, and a refused UPDATE's TSIG reads `BadTime`. The fix is a type rather than two careful call sites (§17): threading `now` into `signed_error` reached eight arguments, which clippy refuses at seven, and `Refused { msg, ip, now, max_len }` is the four values all twenty sites already passed together. Left **#92**, the twelve reads outside any request path, with no remedy named because the obvious one is not obviously right |
+| **88** | nothing measured `rdnsr`'s answer path | **filed and closed 2026-09-20**. Every allocation assertion and every benchmark lived in `rdns` and measured the *authoritative* path, so "the two daemons build a reply two ways" was an observation nobody could price — #45a had already written the sentence in prose, which §18 says is a number. One cache hit is **13 allocations**, identical on Windows and Linux and across `--test-threads` 1-3, and attributed rather than recorded (§10): 2 parse, 3 serialize — `rdns`'s own two numbers, measured again rather than quoted — and **8** for the cache lookup, the copy out of it and the message. So the two daemons differ by the copy, not by the writing: `ResponseWriter` is 0 with a held buffer and 3 without, `rdnsr`'s serialization is 3. A second test asks §10's ratio question instead of a floor and the 201st hit costs what the first did, so nothing is quadratic in how often it is asked. **The measurement was filed to decide whether to touch `handle_query`'s 432 lines, and it decided no.** Lives in `rdnsr/src/allocations.rs` rather than a `tests/` file, because a binary cannot be reached from one without a `lib.rs` and a handful of `pub`s (#82b's ratchet) — and §10's reason for the separate file is answered by the tally being per-thread, which is what `rdns`'s own file had to invent when the separate file proved neither necessary nor sufficient. That tally moved to `rdns_core::testutil::Counting<A>` rather than being written twice (§7); all 22 of `rdns`'s counts are byte-identical across the move |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

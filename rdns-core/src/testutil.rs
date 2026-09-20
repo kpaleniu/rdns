@@ -86,3 +86,88 @@ static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// An allocator that tallies calls per thread, wrapping whichever one the test
+/// binary would otherwise install.
+///
+/// Two test binaries count allocations — `rdns/tests/allocations.rs` over
+/// `dhat::Alloc` and `rdnsr`'s over `System` — and the reason the tally is
+/// *per thread* is subtle enough that a second copy would get it wrong (§7):
+/// a global counter cannot be made exact by a mutex here, because the threads
+/// that allocate inside the window are libtest's. CI once read 10 for a parse
+/// that reads 6 on four machines, and passed on a re-run of the same commit.
+///
+/// Counts `alloc`, `alloc_zeroed` and `realloc`, which is what dhat's
+/// `total_blocks` counts, so a number measured either way means the same thing.
+pub struct Counting<A>(pub A);
+
+thread_local! {
+    /// Allocator calls made by this thread.
+    static BLOCKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// True while this thread is inside an allocator call.
+    static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// This thread's allocator calls so far.
+pub fn blocks() -> u64 {
+    BLOCKS.with(std::cell::Cell::get)
+}
+
+/// How many allocations `body` made on this thread.
+///
+/// The first profiled block in a process picks up one-off initialization, so
+/// call what is measured once before measuring it (`CLAUDE.md` §10).
+pub fn allocations<T>(body: impl FnOnce() -> T) -> (T, u64) {
+    let before = blocks();
+    let out = body();
+    (out, blocks() - before)
+}
+
+/// Enter one allocator call, counting it if `count` and this is the outermost
+/// one on this thread. Nested calls are the wrapped allocator's own
+/// bookkeeping, not the caller's cost — which is why every entry point takes
+/// this guard, including the one that counts nothing.
+///
+/// `try_with`: a thread allocating while its own TLS is being destroyed must
+/// not resurrect the key. Both cells are `const`-initialized and have no
+/// destructor, so the access itself never allocates and cannot recurse.
+fn enter(count: bool) -> impl Drop {
+    struct Guard(bool);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if self.0 {
+                let _ = INSIDE.try_with(|c| c.set(false));
+            }
+        }
+    }
+    let outermost = INSIDE.try_with(|c| !c.replace(true)).unwrap_or(false);
+    if outermost && count {
+        let _ = BLOCKS.try_with(|b| b.set(b.get() + 1));
+    }
+    Guard(outermost)
+}
+
+unsafe impl<A: std::alloc::GlobalAlloc> std::alloc::GlobalAlloc for Counting<A> {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _entered = enter(true);
+        unsafe { self.0.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let _entered = enter(true);
+        unsafe { self.0.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let _entered = enter(true);
+        unsafe { self.0.realloc(ptr, layout, new_size) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        // Allocations are what is counted, so nothing is counted here — the
+        // guard is for what the wrapped allocator may allocate while recording
+        // the free.
+        let _entered = enter(false);
+        unsafe { self.0.dealloc(ptr, layout) }
+    }
+}

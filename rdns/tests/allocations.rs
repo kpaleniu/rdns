@@ -8,17 +8,20 @@
 //! reads 7. Assertions are ranges only where the thing measured has a degree of
 //! freedom; update one with the reason, as a benchmark floor is updated.
 //!
-//! Counts come from [`Counting`], which tallies per thread, because a mutex
-//! cannot make a global counter exact: see [`allocations`]. dhat still supplies
-//! the peak-bytes figures, which are about the whole heap by definition.
+//! Counts come from [`rdns::testutil::Counting`], which tallies per thread,
+//! because a mutex cannot make a global counter exact — its doc comment says
+//! why, and `rdnsr`'s allocation test wraps a different allocator with the same
+//! type (`TODO.md` #88). dhat still supplies the peak-bytes figures, which are
+//! about the whole heap by definition.
 
 use rdns::Class;
 use rdns::Name;
 use rdns::NameRef;
 use rdns::Rtype;
-use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+use rdns::testutil::{allocations, Counting};
 
 use rdns::clock::current_unix_timestamp;
 use rdns::dnssec::{dnskeys_in, rrsigs_in, verify_rrset, Rrset, RrsetProof};
@@ -36,76 +39,7 @@ fn nm(text: &str) -> Name {
 }
 
 #[global_allocator]
-static ALLOC: Counting = Counting;
-
-/// dhat, with a per-thread tally of the allocator calls in front of it.
-///
-/// Everything is passed through to [`dhat::Alloc`], so the peak-bytes
-/// measurements are unchanged. What is added is the count: dhat's own is a
-/// global, and this is the file that cannot use one (see [`allocations`]).
-struct Counting;
-
-thread_local! {
-    /// Allocator calls made by this thread: `alloc`, `alloc_zeroed` and
-    /// `realloc`, which is what dhat's `total_blocks` counts, so no expected
-    /// number in this file moves.
-    static BLOCKS: Cell<u64> = const { Cell::new(0) };
-    /// True while this thread is inside an allocator call.
-    static INSIDE: Cell<bool> = const { Cell::new(false) };
-}
-
-/// This thread's allocator calls so far.
-fn blocks() -> u64 {
-    BLOCKS.with(Cell::get)
-}
-
-/// Enter one allocator call, counting it if `count` and this is the outermost
-/// one on this thread. Nested calls are dhat's own bookkeeping, not the
-/// caller's cost — which is why every entry point takes this guard, including
-/// the one that counts nothing.
-///
-/// `try_with`: a thread allocating while its own TLS is being destroyed must
-/// not resurrect the key. Both cells are `const`-initialized and have no
-/// destructor, so the access itself never allocates and cannot recurse.
-fn enter(count: bool) -> impl Drop {
-    struct Guard(bool);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            if self.0 {
-                let _ = INSIDE.try_with(|c| c.set(false));
-            }
-        }
-    }
-    let outermost = INSIDE.try_with(|c| !c.replace(true)).unwrap_or(false);
-    if outermost && count {
-        let _ = BLOCKS.try_with(|b| b.set(b.get() + 1));
-    }
-    Guard(outermost)
-}
-
-unsafe impl std::alloc::GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let _entered = enter(true);
-        unsafe { dhat::Alloc.alloc(layout) }
-    }
-
-    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        let _entered = enter(true);
-        unsafe { dhat::Alloc.alloc_zeroed(layout) }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
-        let _entered = enter(true);
-        unsafe { dhat::Alloc.realloc(ptr, layout, new_size) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        // `total_blocks` is allocations, so nothing is counted here — the guard
-        // is for what dhat may allocate while recording the free.
-        let _entered = enter(false);
-        unsafe { dhat::Alloc.dealloc(ptr, layout) }
-    }
-}
+static ALLOC: Counting<dhat::Alloc> = Counting(dhat::Alloc);
 
 /// Every measurement in this file, in one test; see the module header for why.
 #[test]
@@ -288,20 +222,11 @@ fn exclusive() -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 
-/// Report how many allocations `body` made on this thread.
-///
-/// Counted here rather than read from dhat because dhat's counters are global:
-/// any other thread allocating inside the window lands in the total, and the
-/// windows are microseconds, so the failure is rare and remote. A CI run read
-/// 10 for a parse that reads 6 on four machines, and passed on re-run.
-/// [`exclusive`] cannot fix that — the threads that allocate are libtest's, not
-/// this file's. Measurements are still taken under it, because [`peak_bytes`]
-/// needs the profiler to itself.
-fn allocations<T>(body: impl FnOnce() -> T) -> (T, u64) {
-    let before = blocks();
-    let out = body();
-    (out, blocks() - before)
-}
+// `allocations` is `rdns::testutil`'s: counted there rather than read from dhat
+// because dhat's counters are global, and any other thread allocating inside a
+// microsecond window lands in the total. [`exclusive`] cannot fix that — the
+// threads that allocate are libtest's, not this file's. Measurements are still
+// taken under it, because [`peak_bytes`] needs the profiler to itself.
 
 /// Run `body` under a profiler and report the most memory it held at once.
 ///
