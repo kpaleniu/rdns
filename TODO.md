@@ -4758,6 +4758,44 @@ re-checked against the code** — do that before touching either.
   §17 shape and is ~15 sites. **Build both before choosing**; the second makes
   the whole class unrepresentable and the first only makes it visible.
 
+  **Closed 2026-09-20. Three shapes built** (§19), and the one that shipped is
+  in neither of the two the row named.
+
+  Provoked first: `a_rewritten_answer_still_asks_for_its_refresh` puts an
+  `rpz-ip` rule over a cache entry 95 seconds into its 100-second TTL and
+  reads `refresh` — `None` against `Some("hot.example.com.")`.
+
+  | | A1: one line | A2: delete the `From` | B: `&mut Option<QuerySection>` |
+  |---|---|---|---|
+  | diff | 1 line | 128/40, one file | 158/103, three files |
+  | sites the compiler names | 0 | **14**, not 15 | 68 errors over ~35 call sites |
+  | after it | the class can recur silently | recurs visibly: a new exit spells `refresh: None` | — |
+  | surprises | — | clippy's `redundant_field_names` ×3 | the local `refresh` shadows `fn refresh`, so two sites need `crate::answer::refresh`; `Answered`'s doc comment, which holds §9's reason the prefetch is handed back rather than spawned, has nowhere to live; clippy then wants `?` where `let…else` was |
+
+  **B's claim does not survive being built.** It does not make the class
+  unrepresentable, it moves it to the call site: a caller may pass `&mut None`
+  and ignore it, and the mechanical conversion wrote exactly that at **32 test
+  call sites** — the silent drop, spelled out 32 times, as the idiom the next
+  test copies. It also deletes the type whose doc comment is the reasoning.
+
+  **What shipped is C, which neither the row nor the review considered: delete
+  the early return.** The hazard is §7's "an early `return` that jumps over a
+  shared epilogue", so the fix is to stop having two exits — the `rpz-ip`
+  block yields `Option<Option<Vec<u8>>>` and the tail chooses between it and
+  `finish_dns64`. 85/9 in one file, one exit after the set point, and the
+  comment says why there is no `return` there. A2 is then 128 lines to restate
+  `refresh: None` at 13 exits that are all *upstream* of the set point, where
+  the compiler can already prove it.
+
+  One behaviour change, pinned by a second test: `rpz-drop` keeps its prefetch
+  now, where before it took the same lossy exit. Refreshing a dropped name is
+  how it stops being blocked when it moves off the address the rule names.
+
+  The patches for A2 and B are not kept as branches — both are mechanical from
+  this description, and the numbers above are what they were built for.
+  Measured: `rdnsr`'s cached answer still costs **13 allocations**, first and
+  201st; 1 260 tests on Windows and 1 281 on Linux.
+
 - **78b. Forward mode returns the upstream's header verbatim.** ~~The
   review's reading, not re-checked.~~ **Verified and closed 2026-09-20**, and
   both consequences were live. `recurse.rs` normalized a recursed answer —

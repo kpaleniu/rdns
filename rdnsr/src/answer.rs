@@ -606,18 +606,32 @@ pub(crate) async fn handle_query(
     // blocked that resolves into blocked space. After a cache hit as well as
     // after a recursion — the cache holds what the internet said, and the
     // policy is applied to what leaves.
-    if !policy.is_empty() && !resp.answers.is_empty() {
-        if let Some(rewrite) = policy.on_answer(&resp.answers, query.qname.as_ref(), query.qtype) {
-            if let Applied::Replied(reply) =
-                apply_policy(&msg, rewrite, &client, &query, ctx, timer, transport)
-            {
-                return reply.into();
+    //
+    // No `return` here, and that is the point: `refresh` is set at the cache
+    // hit above and read below, so an exit between the two loses it — which
+    // this one did, silently turning prefetching off for any name an `rpz-ip`
+    // rule matched (`TODO.md` #78a, `CLAUDE.md` §7's early return over a
+    // shared epilogue). Falling through leaves one exit, so there is nothing
+    // to remember.
+    let rewritten = if !policy.is_empty() && !resp.answers.is_empty() {
+        match policy.on_answer(&resp.answers, query.qname.as_ref(), query.qtype) {
+            Some(rewrite) => {
+                match apply_policy(&msg, rewrite, &client, &query, ctx, timer, transport) {
+                    Applied::Replied(reply) => Some(reply),
+                    Applied::Unchanged => None,
+                }
             }
+            None => None,
         }
-    }
+    } else {
+        None
+    };
 
     Answered {
-        reply: finish_dns64(resp, secure, why, &client, &query, serving, timer).await,
+        reply: match rewritten {
+            Some(reply) => reply,
+            None => finish_dns64(resp, secure, why, &client, &query, serving, timer).await,
+        },
         refresh,
     }
 }
@@ -1683,6 +1697,14 @@ mod tests {
     }
 
     fn timed(stale: StalePolicy, prefetch: bool) -> (Arc<Resolving>, Clock) {
+        timed_with_policy(stale, prefetch, PolicyZones::default())
+    }
+
+    fn timed_with_policy(
+        stale: StalePolicy,
+        prefetch: bool,
+        zones: PolicyZones,
+    ) -> (Arc<Resolving>, Clock) {
         let clock = Clock::fixed(1_000_000_000);
         let ctx = Arc::new(ServeContext {
             clock: clock.clone(),
@@ -1693,7 +1715,7 @@ mod tests {
             Arc::new(Resolving {
                 resolver: test_resolver(),
                 caches,
-                policy: PolicyStore::in_memory(PolicyZones::default()),
+                policy: PolicyStore::in_memory(zones),
                 prefetch,
                 dns64: None,
                 rpz_notify: None,
@@ -1874,6 +1896,106 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
+    }
+
+    /// A rewritten answer still asks for its prefetch.
+    ///
+    /// `refresh` is set at the cache hit and read by the tail; the `rpz-ip`
+    /// exit between them returned `reply.into()`, and `From<Option<Vec<u8>>>`
+    /// fills `refresh: None` — so one rule matching one address turned
+    /// prefetching off for that name with nothing to see (`TODO.md` #78a).
+    /// §7's early return over a shared epilogue, with the epilogue in a
+    /// struct field.
+    #[tokio::test]
+    async fn a_rewritten_answer_still_asks_for_its_refresh() {
+        let (serving, clock) = timed_with_policy(
+            StalePolicy::OFF,
+            true,
+            policy("10.0.2.0.198.rpz-ip IN CNAME .\n"),
+        );
+        let name = nm("hot.example.com.");
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![ResourceRecord {
+                name: name.clone(),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(100),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    std::net::Ipv4Addr::new(198, 0, 2, 10),
+                ))
+                .expect("encodes"),
+            }],
+        );
+        clock.advance(95);
+
+        let answered = handle_query(
+            query_for("hot.example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await;
+
+        let reply = DnsMessage::try_from_bytes(&answered.reply.expect("answered"))
+            .expect("a well-formed reply");
+        assert_eq!(
+            reply.rcode,
+            ResponseCode::NoSuchDomain,
+            "the rule rewrote the cached answer"
+        );
+        assert_eq!(
+            answered.refresh.map(|q| q.qname),
+            Some(name),
+            "and the entry in its last tenth is still due a refresh"
+        );
+    }
+
+    /// And so does a dropped one, which is the same exit.
+    ///
+    /// `rpz-drop` sends nothing back, and the entry still ages out of the
+    /// cache while the next client waits for a full recursion. Refreshing it
+    /// is also how the name stops being blocked when it moves off the address
+    /// the rule names. Pinned because the fix changed it: this path used to
+    /// lose the prefetch with the rewrite path.
+    #[tokio::test]
+    async fn a_dropped_answer_still_asks_for_its_refresh() {
+        let (serving, clock) = timed_with_policy(
+            StalePolicy::OFF,
+            true,
+            policy(
+                "10.0.2.0.198.rpz-ip IN CNAME rpz-drop.
+",
+            ),
+        );
+        let name = nm("hot.example.com.");
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![ResourceRecord {
+                name: name.clone(),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(100),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    std::net::Ipv4Addr::new(198, 0, 2, 10),
+                ))
+                .expect("encodes"),
+            }],
+        );
+        clock.advance(95);
+
+        let answered = handle_query(
+            query_for("hot.example.com.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await;
+
+        assert!(answered.reply.is_none(), "rpz-drop answers nothing");
+        assert_eq!(answered.refresh.map(|q| q.qname), Some(name));
     }
 
     /// Without the switch there is nothing to run, whatever the TTL says.
