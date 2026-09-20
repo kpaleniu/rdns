@@ -451,9 +451,12 @@ RSA key *generation*, automated key rollover, `$GENERATE`, any class but IN.
 MIT. `LICENSE` is the text.
 
 Dependencies: `Cargo.lock` holds 214 packages, nine of them this workspace, so
-205 third-party. Every licence in the graph is permissive and none is copyleft
-— Apache-2.0, MIT, ISC, BSD-3-Clause, Unicode-3.0, Zlib, from `cargo deny
-list`. `deny.toml` holds the allow-list, the duplicate-version exceptions, and
-the reason for each; `cargo deny --all-features check` reports all four
-sections ok — with `--all-features`, because that is what the CI job passes and
-a plain run checks a narrower graph (#97).
+205 third-party. `cargo deny --all-features list` checks 138 of the 214; the
+other 76 are the dev-dependency trees under `criterion` and `rcgen`, which only
+`cargo bench` and the test suite compile. Across those 138, every licence is
+permissive and none is copyleft — eight of them: Apache-2.0, MIT, ISC,
+BSD-3-Clause, Unicode-3.0, Zlib, 0BSD and Unlicense. `deny.toml` holds the
+allow-list, the duplicate-version exceptions, and the reason for each;
+`cargo deny --all-features check` reports all four sections ok — with
+`--all-features`, because that is what the CI job passes and a plain run checks
+a narrower graph (#97).

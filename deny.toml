@@ -22,8 +22,10 @@ targets = [
 ]
 
 [licenses]
-# Every licence actually reachable in the graph, and nothing else. Derived by
-# reading `cargo metadata`, not by guessing:
+# Every licence actually reachable in the graph, and nothing else. Derived from
+# `cargo deny --all-features list`, which is the graph this file is checked
+# against — `cargo metadata`, which an earlier version of this comment was read
+# off, is the lockfile and a wider thing:
 #
 #   MIT           the bulk of it, and what satisfies every `MIT OR ...` crate
 #   Apache-2.0    `mintex` alone requires it, and `ring` needs it *and* ISC
@@ -32,10 +34,17 @@ targets = [
 #   BSD-3-Clause  `subtle`, under `rustls`, which offers nothing else
 #
 # `AND` is why Apache-2.0 and ISC are not optional: an `OR` expression is
-# satisfied by any one branch, an `AND` by all of them. `BSD-2-Clause` and
-# `Zlib` are reachable too — `zerocopy`, `lru-slab`, `tinyvec` — and are *not*
-# listed, because each is an `OR` branch MIT already satisfies. Listing a
-# licence nothing requires is how this file stops describing the graph.
+# satisfied by any one branch, an `AND` by all of them. Three more licences are
+# reachable and are *not* listed, because each is an `OR` branch MIT already
+# satisfies: `Zlib` (`lru-slab`, `miniz_oxide`, `tinyvec`, `tinyvec_macros`),
+# `0BSD` (`adler2`) and `Unlicense` (`memchr`). Listing a licence nothing
+# requires is how this file stops describing the graph.
+#
+# `BSD-2-Clause` used to be named here, for `zerocopy`. It is not in this graph
+# at all: `zerocopy` arrives under `criterion`, and the dev-dependency trees are
+# absent — `Cargo.lock` holds 214 packages and `cargo deny list` reports 138,
+# the difference being `criterion`'s and `rcgen`'s. A licence named from the
+# lockfile is not a licence this file checks.
 allow = [
     "MIT",
     "Apache-2.0",
