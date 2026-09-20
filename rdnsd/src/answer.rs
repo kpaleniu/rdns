@@ -1111,6 +1111,54 @@ x.sub2   IN A   192.0.2.30
         assert_eq!(glue[0].name, nm("ns.sub.example.com."));
     }
 
+    /// A wildcard *below* the cut does not make the name exist here either,
+    /// and the referral comes first.
+    ///
+    /// `dnssec_answer::deny_the_name_and_its_wildcard` needs
+    /// `*.<closest encloser>` to be absent, or its `nsec_covering` search
+    /// yields the record before a name that is in the chain and proves
+    /// nothing. It said `Zone::name_kind` guaranteed that; of that function's
+    /// six `NotFound` returns the delegation one does not — it returns
+    /// `NotFound` because RFC 4592 §2.2.1 forbids synthesis below a cut, which
+    /// says nothing about the index (`TODO.md` #79e). The guarantor is here:
+    /// `resolve_in_zone` asks `delegation_for` before anything else, which is
+    /// RFC 1034 §4.3.2's first case, so a name under a cut never reaches a
+    /// negative proof at all.
+    #[test]
+    fn a_wildcard_below_a_cut_is_still_a_referral() {
+        let mut text = ZONE.to_string();
+        text.push_str(
+            "*.sub    IN A   192.0.2.77
+",
+        );
+        let zone = parse_zone_file(&text, "example.com.").expect("occluded data parses");
+        let mut zones = Zones::default();
+        drop(zones.insert(zone));
+
+        let response = make_response(
+            &query("nothing.sub.example.com.", Qtype::of(record_types::A), true),
+            &zones,
+            &DnsMetrics::new(),
+        );
+
+        assert_eq!(response.rcode, ResponseCode::Ok, "a referral, not NXDOMAIN");
+        assert!(!response.authoritive, "AA is clear on a referral");
+        assert!(
+            response.answers.is_empty(),
+            "the wildcard below the cut is the child's data (RFC 4592 §2.2.1)"
+        );
+        assert_eq!(
+            rdatas(&response.authorities, record_types::NS).len(),
+            2,
+            "the child's NS RRset is the answer"
+        );
+        assert!(
+            rdatas(&response.authorities, record_types::NSEC).is_empty()
+                && rdatas(&response.authorities, record_types::NSEC3).is_empty(),
+            "and no denial is written for a name the zone never decided about"
+        );
+    }
+
     /// The wildcard at the apex must not answer for a name below the cut
     /// (RFC 4592 §2.2.1) — that name belongs to the child.
     #[test]

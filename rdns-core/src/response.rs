@@ -742,6 +742,39 @@ mod tests {
     /// Past the limit the reply is the question, TC=1 and the OPT record — the
     /// shape `to_bytes_within_buf` produced by rebuilding the message with its
     /// sections cleared (RFC 1035 §4.2.1; RFC 6891 §6.2.4 on keeping the OPT).
+    /// An EDE set on a reply with no OPT reaches no wire.
+    ///
+    /// `ede.rs`'s header claimed this was unspellable, because `mirror` is the
+    /// only way to an OPT — and `set_edns` is `pub`, so it never was
+    /// (`TODO.md` #79d). What holds is `finish`'s guard: the EDE is folded in
+    /// under `if let Some(mut edns) = self.edns.take()`. Asserted rather than
+    /// argued, so the claim has something behind it.
+    #[test]
+    fn an_extended_error_with_no_opt_reaches_no_wire() {
+        let request = request("www.example.com.", false);
+        let mut out = Vec::new();
+        let mut compressor = NameCompressor::new();
+        let mut w = ResponseWriter::start(&mut out, &mut compressor, 512, &request).unwrap();
+        w.set_rcode(ResponseCode::ServerFailure);
+        w.set_extended_error(ExtendedError::new(
+            crate::ede::InfoCode::SIGNATURE_EXPIRED,
+            "the zone's signatures have expired",
+        ));
+        w.finish().unwrap();
+
+        let parsed = DnsMessage::try_from_bytes(&out).expect("the reply parses");
+        assert!(!parsed.has_edns(), "no OPT was asked for, so none goes out");
+        assert_eq!(
+            parsed.rcode,
+            ResponseCode::ServerFailure,
+            "the RCODE stands"
+        );
+        assert!(
+            !out.windows(2).any(|pair| pair == 15u16.to_be_bytes()),
+            "and the EDE option code is nowhere in the bytes"
+        );
+    }
+
     #[test]
     fn a_response_over_the_limit_becomes_an_empty_tc_answer() {
         let request = request("www.example.com.", true);

@@ -24,10 +24,13 @@ pub use rdns_core::error::*;
 /// A zone transfer, a NOTIFY, or the TSIG on either.
 #[derive(Debug, thiserror::Error)]
 pub enum TransferError {
-    /// The peer refused, or answered something that is not a transfer.
-    #[error("{0}")]
-    Refused(String),
-    /// The transfer arrived but does not assemble into a zone.
+    /// The transfer does not assemble into a zone — including a master that
+    /// answered an error rcode or something that is not a transfer at all.
+    ///
+    /// There was a `Refused` variant for that second case and nothing ever
+    /// constructed it (`TODO.md` #79a). A caller would have to branch on the
+    /// distinction for it to be worth a variant (§3), and none does: every
+    /// transfer failure reaches the same `warn!` and the same RETRY timer.
     #[error("{0}")]
     Malformed(String),
     /// A TSIG that is absent, unknown, or does not verify. Distinct because it
@@ -50,9 +53,6 @@ pub enum TransferError {
 }
 
 impl TransferError {
-    pub fn refused(detail: impl Into<String>) -> Self {
-        TransferError::Refused(detail.into())
-    }
     pub fn malformed(detail: impl Into<String>) -> Self {
         TransferError::Malformed(detail.into())
     }

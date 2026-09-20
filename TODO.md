@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#78**, **#79**, **#81**, **#82**, **#83**, **#84**, **#90**,
-**#92**, **#93**, **#94**, and **#21**, as of 2026-09-20.
+**#58**, **#68**, **#78**, **#81**, **#82**, **#83**, **#84**, **#90**, **#92**,
+**#93**, **#94**, **#95**, and **#21**, as of 2026-09-20.
 
 **#85 through #90 came out of a second architecture review on 2026-09-20**, this
 one asking what the ideal shape would be and where the tree differs. **Ten
@@ -1133,8 +1133,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#78**, **#79**, **#81**-**#84**, **#90**, **#92**, **#93**,
-**#94**, plus **#21** —
+**#58**, **#68**, **#78**, **#81**-**#84**, **#90**, **#92**, **#93**, **#94**,
+**#95**, plus **#21** —
 see "What is open" above, which is the same list and the only place it is
 written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -4797,7 +4797,7 @@ re-checked against the code** — do that before touching either.
 
 ---
 
-### 79. Claims and code that outlived each other — **filed 2026-09-19**
+### 79. Claims and code that outlived each other — **filed 2026-09-19, closed 2026-09-20**
 
 §4's failure mode has shifted here. The old one was "the claim was never true";
 these are claims that *were* true and whose subject moved. Nothing fails when
@@ -4822,6 +4822,44 @@ they diverge, which is the whole of §18's "dead code is a finding".
   change (#13e)". That sentence is still worth something; move it onto
   `canonical_name`, which is the live one, rather than deleting it with the
   function. §18: file, then delete.
+
+  **Closed 2026-09-20, and the count was four because the method has false
+  negatives.** Swept first (§18): of **713 `pub fn` definitions** in the
+  workspace, a script matching call-shaped uses outside comments flags four —
+  the two named above plus **`Class::is_meta` and `Rtype::is_meta`**, which the
+  review missed. It does *not* flag `Nat64Prefix::bits` or
+  `TransferError::refused`, which are dead too: a string literal carrying the
+  word "bits", and `rdnsd`'s unrelated `.refused` struct field, are enough to
+  hide them. So the tree had **six**, the sweep finds four, and a name-based
+  sweep cannot do better — #82b's point about #38's criterion having no
+  compiler behind it, arriving from the other side.
+
+  Two of the six were not dead code at all, which is why "delete it" was the
+  wrong reflex twice:
+
+  - **`Rtype::is_meta` is the reasoned copy of a live predicate.** RFC 2136
+    §3.4.1's prescan in `update.rs` spells `rtype == rt::ANY || rtype ==
+    rt::AXFR || rtype == rt::IXFR` by hand, and `is_meta` is that expression
+    with the RFC citation on it (§7). Wired in; its doc's claim that the
+    prescan refuses an UPDATE adding one is true by reference now rather than
+    by coincidence.
+  - **`TransferError::Refused` was unreachable because the site that should
+    build it builds `Malformed`.** A master answering REFUSED comes back as
+    `TransferError::malformed("master answered Refused")`, under a variant
+    documented as "the transfer arrived but does not assemble into a zone".
+    Deleted anyway, per §3's "a variant nobody matches on is a `String` with
+    extra syntax", and `Malformed`'s doc now covers the case it has always
+    carried. What decided it: **nothing branches on any `TransferError`
+    variant** — every transfer failure reaches one `warn!` and the same RETRY
+    timer in `replication.rs`. That is **#95**.
+
+  Deleted: `Name::relative_to` (with its stale "the zone parser's per-record
+  cost", whose replacement sits eight lines below saying the allocation is
+  gone), `canonical_name_of` (sentence moved onto `canonical_name`, where it is
+  about the live function), `Nat64Prefix::bits`, `Class::is_meta` (whose
+  predicate the UPDATE path expresses as `QueryClass::Any | QueryClass::None`,
+  and whose stronger guard is the zone parser refusing a non-IN record at all)
+  and `TransferError::refused`.
 
 - **79b. `CLAUDE.md` §17's list is five-sevenths stale — closed 2026-09-20.**
   It opened "The smells, all currently in this tree" and pointed at
@@ -4884,6 +4922,15 @@ they diverge, which is the whole of §18's "dead code is a finding".
   guard; a test that sets an EDE with no OPT and asserts nothing reaches the
   wire would make it a fact rather than a citation.
 
+  **Closed 2026-09-20**, both halves. Three of `rdnsd`'s answer paths call
+  `ResponseWriter::set_edns` without `mirror` (`answer.rs:66`, `:90`, `:121`),
+  so §17's "not expressible" was never a property of the type. The header
+  cites `finish`'s guard now and strikes the old mechanism rather than
+  overwriting it (§11), and `an_extended_error_with_no_opt_reaches_no_wire` in
+  `response.rs` asserts the conclusion: no OPT, so no EDE and no option code 15
+  anywhere in the bytes. Checked by loosening the guard to synthesize an OPT
+  — the test fails (§1).
+
 - **79e. `dnssec_answer.rs:200` holds on four of six paths.** It says
   `*.<closest encloser>` is "guaranteed absent by `Zone::name_kind`". Of
   `name_kind_of_key`'s six `NotFound` returns, four establish it, one is
@@ -4894,6 +4941,26 @@ they diverge, which is the whole of §18's "dead code is a finding".
   naming the real guarantor and **not** a check. Confirm with a zone that has a
   delegation at `sub.` and a wildcard at `*.sub.` before writing it.
 
+  **Confirmed and closed 2026-09-20.** That zone is
+  `a_wildcard_below_a_cut_is_still_a_referral` in `rdnsd/src/answer.rs`: with
+  `*.sub IN A` beside the `sub` delegation, `nothing.sub.example.com.` comes
+  back a referral — NOERROR, AA clear, the child's NS RRset, no denial record
+  — because `resolve_in_zone` asks `delegation_for` before anything else,
+  which is RFC 1034 §4.3.2's first case and `CLAUDE.md` §8's first bullet. The
+  sentence in `dnssec_answer.rs` names that caller now.
+
+  One correction to the row's own count: by my reading **three** of the six
+  `NotFound` returns establish the invariant, not four — no wildcards in the
+  zone (`zone.rs:1243`), a wildcard that would break 255 octets (`:1251`), and
+  the index saying it is absent (`:1256`). **Two** are vacuous, not one: out of
+  the zone (`:1234`) and the loop ending with no encloser found (`:1259`),
+  which an in-zone name cannot reach because the apex always exists. The
+  delegation one (`:1246`) is the one that does not, which is the row's point
+  and is right.
+
+  Worth naming: the precondition is in `rdns` and the guarantor in `rdnsd`, so
+  the test has to live in the other crate, and does.
+
 - **79f. Two config claims about where a rule is enforced.**
   `rdns/src/config.rs`'s macro says a listener with no certificate "is refused
   by each daemon's `check`" — true of `rdnsr`, false of `rdnsd`, which refuses
@@ -4901,6 +4968,21 @@ they diverge, which is the whole of §18's "dead code is a finding".
   `--config` as three where clap has six. Both are three-line corrections; the
   first has the option of making the claim true instead, which would also give
   a config-file user a line number.
+
+  **Closed 2026-09-20, and both counts held.** Of `Cli`'s **46 `#[arg]` fields,
+  40 carry `conflicts_with = "config"`**; the exempt six are `--config`,
+  `--check-config`, `--generate-keys`, `--key-algorithm` (that one's
+  parameter), `--log-level` and `--quiet` (which the file has no key for). The
+  header names all six and points at the attribute as the authority.
+
+  **The option of making the other claim true was declined, with the reason
+  written in.** `rdnsd` refuses a listener with no certificate in `main`, where
+  the flags and the file have already merged into one `Cli` and the store is
+  about to be loaded; moving it into `Config::check` would add a *second* check
+  rather than move one, because the flag path still needs it and clap's
+  `requires` cannot express "either listener needs the pair". The cost is a
+  file error without a line number, and the dry run reaches the check anyway
+  — it is at `main.rs:2053` and `--check-config` returns at `:2292`.
 
 ---
 
@@ -5588,6 +5670,40 @@ do not.
 
 ---
 
+### 95. Nothing branches on a `TransferError` variant — **filed 2026-09-20**
+
+Found closing #79a, which deleted `TransferError::Refused` because nothing
+constructed it. The question that decided that — would a caller branch on it
+(§3)? — has the same answer for every other variant in the enum.
+
+**Measured**: 38 mentions of `TransferError::` outside the enum's own file,
+every one of them a construction — 29 `malformed`, 3 `tsig`, 3 `timeout`, 2
+`Io`, 1 `Malformed` — and **not one a match**. Every transfer failure arrives
+at one place, `replication.rs:431`: a `warn!` with the error's `Display`,
+`expire_if_out_of_contact`, and `timers.after_failure()`. The rcode, the
+malformed stream and the timeout are one behaviour.
+
+**This is a claim in `CLAUDE.md` §3, not only in the code**: `TransferError::Timeout`
+"exists because a secondary retries a timeout and gives up on a malformed
+transfer". The tree does not give up on a malformed transfer — it
+retries on RETRY and expires on EXPIRE, which is RFC 1034 §4.3.5's own answer
+and is probably right. So the *variant* may be justified and the *reason
+written down for it* is not the one the code implements.
+
+**No remedy named** (§18), because the choice is a policy question and not a
+refactor: either a secondary should treat a malformed transfer differently
+from a timeout — in which case the branch is missing, and that is a defect
+worth a number of its own — or it should not, in which case §3's example
+needs correcting in place and the enum is carrying distinctions only a log
+line reads.
+
+**The measurement that would decide it**: what BIND, Knot and NSD do to a
+secondary whose master answers REFUSED versus one that sends a broken stream.
+§4's "check what the other implementations do, and quote them"; if they all
+just wait out RETRY, §3's sentence is the thing to fix.
+
+---
+
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -5748,6 +5864,7 @@ the week; the record is under "How the queue kept going stale" in
 | **87** | the UDP request path read the wall clock, not `ServeContext`'s | **filed and closed 2026-09-20**. #52 made `Clock` the seam and recorded its sweep as "the four accept loops read `ctx.clock.now()`"; two request-path sites are neither an accept loop nor `rdnsr`'s UDP loop, so the criterion did not reach them. Filed as latent — `Clock::System` *is* `current_unix_timestamp` — and that was right about production and wrong about testability: TSIG compares the server's instant against one the client chose, with RFC 8945 §5.2.3's 300-second fudge, so a clock the loop does not read is **visible on the wire**. Two tests, each checked by reverting the line it is about: the UDP loop answers NOTAUTH, and a refused UPDATE's TSIG reads `BadTime`. The fix is a type rather than two careful call sites (§17): threading `now` into `signed_error` reached eight arguments, which clippy refuses at seven, and `Refused { msg, ip, now, max_len }` is the four values all twenty sites already passed together. Left **#92**, the twelve reads outside any request path, with no remedy named because the obvious one is not obviously right |
 | **88** | nothing measured `rdnsr`'s answer path | **filed and closed 2026-09-20**. Every allocation assertion and every benchmark lived in `rdns` and measured the *authoritative* path, so "the two daemons build a reply two ways" was an observation nobody could price — #45a had already written the sentence in prose, which §18 says is a number. One cache hit is **13 allocations**, identical on Windows and Linux and across `--test-threads` 1-3, and attributed rather than recorded (§10): 2 parse, 3 serialize — `rdns`'s own two numbers, measured again rather than quoted — and **8** for the cache lookup, the copy out of it and the message. So the two daemons differ by the copy, not by the writing: `ResponseWriter` is 0 with a held buffer and 3 without, `rdnsr`'s serialization is 3. A second test asks §10's ratio question instead of a floor and the 201st hit costs what the first did, so nothing is quadratic in how often it is asked. **The measurement was filed to decide whether to touch `handle_query`'s 432 lines, and it decided no.** Lives in `rdnsr/src/allocations.rs` rather than a `tests/` file, because a binary cannot be reached from one without a `lib.rs` and a handful of `pub`s (#82b's ratchet) — and §10's reason for the separate file is answered by the tally being per-thread, which is what `rdns`'s own file had to invent when the separate file proved neither necessary nor sufficient. That tally moved to `rdns_core::testutil::Counting<A>` rather than being written twice (§7); all 22 of `rdns`'s counts are byte-identical across the move |
 | **89** | a moved module left its doc comment on the next one | **filed and closed 2026-09-20**, and it is **#79c** filed a second time a day later. `e26a479` (#66c) moved `rdns/src/testutil.rs` to `rdns-core` and left `/// Scratch directories, for tests only.` attached to the `pub mod tls_identity;` below it, where it rendered on the crate index. `cargo doc` cannot catch a doc comment that is wrong rather than broken, and #20 had already written the remedy as prose ("after any move, grep the seam for an orphaned `///`"), so nobody ran it. Deleted, and the grep is now `rdns/tests/module_doc_comments.rs`: a `///` on a `mod X;` that shares no content word with the module's name or the first paragraph of its own `//!`. **Weak on purpose** — the seven that agree measure 4, 1, 4, 5, 2, 1 and 4 shared words against the orphan's 0, so a threshold of two would flag `mod eviction` (which agrees only through its own name) and `mod dispatch`. The one recursive `.rs` walk in the tree moved to `rdns_core::testutil` rather than being written a second time (§7), and both scans assert on what it hands back. It reads source as data, so it covers `rdnsd/src/control.rs` on Windows, where that file never compiles |
+| **79** | claims and code that outlived each other | **filed 2026-09-19, closed 2026-09-20**, five rows. **79a**: six dead `pub fn`, not four — a sweep of the workspace's 713 `pub fn` definitions finds four, and misses `Nat64Prefix::bits` and `TransferError::refused` because a string literal and an unrelated struct field carry those words, which is #82b's point about a name-based criterion from the other side. Two of the six were not dead code: `Rtype::is_meta` is the RFC-citing copy of a predicate `update.rs`'s RFC 2136 §3.4.1 prescan spells by hand, so it was wired in rather than deleted; `TransferError::Refused` was unreachable because the site that should build it builds `Malformed`, which left **#95**. **79b**: §17 re-measured, five fixed and two live. **79c**: closed as #89, which was it filed twice. **79d**: `set_edns` is `pub` and three answer paths use it without `mirror`, so the guarantor is `finish`'s guard, now cited and asserted. **79e**: three of six `NotFound` returns establish the wildcard invariant, not four, and the guarantor is `rdnsd`'s `resolve_in_zone` ordering — confirmed with the zone the row asked for. **79f**: 40 of `Cli`'s 46 `#[arg]` fields conflict with `--config`, so six are exempt and not three; the certificate check stays in `main` over the merged view, with the reason written in |
 | **80** | two bools where the enum was already imported | **filed 2026-09-19, closed 2026-09-20**. `validate_rrset` returned `(is_valid, is_signed)`, documented in prose and nowhere in the type, with seven bare tuple literals in the file. The refuting check — a caller needing `is_signed` without already holding the `ZoneKeys` that answers it — came back empty: both production sites are in `verify_zones`, and the first calls `keys.is_signed()` one line above. `Verdict::{Unchecked, Valid, Invalid(String)}` now, and the `Invalid` carries what the pair could not: `verify_zones` said "does not verify against the zone's own keys" for an expiry, a missing signature and an unreadable algorithm alike. `validate_response` and `is_zone_signed` deleted with it, both dead and both #79a's shape in the same module; five doc comments naming the first were reworded rather than left to rot (#89). Allocation counts 33 either side; one test caught agreeing with the code for the wrong reason, which is **#94** |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly

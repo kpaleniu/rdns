@@ -133,14 +133,6 @@ impl Class {
     pub const fn to_u16(self) -> u16 {
         self.0
     }
-
-    /// Whether this is a QCLASS-only value that no stored record can be in:
-    /// ANY (255) and RFC 2136's NONE (254). Both arrive in a record's CLASS
-    /// field in an UPDATE, where §2.4 and §2.5 repurpose it to say what to *do*
-    /// with the record.
-    pub const fn is_meta(self) -> bool {
-        matches!(self.0, 254 | 255)
-    }
 }
 
 impl Default for Class {

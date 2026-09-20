@@ -253,20 +253,16 @@ pub fn rrsigs_in(records: &[ResourceRecord]) -> Vec<Rrsig> {
 
 // Canonical form (RFC 4034 §6)
 
-/// A [`Name`]'s canonical form, as the text the rest of this module keeps.
+/// Absolute, lowercased form. DNS names compare case-insensitively (RFC 4343)
+/// and canonical DNSSEC form is down-cased (RFC 4034 §6.2).
 ///
 /// The boundary between a record's name and DNSSEC's own bookkeeping. This
 /// module canonicalizes to *presentation text* and derives wire form from it
 /// when signing; that is what produces the octets a signature is computed over,
-/// so it is left exactly as it was when names became wire form. Converting here
-/// keeps the signed bytes identical — which is the property a name refactor
-/// must not quietly change (`TODO.md` #13e).
-pub fn canonical_name_of(name: NameRef<'_>) -> String {
-    canonical_name(&name.to_presentation())
-}
-
-/// Absolute, lowercased form. DNS names compare case-insensitively (RFC 4343)
-/// and canonical DNSSEC form is down-cased (RFC 4034 §6.2).
+/// so it is left exactly as it was when names became wire form — the property
+/// a name refactor must not quietly change (`TODO.md` #13e). The sentence is
+/// here because the `NameRef` wrapper it was written on had no callers
+/// (#79a).
 pub fn canonical_name(name: &str) -> String {
     let lowered = name.to_ascii_lowercase();
     if crate::text_names::ends_with_root(&lowered) {

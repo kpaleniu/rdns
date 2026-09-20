@@ -101,20 +101,6 @@ impl Name {
         Ok(Name(unpacker.decode_wire(name)?.into_boxed_slice()))
     }
 
-    /// Zone-file text that is relative to an origin (RFC 1035 §5.1): the labels
-    /// of `text`, then `origin`.
-    ///
-    /// The caller has already decided the text *is* relative — `@`, the empty
-    /// name and a trailing dot are the zone parser's to interpret, not this
-    /// type's.
-    pub fn relative_to(text: &str, origin: NameRef<'_>) -> WireResult<Name> {
-        // The text decoded on the stack, so the join below is the only
-        // allocation: this is the zone parser's per-record cost.
-        let mut buf = [0u8; MAX_NAME_LEN];
-        let len = presentation_wire_in(text, &mut buf)?;
-        Name::joined(&buf[..len - 1], origin)
-    }
-
     /// A zone file's owner-name text resolved against `origin`, into `buf`.
     ///
     /// The three spellings RFC 1035 §5.1 gives one name — `@`, a trailing dot,

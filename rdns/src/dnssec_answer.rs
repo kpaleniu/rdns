@@ -197,10 +197,19 @@ fn absence<'z>(
 /// the closest encloser and finding it is a hash per label of the QNAME
 /// (RFC 5155 §7.2.1) — asked per proof, the walk runs twice for one answer.
 ///
-/// `*.<closest encloser>` is guaranteed absent by [`Zone::name_kind`] — were it
-/// present the answer would be a wildcard match — and that is load-bearing:
+/// `*.<closest encloser>` has to be absent here, and that is load-bearing:
 /// `nsec_covering` searches strictly below its argument, so a name in the chain
 /// yields the record before it, which proves nothing.
+///
+/// ~~Guaranteed by [`Zone::name_kind`] — were it present the answer would be a
+/// wildcard match.~~ **Four of its six `NotFound` returns establish that and
+/// the delegation one does not** (`TODO.md` #79e): it returns `NotFound`
+/// because RFC 4592 §2.2.1 forbids synthesis below a cut, which says nothing
+/// about whether `*.sub` is in the index. The guarantor is the *caller*:
+/// `rdnsd`'s `resolve_in_zone` asks `delegation_for` before anything else —
+/// RFC 1034 §4.3.2's first case — so a name under a cut is a referral and
+/// never reaches a negative proof. `a_wildcard_below_a_cut_is_still_a_referral`
+/// holds it, in that crate, because that is where the ordering lives.
 fn deny_the_name_and_its_wildcard<'z>(
     zone: &'z Zone,
     qname: NameRef<'_>,

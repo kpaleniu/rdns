@@ -8,8 +8,12 @@
 //!
 //! A file and the flags are mutually exclusive — `--config` with `--port` is an
 //! error, not a precedence rule, because both values are valid and the failure
-//! would be silent. `--check-config`, `--generate-keys` and `--config` itself are
-//! exempt, being settings of nothing.
+//! would be silent. ~~`--check-config`, `--generate-keys` and `--config` itself
+//! are exempt~~ — **six are, not three** (`TODO.md` #79f): those, plus
+//! `--key-algorithm`, which is `--generate-keys`' parameter, and `--log-level`
+//! and `--quiet`, which the file has no key for. Of `Cli`'s 46 `#[arg]` fields
+//! the other 40 carry `conflicts_with = "config"`, and that list is the
+//! authority for this sentence.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

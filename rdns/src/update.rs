@@ -229,7 +229,7 @@ fn read_change(
         QueryClass::from(rr.class),
         QueryClass::Any | QueryClass::None
     );
-    if !deleting && (rtype == rt::ANY || rtype == rt::AXFR || rtype == rt::IXFR) {
+    if !deleting && rtype.is_meta() {
         return Err(Rejected::new(
             ResponseCode::FormatError,
             format!(

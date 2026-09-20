@@ -7,9 +7,21 @@
 //! The option rides in the OPT record, so it reaches only a client that sent
 //! one — RFC 8914 §2 puts it in "any response (SERVFAIL, NXDOMAIN, REFUSED,
 //! even NOERROR, etc.) to a query that includes an OPT pseudo-RR". That rule
-//! needs no check here: [`ClientEdns::mirror`](crate::response::ClientEdns::mirror)
-//! is the only way to a reply's OPT and hands back `None` without one, so an
-//! EDE with no OPT to ride in is not expressible (`CLAUDE.md` §17).
+//! needs no check here, and the guarantor is
+//! [`ResponseWriter::finish`](crate::response::ResponseWriter::finish): the
+//! EDE is folded in inside `if let Some(mut edns) = self.edns.take()`, so a
+//! reply with no OPT writes none — asserted by that module's
+//! `an_extended_error_with_no_opt_reaches_no_wire`, which fails if the guard
+//! is loosened to synthesize an OPT.
+//!
+//! ~~[`ClientEdns::mirror`](crate::response::ClientEdns::mirror) is the only
+//! way to a reply's OPT and hands back `None` without one, so an EDE with no
+//! OPT to ride in is not expressible (`CLAUDE.md` §17).~~ **Wrong about the
+//! mechanism, right about the conclusion** (`TODO.md` #79d):
+//! [`ResponseWriter::set_edns`](crate::response::ResponseWriter::set_edns) is
+//! `pub` and three of `rdnsd`'s answer paths call it without `mirror`. §17's
+//! "not expressible" was never true of the type; what holds is a guard, so
+//! this cites the guard and a test rather than a shape.
 
 use crate::error::WireError;
 use crate::{Edns, EdnsOption};

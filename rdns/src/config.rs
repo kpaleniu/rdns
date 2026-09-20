@@ -97,8 +97,16 @@ macro_rules! server_table {
             metrics_listen: Option<String>,
             /// Where to answer DNS over TLS (RFC 7858), QUIC (RFC 9250) and
             /// HTTPS (RFC 8484), and with what. A listener with no certificate
-            /// is refused by each daemon's `check`: a config file has no
-            /// equivalent of clap's `requires`.
+            /// is refused — in code, because a config file has no equivalent of
+            /// clap's `requires` and "either listener needs the pair" is not an
+            /// `or` `requires` can express.
+            ///
+            /// ~~By each daemon's `check`.~~ `rdnsr`'s, yes; `rdnsd` refuses it
+            /// in `main`, where the flags and the file have already been merged
+            /// into one `Cli` and the certificate is about to be loaded
+            /// (`TODO.md` #79f). One check over both sources rather than two,
+            /// at the cost of a file error without a line number —
+            /// `--check-config` still reaches it.
             tls_listen: Option<String>,
             quic_listen: Option<String>,
             https_listen: Option<String>,

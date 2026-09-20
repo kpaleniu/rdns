@@ -147,12 +147,6 @@ impl Nat64Prefix {
             octets[at[3]],
         ))
     }
-
-    /// The prefix length in bits — one of RFC 6052 §2.2's six. Not `len` as a
-    /// container's: clippy reads that name as one and asks for `is_empty`.
-    pub fn bits(&self) -> u8 {
-        self.len
-    }
 }
 
 impl std::fmt::Display for Nat64Prefix {
