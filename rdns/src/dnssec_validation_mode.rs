@@ -14,7 +14,7 @@ use crate::{Qtype, RecordDataRef, ResourceRecord};
 /// The keys every RRset in one zone is checked against, collected once.
 ///
 /// A type because collecting them is O(the zone) and checking one RRset is not,
-/// and [`DnssecValidator::validate_response`] used to do both on every call —
+/// and the check used to do both on every call —
 /// which made verifying a zone at load quadratic in the zone
 /// (`TODO.md` #50: 20,006 RRsets took 112 s where 5,006 took 7). A parameter
 /// makes the zone-wide cost visible at the call site, where it can be hoisted;
@@ -59,6 +59,36 @@ impl ZoneKeys {
     }
 }
 
+/// What checking one RRset concluded.
+///
+/// Three variants where there were two bools. `(is_valid, is_signed)` was
+/// documented in prose and nowhere in the type, all four call sites discarded
+/// the second element, and the file held seven bare tuple literals
+/// (`TODO.md` #80). The signedness was redundant by construction: a caller
+/// holds the [`ZoneKeys`] that answers it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Nothing was checked: validation is off, or the zone carries no DNSKEY
+    /// and unsigned zones are allowed.
+    Unchecked,
+    /// It verifies against the zone's own keys — or the zone is signed and
+    /// there was no RRset to check.
+    Valid,
+    /// Why, in the sentence an operator reads. Typed as the category and prose
+    /// as the reason (`CLAUDE.md` §3): the caller branches on the variant, and
+    /// "does not verify" is an expiry, a missing signature, an unreadable
+    /// algorithm or a zone with no usable key — four different mornings.
+    Invalid(String),
+}
+
+impl Verdict {
+    /// Whether the RRset may be served. `Unchecked` may: it is the answer for
+    /// a validator that is off and for an unsigned zone that is allowed to be.
+    pub fn is_valid(&self) -> bool {
+        !matches!(self, Verdict::Invalid(_))
+    }
+}
+
 pub struct DnssecValidator {
     enabled: bool,
     /// Whether an *unsigned* zone counts as a failure.
@@ -87,31 +117,6 @@ impl DnssecValidator {
         self.enabled
     }
 
-    /// Whether the zone has DNSKEY records.
-    pub fn is_zone_signed(zone: &Zone) -> bool {
-        zone.records()
-            .iter()
-            .any(|r| r.rdata.rtype() == record_types::DNSKEY)
-    }
-
-    /// Returns `(is_valid, is_signed)`: disabled is `(true, false)`, an unsigned
-    /// zone `(!require_signed, false)`, a signed one `(verified, true)`.
-    ///
-    /// Collects the zone's keys per call, so a caller checking *many* RRsets of
-    /// one zone wants [`ZoneKeys::of`] and [`DnssecValidator::validate_rrset`]
-    /// instead — see `TODO.md` #50 for what the difference measured.
-    pub fn validate_response(
-        &self,
-        zone: &Zone,
-        records: &[ZoneRecordRef<'_>],
-        _query_name: &str,
-    ) -> (bool, bool) {
-        if !self.enabled {
-            return (true, false);
-        }
-        self.validate_rrset(zone, &ZoneKeys::of(zone), records)
-    }
-
     /// One RRset, against keys already collected.
     ///
     /// The signatures come from the zone's own owner index rather than from a
@@ -125,22 +130,28 @@ impl DnssecValidator {
         zone: &Zone,
         keys: &ZoneKeys,
         records: &[ZoneRecordRef<'_>],
-    ) -> (bool, bool) {
+    ) -> Verdict {
         if !self.enabled {
-            return (true, false);
+            return Verdict::Unchecked;
         }
 
         if !keys.is_signed() {
-            return (!self.require_signed, false);
+            return if self.require_signed {
+                Verdict::Invalid("the zone carries no DNSKEY".to_string())
+            } else {
+                Verdict::Unchecked
+            };
         }
 
         // An empty answer carries no RRset, but the zone is still signed.
         let Some(first) = records.first() else {
-            return (true, true);
+            return Verdict::Valid;
         };
 
         if keys.keys.is_empty() {
-            return (false, true); // A signed zone must have DNSKEYs.
+            return Verdict::Invalid(
+                "the zone has DNSKEY records and not one of them parses".to_string(),
+            );
         }
 
         // `verify_rrset` picks the ones covering this RRset by owner and type,
@@ -171,12 +182,17 @@ impl DnssecValidator {
         );
 
         match proof {
-            RrsetProof::Verified { .. } => (true, true),
+            RrsetProof::Verified { .. } => Verdict::Valid,
             // An unsigned RRset in a signed zone is a broken zone; AD would be
-            // a lie either way.
-            RrsetProof::Unsigned | RrsetProof::Bogus(_) | RrsetProof::Unsupported(_) => {
-                (false, true)
+            // a lie either way. The three say different things to an operator,
+            // which is the whole reason the verdict carries one.
+            RrsetProof::Unsigned => {
+                Verdict::Invalid("no signature covers it, in a signed zone".to_string())
             }
+            RrsetProof::Bogus(why) => Verdict::Invalid(why.why),
+            RrsetProof::Unsupported(what) => Verdict::Invalid(format!(
+                "every signature over it uses something we cannot read: {what}"
+            )),
         }
     }
 }
@@ -192,21 +208,37 @@ mod tests {
     use crate::Ttl;
     use std::net::Ipv4Addr;
 
-    /// An unsigned zone is valid and unsigned, and the AD bit says so.
+    /// An unsigned zone is nothing to check, and may be served.
     ///
     /// Lived in `lib.rs`'s tests until the crate split, where it was the one
     /// case in the codec's own suite that needed a zone and a validator
     /// (`TODO.md` #31).
     #[test]
-    fn test_dnssec_validator_integration() {
+    fn an_unsigned_zone_is_unchecked_rather_than_invalid() {
         let validator = DnssecValidator::new(true);
         let zone = crate::zone::Zone::new(nm(&nm("example.com.").to_string()));
-        let records = vec![];
 
-        let (is_valid, is_signed) = validator.validate_response(&zone, &records, "example.com.");
+        let verdict = validator.validate_rrset(&zone, &ZoneKeys::of(&zone), &[]);
 
-        assert!(is_valid);
-        assert!(!is_signed);
+        assert_eq!(verdict, Verdict::Unchecked);
+        assert!(verdict.is_valid());
+    }
+
+    /// The same zone under `--require-signd`: the operator asserted every zone
+    /// here is signed, so one that is not is a failure with a reason.
+    #[test]
+    fn an_unsigned_zone_is_invalid_when_signing_is_required() {
+        let mut validator = DnssecValidator::new(true);
+        validator.set_require_signed(true);
+        let zone = crate::zone::Zone::new(nm(&nm("example.com.").to_string()));
+
+        let verdict = validator.validate_rrset(&zone, &ZoneKeys::of(&zone), &[]);
+
+        assert!(!verdict.is_valid());
+        assert_eq!(
+            verdict,
+            Verdict::Invalid("the zone carries no DNSKEY".to_string())
+        );
     }
 
     #[test]
@@ -219,31 +251,20 @@ mod tests {
     }
 
     #[test]
-    fn test_validator_disabled_returns_not_signed() {
+    fn a_disabled_validator_checks_nothing() {
         let validator = DnssecValidator::new(false);
         let zone = Zone::new(nm(&nm("example.com.").to_string()));
-        let records = vec![];
 
-        let (is_valid, is_signed) = validator.validate_response(&zone, &records, "example.com.");
-
-        assert!(is_valid);
-        assert!(!is_signed);
+        assert_eq!(
+            validator.validate_rrset(&zone, &ZoneKeys::of(&zone), &[]),
+            Verdict::Unchecked
+        );
     }
 
+    /// `ZoneKeys` is what answers "is this zone signed", and it is the answer
+    /// the bool used to duplicate.
     #[test]
-    fn test_validator_unsigned_zone() {
-        let validator = DnssecValidator::new(true);
-        let zone = Zone::new(nm(&nm("example.com.").to_string()));
-        let records = vec![];
-
-        let (is_valid, is_signed) = validator.validate_response(&zone, &records, "example.com.");
-
-        assert!(is_valid);
-        assert!(!is_signed);
-    }
-
-    #[test]
-    fn test_is_zone_signed_false() {
+    fn zone_keys_reads_the_dnskeys_a_zone_has() {
         let mut zone = Zone::new(nm(&nm("example.com.").to_string()));
         zone.add_record(ZoneRecord {
             name: nm(&nm("example.com.").to_string()),
@@ -251,12 +272,32 @@ mod tests {
             class: Class::new(1),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         });
+        assert!(!ZoneKeys::of(&zone).is_signed());
 
-        assert!(!DnssecValidator::is_zone_signed(&zone));
+        zone.add_record(ZoneRecord {
+            name: nm(&nm("example.com.").to_string()),
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
+            rdata: RecordData::from_parsed(&ParsedRecord::DNSKEY {
+                rtype: rdns_core::record_types::DNSKEY,
+                flags: 256,
+                protocol: 3,
+                algorithm: 8,
+                public_key: vec![1, 2, 3, 4],
+            })
+            .unwrap(),
+        });
+        assert!(ZoneKeys::of(&zone).is_signed());
     }
 
+    /// A signed zone with an RRset nothing signed is invalid, and the verdict
+    /// says which of the three ways it failed.
+    ///
+    /// This is what `--require-signd` and `verify_zones` exist to catch: a
+    /// zone that lost its signatures answers exactly as it did before.
     #[test]
-    fn test_is_zone_signed_true() {
+    fn an_unsigned_rrset_in_a_signed_zone_says_so() {
+        let validator = DnssecValidator::new(true);
         let mut zone = Zone::new(nm(&nm("example.com.").to_string()));
         zone.add_record(ZoneRecord {
             name: nm(&nm("example.com.").to_string()),
@@ -271,7 +312,21 @@ mod tests {
             })
             .unwrap(),
         });
+        zone.add_record(ZoneRecord {
+            name: nm(&nm("www.example.com.").to_string()),
+            ttl: Ttl::from_secs(3600),
+            class: Class::new(1),
+            rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
+        });
+        let keys = ZoneKeys::of(&zone);
+        let records = zone.query(nm("www.example.com.").as_ref(), Qtype::of(record_types::A));
 
-        assert!(DnssecValidator::is_zone_signed(&zone));
+        let verdict = validator.validate_rrset(&zone, &keys, &records);
+
+        assert_eq!(
+            verdict,
+            Verdict::Invalid("no signature covers it, in a signed zone".to_string()),
+            "the reason is the point, not the failure"
+        );
     }
 }

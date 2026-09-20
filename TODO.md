@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#78** through **#84**, **#90**, **#92**, **#93**, and
-**#21**, as of 2026-09-20.
+**#58**, **#68**, **#78**, **#79**, **#81**, **#82**, **#83**, **#84**, **#90**,
+**#92**, **#93**, **#94**, and **#21**, as of 2026-09-20.
 
 **#85 through #90 came out of a second architecture review on 2026-09-20**, this
 one asking what the ideal shape would be and where the tree differs. **Ten
@@ -1133,7 +1133,8 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#78**-**#84**, **#90**, **#92**, **#93**, plus **#21** —
+**#58**, **#68**, **#78**, **#79**, **#81**-**#84**, **#90**, **#92**, **#93**,
+**#94**, plus **#21** —
 see "What is open" above, which is the same list and the only place it is
 written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -4877,7 +4878,7 @@ they diverge, which is the whole of §18's "dead code is a finding".
 
 ---
 
-### 80. Two bools where the enum is already imported — **filed 2026-09-19**
+### 80. Two bools where the enum is already imported — **filed 2026-09-19, closed 2026-09-20**
 
 `dnssec_validation_mode::validate_rrset` returns `(bool, bool)`, documented as
 `(is_valid, is_signed)` in prose and nowhere in the type. Seven bare tuple
@@ -4897,6 +4898,40 @@ four call sites.
 **The refuting check**: a caller that needs `is_signed` *without* already
 holding the keys. The review found none; confirm it, because if one exists the
 remedy is naming the fields rather than collapsing them.
+
+**Confirmed, and there is none.** Two production call sites, both in
+`zones::verify_zones`, both `let (ok, _)`, and the first calls
+`keys.is_signed()` on the line above the call that returns it again. The row's
+"four call sites" counted the two tests with them, which is right about the
+shape and worth spelling out: `scale.rs` and `allocations.rs` discard it too.
+Correction to the row: `validate_response` had **one** caller, a test in its
+own module, not zero.
+
+**Closed.** `validate_rrset` returns `Verdict::{Unchecked, Valid, Invalid}`,
+the three-variant shape the row named. `Invalid` carries the sentence, which
+the pair could not: `verify_zones`'s error was "does not verify against the
+zone's own keys" for an expiry, a missing signature and an unreadable
+algorithm alike, and now names which. The seven tuple literals are gone with
+it, and every test asserts on the variant (§3).
+
+Deleted with it, both dead and both #79a's shape found in this module:
+`validate_response` (its only caller a test, and an unused `_query_name` in a
+public signature) and `is_zone_signed` (its only callers its own two tests,
+and a second spelling of `ZoneKeys::of(...).is_signed()`). Five doc comments
+in four files named `validate_response` while telling #50's story; each now
+describes the old shape rather than the gone name, which is #89 avoided in
+advance.
+
+**One test caught in the act** (§1). The first version of the "no usable key"
+test built a DNSKEY with protocol 4 and asserted `!is_valid()`, which passed
+— for the wrong reason. Pinning the message showed the verdict was "no
+signature covers it": `Dnskey::from_record` does not look at the protocol
+field at all. The test became the reachable case, and the protocol field is
+**#94**.
+
+Measured: `cargo test -p rdns --test allocations` reads 33 either side, and
+1 256 tests on Windows against 1 256 before (two tests added, two deleted),
+1 277 on Linux.
 
 ---
 
@@ -5492,6 +5527,41 @@ target's case belongs to the zone that published it, not to us.
 
 ---
 
+### 94. Nothing enforces a DNSKEY's protocol field — **filed 2026-09-20**
+
+RFC 4034 §2.1.2: "The Protocol Field MUST have value 3, and the DNSKEY RR MUST
+be treated as invalid during signature verification if it is found to be some
+value other than 3."
+
+`Dnskey::from_record` (`rdns/src/dnssec.rs:88`) copies `protocol` into the
+struct and nothing reads it afterwards except `key_tag`, which has to include
+it because the tag is over the published RDATA. `grep protocol rdns/src/dnssec.rs`
+is seven lines and none of them is a comparison.
+
+Found while writing #80's tests: a DNSKEY with protocol 4 was built to make
+`ZoneKeys` produce a signed-but-unusable zone, and it did not — the key parsed
+and was used.
+
+**Which direction matters.** As a signer it is nothing: we publish 3. As a
+*validator* it is an interop split — `rdnsr` would call Secure what a
+conforming validator calls Bogus, on a zone publishing a protocol≠​3 key. That
+is the same asymmetry §8 draws for AA and NXDOMAIN: being more permissive than
+the specification is a defect even when nothing breaks here.
+
+**No remedy taken, because the check has a choice in it** (§18): dropping the
+key in `from_record` removes it from DS matching and from the signer's own
+view as well as from verification, and "treated as invalid during signature
+verification" is narrower than that. The two shapes are one line each and
+§19 says build both.
+
+**The measurement that would decide it**: does any live zone publish one?
+`dnspython` over a handful of signed zones answers it, and so does asking what
+BIND, Unbound and Knot do — §4's "check what the other implementations do, and
+quote them", which is cheap here because all three have the check or visibly
+do not.
+
+---
+
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -5652,6 +5722,7 @@ the week; the record is under "How the queue kept going stale" in
 | **87** | the UDP request path read the wall clock, not `ServeContext`'s | **filed and closed 2026-09-20**. #52 made `Clock` the seam and recorded its sweep as "the four accept loops read `ctx.clock.now()`"; two request-path sites are neither an accept loop nor `rdnsr`'s UDP loop, so the criterion did not reach them. Filed as latent — `Clock::System` *is* `current_unix_timestamp` — and that was right about production and wrong about testability: TSIG compares the server's instant against one the client chose, with RFC 8945 §5.2.3's 300-second fudge, so a clock the loop does not read is **visible on the wire**. Two tests, each checked by reverting the line it is about: the UDP loop answers NOTAUTH, and a refused UPDATE's TSIG reads `BadTime`. The fix is a type rather than two careful call sites (§17): threading `now` into `signed_error` reached eight arguments, which clippy refuses at seven, and `Refused { msg, ip, now, max_len }` is the four values all twenty sites already passed together. Left **#92**, the twelve reads outside any request path, with no remedy named because the obvious one is not obviously right |
 | **88** | nothing measured `rdnsr`'s answer path | **filed and closed 2026-09-20**. Every allocation assertion and every benchmark lived in `rdns` and measured the *authoritative* path, so "the two daemons build a reply two ways" was an observation nobody could price — #45a had already written the sentence in prose, which §18 says is a number. One cache hit is **13 allocations**, identical on Windows and Linux and across `--test-threads` 1-3, and attributed rather than recorded (§10): 2 parse, 3 serialize — `rdns`'s own two numbers, measured again rather than quoted — and **8** for the cache lookup, the copy out of it and the message. So the two daemons differ by the copy, not by the writing: `ResponseWriter` is 0 with a held buffer and 3 without, `rdnsr`'s serialization is 3. A second test asks §10's ratio question instead of a floor and the 201st hit costs what the first did, so nothing is quadratic in how often it is asked. **The measurement was filed to decide whether to touch `handle_query`'s 432 lines, and it decided no.** Lives in `rdnsr/src/allocations.rs` rather than a `tests/` file, because a binary cannot be reached from one without a `lib.rs` and a handful of `pub`s (#82b's ratchet) — and §10's reason for the separate file is answered by the tally being per-thread, which is what `rdns`'s own file had to invent when the separate file proved neither necessary nor sufficient. That tally moved to `rdns_core::testutil::Counting<A>` rather than being written twice (§7); all 22 of `rdns`'s counts are byte-identical across the move |
 | **89** | a moved module left its doc comment on the next one | **filed and closed 2026-09-20**, and it is **#79c** filed a second time a day later. `e26a479` (#66c) moved `rdns/src/testutil.rs` to `rdns-core` and left `/// Scratch directories, for tests only.` attached to the `pub mod tls_identity;` below it, where it rendered on the crate index. `cargo doc` cannot catch a doc comment that is wrong rather than broken, and #20 had already written the remedy as prose ("after any move, grep the seam for an orphaned `///`"), so nobody ran it. Deleted, and the grep is now `rdns/tests/module_doc_comments.rs`: a `///` on a `mod X;` that shares no content word with the module's name or the first paragraph of its own `//!`. **Weak on purpose** — the seven that agree measure 4, 1, 4, 5, 2, 1 and 4 shared words against the orphan's 0, so a threshold of two would flag `mod eviction` (which agrees only through its own name) and `mod dispatch`. The one recursive `.rs` walk in the tree moved to `rdns_core::testutil` rather than being written a second time (§7), and both scans assert on what it hands back. It reads source as data, so it covers `rdnsd/src/control.rs` on Windows, where that file never compiles |
+| **80** | two bools where the enum was already imported | **filed 2026-09-19, closed 2026-09-20**. `validate_rrset` returned `(is_valid, is_signed)`, documented in prose and nowhere in the type, with seven bare tuple literals in the file. The refuting check — a caller needing `is_signed` without already holding the `ZoneKeys` that answers it — came back empty: both production sites are in `verify_zones`, and the first calls `keys.is_signed()` one line above. `Verdict::{Unchecked, Valid, Invalid(String)}` now, and the `Invalid` carries what the pair could not: `verify_zones` said "does not verify against the zone's own keys" for an expiry, a missing signature and an unreadable algorithm alike. `validate_response` and `is_zone_signed` deleted with it, both dead and both #79a's shape in the same module; five doc comments naming the first were reworded rather than left to rot (#89). Allocation counts 33 either side; one test caught agreeing with the code for the wrong reason, which is **#94** |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):

@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use rdns::clock::current_unix_timestamp;
 use rdns::dnssec::Rrsig;
 use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
-use rdns::dnssec_validation_mode::{DnssecValidator, ZoneKeys};
+use rdns::dnssec_validation_mode::{DnssecValidator, Verdict, ZoneKeys};
 use rdns::ixfr::plan_change;
 use rdns::name_keys::NameKeyBuf;
 use rdns::zone::{parse_zone_file, parse_zone_file_at, Zone, ZoneRecord};
@@ -386,7 +386,7 @@ fn signing_one_big_zone() {
 /// What `rdnsd` does to a zone it has just signed, before serving any of it.
 ///
 /// `zones::verify_zones` asks one question per signed RRset. It asked it
-/// through `DnssecValidator::validate_response`, which collects every DNSKEY
+/// through a check that collected, per call, every DNSKEY
 /// and every RRSIG *in the whole zone* per call — quadratic, and `TODO.md` #50,
 /// which this stage found and which the shape below is now the fixed version
 /// of: the keys are collected once and `validate_rrset` takes them.
@@ -445,8 +445,8 @@ fn verifying_a_signed_zone() {
             let mut checked = 0usize;
             for (name, rtype) in &rrsets {
                 let records = signed.query(name.as_ref(), Qtype::of(*rtype));
-                let (ok, _) = validator.validate_rrset(&signed, &zone_keys, &records);
-                assert!(ok, "the zone we just signed verifies");
+                let verdict = validator.validate_rrset(&signed, &zone_keys, &records);
+                assert_eq!(verdict, Verdict::Valid, "the zone we just signed verifies");
                 checked += 1;
             }
             checked

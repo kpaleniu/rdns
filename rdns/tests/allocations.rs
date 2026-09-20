@@ -26,7 +26,7 @@ use rdns::testutil::{allocations, Counting};
 use rdns::clock::current_unix_timestamp;
 use rdns::dnssec::{dnskeys_in, rrsigs_in, verify_rrset, Rrset, RrsetProof};
 use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
-use rdns::dnssec_validation_mode::{DnssecValidator, ZoneKeys};
+use rdns::dnssec_validation_mode::{DnssecValidator, Verdict, ZoneKeys};
 use rdns::record_types;
 use rdns::zone::{parse_zone_file, NameKind};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
@@ -146,7 +146,7 @@ fn writing_a_record_as_text_borrows_it() {
 /// What checking one RRset of a signed zone costs, at two zone sizes.
 ///
 /// The count is the point and not its value: `TODO.md` #50 was
-/// `validate_response` collecting every DNSKEY and every RRSIG *in the zone*
+/// the check collecting every DNSKEY and every RRSIG *in the zone* itself
 /// on every call, cloning each one's RDATA — so this number grew with the zone
 /// and verifying a zone at load was quadratic in it. Two sizes an order of
 /// magnitude apart, and the assertion is that they are the same.
@@ -183,8 +183,13 @@ fn checking_one_rrset_does_not_read_the_whole_zone() {
         // things every later one reuses, and the target here is a difference
         // rather than a level.
         let _ = validator.validate_rrset(&signed, &zone_keys, &records);
-        let (ok, count) = allocations(|| validator.validate_rrset(&signed, &zone_keys, &records));
-        assert!(ok.0, "the measurement means nothing unless it verified");
+        let (verdict, count) =
+            allocations(|| validator.validate_rrset(&signed, &zone_keys, &records));
+        assert_eq!(
+            verdict,
+            Verdict::Valid,
+            "the measurement means nothing unless it verified"
+        );
         count
     };
 

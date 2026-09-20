@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 
 use rdns::clock::current_unix_timestamp;
 use rdns::dnssec_key::SigningKey;
-use rdns::dnssec_validation_mode::{DnssecValidator, ZoneKeys};
+use rdns::dnssec_validation_mode::{DnssecValidator, Verdict, ZoneKeys};
 use rdns::ixfr::{plan_change, DeltaLog, PlannedDelta};
 use rdns::journal::Journal;
 use rdns::metrics::DnsMetrics;
@@ -1189,8 +1189,8 @@ fn warn_about_unsigned_algorithms(origin: &str, zone: &Zone) {
 /// signatures, and signatures over data since edited.
 ///
 /// The keys are collected once per zone and the loop uses
-/// [`DnssecValidator::validate_rrset`]. `validate_response` collects them per
-/// call, which made this quadratic in the zone: a ten-thousand-record zone took
+/// [`DnssecValidator::validate_rrset`]. Collecting them inside the check
+/// instead, per call, made this quadratic in the zone: a ten-thousand-record zone took
 /// **112 s** to verify and a million-record one would have taken days, on every
 /// startup, every SIGHUP, every `rdnsctl reload`, every re-signing tick and
 /// inside `--check-config` (`TODO.md` #50).
@@ -1221,8 +1221,7 @@ pub(crate) fn verify_zones(
         if !keys.is_signed() {
             // Asking with no records keeps the "is unsigned acceptable"
             // decision in one place.
-            let (ok, _) = validator.validate_rrset(zone, &keys, &[]);
-            if !ok {
+            if !validator.validate_rrset(zone, &keys, &[]).is_valid() {
                 return Err(anyhow!("{origin} is not signed"));
             }
             continue;
@@ -1236,11 +1235,10 @@ pub(crate) fn verify_zones(
                     "{origin}: a signature covers the {rtype} RRset at {name}, which is not there"
                 ));
             }
-            let (ok, _) = validator.validate_rrset(zone, &keys, &records);
-            if !ok {
+            if let Verdict::Invalid(why) = validator.validate_rrset(zone, &keys, &records) {
                 return Err(anyhow!(
                     "{origin}: the {rtype} RRset at {name} does not verify against the zone's \
-                     own keys"
+                     own keys: {why}"
                 ));
             }
             checked += 1;
@@ -1797,7 +1795,7 @@ mod tests {
     ///
     /// A ratio and not a floor (`CLAUDE.md` §10), because the number itself is
     /// one ECDSA verification and belongs to the machine. What belongs to the
-    /// code is the shape: `TODO.md` #50 was `validate_response` collecting
+    /// code is the shape: `TODO.md` #50 was the check collecting
     /// every DNSKEY and every RRSIG in the zone on every call, so the per-RRset
     /// cost grew with the zone — 32 µs at 5,006 RRsets against 1,402, and
     /// 5,632 at 20,006. On a load that meant two minutes for a zone of ten
