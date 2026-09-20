@@ -6,6 +6,7 @@
 use crate::codes::Rtype;
 use crate::ede::ExtendedError;
 use crate::error::WireError;
+use crate::macros::read_be;
 use crate::validation::Transport;
 use crate::DnsMessage;
 
@@ -345,6 +346,9 @@ impl Edns {
     /// arithmetic that decides whether a packet is FORMERR exists once.
     fn walk_options(mut rdata: &[u8], mut each: impl FnMut(u16, &[u8])) -> Result<(), WireError> {
         while !rdata.is_empty() {
+            // Ahead of `read_be!`, not instead of it: the macro reports the
+            // type it failed to read, so its two returns here are unreachable
+            // and this names the field (`message.rs`'s header does the same).
             if rdata.len() < 4 {
                 return Err(WireError::Truncated {
                     what: "an EDNS option header",
@@ -352,18 +356,18 @@ impl Edns {
                     have: rdata.len(),
                 });
             }
-            let code = u16::from_be_bytes([rdata[0], rdata[1]]);
-            let len = u16::from_be_bytes([rdata[2], rdata[3]]) as usize;
-            rdata = &rdata[4..];
-            if rdata.len() < len {
+            let (code, tail) = read_be!(u16, rdata);
+            let (len, tail) = read_be!(u16, tail);
+            let len = len as usize;
+            if tail.len() < len {
                 return Err(WireError::Truncated {
                     what: "EDNS option data",
                     need: len,
-                    have: rdata.len(),
+                    have: tail.len(),
                 });
             }
-            each(code, &rdata[..len]);
-            rdata = &rdata[len..];
+            each(code, &tail[..len]);
+            rdata = &tail[len..];
         }
         Ok(())
     }
@@ -373,6 +377,22 @@ impl Edns {
 mod tests {
     use super::*;
     use crate::{DnsMessageBuilder, Qtype, Rtype};
+
+    /// The guard `read_be!` cannot replace: a tail too short for a header is
+    /// reported as the header, where the macro would report `u16`.
+    #[test]
+    fn an_option_list_too_short_for_a_header_names_the_header() {
+        let edns = Edns::from_opt(1232, 0, &[0x00, 0x0a, 0x00]);
+        assert_eq!(
+            edns.check_options()
+                .expect_err("three octets cannot hold a code and a length"),
+            WireError::Truncated {
+                what: "an EDNS option header",
+                need: 4,
+                have: 3,
+            }
+        );
+    }
 
     /// A query advertising `advertised`, or none at all when `None`.
     fn asking(advertised: Option<u16>) -> DnsMessage {

@@ -336,7 +336,7 @@ impl ParsedRecord {
                 if rest.len() < 2 {
                     return Err(WireError::Truncated {
                         what: "RRSIG RDATA",
-                        need: 3,
+                        need: 4,
                         have: rdata.len(),
                     });
                 }
@@ -754,5 +754,28 @@ impl Additional {
             Additional::Opt(Edns::from_opt(parts.class, flags, parts.rdata), flags),
             rest,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `have` is the whole RDATA, so `need` is the whole prefix: 2 octets of
+    /// type-covered plus algorithm plus labels. RRSIG's said 3; DS's and
+    /// DNSKEY's, written the same way, both said 4.
+    #[test]
+    fn a_short_rrsig_needs_its_whole_fixed_prefix() {
+        let unpacker = DNameUnpacker::new(&[]);
+        let err = ParsedRecord::decode(record_types::RRSIG, &[0x00, 0x01, 0x08], &unpacker)
+            .expect_err("three octets cannot hold four");
+        assert_eq!(
+            err,
+            WireError::Truncated {
+                what: "RRSIG RDATA",
+                need: 4,
+                have: 3,
+            }
+        );
     }
 }
