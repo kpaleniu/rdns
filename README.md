@@ -3,33 +3,14 @@
 Hobby project implementing DNS in Rust: an authoritative server, a recursive
 resolver, and the library both are built on.
 
-## Crates
-
-| crate | what it is |
-|---|---|
-| `rdns` | the library: wire codec, zones, cache, resolver, DNSSEC |
-| `rdnsd` | authoritative server — UDP and TCP from one process |
-| `rdnsr` | recursive resolver with caching; forwards on `--upstream` |
-| `rdnsc` | command-line query client |
-| `rdnsctl` | control client for a running `rdnsd` (Unix only) |
-
-## Documentation
-
-| file | contents |
-|---|---|
-| this file | how to run and deploy it |
-| `docs/spec/` | what it does: wire codec, zone model, both daemons, DNSSEC, operations, RFC conformance |
-| `docs/CLI_USAGE.md` | `rdnsd` flags in detail |
-| `TODO.md` | open work, current state, verification recipes |
-| `docs/CLOSED_WORK.md` | every finished item, and the reasoning that produced it |
-| `CLAUDE.md` | coding rules for this repo |
-
 ## Features
 
 Authoritative (`rdnsd`):
 
 - RFC 1034 §4.3.2 in full: delegations with referrals and glue, CNAME chasing,
   wildcards to any depth, empty non-terminals, NODATA against NXDOMAIN
+- DNAME (RFC 6672) and SVCB/HTTPS (RFC 9460), stored, served and parsed from a
+  zone file
 - AXFR (RFC 5936) and IXFR (RFC 1995) in both directions; secondary role with
   REFRESH/RETRY timers and EXPIRE
 - Catalog zones (RFC 9432), consumer side: the zones a catalog lists are
@@ -41,6 +22,15 @@ Authoritative (`rdnsd`):
 - A per-zone journal of version steps, so a restart can still answer an IXFR
 - Multi-zone by directory, or a TOML config file with per-zone settings
 - Rate limiting, a response-byte budget, request validation
+
+Transports — both daemons, all from one process:
+
+- UDP and TCP (RFC 1035, RFC 7766), many queries per connection
+- DNS over TLS (RFC 7858), QUIC (RFC 9250) and HTTPS (RFC 8484) on
+  `--tls-listen`, `--quic-listen`, `--https-listen`; one certificate, re-read on
+  every reload
+- Zone transfer over TLS (RFC 9103), both directions, with the client
+  authenticated by certificate name or by TSIG
 
 DNSSEC:
 
@@ -66,10 +56,41 @@ Recursive (`rdnsr`):
 Operations:
 
 - SIGHUP reloads zones; SIGTERM/SIGINT drain in-flight work, transfers included
+- Extended DNS Errors (RFC 8914) on the refusals and on `rdnsr`'s SERVFAILs, so
+  a rejection says which one it was
+- dnstap (`--dnstap`) to a socket or a file, for every answered request
 - Prometheus metrics: RED counters, answer-latency histogram, per-zone serial and
   last-refresh gauges, `/healthz` and `/readyz`
 - A container image (`Dockerfile`), unprivileged, built and exercised in CI
 - A control socket and `rdnsctl`: `status`, `reload`, `dump`, `catalog`
+
+## Crates
+
+Nine, split so a client links neither a server nor a crypto library
+(`TODO.md` #31, #66c, #67).
+
+| crate | what it is |
+|---|---|
+| `rdns-core` | the wire format: codes, records, EDNS0, the message. No `tokio`, no crypto |
+| `rdns-present` | presentation format — the text a zone file is written in, both directions |
+| `rdns-tsig` | TSIG (RFC 8945) on its own, so a query client can sign without linking a server |
+| `rdns-transport` | the socket layer both daemons run: UDP, TCP, TLS, QUIC, HTTPS, metrics |
+| `rdns` | above the wire: zones, cache, resolver, DNSSEC, transfers |
+| `rdnsd` | authoritative server — every transport from one process |
+| `rdnsr` | recursive resolver with caching; forwards on `--upstream` |
+| `rdnsc` | command-line query client |
+| `rdnsctl` | control client for a running `rdnsd` (Unix only) |
+
+## Documentation
+
+| file | contents |
+|---|---|
+| this file | how to run and deploy it |
+| `docs/spec/` | what it does: wire codec, zone model, both daemons, DNSSEC, operations, RFC conformance |
+| `docs/CLI_USAGE.md` | `rdnsd` flags in detail |
+| `TODO.md` | open work, current state, verification recipes |
+| `docs/CLOSED_WORK.md` | every finished item, and the reasoning that produced it |
+| `CLAUDE.md` | coding rules for this repo |
 
 ## Quick start
 
@@ -310,10 +331,11 @@ UDP and TCP from one process, same host and port.
 | `--catalog <ZONE@MASTER[:PORT][#KEY]>` | consume a catalog zone (RFC 9432): replicate it, and serve the zones it lists from the same master. Repeatable; requires `--zone-dir` |
 | `--config <FILE>`, `--check-config` | read settings from TOML, and dry-run them. Mutually exclusive with the flags above |
 
-Nineteen of `rdnsd`'s forty-three flags, counted rather than remembered: the
-sentence here said "nine of twenty-seven" and both halves had gone stale.
-`rdnsd --help` is the full list; `docs/CLI_USAGE.md` covers them individually
-and `docs/spec/06-operations.md` has every default.
+Nineteen of `rdnsd`'s fifty-one flags, counted from `--help` rather than
+remembered — the denominator here has been stale twice, at twenty-seven and at
+forty-three. `rdnsd --help` is the full list;
+`docs/CLI_USAGE.md` covers them individually and `docs/spec/06-operations.md`
+has every default.
 
 ### `rdnsr` — recursive resolver
 
@@ -392,35 +414,43 @@ rdnsr --port 5354 --dns64 --rpz /var/lib/rdns/blocklist.rpz --serve-stale 86400
 
 ## Status
 
-1,098 tests passing on Windows and 1,115 on Linux, measured 2026-09-13 on the
-same tree. Plus 4 doc-tests marked `ignore`. `cargo test --workspace` is the
-source of truth, and the numbers below are what it printed rather than a
-summary kept beside it.
+1,248 tests passing on Windows and 1,269 on Linux, measured 2026-09-20 on the
+same tree, none failing. Plus 3 doc-tests marked `ignore`. `cargo test
+--workspace` is the source of truth, and the numbers below are what it printed
+rather than a summary kept beside it.
 
-| suite | tests |
+| suite | tests (Windows / Linux) |
 |---|---|
-| `rdns-core` | 178 |
-| `rdns` library | 695 (698 on Linux) |
-| `rdns` allocation gate (`tests/allocations.rs`) | 1, printing 49 measurements — `cargo test -p rdns --test allocations -- --nocapture` shows them, and most are asserted to an exact count |
-| `rdns` fuzz guard (`tests/no_input_panics.rs`) | 1, running 1,506 mutated messages through the pre-authentication path |
-| `rdns-transport` | 31 (32 on Linux) |
-| `rdnsd` | 158 (171 on Linux) |
-| `rdnsr` | 34 |
+| `rdns-core` | 188 / 190 |
+| `rdns-present` | 19 |
+| `rdns-tsig` | 27 |
+| `rdns-transport` | 38 / 39 |
+| `rdns` library | 704 / 705 |
+| `rdns` allocation gate (`tests/allocations.rs`) | 1, printing its measurements — `cargo test -p rdns --test allocations -- --nocapture` shows them, and most are asserted to an exact count |
+| `rdns` fuzz guard (`tests/no_input_panics.rs`) | 1, running mutated messages through the pre-authentication path |
+| `rdnsd` | 191 / 207 |
+| `rdnsr` | 73 |
+| `rdnsc` | 5 / 6 |
 
 The gap between the columns is the `#[cfg(unix)]` tests, which a Windows build
-never compiles.
+never compiles — which is why a green suite on one platform is not a green
+suite (`CLAUDE.md` §1).
 
-Open work is `TODO.md`: #56-#60, and one inventory of deliberate
-RFC deviations (#21). Everything else numbered is closed, and
+Open work is `TODO.md`: #58, #68, #78-#84, #87-#90, and one inventory of
+deliberate RFC deviations (#21). Everything else numbered is closed, and
 `docs/CLOSED_WORK.md` holds it.
 
-Not implemented: DNS over TLS/HTTPS/QUIC, SIG(0), DNS Cookies as anything but
-opaque bytes, `$GENERATE`, any class but IN.
+Not implemented: SIG(0), multi-signer DNSSEC (RFC 8901), EDNS Client Subnet
+(declined on purpose, RFC 7871 §11), DNS Cookies as anything but opaque bytes,
+RSA key *generation*, automated key rollover, `$GENERATE`, any class but IN.
 `docs/spec/07-rfc-conformance.md` is the full matrix.
 
 ## Licence
 
 MIT. `LICENSE` is the text.
 
-Dependencies: 138 third-party crates, all permissive (MIT, Apache-2.0, BSD, ISC,
-Unlicense, Zlib, Unicode-3.0), no copyleft. `deny.toml` holds the allow-list.
+Dependencies: `Cargo.lock` holds 214 packages, nine of them this workspace, so
+205 third-party. Every licence in the graph is permissive and none is copyleft
+— Apache-2.0, MIT, ISC, BSD-3-Clause, Unicode-3.0, Zlib, from `cargo deny
+list`. `deny.toml` holds the allow-list, the duplicate-version exceptions, and
+the reason for each; `cargo deny check` reports all four sections ok.
