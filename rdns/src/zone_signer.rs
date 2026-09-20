@@ -27,6 +27,7 @@ use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, Nsec3Hash, MAX_
 use crate::dnssec_key::SigningKey;
 use crate::error::DnssecError;
 use crate::error::DnssecResult as Result;
+use crate::folded_hash::folded_hash;
 use crate::record_types as rt;
 use crate::zone::{Zone, ZoneRecord, ZoneRecordRef};
 use crate::Class;
@@ -209,24 +210,16 @@ impl SigningPolicy {
         if spread == 0 {
             return self.expiration;
         }
-        // FNV-1a over owner and type: a cheap, stable spread. `DefaultHasher`
-        // is randomized per process, which would destroy the determinism above.
-        //
-        // Over the *wire* octets since #38: a length octet is at most 63
-        // (RFC 1035 §2.3.4) so the fold below still cannot touch one, and the
-        // spread stays a function of (owner, type) alone. The numbers it picks
-        // differ from the presentation-text version's, so the first re-signing
-        // after that change moves every expiry once.
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in name
-            .as_wire()
-            .iter()
-            .copied()
-            .chain(rtype.to_u16().to_be_bytes().iter().copied())
-        {
-            hash ^= u64::from(byte.to_ascii_lowercase());
-            hash = hash.wrapping_mul(0x100_0000_01b3);
-        }
+        // Over the *wire* octets since #38, so the spread stays a function of
+        // (owner, type) alone. The numbers differ from the presentation-text
+        // version's, so the first re-signing after that change moved every
+        // expiry once.
+        let hash = folded_hash(
+            name.as_wire()
+                .iter()
+                .copied()
+                .chain(rtype.to_u16().to_be_bytes()),
+        );
         self.expiration
             .saturating_sub((hash % spread) as u32)
             .max(self.inception.saturating_add(1))
@@ -2236,6 +2229,36 @@ a\.b    IN A   192.0.2.50
                 "and never much less: {expiry} is outside the spread"
             );
             assert!(*expiry > policy.inception, "and always after inception");
+        }
+    }
+
+    /// The slope itself, pinned. `the_spread_is_deterministic_for_a_given_name_and_type`
+    /// below asks whether the number is stable within one process; this asks
+    /// whether it is the *same* number it was, which is the property two servers
+    /// holding one zone need and the one a shared hash can silently break
+    /// (`TODO.md` #81b).
+    ///
+    /// Measured against the tree before `expiry_for`'s own FNV-1a loop was
+    /// merged into `rdns_core::folded_hash`, so it is what says the merge moved
+    /// nothing. It is allowed to change — a deliberate change to the spread is a
+    /// re-signing of every zone, which is exactly what should have to be typed
+    /// out here.
+    #[test]
+    fn the_spread_is_the_spread_it_was() {
+        let policy = policy(DenialChain::Nsec);
+        for (name, rtype, offset) in [
+            ("example.com.", rt::SOA, 164_892),
+            ("www.example.com.", rt::A, 316_449),
+            ("www.example.com.", rt::AAAA, 2_418),
+            ("mail.example.com.", rt::A, 369_622),
+            ("*.example.com.", rt::TXT, 203_755),
+            ("a.very.deep.name.example.com.", rt::NS, 41_079),
+        ] {
+            assert_eq!(
+                policy.expiration - policy.expiry_for(nm(name).as_ref(), rtype),
+                offset,
+                "{name} {rtype:?}"
+            );
         }
     }
 

@@ -7,6 +7,7 @@
 
 use crate::dname::{write_bytes, POINTER_MASK, POINTER_TAG};
 use crate::error::WireError;
+use crate::folded_hash::folded_hash;
 use crate::record_types as rt;
 use crate::{Name, NameRef, Rtype};
 use std::collections::HashMap;
@@ -183,7 +184,7 @@ impl NameCompressor {
                 .find(|s| arena[s.start as usize..s.end as usize].eq_ignore_ascii_case(needle))
                 .map(|s| s.offset);
         }
-        let entry = self.seen[*self.index.get(&folded_hash(needle))? as usize];
+        let entry = self.seen[*self.index.get(&folded_hash(needle.iter().copied()))? as usize];
         self.arena[entry.start as usize..entry.end as usize]
             .eq_ignore_ascii_case(needle)
             .then_some(entry.offset)
@@ -211,7 +212,11 @@ impl NameCompressor {
     /// Index one entry of `seen`, keeping whichever is already there.
     fn note(&mut self, i: usize) {
         let entry = self.seen[i];
-        let hash = folded_hash(&self.arena[entry.start as usize..entry.end as usize]);
+        let hash = folded_hash(
+            self.arena[entry.start as usize..entry.end as usize]
+                .iter()
+                .copied(),
+        );
         self.index.entry(hash).or_insert(i as u32);
     }
 
@@ -266,22 +271,6 @@ impl NameCompressor {
             _ => write_bytes(buf, pos, rdata),
         }
     }
-}
-
-/// FNV-1a over the ASCII-folded bytes (RFC 4343), folding exactly as [`lookup`]
-/// compares.
-///
-/// Not DoS-resistant on purpose: a collision drops a compression target, so a
-/// chosen name buys a few extra bytes in one message and nothing else.
-///
-/// [`lookup`]: NameCompressor::lookup
-fn folded_hash(name: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    for &byte in name {
-        hash ^= u64::from(byte.to_ascii_lowercase());
-        hash = u64::wrapping_mul(hash, 0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 #[cfg(test)]
@@ -401,12 +390,12 @@ mod tests {
         // The hash takes wire octets now, so the comparison is over names.
         let wire = |text: &str| nm(text).as_ref().as_wire().to_vec();
         assert_eq!(
-            folded_hash(&wire("Example.COM.")),
-            folded_hash(&wire("example.com."))
+            folded_hash(wire("Example.COM.")),
+            folded_hash(wire("example.com."))
         );
         assert_ne!(
-            folded_hash(&wire("\u{212A}.example.com.")),
-            folded_hash(&wire("k.example.com."))
+            folded_hash(wire("\u{212A}.example.com.")),
+            folded_hash(wire("k.example.com."))
         );
     }
 

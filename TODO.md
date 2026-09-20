@@ -5165,15 +5165,33 @@ Measured: `cargo test -p rdns --test allocations` reads 33 either side, and
   fourth copy of `hmac-sha256` — the flag's default and the file's default are
   one decision.
 
-- **81b. FNV-1a over ASCII-folded bytes, twice.** `compression::folded_hash` and
-  the loop inside `zone_signer::expiry_for`, same offset, same prime, same fold,
-  each with its own comment stating the same requirement in different words.
-  They agree today. The asymmetry is what a drift would cost: one loses a
-  compression pointer, the other moves every RRSIG expiry in every zone at once,
-  and §8 requires that two servers holding the zone agree about it.
+- **81b. FNV-1a over ASCII-folded bytes, twice — closed 2026-09-20.**
+  `compression::folded_hash` and the loop inside `zone_signer::expiry_for`, same
+  offset, same prime, same fold, each with its own comment stating the same
+  requirement in different words. The asymmetry is what a drift would cost: one
+  loses a compression pointer, the other moves every RRSIG expiry in every zone
+  at once, and §8 requires that two servers holding the zone agree about it.
 
-  Assert the two agree on one input before merging them — if they disagree, the
-  finding is wrong and both comments are missing the reason why.
+  **They agreed**, and the row's own instruction is how that was established
+  rather than assumed. The check is not an assertion that the two loops compute
+  the same number — that would be a test of a copy — but a golden test taken
+  *through the observable*: six `expiry_for` offsets measured against the tree
+  before the merge, asserted after it. Unchanged, so the merge moved no
+  signature's expiry.
+
+  `rdns_core::folded_hash`, one function over a byte iterator, because the two
+  callers hash different things — the compressor a suffix, the signer a name
+  plus two octets of type — and two entry points is what invites the next copy.
+  The module doc carries the asymmetry, which is the reason §7 says to move
+  (the two old comments each stated half of it). `expiry_for`'s note about
+  `DefaultHasher` being per-process seeded went with it: that is a fact about
+  the hash, not about the signer.
+
+  Golden tests on both sides: `folded_hash::the_hash_is_the_hash_it_was` pins
+  the empty input and one name, and `zone_signer::the_spread_is_the_spread_it_was`
+  pins the six offsets, with a note saying the number is *allowed* to change and
+  that changing it deliberately means re-signing every zone — which is what
+  should have to be typed out.
 
 ---
 

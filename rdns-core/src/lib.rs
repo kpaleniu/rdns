@@ -22,6 +22,7 @@ pub mod control;
 pub mod dname;
 pub mod ede;
 pub mod error;
+pub mod folded_hash;
 pub mod name;
 pub mod name_keys;
 pub mod persist;
