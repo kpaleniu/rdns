@@ -1328,7 +1328,12 @@ pub(crate) fn load_zones(
                 zones: ZoneMap::new(),
                 kept: Default::default(),
             };
-            let (key, zone, was_kept) = load_one(Path::new(path), &zone_origin, keep)?;
+            // Named, because the two sibling branches below name theirs and
+            // this one did not: a `--zone-file` that will not parse reported
+            // `line 2: ...` and nothing else, which is §7's second copy — the
+            // one place the shared reasoning was not applied (`TODO.md` #90).
+            let (key, zone, was_kept) = load_one(Path::new(path), &zone_origin, keep)
+                .map_err(|e| anyhow!("{path}: {e}"))?;
             if was_kept {
                 loaded.kept.insert(key.clone());
             } else {

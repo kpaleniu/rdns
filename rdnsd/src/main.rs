@@ -687,7 +687,15 @@ struct Cli {
     ///
     /// Reads the config, the TSIG secrets and the signing keys, and checks
     /// everything knowable without the network. Exit 0 means it would start.
-    #[arg(long, requires = "config")]
+    ///
+    /// ~~`requires = "config"`~~ removed at `TODO.md` #90: everything this
+    /// checks is flag-settable too, so the requirement was inert where it
+    /// mattered — `--zone-file` conflicts with `--config`, so clap never
+    /// enforced it there — and misleading where it fired, telling an operator
+    /// running a flags-only server to write a TOML file. `rdnsr`'s own
+    /// `check_config` carries that argument and has never had the attribute
+    /// (§7: the copy with the reason on it was the right one).
+    #[arg(long)]
     check_config: bool,
     /// How much to say: error, warn, info, debug or trace.
     ///
