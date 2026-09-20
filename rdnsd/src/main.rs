@@ -16,6 +16,9 @@
 //! nothing below them decides to exit. A change about *what an answer is* belongs
 //! two modules down.
 
+// `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
+#![warn(unreachable_pub)]
+
 mod answer;
 /// Consuming catalog zones: what `--catalog` provisions (RFC 9432).
 mod catalog;

@@ -18,6 +18,9 @@
 //! `rdns-core`. A hash *value* of a fixed length lives here
 //! ([`denial_wire::Nsec3Hash`]); everything that computes one is `rdns`'s.
 
+// `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
+#![warn(unreachable_pub)]
+
 pub mod denial_wire;
 pub mod dnssec_time;
 pub mod record_text;

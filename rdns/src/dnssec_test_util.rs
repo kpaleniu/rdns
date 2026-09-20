@@ -23,7 +23,7 @@ use crate::{NameRef, ParsedRecord, RecordData, ResourceRecord};
 /// DNSKEY flags for a zone-signing key, and for a key-signing key (which adds
 /// the Secure Entry Point bit).
 const ZSK_FLAGS: u16 = 0x0100;
-pub const KSK_FLAGS: u16 = 0x0101;
+pub(crate) const KSK_FLAGS: u16 = 0x0101;
 
 /// A keypair that can actually sign.
 ///
@@ -32,20 +32,20 @@ pub const KSK_FLAGS: u16 = 0x0101;
 /// What is added here is publishing one key at several owner names and flag
 /// combinations, which a signer has no business offering and a chain-walk test
 /// needs constantly.
-pub struct TestKey {
+pub(crate) struct TestKey {
     key: SigningKey,
 }
 
 impl TestKey {
-    pub fn generate_p256() -> Self {
+    pub(crate) fn generate_p256() -> Self {
         Self::generate(SigningAlgorithm::EcdsaP256Sha256)
     }
 
-    pub fn generate_p384() -> Self {
+    pub(crate) fn generate_p384() -> Self {
         Self::generate(SigningAlgorithm::EcdsaP384Sha384)
     }
 
-    pub fn generate_ed25519() -> Self {
+    pub(crate) fn generate_ed25519() -> Self {
         Self::generate(SigningAlgorithm::Ed25519)
     }
 
@@ -57,30 +57,30 @@ impl TestKey {
         }
     }
 
-    pub fn algorithm(&self) -> u8 {
+    pub(crate) fn algorithm(&self) -> u8 {
         self.key.algorithm().code()
     }
 
-    pub fn public_key(&self) -> &[u8] {
+    pub(crate) fn public_key(&self) -> &[u8] {
         self.key.dnskey_public_key()
     }
 
     /// Sign arbitrary bytes, exactly as a signer would sign the canonical form.
-    pub fn sign(&self, data: &[u8]) -> Vec<u8> {
+    pub(crate) fn sign(&self, data: &[u8]) -> Vec<u8> {
         self.key.sign(data).expect("sign")
     }
 
     /// This key published at `owner` as a zone-signing key.
-    pub fn dnskey(&self, owner: &str) -> Dnskey {
+    pub(crate) fn dnskey(&self, owner: &str) -> Dnskey {
         self.dnskey_with(owner, ZSK_FLAGS)
     }
 
     /// This key published at `owner` as a key-signing key (SEP set).
-    pub fn ksk(&self, owner: &str) -> Dnskey {
+    pub(crate) fn ksk(&self, owner: &str) -> Dnskey {
         self.dnskey_with(owner, KSK_FLAGS)
     }
 
-    pub fn dnskey_with(&self, owner: &str, flags: u16) -> Dnskey {
+    pub(crate) fn dnskey_with(&self, owner: &str, flags: u16) -> Dnskey {
         Dnskey {
             owner: nm(owner),
             flags,
@@ -92,7 +92,7 @@ impl TestKey {
 
     /// An RRSIG with everything filled in but the signature itself — the shape
     /// [`signed_data`] hashes.
-    pub fn rrsig_template(
+    pub(crate) fn rrsig_template(
         &self,
         owner: NameRef<'_>,
         type_covered: Rtype,
@@ -116,7 +116,7 @@ impl TestKey {
     }
 
     /// Produce a genuine RRSIG over `rdatas`, signed as a ZSK would sign it.
-    pub fn sign_rrset(
+    pub(crate) fn sign_rrset(
         &self,
         owner: &str,
         rtype: Rtype,
@@ -135,7 +135,13 @@ impl TestKey {
 
     /// As [`TestKey::sign_rrset`], but for a key published with `flags` — the
     /// key tag depends on the flags, so a KSK signature has to name the KSK.
-    pub fn sign_rrset_as(&self, rrset: &Rrset<'_>, ttl: u32, signer: &str, flags: u16) -> Rrsig {
+    pub(crate) fn sign_rrset_as(
+        &self,
+        rrset: &Rrset<'_>,
+        ttl: u32,
+        signer: &str,
+        flags: u16,
+    ) -> Rrsig {
         let mut rrsig = self.rrsig_template(rrset.owner, rrset.rtype, ttl, signer, flags);
         let data =
             signed_data(&rrsig, rrset.owner, rrset.class, rrset.rdatas).expect("build signed data");
@@ -147,14 +153,14 @@ impl TestKey {
 /// A signed zone: a KSK the parent's DS points at, and a ZSK signing the data.
 /// The split is not required by the protocol, but it is what real zones do and
 /// what the chain walk has to handle.
-pub struct TestZone {
-    pub name: String,
-    pub ksk: TestKey,
-    pub zsk: TestKey,
+pub(crate) struct TestZone {
+    pub(crate) name: String,
+    pub(crate) ksk: TestKey,
+    pub(crate) zsk: TestKey,
 }
 
 impl TestZone {
-    pub fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         TestZone {
             name: name.to_string(),
             ksk: TestKey::generate_p256(),
@@ -163,12 +169,12 @@ impl TestZone {
     }
 
     /// Both public keys as they are published at the apex.
-    pub fn dnskeys(&self) -> Vec<Dnskey> {
+    pub(crate) fn dnskeys(&self) -> Vec<Dnskey> {
         vec![self.ksk.ksk(&self.name), self.zsk.dnskey(&self.name)]
     }
 
     /// The apex DNSKEY RRset and the KSK's signature over it.
-    pub fn signed_dnskey_rrset(&self) -> (Vec<RecordData>, Rrsig) {
+    pub(crate) fn signed_dnskey_rrset(&self) -> (Vec<RecordData>, Rrsig) {
         let rdatas: Vec<RecordData> = self.dnskeys().iter().map(dnskey_rdata).collect();
         let sig = self.ksk.sign_rrset_as(
             &Rrset::new(nm(&self.name).as_ref(), rt::DNSKEY, Class::new(1), &rdatas),
@@ -180,7 +186,7 @@ impl TestZone {
     }
 
     /// The DS record the parent must publish for this zone.
-    pub fn ds(&self, digest_type: u8) -> Ds {
+    pub(crate) fn ds(&self, digest_type: u8) -> Ds {
         let ksk = self.ksk.ksk(&self.name);
         Ds {
             owner: nm(&self.name),
@@ -193,7 +199,7 @@ impl TestZone {
 
     /// The apex DNSKEY RRset plus its RRSIG, as resource records ready to put
     /// in an answer section.
-    pub fn dnskey_records(&self) -> Vec<ResourceRecord> {
+    pub(crate) fn dnskey_records(&self) -> Vec<ResourceRecord> {
         let (rdatas, sig) = self.signed_dnskey_rrset();
         let mut out: Vec<ResourceRecord> = rdatas
             .into_iter()
@@ -214,7 +220,11 @@ impl TestZone {
     ///
     /// The same signature verifies at every name the wildcard could reach, so a
     /// test may re-own the result onto any of them.
-    pub fn sign_as_wildcard(&self, records: &[ResourceRecord], wildcard: &str) -> ResourceRecord {
+    pub(crate) fn sign_as_wildcard(
+        &self,
+        records: &[ResourceRecord],
+        wildcard: &str,
+    ) -> ResourceRecord {
         let first = records.first().expect("an RRset has at least one record");
         let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
         let mut sig = self.zsk.sign_rrset(
@@ -231,7 +241,7 @@ impl TestZone {
 
     /// Sign `records` (all one RRset) with the ZSK, returning the RRSIG record
     /// to put beside them.
-    pub fn sign_records(&self, records: &[ResourceRecord]) -> ResourceRecord {
+    pub(crate) fn sign_records(&self, records: &[ResourceRecord]) -> ResourceRecord {
         let first = records.first().expect("an RRset has at least one record");
         let rdatas: Vec<RecordData> = records.iter().map(|r| r.rdata.clone()).collect();
         let sig = self.zsk.sign_rrset(
@@ -247,7 +257,7 @@ impl TestZone {
 }
 
 /// A DNSKEY's RDATA in stored form.
-pub fn dnskey_rdata(key: &Dnskey) -> RecordData {
+pub(crate) fn dnskey_rdata(key: &Dnskey) -> RecordData {
     RecordData::from_parsed(&ParsedRecord::DNSKEY {
         rtype: crate::record_types::DNSKEY,
         flags: key.flags,
@@ -259,7 +269,7 @@ pub fn dnskey_rdata(key: &Dnskey) -> RecordData {
 }
 
 /// An RRSIG as a resource record.
-pub fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
+pub(crate) fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
         name: sig.owner.clone(),
         class: Class::new(1),
@@ -280,7 +290,7 @@ pub fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
 }
 
 /// A DS as a resource record.
-pub fn ds_record(ds: &Ds, ttl: Ttl) -> ResourceRecord {
+pub(crate) fn ds_record(ds: &Ds, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
         name: ds.owner.clone(),
         class: Class::new(1),
@@ -302,7 +312,7 @@ pub fn ds_record(ds: &Ds, ttl: Ttl) -> ResourceRecord {
 /// This is [`SigningKey`] rather than [`TestKey`] on purpose — a `sign_zone`
 /// test is exercising the signer, so its keys have to be the ones the signer
 /// would be handed.
-pub fn signing_keys(origin: &str) -> Vec<SigningKey> {
+pub(crate) fn signing_keys(origin: &str) -> Vec<SigningKey> {
     vec![
         SigningKey::generate(
             SigningAlgorithm::EcdsaP256Sha256,
@@ -317,7 +327,7 @@ pub fn signing_keys(origin: &str) -> Vec<SigningKey> {
 
 /// Thirty days' validity from `now`, which is the default the daemon runs and
 /// the only value either signing test has wanted.
-pub fn signing_policy(now: u64, chain: DenialChain) -> SigningPolicy {
+pub(crate) fn signing_policy(now: u64, chain: DenialChain) -> SigningPolicy {
     SigningPolicy::valid_for(now, 30 * 86_400).with_chain(chain)
 }
 
@@ -328,14 +338,14 @@ pub fn signing_policy(now: u64, chain: DenialChain) -> SigningPolicy {
 /// The NSEC3 parameters every fixture here hashes under. One salt and one
 /// iteration count, because two records in one proof that disagree about
 /// either are a chain with a hole in it rather than a test.
-pub const NSEC3_SALT: [u8; 2] = [0xaa, 0xbb];
+pub(crate) const NSEC3_SALT: [u8; 2] = [0xaa, 0xbb];
 
-pub const NSEC3_ITERATIONS: u16 = 3;
+pub(crate) const NSEC3_ITERATIONS: u16 = 3;
 
 /// The NSEC3 denying `name`, parsed — the owner hash is `name`'s under
 /// [`NSEC3_SALT`], and `next` is given outright because a fixture wants to
 /// choose what the span contains.
-pub fn nsec3(zone: &str, name: &str, next: &[u8], flags: u8, types: &[Rtype]) -> Nsec3 {
+pub(crate) fn nsec3(zone: &str, name: &str, next: &[u8], flags: u8, types: &[Rtype]) -> Nsec3 {
     let hash = nsec3_hash_name(nm(name).as_ref(), &NSEC3_SALT, NSEC3_ITERATIONS)
         .expect("hash the owner name");
     Nsec3 {
@@ -352,7 +362,7 @@ pub fn nsec3(zone: &str, name: &str, next: &[u8], flags: u8, types: &[Rtype]) ->
 }
 
 /// The same record on the wire.
-pub fn nsec3_record(
+pub(crate) fn nsec3_record(
     zone: &str,
     name: &str,
     next: &[u8],
@@ -365,7 +375,7 @@ pub fn nsec3_record(
 
 /// An NSEC3 with both hashes given outright, for a chain laid out by hand
 /// rather than by finding names that hash where they are wanted.
-pub fn nsec3_span(
+pub(crate) fn nsec3_span(
     zone: &str,
     owner_hash: &[u8],
     next: &[u8],

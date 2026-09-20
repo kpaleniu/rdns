@@ -1,5 +1,8 @@
 //! A command-line DNS query client.
 
+// `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
+#![warn(unreachable_pub)]
+
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::path::Path;

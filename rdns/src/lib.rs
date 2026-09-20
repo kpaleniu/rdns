@@ -7,6 +7,15 @@
 //! defines is re-exported here, so `rdns::DnsMessage` still names what it
 //! always did and nothing downstream has two spellings to choose between.
 
+// `TODO.md` #82b's ratchet. #38's sweep asked "is this item *named* from
+// outside" and had no compiler behind it, so it did not hold: `pub` in this
+// crate went 694 → 889 over the 168 commits after #38 was filed, `pub(crate)`
+// 17 → 21. This lint asks the weaker question rustc can answer — is the item
+// reachable from outside at all — which is what caught `xfr.rs`'s five `pub fn`
+// on two private assemblers. It does not answer #38's question; that sweep has
+// to be re-run by hand.
+#![warn(unreachable_pub)]
+
 pub use rdns_core::*;
 
 // The presentation format is its own crate since `TODO.md` #66a, so that a

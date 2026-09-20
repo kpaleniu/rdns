@@ -101,7 +101,7 @@ struct AxfrAssembler {
 }
 
 impl AxfrAssembler {
-    pub fn new(zone: Name) -> Self {
+    fn new(zone: Name) -> Self {
         AxfrAssembler {
             zone,
             records: Vec::new(),
@@ -120,7 +120,7 @@ impl AxfrAssembler {
     }
 
     /// Take one message of the transfer.
-    pub fn accept(&mut self, msg: &DnsMessage) -> TransferResult<Progress> {
+    fn accept(&mut self, msg: &DnsMessage) -> TransferResult<Progress> {
         check_envelope(msg, self.complete)?;
 
         for rr in &msg.answers {
@@ -174,7 +174,7 @@ impl AxfrAssembler {
     /// The assembled zone, if the transfer closed properly.
     ///
     /// A stream that stopped early is an error, not a short zone.
-    pub fn into_zone(self) -> TransferResult<Zone> {
+    fn into_zone(self) -> TransferResult<Zone> {
         if !self.complete {
             return Err(TransferError::malformed(format!(
                 "transfer of {} ended without its closing SOA — the stream was cut",
@@ -268,7 +268,7 @@ struct IxfrAssembler {
 }
 
 impl IxfrAssembler {
-    pub fn new(zone: Name) -> Self {
+    fn new(zone: Name) -> Self {
         IxfrAssembler {
             zone: zone.clone(),
             current_serial: None,
@@ -280,7 +280,7 @@ impl IxfrAssembler {
     }
 
     /// Take one message of the answer.
-    pub fn accept(&mut self, msg: &DnsMessage) -> TransferResult<Progress> {
+    fn accept(&mut self, msg: &DnsMessage) -> TransferResult<Progress> {
         check_envelope(msg, self.state == IxfrState::Complete)?;
 
         for rr in &msg.answers {

@@ -7,6 +7,9 @@
 //! `Rtype`, `Qtype`, `Ttl`, `Serial` and `Edns`'s option list are sealed by
 //! sitting in a module small enough to be the boundary (`CLAUDE.md` §17).
 
+// `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
+#![warn(unreachable_pub)]
+
 /// This build, as `<package version> (<git describe>)`. Stamped by `build.rs`
 /// and passed to clap's `version` by every binary, so `--version` names a
 /// commit.

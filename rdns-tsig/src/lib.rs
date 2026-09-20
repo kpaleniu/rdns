@@ -9,6 +9,9 @@
 //! The module below is re-exported flat, so `rdns_tsig::TsigKey` is the path
 //! and `rdns::tsig::TsigKey` still is too.
 
+// `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
+#![warn(unreachable_pub)]
+
 mod tsig;
 
 pub use tsig::*;

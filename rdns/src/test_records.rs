@@ -21,12 +21,12 @@ use std::net::Ipv4Addr;
 /// in `name.rs`. The copies left are in the standalone binaries, `tests/`,
 /// `benches/` and `examples/`, which cannot see a `#[cfg(test)]` item in the
 /// library; making it public API to spare them would be the worse trade.
-pub fn nm(text: &str) -> Name {
+pub(crate) fn nm(text: &str) -> Name {
     text.parse().expect("a test name parses")
 }
 
 /// An A record at 300s, the TTL every caller was already using.
-pub fn a_record(name: &str, addr: impl Into<Ipv4Addr>) -> ResourceRecord {
+pub(crate) fn a_record(name: &str, addr: impl Into<Ipv4Addr>) -> ResourceRecord {
     ResourceRecord {
         name: nm(name),
         class: Class::new(1),
@@ -35,13 +35,13 @@ pub fn a_record(name: &str, addr: impl Into<Ipv4Addr>) -> ResourceRecord {
     }
 }
 
-pub fn a_rdata(addr: impl Into<Ipv4Addr>) -> RecordData {
+pub(crate) fn a_rdata(addr: impl Into<Ipv4Addr>) -> RecordData {
     RecordData::from_parsed(&ParsedRecord::A(addr.into())).expect("encode A")
 }
 
 /// An apex SOA whose MNAME and RNAME are derived from the zone, so a test that
 /// names two zones cannot accidentally give them the same SOA.
-pub fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
+pub(crate) fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
         name: nm(zone),
         class: Class::new(1),
@@ -59,7 +59,7 @@ pub fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
     }
 }
 
-pub fn nsec_record(owner: &str, next: &str, types: &[Rtype], ttl: Ttl) -> ResourceRecord {
+pub(crate) fn nsec_record(owner: &str, next: &str, types: &[Rtype], ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
         name: nm(owner),
         class: Class::new(1),
@@ -76,7 +76,7 @@ pub fn nsec_record(owner: &str, next: &str, types: &[Rtype], ttl: Ttl) -> Resour
 ///
 /// `ixfr` and `journal` had this identical: both are about the *steps between*
 /// two versions, so both want a zone that differs only where they say it does.
-pub fn zone_at(serial: u32, body: &str) -> Zone {
+pub(crate) fn zone_at(serial: u32, body: &str) -> Zone {
     parse_zone_file(
         &format!(
             "$TTL 3600\n\

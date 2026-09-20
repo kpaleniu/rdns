@@ -17,6 +17,9 @@
 //! It holds no DNS logic. Deciding what a question deserves is `rdns`'s, and
 //! answering it is each daemon's.
 
+// `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
+#![warn(unreachable_pub)]
+
 pub mod https;
 pub mod logging;
 pub mod metrics_server;

@@ -6,6 +6,9 @@
 //! Unix only, because the socket is. On Windows it says so and exits 2 rather
 //! than not existing, so `cargo build --workspace` still covers it.
 
+// `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
+#![warn(unreachable_pub)]
+
 use clap::Parser;
 
 /// `/run` rather than `/var/run` (its symlink) or `/tmp`: tmpfs, cleared on

@@ -4957,19 +4957,35 @@ remedy is naming the fields rather than collapsing them.
   modules and a manifest. 82a's own move stands on the measurement above it.
 
 - **82b. Five `pub fn` on private structs in `xfr.rs`, and the ratchet question
-  behind them.** `AxfrAssembler` and `IxfrAssembler` are private and their
-  `new`/`accept`/`into_zone` are `pub` — #38's exact shape, in a module #38
-  swept. Five lines.
+  behind them — closed 2026-09-20.** `AxfrAssembler` and `IxfrAssembler` are
+  private and their `new`/`accept`/`into_zone` were `pub` — #38's exact shape,
+  in a module #38 swept. They are module-private now, not `pub(crate)`: the
+  structs they hang off cannot be named outside `xfr` either.
 
-  File the ratchet with them, because the measurement is already taken:
-  `RUSTFLAGS="-W unreachable_pub" cargo check --workspace --all-targets` gives
-  44 warnings, **5 real** (these) and 39 from two `#[cfg(test)]` fixture
-  modules. The lint asks "is this reachable" and #38 asked "is this *named*
-  from outside" — two different questions, and rustc only has the first. So
-  either take that trade deliberately or write down that #38's criterion has no
-  compiler behind it and needs re-running. It is worth knowing that it has not
-  been: `pub` in `rdns/src` has gone 517 → 651 across 77 commits since the
-  sweep, with `pub(crate)` flat.
+  **The ratchet is taken.** `RUSTFLAGS="-W unreachable_pub" cargo check
+  --workspace --all-targets` gave **44 warning lines over 43 distinct sites**
+  — the 44th is `xfr.rs:104` reported once per target, which is why the row
+  first read "5 real and 39 from two fixture modules" and the fixture number is
+  **38**. Those 38 are `test_records` and `dnssec_test_util`, both
+  `#[cfg(test)] mod`, so `pub(crate)` is what they always meant. With all 43
+  fixed, `#![warn(unreachable_pub)]` is in all nine crate roots and the
+  workspace is clean under it; the four binaries had nothing to fix, so the
+  attribute there is only the lock.
+
+  **What it does not buy**, written on the lint in `rdns/src/lib.rs` so the
+  next reader does not over-trust it: rustc answers "is this reachable from
+  outside", #38 asked "is this *named* from outside", and only the first has a
+  compiler. #38's sweep still has to be re-run by hand.
+
+  ~~`pub` in `rdns/src` has gone 517 → 651 across 77 commits since the sweep,
+  with `pub(crate)` flat.~~ **The direction was right and the numbers are not
+  reproducible**: no command was recorded with them, and none tried here gives
+  either figure. Re-measured with the criterion written down —
+  `git grep -hE "^\s*pub [a-z]" <rev> -- 'rdns/src/*.rs'`, minus comment lines
+  — it is **694 at #38's filing (`2835422`), 706 at #38a's close, 889 today**,
+  across 168 commits, with `pub(crate)` 17 → 21. §18's "never write a number
+  you did not just read" has a corollary: write the command beside it, or the
+  next person cannot re-read it.
 
 ---
 
