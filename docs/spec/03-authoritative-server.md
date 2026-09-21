@@ -183,7 +183,7 @@ mirrored OPT and the TSIG, TC=1, RCODE 0.
 | NXDOMAIN | `NameKind::NotFound` inside a zone we serve; an UPDATE prerequisite of §2.4.4's form that did not hold (§3.2.4) |
 | FORMERR | a malformed EDNS option list; AXFR over UDP; an UPDATE that breaks §3.1 or §3.4.1's prescan |
 | NOTIMP | any opcode but QUERY, NOTIFY and UPDATE |
-| REFUSED | a class we do not serve; a name in no zone we hold; a transfer the ACL or key scope denies, or one not over TLS 1.3 under `--transfer-tls-only`; an UPDATE that is unsigned, outside its key's scope, for a zone we replicate, or for a zone we cannot write |
+| REFUSED | a class we do not serve; a name in no zone we hold; a transfer the ACL or key scope denies, or one not over TLS 1.3 under `--transfer-tls-only`; an UPDATE that is unsigned, outside its key's scope, for a zone we replicate, or for a zone we cannot write — including one whose file `$INCLUDE`s another |
 | NOTAUTH | a transfer or NOTIFY for a zone not served here; a TSIG that did not verify; an UPDATE for a zone we are not authoritative for (RFC 2136 §3.1.1) |
 | SERVFAIL | a transfer that would not build or serialize; an UPDATE that could not be read, written or signed (RFC 2136 §3.4.2.1) |
 | BADVERS | EDNS version > 0 |
@@ -517,6 +517,13 @@ An UPDATE is therefore a zone-file edit followed by the load path: read the zone
 as the file has it, check §3.2 against that, apply, write atomically, sign,
 verify, install. §3.7's atomicity is one mutex held across the whole
 read-modify-write.
+
+A zone whose file `$INCLUDE`s another is REFUSED, with an EDE saying so. The
+write-back serializes the whole zone into one file, which would inline the
+included records and drop the directive, so the file the operator's other
+tooling maintains would stop being read with nothing said. The same test —
+`FileDigest::of_self_contained` — is what makes the remembered digest honest:
+a digest of the parent says nothing about the included file (`TODO.md` #104).
 
 The verify step checks the RRsets this signing run signed — not the whole zone,
 which is what the incremental path exists to avoid — plus every signed RRset at

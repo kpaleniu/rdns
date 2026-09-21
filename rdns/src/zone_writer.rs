@@ -66,7 +66,7 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
 /// a zone being rewritten, and a record that cannot be expressed leaves the
 /// previous file untouched.
 pub fn write_zone_file(zone: &Zone, path: &Path) -> Result<(), ZoneError> {
-    write_zone_text(&zone_to_string(zone)?, path)
+    write_zone_text(&zone_to_string(zone)?, path).map(|_| ())
 }
 
 /// The same, for a caller that needs the text as well as the file.
@@ -75,11 +75,47 @@ pub fn write_zone_file(zone: &Zone, path: &Path) -> Result<(), ZoneError> {
 /// the file back (`TODO.md` #71f, `rdns::rpz::PolicyStore::offer`), and
 /// serializing a million-record zone twice to get it is 249 ms
 /// (`rdns/tests/record_storage.rs`).
-pub fn write_zone_text(text: &str, path: &Path) -> Result<(), ZoneError> {
+///
+/// It hands back a [`Written`] rather than `()` because the next reader's
+/// whole test is that those bytes are the bytes on disk, and that used to be a
+/// sentence in `offer`'s doc asking its caller to write first and pass the
+/// same slice (#104).
+pub fn write_zone_text(text: &str, path: &Path) -> Result<Written, ZoneError> {
     crate::persist::write_atomically_str(path, text).map_err(|source| ZoneError::Io {
         path: path.display().to_string(),
         source,
+    })?;
+    Ok(Written {
+        path: path.to_path_buf(),
+        digest: crate::zone::FileDigest::of_self_contained(text.as_bytes()),
     })
+}
+
+/// What [`write_zone_text`] put where, for a caller that will offer the same
+/// zone to something holding a digest cache.
+///
+/// Only this module makes one, so holding it is the evidence that the write
+/// happened and that these are the bytes it wrote — where the rule used to be
+/// prose in `rdns::rpz::PolicyStore::offer` with nothing making it true
+/// (`TODO.md` #104, `CLAUDE.md` §17).
+///
+/// `digest` is `None` for text that `$INCLUDE`s another file, which a
+/// serialized zone never does and a caller must not have to know: see
+/// [`crate::zone::FileDigest::of_self_contained`].
+#[derive(Debug, Clone)]
+pub struct Written {
+    path: std::path::PathBuf,
+    digest: Option<crate::zone::FileDigest>,
+}
+
+impl Written {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn digest(&self) -> Option<crate::zone::FileDigest> {
+        self.digest
+    }
 }
 
 /// One record and its newline, appended to a zone being written.

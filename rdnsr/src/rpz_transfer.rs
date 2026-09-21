@@ -340,14 +340,14 @@ async fn fetch_and_write(
     let store = policy.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let text = zone_to_string(&zone)?;
-        write_zone_text(&text, &path)?;
+        let written = write_zone_text(&text, &path)?;
         // Warned and not propagated: the transfer's job was to get the zone on
         // disk and it is done, so a store that cannot place the zone costs the
         // reload a parse — the route this refresh took before #71f — rather
         // than a failed refresh and a retry. Only a feed nobody reads gets
         // here, which the configuration makes unreachable: `[[rpz.feeds]]`
         // builds both lists.
-        if let Err(e) = store.offer(&path, zone, &text) {
+        if let Err(e) = store.offer(&written, zone) {
             tracing::warn!(
                 "the transferred zone will be parsed back from {}: {e}",
                 path.display()

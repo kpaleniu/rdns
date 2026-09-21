@@ -37,7 +37,13 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#104**-**#106**, and **#21**, as of 2026-09-21.
+**#58**, **#68**, **#105**, **#106**, and **#21**, as of 2026-09-21.
+**#104 closed** the day it was filed, and the count in its title is wrong:
+there are two maps and a zone list, not four maps, and unifying them is
+declined on that measurement. What asking the question found instead is two
+defects in the UPDATE path — an `$INCLUDE` resolved against the process's
+working directory, and under it a digest that let an edit to an included file
+be silently reverted — one of which was hiding the other.
 **#103 closed** the day it was filed, and the measurement that could have
 refuted it narrowed it instead: `dead_code` does warn about a `[server]` field
 nothing reads, so the silent case is the one where something *else* reads it —
@@ -6498,7 +6504,7 @@ clean on both, `cargo doc` and `cargo fmt --check` clean.
 
 ---
 
-### 104. Four digest caches over one `FileDigest` — **filed 2026-09-21**
+### 104. Four digest caches over one `FileDigest` — **filed and closed 2026-09-21**
 
 The type is shared and says why (`rdns/src/zone.rs:78`): "One copy for three
 callers … because two implementations of 'did these bytes change' is how the two
@@ -6521,6 +6527,94 @@ making it true.
 
 `FileDigest` itself is deep and stays. #64b, #64f, #71b and #71f are the four
 optimisations, each landed alone; none asked what the four together are.
+
+**Closed 2026-09-21.** Asking what the four are together found two defects in
+one of them, one hiding the other, and refuted the count.
+
+**The UPDATE path parsed `$INCLUDE` against the wrong directory.** It used
+`parse_zone_file(&text, origin)`, which takes no base directory and so resolves
+an include relative to the *process's* working directory; the loader uses
+`parse_zone_file_at` and resolves it relative to the zone file's. So one file
+parsed to two different zones depending on which path read it, and in the
+ordinary case to neither: watched failing as
+`re-reading …/example.com.zone to update it: line 4: $INCLUDE hosts.inc: The
+system cannot find the file specified`, a SERVFAIL for a file the loader reads
+perfectly well.
+
+**Underneath it, the digest defect the row's asymmetry was pointing at, and it
+is worse than "safe today".** With the parse fixed the second one is
+reachable, and it was reproduced in that state: a no-op UPDATE — one whose
+changes apply to nothing, which RFC 2136 answers NOERROR — returns
+`FileDigest::of(&raw)` over a file carrying `$INCLUDE`, and the caller
+remembers it. The operator's other tooling then rewrites the *included* file.
+The next UPDATE digests the parent, matches, takes the `reused` path, and
+applies to the **served** copy from before the edit. Measured on the probe:
+`www` came back `192.0.2.9` after the include had been rewritten to
+`198.51.100.77`, and the file was written back flattened with neither the
+directive nor the new address in it. The operator's change silently reverted
+and the include mechanism silently destroyed, in one UPDATE (`CLAUDE.md` §4).
+
+**Both are one check, at the boundary.** `FileDigest::of_self_contained(&raw)`
+replaces `of`, and `None` is a refusal rather than a digest: a zone file built
+out of `$INCLUDE`s is not a writable source, because `zone_to_string` cannot
+write it back as one file without dropping the directive. REFUSED with an EDE
+sentence, which is what `answer_update`'s two other not-writable checks
+already answer — this one is about the file rather than the configuration,
+which is why it is inside the blocking task and not beside them. The parse
+becomes `parse_zone_text_at`, which cannot matter while the refusal stands and
+is the right function for text that came from a path (§7). No startup warning
+to go with it: whether a zone is updatable also depends on the TSIG policy,
+which the loader does not know, and a warning on every server that has an
+include and never receives an UPDATE is noise. The refusal arrives at the
+moment it is actionable.
+
+**Nothing worked before and nothing that worked is narrowed** (§16). An UPDATE
+to such a zone already failed — with a SERVFAIL naming a path in the wrong
+directory — unless the working directory happened to hold a file of that name,
+in which case it inlined the wrong file's contents.
+
+**The count was wrong, and that half is declined.** There are not four maps
+over one `FileDigest`:
+
+- `LoadedFiles` and `Keepable` are **one** cache and a policy layer on it.
+  `unchanged`, `note` and `forget` are private to `zones.rs` and `Keepable` is
+  their only caller.
+- `UpdateHandling::applying` is a second map, and it lives under the
+  `tokio::Mutex` that serialises RFC 2136 §3.7's read-modify-write **on
+  purpose** — its own doc says the fact it holds is *made* under that lock.
+- `PolicyStore.offered` is not a digest map at all. It is a
+  `Mutex<Vec<Arc<PolicyZone>>>` of zones, each carrying its own
+  `ReadFrom { path, digest }`, scanned rather than probed because a resolver
+  runs a handful of feeds.
+
+So: two maps and one zone list, in two crates, under three kinds of lock, with
+two key shapes. What they genuinely share is "did these bytes change" and the
+reason for answering it that way, and both of those are `FileDigest`, which
+was already shared.
+
+**The prose that was duplicated is the argument, not the measurements.** "A
+`stat` cannot see an edit that preserves length and timestamp" was written out
+at `dispatch.rs` and at `rpz.rs` in near-identical words; it is now on
+`FileDigest` once and cited from both. Each caller keeps its own numbers —
+7.8 ms against 435 for a 24 MB zone, 21 ms against ~720 for a million-rule
+feed — because those are different measurements about different files, and
+only the reason they are worth paying is shared (§7).
+
+**`PolicyStore::offer`'s leaked ordering is now a type.** Its doc asked the
+caller to "write `text` to `path` first and pass the same bytes here", with
+nothing making it true — a zone offered before or instead of the write would
+be installed by the next reload as though it were what the file holds.
+`zone_writer::write_zone_text` returns a `Written` (the path and the digest of
+the bytes that reached the file), only that function makes one, and `offer`
+takes it in place of the path and the text. The sentence is gone because the
+call cannot be made wrongly (`CLAUDE.md` §17).
+
+Verified: one new test, `an_update_to_a_zone_file_that_includes_another…`,
+watched failing against both halves reverted — SERVFAIL from the
+include resolved against the working directory — and the second defect
+reproduced separately with the parse fixed, which is the only state it is
+reachable in. 1 299 tests on Windows (1 298 before) and 1 320 on Linux,
+clippy clean on both, `cargo doc` and `cargo fmt --check` clean.
 
 ---
 
@@ -6748,6 +6842,7 @@ the week; the record is under "How the queue kept going stale" in
 | **99** | both daemons' dry run was a `return` at a line number, not the rule §15 states | **filed and closed 2026-09-21**, out of an architecture review rather than a defect report. `rdnsd --check-config --dnstap garbage-not-a-scheme` printed "configuration is valid" and exited 0 where the real start exits 1 — the parse sat in `serve`'s **argument list**, which is evaluated below the dry-run exit. `rdnsr`'s half is worse and was reproduced too: a TSIG secret that is not base64 passes the dry run, and `TsigKey::parse` (`:944`) runs after both `bind`s (`:766`, `:767`) and a `tokio::spawn` (`:931`), so the process takes the ports and then dies. Counted before anything was edited: **four** fallible sites below `rdnsd`'s exit, of which `--metrics-listen` in `rdnsr` is *not* one — it is a real `TcpListener::bind` and was checked before it was counted. **Both shapes were built and the type lost**: hoisting is +9 −4, a `Checked` type holding every fallible flag value is +31 −12 and still leaves **23 `cli.*` reads** below the line across 20 fields, with the enforcing version costing a 49-field mirror of `Cli` or the lift #90 declined. **The rule itself was wrong**, which is the part worth keeping: "everything that does not bind a socket" invited moving the exit down to the first spawn, and one function past `rdnsd`'s exit `discard_orphan_journals` calls `Journal::forget` — `std::fs::remove_file`. That dry run would have deleted journals. §15 now says where the exit goes instead, with the journal fact beside it, and the old sentence struck in place. One regression test per daemon, each run against the unfixed tree first |
 | **100** | a dynamic UPDATE's own signatures were the only ones no run verified | **filed and closed 2026-09-21**, and the row undercounted itself. `verify_zones` had two production callers, load and reload, and an UPDATE is the third way a zone reaches the map — but the wider hole is that `ProvenSigning` skips a zone already proved for its key roles, so the *incremental* signer's output had never been checked on any path: startup proves a full sign and every incremental run after it is skipped. Fixed as the row proposed, in the type: `sign_zone_incrementally` returns `Resigned { zone, fresh }`, `sign_one_incrementally` a `FreshlySigned` whose only exit is `verify`, so a zone cannot reach the map unchecked (§17). **The set the row did not name is the one that earns the pass**: checking only what the signer says it signed agrees with a carry-forward that wrongly kept a signature over data that moved, so `verify` also takes every signed RRset at a name the update named (§19). Both sets are O(the change). `SigningRun` carries the same list for the reload path, and `Checked::resigned` counts it, so #53's saving is measurably untouched. Four tests, each watched failing; the first non-`#[ignore]`d test of the signed UPDATE path came with it |
 | **103** | `server_table!` shared the field declarations and not the projection onto `Cli` | **filed and closed 2026-09-21**. The macro removed the copy that is cheap to keep right — the declarations and the defaults, where a missing default is a struct literal missing a field — and left the one where a mistake is silent: 36 hand-written assignments in `rdnsd` and 23 in `rdnsr`, where a declared key with none parsed, passed `deny_unknown_fields` and did nothing. **Probed both ways, and the row was too broad**: `dead_code` warns about a field nothing reads, so the quiet case needs a second reader — and `check` is one for 10 of `rdnsd`'s keys and 9 of `rdnsr`'s, so "validate the new key, forget to project it" built with no warning at all. Fixed by structuring the macro's own-field capture and generating `apply_to` from it, `https-path`'s keep-the-default exception included; 59 statements became none, and a key with no `Cli` field is now `error[E0609]` pointing at the declaration. `every_server_key_reaches_its_flag` is the full-fixture test the row said was missing, one per daemon, asserting the value so a cross-wired key fails too — green against the old projection, and naming `max-tcp-request` with one line deleted from it while the old tripwire stayed green |
+| **104** | four digest caches over one `FileDigest`, with the reasoning built on it copied | **filed and closed 2026-09-21**, and asking the question found two defects rather than a duplication. `rdnsd`'s UPDATE path parsed with `parse_zone_file`, which has no base directory and resolves `$INCLUDE` against the *process's* working directory where the loader resolves it against the zone file's — a SERVFAIL for a file the loader reads. Under it, and reachable only once that was fixed: the digest was `FileDigest::of` over bytes read off disk, so a no-op UPDATE remembered the digest of an `$INCLUDE`-bearing parent and the next UPDATE matched it while the *included* file had moved. Reproduced: `www` served `192.0.2.9` after the include had been rewritten to `198.51.100.77`, and the file was written back flattened with neither the directive nor the new address in it (`CLAUDE.md` §4). **Both are one check at the boundary**: `of_self_contained`, with `None` a REFUSED — a file built out of includes is not a writable source, because it cannot be written back as one. **The count is declined on a measurement**: `LoadedFiles` and `Keepable` are one cache and a policy layer, `UpdateHandling::applying` lives under the §3.7 mutex on purpose, and `PolicyStore.offered` is a `Vec` of zones rather than a digest map — two maps and a list, two crates, three lock kinds. What they share is `FileDigest`, which was already shared, and the `stat` argument, which is now on it once instead of written out at two call sites. `PolicyStore::offer`'s "the caller writes `text` to `path` first" became `zone_writer::Written`, which only the write makes (§17) |
 | **101** | the TSIG-rejection branch returned past the dnstap tail | **filed and closed 2026-09-21**, out of the same review as #99 and the same shape: a rule stated in a comment and held by nothing. #75 gave `Server::answer` one tail so nothing could `return` past `record_dnstap`, and the comment at `dispatch.rs:311` said "three ways to answer and one tail". There were four — the `TsigCheck::Rejected` arm sends a NOTAUTH at `:289` and returns at `:292`, sixty lines above the tail — so a capture under a key-guessing probe, which is the one time an operator wants it, held nothing. The test that locked #75 in asserted 3, so the fourth door was invisible from the comment and from the suite at once. Fixed by making the check an expression: both arms produce `Option<Cow<[u8]>>`, the refusal returns what it sent, and the rest moves to `answer_admitted` behind an `Admitted` struct — six values that travel together, because the method wants nine parameters and clippy stops at seven (§14). **The cheapest of the three shapes was the one declined**: a `Drop` guard on the tail is a few lines and makes the record impossible to skip while leaving it easy to hand nothing, which reports "no reply" for a request that got one — the same symptom, quieter. The `let ... else { return; }` in the refusal became a `match` as a consequence, since "no reply fits" is now a value rather than a divergence. Test count 3 → 4, run against the unfixed tree first (`left: 3, right: 4`) |
 | **102** | `Answered::refresh` survived thirteen exits by inspection | **filed and closed 2026-09-21**. `refresh` was a `mut` local declared 226 lines above the cache hit that set it and 200 below the tail that read it, with thirteen `.into()` exits in between and a `From<Option<Vec<u8>>>` that fills `refresh: None` for free — #78a is the time one of those exits silently turned prefetching off for any name an `rpz-ip` rule matched. Fixed by deriving it from the lookup: `hit.as_ref().filter(|hit| hit.refresh).map(|_| query.clone())`, immutable, one line below the `lookup` it comes from. The invariant stops being "read all thirteen exits" and becomes one implication — `refresh` is `Some` only when `hit` is, and both exits that could drop it are in the arm that runs when the cache *missed*. **Both halves of the row's own guess were wrong**: the `From` impl was not the defect and stays, because once the local is gone `.into()` is correct by construction at every one of the thirteen sites, and deleting it would have made them noisier and fixed nothing. No behaviour changed, so there is no new test — a test here would agree with the code (§1); #78a's *A rewritten answer still asks for its prefetch* is still the guard. The old comment's argument is struck in place rather than rewritten, because it is the lesson: "falling through leaves one exit, so there is nothing to remember" held for the exit that had just been removed and said nothing about the next one |
 | **81** | what #63h's macro did not reach, and one more copy | **filed 2026-09-19, closed 2026-09-20**, two rows. **81a** measured and mostly declined: of the 27 commits touching `rdnsd/src/config.rs`, 8 touch its TSIG lines and 1 of those also touches `rdnsr`'s — and that one *created* the copy — so the two tables do not co-move and the shared struct is declined; three fields of five are shared, not five, because a resolver authorizes nothing. What was taken is the list and the default under it: `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES`, `::DEFAULT`, with `TsigKey::parse` coming out better than it went in. **81b** merged the two FNV-1a loops into `rdns_core::folded_hash`, and the check was the row's own instruction taken through the observable rather than by comparing the copies: six `expiry_for` offsets measured before the merge, unchanged after it, so no signature's expiry moved |

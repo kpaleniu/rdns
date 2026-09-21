@@ -1145,6 +1145,18 @@ impl Server {
                 tracing::info!(peer = %ip, "UPDATE of {zone_name}: {rejected}");
                 return self.signed_error(refused, rejected.rcode, None, Some(session));
             }
+            // The two checks above this task answer the configuration's
+            // spellings of "nowhere to write it"; this is the file's, and it
+            // needs the bytes, which is why it is not up there with them.
+            Err(UpdateFailure::NotWritable(why)) => {
+                serving_error!(
+                    self.ctx.logger,
+                    ip,
+                    "UPDATE of {zone_name} REFUSED: {}",
+                    why.extra_text()
+                );
+                return self.signed_error(refused, ResponseCode::Refused, Some(why), Some(session));
+            }
             // §3.4.2.1: a system failure is SERVFAIL with every applied update
             // undone. Nothing to undo here — the write is atomic and the map is
             // untouched until it succeeds.
@@ -1241,6 +1253,16 @@ const NOT_WRITABLE: ExtendedError = ExtendedError::new(
     "this server has nowhere to write this zone back to",
 );
 
+/// The third spelling of it, and the one that is about the file rather than
+/// the configuration: a zone file built out of `$INCLUDE`s cannot be written
+/// back as one file without dropping the directive, so the file the operator's
+/// other tooling maintains would stop being read with nothing said
+/// (`TODO.md` #104).
+const INCLUDES_ANOTHER_FILE: ExtendedError = ExtendedError::new(
+    InfoCode::OTHER,
+    "this zone's file $INCLUDEs another, so it cannot be written back as one",
+);
+
 /// A NOTIFY from an address the zone's `masters` list does not name. RFC 8914
 /// §4.19's "a query from an 'unauthorized' client", which is what this is: the
 /// sender is refused on its address, exactly as a transfer is.
@@ -1317,6 +1339,12 @@ fn error_reply(
 /// four codes indistinguishable from a full disk.
 enum UpdateFailure {
     Prerequisite(update::Rejected),
+    /// The file cannot be written back faithfully, so it is not a writable
+    /// source — REFUSED, which is what the two checks above `answer_update`'s
+    /// blocking task already answer for the configuration's spellings of the
+    /// same thing. A third variant because the caller branches: this is not a
+    /// full disk (`CLAUDE.md` §3).
+    NotWritable(ExtendedError),
     System(anyhow::Error),
 }
 
@@ -1347,15 +1375,23 @@ fn apply_update_to_file(
     //
     // The *bytes* always; the parse only when they are not the bytes this
     // server last wrote (`TODO.md` #64b). Reading and digesting 24 MB is
-    // 7.8 ms against 435 for the parse and index, so the honest test is 1.8% of
-    // what it replaces — which is why there is no `stat` shortcut here. `stat`
-    // is 0.07 ms and cannot see an edit that preserves length and timestamp,
-    // and a missed edit is the operator's change silently reverted, which is
-    // the failure this re-read exists to prevent (`CLAUDE.md` §4).
+    // 7.8 ms against 435 for the parse and index, so the honest test is 1.8%
+    // of what it replaces. Why it is the bytes rather than a `stat` at 0.07 ms
+    // is `FileDigest`'s own doc, which is where all three callers' copy of
+    // that argument now lives (#104).
     let raw = std::fs::read(path)
         .with_context(|| format!("re-reading {} to update it", path.display()))
         .map_err(UpdateFailure::System)?;
-    let digest = FileDigest::of(&raw);
+    // The one place the shape of the file is judged, and the digest is what it
+    // is judged for: `FileDigest::of` is only sound over text this process
+    // wrote or a file known to carry no `$INCLUDE`, and this is neither until
+    // asked. A digest of the parent says nothing about the included file, so a
+    // remembered one would match while the include had moved — the operator's
+    // change silently reverted (`TODO.md` #104, `CLAUDE.md` §2's rule about
+    // where a check belongs).
+    let Some(digest) = FileDigest::of_self_contained(&raw) else {
+        return Err(UpdateFailure::NotWritable(INCLUDES_ANOTHER_FILE));
+    };
 
     // Reusing the served copy is only sound with no signing configured: then it
     // *is* what the file holds, because the last thing written there was the
@@ -1370,7 +1406,13 @@ fn apply_update_to_file(
         let text = String::from_utf8(raw)
             .map_err(|_| anyhow::anyhow!("{} is not UTF-8", path.display()))
             .map_err(UpdateFailure::System)?;
-        parsed = rdns::zone::parse_zone_file(&text, origin)
+        // `parse_zone_text_at`, not `parse_zone_file`: the latter has no base
+        // directory and resolves `$INCLUDE` against the process's working
+        // directory, where the loader resolves it against the file's. The
+        // refusal above means no include reaches here, so this cannot differ
+        // today — it is the right function for text that came from a path, and
+        // two spellings of "parse this zone file" is what drifts (§7).
+        parsed = rdns::zone::parse_zone_text_at(&text, origin, path)
             .with_context(|| format!("re-reading {} to update it", path.display()))
             .map_err(UpdateFailure::System)?;
         &parsed
@@ -2050,6 +2092,96 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An UPDATE to a zone whose file `$INCLUDE`s another is refused, not
+    /// applied against the wrong file.
+    ///
+    /// Two defects, and the first hid the second (`TODO.md` #104).
+    ///
+    /// The parse was `parse_zone_file(&text, origin)`, which has no base
+    /// directory and so resolves `$INCLUDE` against the *process's* working
+    /// directory — where the reload path uses `parse_zone_file_at` and
+    /// resolves it against the zone file's. So the same file parsed to two
+    /// different zones depending on which path read it, and usually to an
+    /// error here.
+    ///
+    /// Underneath it: the digest was `FileDigest::of` over bytes read off
+    /// disk, which the type's doc restricts to text this process wrote or a
+    /// file known to carry no `$INCLUDE`. A no-op UPDATE stores that digest,
+    /// and a later one then matches it while the *included* file has moved —
+    /// the operator's change silently reverted, which is the failure the
+    /// re-read exists to prevent (`CLAUDE.md` §4). Unreachable only because
+    /// the parse above failed first.
+    ///
+    /// Refused rather than flattened. Writing the zone back with
+    /// `zone_to_string` inlines the include and drops the directive, so the
+    /// file the operator's other tooling maintains stops being read with
+    /// nothing said — and REFUSED is what the two other "this is not a
+    /// writable source" checks already answer.
+    #[test]
+    fn an_update_to_a_zone_file_that_includes_another_is_refused() {
+        let dir = rdns::testutil::ScratchDir::new("update-include");
+        dir.write("hosts.inc", "www IN A 192.0.2.9\n");
+        let path = dir.write(
+            "example.com.zone",
+            concat!(
+                "$TTL 3600\n",
+                "@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n",
+                "@ IN NS ns.example.com.\n",
+                "$INCLUDE hosts.inc\n",
+            ),
+        );
+        let served = parse_zone_file_at(&path, "example.com.").expect("the fixture parses");
+        assert_eq!(
+            served
+                .query(nm("www.example.com.").as_ref(), Qtype::of(record_types::A))
+                .len(),
+            1,
+            "the loader resolves the include against the zone file's directory"
+        );
+
+        let change = update::Change::Add(rdns::ResourceRecord {
+            name: nm("added.example.com."),
+            class: rdns::Class::new(1),
+            ttl: rdns::Ttl::from_secs(3600),
+            rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(std::net::Ipv4Addr::new(
+                198, 51, 100, 4,
+            )))
+            .expect("the rdata builds"),
+        });
+        let outcome = apply_update_to_file(
+            &path,
+            "example.com.",
+            &served,
+            &[],
+            std::slice::from_ref(&change),
+            unsigned(&test_validator()),
+            None,
+        );
+        match outcome {
+            Err(UpdateFailure::NotWritable(why)) => {
+                assert!(
+                    why.extra_text().contains("$INCLUDE"),
+                    "the client is told which shape of file it is: {:?}",
+                    why.extra_text()
+                );
+            }
+            Err(UpdateFailure::System(e)) => {
+                panic!("SERVFAIL for a file we can read perfectly well: {e:#}")
+            }
+            Err(UpdateFailure::Prerequisite(r)) => panic!("no prerequisites were given: {r}"),
+            Ok(_) => panic!("the include was flattened away instead of refused"),
+        }
+
+        // And the file is untouched, so the operator's other tooling still
+        // owns what it wrote.
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("still there")
+                .contains("$INCLUDE hosts.inc"),
+            "a refused update writes nothing"
+        );
+    }
+
     /// Every encrypted transport gets its own dnstap label.
     ///
     /// `TODO.md` #54: the dispatcher was told [`Privacy`], which is `Clear`,
@@ -2242,6 +2374,9 @@ pub(crate) mod tests {
         .unwrap_or_else(|e| match e {
             UpdateFailure::System(e) => panic!("the signed update applies: {e:#}"),
             UpdateFailure::Prerequisite(r) => panic!("no prerequisites were given: {r}"),
+            UpdateFailure::NotWritable(why) => {
+                panic!("the fixture is writable: {}", why.extra_text())
+            }
         });
         assert_eq!(report.changed, 1);
         let installed = installed.expect("a changed zone is installed");

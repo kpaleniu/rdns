@@ -79,6 +79,14 @@ pub fn origin_from_path(path: &str) -> String {
 /// reload path (#64f), and the resolver's policy reload (#71b) — because two
 /// implementations of "did these bytes change" is how the two answers come to
 /// differ (`CLAUDE.md` §7). It lived in `rdnsd` alone until the third.
+///
+/// **Why the bytes and not a `stat`.** The argument is the same at all three
+/// and was written out at each of them (#104): `stat` cannot see an edit that
+/// preserves length and timestamp, and a missed edit is the operator's change
+/// silently reverted — the failure the re-read exists to prevent
+/// (`CLAUDE.md` §4). Each caller keeps its own *measurement* of what the read
+/// costs against the parse it saves, because those are different numbers about
+/// different files; the reason they are willing to pay it is this one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileDigest(u64);
 

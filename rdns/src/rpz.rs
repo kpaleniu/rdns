@@ -45,6 +45,7 @@ use crate::error::{ConfigError, ConfigResult};
 use crate::record_types as rt;
 use crate::resolver::NameserverPolicy;
 use crate::zone::{parse_zone_text_at, FileDigest, Located, NameKind, Zone, ZoneRecordRef};
+use crate::zone_writer::Written;
 use crate::{Name, NameRef, ParsedRecord, Qtype, ResourceRecord, Serial};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -452,6 +453,23 @@ impl PolicyZone {
         Ok(indexed)
     }
 
+    /// The same, for a zone this process serialized and wrote rather than read.
+    ///
+    /// [`Written`] already holds the path and the digest of the bytes that
+    /// reached the file, so there is nothing here to get out of step with them.
+    fn from_written(
+        zone: Zone,
+        policy: PolicyOverride,
+        written: &Written,
+    ) -> ConfigResult<PolicyZone> {
+        let mut indexed = PolicyZone::new(zone, policy)?;
+        indexed.read_from = written.digest().map(|digest| ReadFrom {
+            path: written.path().to_path_buf(),
+            digest,
+        });
+        Ok(indexed)
+    }
+
     /// Index a parsed zone as policy.
     ///
     /// The SOA is required rather than optional: a rewrite to NXDOMAIN owes an
@@ -844,12 +862,11 @@ impl PolicyZones {
     /// that the test is now per feed rather than per set — one feed publishing
     /// no longer re-parses the others.
     ///
-    /// The bytes are read either way and the digest is taken over them, because
-    /// a `stat` cannot see an edit that preserves length and timestamp and a
-    /// missed edit is the operator's change silently not taken (`CLAUDE.md`
-    /// §4). Measured at a million rules: read and digest 21 ms per feed against
-    /// ~720 for the parse and index it replaces — the same argument `rdnsd`'s
-    /// reload path makes (#64f), where it was 1.8%.
+    /// The bytes are read either way and the digest is taken over them rather
+    /// than a `stat` — [`FileDigest`] says why, for all three callers of it
+    /// (#104). Measured at a million rules: read and digest 21 ms per feed
+    /// against ~720 for the parse and index it replaces, where `rdnsd`'s
+    /// reload path measured 1.8% (#64f).
     ///
     /// `offered` is what this process wrote and did not throw away
     /// (`TODO.md` #71f): a zone from there is taken only when its digest is the
@@ -1086,15 +1103,20 @@ impl PolicyStore {
         })
     }
 
-    /// Index a zone this process just wrote to `path`, and keep it for the next
-    /// reload to install without parsing the file back — `TODO.md` #71f.
+    /// Index a zone this process just wrote, and keep it for the next reload
+    /// to install without parsing the file back — `TODO.md` #71f.
     ///
-    /// The caller writes `text` to `path` first and passes the same bytes here.
+    /// The [`Written`] is the write: only [`crate::zone_writer::write_zone_text`]
+    /// makes one, so a caller cannot offer bytes it did not put on disk or
+    /// offer them before it did. That rule used to be this sentence — "the
+    /// caller writes `text` to `path` first and passes the same bytes here" —
+    /// with nothing making it true (`TODO.md` #104, `CLAUDE.md` §17).
+    ///
     /// A reload still reads every file, and takes this zone only if the file's
-    /// bytes are still the bytes named here, so a feed somebody else rewrote in
-    /// between is parsed as it would have been: the digest is the whole test
-    /// and it is the same one `rdnsd`'s UPDATE path applies to a zone it wrote
-    /// (`TODO.md` #64b, `CLAUDE.md` §7).
+    /// bytes are still the bytes written here, so a feed somebody else rewrote
+    /// in between is parsed as it would have been: the digest is the whole
+    /// test and it is the same one `rdnsd`'s UPDATE path applies to a zone it
+    /// wrote (`TODO.md` #64b, `CLAUDE.md` §7).
     ///
     /// **Blocking**: indexing a million-rule feed is ~40 ms, so this belongs
     /// where the write does, off the workers (`CLAUDE.md` §9).
@@ -1103,7 +1125,8 @@ impl PolicyStore {
     /// caller — a zone offered under the wrong override would answer a query
     /// differently than the same file read back (§15's rule about two sources
     /// for one setting).
-    pub fn offer(&self, path: &Path, zone: Zone, text: &str) -> ConfigResult<()> {
+    pub fn offer(&self, written: &Written, zone: Zone) -> ConfigResult<()> {
+        let path = written.path();
         let Some(feed) = self.feeds.iter().find(|feed| feed.path == path) else {
             // Refused rather than dropped: writing a policy zone to a path no
             // feed reads is a configuration nobody gets an answer from, and a
@@ -1114,7 +1137,7 @@ impl PolicyStore {
                 path.display()
             )));
         };
-        let indexed = Arc::new(PolicyZone::from_text(zone, feed.policy, path, text)?);
+        let indexed = Arc::new(PolicyZone::from_written(zone, feed.policy, written)?);
         let mut offered = match self.offered.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -2262,10 +2285,8 @@ evil.example.com IN CNAME .
             crate::zone::parse_zone_file(&feed(2, "second.example.com", None), "rpz.invalid.")
                 .expect("the transferred zone parses");
         let text = crate::zone_writer::zone_to_string(&arrived).expect("it serializes");
-        crate::zone_writer::write_zone_text(&text, &path).expect("it is written");
-        store
-            .offer(&path, arrived, &text)
-            .expect("the feed is ours");
+        let written = crate::zone_writer::write_zone_text(&text, &path).expect("it is written");
+        store.offer(&written, arrived).expect("the feed is ours");
 
         let reloaded = store.reload().expect("it re-reads");
         assert_eq!(reloaded.reread, 0, "nothing had to be parsed");
@@ -2311,10 +2332,8 @@ evil.example.com IN CNAME .
         )
         .expect("the transferred zone parses");
         let text = crate::zone_writer::zone_to_string(&arrived).expect("it serializes");
-        crate::zone_writer::write_zone_text(&text, &path).expect("it is written");
-        store
-            .offer(&path, arrived, &text)
-            .expect("the feed is ours");
+        let written = crate::zone_writer::write_zone_text(&text, &path).expect("it is written");
+        store.offer(&written, arrived).expect("the feed is ours");
         let reloaded = store.reload().expect("it installs");
         assert_eq!(
             reloaded.installed, 1,
@@ -2358,10 +2377,8 @@ evil.example.com IN CNAME .
             crate::zone::parse_zone_file(&feed(2, "second.example.com", None), "rpz.invalid.")
                 .expect("the transferred zone parses");
         let text = crate::zone_writer::zone_to_string(&arrived).expect("it serializes");
-        crate::zone_writer::write_zone_text(&text, &path).expect("it is written");
-        store
-            .offer(&path, arrived, &text)
-            .expect("the feed is ours");
+        let written = crate::zone_writer::write_zone_text(&text, &path).expect("it is written");
+        store.offer(&written, arrived).expect("the feed is ours");
 
         // Somebody else — a cron job, an operator — writes the file after the
         // transfer did.
@@ -2398,8 +2415,10 @@ evil.example.com IN CNAME .
                 .expect("it parses");
         let text = crate::zone_writer::zone_to_string(&stray).expect("it serializes");
         let elsewhere = dir.join("other.zone");
+        let written =
+            crate::zone_writer::write_zone_text(&text, &elsewhere).expect("it is written");
         let refused = store
-            .offer(&elsewhere, stray, &text)
+            .offer(&written, stray)
             .expect_err("no feed reads that path");
         assert!(
             refused.to_string().contains("other.zone"),

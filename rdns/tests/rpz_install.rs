@@ -425,10 +425,8 @@ fn refreshing_a_transferred_policy_zone() {
         let held = after.clone();
         let (_, offered) = measure(|| {
             let text = zone_to_string(&held).expect("serializes");
-            write_zone_text(&text, &path).expect("written");
-            store
-                .offer(&path, held, &text)
-                .expect("the feed is configured");
+            let written = write_zone_text(&text, &path).expect("written");
+            store.offer(&written, held).expect("the feed is configured");
             let reloaded = store.reload().expect("re-reads");
             assert_eq!(
                 (reloaded.reread, reloaded.installed),
