@@ -928,3 +928,22 @@ side". Both true, neither about `rdns`, and neither checkable from a clone.
 
 This applies to prose in tracked files exactly as it does to commits, and to
 `TODO.md` hardest of all, since it is the page a session reads first.
+
+---
+
+## Agent skills
+
+### Issue tracker
+
+Issues are numbered items in `TODO.md`; closed ones move to
+`docs/CLOSED_WORK.md`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles under their own names, as markers rather than labels.
+See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` and `docs/adr/` at the repo root, neither present
+yet. See `docs/agents/domain.md`.
