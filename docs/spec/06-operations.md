@@ -176,6 +176,13 @@ expected-key list, for `rdnsd`'s file as much as for this one (`TODO.md` #63h).
 The macro takes each field's default from the calling crate's root, which is why
 `host`, `query-rate` and `query-burst` can differ between the two daemons.
 
+It writes the *projection* onto the flags as well, for its own keys and the
+daemon's. A key declared and never assigned used to parse, satisfy
+`deny_unknown_fields` and then do nothing — visible as a `dead_code` warning
+only while nothing else read the field, which `check` does for ten of
+`rdnsd`'s (`TODO.md` #103). A key with no flag of the same name and type is now
+a compile error.
+
 `log-level` and `quiet` are not settable from either file.
 
 ### Secret files

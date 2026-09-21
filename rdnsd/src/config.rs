@@ -557,47 +557,13 @@ impl Config {
     /// produce the same shape, so there is one code path and not two to drift
     /// apart (`CLAUDE.md` §7). It is sound because the two are mutually exclusive
     /// — nothing in `cli` can be an operator's explicit choice here.
+    ///
+    /// `[server]` is `apply_to`'s, generated beside the declarations: the
+    /// thirty-six keys used to be assigned by hand here and in `rdnsr`, where
+    /// a key with no assignment parsed and did nothing (`TODO.md` #103). What
+    /// is left below is what is not a `[server]` key.
     pub(crate) fn apply(&self, cli: &mut Cli) -> Result<PerZone> {
-        cli.host = self.server.host.clone();
-        cli.port = self.server.port;
-        cli.zone_dir = self.server.zone_dir.clone();
-        cli.allow_transfer = self.server.allow_transfer.clone();
-        cli.also_notify = self.server.also_notify.clone();
-        cli.response_rate = self.server.response_rate;
-        cli.query_rate = self.server.query_rate;
-        cli.query_burst = self.server.query_burst;
-        cli.query_rate_exempt = self.server.query_rate_exempt.clone();
-        cli.max_udp_request = self.server.max_udp_request;
-        cli.max_tcp_request = self.server.max_tcp_request;
-        cli.udp_payload_size = self.server.udp_payload_size;
-        cli.max_udp_response = self.server.max_udp_response;
-        cli.anomaly_interval = self.server.anomaly_interval;
-        cli.anomaly_query_rate = self.server.anomaly_query_rate;
-        cli.anomaly_error_percent = self.server.anomaly_error_percent;
-        cli.anomaly_source_queries = self.server.anomaly_source_queries;
-        cli.anomaly_source_refusals = self.server.anomaly_source_refusals;
-        cli.udp_workers = self.server.udp_workers;
-        cli.metrics_listen = self.server.metrics_listen.clone();
-        cli.dnstap = self.server.dnstap.clone();
-        cli.dnstap_max_bytes = self.server.dnstap_max_bytes;
-        cli.tls_listen = self.server.tls_listen.clone();
-        cli.quic_listen = self.server.quic_listen.clone();
-        cli.https_listen = self.server.https_listen.clone();
-        // The flag has a default, so an absent key means "keep it" rather than
-        // "clear it" — the `Option` here is the override, not the value (§15).
-        if let Some(path) = &self.server.https_path {
-            cli.https_path = path.clone();
-        }
-        cli.tls_cert = self.server.tls_cert.clone();
-        cli.tls_key = self.server.tls_key.clone();
-        cli.transfer_tls_ca = self.server.transfer_tls_ca.clone();
-        cli.transfer_tls_cert = self.server.transfer_tls_cert.clone();
-        cli.transfer_tls_key = self.server.transfer_tls_key.clone();
-        cli.transfer_tls_only = self.server.transfer_tls_only;
-        cli.transfer_client_ca = self.server.transfer_client_ca.clone();
-        cli.allow_transfer_cert = self.server.allow_transfer_cert.clone();
-        cli.control_socket = self.server.control_socket.clone();
-        cli.allow_partial_load = self.server.allow_partial_load;
+        self.server.apply_to(cli);
         cli.tsig_key = self.tsig_specs()?;
         cli.secondary = self.secondary_specs();
         cli.catalog = self.catalog_specs();
@@ -723,6 +689,123 @@ mod tests {
 [server]
 zone-dir = "./zones"
 "#;
+
+    /// Every `[server]` key this daemon has, set to something that is not its
+    /// default.
+    ///
+    /// The fixture `a_minimal_config_changes_no_flag_default` cannot be: it
+    /// sets only what it must, so every value it compares equals the flag
+    /// default on both sides and a key that reached nothing compares equal.
+    const EVERY_SERVER_KEY: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 5353
+zone-dir = "./zones"
+allow-transfer = ["192.0.2.1"]
+also-notify = ["192.0.2.2"]
+response-rate = 4096
+query-rate = 500
+query-burst = 100
+query-rate-exempt = ["192.0.2.3"]
+max-udp-request = 2048
+max-tcp-request = 8192
+udp-payload-size = 1400
+max-udp-response = 1100
+anomaly-interval = 30
+anomaly-query-rate = 25.0
+anomaly-error-percent = 5.0
+anomaly-source-queries = 50
+anomaly-source-refusals = 2
+udp-workers = 3
+metrics-listen = "127.0.0.1:9153"
+dnstap = "file:./dnstap.fstrm"
+dnstap-max-bytes = 1024
+tls-listen = "127.0.0.1:8530"
+quic-listen = "127.0.0.1:8531"
+https-listen = "127.0.0.1:8532"
+https-path = "/query"
+tls-cert = "./cert.pem"
+tls-key = "./key.pem"
+transfer-tls-ca = "./ca.pem"
+transfer-tls-cert = "./client.pem"
+transfer-tls-key = "./client-key.pem"
+transfer-tls-only = true
+transfer-client-ca = "./clients.pem"
+allow-transfer-cert = ["partner:example.com"]
+control-socket = "/run/rdnsd.sock"
+allow-partial-load = true
+"#;
+
+    /// Every `[server]` key reaches the flag of the same name, with its value.
+    ///
+    /// The guard `TODO.md` #103 found missing. `deny_unknown_fields` refuses a
+    /// key the struct does not declare; nothing refused a key the struct
+    /// declared and `apply` never read, so it parsed and did nothing. The
+    /// projection is generated from the declarations now (`server_table!`), and
+    /// this is the behavioural half: it asserts the *value*, so a key wired to
+    /// the wrong flag fails too, which a comparison against the default cannot
+    /// see.
+    ///
+    /// Run against the hand-written projection with one line deleted, it names
+    /// that key.
+    #[test]
+    fn every_server_key_reaches_its_flag() {
+        let mut cli = Cli::parse_from(["rdnsd"]);
+        parse(EVERY_SERVER_KEY)
+            .expect("the full config parses")
+            .apply(&mut cli)
+            .expect("and applies");
+
+        macro_rules! reaches {
+            ($($field:ident = $want:expr),* $(,)?) => {$(
+                assert_eq!(
+                    cli.$field,
+                    $want,
+                    "[server].{} did not reach the flag of that name",
+                    stringify!($field).replace('_', "-"),
+                );
+            )*};
+        }
+        let path = |p: &str| Some(PathBuf::from(p));
+        reaches! {
+            host = "127.0.0.1",
+            port = 5353,
+            zone_dir = Some("./zones".to_string()),
+            allow_transfer = vec!["192.0.2.1".to_string()],
+            also_notify = vec!["192.0.2.2".to_string()],
+            response_rate = 4096,
+            query_rate = 500,
+            query_burst = 100,
+            query_rate_exempt = vec!["192.0.2.3".to_string()],
+            max_udp_request = 2048,
+            max_tcp_request = 8192,
+            udp_payload_size = 1400,
+            max_udp_response = 1100,
+            anomaly_interval = 30,
+            anomaly_query_rate = 25.0,
+            anomaly_error_percent = 5.0,
+            anomaly_source_queries = 50,
+            anomaly_source_refusals = 2,
+            udp_workers = 3,
+            metrics_listen = Some("127.0.0.1:9153".to_string()),
+            dnstap = Some("file:./dnstap.fstrm".to_string()),
+            dnstap_max_bytes = 1024,
+            tls_listen = Some("127.0.0.1:8530".to_string()),
+            quic_listen = Some("127.0.0.1:8531".to_string()),
+            https_listen = Some("127.0.0.1:8532".to_string()),
+            https_path = "/query",
+            tls_cert = path("./cert.pem"),
+            tls_key = path("./key.pem"),
+            transfer_tls_ca = path("./ca.pem"),
+            transfer_tls_cert = path("./client.pem"),
+            transfer_tls_key = path("./client-key.pem"),
+            transfer_tls_only = true,
+            transfer_client_ca = path("./clients.pem"),
+            allow_transfer_cert = vec!["partner:example.com".to_string()],
+            control_socket = path("/run/rdnsd.sock"),
+            allow_partial_load = true,
+        }
+    }
 
     /// A config file that sets only what it must changes no default
     /// (`TODO.md` #63e).

@@ -355,33 +355,7 @@ impl Config {
     /// drift apart (`CLAUDE.md` §7). It is sound because the two are mutually
     /// exclusive — nothing in `cli` can be an operator's explicit choice here.
     pub(crate) fn apply(&self, cli: &mut Cli) {
-        cli.host = self.server.host.clone();
-        cli.port = self.server.port;
-        cli.query_rate = self.server.query_rate;
-        cli.query_burst = self.server.query_burst;
-        cli.query_rate_exempt = self.server.query_rate_exempt.clone();
-        cli.response_rate = self.server.response_rate;
-        cli.max_udp_request = self.server.max_udp_request;
-        cli.max_tcp_request = self.server.max_tcp_request;
-        cli.udp_payload_size = self.server.udp_payload_size;
-        cli.max_udp_response = self.server.max_udp_response;
-        cli.max_inflight_udp = self.server.max_inflight_udp;
-        cli.anomaly_interval = self.server.anomaly_interval;
-        cli.anomaly_query_rate = self.server.anomaly_query_rate;
-        cli.anomaly_error_percent = self.server.anomaly_error_percent;
-        cli.anomaly_source_queries = self.server.anomaly_source_queries;
-        cli.anomaly_source_refusals = self.server.anomaly_source_refusals;
-        cli.metrics_listen = self.server.metrics_listen.clone();
-        cli.tls_listen = self.server.tls_listen.clone();
-        cli.quic_listen = self.server.quic_listen.clone();
-        cli.https_listen = self.server.https_listen.clone();
-        // The flag has a default, so an absent key means "keep it" rather than
-        // "clear it" — the `Option` here is the override, not the value (§15).
-        if let Some(path) = &self.server.https_path {
-            cli.https_path = path.clone();
-        }
-        cli.tls_cert = self.server.tls_cert.clone();
-        cli.tls_key = self.server.tls_key.clone();
+        self.server.apply_to(cli);
 
         cli.upstream = self.resolver.upstream.clone();
         cli.root_hints = self.resolver.root_hints.clone();
@@ -453,6 +427,88 @@ mod tests {
         let config: Config = toml::from_str(text)?;
         config.check()?;
         Ok(config)
+    }
+
+    /// Every `[server]` key this daemon has, set to something that is not its
+    /// default. The sibling of `rdnsd`'s fixture of the same name, and for the
+    /// same reason: the minimal one compares every value against the default
+    /// it already equals.
+    const EVERY_SERVER_KEY: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 5353
+response-rate = 4096
+query-rate = 500
+query-burst = 100
+query-rate-exempt = ["192.0.2.3"]
+max-udp-request = 2048
+max-tcp-request = 8192
+udp-payload-size = 1400
+max-udp-response = 1100
+max-inflight-udp = 7
+anomaly-interval = 30
+anomaly-query-rate = 25.0
+anomaly-error-percent = 5.0
+anomaly-source-queries = 50
+anomaly-source-refusals = 2
+metrics-listen = "127.0.0.1:9153"
+tls-listen = "127.0.0.1:8530"
+quic-listen = "127.0.0.1:8531"
+https-listen = "127.0.0.1:8532"
+https-path = "/query"
+tls-cert = "./cert.pem"
+tls-key = "./key.pem"
+"#;
+
+    /// Every `[server]` key reaches the flag of the same name, with its value.
+    ///
+    /// `TODO.md` #103: `deny_unknown_fields` refuses a key the struct does not
+    /// declare, and nothing refused a key the struct declared and `apply`
+    /// never read. The projection comes out of `server_table!` now, and this
+    /// asserts the value rather than "not the default", so a key wired to the
+    /// wrong flag fails here too.
+    #[test]
+    fn every_server_key_reaches_its_flag() {
+        let mut cli = Cli::parse_from(["rdnsr"]);
+        parse(EVERY_SERVER_KEY)
+            .expect("the full config parses")
+            .apply(&mut cli);
+
+        macro_rules! reaches {
+            ($($field:ident = $want:expr),* $(,)?) => {$(
+                assert_eq!(
+                    cli.$field,
+                    $want,
+                    "[server].{} did not reach the flag of that name",
+                    stringify!($field).replace('_', "-"),
+                );
+            )*};
+        }
+        reaches! {
+            host = "127.0.0.1",
+            port = 5353,
+            response_rate = 4096,
+            query_rate = 500,
+            query_burst = 100,
+            query_rate_exempt = vec!["192.0.2.3".to_string()],
+            max_udp_request = 2048,
+            max_tcp_request = 8192,
+            udp_payload_size = 1400,
+            max_udp_response = 1100,
+            max_inflight_udp = 7,
+            anomaly_interval = 30,
+            anomaly_query_rate = 25.0,
+            anomaly_error_percent = 5.0,
+            anomaly_source_queries = 50,
+            anomaly_source_refusals = 2,
+            metrics_listen = Some("127.0.0.1:9153".to_string()),
+            tls_listen = Some("127.0.0.1:8530".to_string()),
+            quic_listen = Some("127.0.0.1:8531".to_string()),
+            https_listen = Some("127.0.0.1:8532".to_string()),
+            https_path = "/query",
+            tls_cert = Some(PathBuf::from("./cert.pem")),
+            tls_key = Some(PathBuf::from("./key.pem")),
+        }
     }
 
     /// A config file that sets nothing changes no default (`TODO.md` #63e, for

@@ -37,7 +37,12 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#103**-**#106**, and **#21**, as of 2026-09-21.
+**#58**, **#68**, **#104**-**#106**, and **#21**, as of 2026-09-21.
+**#103 closed** the day it was filed, and the measurement that could have
+refuted it narrowed it instead: `dead_code` does warn about a `[server]` field
+nothing reads, so the silent case is the one where something *else* reads it —
+`check` reads ten of `rdnsd`'s keys — which is exactly a key that arrives with
+a validation rule.
 **#100 closed** the day it was filed, and it undercounted itself: the UPDATE
 path was the only one with no verification at all, but the *incremental*
 signer's output had never been checked on any path, a reload's included. The
@@ -6416,7 +6421,7 @@ clean.
 
 ---
 
-### 103. `server_table!` shares the field declarations and not the fold — **filed 2026-09-21**
+### 103. `server_table!` shares the field declarations and not the fold — **filed and closed 2026-09-21**
 
 `rdns/src/config.rs:45` declares **22** shared fields and generates a `Default`.
 The projection onto `Cli` is then hand-written twice: **35** `cli.x =
@@ -6440,6 +6445,56 @@ survives — it argues for one target shape, not for writing the projection twic
 
 The shape to try: emit the assignment from the macro that declares the field.
 Not costed.
+
+**Closed 2026-09-21**, and the silence is narrower than the row said — which
+makes the finding sharper rather than weaker.
+
+**Probed both ways** (§19). A `[server]` field declared and never assigned does
+*not* compile quietly on its own: `dead_code` says "field `x` is never read",
+and this tree treats a warning as a failure. What kills that warning is any
+other reader — and `check` is one, reading **10** of `rdnsd`'s 36 keys and
+**9** of `rdnsr`'s 23. Added as a field `check` validates and `apply` forgets,
+which is the plausible version of the mistake, the probe built with **no
+warning at all** and `cargo clippy -p rdnsd --all-targets` reported zero. So
+the hole is real and it is exactly the shape of a key that arrives with a
+validation rule.
+
+**The fix is the row's.** `server_table!`'s own-field capture goes from
+`$($own:tt)*` to `$(#[$meta])* $field:ident : $ty:ty`, which is what lets the
+macro emit `Server::apply_to(&self, cli: &mut crate::Cli)` — the 22 shared keys
+and this daemon's own, from the declarations that produce the fields. The
+hand-written projections were **36 statements in `rdnsd` and 23 in `rdnsr`**
+and are now none. `https-path`'s exception — an absent key means "keep the
+flag's default", not "clear it" (§15) — moves into the macro beside the
+declaration, which is where its two copies were.
+
+**The contract grows by one name**, and the module header says so: the calling
+crate's root already had to define the `default_*` functions, and now also a
+`Cli` with a field of the same name and type per key. The probe above, against
+the *fixed* macro, is `error[E0609]: no field 'unwired_probe' on type &mut Cli`
+pointing at the declaration — the same way a missing default has always been a
+struct literal missing a field.
+
+**`rdns::config::taken` is a generic `Clone::clone`** and exists for one
+reason, written next to it: a macro projecting fifty-nine fields a line each
+cannot know which are `Copy`, `.clone()` on those is `clippy::clone_on_copy`,
+and UFCS silences that lint by accident rather than on purpose.
+
+**The test the row said was missing.** `every_server_key_reaches_its_flag`, one
+per daemon, sets every `[server]` key to a non-default and asserts the
+**value** on the flag — not "it differs from the default", which cannot see a
+key wired to the wrong flag. Run against the old hand-written projection it
+passes, which is the equivalence measurement for the generated one; with
+`cli.max_tcp_request = self.server.max_tcp_request` deleted from that old
+projection it fails naming `max-tcp-request`, while
+`a_minimal_config_changes_no_flag_default` stays green — the row's claim about
+that test, demonstrated rather than asserted (§1).
+
+**One stale number corrected in passing**: the module header said `rdnsd`'s
+`[server]` holds 34 keys. It holds 36, counted.
+
+Verified: 1 298 tests on Windows (1 296 before) and 1 319 on Linux, clippy
+clean on both, `cargo doc` and `cargo fmt --check` clean.
 
 ---
 
@@ -6692,6 +6747,7 @@ the week; the record is under "How the queue kept going stale" in
 | **98** | the agent-skill config pointed at a `CONTEXT.md` that was not there | **filed and closed 2026-09-21**, out of the skills' own setup rather than a review. `docs/agents/domain.md` told them to read `CONTEXT.md` and `docs/adr/` before exploring; neither exists. The row named **no remedy**, because none had been checked (§18), and the measurement said which gap was real: the RFC vocabulary is cited in place, and the names this project coined — `ServeContext`, `Reloading`, the denial cache, **75** occurrences across **20** `.rs` files and 17 in `TODO.md` — are defined in doc comments, mentioned twice in `docs/spec/` without a definition, and nowhere else; `docs/spec/README.md`'s Conventions is the only glossary in the tree and it is two lines. Of the three shapes, the one taken was **deleting the pointer**: a root `CONTEXT.md` collides with §11's "no new design documents unless asked for by name", and a terms section grown out of those two lines is §7's second copy. The file now names where a definition lives and records the absence as a decision |
 | **99** | both daemons' dry run was a `return` at a line number, not the rule §15 states | **filed and closed 2026-09-21**, out of an architecture review rather than a defect report. `rdnsd --check-config --dnstap garbage-not-a-scheme` printed "configuration is valid" and exited 0 where the real start exits 1 — the parse sat in `serve`'s **argument list**, which is evaluated below the dry-run exit. `rdnsr`'s half is worse and was reproduced too: a TSIG secret that is not base64 passes the dry run, and `TsigKey::parse` (`:944`) runs after both `bind`s (`:766`, `:767`) and a `tokio::spawn` (`:931`), so the process takes the ports and then dies. Counted before anything was edited: **four** fallible sites below `rdnsd`'s exit, of which `--metrics-listen` in `rdnsr` is *not* one — it is a real `TcpListener::bind` and was checked before it was counted. **Both shapes were built and the type lost**: hoisting is +9 −4, a `Checked` type holding every fallible flag value is +31 −12 and still leaves **23 `cli.*` reads** below the line across 20 fields, with the enforcing version costing a 49-field mirror of `Cli` or the lift #90 declined. **The rule itself was wrong**, which is the part worth keeping: "everything that does not bind a socket" invited moving the exit down to the first spawn, and one function past `rdnsd`'s exit `discard_orphan_journals` calls `Journal::forget` — `std::fs::remove_file`. That dry run would have deleted journals. §15 now says where the exit goes instead, with the journal fact beside it, and the old sentence struck in place. One regression test per daemon, each run against the unfixed tree first |
 | **100** | a dynamic UPDATE's own signatures were the only ones no run verified | **filed and closed 2026-09-21**, and the row undercounted itself. `verify_zones` had two production callers, load and reload, and an UPDATE is the third way a zone reaches the map — but the wider hole is that `ProvenSigning` skips a zone already proved for its key roles, so the *incremental* signer's output had never been checked on any path: startup proves a full sign and every incremental run after it is skipped. Fixed as the row proposed, in the type: `sign_zone_incrementally` returns `Resigned { zone, fresh }`, `sign_one_incrementally` a `FreshlySigned` whose only exit is `verify`, so a zone cannot reach the map unchecked (§17). **The set the row did not name is the one that earns the pass**: checking only what the signer says it signed agrees with a carry-forward that wrongly kept a signature over data that moved, so `verify` also takes every signed RRset at a name the update named (§19). Both sets are O(the change). `SigningRun` carries the same list for the reload path, and `Checked::resigned` counts it, so #53's saving is measurably untouched. Four tests, each watched failing; the first non-`#[ignore]`d test of the signed UPDATE path came with it |
+| **103** | `server_table!` shared the field declarations and not the projection onto `Cli` | **filed and closed 2026-09-21**. The macro removed the copy that is cheap to keep right — the declarations and the defaults, where a missing default is a struct literal missing a field — and left the one where a mistake is silent: 36 hand-written assignments in `rdnsd` and 23 in `rdnsr`, where a declared key with none parsed, passed `deny_unknown_fields` and did nothing. **Probed both ways, and the row was too broad**: `dead_code` warns about a field nothing reads, so the quiet case needs a second reader — and `check` is one for 10 of `rdnsd`'s keys and 9 of `rdnsr`'s, so "validate the new key, forget to project it" built with no warning at all. Fixed by structuring the macro's own-field capture and generating `apply_to` from it, `https-path`'s keep-the-default exception included; 59 statements became none, and a key with no `Cli` field is now `error[E0609]` pointing at the declaration. `every_server_key_reaches_its_flag` is the full-fixture test the row said was missing, one per daemon, asserting the value so a cross-wired key fails too — green against the old projection, and naming `max-tcp-request` with one line deleted from it while the old tripwire stayed green |
 | **101** | the TSIG-rejection branch returned past the dnstap tail | **filed and closed 2026-09-21**, out of the same review as #99 and the same shape: a rule stated in a comment and held by nothing. #75 gave `Server::answer` one tail so nothing could `return` past `record_dnstap`, and the comment at `dispatch.rs:311` said "three ways to answer and one tail". There were four — the `TsigCheck::Rejected` arm sends a NOTAUTH at `:289` and returns at `:292`, sixty lines above the tail — so a capture under a key-guessing probe, which is the one time an operator wants it, held nothing. The test that locked #75 in asserted 3, so the fourth door was invisible from the comment and from the suite at once. Fixed by making the check an expression: both arms produce `Option<Cow<[u8]>>`, the refusal returns what it sent, and the rest moves to `answer_admitted` behind an `Admitted` struct — six values that travel together, because the method wants nine parameters and clippy stops at seven (§14). **The cheapest of the three shapes was the one declined**: a `Drop` guard on the tail is a few lines and makes the record impossible to skip while leaving it easy to hand nothing, which reports "no reply" for a request that got one — the same symptom, quieter. The `let ... else { return; }` in the refusal became a `match` as a consequence, since "no reply fits" is now a value rather than a divergence. Test count 3 → 4, run against the unfixed tree first (`left: 3, right: 4`) |
 | **102** | `Answered::refresh` survived thirteen exits by inspection | **filed and closed 2026-09-21**. `refresh` was a `mut` local declared 226 lines above the cache hit that set it and 200 below the tail that read it, with thirteen `.into()` exits in between and a `From<Option<Vec<u8>>>` that fills `refresh: None` for free — #78a is the time one of those exits silently turned prefetching off for any name an `rpz-ip` rule matched. Fixed by deriving it from the lookup: `hit.as_ref().filter(|hit| hit.refresh).map(|_| query.clone())`, immutable, one line below the `lookup` it comes from. The invariant stops being "read all thirteen exits" and becomes one implication — `refresh` is `Some` only when `hit` is, and both exits that could drop it are in the arm that runs when the cache *missed*. **Both halves of the row's own guess were wrong**: the `From` impl was not the defect and stays, because once the local is gone `.into()` is correct by construction at every one of the thirteen sites, and deleting it would have made them noisier and fixed nothing. No behaviour changed, so there is no new test — a test here would agree with the code (§1); #78a's *A rewritten answer still asks for its prefetch* is still the guard. The old comment's argument is struck in place rather than rewritten, because it is the lesson: "falling through leaves one exit, so there is nothing to remember" held for the exit that had just been removed and said nothing about the next one |
 | **81** | what #63h's macro did not reach, and one more copy | **filed 2026-09-19, closed 2026-09-20**, two rows. **81a** measured and mostly declined: of the 27 commits touching `rdnsd/src/config.rs`, 8 touch its TSIG lines and 1 of those also touches `rdnsr`'s — and that one *created* the copy — so the two tables do not co-move and the shared struct is declined; three fields of five are shared, not five, because a resolver authorizes nothing. What was taken is the list and the default under it: `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES`, `::DEFAULT`, with `TsigKey::parse` coming out better than it went in. **81b** merged the two FNV-1a loops into `rdns_core::folded_hash`, and the check was the row's own instruction taken through the observable rather than by comparing the copies: six `expiry_for` offsets measured before the merge, unchanged after it, so no signature's expiry moved |

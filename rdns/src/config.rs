@@ -1,6 +1,6 @@
 //! The `[server]` keys both daemons have, written once.
 //!
-//! `rdnsd`'s `[server]` table holds 34 keys and 22 of them name a setting
+//! `rdnsd`'s `[server]` table holds 36 keys and 22 of them name a setting
 //! `rdnsr` has as a flag under the same name (`TODO.md` #63b). Two parsers for
 //! one setting is how `[zones."x"].also-notify` came to be parsed into a field
 //! nothing read (#46c), so the shared half is written here.
@@ -14,8 +14,28 @@
 //! exactly as it does today.
 //!
 //! The contract is that the calling crate's root defines the `default_*`
-//! functions named below, which both daemons already do (#63e). A crate that
-//! does not gets a compile error naming the missing one.
+//! functions named below and a `Cli` with a field per key, which both daemons
+//! already do (#63e). A crate that does not gets a compile error naming the
+//! missing one.
+//!
+//! **The projection is generated too**, not only the declarations and the
+//! defaults. It was written out by hand in each daemon — 36 statements in
+//! `rdnsd` and 23 in `rdnsr` — and a key declared and never assigned parsed,
+//! passed `deny_unknown_fields` and did nothing. `dead_code` catches that only while nothing *else* reads the
+//! field, and `check` reads ten of `rdnsd`'s, so the plausible version of the
+//! mistake — validate the new key, forget to project it — compiled without a
+//! warning (`TODO.md` #103).
+
+/// `Clone::clone`, behind a generic.
+///
+/// [`crate::server_table`] projects every `[server]` field a line each and
+/// cannot know which are `Copy`; written as `.clone()` the `Copy` ones are
+/// `clippy::clone_on_copy`, and UFCS dodges that lint by accident rather than
+/// on purpose. Inside a generic the type is not known to be `Copy`, so the
+/// line is the same for a `u16` and for a `Vec<String>`.
+pub fn taken<T: Clone>(value: &T) -> T {
+    value.clone()
+}
 
 /// Declare a `[server]` table: the 22 shared keys, then this daemon's own.
 ///
@@ -46,7 +66,10 @@ macro_rules! server_table {
     (
         $(#[$meta:meta])*
         struct $name:ident {
-            $($own:tt)*
+            $(
+                $(#[$own_meta:meta])*
+                $own_field:ident : $own_type:ty
+            ),* $(,)?
         }
         defaults {
             $($own_default:tt)*
@@ -113,7 +136,61 @@ macro_rules! server_table {
             https_path: Option<String>,
             tls_cert: Option<std::path::PathBuf>,
             tls_key: Option<std::path::PathBuf>,
-            $($own)*
+            $(
+                $(#[$own_meta])*
+                $own_field: $own_type,
+            )*
+        }
+
+        impl $name {
+            /// Write every `[server]` key onto `cli`.
+            ///
+            /// Generated from the declarations above, so a key that parses
+            /// is a key the daemon reads. Written by hand it was 36
+            /// statements in `rdnsd` and 23 in `rdnsr`, and a field with no
+            /// assignment parsed, passed `deny_unknown_fields` and then did
+            /// nothing — the failure `deny_unknown_fields` exists to prevent,
+            /// reached by the other door (`TODO.md` #103). The defaults never
+            /// had that hole, because a missing one is a struct literal
+            /// missing a field; the projection had nothing checking it.
+            ///
+            /// The contract of the module header, plus one name: the calling
+            /// crate's root defines `Cli`, with a field of the same name and
+            /// type per key. A missing or mistyped one is a compile error
+            /// naming the key and pointing at its declaration.
+            fn apply_to(&self, cli: &mut crate::Cli) {
+                cli.host = $crate::config::taken(&self.host);
+                cli.port = $crate::config::taken(&self.port);
+                cli.response_rate = $crate::config::taken(&self.response_rate);
+                cli.query_rate = $crate::config::taken(&self.query_rate);
+                cli.query_burst = $crate::config::taken(&self.query_burst);
+                cli.query_rate_exempt = $crate::config::taken(&self.query_rate_exempt);
+                cli.max_udp_request = $crate::config::taken(&self.max_udp_request);
+                cli.max_tcp_request = $crate::config::taken(&self.max_tcp_request);
+                cli.udp_payload_size = $crate::config::taken(&self.udp_payload_size);
+                cli.max_udp_response = $crate::config::taken(&self.max_udp_response);
+                cli.anomaly_interval = $crate::config::taken(&self.anomaly_interval);
+                cli.anomaly_query_rate = $crate::config::taken(&self.anomaly_query_rate);
+                cli.anomaly_error_percent = $crate::config::taken(&self.anomaly_error_percent);
+                cli.anomaly_source_queries = $crate::config::taken(&self.anomaly_source_queries);
+                cli.anomaly_source_refusals =
+                    $crate::config::taken(&self.anomaly_source_refusals);
+                cli.metrics_listen = $crate::config::taken(&self.metrics_listen);
+                cli.tls_listen = $crate::config::taken(&self.tls_listen);
+                cli.quic_listen = $crate::config::taken(&self.quic_listen);
+                cli.https_listen = $crate::config::taken(&self.https_listen);
+                cli.tls_cert = $crate::config::taken(&self.tls_cert);
+                cli.tls_key = $crate::config::taken(&self.tls_key);
+                // The one key whose flag has a default, so an absent key means
+                // "keep it" rather than "clear it" — the `Option` here is the
+                // override and not the value (§15). The exception lives with
+                // the declaration rather than in each daemon, which is where
+                // both copies of it used to be.
+                if let Some(https_path) = &self.https_path {
+                    cli.https_path = $crate::config::taken(https_path);
+                }
+                $( cli.$own_field = $crate::config::taken(&self.$own_field); )*
+            }
         }
 
         impl Default for $name {
