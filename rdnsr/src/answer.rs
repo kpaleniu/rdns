@@ -223,8 +223,6 @@ pub(crate) async fn handle_query(
     // `Arc` also outlives the resolution that the nameserver triggers are
     // borrowed across, where a lock guard could not go (`CLAUDE.md` §9).
     let policy = policy.in_force();
-    // Set by the one lookup that can discover it, returned by every path.
-    let mut refresh = None;
     // Refuse a *response*: a reply parsed as a question and answered with
     // another reply is a packet loop between two servers pointed at each other.
     // `None` is the whole reply, because the peer did not ask anything. The type
@@ -441,17 +439,25 @@ pub(crate) async fn handle_query(
 
     // Build the response: from cache if we have it, else by resolving. The
     // third is RFC 8914's reason, which only the two failing arms have.
-    let (mut resp, secure, why) = if let Some(hit) =
-        caches
-            .answers
-            .lookup(query.qname.as_ref(), query.qtype, *prefetch)
-    {
+    let hit = caches
+        .answers
+        .lookup(query.qname.as_ref(), query.qtype, *prefetch);
+    // The cache said this entry is in the last tenth of its TTL and nobody has
+    // been asked to refresh it yet. Not here: the client is waiting.
+    //
+    // Derived from the lookup rather than assigned inside the arm below, which
+    // is what makes it provable instead of inspectable (`TODO.md` #102). It
+    // used to be a `mut` declared 226 lines above and set in the hit arm, so
+    // the invariant was "none of the thirteen exits in between returns" —
+    // checked by reading all thirteen, and #78a is the time one of them did.
+    // Now it is `Some` only when `hit` is, and every exit that could drop it is
+    // inside the arm that runs when `hit` is `None`.
+    let refresh = hit
+        .as_ref()
+        .filter(|hit| hit.refresh)
+        .map(|_| query.clone());
+    let (mut resp, secure, why) = if let Some(hit) = hit {
         ctx.metrics.count(&ctx.metrics.cache_hits);
-        // The cache said this entry is in the last tenth of its TTL and nobody
-        // has been asked to refresh it yet. Not here: the client is waiting.
-        if hit.refresh {
-            refresh = Some(query.clone());
-        }
         let (records, secure) = (hit.records, hit.secure);
         (
             build_response(&msg, records, ResponseCode::Ok),
@@ -623,12 +629,16 @@ pub(crate) async fn handle_query(
     // after a recursion — the cache holds what the internet said, and the
     // policy is applied to what leaves.
     //
-    // No `return` here, and that is the point: `refresh` is set at the cache
-    // hit above and read below, so an exit between the two loses it — which
-    // this one did, silently turning prefetching off for any name an `rpz-ip`
-    // rule matched (`TODO.md` #78a, `CLAUDE.md` §7's early return over a
-    // shared epilogue). Falling through leaves one exit, so there is nothing
-    // to remember.
+    // No `return` here. This one had one, and it silently turned prefetching
+    // off for any name an `rpz-ip` rule matched (`TODO.md` #78a, `CLAUDE.md`
+    // §7's early return over a shared epilogue), because `refresh` was set at
+    // the cache hit and read below and an exit between the two dropped it.
+    // ~~Falling through leaves one exit, so there is nothing to remember.~~
+    // That was the argument and it was the weak kind: it held for the exit
+    // that had just been removed and said nothing about the next one. #102
+    // moved `refresh` to the lookup, so it is now `Some` only when the cache
+    // hit, and the exits that could drop it are in the arm the cache *missed*.
+    // Falling through is still right, and no longer the only thing holding it.
     let rewritten = if !policy.is_empty() && !resp.answers.is_empty() {
         match policy.on_answer(&resp.answers, query.qname.as_ref(), query.qtype) {
             Some(rewrite) => {
