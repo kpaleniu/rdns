@@ -37,8 +37,29 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, and **#21**, as of 2026-09-21 — the seven filed out of the
-architecture review are closed.
+**#58**, **#68**, **#107**-**#115**, plus **#21**, as of 2026-09-21 — the seven
+filed out of the architecture review are closed and nine more are filed.
+
+**#107 through #115 came out of a third architecture review on 2026-09-21**,
+this one asking where a module's interface is nearly as large as what is behind
+it and where a test cannot reach past one. Nine rows, none of them a defect on
+the wire, and **not one names a costed remedy** (§18) — every row says what was
+measured and stops.
+
+What the review did *not* file is the half worth reading. The two UDP loops,
+the two clock reads and the per-transport admission differences are #30's "What
+must not be unified" and nothing found contradicts it. `rdnsr`'s `handle_query`
+at 460 lines is answered by `finish_dns64`'s own header, as #88 already
+recorded. `rdns`'s 40 modules were re-checked against the negative result below
+and it holds. And #83's `absolute_name` was challenged — "a second spelling is
+§7's whole subject" reads oddly for a one-line alias whose two call sites
+already reach one implementation in `rdns` — and left alone: it is a name, not a
+drift surface, and the row it belongs to is closed.
+
+One row corrects a claim's *scope* rather than a claim: #107 against
+`clock.rs:42`. The decision #92 took is right for `rdnsd`; the sentence it
+produced is about the whole tree and the count behind it never left that crate.
+
 **#106 closed** the day it was filed, and it was worse than built-and-
 discarded: a zone small enough to fit one envelope *transferred* over DoH, so
 whether DoH carried a transfer depended on zone size. Refusing narrows that,
@@ -1186,7 +1207,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#100**, **#103**-**#106**, plus **#21** —
+**#58**, **#68**, **#107**-**#115**, plus **#21** —
 see "What is open" above, which is the same list and the only place it is
 written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -6770,6 +6791,279 @@ refused however small the zone, and was watched failing against the unfixed
 predicate — where it transferred the whole fixture. 1 302 tests on Windows
 (1 300 before) and 1 323 on Linux, clippy clean on both, `cargo doc` and
 `cargo fmt --check` clean.
+
+---
+
+### 107. Eleven wall-clock reads inside the request path, in the crate #92 did not count — **filed 2026-09-21**
+
+`rdns-core/src/clock.rs:42` says "**The seam stops at the request path, and that
+is a decision rather than a place nobody got to**", citing #92. #92's twelve
+reads are all in `rdnsd` and all *outside* a request path. It never counted
+`rdns/`.
+
+Production reads of `current_unix_timestamp()` in `rdns/`, test modules
+excluded:
+
+| file | reads | reached from |
+|---|---|---|
+| `resolver/caches.rs` | 6 — :71, :117, :137, :251, :274, :290 | every `Resolver::resolve` |
+| `nsec_cache.rs` | 4 — :199, :291, :423, :473 | `handle_query`, before the answer cache |
+| `resolver/validate.rs` | 1 — :32 | `resolve_validated` |
+
+The sharp one is `rdnsr/src/answer.rs:82`. `Caches::new` takes a `Clock` under a
+comment saying why — "one process, one idea of the time, and a test that can
+move it (`TODO.md` #52)" — hands it to `DnsCache::with_stale` and
+`NegativeCache::with_stale`, and then builds the third as
+`NsecCache::new(denial_zones)`. Two of three.
+
+**The measurement that could refute this is #92's own**: does the read decide a
+test's outcome? For two of the three it does.
+
+- `NsecCache` has no expiry test but the degenerate one.
+  `test_expired_proofs_are_not_used` (nsec_cache.rs:1320) signs with
+  `Ttl::from_secs(0)` — "a zero TTL means do not reuse this". Nothing asserts
+  that a 3 600-second proof is live at +1 800 and gone at +3 601, because
+  nothing can.
+- `DelegationCache`'s expiry test reaches through the mutex and forges an entry
+  (caches.rs:402-412), because `insert` clamps `expires_at` to `now + ttl` and
+  there is no clock to move.
+
+**Cost, counted before filing, and the two halves are not the same size.**
+`NsecCache::new` has one production caller — `rdnsr/src/answer.rs:94` — and it
+already holds the `Clock`; the other 26 sites are tests and one example.
+`DelegationCache::new` and `KeyCache::new` have one production caller each, both
+in `Resolver::new` (resolver.rs:510, :512), which holds no clock today, so that
+half is a new field on `Resolver` or `ResolverConfig`. Not costed further: the
+row files what was seen (§18).
+
+`RttStore` is not in this. It reads `Instant::now()`, which is an interval and is
+what §6 asks for.
+
+---
+
+### 108. `min(SOA MINIMUM, the SOA's own TTL)` is written five times — **filed 2026-09-21**
+
+RFC 2308 §5, and RFC 9077 §3 for the denial beside it. Counted:
+
+| site | spelling |
+|---|---|
+| `rdns/src/zone_signer.rs:412` | `Ttl::from_secs(minimum).min(soa_ttl)` |
+| `rdns/src/dnssec_answer.rs:298` | `Ttl::from_secs(soa.rdata.soa_minimum()?).min(soa.ttl)` |
+| `rdns/src/negative_cache.rs:163` | `soa_rr.ttl.as_secs().min(minimum).min(MAX_NEGATIVE_TTL)` |
+| `rdns/src/nsec_cache.rs:202` | `soa_ttl.min(minimum)` |
+| `rdnsd/src/answer.rs:675` | `soa.ttl.min(Ttl::from_secs(minimum))` |
+
+Two of the five already carry a *name* — `negative_ttl_cap(zone)`
+(dnssec_answer.rs:293) and `negative_ttl(soa)` (rdnsd/answer.rs:673) — in two
+crates. The concept has been given a home twice and neither home is reachable
+from the other three sites.
+
+**A reason is on record for exactly one pair.** dnssec_answer.rs:280: "The
+requirement is on what is returned, so it belongs here as well as in the signer
+— a zone whose signatures arrived from somewhere else is answered from this path
+too, and its chain was built by a signer this server does not control" (#73,
+#77a). It holds for that pair and says nothing about the other three.
+
+**The sentence that would make this row wrong**: the five are not one rule.
+Checked — the two ceilings (`MAX_NEGATIVE_TTL`, `MAX_PROOF_TTL`, both 3600) are
+policy applied on top; take them off and the five compute the same number from
+the same two inputs.
+
+**#73 is the evidence that it drifts**: MINIMUM alone where RFC 9077 §3 wants
+the lesser, for months, behind fixtures that are every one of them `$TTL 3600`
+with `minimum 300` — the masking direction.
+
+No remedy costed. `Ttl` is `rdns-core::codes` and `soa_minimum()` is on
+`RecordData` in the same crate, so a home exists; what was not checked is whether
+each of the five holds a record or two loose integers where it asks (§18: file
+the fix only if you checked it).
+
+---
+
+### 109. `struct Server` is in the crate root and its implementation is not — **filed 2026-09-21**
+
+#38d moved the answering out of `main.rs` and left the type behind.
+`dispatch.rs:11` states what the move was for: "Everything else is private to
+this module, which is the whole of `TODO.md` #38d: the transfer and UPDATE
+answering used to be `impl Server` blocks in the crate root, where private means
+visible to the root and every descendant (`CLAUDE.md` §17)." The eleven fields
+that code reads are still in the root, so they are still visible to every
+descendant — the condition the move was made to escape.
+
+Measured:
+
+| | |
+|---|---|
+| `struct Server` | 11 fields, `main.rs:717-745` |
+| `impl Server` | `dispatch.rs:212-1247` — 1 035 lines, 9 methods |
+| `impl tcp::Handler for Server` | `dispatch.rs:141-167` |
+| other implementors in the workspace | 0 |
+| production literals | 2 — `serve` (main.rs:1099) and the test helper `server_with_keys_at` (main.rs:2719) |
+
+**The type is already being worked around.** `dispatch.rs:1239` holds a private
+`fn zone_context(&self) -> ZoneContext` over four of `Server`'s fields, and
+`main.rs:1263-1267` builds the same four by hand from `server.*` because it
+cannot reach it. Three of the five production `ZoneContext` literals are over the
+same four values.
+
+**The test half is downstream of the same fact.** The harness is built around
+`Server` and `replication.rs:19` says so, so 86 tests and 4 414 lines sit in the
+crate root's test module while `replication.rs` has 702 lines and no tests of its
+own, and `dispatch.rs` has 11 over 1 620.
+
+**Price it #83's way, which is not line count.** #83 read "more `pub(crate)` than
+it makes private" as *reachability* rather than annotation count, and took the
+NOTIFY split on the second reading for that reason. A constructor keeps all 11
+fields private; the annotations are the type and three methods. Not built, so not
+claimed — the number decides it, and a `git revert` is the cost of disagreeing.
+
+---
+
+### 110. Four copies of the eviction idiom `Halving` exists to stop — **filed 2026-09-21**
+
+`rdns/src/eviction.rs:1-17`: "This is that halving, moved (`CLAUDE.md` §7), and
+the reason is here so the next copy is not written." Three maps call it —
+`cache.rs:379`, `negative_cache.rs:346`, `nsec_cache.rs:963`. Four sites still
+write the idiom it replaced, `min_by_key` plus a key clone, one victim per
+insert:
+
+- `resolver/caches.rs:119-131`, `DelegationCache::insert`
+- `resolver/caches.rs:273-285`, `KeyCache::insert` — the same eight lines
+- `nsec_cache.rs:912-918`, `insert_bounded_map`
+- `nsec_cache.rs:939-945`, `insert_bounded`
+
+**One of the four says why it declines, and the reason holds**: nsec_cache.rs:924
+— "this bound is per zone and a constant, so the scan cannot grow with anything
+an operator or a stranger sets, and halving would throw away 128 validated proofs
+to save it". Its twin twenty lines above carries no such sentence and differs
+only in `HashMap` against `BTreeMap`.
+
+The two in `resolver/caches.rs` carry no reason, **and their bound is
+operator-set**: `--delegation-cache-size`, 10 000 by default (resolver.rs:257,
+:344), on the resolver's request path, under the map's own mutex.
+
+**The measurement that could refute this row**: at 10 000 entries the scan is
+cheap enough not to matter. It has not been taken here. `eviction.rs`'s 14.6 µs
+against 0.26 was measured for a different map at `rdnsr`'s default bound, so
+quoting it for this one would be §4's "never state what a function does without
+opening it" wearing a benchmark's clothes. Measure before changing.
+
+---
+
+### 111. The signing cost harness is a copy of `sign_zone_inner`, and it has drifted — **filed 2026-09-21**
+
+`split_passes` (zone_signer.rs:3380) is a hand copy of `sign_zone_inner`'s body,
+written because the production function returns `(Zone, FreshRrsets)` and offers
+no per-phase observation. Its own doc names the hazard: "a second copy of this is
+a second thing that can stop being what `sign_zone_inner` runs (`CLAUDE.md` §7),
+and neither caller would notice." It has, twice:
+
+- **:3415** calls `build_nsec_chain(&layout, Ttl::from_secs(minimum), …)`.
+  Production is `Ttl::from_secs(minimum).min(soa_ttl)` (:412) with RFC 9077 §3
+  written on the three lines above it — #73's fix, which the copy never got. It
+  is #108's arithmetic again, in a sixth place.
+- **:3428** passes `&sep, &rest` to `signatures_for`. Production (:1391-1404)
+  computes `dnskey_signers` and `data_signers` with an empty-set fallback and
+  fails the run outright when every key is inactive.
+
+**The guard cannot see either.** `check_split` (:3453) asserts that
+`zone.records().len()` matches and that the wall-clock ratio is within 0.8-1.25×.
+Both drifts preserve the record count.
+
+**And the guard does not run.** All three cost tests are `#[ignore]` (:3549,
+:3675, :3801), so `cargo test` never executes the assertion that was supposed to
+catch this.
+
+No remedy costed. The shape that removes the copy is the production body handing
+its phase timings back, which changes a return type on the signing path and was
+not built (§18).
+
+---
+
+### 112. Price the reload cluster's constructors — **filed 2026-09-21**
+
+#83's own follow-up, in its words: "give `Reloading` and `ReloadContext`
+constructors and the 13 fields stay private — 5 `pub(crate)` against 1, still a
+loss, but a close one. That is a different change from moving a file, and it is
+the one somebody should price if this comes back."
+
+Re-measured 2026-09-21, and one number has moved in its favour. **The cluster's
+reach-backs into `main`'s locals are 0.** #83 predicted the NOTIFY split would
+remove the one it counted, and it did: the only cross-module reference in
+main.rs:1387-1730 is `crate::notify_out::announce_zones` at :1596, which is a
+sibling module and not the root. The 13 fields are confirmed — `Reloading` 8,
+`ReloadContext` 5 — and one of the five items is **already** named from outside
+the root: `control.rs:25` reads `use crate::{ReloadTrigger, ZoneContext};`, so
+that one is paid whether or not anything moves.
+
+**What makes it worth pricing is a test, not a file length.**
+`spawn_zone_maintenance` (main.rs:1634, 82 lines) has no test — two occurrences
+of the name in the file, its definition and `main`'s call. Its two non-obvious
+behaviours are asserted by comments only: the depth-1 channel, so a second
+`rdnsctl reload` arriving during one waits for a slot rather than piling up
+(:1663-1667), and the keepalive sender clone that stops `recv` returning `None`
+when no control socket is configured (:1668-1672). `sleep_for`'s timer is
+`tokio::time::sleep`, which `tokio::time::pause()` moves with no new parameter —
+so the timer is not what blocks the test. The struct literals in `main` are.
+
+---
+
+### 113. #103's projection sweep stopped at `[server]` — **filed 2026-09-21**
+
+`rdnsr/src/config.rs`'s `[resolver]` section lists its 11 fields three times: the
+declaration (:92-114), `impl Default` (:116-132) and `apply` (:360-374).
+`[server]`'s 22 keys come out of `rdns::server_table!` since #103; `[resolver]`
+and `[rpz]` were not swept, and the guard test is `[server]`-only —
+`every_server_key_reaches_its_flag`, config.rs:471.
+
+**#103's own narrowing says when this bites, and half of it is already true
+here.** Its finding was that `dead_code` does warn about a field nothing reads,
+so the silent case is the one where something *else* reads it — "a key that
+arrives with a validation rule". `[rpz]`'s keys have one: `check` parses
+`self.rpz.policy` (config.rs:297) and `apply` re-parses it under
+`expect("checked in Config::check")` (:379). A `[rpz]` key that `check` reads and
+`apply` forgets warns about nothing and does nothing.
+
+`[resolver]`'s 11 are read by `apply` alone today, so a forgotten one still
+warns. That is the shape one validation rule away from #103's silent case, not
+the case itself — which is why this row files the two sections together and names
+neither as a defect today.
+
+---
+
+### 114. `Answered.refresh` is discharged by hand at each transport — **filed 2026-09-21**
+
+`rdnsr/src/serve.rs:115-117` (UDP) and `:145-147` (TCP) are the same three lines
+under the same comment: "After the reply, never before it" and "As on UDP: after
+the reply is on the wire, in the task that sent it". The obligation is prose on a
+struct field (answer.rs:166-172).
+
+#102 narrowed how `refresh` is *derived* — from the lookup rather than assigned
+in an arm, so an exit added between the write and the read cannot drop it — and
+was honest about its predecessor's argument: "it held for the exit that had just
+been removed and said nothing about the next one." The same sentence applies to
+the *discharge*, which #102 did not touch.
+
+Count of the shape: 2. A third transport is a third copy or a third bug. No
+remedy costed.
+
+---
+
+### 115. Two pieces of `rdnsd` prose that are wrong in the tree today — **filed 2026-09-21**
+
+Both are §4's "a claim to verify", in the half no compiler reads.
+
+- **`dispatch.rs:290-293`** — the two-line RFC 8945 §5.2 comment is written twice
+  in a row, verbatim. `git log -S` puts the phrase's last touch at `955504d`
+  (#101), the commit that split `answer_admitted` out of `answer`. Count of the
+  shape tree-wide: **1**; a scan for a repeated two-line comment block over every
+  `.rs` file in the workspace finds this and nothing else. `cargo fmt` and clippy
+  both pass it, which is why it survived.
+- **`config.rs:14-16`** — "Of `Cli`'s 46 `#[arg]` fields the other 40 carry
+  `conflicts_with = "config"`, and that list is the authority for this sentence."
+  Counted 2026-09-21: **51** `#[arg]` attributes over 49 fields, **45** carrying
+  `conflicts_with`. A sentence that names itself the authority for a number it no
+  longer holds.
 
 ---
 
