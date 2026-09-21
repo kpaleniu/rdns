@@ -21,10 +21,17 @@
 //!
 //! **What this deliberately does not carry.** A zone transfer. The handler is a
 //! sink because an AXFR is a sequence of messages (RFC 5936 §2.2), and one HTTP
-//! response is one message — so a handler that emits several has its first
-//! answer sent and the rest dropped, with a warning. RFC 8484 defines no
-//! framing that would carry the rest, and inventing one would be a protocol
-//! this tree made up.
+//! response is one message. RFC 8484 defines no framing that would carry the
+//! rest, and inventing one would be a protocol this tree made up; RFC 9103
+//! §7.1 leaves DoH outside zone transfer as well.
+//!
+//! The refusal is the *dispatcher's*, on
+//! [`rdns::validation::Arrival::carries_a_sequence`], because only it can
+//! refuse before the zone is looked up. This module used to find out by
+//! draining what had already been built and warning — and a zone small enough
+//! to fit one envelope transferred, so whether DoH carried a transfer depended
+//! on zone size (`TODO.md` #106). The drain is still here as a backstop: the
+//! `Handler` trait permits a sequence because `tcp` and `quic` need it.
 
 use std::io;
 use std::net::SocketAddr;

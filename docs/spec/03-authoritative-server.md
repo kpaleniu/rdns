@@ -228,7 +228,10 @@ operator can read.
 ### Authorization
 
 ```
-if --transfer-tls-only and the connection is not TLS 1.3 or later:
+if the transport carries one message per request (DoH):
+        REFUSED   (EDE: a zone transfer is a sequence of messages and DoH
+                   carries one)
+else if --transfer-tls-only and the connection is not TLS 1.3 or later:
         REFUSED   (EDE: zone transfers here are over TLS 1.3 only)
 else if a TSIG session exists and the key is scoped to zones not containing <apex>:
         REFUSED   (signed)
@@ -241,10 +244,18 @@ else:
         allowed
 ```
 
-- The transport question comes first because it is about the connection rather
-  than the peer: a client may be perfectly authorized and asking on the wrong
-  socket, and RFC 9103 §11 makes that a different answer. TLS 1.3 or later
-  (§7.2); DoQ always qualifies (RFC 9001 §4.2) and DoT or DoH qualify when the
+- **DoH cannot carry a transfer at all**, whatever the policy and whoever is
+  asking (`Arrival::carries_a_sequence`). An AXFR is a sequence of messages
+  (RFC 5936 §2.2) and one HTTP response is one `application/dns-message`
+  (RFC 8484 §4.2); RFC 8484 defines no framing for the rest and RFC 9103 §7.1
+  leaves DoH outside zone transfer. It used to be *built* and then drained by
+  the adapter and discarded — except for a zone that fitted one envelope,
+  which transferred, so whether DoH carried a transfer depended on zone size
+  (`TODO.md` #106).
+- The transport questions come first because they are about the connection
+  rather than the peer: a client may be perfectly authorized and asking on the
+  wrong socket, and RFC 9103 §11 makes that a different answer. TLS 1.3 or
+  later (§7.2); DoQ always qualifies (RFC 9001 §4.2) and DoT qualifies when the
   handshake was 1.3.
 - Checked before the zone is looked up and before any message is built.
 - Authorized against the apex, exactly: a child of a listed zone is refused.

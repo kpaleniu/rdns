@@ -37,7 +37,12 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#106**, and **#21**, as of 2026-09-21.
+**#58**, **#68**, and **#21**, as of 2026-09-21 — the seven filed out of the
+architecture review are closed.
+**#106 closed** the day it was filed, and it was worse than built-and-
+discarded: a zone small enough to fit one envelope *transferred* over DoH, so
+whether DoH carried a transfer depended on zone size. Refusing narrows that,
+and the narrowing is the finding.
 **#105 closed** the day it was filed, and its open design question has an
 answer that leaves #30e alone: what #30e argues is that the two *daemons*
 disagree, so the parameter and its call sites stay — what became one is the
@@ -6691,7 +6696,7 @@ clean.
 
 ---
 
-### 106. A DoH transfer is built in full and discarded — **filed 2026-09-21**
+### 106. A DoH transfer is built in full and discarded — **filed and closed 2026-09-21**
 
 `Server::answer` decides to stream a transfer from `qtype` and `Wire::Framed`
 alone (`dispatch.rs:317`). DoH arrives as `Wire::Framed(_, Arrival::Doh(..))`, so
@@ -6713,6 +6718,58 @@ right. The gap is that it carries no way for an adapter to say how many replies
 it can take, which is the one fact `https` needs and `tcp` and `quic` do not.
 Refusing before building is the shape to try, beside the place AXFR-over-UDP is
 already refused. Not costed.
+
+**Closed 2026-09-21**, and the cost was not the only thing the row did not
+answer: it is worse than "built and discarded".
+
+**Measured before fixing.** The three-record fixture `transfer_by_certificate`
+uses **transferred over DoH**, completely and successfully — one envelope is a
+whole AXFR (RFC 5936 §2.2 lets a server use one message), and `https::answer`
+takes the first frame as its body. So DoH carried a transfer when the zone was
+small and built the whole zone into a discarded channel when it was not.
+Succeeding by zone size is the shape `CLAUDE.md` §4 is about: it passes every
+fixture and fails the deployment.
+
+**The fact goes on `Arrival`, not on `Wire`.** `Arrival` already answers the
+other two questions a transport is asked — `peer_certificate` and `privacy` —
+and its own header calls itself the third of three. `carries_a_sequence` is
+the fourth, and it belongs there for the same reason: every adapter that
+builds an `Arrival` has already decided it, where the dispatcher was inferring
+it from whether the reply channel was framed at all.
+
+**The refusal goes in `answer_transfer`, beside `--transfer-tls-only`.** Not at
+the dispatch that chose to stream, although that is where the row pointed:
+this is the function that logs an attempt, that signs a refusal when the
+request was signed (RFC 8945 §5.3, §16), and that already refuses before the
+zone is looked up — which is the whole content of "refuse before building". It
+goes *before* the TLS check, because it is the one refusal no configuration
+and no credential can change. REFUSED with an EDE naming the transport rather
+than a setting, since there is nothing an operator could turn on.
+
+**This narrows something that worked, and the narrowing is the finding**
+(§16). What is lost is a DoH transfer of a zone small enough to fit one
+envelope. Nothing defines that: RFC 8484 defines no framing for a sequence and
+RFC 9103 §7.1 puts DoH outside zone transfer.
+
+**`https`'s drain stays, as a backstop.** `Handler` permits a sequence because
+`tcp` and `quic` need one, so an adapter that can take only one reply still
+has to say what it does with a second. What changed is that it is no longer
+how a DoH transfer is *decided* — the module header said "a handler that emits
+several has its first answer sent and the rest dropped, with a warning", which
+described the mechanism and not the outcome.
+
+The row's other reading holds: #30's "the handler has to be sink-shaped" is
+untouched. The gap it named — the sink carries no way to say how many replies
+it can take — is closed from the other end, by the dispatcher asking the
+arrival instead of the sink answering for itself.
+
+Verified: two new tests. The control transfers over `Tcp`, `Dot` and `Doq`
+with the same ACL and only the arrival differing, so the refusal below is
+about the transport and not about permission; the second asserts DoH is
+refused however small the zone, and was watched failing against the unfixed
+predicate — where it transferred the whole fixture. 1 302 tests on Windows
+(1 300 before) and 1 323 on Linux, clippy clean on both, `cargo doc` and
+`cargo fmt --check` clean.
 
 ---
 
@@ -6892,6 +6949,7 @@ the week; the record is under "How the queue kept going stale" in
 | **103** | `server_table!` shared the field declarations and not the projection onto `Cli` | **filed and closed 2026-09-21**. The macro removed the copy that is cheap to keep right — the declarations and the defaults, where a missing default is a struct literal missing a field — and left the one where a mistake is silent: 36 hand-written assignments in `rdnsd` and 23 in `rdnsr`, where a declared key with none parsed, passed `deny_unknown_fields` and did nothing. **Probed both ways, and the row was too broad**: `dead_code` warns about a field nothing reads, so the quiet case needs a second reader — and `check` is one for 10 of `rdnsd`'s keys and 9 of `rdnsr`'s, so "validate the new key, forget to project it" built with no warning at all. Fixed by structuring the macro's own-field capture and generating `apply_to` from it, `https-path`'s keep-the-default exception included; 59 statements became none, and a key with no `Cli` field is now `error[E0609]` pointing at the declaration. `every_server_key_reaches_its_flag` is the full-fixture test the row said was missing, one per daemon, asserting the value so a cross-wired key fails too — green against the old projection, and naming `max-tcp-request` with one line deleted from it while the old tripwire stayed green |
 | **104** | four digest caches over one `FileDigest`, with the reasoning built on it copied | **filed and closed 2026-09-21**, and asking the question found two defects rather than a duplication. `rdnsd`'s UPDATE path parsed with `parse_zone_file`, which has no base directory and resolves `$INCLUDE` against the *process's* working directory where the loader resolves it against the zone file's — a SERVFAIL for a file the loader reads. Under it, and reachable only once that was fixed: the digest was `FileDigest::of` over bytes read off disk, so a no-op UPDATE remembered the digest of an `$INCLUDE`-bearing parent and the next UPDATE matched it while the *included* file had moved. Reproduced: `www` served `192.0.2.9` after the include had been rewritten to `198.51.100.77`, and the file was written back flattened with neither the directive nor the new address in it (`CLAUDE.md` §4). **Both are one check at the boundary**: `of_self_contained`, with `None` a REFUSED — a file built out of includes is not a writable source, because it cannot be written back as one. **The count is declined on a measurement**: `LoadedFiles` and `Keepable` are one cache and a policy layer, `UpdateHandling::applying` lives under the §3.7 mutex on purpose, and `PolicyStore.offered` is a `Vec` of zones rather than a digest map — two maps and a list, two crates, three lock kinds. What they share is `FileDigest`, which was already shared, and the `stat` argument, which is now on it once instead of written out at two call sites. `PolicyStore::offer`'s "the caller writes `text` to `path` first" became `zone_writer::Written`, which only the write makes (§17) |
 | **105** | `https::answer` charged the rate limiter whatever the caller asked for | **filed and closed 2026-09-21**, and the row's own framing was the first correction: the review said `RateLimit::PerConnection` had no production caller, and `rdnsr` passes it to all four of its listeners. What survived is worse — `https::serve` charged `allow_source` at accept and `answer` charged again for every request, so the first request of every DoH connection paid twice and `--query-rate` meant one thing over DoT and another over DoH. Reproduced: a burst of one, and the first request of the first connection came back `429`. **The open design question has an answer that leaves #30e alone**: #30e is about the two *daemons* disagreeing, so the parameter and its call sites stay; what became one is the four *adapters*' reading of it. `RateLimit::admits_connection` and `admits_message` are a pair, so a caller that asks both charges once whatever the policy is — seven places in `rdns-transport` spelled the predicate, four accept blocks and two per-message `if`s and one call that consulted nothing, and two do now. Where a refusal lands is now stated: before the TLS handshake under `PerConnection`, so a dropped connection rather than a 429 |
+| **106** | a DoH transfer was built in full and discarded | **filed and closed 2026-09-21**, and measuring it first found worse than the row claimed: the three-record fixture **transferred** over DoH, because one envelope is a whole AXFR (RFC 5936 §2.2) and `https::answer` takes the first frame as its body. So DoH carried a transfer when the zone was small and serialized the whole zone into a discarded channel when it was not — succeeding by zone size, which passes every fixture and fails the deployment. `Arrival::carries_a_sequence` is the fourth question that type answers, beside `peer_certificate` and `privacy`, because every adapter that builds an `Arrival` has already decided it. The refusal goes in `answer_transfer` beside `--transfer-tls-only` rather than at the dispatch that chose to stream: that is the function that logs an attempt, signs a refusal when the request was signed (§16), and already runs before the zone is looked up. First of the three, because no configuration or credential can change it. **It narrows something that worked** and nothing defines that something — RFC 8484 gives no framing for a sequence and RFC 9103 §7.1 puts DoH outside zone transfer. `https`'s drain stays as a backstop, since `Handler` permits a sequence for `tcp` and `quic` |
 | **101** | the TSIG-rejection branch returned past the dnstap tail | **filed and closed 2026-09-21**, out of the same review as #99 and the same shape: a rule stated in a comment and held by nothing. #75 gave `Server::answer` one tail so nothing could `return` past `record_dnstap`, and the comment at `dispatch.rs:311` said "three ways to answer and one tail". There were four — the `TsigCheck::Rejected` arm sends a NOTAUTH at `:289` and returns at `:292`, sixty lines above the tail — so a capture under a key-guessing probe, which is the one time an operator wants it, held nothing. The test that locked #75 in asserted 3, so the fourth door was invisible from the comment and from the suite at once. Fixed by making the check an expression: both arms produce `Option<Cow<[u8]>>`, the refusal returns what it sent, and the rest moves to `answer_admitted` behind an `Admitted` struct — six values that travel together, because the method wants nine parameters and clippy stops at seven (§14). **The cheapest of the three shapes was the one declined**: a `Drop` guard on the tail is a few lines and makes the record impossible to skip while leaving it easy to hand nothing, which reports "no reply" for a request that got one — the same symptom, quieter. The `let ... else { return; }` in the refusal became a `match` as a consequence, since "no reply fits" is now a value rather than a divergence. Test count 3 → 4, run against the unfixed tree first (`left: 3, right: 4`) |
 | **102** | `Answered::refresh` survived thirteen exits by inspection | **filed and closed 2026-09-21**. `refresh` was a `mut` local declared 226 lines above the cache hit that set it and 200 below the tail that read it, with thirteen `.into()` exits in between and a `From<Option<Vec<u8>>>` that fills `refresh: None` for free — #78a is the time one of those exits silently turned prefetching off for any name an `rpz-ip` rule matched. Fixed by deriving it from the lookup: `hit.as_ref().filter(|hit| hit.refresh).map(|_| query.clone())`, immutable, one line below the `lookup` it comes from. The invariant stops being "read all thirteen exits" and becomes one implication — `refresh` is `Some` only when `hit` is, and both exits that could drop it are in the arm that runs when the cache *missed*. **Both halves of the row's own guess were wrong**: the `From` impl was not the defect and stays, because once the local is gone `.into()` is correct by construction at every one of the thirteen sites, and deleting it would have made them noisier and fixed nothing. No behaviour changed, so there is no new test — a test here would agree with the code (§1); #78a's *A rewritten answer still asks for its prefetch* is still the guard. The old comment's argument is struck in place rather than rewritten, because it is the lesson: "falling through leaves one exit, so there is nothing to remember" held for the exit that had just been removed and said nothing about the next one |
 | **81** | what #63h's macro did not reach, and one more copy | **filed 2026-09-19, closed 2026-09-20**, two rows. **81a** measured and mostly declined: of the 27 commits touching `rdnsd/src/config.rs`, 8 touch its TSIG lines and 1 of those also touches `rdnsr`'s — and that one *created* the copy — so the two tables do not co-move and the shared struct is declined; three fields of five are shared, not five, because a resolver authorizes nothing. What was taken is the list and the default under it: `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES`, `::DEFAULT`, with `TsigKey::parse` coming out better than it went in. **81b** merged the two FNV-1a loops into `rdns_core::folded_hash`, and the check was the row's own instruction taken through the observable rather than by comparing the copies: six `expiry_for` offsets measured before the merge, unchanged after it, so no signature's expiry moved |

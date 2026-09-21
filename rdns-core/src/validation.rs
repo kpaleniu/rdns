@@ -266,6 +266,28 @@ impl Arrival {
         }
     }
 
+    /// Whether this transport can carry a *sequence* of messages in answer to
+    /// one request, which a zone transfer is (RFC 5936 §2.2).
+    ///
+    /// The fourth question, and the one the dispatcher used to answer by
+    /// asking whether the reply channel was framed at all. DoH is framed and
+    /// carries one message: RFC 8484 §4.2 makes one HTTP response one
+    /// `application/dns-message`, defines no framing that would carry the
+    /// rest, and RFC 9103 §7.1 leaves DoH outside zone transfer altogether.
+    /// So a transfer over DoH used to be built in full, drained by the adapter
+    /// and thrown away — except for a zone small enough to fit one envelope,
+    /// which succeeded (`TODO.md` #106).
+    ///
+    /// Here rather than on the dispatcher's own wrapper, for the reason the
+    /// other two answers are here: this is a fact about the protocol, and
+    /// every adapter that builds an [`Arrival`] has already decided it.
+    pub fn carries_a_sequence(&self) -> bool {
+        match self {
+            Arrival::Tcp | Arrival::Dot(..) | Arrival::Doq(_) => true,
+            Arrival::Doh(..) => false,
+        }
+    }
+
     /// What this connection hid from the path it crossed.
     pub fn privacy(&self) -> Privacy {
         match self {

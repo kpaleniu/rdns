@@ -3473,6 +3473,122 @@ mod tests {
 
     mod transfer_authorization {
         use super::*;
+        /// A transfer is a sequence of messages, and DoH carries one.
+        ///
+        /// `TODO.md` #106. `Server::answer` decided to stream from the QTYPE
+        /// and `Wire::Framed` alone, so a DoH request reached
+        /// `answer_transfer` and the whole zone was serialized one envelope at
+        /// a time into a channel `https::answer` drains and discards — the
+        /// client waiting on the producer to finish before it is handed the
+        /// first envelope. RFC 8484 defines no framing that would carry the
+        /// rest and RFC 9103 §7.1 puts DoH outside zone transfer, so the
+        /// answer is a refusal rather than a stream nothing can read.
+        ///
+        /// The arrival is the whole of what this drives, so the socket is a
+        /// plain one — the same shape `transfer_by_certificate` uses to test
+        /// authorization without a handshake.
+        mod transfer_needs_a_transport_that_carries_a_sequence {
+            use super::*;
+            use rdns::validation::{Arrival, PeerCertificate, TlsVersion};
+
+            /// A primary that allows this address to transfer, arriving as
+            /// whatever `arrival` says.
+            async fn primary_arriving_over(arrival: Arrival) -> SocketAddr {
+                let zone = rdns::zone::parse_zone_file(
+                    "$ORIGIN example.com.\n\
+                     $TTL 3600\n\
+                     @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                     @   IN NS  ns1.example.com.\n\
+                     ns1 IN A   192.0.2.1\n",
+                    "example.com.",
+                )
+                .expect("parse");
+                let mut zones = HashMap::new();
+                zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
+
+                let server = Arc::new(Server {
+                    zone_map: Arc::new(RwLock::new(Zones::new(zones))),
+                    ctx: test_context(),
+                    transfer_acl: Arc::new(
+                        TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl"),
+                    ),
+                    transfer_clients: Arc::new(TransferCertificates::default()),
+                    transfer_tls_only: false,
+                    tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
+                    secondaries: Arc::new(Secondaries::default()),
+                    deltas: Arc::new(RwLock::new(DeltaLog::new())),
+                    updates: Arc::new(UpdateHandling::disabled()),
+                    journal: None,
+                    dnstap: None,
+                });
+
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    while let Ok((stream, peer)) = listener.accept().await {
+                        tokio::spawn(tcp::serve_one(
+                            stream,
+                            peer,
+                            server.clone(),
+                            TransportLimits::default(),
+                            tcp::RateLimit::PerMessage,
+                            arrival.clone(),
+                            test_shutdown().stop_handle(),
+                        ));
+                    }
+                });
+                addr
+            }
+
+            async fn transfer(master: SocketAddr) -> rdns::error::TransferResult<rdns::zone::Zone> {
+                rdns::xfr::fetch_zone(
+                    &rdns::xfr::Master::plain(master),
+                    nm("example.com.").as_ref(),
+                    None,
+                )
+                .await
+            }
+
+            /// The three that frame a stream answer it. This is the control:
+            /// the ACL is the same and only the arrival differs, so a failure
+            /// below is about the transport and not about permission.
+            #[tokio::test]
+            async fn tcp_dot_and_doq_still_transfer() {
+                for arrival in [
+                    Arrival::Tcp,
+                    Arrival::Dot(TlsVersion::Tls13, PeerCertificate::none()),
+                    Arrival::Doq(PeerCertificate::none()),
+                ] {
+                    let master = primary_arriving_over(arrival.clone()).await;
+                    let zone = transfer(master)
+                        .await
+                        .unwrap_or_else(|e| panic!("{arrival:?} carries a sequence: {e}"));
+                    assert_eq!(zone.serial(), Some(Serial::new(1)));
+                }
+            }
+
+            /// And DoH is refused, however small the zone.
+            ///
+            /// **This narrows something that worked** (`CLAUDE.md` §16), and
+            /// the narrowing is the point: a zone that fitted one envelope
+            /// transferred over DoH and a zone that did not was built in full
+            /// and thrown away. Succeeding by zone size is the shape §4 is
+            /// about — it passes every test fixture and fails the deployment.
+            #[tokio::test]
+            async fn doh_is_refused_however_small_the_zone() {
+                let master =
+                    primary_arriving_over(Arrival::Doh(TlsVersion::Tls13, PeerCertificate::none()))
+                        .await;
+                let err = transfer(master)
+                    .await
+                    .expect_err("one HTTP response is one message");
+                assert!(
+                    err.to_string().contains("Refused"),
+                    "want a refusal, got: {err}"
+                );
+            }
+        }
+
         /// RFC 9103 §7.5's other method: a transfer authorized by the certificate
         /// the client presented, with no TSIG key and an empty address ACL —
         /// `TODO.md` #59.

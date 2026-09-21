@@ -606,6 +606,38 @@ impl Server {
         let incremental = msg.queries.first().map(|q| q.qtype) == Some(Qtype::IXFR);
         let kind = if incremental { "IXFR" } else { "AXFR" };
 
+        // Before anything about who is asking, and before this one too: the
+        // answer cannot leave by the door it arrived at, whoever is asking and
+        // whatever the policy. Checked here rather than at the dispatch that
+        // chose to stream, because this is where a refusal is logged and
+        // signed — an authenticated refusal is still signed (RFC 8945 §5.3,
+        // `CLAUDE.md` §16) — and because it is before the zone is looked up,
+        // which is the whole point of refusing rather than building
+        // (`TODO.md` #106).
+        if !arrival.carries_a_sequence() {
+            serving_error!(
+                self.ctx.logger,
+                ip,
+                "{kind} of {qname} REFUSED: {} carries one message per request",
+                match arrival {
+                    Arrival::Doh(..) => "DoH",
+                    // Unreachable while DoH is the only one, and written out
+                    // so adding a transport that cannot stream is a compile
+                    // error here rather than a wrong sentence.
+                    Arrival::Tcp | Arrival::Dot(..) | Arrival::Doq(_) => "this transport",
+                }
+            );
+            self.send_transfer_error(
+                refused,
+                ResponseCode::Refused,
+                Some(ONE_MESSAGE_TRANSPORT),
+                session,
+                out,
+            )
+            .await;
+            return;
+        }
+
         // Before anything about who is asking: RFC 9103 §11 — "An individual
         // zone transfer is not considered protected by XoT unless both the
         // client and server are configured to use only XoT" — and this is the
@@ -1233,6 +1265,15 @@ const NOT_YOURS: ExtendedError =
 const NOT_OVER_TLS: ExtendedError = ExtendedError::new(
     InfoCode::OTHER,
     "zone transfers here are over TLS 1.3 only (RFC 9103)",
+);
+
+/// A transfer asked for over a transport that carries one message. Not a
+/// policy and not the client's fault, so OTHER again, and the sentence names
+/// the transport rather than the server's configuration — there is nothing an
+/// operator could turn on (`TODO.md` #106).
+const ONE_MESSAGE_TRANSPORT: ExtendedError = ExtendedError::new(
+    InfoCode::OTHER,
+    "a zone transfer is a sequence of messages and DoH carries one (RFC 8484 §4.2)",
 );
 
 /// An UPDATE for a zone this server replicates. Not PROHIBITED â the
