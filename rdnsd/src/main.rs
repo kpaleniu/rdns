@@ -4105,14 +4105,16 @@ mod tests {
         frames
     }
 
-    /// All three answering paths reach the query stream, not just the ordinary
+    /// All four answering paths reach the query stream, not just the ordinary
     /// one.
     ///
     /// `TODO.md` #77b, the test #75 landed without. `record_dnstap` used to sit
     /// behind `finish`, which the transfer and UPDATE branches returned above,
     /// so a capture held neither — while `--dnstap` says "every answered
     /// request" and `MessageType::UpdateQuery` was an arm nothing could reach.
-    /// Watched failing against that shape: one data frame, not three.
+    /// Watched failing against that shape: one data frame, not three — and
+    /// again at three against the TSIG-rejection branch, which #75 left
+    /// returning past the tail and #101 took out.
     ///
     /// The transfer is refused, because this server has no ACL. That is the
     /// case worth capturing anyway — `answer_transfer` logs every attempt for
@@ -4172,6 +4174,23 @@ mod tests {
             "an empty ACL refuses everyone"
         );
 
+        // The fourth door (`TODO.md` #101). A key the server does not hold is
+        // *answered* — NOTAUTH, signed per RFC 8945 §5.3 — and the branch used
+        // to `return` sixty lines above the tail, so the one capture an
+        // operator wants during a key-guessing probe held nothing.
+        let stranger = TsigKey::new("stranger.key.", TsigAlgorithm::HmacSha256, vec![9u8; 32]);
+        let probe = update_message(
+            "example.com.",
+            vec![a_record("probe.example.com.", "192.0.2.51")],
+        );
+        let bytes = probe.to_bytes_within(4096).expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &stranger, tsig::now()).expect("sign");
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::NotAuthorized,
+            "a key this server does not hold"
+        );
+
         // Polled rather than slept: the pump writes STOP and flushes as it
         // stops, so the capture is closed when it ends with one, and a fixed
         // sleep would make a loaded machine decide the result.
@@ -4192,8 +4211,8 @@ mod tests {
         };
         assert_eq!(
             data_frames(&capture),
-            3,
-            "a query, an UPDATE and a transfer attempt"
+            4,
+            "a query, an UPDATE, a transfer attempt and a TSIG refusal"
         );
     }
 

@@ -195,6 +195,19 @@ impl<'a> Refused<'a> {
     }
 }
 
+/// What `answer` has settled about a request before it is answered.
+///
+/// Six values that travel together into `answer_admitted`, which would
+/// otherwise take them one by one past the point clippy stops counting.
+struct Admitted<'a> {
+    msg: &'a DnsMessage,
+    qtype: Option<Qtype>,
+    peer: SocketAddr,
+    now: u64,
+    ceiling: usize,
+    advertised: u16,
+}
+
 impl Server {
     /// Answer one request, whatever it arrived on.
     ///
@@ -258,11 +271,26 @@ impl Server {
         let ceiling = self.ctx.udp.reply_ceiling(&msg, wire.transport());
         let advertised = self.ctx.udp.advertised();
 
+        let incoming = Incoming {
+            msg: &msg,
+            bytes: packet,
+            arrived,
+        };
+
+        let admitted = Admitted {
+            msg: &msg,
+            qtype,
+            peer,
+            now,
+            ceiling,
+            advertised,
+        };
+
         // TSIG before anything that could answer (RFC 8945 §5.2): checking the
         // signature afterwards means answering whoever asked.
-        let mut session = match tsig::check_request(packet, &self.tsig_keys, now) {
-            TsigCheck::Unsigned => None,
-            TsigCheck::Verified(session) => Some(session),
+        // TSIG before anything that could answer (RFC 8945 §5.2): checking the
+        // signature afterwards means answering whoever asked.
+        let sent = match tsig::check_request(packet, &self.tsig_keys, now) {
             TsigCheck::Rejected(rejection) => {
                 // WARN, not DEBUG: a key that does not verify is either a
                 // misconfiguration or somebody trying keys.
@@ -276,23 +304,70 @@ impl Server {
                 // No RFC 8914 reason: the TSIG record this reply carries says
                 // BADKEY, BADSIG or BADTIME itself (RFC 8945 §4.3), which is a
                 // finer answer than any INFO-CODE has.
-                let Some(response) = error_reply(
+                // A `match` and not a `let ... else`: this is an arm now, so
+                // "no reply fits" is a value it produces rather than a
+                // divergence it escapes through.
+                match error_reply(
                     &msg,
                     ResponseCode::NotAuthorized,
                     None,
                     reserve(ceiling, rejection.reply_overhead()),
                     advertised,
-                ) else {
-                    return;
-                };
-                match rejection.attach(response, now) {
-                    Ok(bytes) => wire.send(&bytes, &self.ctx.logger, ip).await,
-                    Err(e) => serving_error!(self.ctx.logger, ip, "TSIG error reply: {e}"),
+                ) {
+                    None => None,
+                    Some(response) => match rejection.attach(response, now) {
+                        Ok(bytes) => {
+                            wire.send(&bytes, &self.ctx.logger, ip).await;
+                            // Returned rather than dropped: the tail records
+                            // what went out, and a NOTAUTH is an answered
+                            // request.
+                            Some(Cow::Owned(bytes))
+                        }
+                        Err(e) => {
+                            serving_error!(self.ctx.logger, ip, "TSIG error reply: {e}");
+                            None
+                        }
+                    },
                 }
-                return;
+            }
+            other => {
+                let mut session = match other {
+                    TsigCheck::Verified(session) => Some(session),
+                    // `Unsigned`; `Rejected` is the arm above.
+                    _ => None,
+                };
+                self.answer_admitted(&admitted, &mut session, wire, scratch)
+                    .await
             }
         };
 
+        self.record_dnstap(wire, incoming, peer, sent.as_deref());
+    }
+
+    /// Answer a request whose TSIG has been settled: the three ordinary ways,
+    /// and the bytes each of them put on the wire.
+    ///
+    /// Split out of `answer` so a TSIG refusal and an ordinary answer are two
+    /// arms of one `match` producing the same value, rather than one of them
+    /// returning past the dnstap tail (`TODO.md` #101). The parameters are a
+    /// struct because the alternative is nine, four of them a `u16` or a `u64`
+    /// next to each other (`CLAUDE.md` §14).
+    async fn answer_admitted<'s>(
+        &self,
+        admitted: &Admitted<'_>,
+        session: &mut Option<tsig::TsigSession>,
+        wire: &Wire<'_>,
+        scratch: &'s mut Scratch,
+    ) -> Option<Cow<'s, [u8]>> {
+        let Admitted {
+            msg,
+            qtype,
+            peer,
+            now,
+            ceiling,
+            advertised,
+        } = *admitted;
+        let ip = peer.ip();
         // The record the signer appends comes out of the ceiling, not on top of
         // it: RFC 8945 §5.3 says a TSIG that would not fit means altering the
         // response, not sending it oversized (`TODO.md` #41d). Signing is the
@@ -302,18 +377,14 @@ impl Server {
             None => ceiling,
         };
 
-        let incoming = Incoming {
-            msg: &msg,
-            bytes: packet,
-            arrived,
-        };
-
-        // Three ways to answer and one tail, because the first two used to
+        // Four ways to answer and one tail, because three of them used to
         // `return` past it: `record_dnstap` was reachable only through
         // `finish`, so a capture held no UPDATE and no transfer while
         // `--dnstap` says "every answered request" and `MessageType` carried
         // `UpdateQuery` for nobody (`CLAUDE.md` §7's early return over a shared
-        // epilogue).
+        // epilogue). The fourth was a TSIG that did not verify, which answered
+        // NOTAUTH and returned sixty lines above the tail (`TODO.md` #101); it
+        // now leaves through the caller's `match`, which has to produce a value.
         let transfer = matches!(qtype, Some(Qtype::AXFR) | Some(Qtype::IXFR));
         let sent = if let (true, Wire::Framed(out, arrival)) = (transfer, wire) {
             // A sequence of messages, gated on an ACL, and the answer can be
@@ -321,7 +392,7 @@ impl Server {
             // TCP alone (RFC 5936 §4.2) and an IXFR over UDP is answered with a
             // single SOA (RFC 1995 §2), both of which `write_response` does
             // below.
-            self.answer_transfer(&msg, peer, session.as_mut(), now, arrival, out)
+            self.answer_transfer(msg, peer, session.as_mut(), now, arrival, out)
                 .await;
             // No one envelope is the reply, and buffering the zone to name one
             // would undo what `answer_transfer` is shaped to avoid. The entry
@@ -335,7 +406,7 @@ impl Server {
             // either transport, and the checks, the ordering and the
             // persistence are the request's, not the transport's.
             let reply = self
-                .answer_update(&msg, peer, session.as_mut(), now, max_len)
+                .answer_update(msg, peer, session.as_mut(), now, max_len)
                 .await;
             if let Some(reply) = &reply {
                 wire.send(reply, &self.ctx.logger, ip).await;
@@ -347,21 +418,14 @@ impl Server {
             let serialized = {
                 let zones = self.zone_map.read().await;
                 if msg.opcode == OpCode::Notify {
-                    notify_reply(&msg, &zones, &self.secondaries, peer, advertised)
+                    notify_reply(msg, &zones, &self.secondaries, peer, advertised)
                         .to_bytes_within_buf_with(
                             max_len,
                             &mut scratch.out,
                             &mut scratch.compressor,
                         )
                 } else {
-                    write_response(
-                        &msg,
-                        &zones,
-                        &self.ctx.metrics,
-                        max_len,
-                        advertised,
-                        scratch,
-                    )
+                    write_response(msg, &zones, &self.ctx.metrics, max_len, advertised, scratch)
                 }
             };
             if let Err(e) = serialized {
@@ -370,11 +434,11 @@ impl Server {
                 // request arrived and got nothing.
                 None
             } else {
-                self.finish(wire, &msg, session.as_mut(), peer, now, scratch)
+                self.finish(wire, msg, session.as_mut(), peer, now, scratch)
                     .await
             }
         };
-        self.record_dnstap(wire, incoming, peer, sent.as_deref());
+        sent
     }
 
     /// The epilogue every ordinary answer leaves through: charge it, sign it,
