@@ -625,10 +625,21 @@ git config blame.ignoreRevsFile .git-blame-ignore-revs
 - Reuse the parser the flags use. The config builds `[alg:]name:secret[:zones]`
   strings and hands them to `TsigKey::parse` rather than constructing keys, so the
   two paths cannot disagree (§7).
-- A dry run has to run everything that does not bind a socket. `--check-config`
-  returns after the config parsed, secrets were read and mode-checked, every zone
-  loaded, every zone signed and every signature verified. Parse-and-stop passes
-  for the failures that actually break a deploy.
+- A dry run exits before the first thing that binds, spawns or writes.
+  `--check-config` returns after the config parsed, secrets were read and
+  mode-checked, every zone loaded, every zone signed and every signature
+  verified. Parse-and-stop passes for the failures that actually break a deploy.
+  ~~Written as "everything that does not bind a socket"~~ until #99, which
+  found both halves of that wrong: it *under*-describes what must not run — one
+  function past `rdnsd`'s exit, `discard_orphan_journals` calls
+  `Journal::forget`, which is `std::fs::remove_file`, so a dry run that ran that
+  far would delete journals — and it invited the exit to be treated as a
+  property of the code above it rather than a place. Both daemons implemented it
+  as the position of one `return`, and in both a flag parsed below that line
+  passed the dry run and stopped the real start.
+- A flag's value is parsed above that exit, never in an argument expression
+  below it. That is where `rdnsd`'s `--dnstap` target hid; `serve`'s arguments
+  are evaluated at the call, which is after the dry run has already answered.
 - Pay for a parser; do not pay for a stub. Nine crates for `toml` + `serde` is
   proportionate three commits after deleting eighty-three for an exporter that
   never ran. The rule is not "no dependencies", it is "no dependencies that do not

@@ -721,6 +721,21 @@ async fn main() -> anyhow::Result<()> {
     let query_rate_exempt =
         TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?;
 
+    // The keys a transferred policy feed may be signed with. Parsed through
+    // `TsigKey::parse`, so this daemon and `rdnsd` cannot disagree about what a
+    // key means (`CLAUDE.md` §7).
+    //
+    // Above the exit, and not beside the feed tasks that use it: down there it
+    // is parsed after both sockets are bound and the anomaly watcher is
+    // spawned, so a secret that is not base64 passed the dry run and killed a
+    // started process (`TODO.md` #99).
+    let policy_keys: Vec<rdns::tsig::TsigKey> = cli
+        .tsig_key
+        .iter()
+        .map(|spec| rdns::tsig::TsigKey::parse(spec))
+        .collect::<Result<_, _>>()
+        .context("a TSIG key in [keys]")?;
+
     // The dry run exits here, and *here* specifically: everything above is
     // everything knowable without binding a socket. The config parsed, every
     // feed was read and indexed, the trust anchors loaded, every ACL and the
@@ -934,16 +949,6 @@ async fn main() -> anyhow::Result<()> {
         anomaly_interval,
         shutdown.stop_handle(),
     ));
-
-    // The keys a transferred policy feed may be signed with. Parsed through
-    // `TsigKey::parse`, so this daemon and `rdnsd` cannot disagree about what a
-    // key means (`CLAUDE.md` §7).
-    let policy_keys: Vec<rdns::tsig::TsigKey> = cli
-        .tsig_key
-        .iter()
-        .map(|spec| rdns::tsig::TsigKey::parse(spec))
-        .collect::<Result<_, _>>()
-        .context("a TSIG key in [keys]")?;
 
     // Built before `Resolving` because the answer path holds them: a NOTIFY
     // naming a transferred feed wakes that feed's task, where one naming a file

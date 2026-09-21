@@ -2044,6 +2044,14 @@ async fn main() -> Result<()> {
     // what the reload path may then skip.
     verify_zones(&zones, &validator, &run, &proved)?;
 
+    // Parsed here and not in `serve`'s argument list: an argument expression
+    // is evaluated below the dry-run exit, which made this the one flag
+    // `--check-config` accepted and the real start refused (`TODO.md` #99).
+    let dnstap = match &cli.dnstap {
+        Some(spec) => Some((spec.parse::<dnstap::Target>()?, cli.dnstap_max_bytes)),
+        None => None,
+    };
+
     // The dry run exits here, and *here* specifically: everything above is
     // everything that can be known without touching the network. The config
     // parsed, the TSIG secrets were read and their permissions checked, the ACLs
@@ -2294,10 +2302,7 @@ async fn main() -> Result<()> {
             readiness,
             updates,
             journal,
-            dnstap: match &cli.dnstap {
-                Some(spec) => Some((spec.parse()?, cli.dnstap_max_bytes)),
-                None => None,
-            },
+            dnstap,
             control: ControlPolicy {
                 socket: cli.control_socket,
                 reloads,

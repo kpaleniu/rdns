@@ -8910,3 +8910,102 @@ definitions already are. The other two shapes decline for one reason and it is
 copy is where the drift goes. What the file gained in place of the pointer is a
 sentence saying the absence is a decision and naming this number, so the next
 session does not file it again (§18).
+
+---
+
+### 99. Both daemons' dry run is a `return` at a line number, not the rule §15 states — **filed and closed 2026-09-21**
+
+`CLAUDE.md` §15 already writes the rule down — "A dry run has to run everything
+that does not bind a socket" — and both daemons implement it as the position of
+one `return` inside a `main` several hundred lines long. Anything added below
+that line escapes the check silently, and something has.
+
+Reproduced against the built binary, not read off the diff:
+
+```
+$ rdnsd --check-config --zone-file plain.example.com.zone --dnstap garbage-not-a-scheme
+configuration is valid: 1 zone(s), 0 TSIG key(s), signing disabled, encrypted transports disabled
+exit=0
+
+$ rdnsd --host 127.0.0.1 --port 15353 --zone-file plain.example.com.zone --dnstap garbage-not-a-scheme
+Error: a dnstap target is `tcp:<addr:port>` or `file:<path>`, not "garbage-not-a-scheme"
+exit=1
+```
+
+Counted before anything was edited (§18):
+
+- **`rdnsd`** has **four** fallible sites below the exit at `main.rs:2094` —
+  `Catalogs::new(..)?` (`:2187`), `spawn_secondaries(..)?` (`:2204`), the dnstap
+  `spec.parse()?` (`:2298`) and an empty-catalog fallback (`:2317`). The first
+  socket is bound by `serve(..)` at `:2264`, so everything up to `:2204` is
+  construction a dry run could do. The dnstap parse is an *argument expression*
+  to `serve`, which is why it sits below everything else rather than beside the
+  other flag parsing.
+- **`rdnsr`** has the same shape and its own copy of the comment (`main.rs:724`,
+  "everything knowable without binding a socket"). `TsigKey::parse` is at
+  `:946`, about two hundred lines below its exit, in one `main` that runs to
+  `:1108`. Its `--metrics-listen` handling at `:772` is a real
+  `TcpListener::bind` and is correctly below the line — checked before it was
+  counted, because a list of offenders that includes a non-offender is §19's
+  measurement that agrees with itself.
+
+The two comments are §7's second copy, and both are wrong the same way: each
+states the rule as a property and implements it as an ordinal.
+
+**What is decided, and what is not.** Scope is both daemons: fixing one leaves
+the other reading correct to the next `grep`, which is §18's fix that silently
+leaves N-1. The promise stays as §15 writes it rather than being narrowed to
+what the code does, because the flag's job is to be trusted by a deploy script
+and narrowing it weakens the gate exactly where an operator would not look. **No
+remedy is named yet** (§18) — #90 measured and declined lifting the startup
+sequence out of `main` (28 top-level bindings, about twenty live after the
+exit), so whatever lands has to hold the property without that lift.
+
+**`rdnsr`'s half was reproduced too, and it is the worse one.** A TSIG secret
+that is not base64 in `[keys]`:
+
+```
+$ rdnsr --config rdnsr-badkey.toml --check-config
+configuration is valid: recursing from the built-in root hints, 0 policy feed(s), …
+exit=0
+
+$ rdnsr --config rdnsr-badkey.toml
+Caused by:
+    TSIG secret for "partner.key." is not base64: Invalid symbol 33, offset 16.
+exit=1
+```
+
+`UdpSocket::bind` (`:766`), `TcpListener::bind` (`:767`) and
+`tokio::spawn(watch_anomalies)` (`:931`) all happen before `TsigKey::parse`
+(`:944`), so the process binds both sockets and spawns a task before dying on a
+config value.
+
+**Both shapes were built, and the one this row was filed leaning towards is the
+one that measured out as the decline** (§19, as #40a and #94 went).
+
+- **Hoist the parse above the exit** — `rdnsd` +9 −4, one file. Fixes the
+  defect, keeps the shape ordinal.
+- **A `Checked` type holding every flag value whose parse can fail** — +31 −12,
+  one file, clippy clean, same behaviour. It does **not** make the wrong thing
+  stop compiling: **23 `cli.*` reads remain below the exit** across 20 fields,
+  seven of them raw strings that could grow a `.parse()?` tomorrow. The version
+  that would enforce it needs `cli` itself consumed above the line — a mirror of
+  **49 fields**, 18 of them raw strings — or the lift #90 measured and declined.
+  A type that looks like an answer while leaving 23 ways to reproduce the bug is
+  §17's own warning about a newtype wrapping an unanswered question, so it was
+  built, measured and thrown away rather than argued about.
+
+**The rule was wrong in both directions and §15 now says so.** "Everything that
+does not bind a socket" under-describes what must not run: one function past
+`rdnsd`'s exit, `discard_orphan_journals` calls `Journal::forget`, which is
+`std::fs::remove_file` (`rdns/src/journal.rs:136`). A dry run moved down to just
+before the first spawn — which is what this row's own design discussion settled
+on first — would have deleted journal files. §15 is now written as where the
+exit goes rather than as a property of the code above it, with that fact beside
+it, and the old sentence is struck in place.
+
+Landed: the two parses hoisted, §15 rewritten, and one regression test per
+daemon in `rdnsd/tests/startup.rs` and `rdnsr/tests/startup.rs`. Both were run
+against the unfixed tree and both fail there with a zero status and
+"configuration is valid" on stdout (§1), which is the symptom rather than a
+proxy for it.

@@ -94,6 +94,34 @@ fn the_dry_run_refuses_a_policy_feed_that_does_not_parse() {
     );
 }
 
+/// The same defect as `rdnsd`'s dnstap target, one daemon over and worse.
+///
+/// `TsigKey::parse` sat two hundred lines below the exit, after both sockets
+/// were bound and the anomaly watcher spawned, so a secret that is not base64
+/// passed the dry run and killed a started process (`TODO.md` #99). Move the
+/// parse back down and this fails with a zero status.
+#[test]
+fn the_dry_run_refuses_a_tsig_secret_that_is_not_base64() {
+    let dir = ScratchDir::new("rdnsr-bad-key");
+    let config = dir.join("rdnsr.toml");
+    std::fs::write(
+        &config,
+        "[keys.\"partner.key.\"]
+algorithm = \"hmac-sha256\"
+secret = \"not!base64!\"
+",
+    )
+    .expect("write the config");
+
+    let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
+    assert!(!out.status.success(), "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("not base64"),
+        "the message names the secret: {}",
+        stderr(&out)
+    );
+}
+
 /// §15 again, and #63i's row: `--dnstap-max-bytes` was the one flag of 35 not
 /// refused beside `--config`, so the file overwrote it in silence. This asks
 /// whether the refusal reaches the operator.

@@ -99,6 +99,32 @@ fn check_config_refuses_a_zone_that_does_not_parse() {
     );
 }
 
+/// A flag whose *value* is malformed has to fail the dry run, not the start.
+///
+/// `--dnstap` was parsed inside `serve`'s argument list, which is evaluated
+/// below the dry-run exit, so `--check-config` accepted a target the real start
+/// refused (`TODO.md` #99). Put the parse back in the argument list and this
+/// fails with a zero status and "configuration is valid" on stdout.
+#[test]
+fn check_config_refuses_a_malformed_dnstap_target() {
+    let dir = ScratchDir::new("check-config-dnstap");
+    let zone = zone_in(&dir, ZONE);
+
+    let out = rdnsd(&[
+        "--check-config",
+        "--zone-file",
+        &zone,
+        "--dnstap",
+        "garbage-not-a-scheme",
+    ]);
+    assert!(!out.status.success(), "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("a dnstap target is"),
+        "the message says what a target looks like: {}",
+        stderr(&out)
+    );
+}
+
 /// `--quiet` must not be able to take the output away: the flag is about log
 /// lines and this is an answer on stdout. The comment in `main` says so; this
 /// is the assertion behind it.
