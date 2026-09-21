@@ -8870,3 +8870,43 @@ queue (`CLAUDE.md` §18).
   reason `answer_transfer` already logs every one of them.
 
 ---
+
+### 98. The agent skills read a `CONTEXT.md` this repo does not have — **filed and closed 2026-09-21**
+
+`docs/agents/domain.md` (`9008531`) tells the mattpocock engineering skills to
+read `CONTEXT.md` and `docs/adr/` before exploring. Neither exists, so that half
+of the file points at nothing and the skills fall through to `docs/spec/`.
+
+**What is missing is a glossary, and only for the names this project coined.**
+The RFC vocabulary needs none — `CLAUDE.md` §1 already says to cite the section
+that says it, and `docs/spec/` carries the citations. The coined names are the
+gap: `ServeContext`, `Reloading` and "the denial cache" occur 75 times across 20
+`.rs` files and 17 times in this file, and `docs/spec/` mentions them twice
+(`03-authoritative-server.md`, `05-resolver.md`) without defining either. The
+only definitions anywhere are two lines in `docs/spec/README.md`'s Conventions —
+"the library" is the `rdns` crate, "the daemons" are `rdnsd` and `rdnsr`.
+Everything else is defined in a doc comment beside its own type, which is the
+right place to read it and no place to discover it.
+
+**No remedy is named, because none has been checked** (§18). Writing a
+`CONTEXT.md` is the skills' answer and it collides with two rules here: "no new
+READMEs, design documents or doc-comment essays unless asked for by name" (§11),
+and §7, since a glossary is a second copy of what the doc comments say and the
+second copy is where the drift goes. Three shapes to build before choosing
+(§19): a root `CONTEXT.md`; a terms section grown out of `docs/spec/README.md`'s
+Conventions, where two entries already live; or deleting the dangling pointer
+from `docs/agents/domain.md` and nothing else.
+
+The sentence that would make this row wrong is "the repo already keeps a
+glossary somewhere else". Checked: `glossary`, `terminology` and `vocabulary`
+appear in no `.md` in the tree outside `docs/CLOSED_WORK.md` and
+`docs/agents/` itself.
+
+**Closed the same day by taking the third shape.** `docs/agents/domain.md` no
+longer names `CONTEXT.md` or `docs/adr/`; it points at `docs/spec/`, the
+`## Architecture:` sections and the doc comment on the type, which is where the
+definitions already are. The other two shapes decline for one reason and it is
+§7's: a glossary is a second copy of what the doc comment says, and the second
+copy is where the drift goes. What the file gained in place of the pointer is a
+sentence saying the absence is a decision and naming this number, so the next
+session does not file it again (§18).

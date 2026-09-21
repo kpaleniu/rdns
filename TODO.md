@@ -37,11 +37,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#98** and **#21**, as of 2026-09-21.
-**#98 filed** the day the agent-skill config landed: `docs/agents/domain.md`
-points at a `CONTEXT.md` and a `docs/adr/` that do not exist, and what is
-actually undocumented is the vocabulary this project coined rather than the
-RFCs'.
+**#58**, **#68**, and **#21**, as of 2026-09-21.
+**#98 filed and closed** the day the agent-skill config landed: it pointed at a
+`CONTEXT.md` and a `docs/adr/` that do not exist, and what went was the pointer
+rather than a glossary being written — the definitions are in the doc comments
+and in the RFCs, and a second copy is where drift goes (§7).
 **#97 closed** the day it was filed: `licences and advisories` had been red
 since 2026-09-12 and the reason it was not noticed is that `cargo deny check`
 by hand checks a narrower graph than the job does.
@@ -1146,7 +1146,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#98**, plus **#21** —
+**#58**, **#68**, plus **#21** —
 see "What is open" above, which is the same list and the only place it is
 written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -6298,39 +6298,6 @@ no test count moved.
 
 ---
 
-### 98. The agent skills read a `CONTEXT.md` this repo does not have — **filed 2026-09-21**
-
-`docs/agents/domain.md` (`9008531`) tells the mattpocock engineering skills to
-read `CONTEXT.md` and `docs/adr/` before exploring. Neither exists, so that half
-of the file points at nothing and the skills fall through to `docs/spec/`.
-
-**What is missing is a glossary, and only for the names this project coined.**
-The RFC vocabulary needs none — `CLAUDE.md` §1 already says to cite the section
-that says it, and `docs/spec/` carries the citations. The coined names are the
-gap: `ServeContext`, `Reloading` and "the denial cache" occur 75 times across 20
-`.rs` files and 17 times in this file, and `docs/spec/` mentions them twice
-(`03-authoritative-server.md`, `05-resolver.md`) without defining either. The
-only definitions anywhere are two lines in `docs/spec/README.md`'s Conventions —
-"the library" is the `rdns` crate, "the daemons" are `rdnsd` and `rdnsr`.
-Everything else is defined in a doc comment beside its own type, which is the
-right place to read it and no place to discover it.
-
-**No remedy is named, because none has been checked** (§18). Writing a
-`CONTEXT.md` is the skills' answer and it collides with two rules here: "no new
-READMEs, design documents or doc-comment essays unless asked for by name" (§11),
-and §7, since a glossary is a second copy of what the doc comments say and the
-second copy is where the drift goes. Three shapes to build before choosing
-(§19): a root `CONTEXT.md`; a terms section grown out of `docs/spec/README.md`'s
-Conventions, where two entries already live; or deleting the dangling pointer
-from `docs/agents/domain.md` and nothing else.
-
-The sentence that would make this row wrong is "the repo already keeps a
-glossary somewhere else". Checked: `glossary`, `terminology` and `vocabulary`
-appear in no `.md` in the tree outside `docs/CLOSED_WORK.md` and
-`docs/agents/` itself.
-
----
-
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -6501,6 +6468,7 @@ the week; the record is under "How the queue kept going stale" in
 | **93** | an answer's owner names carried this resolver's 0x20 scramble | **filed and closed 2026-09-20**, and the measurement refuted the row. The scramble does not reach the client: the question is serialized first in the client's own case and `NameCompressor::lookup` folds ASCII, so an owner name equal to the QNAME goes out as `c0 0c`, two bytes of pointer at the question. A name the client did not send costs **four** bytes of upstream case and then points at the question for its tail — and those labels belong to the zone that published them, which is what the row itself said must not be rewritten. The row's own measurement had read `upstream.answers`, the cache, not the datagram. §4's survey agrees and corrects the row twice: **BIND ships no 0x20 at all**, and **Unbound**, which does, also does not normalize — `dname_lab_cmp` folds with `tolower` and the qname is first into its compression tree. The one implementation that would relay is BIND *authoritative*, which sets `DNS_COMPRESS_CASE` for every client outside `no-case-compress`. Pinned in `rdns/tests/case_on_the_wire.rs`, asserting the pointer rather than the rendered name |
 | **94** | nothing enforced a DNSKEY's protocol field | **filed and closed 2026-09-20**, out of #80's tests. RFC 4034 §2.1.2 makes a DNSKEY with protocol ≠ 3 "invalid during signature verification"; `Dnskey::from_record` copied the octet and only `key_tag` read it afterwards, so `rdnsr` called Secure what a conforming validator calls Bogus. Both shapes built (§19) and **the measurement declined the one the row leaned towards**: rejecting in `from_record` fixes nothing, because `verify_rrset` takes `&[Dnskey]` and every field of `Dnskey` is `pub` — shape A passed the whole suite and left the new test failing, which is §17's "a `pub` field beside a checking constructor" arriving as a measurement. What landed is the predicate: `is_zone_key` wants the flag **and** protocol 3, so its three callers — the candidate-key filter, DS matching, RFC 5011 anchor candidacy — inherit it. §4's survey agrees and settled the one open choice: BIND's `dns_dnssec_iszonekey()` folds the two tests the same way, Unbound checks it in `dnskey_verify_rrset_sig` and Knot in `dnskey_rdata_to_crypto_key`; BIND alone also accepts RFC 2535's protocol 255, which is not copied. The test passed against the unfixed tree on its first draft, for a reason §1 predicts — the key tag is inside the RRSIG RDATA `signed_data` hashes, so repointing the tag after signing breaks the crypto instead of testing the field |
 | **97** | `cargo deny check` by hand checked less than the job that runs it | **filed and closed 2026-09-21**. `licences and advisories` had been red on all three pushes since 2026-09-12, on `bans` alone: two `rustc-hash`, `dhat`'s 1.1.0 against `quinn`'s 2.1.3, in with `8f1be6e` (#42b). **The duplicate is the smaller half.** #91 closed five days earlier on a local `cargo deny check`, and the job was red on the next push with the duplicate already in the lockfile — because the action passes `--all-features` and the command by hand does not, so `dhat` (behind `rdnsd`'s off-by-default `dhat-heap`) is in the job's graph and not in the operator's. §1 from the other direction, and #91's verification is struck in place. Fixed in three places: a `skip` naming what collapses it (a default `rdnsd` has one copy, `dhat` 0.3.3 is the latest, so the pin is not ours), `--all-features` spelled out in `ci.yml` although it is the default, and the recipe changed to match. Plain `cargo deny check` now warns "unnecessary skip configuration", which is the two invocations disagreeing in the direction that cannot go wrong quietly. **Two licence claims fell out of the same mistake** and are corrected with it: `deny.toml` called `BSD-2-Clause` reachable for `zerocopy`, which arrives under `criterion` and is not in this graph at all, and the README enumerated six licences where `cargo deny list` reports eight. Both described the lockfile's 214 packages when the tool checks **138** — the 76 missing are `criterion`'s and `rcgen`'s dev trees — and the comment's header said so, naming `cargo metadata` as its source |
+| **98** | the agent-skill config pointed at a `CONTEXT.md` that was not there | **filed and closed 2026-09-21**, out of the skills' own setup rather than a review. `docs/agents/domain.md` told them to read `CONTEXT.md` and `docs/adr/` before exploring; neither exists. The row named **no remedy**, because none had been checked (§18), and the measurement said which gap was real: the RFC vocabulary is cited in place, and the names this project coined — `ServeContext`, `Reloading`, the denial cache, **75** occurrences across **20** `.rs` files and 17 in `TODO.md` — are defined in doc comments, mentioned twice in `docs/spec/` without a definition, and nowhere else; `docs/spec/README.md`'s Conventions is the only glossary in the tree and it is two lines. Of the three shapes, the one taken was **deleting the pointer**: a root `CONTEXT.md` collides with §11's "no new design documents unless asked for by name", and a terms section grown out of those two lines is §7's second copy. The file now names where a definition lives and records the absence as a decision |
 | **81** | what #63h's macro did not reach, and one more copy | **filed 2026-09-19, closed 2026-09-20**, two rows. **81a** measured and mostly declined: of the 27 commits touching `rdnsd/src/config.rs`, 8 touch its TSIG lines and 1 of those also touches `rdnsr`'s — and that one *created* the copy — so the two tables do not co-move and the shared struct is declined; three fields of five are shared, not five, because a resolver authorizes nothing. What was taken is the list and the default under it: `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES`, `::DEFAULT`, with `TsigKey::parse` coming out better than it went in. **81b** merged the two FNV-1a loops into `rdns_core::folded_hash`, and the check was the row's own instruction taken through the observable rather than by comparing the copies: six `expiry_for` offsets measured before the merge, unchanged after it, so no signature's expiry moved |
 | **82** | two modules in the wrong place, and a `pub` with no ratchet | **filed 2026-09-19, closed 2026-09-20**, two rows. **82b** took the ratchet: 43 sites, 38 of them `#[cfg(test)]` fixtures that always meant `pub(crate)`, and `#![warn(unreachable_pub)]` is in all nine crate roots with what it does *not* answer written on the lint. **82a** moved `readiness` to `rdns-transport`, whose metrics server serves `/readyz`; the estimate held except that a move is two `mod` lines, not one. Both halves of the *larger* version stay declined on measurements taken in place: an `rdns-ops` crate takes no package off any binary (`cargo tree -p rdnsd` is 150 either way) and the transport link is ~450 ms of a ~3.3 s rebuild, which is a ceiling and not a saving |
 | **84** | `to_prometheus_format` was 337 lines of one idiom | **filed 2026-09-19, closed 2026-09-20**, and the row's own remedy was wrong by an order of magnitude. Both shapes built (§19): helper calls 278 lines, a table 276, against 337 — because stock rustfmt breaks *every* element of an argument list when one exceeds 100 columns, and §12 forbids a `rustfmt.toml`, so the length was never available to be fixed. The table shipped on what it makes unrepresentable instead: name, help and field on one row, so a counter rendered nowhere is a missing row rather than a missing block among thirty. The `diff` the row asked for came back **byte-identical except the `dns_catalog_members` HELP line**, its 22 stray spaces, exactly as predicted. One it did not ask for: a scrape was **65 allocations and is 16** for the same 4 775 bytes, pinned. Both sub-findings fixed — `the_scrape_is_well_formed` asserts one HELP and one TYPE per family, no undeclared sample and no padded help text, and fails against the padded line put back; the two lock guards read *through* a poisoned lock now, matching the decision every writer in the file had already made, because dropping the series made every zone look withdrawn at once |
