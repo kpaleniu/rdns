@@ -6,6 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 description = "DNS above the wire: zone files, DNSSEC, transfers, the resolver and a daemon's operational furniture. The codec is rdns-core."
 
+# `cargo test --benches` selects every target with `bench = true`, and the lib's
+# default is true — so the CI step meant for `benches/` re-ran the whole 709-test
+# lib suite a second time, and a timing test that had just passed failed on the
+# replay (CI run 35538607349). Nothing here is a `#[bench]`; that is nightly.
+[lib]
+bench = false
+
 [dependencies]
 rdns-core.workspace = true
 rdns-present.workspace = true

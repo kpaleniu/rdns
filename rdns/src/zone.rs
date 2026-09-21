@@ -3024,6 +3024,13 @@ deep.a.b IN TXT \"down here\"
     /// per line was O(sections x records) — 3.81 s at 8 000 records and 13.64 s
     /// at 16 000 in release, ~4x per doubling — and fails this at 3x with room
     /// to spare. Deferring the move to one rebuild reads ~2x.
+    ///
+    /// Best of five a side, because a ratio is machine-independent and not
+    /// noise-independent: a single ~14 ms sample that loses a scheduling slice
+    /// reads 3.03x and fails, which the Windows runner did in CI run
+    /// 35538607349 — thirty seconds after the same test passed in the same job.
+    /// Contention only ever adds time, so the minimum is the sample the machine
+    /// was least busy for.
     #[test]
     fn parsing_does_not_cost_more_per_record_when_every_record_moves_the_origin() {
         fn parse(records: usize) -> std::time::Duration {
@@ -3038,8 +3045,12 @@ deep.a.b IN TXT \"down here\"
             took
         }
 
-        let small = parse(1_000);
-        let large = parse(2_000);
+        fn best_of_five(records: usize) -> std::time::Duration {
+            (0..5).map(|_| parse(records)).min().expect("five samples")
+        }
+
+        let small = best_of_five(1_000);
+        let large = best_of_five(2_000);
         assert!(
             large < small * 3,
             "twice the records must not cost four times the work: \
