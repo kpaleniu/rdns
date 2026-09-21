@@ -515,7 +515,14 @@ the zone map would be discarded within one re-signing interval.
 
 An UPDATE is therefore a zone-file edit followed by the load path: read the zone
 as the file has it, check §3.2 against that, apply, write atomically, sign,
-install. §3.7's atomicity is one mutex held across the whole read-modify-write.
+verify, install. §3.7's atomicity is one mutex held across the whole
+read-modify-write.
+
+The verify step checks the RRsets this signing run signed — not the whole zone,
+which is what the incremental path exists to avoid — plus every signed RRset at
+a name the update named. The second set is the one that can disagree with the
+signer: a carry-forward that wrongly kept a signature over data that moved
+leaves that RRset out of the first.
 
 ### Re-signing
 
@@ -551,9 +558,12 @@ in place and reports why; `rdnsctl reload` exits 1 with the parse error.
 
 **Which signatures get verified.** A zone this server did not sign is verified
 every time — that is what the pass is for. A zone it signed is verified once per
-set of signing keys: the first run producing it from a given key set is checked,
-its repeats are not, and a rollover step activating a key makes its zone checked
-again. The proof is recorded after the zone verifies, never before. Startup and
+set of signing keys: the first *whole-zone* run producing it from a given key
+set is checked, its repeats are not, and a rollover step activating a key makes
+its zone checked again. What the skip never covers is what a run signed afresh:
+a reload that re-signed a zone incrementally checks those RRsets whether the
+zone is proved or not, because for them there is no earlier pass to repeat. The
+proof is recorded after the zone verifies, never before. Startup and
 `--check-config` begin with an empty record, so both check everything.
 Verification is the expensive half of a load — 76 s against 28 s to sign, for a
 million-record zone — and a re-signing tick that re-proved what the tick above it

@@ -751,13 +751,16 @@ struct Server {
 /// reloads every zone from its file (see [`ZoneSigning::resign_interval`]), so
 /// an in-memory-only edit is discarded within one re-signing interval with
 /// nothing logged. The flow is apply to the zone as the file has it, write the
-/// file, sign the result, install that.
+/// file, sign the result, verify what was signed, install that.
 struct UpdateHandling {
     /// `None` when the server has no source it may write — a secondary's
     /// replicated zones are the master's copy.
     source: Option<ZoneSource>,
     /// So the installed version is signed the way a loaded one would be.
     signing: Option<Arc<ZoneSigning>>,
+    /// And checked the way a loaded one is: the same validator `verify_zones`
+    /// is given, so `--require-signed` means one thing (`TODO.md` #100).
+    validator: Arc<DnssecValidator>,
     /// Serializes the read-modify-write, which RFC 2136 §3.7 requires.
     ///
     /// One lock for all zones rather than one per zone: two concurrent UPDATEs
@@ -781,6 +784,7 @@ impl UpdateHandling {
         UpdateHandling {
             source: None,
             signing: None,
+            validator: Arc::new(DnssecValidator::new(false)),
             applying: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -2240,6 +2244,7 @@ async fn main() -> Result<()> {
     let updates = Arc::new(UpdateHandling {
         source: Some(source.clone()),
         signing: signing.clone(),
+        validator: Arc::clone(&validator),
         applying: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
 
@@ -3862,6 +3867,7 @@ mod tests {
             updates: Arc::new(UpdateHandling {
                 source: Some(source),
                 signing: None,
+                validator: Arc::new(DnssecValidator::new(false)),
                 applying: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             }),
             journal,
@@ -6375,6 +6381,7 @@ ns.plain  IN A   192.0.2.30
                     zones: 0,
                     rrsets: 0,
                     skipped: 1,
+                    resigned: 0,
                 },
             );
 

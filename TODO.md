@@ -37,7 +37,13 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#100**, **#103**-**#106**, and **#21**, as of 2026-09-21.
+**#58**, **#68**, **#103**-**#106**, and **#21**, as of 2026-09-21.
+**#100 closed** the day it was filed, and it undercounted itself: the UPDATE
+path was the only one with no verification at all, but the *incremental*
+signer's output had never been checked on any path, a reload's included. The
+fix is the one the row named — the signing call hands back a value whose only
+exit is the check — plus the set the row did not name, because verifying what
+the signer says it signed agrees with the one bug that path can have (§19).
 **#102 closed** the day it was filed, and the remedy it named was the wrong
 one: the `From` impl it proposed deleting was never the defect, and the fix is
 that the value stops being in flight for 226 lines.
@@ -6312,7 +6318,7 @@ no test count moved.
 
 ---
 
-### 100. A dynamic UPDATE's signatures are the only ones no run verifies — **filed 2026-09-21**
+### 100. A dynamic UPDATE's signatures are the only ones no run verifies — **filed and closed 2026-09-21**
 
 `main.rs:2031` states the invariant: "Signing happens between loading and
 serving, and so does checking the result: verifying what we just produced is
@@ -6338,6 +6344,75 @@ needs a reason and states none is the finding (§19).
 The shape to try: have the signing call hand back something a zone cannot be
 installed without, so "signed here, checked here" rides the value rather than the
 caller remembering. Not costed — nobody has built it (§18).
+
+**Closed 2026-09-21**, and the row undercounted its own finding.
+
+**~~"the new and changed RRsets … are the only signatures in the process
+nothing has ever checked"~~ — the UPDATE path is the only one with *no*
+verification, and it is not the only place a new signature goes unread.**
+`ProvenSigning::already_proved` keys on the key roles, so the second run
+producing a zone from a given key set is skipped whole; startup proves a *full*
+sign, and a reload of an edited zone file signs **incrementally**
+(`zones.rs`'s `apply_keeping`, `previous = served`) and is skipped. So
+`sign_zone_incrementally`'s own distinctive work — `PreviousSignatures::reuse`,
+the decision to carry a signature forward — had never been checked on any path
+in this process, which is a wider hole than the row described. Two instances of
+one shape, and §18 says count them before fixing one.
+
+**The shape the row named, built.** `sign_zone_incrementally` returns
+`Resigned { zone, fresh }`, where `fresh` is the `(owner, type)` pairs whose
+RRSIGs the run *made* rather than carried. Collected in `signatures_for` only
+when `previous` is `Some`, so a full sign does not pay a `Name` clone per RRset
+— which at a million records is the allocation #64e spent the row on.
+`ZoneSigning::sign_one_incrementally` hands back a `FreshlySigned` whose fields
+are private and whose only exit is `verify(&DnssecValidator, touched)`: the
+zone cannot reach the map without the check. That is the difference between an
+invariant and a habit (§17), and a habit is what the UPDATE path had instead.
+
+**Checking `fresh` alone would have agreed with the bug** (§19). A
+carry-forward that wrongly kept a signature over data that moved leaves that
+RRset out of `fresh` *by construction*, so a pass given only the fresh list
+confirms the signer's own decision and calls it evidence. `verify` therefore
+takes a second set — every signed RRset at a name the update named
+(`names_changed`, one per `update::Change`) — and both sets are O(the change),
+never O(the zone). The test named for that
+(`..._is_caught_at_a_changed_name`) asserts both directions: the same zone with
+nothing named verifies clean, and fails the moment the name is given.
+
+**The reload half is the same fix one layer up.** `SigningRun` carries the
+fresh set per zone, and `verify_zones` checks it for a zone `already_proved`
+would skip. #53's skip is about the *whole-zone* pass, and for a signature this
+run has just made there is no earlier pass to repeat. `Checked::resigned` is
+the count, so the claim is an equality rather than a clock (§10). The set is
+empty for a `kept` zone and for the re-signing timer's full sign, so #53's
+measured saving is untouched — `a_zone_we_signed_with_the_same_keys_is_proved_once`
+still reads `Checked { zones: 0, rrsets: 0, skipped: 1, resigned: 0 }`.
+
+**Eight arguments became seven.** `apply_update_to_file` reached clippy's limit
+(§14), and the two that merged are `signing` and `validator`, as `SigningCheck`
+— which is the finding's own shape: what let the check go missing is that it
+was a second thing a call site had to remember.
+
+**What it costs, measured rather than argued.** The signed-update benchmark
+grew a `verify` column, and at a million records it reads **21.1 ms
+against the update's 9 788 ms — 0.2%**, where a whole-zone `verify_zones` pass
+at that size is the 76 s #53 removed. That ratio is the reason the check is of
+the change and not of the zone, and it is why the same fix could be put on the
+reload path without giving #53 back. All five columns were re-measured in the
+same run; the four that existed before moved with the machine and not with the
+shape, and the old figures are kept beside the new ones in the test's own
+header (§11).
+
+Verified: four new tests, each watched failing against the behaviour it is
+for (§1) — `verify` cut to `Ok(self.zone)` fails the two `FreshlySigned` tests,
+and `fresh_for` stubbed to `&[]` fails the reload one with
+`resigned: 0`. `a_signed_update_verifies_what_it_signed` is the first test of
+the signed UPDATE path that is not one of the `#[ignore]`d benchmarks: it runs
+a real `ZoneSigning` through `apply_update_to_file` and then re-checks **every**
+signature in the installed zone from outside the call, since a pass that agrees
+with the signer is not evidence. **1 296 tests on Windows (1 292 before) and
+1 317 on Linux**, clippy clean on both, `cargo doc` and `cargo fmt --check`
+clean.
 
 ---
 
@@ -6616,6 +6691,7 @@ the week; the record is under "How the queue kept going stale" in
 | **97** | `cargo deny check` by hand checked less than the job that runs it | **filed and closed 2026-09-21**. `licences and advisories` had been red on all three pushes since 2026-09-12, on `bans` alone: two `rustc-hash`, `dhat`'s 1.1.0 against `quinn`'s 2.1.3, in with `8f1be6e` (#42b). **The duplicate is the smaller half.** #91 closed five days earlier on a local `cargo deny check`, and the job was red on the next push with the duplicate already in the lockfile — because the action passes `--all-features` and the command by hand does not, so `dhat` (behind `rdnsd`'s off-by-default `dhat-heap`) is in the job's graph and not in the operator's. §1 from the other direction, and #91's verification is struck in place. Fixed in three places: a `skip` naming what collapses it (a default `rdnsd` has one copy, `dhat` 0.3.3 is the latest, so the pin is not ours), `--all-features` spelled out in `ci.yml` although it is the default, and the recipe changed to match. Plain `cargo deny check` now warns "unnecessary skip configuration", which is the two invocations disagreeing in the direction that cannot go wrong quietly. **Two licence claims fell out of the same mistake** and are corrected with it: `deny.toml` called `BSD-2-Clause` reachable for `zerocopy`, which arrives under `criterion` and is not in this graph at all, and the README enumerated six licences where `cargo deny list` reports eight. Both described the lockfile's 214 packages when the tool checks **138** — the 76 missing are `criterion`'s and `rcgen`'s dev trees — and the comment's header said so, naming `cargo metadata` as its source |
 | **98** | the agent-skill config pointed at a `CONTEXT.md` that was not there | **filed and closed 2026-09-21**, out of the skills' own setup rather than a review. `docs/agents/domain.md` told them to read `CONTEXT.md` and `docs/adr/` before exploring; neither exists. The row named **no remedy**, because none had been checked (§18), and the measurement said which gap was real: the RFC vocabulary is cited in place, and the names this project coined — `ServeContext`, `Reloading`, the denial cache, **75** occurrences across **20** `.rs` files and 17 in `TODO.md` — are defined in doc comments, mentioned twice in `docs/spec/` without a definition, and nowhere else; `docs/spec/README.md`'s Conventions is the only glossary in the tree and it is two lines. Of the three shapes, the one taken was **deleting the pointer**: a root `CONTEXT.md` collides with §11's "no new design documents unless asked for by name", and a terms section grown out of those two lines is §7's second copy. The file now names where a definition lives and records the absence as a decision |
 | **99** | both daemons' dry run was a `return` at a line number, not the rule §15 states | **filed and closed 2026-09-21**, out of an architecture review rather than a defect report. `rdnsd --check-config --dnstap garbage-not-a-scheme` printed "configuration is valid" and exited 0 where the real start exits 1 — the parse sat in `serve`'s **argument list**, which is evaluated below the dry-run exit. `rdnsr`'s half is worse and was reproduced too: a TSIG secret that is not base64 passes the dry run, and `TsigKey::parse` (`:944`) runs after both `bind`s (`:766`, `:767`) and a `tokio::spawn` (`:931`), so the process takes the ports and then dies. Counted before anything was edited: **four** fallible sites below `rdnsd`'s exit, of which `--metrics-listen` in `rdnsr` is *not* one — it is a real `TcpListener::bind` and was checked before it was counted. **Both shapes were built and the type lost**: hoisting is +9 −4, a `Checked` type holding every fallible flag value is +31 −12 and still leaves **23 `cli.*` reads** below the line across 20 fields, with the enforcing version costing a 49-field mirror of `Cli` or the lift #90 declined. **The rule itself was wrong**, which is the part worth keeping: "everything that does not bind a socket" invited moving the exit down to the first spawn, and one function past `rdnsd`'s exit `discard_orphan_journals` calls `Journal::forget` — `std::fs::remove_file`. That dry run would have deleted journals. §15 now says where the exit goes instead, with the journal fact beside it, and the old sentence struck in place. One regression test per daemon, each run against the unfixed tree first |
+| **100** | a dynamic UPDATE's own signatures were the only ones no run verified | **filed and closed 2026-09-21**, and the row undercounted itself. `verify_zones` had two production callers, load and reload, and an UPDATE is the third way a zone reaches the map — but the wider hole is that `ProvenSigning` skips a zone already proved for its key roles, so the *incremental* signer's output had never been checked on any path: startup proves a full sign and every incremental run after it is skipped. Fixed as the row proposed, in the type: `sign_zone_incrementally` returns `Resigned { zone, fresh }`, `sign_one_incrementally` a `FreshlySigned` whose only exit is `verify`, so a zone cannot reach the map unchecked (§17). **The set the row did not name is the one that earns the pass**: checking only what the signer says it signed agrees with a carry-forward that wrongly kept a signature over data that moved, so `verify` also takes every signed RRset at a name the update named (§19). Both sets are O(the change). `SigningRun` carries the same list for the reload path, and `Checked::resigned` counts it, so #53's saving is measurably untouched. Four tests, each watched failing; the first non-`#[ignore]`d test of the signed UPDATE path came with it |
 | **101** | the TSIG-rejection branch returned past the dnstap tail | **filed and closed 2026-09-21**, out of the same review as #99 and the same shape: a rule stated in a comment and held by nothing. #75 gave `Server::answer` one tail so nothing could `return` past `record_dnstap`, and the comment at `dispatch.rs:311` said "three ways to answer and one tail". There were four — the `TsigCheck::Rejected` arm sends a NOTAUTH at `:289` and returns at `:292`, sixty lines above the tail — so a capture under a key-guessing probe, which is the one time an operator wants it, held nothing. The test that locked #75 in asserted 3, so the fourth door was invisible from the comment and from the suite at once. Fixed by making the check an expression: both arms produce `Option<Cow<[u8]>>`, the refusal returns what it sent, and the rest moves to `answer_admitted` behind an `Admitted` struct — six values that travel together, because the method wants nine parameters and clippy stops at seven (§14). **The cheapest of the three shapes was the one declined**: a `Drop` guard on the tail is a few lines and makes the record impossible to skip while leaving it easy to hand nothing, which reports "no reply" for a request that got one — the same symptom, quieter. The `let ... else { return; }` in the refusal became a `match` as a consequence, since "no reply fits" is now a value rather than a divergence. Test count 3 → 4, run against the unfixed tree first (`left: 3, right: 4`) |
 | **102** | `Answered::refresh` survived thirteen exits by inspection | **filed and closed 2026-09-21**. `refresh` was a `mut` local declared 226 lines above the cache hit that set it and 200 below the tail that read it, with thirteen `.into()` exits in between and a `From<Option<Vec<u8>>>` that fills `refresh: None` for free — #78a is the time one of those exits silently turned prefetching off for any name an `rpz-ip` rule matched. Fixed by deriving it from the lookup: `hit.as_ref().filter(|hit| hit.refresh).map(|_| query.clone())`, immutable, one line below the `lookup` it comes from. The invariant stops being "read all thirteen exits" and becomes one implication — `refresh` is `Some` only when `hit` is, and both exits that could drop it are in the arm that runs when the cache *missed*. **Both halves of the row's own guess were wrong**: the `From` impl was not the defect and stays, because once the local is gone `.into()` is correct by construction at every one of the thirteen sites, and deleting it would have made them noisier and fixed nothing. No behaviour changed, so there is no new test — a test here would agree with the code (§1); #78a's *A rewritten answer still asks for its prefetch* is still the guard. The old comment's argument is struck in place rather than rewritten, because it is the lesson: "falling through leaves one exit, so there is nothing to remember" held for the exit that had just been removed and said nothing about the next one |
 | **81** | what #63h's macro did not reach, and one more copy | **filed 2026-09-19, closed 2026-09-20**, two rows. **81a** measured and mostly declined: of the 27 commits touching `rdnsd/src/config.rs`, 8 touch its TSIG lines and 1 of those also touches `rdnsr`'s — and that one *created* the copy — so the two tables do not co-move and the shared struct is declined; three fields of five are shared, not five, because a resolver authorizes nothing. What was taken is the list and the default under it: `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES`, `::DEFAULT`, with `TsigKey::parse` coming out better than it went in. **81b** merged the two FNV-1a loops into `rdns_core::folded_hash`, and the check was the row's own instruction taken through the observable rather than by comparing the copies: six `expiry_for` offsets measured before the merge, unchanged after it, so no signature's expiry moved |

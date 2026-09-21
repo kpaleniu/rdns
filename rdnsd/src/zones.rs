@@ -28,7 +28,7 @@ use rdns::zone_signer::{
     active_signing_keys, algorithms_missing_signatures, resign_after, sign_zone,
     sign_zone_incrementally, DenialChain, DnskeySignature, SigningPolicy,
 };
-use rdns::{Name, NameRef, Qtype, ResourceRecord, Rtype};
+use rdns::{Class, Name, NameRef, Qtype, RecordDataRef, ResourceRecord, Rtype, Ttl};
 
 use crate::config;
 use crate::{absolute_name, Cli};
@@ -894,14 +894,29 @@ impl ZoneSigning {
     ///
     /// A zone with no key is returned unchanged, exactly as `apply` skips it —
     /// by value, so that case costs no copy of the zone (`TODO.md` #64a).
-    pub(crate) fn sign_one_incrementally(&self, previous: &Zone, zone: Zone) -> Result<Zone> {
+    ///
+    /// The zone comes back inside a [`FreshlySigned`], which is the only way
+    /// out of this function and has only one way out of itself: nothing this
+    /// run signed reaches the map without being checked (`TODO.md` #100).
+    pub(crate) fn sign_one_incrementally(
+        &self,
+        previous: &Zone,
+        zone: Zone,
+    ) -> Result<FreshlySigned> {
         let Some(keys) = self.keys.get(&zone.origin().to_owned()) else {
-            return Ok(zone);
+            return Ok(FreshlySigned {
+                zone,
+                fresh: Vec::new(),
+            });
         };
         let origin = zone.origin().to_string();
         let policy = self.policy_for(&origin, current_unix_timestamp());
-        sign_zone_incrementally(previous, &zone, keys, &policy)
-            .with_context(|| format!("re-signing {origin} after an update"))
+        let signed = sign_zone_incrementally(previous, &zone, keys, &policy)
+            .with_context(|| format!("re-signing {origin} after an update"))?;
+        Ok(FreshlySigned {
+            zone: signed.zone,
+            fresh: signed.fresh,
+        })
     }
 
     /// Sign every zone there are keys for, in place.
@@ -955,11 +970,19 @@ impl ZoneSigning {
                 continue;
             }
             let carried = previous.and_then(|served| served.get(key));
+            let apex = origin.to_owned();
             let origin = origin.to_presentation();
             let policy = self.policy_for(&origin, signed_at);
             *zone = Arc::new(match carried {
-                Some(served) => sign_zone_incrementally(served, zone, keys, &policy)
-                    .with_context(|| format!("re-signing {origin}"))?,
+                Some(served) => {
+                    let signed = sign_zone_incrementally(served, zone, keys, &policy)
+                        .with_context(|| format!("re-signing {origin}"))?;
+                    // What this run signed rather than carried, so
+                    // `verify_zones` checks it even for a zone whose whole-zone
+                    // pass #53 lets it skip (`TODO.md` #100).
+                    run.fresh.insert(apex, signed.fresh);
+                    signed.zone
+                }
                 None => {
                     sign_zone(zone, keys, &policy).with_context(|| format!("signing {origin}"))?
                 }
@@ -997,7 +1020,16 @@ impl ZoneSigning {
 /// (`TODO.md` #44f), and signatures no run has ever checked are exactly what
 /// the pass is for.
 #[derive(Debug, Default)]
-pub(crate) struct SigningRun(HashMap<Name, KeyRoles>);
+pub(crate) struct SigningRun {
+    roles: HashMap<Name, KeyRoles>,
+    /// Per zone, the RRsets this run signed rather than carried forward.
+    ///
+    /// Only the incremental path fills it, and it is what [`verify_zones`]
+    /// checks in a zone [`ProvenSigning`] otherwise skips: "already proved" is
+    /// about the whole-zone pass #53 removed, and a run that re-signed
+    /// something still made signatures nothing has read (`TODO.md` #100).
+    fresh: HashMap<Name, Vec<(Name, Rtype)>>,
+}
 
 /// The key tags a run used, by what it used them for.
 ///
@@ -1024,7 +1056,7 @@ impl SigningRun {
             tags.dedup();
             tags
         };
-        self.0.insert(
+        self.roles.insert(
             origin,
             KeyRoles {
                 signing: tidy(
@@ -1041,6 +1073,11 @@ impl SigningRun {
                 ),
             },
         );
+    }
+
+    /// The RRsets this run signed in `origin`, freshly.
+    fn fresh_for(&self, origin: &Name) -> &[(Name, Rtype)] {
+        self.fresh.get(origin).map_or(&[], Vec::as_slice)
     }
 }
 
@@ -1075,7 +1112,7 @@ impl ProvenSigning {
     /// strength of state that cannot be read is the wrong way for this to fail
     /// (`CLAUDE.md` §6 — the decision goes here rather than in an `unwrap`).
     fn already_proved(&self, origin: &Name, run: &SigningRun) -> bool {
-        let Some(roles) = run.0.get(origin) else {
+        let Some(roles) = run.roles.get(origin) else {
             return false;
         };
         let Ok(proved) = self.0.lock() else {
@@ -1085,7 +1122,7 @@ impl ProvenSigning {
     }
 
     fn prove(&self, origin: &Name, run: &SigningRun) {
-        let Some(roles) = run.0.get(origin) else {
+        let Some(roles) = run.roles.get(origin) else {
             return;
         };
         let Ok(mut proved) = self.0.lock() else {
@@ -1108,6 +1145,9 @@ pub(crate) struct Checked {
     pub(crate) rrsets: usize,
     /// Zones this run signed whose output had already been proved.
     pub(crate) skipped: usize,
+    /// RRsets checked inside those zones: what the run re-signed, which no
+    /// earlier pass can have seen (`TODO.md` #100).
+    pub(crate) resigned: usize,
 }
 
 /// Say what each key is doing right now, once per load.
@@ -1215,6 +1255,17 @@ pub(crate) fn verify_zones(
         let origin = key.as_name().to_presentation();
         if proved.already_proved(&apex, run) {
             done.skipped += 1;
+            // Skipped is not nothing. What #53 removed is the *whole-zone*
+            // pass; a run that re-signed this zone incrementally still made
+            // signatures no pass has read, and those are exactly the ones a
+            // canonicalization bug would be in (`TODO.md` #100). Empty for a
+            // zone this run did not sign, and for a full re-sign, which is the
+            // case #53 measured.
+            let fresh = run.fresh_for(&apex);
+            if !fresh.is_empty() {
+                let keys = ZoneKeys::of(zone);
+                done.resigned += verify_rrsets(validator, zone, &keys, &origin, fresh)?;
+            }
             continue;
         }
         let keys = ZoneKeys::of(zone);
@@ -1227,22 +1278,7 @@ pub(crate) fn verify_zones(
             continue;
         }
 
-        let mut checked = 0usize;
-        for (name, rtype) in signed_rrsets(zone) {
-            let records = zone.query(name.as_ref(), Qtype::of(rtype));
-            if records.is_empty() {
-                return Err(anyhow!(
-                    "{origin}: a signature covers the {rtype} RRset at {name}, which is not there"
-                ));
-            }
-            if let Verdict::Invalid(why) = validator.validate_rrset(zone, &keys, &records) {
-                return Err(anyhow!(
-                    "{origin}: the {rtype} RRset at {name} does not verify against the zone's \
-                     own keys: {why}"
-                ));
-            }
-            checked += 1;
-        }
+        let checked = verify_rrsets(validator, zone, &keys, &origin, &signed_rrsets(zone))?;
         proved.prove(&apex, run);
         done.zones += 1;
         done.rrsets += checked;
@@ -1252,12 +1288,146 @@ pub(crate) fn verify_zones(
         // Said out loud: a check that stopped running and says nothing is a
         // check the operator believes is in force (`CLAUDE.md` §4).
         tracing::info!(
-            "{} zone{} signed here with keys already checked: not verified again",
+            "{} zone{} signed here with keys already checked: {} re-signed RRset{} \
+             verified, the rest not again",
             done.skipped,
             if done.skipped == 1 { "" } else { "s" },
+            done.resigned,
+            if done.resigned == 1 { "" } else { "s" },
         );
     }
     Ok(done)
+}
+
+/// Check the signatures over `rrsets`, and say how many were checked.
+///
+/// The loop [`verify_zones`] and [`FreshlySigned::verify`] share. One copy,
+/// because the two sentences it can fail with are what an operator reads at
+/// 3am and a second copy of them is a second thing that can stop describing
+/// the check (`CLAUDE.md` §7).
+fn verify_rrsets(
+    validator: &DnssecValidator,
+    zone: &Zone,
+    keys: &ZoneKeys,
+    origin: &str,
+    rrsets: &[(Name, Rtype)],
+) -> Result<usize> {
+    let mut checked = 0usize;
+    for (name, rtype) in rrsets {
+        let records = zone.query(name.as_ref(), Qtype::of(*rtype));
+        if records.is_empty() {
+            return Err(anyhow!(
+                "{origin}: a signature covers the {rtype} RRset at {name}, which is not there"
+            ));
+        }
+        if let Verdict::Invalid(why) = validator.validate_rrset(zone, keys, &records) {
+            return Err(anyhow!(
+                "{origin}: the {rtype} RRset at {name} does not verify against the zone's \
+                 own keys: {why}"
+            ));
+        }
+        checked += 1;
+    }
+    Ok(checked)
+}
+
+/// A zone an incremental signing run has just produced, and the RRsets whose
+/// signatures that run made rather than carried forward.
+///
+/// The zone cannot be had except through [`FreshlySigned::verify`]. That is the
+/// whole point: the dynamic-UPDATE path signed and installed, and the
+/// verification the startup pass does was a step at a call site rather than
+/// something the value owed, so it was never written (`TODO.md` #100,
+/// `CLAUDE.md` §17).
+pub(crate) struct FreshlySigned {
+    zone: Zone,
+    fresh: Vec<(Name, Rtype)>,
+}
+
+impl FreshlySigned {
+    /// Check what this run signed, then give the zone up.
+    ///
+    /// Two sets, and the second is what lets this *disagree* with the signer
+    /// (`CLAUDE.md` §19). `fresh` is the signatures nothing has ever looked at.
+    /// `touched` is the names the caller changed: a carry-forward that wrongly
+    /// kept a signature over data that moved leaves that RRset out of `fresh`,
+    /// so checking `fresh` alone would agree with exactly the bug the pass
+    /// exists to catch. Everything else in the zone holds a signature an
+    /// earlier run made and an earlier pass checked — [`verify_zones`] at
+    /// startup, or the verify of the update before this one.
+    ///
+    /// Both sets are O(the change). The crypto is what must not become
+    /// O(the zone) here; [`ZoneKeys::of`] walks the records once, which an
+    /// incremental sign has already done three times (`TODO.md` #64d).
+    pub(crate) fn verify(self, validator: &DnssecValidator, touched: &[Name]) -> Result<Zone> {
+        let FreshlySigned { zone, fresh } = self;
+        let origin = zone.origin().to_presentation();
+        let keys = ZoneKeys::of(&zone);
+        if !keys.is_signed() {
+            // The same question `verify_zones` asks of an unsigned zone, asked
+            // in the same words: whether that is a failure is
+            // `--require-signed`'s to answer, in one place.
+            if !validator.validate_rrset(&zone, &keys, &[]).is_valid() {
+                return Err(anyhow!("{origin} is not signed"));
+            }
+            return Ok(zone);
+        }
+
+        let mut rrsets = fresh;
+        for name in touched {
+            rrsets.extend(signed_rrsets_at(&zone, name.as_ref()));
+        }
+        tidy(&mut rrsets);
+        let checked = verify_rrsets(validator, &zone, &keys, &origin, &rrsets)?;
+        tracing::debug!("verified {checked} re-signed RRsets in {origin}");
+        Ok(zone)
+    }
+}
+
+/// Every `(owner, type)` at `name` that an RRSIG there claims to cover.
+///
+/// [`signed_rrsets`] for one name, and a lookup rather than a walk: an RRSIG is
+/// stored at the name it covers, so the owner index already answers this.
+fn signed_rrsets_at(zone: &Zone, name: NameRef<'_>) -> Vec<(Name, Rtype)> {
+    zone.query(name, Qtype::of(record_types::RRSIG))
+        .into_iter()
+        .filter_map(|r| rrsig_covers(r.name, r.class, r.ttl, r.rdata))
+        .collect()
+}
+
+/// What an RRSIG record covers, or `None` when it does not parse.
+///
+/// One copy for the two traversals here. They differ in how they *find* the
+/// records — a walk of the zone, a lookup at one name — and not at all in what
+/// they read out of one (`CLAUDE.md` §7).
+fn rrsig_covers(
+    name: NameRef<'_>,
+    class: Class,
+    ttl: Ttl,
+    rdata: RecordDataRef<'_>,
+) -> Option<(Name, Rtype)> {
+    rdns::dnssec::Rrsig::from_record(&ResourceRecord {
+        name: name.to_owned(),
+        class,
+        ttl,
+        rdata: rdata.to_owned(),
+    })
+    .map(|sig| (sig.owner, sig.type_covered))
+}
+
+/// Sort and dedupe a list of RRsets.
+///
+/// By the folded octets: `Name` has no `Ord`, because DNS's own ordering is
+/// RFC 4034 §6.1's and not the octets' — and this only wants a stable order to
+/// dedupe against.
+fn tidy(rrsets: &mut Vec<(Name, Rtype)>) {
+    rrsets.sort_by(|a, b| {
+        a.0.as_ref()
+            .folded()
+            .cmp(&b.0.as_ref().folded())
+            .then(a.1.to_u16().cmp(&b.1.to_u16()))
+    });
+    rrsets.dedup();
 }
 
 /// Every `(owner, type)` in the zone that some RRSIG claims to cover.
@@ -1266,26 +1436,9 @@ pub(crate) fn signed_rrsets(zone: &Zone) -> Vec<(Name, Rtype)> {
         .records()
         .iter()
         .filter(|r| r.rdata.rtype() == record_types::RRSIG)
-        .filter_map(|r| {
-            rdns::dnssec::Rrsig::from_record(&ResourceRecord {
-                name: r.name.to_owned(),
-                class: r.class,
-                ttl: r.ttl,
-                rdata: r.rdata.to_owned(),
-            })
-        })
-        .map(|sig| (sig.owner, sig.type_covered))
+        .filter_map(|r| rrsig_covers(r.name, r.class, r.ttl, r.rdata))
         .collect();
-    // Sorted by the folded octets: `Name` has no `Ord`, because DNS's own
-    // ordering is RFC 4034 §6.1's and not the octets' — and this only wants a
-    // stable order to dedupe against.
-    seen.sort_by(|a, b| {
-        a.0.as_ref()
-            .folded()
-            .cmp(&b.0.as_ref().folded())
-            .then(a.1.to_u16().cmp(&b.1.to_u16()))
-    });
-    seen.dedup();
+    tidy(&mut seen);
     seen
 }
 
@@ -1909,7 +2062,8 @@ mod tests {
             Checked {
                 zones: 0,
                 rrsets: 0,
-                skipped: 1
+                skipped: 1,
+                resigned: 0,
             },
         );
     }
@@ -2027,6 +2181,125 @@ mod tests {
         verify_zones(&zones, &validator, &run, &proved).expect_err("still does not verify");
     }
 
+    /// A reload that re-signed a zone checks what it signed, proved or not.
+    ///
+    /// #53's skip is about the *whole-zone* pass. The zone is already proved
+    /// for these keys, so nothing is verified a second time — and the RRsets
+    /// this run made are not a second time, they are a first
+    /// (`TODO.md` #100). Two instances of one shape: the UPDATE path had no
+    /// verification at all, and here it had one that skipped exactly the runs
+    /// that signed something new.
+    ///
+    /// Counts, not a clock (`CLAUDE.md` §10).
+    #[test]
+    fn a_reload_that_resigned_checks_what_it_signed_even_when_proved() {
+        let signing = signing_with(vec![new_key()]);
+        let validator = DnssecValidator::new(true);
+        let proved = ProvenSigning::default();
+
+        let mut served = unsigned_zone();
+        let run = signing.apply(&mut served, None).expect("signs");
+        let first = verify_zones(&served, &validator, &run, &proved).expect("verifies");
+        assert_eq!((first.zones, first.skipped, first.resigned), (1, 0, 0));
+
+        // The operator edits the file and reloads: same keys, so the same key
+        // roles, so `already_proved`.
+        let mut edited = unsigned_zone_with("www IN A 198.51.100.7\n");
+        let run = signing
+            .apply_keeping(
+                &mut edited,
+                Some(&served),
+                &std::collections::HashSet::new(),
+                current_unix_timestamp(),
+            )
+            .expect("re-signs incrementally");
+        let second = verify_zones(&edited, &validator, &run, &proved).expect("verifies");
+        assert_eq!(
+            (second.zones, second.skipped),
+            (0, 1),
+            "the whole-zone pass is what #53 skips"
+        );
+        assert!(
+            second.resigned > 0,
+            "and what the run signed is checked anyway: {second:?}"
+        );
+    }
+
+    /// A signature this run made that does not cover its RRset must not reach
+    /// the map.
+    ///
+    /// The invariant `main.rs`'s startup pass states, at the one door no pass
+    /// stood at: a dynamic UPDATE signs and installs, and `verify_zones` has
+    /// only the load and reload callers (`TODO.md` #100). Watched failing with
+    /// [`FreshlySigned::verify`] cut down to `Ok(self.zone)`, which is what the
+    /// UPDATE path did.
+    #[test]
+    fn a_fresh_signature_that_does_not_cover_its_rrset_does_not_install() {
+        let validator = DnssecValidator::new(true);
+        let (zone, moved) = a_zone_edited_under_its_signature();
+        FreshlySigned {
+            zone,
+            fresh: vec![(moved, record_types::A)],
+        }
+        .verify(&validator, &[])
+        .expect_err("the A RRset no longer verifies against the signature over it");
+    }
+
+    /// And a signature the run *carried*, at a name the caller says it changed.
+    ///
+    /// This is the half a check of the fresh list alone cannot have
+    /// (`CLAUDE.md` §19): a carry-forward that kept a signature over data that
+    /// moved leaves that RRset out of the fresh list by construction, so the
+    /// pass would agree with exactly the bug it is for. The first assertion is
+    /// the refutation — the same zone, the same validator, and nothing said
+    /// about the name, verifies clean.
+    #[test]
+    fn a_carried_signature_over_data_that_moved_is_caught_at_a_changed_name() {
+        let validator = DnssecValidator::new(true);
+        let (zone, moved) = a_zone_edited_under_its_signature();
+        let unsaid = FreshlySigned {
+            zone,
+            fresh: Vec::new(),
+        };
+        let zone = unsaid
+            .verify(&validator, &[])
+            .expect("nothing fresh and nothing named: nothing to check");
+
+        FreshlySigned {
+            zone,
+            fresh: Vec::new(),
+        }
+        .verify(&validator, std::slice::from_ref(&moved))
+        .expect_err("the caller changed that name, so its signatures are this run's to justify");
+    }
+
+    /// A signed zone with one A RRset edited out from under its signature, and
+    /// the name that happened at.
+    ///
+    /// The same edit `a_run_that_failed_to_verify_is_not_recorded_as_proved`
+    /// makes, which is what an operator editing a pre-signed file does — and
+    /// what a signer that carried a signature over data that moved would
+    /// produce.
+    fn a_zone_edited_under_its_signature() -> (Zone, Name) {
+        let signing = signing_with(vec![new_key()]);
+        let mut zones = unsigned_zone();
+        drop(signing.apply(&mut zones, None).expect("signs"));
+        let moved = nm("ns1.example.com.");
+        let signed = zones.values().next().expect("the zone");
+        let mut edited = Zone::new(nm("example.com."));
+        for record in signed.records() {
+            let mut record = record.to_owned();
+            if record.name == moved && record.rdata.rtype() == record_types::A {
+                record.rdata = rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    "198.51.100.9".parse().unwrap(),
+                ))
+                .unwrap();
+            }
+            edited.add_record(record);
+        }
+        (edited, moved)
+    }
+
     fn new_key() -> SigningKey {
         SigningKey::generate(
             rdns::dnssec_key::SigningAlgorithm::Ed25519,
@@ -2047,6 +2320,12 @@ mod tests {
 
     /// The file, re-read. Each call is a fresh load, which is what a reload is.
     fn unsigned_zone() -> ZoneMap {
+        unsigned_zone_with("")
+    }
+
+    /// The same file with `extra` appended: what an operator's edit looks like
+    /// to a reload.
+    fn unsigned_zone_with(extra: &str) -> ZoneMap {
         // Unindented on purpose: a leading space makes a line a continuation of
         // the record above it, which is a zone file's own syntax and not this
         // file's formatting.
@@ -2057,7 +2336,8 @@ $TTL 3600
 ns1 IN A 192.0.2.1
 www IN A 192.0.2.2
 ";
-        let zone = rdns::zone::parse_zone_file(TEXT, "example.com.").expect("parse");
+        let zone =
+            rdns::zone::parse_zone_file(&format!("{TEXT}{extra}"), "example.com.").expect("parse");
         let mut map = ZoneMap::new();
         map.insert(zone_key(&zone), Arc::new(zone));
         map

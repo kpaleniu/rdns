@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 
 use rdns::dnstap;
 use rdns::{
+    dnssec_validation_mode::DnssecValidator,
     ede::InfoCode,
     error::RequestError,
     ixfr::{ixfr_response, IxfrResponse},
@@ -34,7 +35,7 @@ use rdns::{
     update,
     validation::{Arrival, Privacy, Request, Transport},
     zone::{FileDigest, Zone},
-    DnsMessage, ExtendedError, OpCode, Qtype, ResponseCode,
+    DnsMessage, ExtendedError, Name, OpCode, Qtype, ResponseCode,
 };
 use rdns_transport::tcp::{self, send_framed, Reply};
 use rdns_transport::ServeContext;
@@ -1098,6 +1099,7 @@ impl Server {
         // blocking thread rather than stalling a worker that is also answering
         // queries (`CLAUDE.md` §9).
         let signing = self.updates.signing.clone();
+        let validator = Arc::clone(&self.updates.validator);
         let changes = request.changes.clone();
         let prerequisites = request.prerequisites.clone();
         let origin = zone_name.clone();
@@ -1108,7 +1110,10 @@ impl Server {
                 &previous,
                 &prerequisites,
                 &changes,
-                signing.as_deref(),
+                SigningCheck {
+                    signing: signing.as_deref(),
+                    validator: &validator,
+                },
                 known,
             )
         })
@@ -1315,8 +1320,8 @@ enum UpdateFailure {
     System(anyhow::Error),
 }
 
-/// Apply an UPDATE to the zone as its *file* has it, persist it, and return the
-/// version to install.
+/// Apply an UPDATE to the zone as its *file* has it, persist it, sign it, check
+/// what was signed, and return the version to install.
 ///
 /// `Ok((None, report, digest))` when nothing changed: no write, nothing to
 /// install, and the client still gets NOERROR. See [`crate::UpdateHandling`]
@@ -1333,7 +1338,7 @@ fn apply_update_to_file(
     previous: &Zone,
     prerequisites: &[update::Prerequisite],
     changes: &[update::Change],
-    signing: Option<&ZoneSigning>,
+    check: SigningCheck<'_>,
     known: Option<FileDigest>,
 ) -> Result<(Option<Zone>, UpdateReport, FileDigest), UpdateFailure> {
     // The zone as the file has it: unsigned, on the operator's serial. Taken
@@ -1357,7 +1362,7 @@ fn apply_update_to_file(
     // last thing installed. A signed server serves RRSIGs and NSECs the file
     // does not carry, and 64d measured the four O(zone) steps at 12% of a
     // signed update anyway — so the case worth having is this one.
-    let reused = known == Some(digest) && signing.is_none();
+    let reused = known == Some(digest) && check.signing.is_none();
     let parsed;
     let source = if reused {
         previous
@@ -1400,13 +1405,51 @@ fn apply_update_to_file(
     // served number moves too. Incrementally against the version being served:
     // a full re-sign would reinception every RRSIG and put the whole zone into
     // the next IXFR delta.
-    let installed = match signing {
+    // Verified before it is installed, which until `TODO.md` #100 no path did
+    // for an UPDATE: `main.rs`'s two calls to `verify_zones` cover loading and
+    // reloading, and this is the third way a zone reaches the map. The signing
+    // call hands back something the zone cannot be got out of without asking,
+    // so the check is the value's obligation rather than this function's memory
+    // of it (`CLAUDE.md` §17).
+    let installed = match check.signing {
         Some(signing) => signing
             .sign_one_incrementally(previous, zone)
+            .and_then(|signed| signed.verify(check.validator, &names_changed(changes)))
             .map_err(UpdateFailure::System)?,
         None => zone,
     };
     Ok((Some(installed), report, written))
+}
+
+/// How an UPDATE's result is signed and checked before it is installed.
+///
+/// One parameter rather than two. Signing without verifying is the shape
+/// `TODO.md` #100 found, and what let it happen is that the check was
+/// something a call site had to remember rather than something the signing
+/// arrived with (`CLAUDE.md` §17).
+struct SigningCheck<'a> {
+    signing: Option<&'a ZoneSigning>,
+    validator: &'a DnssecValidator,
+}
+
+/// Every name the changes name, for [`crate::zones::FreshlySigned::verify`]'s
+/// second set.
+///
+/// Not the same question as "what did the signer sign". A carry-forward that
+/// kept a signature over data that moved leaves that RRset out of the fresh
+/// list by definition, so a pass given only the fresh list would agree with
+/// the one bug the incremental path can have that a full sign cannot
+/// (`CLAUDE.md` §19). Deduping is `verify`'s, which has both sets.
+fn names_changed(changes: &[update::Change]) -> Vec<Name> {
+    changes
+        .iter()
+        .map(|change| match change {
+            update::Change::Add(record) => record.name.clone(),
+            update::Change::DeleteRrset { name, .. }
+            | update::Change::DeleteName { name }
+            | update::Change::DeleteRecord { name, .. } => name.clone(),
+        })
+        .collect()
 }
 
 /// What an UPDATE did, for the log line: the counts, without the zone.
@@ -1505,6 +1548,23 @@ pub(crate) mod tests {
 
     pub(crate) use rdns::testutil::one_at_a_time;
 
+    /// Validation on, `--require-signed` off: what `serve` builds for a server
+    /// that signs (`main.rs`'s `DnssecValidator::new`). Enabled, so the
+    /// verification these tests drive actually runs — a disabled one returns
+    /// `Unchecked` for everything and would make every assertion below about
+    /// nothing.
+    fn test_validator() -> DnssecValidator {
+        DnssecValidator::new(true)
+    }
+
+    /// [`SigningCheck`] for a server that does not sign.
+    fn unsigned(validator: &DnssecValidator) -> SigningCheck<'_> {
+        SigningCheck {
+            signing: None,
+            validator,
+        }
+    }
+
     /// A zone of `records` A records under one apex, for the benchmarks.
     pub(crate) fn zone_text(records: usize) -> String {
         let mut text = String::new();
@@ -1602,7 +1662,7 @@ pub(crate) mod tests {
                 &previous,
                 &[],
                 std::slice::from_ref(&change),
-                None,
+                unsigned(&test_validator()),
                 None,
             )
             .unwrap_or_else(|_| panic!("the update applies at {records}"));
@@ -1737,7 +1797,7 @@ pub(crate) mod tests {
                     &served,
                     &[],
                     std::slice::from_ref(&change),
-                    None,
+                    unsigned(&test_validator()),
                     if reuse { Some(digest) } else { None },
                 )
                 .unwrap_or_else(|_| panic!("the update applies at {records}"));
@@ -1775,16 +1835,27 @@ pub(crate) mod tests {
     /// barely matters? **It does.**
     ///
     /// ```text
-    ///   records   unsigned     signed  incr-sign  full-sign      carried
-    ///     10000     20.7ms    87.0ms    55.8ms   245.7ms  20004/20008
-    ///    100000    165.5ms   931.4ms   783.7ms  2556.1ms  200004/200008
-    ///   1000000   1952.1ms 11801.0ms 10314.9ms 26939.1ms  2000004/2000008
+    ///   records   unsigned     signed  incr-sign     verify  full-sign      carried
+    ///     10000     15.5ms    83.6ms    51.5ms      0.4ms   251.5ms  20004/20008
+    ///    100000     95.1ms   715.0ms   627.8ms      2.3ms  2568.4ms  200004/200008
+    ///   1000000   1326.2ms  9788.0ms  8832.5ms     21.1ms 27801.1ms  2000004/2000008
     /// ```
     ///
     /// Three warm runs, discarding the first after a rebuild. At a million
-    /// records **signing is 10.3 s of 11.7 s, 88%**, so the whole of 64b and
-    /// 64c — 68% of the unsigned 1.95 s — is **10% of what a signed update
+    /// records **signing is 8.8 s of 9.8 s, 90%**, so the whole of 64b and
+    /// 64c — 68% of the unsigned 1.33 s — is **9% of what a signed update
     /// costs**. `full-sign` reproduces #44c's 28 s by a different route.
+    ///
+    /// `verify` is what `TODO.md` #100 added: the RRsets this run signed, plus
+    /// every signed RRset at a name the update named. **21 ms at a million
+    /// records, 0.2% of the signed update** — against the 76 s a whole-zone
+    /// `verify_zones` pass costs at that size (#53), which is why it is the
+    /// change and not the pass.
+    ///
+    /// Re-measured 2026-09-21 on the development machine, all columns, when
+    /// #100 added the fifth. The four that existed before read 20.7 / 87.0 /
+    /// 55.8 / 245.7 at ten thousand and 1952.1 / 11801.0 / 10314.9 / 26939.1
+    /// at a million; the shape is the same and the machine was not.
     ///
     /// A real [`ZoneSigning`] rather than a bare `sign_zone_incrementally`, so
     /// the column is the whole path an operator pays. The row filed this as
@@ -1846,8 +1917,8 @@ pub(crate) mod tests {
             .expect("a key directory means signing");
 
         println!(
-            "{:>9}  {:>9} {:>9} {:>9} {:>9}  {:>9}",
-            "records", "unsigned", "signed", "incr-sign", "full-sign", "carried"
+            "{:>9}  {:>9} {:>9} {:>9} {:>9} {:>9}  {:>9}",
+            "records", "unsigned", "signed", "incr-sign", "verify", "full-sign", "carried"
         );
         for records in [10_000usize, 100_000, 1_000_000] {
             let mut text = String::from("$TTL 3600\n");
@@ -1891,7 +1962,7 @@ pub(crate) mod tests {
                 &previous,
                 &[],
                 std::slice::from_ref(&change),
-                None,
+                unsigned(&test_validator()),
                 None,
             )
             .unwrap_or_else(|_| panic!("the unsigned update applies at {records}"));
@@ -1905,7 +1976,10 @@ pub(crate) mod tests {
                 &previous,
                 &[],
                 std::slice::from_ref(&change),
-                Some(&signing),
+                SigningCheck {
+                    signing: Some(&signing),
+                    validator: &test_validator(),
+                },
                 None,
             )
             .unwrap_or_else(|_| panic!("the signed update applies at {records}"));
@@ -1914,15 +1988,26 @@ pub(crate) mod tests {
             let installed = installed.expect("a changed zone is installed");
 
             // The signing step alone, from the same inputs the call above fed
-            // it, so `signed` minus this is the four unsigned steps.
+            // it, so `signed` minus this and `verify` is the four unsigned
+            // steps. Timed apart because they are different questions: one is
+            // the ECDSA and the carry-forward, the other is what `TODO.md`
+            // #100 added.
             std::fs::write(&path, &text).expect("restore the fixture");
             let reparsed = parse_zone_file_at(&path, "example.com.").expect("parses");
             let applied = update::apply(&reparsed, std::slice::from_ref(&change));
             let start = Instant::now();
-            let again = signing
+            let fresh = signing
                 .sign_one_incrementally(&previous, applied.zone)
                 .expect("signs");
             let incr_sign = start.elapsed();
+            let start = Instant::now();
+            let again = fresh
+                .verify(
+                    &test_validator(),
+                    &names_changed(std::slice::from_ref(&change)),
+                )
+                .expect("verifies");
+            let verify = start.elapsed();
             assert_eq!(
                 again.records().len(),
                 installed.records().len(),
@@ -1948,10 +2033,11 @@ pub(crate) mod tests {
             // Made fresh, not carried: what the run actually paid ECDSA for.
             let made = now.len() - carried;
             println!(
-                "{records:>9}  {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>7.1}ms  {:>9}",
+                "{records:>9}  {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>7.1}ms {:>7.1}ms  {:>9}",
                 unsigned.as_secs_f64() * 1000.0,
                 signed.as_secs_f64() * 1000.0,
                 incr_sign.as_secs_f64() * 1000.0,
+                verify.as_secs_f64() * 1000.0,
                 full_sign.as_secs_f64() * 1000.0,
                 format!("{carried}/{}", now.len()),
             );
@@ -2020,7 +2106,7 @@ pub(crate) mod tests {
             &served,
             &[],
             std::slice::from_ref(&add("one.example.com.", 1)),
-            None,
+            unsigned(&test_validator()),
             None,
         )
         .unwrap_or_else(|_| panic!("the first update applies"));
@@ -2034,7 +2120,7 @@ pub(crate) mod tests {
             &served,
             &[],
             std::slice::from_ref(&add("two.example.com.", 2)),
-            None,
+            unsigned(&test_validator()),
             Some(digest),
         )
         .unwrap_or_else(|_| panic!("the second update applies"));
@@ -2063,7 +2149,7 @@ pub(crate) mod tests {
             &served,
             &[],
             std::slice::from_ref(&add("three.example.com.", 3)),
-            None,
+            unsigned(&test_validator()),
             Some(digest),
         )
         .unwrap_or_else(|_| panic!("the third update applies"));
@@ -2079,6 +2165,102 @@ pub(crate) mod tests {
             1,
             "the operator's edit is in the zone that was installed"
         );
+    }
+
+    /// A signed UPDATE's own signatures are checked before the zone is
+    /// installed.
+    ///
+    /// The whole of `TODO.md` #100 through the door an UPDATE comes in at, and
+    /// the first test of the signed path that is not one of the `#[ignore]`d
+    /// benchmarks above. The assertion is that the RRsets the update moved —
+    /// the added A, the SOA, the NSECs the insertion shifts — verify against
+    /// the zone's own keys after the install, which is what the call now
+    /// refuses to skip.
+    #[test]
+    fn a_signed_update_verifies_what_it_signed() {
+        use clap::Parser;
+        use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
+        use rdns::zone_signer::sign_zone;
+        use std::collections::BTreeMap;
+
+        let dir = rdns::testutil::ScratchDir::new("signed-update-verify");
+        let key_dir = dir.path().join("keys");
+        std::fs::create_dir_all(&key_dir).expect("the key directory");
+        let key = SigningKey::generate(
+            SigningAlgorithm::Ed25519,
+            "example.com.",
+            rdns::dnssec::DNSKEY_FLAG_ZONE,
+        )
+        .expect("a key");
+        key.write_to_dir(&key_dir).expect("the key file");
+        let mut cli = crate::Cli::parse_from(["rdnsd"]);
+        cli.signing_key_dir = Some(key_dir);
+        let signing = ZoneSigning::load(&cli, &BTreeMap::new())
+            .expect("the keys load")
+            .expect("a key directory means signing");
+
+        let path = dir.write(
+            "example.com.zone",
+            concat!(
+                "$TTL 3600\n",
+                "@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n",
+                "@ IN NS ns.example.com.\n",
+                "ns IN A 192.0.2.1\n",
+                "www IN A 192.0.2.2\n",
+            ),
+        );
+        let source = parse_zone_file_at(&path, "example.com.").expect("the fixture parses");
+        let served = sign_zone(
+            &source,
+            std::slice::from_ref(&key),
+            &signing.policy_for("example.com.", current_unix_timestamp()),
+        )
+        .expect("the fixture signs");
+
+        let change = update::Change::Add(rdns::ResourceRecord {
+            name: nm("added.example.com."),
+            class: rdns::Class::new(1),
+            ttl: rdns::Ttl::from_secs(3600),
+            rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(std::net::Ipv4Addr::new(
+                198, 51, 100, 4,
+            )))
+            .expect("the rdata builds"),
+        });
+        let validator = test_validator();
+        let (installed, report, _) = apply_update_to_file(
+            &path,
+            "example.com.",
+            &served,
+            &[],
+            std::slice::from_ref(&change),
+            SigningCheck {
+                signing: Some(&signing),
+                validator: &validator,
+            },
+            None,
+        )
+        .unwrap_or_else(|e| match e {
+            UpdateFailure::System(e) => panic!("the signed update applies: {e:#}"),
+            UpdateFailure::Prerequisite(r) => panic!("no prerequisites were given: {r}"),
+        });
+        assert_eq!(report.changed, 1);
+        let installed = installed.expect("a changed zone is installed");
+
+        // The same question the install now answers, asked again from outside
+        // it: every signature in the zone, not only the ones this run made.
+        // A pass that agrees with the signer is not evidence (`CLAUDE.md` §1),
+        // and this one is the whole-zone check the UPDATE path cannot afford.
+        let keys = rdns::dnssec_validation_mode::ZoneKeys::of(&installed);
+        assert!(keys.is_signed(), "the installed zone carries its DNSKEYs");
+        for (name, rtype) in crate::zones::signed_rrsets(&installed) {
+            let records = installed.query(name.as_ref(), Qtype::of(rtype));
+            assert!(
+                validator
+                    .validate_rrset(&installed, &keys, &records)
+                    .is_valid(),
+                "the {rtype} RRset at {name} does not verify after the update"
+            );
+        }
     }
 
     #[test]

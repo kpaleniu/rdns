@@ -273,7 +273,7 @@ pub fn signed_serial(file_serial: Serial, signed_at: u64) -> Serial {
 /// two chains. DNSKEY records are *not* dropped: a key published without its
 /// private half is how every rollover starts.
 pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Result<Zone> {
-    sign_zone_inner(zone, keys, policy, None)
+    Ok(sign_zone_inner(zone, keys, policy, None)?.0)
 }
 
 /// The keys that sign at `now`, which is not the keys that are published
@@ -312,17 +312,40 @@ pub fn sign_zone_incrementally(
     zone: &Zone,
     keys: &[SigningKey],
     policy: &SigningPolicy,
-) -> Result<Zone> {
+) -> Result<Resigned> {
     let carried = PreviousSignatures::of(previous);
-    sign_zone_inner(zone, keys, policy, Some(&carried))
+    let (zone, fresh) = sign_zone_inner(zone, keys, policy, Some(&carried))?;
+    Ok(Resigned { zone, fresh })
 }
 
+/// An incrementally signed zone, and which of its RRsets this run signed.
+///
+/// The second half is the whole reason the type exists: the signatures a run
+/// carried forward were checked when they were made, and the ones it made now
+/// are the ones nothing has looked at. A caller that verifies its own output
+/// (`TODO.md` #100) needs the difference, and deriving it by diffing the two
+/// zones is the O(zone) pass the incremental path exists to avoid.
+///
+/// Collected only on this path. A full [`sign_zone`] signs everything, so the
+/// list would be a `Name` clone per RRset — a million of them on a
+/// million-record zone (`TODO.md` #64e) — answering a question with no caller.
+pub struct Resigned {
+    pub zone: Zone,
+    /// The `(owner, type)` pairs whose RRSIGs came out of this run.
+    pub fresh: FreshRrsets,
+}
+
+/// The RRsets a run signed rather than carried, as [`Resigned::fresh`].
+pub type FreshRrsets = Vec<(Name, Rtype)>;
+
+/// The signed zone, and the RRsets this run signed rather than carried — empty
+/// unless `previous` was given. See [`Resigned`].
 fn sign_zone_inner(
     zone: &Zone,
     keys: &[SigningKey],
     policy: &SigningPolicy,
     previous: Option<&PreviousSignatures>,
-) -> Result<Zone> {
+) -> Result<(Zone, FreshRrsets)> {
     policy.chain.check()?;
     let origin = zone.origin().to_folded();
     check_keys(keys, origin.as_ref())?;
@@ -403,8 +426,8 @@ fn sign_zone_inner(
         )?,
     }
 
-    sign_everything(&layout, keys, policy, previous, &mut signed)?;
-    Ok(signed)
+    let fresh = sign_everything(&layout, keys, policy, previous, &mut signed)?;
+    Ok((signed, fresh))
 }
 
 /// A previous signed version of a zone, indexed so that an RRset which has not
@@ -1257,8 +1280,11 @@ fn signatures_for(
     previous: Option<&PreviousSignatures>,
     dnskey_signers: &[&SigningKey],
     data_signers: &[&SigningKey],
-) -> Result<Vec<ZoneRecord>> {
+) -> Result<(Vec<ZoneRecord>, FreshRrsets)> {
     let mut signatures = Vec::new();
+    // Only on the incremental path — see [`Resigned`] for why a full run does
+    // not pay for the clones.
+    let mut fresh = Vec::new();
     for ((key, rtype), (name, ttl, rdatas)) in rrsets {
         // The key the map is already keyed by, rather than `Layout::entry`
         // deriving it again and cloning the entry to read two bools: two
@@ -1308,6 +1334,9 @@ fn signatures_for(
             }
         }
 
+        if previous.is_some() {
+            fresh.push((name.to_owned(), rtype));
+        }
         let original_ttl = ttl.as_secs();
         let rrset = Rrset::new(name, rtype, Class::new(1), &rdatas);
         // Spread back from the window's end so the zone degrades over a slope
@@ -1338,7 +1367,7 @@ fn signatures_for(
             });
         }
     }
-    Ok(signatures)
+    Ok((signatures, fresh))
 }
 
 /// Three O(zone) passes, and the split is where it is because #64e measured
@@ -1350,7 +1379,7 @@ fn sign_everything(
     policy: &SigningPolicy,
     previous: Option<&PreviousSignatures>,
     signed: &mut Zone,
-) -> Result<()> {
+) -> Result<FreshRrsets> {
     // The key the parent's DS points at signs only the DNSKEY RRset; a separate
     // key signs the data. Not required — one key does both when only one is
     // present — but it lets the data key roll without involving the parent.
@@ -1377,7 +1406,7 @@ fn sign_everything(
     // After the check above, so a zone with no active key fails without paying
     // for a pass it throws away.
     let rrsets = rrsets_of(signed);
-    let signatures = signatures_for(
+    let (signatures, fresh) = signatures_for(
         rrsets,
         layout,
         policy,
@@ -1388,7 +1417,7 @@ fn sign_everything(
     for signature in signatures {
         signed.add_record(signature);
     }
-    Ok(())
+    Ok(fresh)
 }
 
 /// Whether this RRset is one the zone is authoritative for, and so must sign.
@@ -3012,8 +3041,9 @@ a\.b    IN A   192.0.2.50
 
         // Signing incrementally carries every untouched signature forward, so
         // the delta collapses to what moved plus the chain around it.
-        let incremental =
-            sign_zone_incrementally(&before, &updated.zone, &keys, &later).expect("signs");
+        let incremental = sign_zone_incrementally(&before, &updated.zone, &keys, &later)
+            .expect("signs")
+            .zone;
         let small = diff(&before, &incremental).expect("both have an SOA");
         assert!(
             small.len() * 4 < delta.len(),
@@ -3069,7 +3099,9 @@ a\.b    IN A   192.0.2.50
             })],
         );
         let later = SigningPolicy::valid_for(NOW + 60, 30 * 86_400).with_chain(DenialChain::Nsec);
-        let signed = sign_zone_incrementally(&before, &updated.zone, &keys, &later).unwrap();
+        let signed = sign_zone_incrementally(&before, &updated.zone, &keys, &later)
+            .unwrap()
+            .zone;
 
         // The record the update added, whose signature is new.
         assert!(matches!(
@@ -3125,7 +3157,9 @@ a\.b    IN A   192.0.2.50
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.88".parse().unwrap()))
                 .unwrap(),
         });
-        let signed = sign_zone_incrementally(&before, &grown, &keys, &later).unwrap();
+        let signed = sign_zone_incrementally(&before, &grown, &keys, &later)
+            .unwrap()
+            .zone;
         assert_ne!(
             sig_at(&signed, "www.example.com.", rt::A),
             sig_at(&before, "www.example.com.", rt::A),
@@ -3146,7 +3180,9 @@ a\.b    IN A   192.0.2.50
                     .to_owned(),
             })],
         );
-        let signed = sign_zone_incrementally(&before, &retimed.zone, &keys, &later).unwrap();
+        let signed = sign_zone_incrementally(&before, &retimed.zone, &keys, &later)
+            .unwrap()
+            .zone;
         assert_ne!(
             sig_at(&signed, "www.example.com.", rt::A),
             sig_at(&before, "www.example.com.", rt::A),
@@ -3161,7 +3197,9 @@ a\.b    IN A   192.0.2.50
             SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, ORIGIN, DNSKEY_FLAG_ZONE)
                 .unwrap(),
         );
-        let signed = sign_zone_incrementally(&before, &zone, &rolling, &later).unwrap();
+        let signed = sign_zone_incrementally(&before, &zone, &rolling, &later)
+            .unwrap()
+            .zone;
         assert_eq!(
             sig_at(&signed, "www.example.com.", rt::A).len(),
             2,
@@ -3386,7 +3424,7 @@ a\.b    IN A   192.0.2.50
         let rrsets = rrsets_of(&signed);
         let build_rrsets = start.elapsed();
         let start = Instant::now();
-        let signatures =
+        let (signatures, _fresh) =
             signatures_for(rrsets, &layout, policy, previous, &sep, &rest).expect("the signatures");
         let sign_rrsets = start.elapsed();
         let start = Instant::now();
@@ -3549,7 +3587,9 @@ a\.b    IN A   192.0.2.50
             // The whole first, so the parts below are not the ones paying for
             // whatever it warms.
             let start = Instant::now();
-            let whole = sign_zone_incrementally(&previous, &zone, &keys, &policy).expect("signs");
+            let whole = sign_zone_incrementally(&previous, &zone, &keys, &policy)
+                .expect("signs")
+                .zone;
             let incremental = start.elapsed();
 
             let start = Instant::now();
@@ -3698,8 +3738,9 @@ a\.b    IN A   192.0.2.50
                 }
 
                 let start = Instant::now();
-                let signed =
-                    sign_zone_incrementally(&previous, &edited, &keys, &policy).expect("signs");
+                let signed = sign_zone_incrementally(&previous, &edited, &keys, &policy)
+                    .expect("signs")
+                    .zone;
                 let incremental = start.elapsed();
 
                 let fresh = signed
