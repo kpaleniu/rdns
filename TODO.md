@@ -37,7 +37,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, and **#21**, as of 2026-09-21.
+**#58**, **#68**, **#98** and **#21**, as of 2026-09-21.
+**#98 filed** the day the agent-skill config landed: `docs/agents/domain.md`
+points at a `CONTEXT.md` and a `docs/adr/` that do not exist, and what is
+actually undocumented is the vocabulary this project coined rather than the
+RFCs'.
 **#97 closed** the day it was filed: `licences and advisories` had been red
 since 2026-09-12 and the reason it was not noticed is that `cargo deny check`
 by hand checks a narrower graph than the job does.
@@ -1142,8 +1146,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#81**-**#84**, **#90**, **#92**, **#93**, **#94**,
-**#95**, plus **#21** —
+**#58**, **#68**, **#98**, plus **#21** —
 see "What is open" above, which is the same list and the only place it is
 written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -6292,6 +6295,39 @@ the CI failure reproduces command for command against the unfixed `deny.toml`
 (§1). The licence counts are `cargo deny --all-features list --layout crate`
 against `Cargo.lock`, both read rather than recalled (§18). No code changed, so
 no test count moved.
+
+---
+
+### 98. The agent skills read a `CONTEXT.md` this repo does not have — **filed 2026-09-21**
+
+`docs/agents/domain.md` (`9008531`) tells the mattpocock engineering skills to
+read `CONTEXT.md` and `docs/adr/` before exploring. Neither exists, so that half
+of the file points at nothing and the skills fall through to `docs/spec/`.
+
+**What is missing is a glossary, and only for the names this project coined.**
+The RFC vocabulary needs none — `CLAUDE.md` §1 already says to cite the section
+that says it, and `docs/spec/` carries the citations. The coined names are the
+gap: `ServeContext`, `Reloading` and "the denial cache" occur 75 times across 20
+`.rs` files and 17 times in this file, and `docs/spec/` mentions them twice
+(`03-authoritative-server.md`, `05-resolver.md`) without defining either. The
+only definitions anywhere are two lines in `docs/spec/README.md`'s Conventions —
+"the library" is the `rdns` crate, "the daemons" are `rdnsd` and `rdnsr`.
+Everything else is defined in a doc comment beside its own type, which is the
+right place to read it and no place to discover it.
+
+**No remedy is named, because none has been checked** (§18). Writing a
+`CONTEXT.md` is the skills' answer and it collides with two rules here: "no new
+READMEs, design documents or doc-comment essays unless asked for by name" (§11),
+and §7, since a glossary is a second copy of what the doc comments say and the
+second copy is where the drift goes. Three shapes to build before choosing
+(§19): a root `CONTEXT.md`; a terms section grown out of `docs/spec/README.md`'s
+Conventions, where two entries already live; or deleting the dangling pointer
+from `docs/agents/domain.md` and nothing else.
+
+The sentence that would make this row wrong is "the repo already keeps a
+glossary somewhere else". Checked: `glossary`, `terminology` and `vocabulary`
+appear in no `.md` in the tree outside `docs/CLOSED_WORK.md` and
+`docs/agents/` itself.
 
 ---
 
