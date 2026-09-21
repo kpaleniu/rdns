@@ -37,7 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#100**, **#102**-**#106**, and **#21**, as of 2026-09-21.
+**#58**, **#68**, **#100**, **#103**-**#106**, and **#21**, as of 2026-09-21.
+**#102 closed** the day it was filed, and the remedy it named was the wrong
+one: the `From` impl it proposed deleting was never the defect, and the fix is
+that the value stops being in flight for 226 lines.
 **#101 closed** the day it was filed, and it is #99's shape one file over: a
 rule stated in a comment, held by nothing, with the test that locked the
 original fix in counting the wrong number.
@@ -1157,7 +1160,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#100**, **#102**-**#106**, plus **#21** —
+**#58**, **#68**, **#100**, **#103**-**#106**, plus **#21** —
 see "What is open" above, which is the same list and the only place it is
 written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -6338,27 +6341,6 @@ caller remembering. Not costed — nobody has built it (§18).
 
 ---
 
-### 102. `Answered::refresh` survives thirteen exits by inspection — **filed 2026-09-21**
-
-`rdnsr/src/answer.rs`: `refresh` is set at `:452`, read at `:651`, and
-`From<Option<Vec<u8>>> for Answered` (`:176`) substitutes `refresh: None` for
-free. Between the two are thirteen `.into()` exits. The struct's own doc (`:158`)
-states a reason and it survives — a prefetch must not delay the answer that
-discovered it, and a task spawned there would hold neither the in-flight permit
-nor the shutdown guard (§9). The `From` impl states none, and it is the only
-thing making the loss silent.
-
-Correct today: the exits after `:453` are in the recursion arm, where `refresh`
-is `None` anyway. The property holds by inspection of thirteen exits rather than
-by construction, and the comment at `:626` records the time it did not — #78a,
-prefetching silently off for any name an `rpz-ip` rule matched.
-
-The shape to try: let the cache lookup own the refresh obligation, so the caller
-cannot return without it. Deleting the `From` impl is the smaller half and may be
-the whole of it; neither is costed.
-
----
-
 ### 103. `server_table!` shares the field declarations and not the fold — **filed 2026-09-21**
 
 `rdns/src/config.rs:45` declares **22** shared fields and generates a `Default`.
@@ -6635,6 +6617,7 @@ the week; the record is under "How the queue kept going stale" in
 | **98** | the agent-skill config pointed at a `CONTEXT.md` that was not there | **filed and closed 2026-09-21**, out of the skills' own setup rather than a review. `docs/agents/domain.md` told them to read `CONTEXT.md` and `docs/adr/` before exploring; neither exists. The row named **no remedy**, because none had been checked (§18), and the measurement said which gap was real: the RFC vocabulary is cited in place, and the names this project coined — `ServeContext`, `Reloading`, the denial cache, **75** occurrences across **20** `.rs` files and 17 in `TODO.md` — are defined in doc comments, mentioned twice in `docs/spec/` without a definition, and nowhere else; `docs/spec/README.md`'s Conventions is the only glossary in the tree and it is two lines. Of the three shapes, the one taken was **deleting the pointer**: a root `CONTEXT.md` collides with §11's "no new design documents unless asked for by name", and a terms section grown out of those two lines is §7's second copy. The file now names where a definition lives and records the absence as a decision |
 | **99** | both daemons' dry run was a `return` at a line number, not the rule §15 states | **filed and closed 2026-09-21**, out of an architecture review rather than a defect report. `rdnsd --check-config --dnstap garbage-not-a-scheme` printed "configuration is valid" and exited 0 where the real start exits 1 — the parse sat in `serve`'s **argument list**, which is evaluated below the dry-run exit. `rdnsr`'s half is worse and was reproduced too: a TSIG secret that is not base64 passes the dry run, and `TsigKey::parse` (`:944`) runs after both `bind`s (`:766`, `:767`) and a `tokio::spawn` (`:931`), so the process takes the ports and then dies. Counted before anything was edited: **four** fallible sites below `rdnsd`'s exit, of which `--metrics-listen` in `rdnsr` is *not* one — it is a real `TcpListener::bind` and was checked before it was counted. **Both shapes were built and the type lost**: hoisting is +9 −4, a `Checked` type holding every fallible flag value is +31 −12 and still leaves **23 `cli.*` reads** below the line across 20 fields, with the enforcing version costing a 49-field mirror of `Cli` or the lift #90 declined. **The rule itself was wrong**, which is the part worth keeping: "everything that does not bind a socket" invited moving the exit down to the first spawn, and one function past `rdnsd`'s exit `discard_orphan_journals` calls `Journal::forget` — `std::fs::remove_file`. That dry run would have deleted journals. §15 now says where the exit goes instead, with the journal fact beside it, and the old sentence struck in place. One regression test per daemon, each run against the unfixed tree first |
 | **101** | the TSIG-rejection branch returned past the dnstap tail | **filed and closed 2026-09-21**, out of the same review as #99 and the same shape: a rule stated in a comment and held by nothing. #75 gave `Server::answer` one tail so nothing could `return` past `record_dnstap`, and the comment at `dispatch.rs:311` said "three ways to answer and one tail". There were four — the `TsigCheck::Rejected` arm sends a NOTAUTH at `:289` and returns at `:292`, sixty lines above the tail — so a capture under a key-guessing probe, which is the one time an operator wants it, held nothing. The test that locked #75 in asserted 3, so the fourth door was invisible from the comment and from the suite at once. Fixed by making the check an expression: both arms produce `Option<Cow<[u8]>>`, the refusal returns what it sent, and the rest moves to `answer_admitted` behind an `Admitted` struct — six values that travel together, because the method wants nine parameters and clippy stops at seven (§14). **The cheapest of the three shapes was the one declined**: a `Drop` guard on the tail is a few lines and makes the record impossible to skip while leaving it easy to hand nothing, which reports "no reply" for a request that got one — the same symptom, quieter. The `let ... else { return; }` in the refusal became a `match` as a consequence, since "no reply fits" is now a value rather than a divergence. Test count 3 → 4, run against the unfixed tree first (`left: 3, right: 4`) |
+| **102** | `Answered::refresh` survived thirteen exits by inspection | **filed and closed 2026-09-21**. `refresh` was a `mut` local declared 226 lines above the cache hit that set it and 200 below the tail that read it, with thirteen `.into()` exits in between and a `From<Option<Vec<u8>>>` that fills `refresh: None` for free — #78a is the time one of those exits silently turned prefetching off for any name an `rpz-ip` rule matched. Fixed by deriving it from the lookup: `hit.as_ref().filter(|hit| hit.refresh).map(|_| query.clone())`, immutable, one line below the `lookup` it comes from. The invariant stops being "read all thirteen exits" and becomes one implication — `refresh` is `Some` only when `hit` is, and both exits that could drop it are in the arm that runs when the cache *missed*. **Both halves of the row's own guess were wrong**: the `From` impl was not the defect and stays, because once the local is gone `.into()` is correct by construction at every one of the thirteen sites, and deleting it would have made them noisier and fixed nothing. No behaviour changed, so there is no new test — a test here would agree with the code (§1); #78a's *A rewritten answer still asks for its prefetch* is still the guard. The old comment's argument is struck in place rather than rewritten, because it is the lesson: "falling through leaves one exit, so there is nothing to remember" held for the exit that had just been removed and said nothing about the next one |
 | **81** | what #63h's macro did not reach, and one more copy | **filed 2026-09-19, closed 2026-09-20**, two rows. **81a** measured and mostly declined: of the 27 commits touching `rdnsd/src/config.rs`, 8 touch its TSIG lines and 1 of those also touches `rdnsr`'s — and that one *created* the copy — so the two tables do not co-move and the shared struct is declined; three fields of five are shared, not five, because a resolver authorizes nothing. What was taken is the list and the default under it: `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES`, `::DEFAULT`, with `TsigKey::parse` coming out better than it went in. **81b** merged the two FNV-1a loops into `rdns_core::folded_hash`, and the check was the row's own instruction taken through the observable rather than by comparing the copies: six `expiry_for` offsets measured before the merge, unchanged after it, so no signature's expiry moved |
 | **82** | two modules in the wrong place, and a `pub` with no ratchet | **filed 2026-09-19, closed 2026-09-20**, two rows. **82b** took the ratchet: 43 sites, 38 of them `#[cfg(test)]` fixtures that always meant `pub(crate)`, and `#![warn(unreachable_pub)]` is in all nine crate roots with what it does *not* answer written on the lint. **82a** moved `readiness` to `rdns-transport`, whose metrics server serves `/readyz`; the estimate held except that a move is two `mod` lines, not one. Both halves of the *larger* version stay declined on measurements taken in place: an `rdns-ops` crate takes no package off any binary (`cargo tree -p rdnsd` is 150 either way) and the transport link is ~450 ms of a ~3.3 s rebuild, which is a ceiling and not a saving |
 | **84** | `to_prometheus_format` was 337 lines of one idiom | **filed 2026-09-19, closed 2026-09-20**, and the row's own remedy was wrong by an order of magnitude. Both shapes built (§19): helper calls 278 lines, a table 276, against 337 — because stock rustfmt breaks *every* element of an argument list when one exceeds 100 columns, and §12 forbids a `rustfmt.toml`, so the length was never available to be fixed. The table shipped on what it makes unrepresentable instead: name, help and field on one row, so a counter rendered nowhere is a missing row rather than a missing block among thirty. The `diff` the row asked for came back **byte-identical except the `dns_catalog_members` HELP line**, its 22 stray spaces, exactly as predicted. One it did not ask for: a scrape was **65 allocations and is 16** for the same 4 775 bytes, pinned. Both sub-findings fixed — `the_scrape_is_well_formed` asserts one HELP and one TYPE per family, no undeclared sample and no padded help text, and fails against the padded line put back; the two lock guards read *through* a poisoned lock now, matching the decision every writer in the file had already made, because dropping the series made every zone look withdrawn at once |

@@ -9059,3 +9059,60 @@ UPDATE signed with a key the server does not hold, answered NOTAUTH — and its
 count went 3 → 4. Run against the unfixed tree first, where it fails with
 `left: 3, right: 4` (§1). Windows 1292 passed / 0 failed / 16 ignored, Linux
 1313 / 0 / 16, clippy clean on both.
+
+---
+
+### 102. `Answered::refresh` survives thirteen exits by inspection — **filed and closed 2026-09-21**
+
+`rdnsr/src/answer.rs`: `refresh` is set at `:452`, read at `:651`, and
+`From<Option<Vec<u8>>> for Answered` (`:176`) substitutes `refresh: None` for
+free. Between the two are thirteen `.into()` exits. The struct's own doc (`:158`)
+states a reason and it survives — a prefetch must not delay the answer that
+discovered it, and a task spawned there would hold neither the in-flight permit
+nor the shutdown guard (§9). The `From` impl states none, and it is the only
+thing making the loss silent.
+
+Correct today: the exits after `:453` are in the recursion arm, where `refresh`
+is `None` anyway. The property holds by inspection of thirteen exits rather than
+by construction, and the comment at `:626` records the time it did not — #78a,
+prefetching silently off for any name an `rpz-ip` rule matched.
+
+The shape to try: let the cache lookup own the refresh obligation, so the caller
+cannot return without it. Deleting the `From` impl is the smaller half and may be
+the whole of it; neither is costed.
+
+**Closed the same day, and both halves of the row's own guess were wrong.**
+
+`refresh` is derived from the lookup now rather than assigned inside the arm
+below it:
+
+```rust
+let hit = caches.answers.lookup(query.qname.as_ref(), query.qtype, *prefetch);
+let refresh = hit.as_ref().filter(|hit| hit.refresh).map(|_| query.clone());
+```
+
+The `mut` local declared 226 lines above is gone, and with it the invariant that
+had to be checked by reading thirteen exits. What replaces it is one
+implication: `refresh` is `Some` only when `hit` is `Some`, and both exits that
+could drop it (`:533`, `:581`) are inside the arm that runs when `hit` is
+`None`. That is not the compiler holding it — it is one line to verify at the
+binding instead of thirteen sites to walk.
+
+**The `From` impl stays**, where the row called deleting it "the smaller half
+and may be the whole of it". Once the local is gone, `.into()` is correct by
+construction at all thirteen sites: eleven are above the binding and two are in
+the miss arm. Deleting it would have made thirteen call sites noisier and fixed
+nothing — the impl was never the defect, the 226-line lifetime was.
+
+**No behaviour changed, so there is no new test and nothing to watch fail** (§1
+from the other direction: a test here would agree with the code and prove
+nothing). The behavioural guard is still #78a's *A rewritten answer still asks
+for its prefetch*, untouched and passing.
+
+The comment at `:629` is struck rather than rewritten, because the argument it
+made is the lesson: "falling through leaves one exit, so there is nothing to
+remember" held for the exit that had just been removed and said nothing about
+the next one.
+
+Windows 1292 passed / 0 failed / 16 ignored, Linux 1313 / 0 / 16, clippy clean
+on both.
