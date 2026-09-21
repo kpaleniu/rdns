@@ -37,7 +37,14 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, and **#21**, as of 2026-09-21.
+**#58**, **#68**, **#100**, **#102**-**#106**, and **#21**, as of 2026-09-21.
+**#101 closed** the day it was filed, and it is #99's shape one file over: a
+rule stated in a comment, held by nothing, with the test that locked the
+original fix in counting the wrong number.
+**#100 through #106 were filed together** out of the same architecture review
+that produced #99, each with its quote checked against the file before the row
+was written. #105's framing did not survive that check and the row leads with
+the correction; none of the seven names a costed remedy (§18).
 **#99 filed and closed** out of an architecture review: `--check-config` was a
 `return` at a line number in both daemons, and the rule §15 stated turned out to
 be wrong in both directions — a dry run moved down to the first spawn would have
@@ -1150,7 +1157,7 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, plus **#21** —
+**#58**, **#68**, **#100**, **#102**-**#106**, plus **#21** —
 see "What is open" above, which is the same list and the only place it is
 written down.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
@@ -6302,6 +6309,159 @@ no test count moved.
 
 ---
 
+### 100. A dynamic UPDATE's signatures are the only ones no run verifies — **filed 2026-09-21**
+
+`main.rs:2031` states the invariant: "Signing happens between loading and
+serving, and so does checking the result: verifying what we just produced is
+what catches a canonicalization bug here rather than at every validator on the
+internet." `verify_zones` has exactly **two** production callers — `main.rs:1456`
+(reload) and `:2045` (startup). The third way a zone reaches the map is a dynamic
+UPDATE, which signs through `zones.rs:897`'s `sign_one_incrementally` — one
+production caller, `dispatch.rs:1341` — and installs directly. The counts are
+`grep`s with the `#[cfg(test)]` boundaries checked (`zones.rs:1500`,
+`dispatch.rs:1431`), because most of the hits are tests.
+
+So the new and changed RRsets and the denial chain around them are the only
+signatures in the process nothing has ever checked, and they are the ones the
+invariant exists for. #53 compounds it: `ProvenSigning::already_proved`
+(`zones.rs:1216`) makes a later reload skip a zone the startup pass proved, so an
+UPDATE-installed version is never reached by any path.
+
+**No reason is stated.** The UPDATE path's own doc (`dispatch.rs:1254`) explains
+write-then-install ordering and says nothing about verification; `grep`ping
+`dispatch.rs` for "verif" returns eight hits and all eight are TSIG. A shape that
+needs a reason and states none is the finding (§19).
+
+The shape to try: have the signing call hand back something a zone cannot be
+installed without, so "signed here, checked here" rides the value rather than the
+caller remembering. Not costed — nobody has built it (§18).
+
+---
+
+### 102. `Answered::refresh` survives thirteen exits by inspection — **filed 2026-09-21**
+
+`rdnsr/src/answer.rs`: `refresh` is set at `:452`, read at `:651`, and
+`From<Option<Vec<u8>>> for Answered` (`:176`) substitutes `refresh: None` for
+free. Between the two are thirteen `.into()` exits. The struct's own doc (`:158`)
+states a reason and it survives — a prefetch must not delay the answer that
+discovered it, and a task spawned there would hold neither the in-flight permit
+nor the shutdown guard (§9). The `From` impl states none, and it is the only
+thing making the loss silent.
+
+Correct today: the exits after `:453` are in the recursion arm, where `refresh`
+is `None` anyway. The property holds by inspection of thirteen exits rather than
+by construction, and the comment at `:626` records the time it did not — #78a,
+prefetching silently off for any name an `rpz-ip` rule matched.
+
+The shape to try: let the cache lookup own the refresh obligation, so the caller
+cannot return without it. Deleting the `From` impl is the smaller half and may be
+the whole of it; neither is costed.
+
+---
+
+### 103. `server_table!` shares the field declarations and not the fold — **filed 2026-09-21**
+
+`rdns/src/config.rs:45` declares **22** shared fields and generates a `Default`.
+The projection onto `Cli` is then hand-written twice: **35** `cli.x =
+self.server.x` lines in `rdnsd/src/config.rs` and **22** in `rdnsr/src/config.rs`
+(counted, `^\s+cli\.[a-z_]+ = self\.server\.`). The macro removed the copy that is
+cheap to keep right and left the copy where a mistake is silent: a `Server` field
+with no matching assignment parses, passes `deny_unknown_fields`, and does
+nothing — which is what `deny_unknown_fields` exists to prevent, reached by the
+other door.
+
+The test that looks like the guard is not one, and says so:
+`a_minimal_config_changes_no_flag_default` uses a minimal fixture, so every
+compared value equals the flag default on both sides and a missing assignment
+compares equal. Its doc calls it "a tripwire, not a regression test" — for
+drifting *defaults*, not for missing *wiring*.
+
+The stated reason for the shape (`rdnsd/src/config.rs:553`) is about overwriting
+`cli` rather than threading a second settings type through the daemon, and it
+survives — it argues for one target shape, not for writing the projection twice.
+#30k is about clap's `#[command(flatten)]` and does not cover this.
+
+The shape to try: emit the assignment from the macro that declares the field.
+Not costed.
+
+---
+
+### 104. Four digest caches over one `FileDigest` — **filed 2026-09-21**
+
+The type is shared and says why (`rdns/src/zone.rs:78`): "One copy for three
+callers … because two implementations of 'did these bytes change' is how the two
+answers come to differ (`CLAUDE.md` §7)." What was copied is the reasoning built
+on it — four maps, four invalidation rules, four decisions about what a stale
+entry costs: `LoadedFiles` and `Keepable` (`rdnsd/src/zones.rs:60`, `:96`),
+`UpdateHandling::applying` (`rdnsd/src/main.rs:761`) and `PolicyStore.offered`
+(`rdns/src/rpz.rs:1060`). The prose argument about `stat` not seeing an edit that
+preserves length and timestamp is written out in near-identical words at
+`dispatch.rs:1282` and `rpz.rs:848`.
+
+One asymmetry is measured rather than described: the reload path uses
+`of_self_contained` (`zones.rs:128`, `:147`) and the UPDATE path uses
+`FileDigest::of(&raw)` (`dispatch.rs:1289`) on bytes read off disk, which the
+type's doc restricts to "text this process wrote, or a file already known to
+carry no `$INCLUDE`". Safe today only through a two-step argument spanning two
+functions. `PolicyStore::offer` also leaks its callee's ordering — "The caller
+writes `text` to `path` first and passes the same bytes here" — with nothing
+making it true.
+
+`FileDigest` itself is deep and stays. #64b, #64f, #71b and #71f are the four
+optimisations, each landed alone; none asked what the four together are.
+
+---
+
+### 105. `https::answer` charges the rate limiter whatever the caller asked for — **filed 2026-09-21**
+
+**The framing this was found under was wrong, and the correction is the finding.**
+The review said the `RateLimit::PerConnection` arm had no production caller
+because only `rdnsd` has encrypted listeners. It has four: `rdnsr` spawns
+`tcp`, `https`, `quic` and `tls` at `main.rs:1026`, `:1035`, `:1046` and `:1058`
+and passes `PerConnection` to every one. A `grep` for the variant would have said
+so before the sentence was written (§19).
+
+What survives is worse than what was claimed. `https::serve` charges
+`allow_source` once per connection when the caller asks for `PerConnection`
+(`https.rs:123`). `https::answer` (`:211`) takes **no** `rate` parameter and
+charges `allow_source` again at `:227` for every request. `tcp`, `quic` and `tls`
+all branch on the arm (`tcp.rs:155`, `quic.rs:116`, `tls.rs:263`); `https` is the
+one adapter that is handed the parameter and does not consult it. So a DoH client
+of `rdnsr` is charged twice for the first query of every connection, and the
+operator's `--query-rate` means something different over DoH than over DoT.
+
+#30e's resolution says the composition is "composed at each of the four sites …
+which keeps the two differences visible where they are decided". There are eight
+or more sites now. Whether that argues for deciding once inside the shared loop
+is the design question, and it is not costed.
+
+---
+
+### 106. A DoH transfer is built in full and discarded — **filed 2026-09-21**
+
+`Server::answer` decides to stream a transfer from `qtype` and `Wire::Framed`
+alone (`dispatch.rs:317`). DoH arrives as `Wire::Framed(_, Arrival::Doh(..))`, so
+an authorized DoH client asking AXFR makes the server serialize the whole zone
+one envelope at a time into an `mpsc` of depth 4, which `https::answer` drains
+and throws away — `Reply::Frame(_) => extra += 1` at `https.rs:256`, a warning at
+`:265` — then waits on the producer before answering with the first envelope.
+
+The stated reason (`https.rs:22`) survives as far as it goes: "The handler is a
+sink because an AXFR is a sequence of messages (RFC 5936 §2.2), and one HTTP
+response is one message … RFC 8484 defines no framing that would carry the rest,
+and inventing one would be a protocol this tree made up." It does not answer the
+cost. The fact needed to refuse cheaply — this arrival carries one message —
+exists at `dispatch.rs:107` in `Wire::socket_protocol`, one layer below the
+dispatch that needs it.
+
+#30's "the handler has to be sink-shaped" is not contradicted: the sink shape is
+right. The gap is that it carries no way for an adapter to say how many replies
+it can take, which is the one fact `https` needs and `tcp` and `quic` do not.
+Refusing before building is the shape to try, beside the place AXFR-over-UDP is
+already refused. Not costed.
+
+---
+
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -6474,6 +6634,7 @@ the week; the record is under "How the queue kept going stale" in
 | **97** | `cargo deny check` by hand checked less than the job that runs it | **filed and closed 2026-09-21**. `licences and advisories` had been red on all three pushes since 2026-09-12, on `bans` alone: two `rustc-hash`, `dhat`'s 1.1.0 against `quinn`'s 2.1.3, in with `8f1be6e` (#42b). **The duplicate is the smaller half.** #91 closed five days earlier on a local `cargo deny check`, and the job was red on the next push with the duplicate already in the lockfile — because the action passes `--all-features` and the command by hand does not, so `dhat` (behind `rdnsd`'s off-by-default `dhat-heap`) is in the job's graph and not in the operator's. §1 from the other direction, and #91's verification is struck in place. Fixed in three places: a `skip` naming what collapses it (a default `rdnsd` has one copy, `dhat` 0.3.3 is the latest, so the pin is not ours), `--all-features` spelled out in `ci.yml` although it is the default, and the recipe changed to match. Plain `cargo deny check` now warns "unnecessary skip configuration", which is the two invocations disagreeing in the direction that cannot go wrong quietly. **Two licence claims fell out of the same mistake** and are corrected with it: `deny.toml` called `BSD-2-Clause` reachable for `zerocopy`, which arrives under `criterion` and is not in this graph at all, and the README enumerated six licences where `cargo deny list` reports eight. Both described the lockfile's 214 packages when the tool checks **138** — the 76 missing are `criterion`'s and `rcgen`'s dev trees — and the comment's header said so, naming `cargo metadata` as its source |
 | **98** | the agent-skill config pointed at a `CONTEXT.md` that was not there | **filed and closed 2026-09-21**, out of the skills' own setup rather than a review. `docs/agents/domain.md` told them to read `CONTEXT.md` and `docs/adr/` before exploring; neither exists. The row named **no remedy**, because none had been checked (§18), and the measurement said which gap was real: the RFC vocabulary is cited in place, and the names this project coined — `ServeContext`, `Reloading`, the denial cache, **75** occurrences across **20** `.rs` files and 17 in `TODO.md` — are defined in doc comments, mentioned twice in `docs/spec/` without a definition, and nowhere else; `docs/spec/README.md`'s Conventions is the only glossary in the tree and it is two lines. Of the three shapes, the one taken was **deleting the pointer**: a root `CONTEXT.md` collides with §11's "no new design documents unless asked for by name", and a terms section grown out of those two lines is §7's second copy. The file now names where a definition lives and records the absence as a decision |
 | **99** | both daemons' dry run was a `return` at a line number, not the rule §15 states | **filed and closed 2026-09-21**, out of an architecture review rather than a defect report. `rdnsd --check-config --dnstap garbage-not-a-scheme` printed "configuration is valid" and exited 0 where the real start exits 1 — the parse sat in `serve`'s **argument list**, which is evaluated below the dry-run exit. `rdnsr`'s half is worse and was reproduced too: a TSIG secret that is not base64 passes the dry run, and `TsigKey::parse` (`:944`) runs after both `bind`s (`:766`, `:767`) and a `tokio::spawn` (`:931`), so the process takes the ports and then dies. Counted before anything was edited: **four** fallible sites below `rdnsd`'s exit, of which `--metrics-listen` in `rdnsr` is *not* one — it is a real `TcpListener::bind` and was checked before it was counted. **Both shapes were built and the type lost**: hoisting is +9 −4, a `Checked` type holding every fallible flag value is +31 −12 and still leaves **23 `cli.*` reads** below the line across 20 fields, with the enforcing version costing a 49-field mirror of `Cli` or the lift #90 declined. **The rule itself was wrong**, which is the part worth keeping: "everything that does not bind a socket" invited moving the exit down to the first spawn, and one function past `rdnsd`'s exit `discard_orphan_journals` calls `Journal::forget` — `std::fs::remove_file`. That dry run would have deleted journals. §15 now says where the exit goes instead, with the journal fact beside it, and the old sentence struck in place. One regression test per daemon, each run against the unfixed tree first |
+| **101** | the TSIG-rejection branch returned past the dnstap tail | **filed and closed 2026-09-21**, out of the same review as #99 and the same shape: a rule stated in a comment and held by nothing. #75 gave `Server::answer` one tail so nothing could `return` past `record_dnstap`, and the comment at `dispatch.rs:311` said "three ways to answer and one tail". There were four — the `TsigCheck::Rejected` arm sends a NOTAUTH at `:289` and returns at `:292`, sixty lines above the tail — so a capture under a key-guessing probe, which is the one time an operator wants it, held nothing. The test that locked #75 in asserted 3, so the fourth door was invisible from the comment and from the suite at once. Fixed by making the check an expression: both arms produce `Option<Cow<[u8]>>`, the refusal returns what it sent, and the rest moves to `answer_admitted` behind an `Admitted` struct — six values that travel together, because the method wants nine parameters and clippy stops at seven (§14). **The cheapest of the three shapes was the one declined**: a `Drop` guard on the tail is a few lines and makes the record impossible to skip while leaving it easy to hand nothing, which reports "no reply" for a request that got one — the same symptom, quieter. The `let ... else { return; }` in the refusal became a `match` as a consequence, since "no reply fits" is now a value rather than a divergence. Test count 3 → 4, run against the unfixed tree first (`left: 3, right: 4`) |
 | **81** | what #63h's macro did not reach, and one more copy | **filed 2026-09-19, closed 2026-09-20**, two rows. **81a** measured and mostly declined: of the 27 commits touching `rdnsd/src/config.rs`, 8 touch its TSIG lines and 1 of those also touches `rdnsr`'s — and that one *created* the copy — so the two tables do not co-move and the shared struct is declined; three fields of five are shared, not five, because a resolver authorizes nothing. What was taken is the list and the default under it: `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES`, `::DEFAULT`, with `TsigKey::parse` coming out better than it went in. **81b** merged the two FNV-1a loops into `rdns_core::folded_hash`, and the check was the row's own instruction taken through the observable rather than by comparing the copies: six `expiry_for` offsets measured before the merge, unchanged after it, so no signature's expiry moved |
 | **82** | two modules in the wrong place, and a `pub` with no ratchet | **filed 2026-09-19, closed 2026-09-20**, two rows. **82b** took the ratchet: 43 sites, 38 of them `#[cfg(test)]` fixtures that always meant `pub(crate)`, and `#![warn(unreachable_pub)]` is in all nine crate roots with what it does *not* answer written on the lint. **82a** moved `readiness` to `rdns-transport`, whose metrics server serves `/readyz`; the estimate held except that a move is two `mod` lines, not one. Both halves of the *larger* version stay declined on measurements taken in place: an `rdns-ops` crate takes no package off any binary (`cargo tree -p rdnsd` is 150 either way) and the transport link is ~450 ms of a ~3.3 s rebuild, which is a ceiling and not a saving |
 | **84** | `to_prometheus_format` was 337 lines of one idiom | **filed 2026-09-19, closed 2026-09-20**, and the row's own remedy was wrong by an order of magnitude. Both shapes built (§19): helper calls 278 lines, a table 276, against 337 — because stock rustfmt breaks *every* element of an argument list when one exceeds 100 columns, and §12 forbids a `rustfmt.toml`, so the length was never available to be fixed. The table shipped on what it makes unrepresentable instead: name, help and field on one row, so a counter rendered nowhere is a missing row rather than a missing block among thirty. The `diff` the row asked for came back **byte-identical except the `dns_catalog_members` HELP line**, its 22 stray spaces, exactly as predicted. One it did not ask for: a scrape was **65 allocations and is 16** for the same 4 775 bytes, pinned. Both sub-findings fixed — `the_scrape_is_well_formed` asserts one HELP and one TYPE per family, no undeclared sample and no padded help text, and fails against the padded line put back; the two lock guards read *through* a poisoned lock now, matching the decision every writer in the file had already made, because dropping the series made every zone look withdrawn at once |

@@ -9009,3 +9009,53 @@ daemon in `rdnsd/tests/startup.rs` and `rdnsr/tests/startup.rs`. Both were run
 against the unfixed tree and both fail there with a zero status and
 "configuration is valid" on stdout (§1), which is the symptom rather than a
 proxy for it.
+
+---
+
+### 101. The TSIG-rejection branch returns past the dnstap tail — **filed and closed 2026-09-21**
+
+#75's fix gave `Server::answer` one tail so nothing could return past
+`record_dnstap`, and the comment at `dispatch.rs:311` says so: "Three ways to
+answer and one tail, because the first two used to `return` past it …
+`--dnstap` says 'every answered request'". There is a fourth. The
+`TsigCheck::Rejected` arm at `:266` sends a reply — `wire.send(&bytes, …)` at
+`:289` — and returns at `:292`, sixty lines above the tail at `:377`.
+
+A capture on a server under a key-guessing probe therefore holds nothing about
+it, which is the one time an operator most wants the record. The test that locked
+#75 in counts three (`main.rs:4103`, `data_frames(&capture), 3`) and the comment
+says three, so the fourth door is invisible from both.
+
+This is #99's shape one file over: a rule stated in a comment and held by nothing.
+The same answer may fit — make the body produce a value the tail consumes, so a
+branch that wants to leave early has to say what it sent — but it is not costed
+and `answer` has more exits than `main` did.
+
+**Closed the same day.** `Server::answer` now settles the TSIG check into a
+`match` whose arms both produce `Option<Cow<[u8]>>`: the refusal returns the
+bytes it sent, and everything else goes through `answer_admitted`, which holds
+the three ordinary ways. The tail is then the only way out, because the compiler
+demands a value from every arm — not because a comment says so.
+
+**Three shapes, and the smallest was the one to decline** (§19). Nesting the
+remainder in the match arm costs 83 lines of re-indent, which §12 answers with a
+separate commit; extracting it costs a parameter struct, since the method wants
+nine and clippy stops at seven; a `Drop` guard on the tail costs almost nothing
+and is the only one of the three where this bug can come back quietly — it makes
+the record impossible to *skip* while leaving it easy to hand nothing, which
+reports "no reply" for a request that got one. That is the same symptom arriving
+more politely. The extraction was taken, and `Admitted` is the struct §14 asks
+for: six values that travel together, four of them a `u16` or a `u64` next to
+each other.
+
+Two things fell out of the move rather than being planned. The refusal's
+`let ... else { return; }` had to become a `match`, because "no reply fits" is
+now a value an arm produces instead of a divergence it escapes through. And the
+`error_reply` that cannot fit still records nothing, which is right: nothing was
+sent.
+
+`every_answering_path_reaches_the_dnstap_stream` grew a fourth request — an
+UPDATE signed with a key the server does not hold, answered NOTAUTH — and its
+count went 3 → 4. Run against the unfixed tree first, where it fails with
+`left: 3, right: 4` (§1). Windows 1292 passed / 0 failed / 16 ignored, Linux
+1313 / 0 / 16, clippy clean on both.
