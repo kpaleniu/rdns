@@ -120,11 +120,7 @@ pub async fn serve<H: Handler>(
             },
             _ = stop.wait() => return Ok(()),
         };
-        if rate == RateLimit::PerConnection
-            && !handler
-                .context()
-                .allow_source(peer.ip(), handler.context().clock.now())
-        {
+        if !rate.admits_connection(handler.context(), peer.ip()) {
             continue;
         }
         let Ok(permit) = permits.clone().acquire_owned().await else {
@@ -181,7 +177,7 @@ pub async fn serve<H: Handler>(
                 let arrival = arrival.clone();
                 async move {
                     Ok::<_, std::convert::Infallible>(
-                        answer(request, peer, handler, path, arrival).await,
+                        answer(request, peer, handler, path, arrival, rate).await,
                     )
                 }
             });
@@ -214,6 +210,7 @@ async fn answer<H: Handler>(
     handler: Arc<H>,
     path: Arc<str>,
     arrival: Arrival,
+    rate: RateLimit,
 ) -> Response<Full<Bytes>> {
     if request.uri().path() != &*path {
         return status(StatusCode::NOT_FOUND);
@@ -224,7 +221,11 @@ async fn answer<H: Handler>(
     };
 
     let now = handler.context().clock.now();
-    if !handler.context().allow_source(peer.ip(), now) {
+    // Through `rate`, as the other three adapters ask it. Asking
+    // `allow_source` outright charged a `PerConnection` client a second token
+    // for the first request of every connection, so `--query-rate` meant one
+    // thing over DoT and another over DoH (`TODO.md` #105).
+    if !rate.admits_message(handler.context(), peer.ip(), now) {
         // 429 rather than a silent drop, and the difference from UDP is the
         // point: this peer completed a TCP and a TLS handshake, so there is
         // nobody to reflect an answer at and nothing to gain by staying quiet.
@@ -390,6 +391,7 @@ mod tests {
     use crate::testutil::{context, query};
     use crate::tls::testing::write_pem;
     use crate::ServeContext;
+    use rdns::clock::Clock;
     use rdns::shutdown::Shutdown;
     use rustls::pki_types::CertificateDer;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -415,6 +417,14 @@ mod tests {
 
     /// A server on a fresh port, and the client config that trusts it.
     async fn started() -> (SocketAddr, Vec<u8>, Shutdown, tokio::task::JoinHandle<()>) {
+        started_with(context(0), RateLimit::PerMessage).await
+    }
+
+    /// The same, for a test that is about the admission policy.
+    async fn started_with(
+        ctx: ServeContext,
+        rate: RateLimit,
+    ) -> (SocketAddr, Vec<u8>, Shutdown, tokio::task::JoinHandle<()>) {
         let pem = write_pem("doh", "localhost");
         let store = CertificateStore::load(&pem.cert, &pem.key).expect("loads");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -427,9 +437,9 @@ mod tests {
                 let _ = serve(
                     listener,
                     endpoint(store, DEFAULT_PATH, None).expect("a DoH endpoint"),
-                    Arc::new(Echo(context(0))),
+                    Arc::new(Echo(ctx)),
                     TransportLimits::default(),
-                    RateLimit::PerMessage,
+                    rate,
                     stop,
                     busy,
                 )
@@ -442,6 +452,17 @@ mod tests {
     /// One HTTP/1.1 request over TLS, written by hand so the test is about the
     /// bytes RFC 8484 §4.1 specifies rather than about a client library.
     async fn request(addr: SocketAddr, der: &[u8], head: &str, body: &[u8]) -> Vec<u8> {
+        try_request(addr, der, head, body)
+            .await
+            .expect("the connection was served")
+    }
+
+    /// The same, for a test where the server may refuse before the handshake.
+    ///
+    /// `None` is a connection the accept loop dropped — which is what a
+    /// `PerConnection` refusal looks like from outside, there being no HTTP
+    /// yet to carry a 429.
+    async fn try_request(addr: SocketAddr, der: &[u8], head: &str, body: &[u8]) -> Option<Vec<u8>> {
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(CertificateDer::from(der.to_vec()))
@@ -454,14 +475,14 @@ mod tests {
         let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
         let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
-        let mut tls = connector.connect(name, tcp).await.expect("handshake");
+        let mut tls = connector.connect(name, tcp).await.ok()?;
 
         let mut wire = head.as_bytes().to_vec();
         wire.extend_from_slice(body);
-        tls.write_all(&wire).await.expect("write");
+        tls.write_all(&wire).await.ok()?;
         let mut out = Vec::new();
         let _ = tls.read_to_end(&mut out).await;
-        out
+        (!out.is_empty()).then_some(out)
     }
 
     fn split(response: &[u8]) -> (String, Vec<u8>) {
@@ -473,6 +494,66 @@ mod tests {
             String::from_utf8_lossy(&response[..at]).to_string(),
             response[at + 4..].to_vec(),
         )
+    }
+
+    /// A DoH client is charged one token for its connection, not two.
+    ///
+    /// `TODO.md` #105. `serve` charges `allow_source` at accept when the
+    /// caller asked for `PerConnection`; `answer` took no `rate` and charged
+    /// again for every request, so the *first* request of every connection
+    /// paid twice — and `--query-rate` meant something different over DoH than
+    /// over DoT, which is the one thing a shared parameter is for.
+    ///
+    /// A burst of one, so the double charge is the whole difference between
+    /// 200 and 429. The clock is the test's for `TODO.md` #52's reason: the
+    /// limiter refills by whole seconds, and against `SystemTime` this would
+    /// be decided by whether the two charges straddled a boundary.
+    #[tokio::test]
+    async fn a_doh_connection_is_charged_once_and_not_once_per_request() {
+        let clock = Clock::fixed(1_000_000_000);
+        let mut ctx = context(1);
+        ctx.clock = clock.clone();
+        let (addr, der, shutdown, task) = started_with(ctx, RateLimit::PerConnection).await;
+
+        let question = query(0x1111);
+        let head = |body: &[u8]| {
+            format!(
+                "POST /dns-query HTTP/1.1\r\nHost: localhost\r\n\
+                 Content-Type: application/dns-message\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            )
+        };
+        let (headers, body) = split(&request(addr, &der, &head(&question), &question).await);
+        assert!(
+            headers.starts_with("HTTP/1.1 200 OK"),
+            "the connection's own token paid for its first request: {headers}"
+        );
+        assert_eq!(body, question);
+
+        // And the token really was spent at accept: the next connection has
+        // nothing to pay with. Under `PerConnection` the refusal lands before
+        // the TLS handshake, so there is no HTTP to carry a 429 and the tell
+        // is a dropped connection — which is also where the refusal is
+        // cheapest.
+        assert!(
+            try_request(addr, &der, &head(&question), &question)
+                .await
+                .is_none(),
+            "a second connection is over the burst of one"
+        );
+
+        // One second buys one token back, which is what says the first
+        // connection was charged rather than never admitted.
+        clock.advance(1);
+        let (headers, _) = split(&request(addr, &der, &head(&question), &question).await);
+        assert!(
+            headers.starts_with("HTTP/1.1 200 OK"),
+            "the refill admits one: {headers}"
+        );
+
+        shutdown.begin();
+        task.abort();
     }
 
     /// POST, which is the form RFC 8484 §4.1 requires of every implementation.

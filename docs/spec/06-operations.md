@@ -235,6 +235,17 @@ per-peer table has a `max_tracked` and a documented direction of failure: the
 rate limiter allows an untracked source, the query logger decays counts. A burst
 of zero is floored to one.
 
+**Where the token is spent differs by daemon and not by transport.** `rdnsd`
+charges per message, `rdnsr` per connection accepted (`TODO.md` #30e): a
+resolver's clients open a connection and ask a few things, an authoritative
+server's are resolvers that pipeline. All four connection-oriented transports
+— TCP, DoT, DoQ and DoH — ask the same two questions of `RateLimit`, so the
+number an operator sets means the same thing on each. It did not: DoH charged
+a `PerConnection` client again for the first request of every connection
+(#105). A `PerConnection` refusal lands before the TLS handshake and shows as
+a dropped connection; a `PerMessage` one over DoH is a 429, because by then
+the peer has completed two handshakes and there is nobody to reflect at.
+
 The effective policy — including what each TSIG key may transfer — is printed in
 the startup banner, because rate-limited queries are dropped without a reply.
 

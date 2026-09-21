@@ -37,7 +37,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#105**, **#106**, and **#21**, as of 2026-09-21.
+**#58**, **#68**, **#106**, and **#21**, as of 2026-09-21.
+**#105 closed** the day it was filed, and its open design question has an
+answer that leaves #30e alone: what #30e argues is that the two *daemons*
+disagree, so the parameter and its call sites stay — what became one is the
+four *adapters*' reading of it, which is the thing that drifted.
 **#104 closed** the day it was filed, and the count in its title is wrong:
 there are two maps and a zone list, not four maps, and unifying them is
 declined on that measurement. What asking the question found instead is two
@@ -6618,7 +6622,7 @@ clippy clean on both, `cargo doc` and `cargo fmt --check` clean.
 
 ---
 
-### 105. `https::answer` charges the rate limiter whatever the caller asked for — **filed 2026-09-21**
+### 105. `https::answer` charges the rate limiter whatever the caller asked for — **filed and closed 2026-09-21**
 
 **The framing this was found under was wrong, and the correction is the finding.**
 The review said the `RateLimit::PerConnection` arm had no production caller
@@ -6640,6 +6644,50 @@ operator's `--query-rate` means something different over DoH than over DoT.
 which keeps the two differences visible where they are decided". There are eight
 or more sites now. Whether that argues for deciding once inside the shared loop
 is the design question, and it is not costed.
+
+**Closed 2026-09-21.** The defect is what the row said; the design question it
+left open has an answer that does not touch #30e.
+
+**Reproduced first.** A DoH listener on `PerConnection` with a burst of one:
+the very first request of the very first connection came back
+`HTTP/1.1 429 Too Many Requests`. The connection's token was taken at accept
+and taken again in `answer`, so the operator's `--query-rate` bought a DoH
+client half of what it bought a DoT client — and on `rdnsr`, which passes
+`PerConnection` to all four of its listeners, that is every DoH client it has.
+
+**#30e's reason survives, because it is about the daemons and not the
+adapters.** What it argues is that `rdnsd` charges per message and `rdnsr` per
+accept, both defensibly, so the shared loop is *told* rather than deciding —
+and the parameter keeps each daemon's choice visible at its own call site. It
+says nothing about the four adapters agreeing on what the parameter means, and
+that is what drifted: `tcp`, `quic` and `tls` spelled `rate == PerConnection`
+and `rate == PerMessage` by hand, and `https` was handed `rate` and asked
+`allow_source` outright.
+
+So the parameter and its call sites stay, and what becomes one is the reading
+of it. `RateLimit::admits_connection` and `admits_message` are the two halves,
+and they are a **pair** on purpose: a caller that asks both charges once
+whatever the policy is, where two spellings of one `if` let an adapter ask
+neither question or the wrong one. Seven places in `rdns-transport` spelled
+the predicate — four accept blocks, two per-message `if`s and one call that
+consulted nothing — and now two do. The two remaining `allow_source` callers
+outside it are the daemons' UDP loops, which have no `RateLimit` because a
+datagram is not a connection.
+
+**Where a refusal lands is now stated rather than discovered.** Under
+`PerConnection` it happens before the TLS handshake, so a DoH client sees a
+dropped connection and there is no HTTP to carry a 429; under `PerMessage` it
+is the 429 `answer` already sent, which is right for a peer that completed two
+handshakes. The test asserts both, and the second assertion is what says the
+first connection was *charged* rather than never admitted — a refusal no
+refill undoes would pass the first on its own.
+
+Verified: one new test,
+`a_doh_connection_is_charged_once_and_not_once_per_request`, on the test's own
+clock for #52's reason. Watched failing with only `answer`'s line reverted:
+`429` for the first request. 1 300 tests on Windows (1 299 before) and
+1 321 on Linux, clippy clean on both, `cargo doc` and `cargo fmt --check`
+clean.
 
 ---
 
@@ -6843,6 +6891,7 @@ the week; the record is under "How the queue kept going stale" in
 | **100** | a dynamic UPDATE's own signatures were the only ones no run verified | **filed and closed 2026-09-21**, and the row undercounted itself. `verify_zones` had two production callers, load and reload, and an UPDATE is the third way a zone reaches the map — but the wider hole is that `ProvenSigning` skips a zone already proved for its key roles, so the *incremental* signer's output had never been checked on any path: startup proves a full sign and every incremental run after it is skipped. Fixed as the row proposed, in the type: `sign_zone_incrementally` returns `Resigned { zone, fresh }`, `sign_one_incrementally` a `FreshlySigned` whose only exit is `verify`, so a zone cannot reach the map unchecked (§17). **The set the row did not name is the one that earns the pass**: checking only what the signer says it signed agrees with a carry-forward that wrongly kept a signature over data that moved, so `verify` also takes every signed RRset at a name the update named (§19). Both sets are O(the change). `SigningRun` carries the same list for the reload path, and `Checked::resigned` counts it, so #53's saving is measurably untouched. Four tests, each watched failing; the first non-`#[ignore]`d test of the signed UPDATE path came with it |
 | **103** | `server_table!` shared the field declarations and not the projection onto `Cli` | **filed and closed 2026-09-21**. The macro removed the copy that is cheap to keep right — the declarations and the defaults, where a missing default is a struct literal missing a field — and left the one where a mistake is silent: 36 hand-written assignments in `rdnsd` and 23 in `rdnsr`, where a declared key with none parsed, passed `deny_unknown_fields` and did nothing. **Probed both ways, and the row was too broad**: `dead_code` warns about a field nothing reads, so the quiet case needs a second reader — and `check` is one for 10 of `rdnsd`'s keys and 9 of `rdnsr`'s, so "validate the new key, forget to project it" built with no warning at all. Fixed by structuring the macro's own-field capture and generating `apply_to` from it, `https-path`'s keep-the-default exception included; 59 statements became none, and a key with no `Cli` field is now `error[E0609]` pointing at the declaration. `every_server_key_reaches_its_flag` is the full-fixture test the row said was missing, one per daemon, asserting the value so a cross-wired key fails too — green against the old projection, and naming `max-tcp-request` with one line deleted from it while the old tripwire stayed green |
 | **104** | four digest caches over one `FileDigest`, with the reasoning built on it copied | **filed and closed 2026-09-21**, and asking the question found two defects rather than a duplication. `rdnsd`'s UPDATE path parsed with `parse_zone_file`, which has no base directory and resolves `$INCLUDE` against the *process's* working directory where the loader resolves it against the zone file's — a SERVFAIL for a file the loader reads. Under it, and reachable only once that was fixed: the digest was `FileDigest::of` over bytes read off disk, so a no-op UPDATE remembered the digest of an `$INCLUDE`-bearing parent and the next UPDATE matched it while the *included* file had moved. Reproduced: `www` served `192.0.2.9` after the include had been rewritten to `198.51.100.77`, and the file was written back flattened with neither the directive nor the new address in it (`CLAUDE.md` §4). **Both are one check at the boundary**: `of_self_contained`, with `None` a REFUSED — a file built out of includes is not a writable source, because it cannot be written back as one. **The count is declined on a measurement**: `LoadedFiles` and `Keepable` are one cache and a policy layer, `UpdateHandling::applying` lives under the §3.7 mutex on purpose, and `PolicyStore.offered` is a `Vec` of zones rather than a digest map — two maps and a list, two crates, three lock kinds. What they share is `FileDigest`, which was already shared, and the `stat` argument, which is now on it once instead of written out at two call sites. `PolicyStore::offer`'s "the caller writes `text` to `path` first" became `zone_writer::Written`, which only the write makes (§17) |
+| **105** | `https::answer` charged the rate limiter whatever the caller asked for | **filed and closed 2026-09-21**, and the row's own framing was the first correction: the review said `RateLimit::PerConnection` had no production caller, and `rdnsr` passes it to all four of its listeners. What survived is worse — `https::serve` charged `allow_source` at accept and `answer` charged again for every request, so the first request of every DoH connection paid twice and `--query-rate` meant one thing over DoT and another over DoH. Reproduced: a burst of one, and the first request of the first connection came back `429`. **The open design question has an answer that leaves #30e alone**: #30e is about the two *daemons* disagreeing, so the parameter and its call sites stay; what became one is the four *adapters*' reading of it. `RateLimit::admits_connection` and `admits_message` are a pair, so a caller that asks both charges once whatever the policy is — seven places in `rdns-transport` spelled the predicate, four accept blocks and two per-message `if`s and one call that consulted nothing, and two do now. Where a refusal lands is now stated: before the TLS handshake under `PerConnection`, so a dropped connection rather than a 429 |
 | **101** | the TSIG-rejection branch returned past the dnstap tail | **filed and closed 2026-09-21**, out of the same review as #99 and the same shape: a rule stated in a comment and held by nothing. #75 gave `Server::answer` one tail so nothing could `return` past `record_dnstap`, and the comment at `dispatch.rs:311` said "three ways to answer and one tail". There were four — the `TsigCheck::Rejected` arm sends a NOTAUTH at `:289` and returns at `:292`, sixty lines above the tail — so a capture under a key-guessing probe, which is the one time an operator wants it, held nothing. The test that locked #75 in asserted 3, so the fourth door was invisible from the comment and from the suite at once. Fixed by making the check an expression: both arms produce `Option<Cow<[u8]>>`, the refusal returns what it sent, and the rest moves to `answer_admitted` behind an `Admitted` struct — six values that travel together, because the method wants nine parameters and clippy stops at seven (§14). **The cheapest of the three shapes was the one declined**: a `Drop` guard on the tail is a few lines and makes the record impossible to skip while leaving it easy to hand nothing, which reports "no reply" for a request that got one — the same symptom, quieter. The `let ... else { return; }` in the refusal became a `match` as a consequence, since "no reply fits" is now a value rather than a divergence. Test count 3 → 4, run against the unfixed tree first (`left: 3, right: 4`) |
 | **102** | `Answered::refresh` survived thirteen exits by inspection | **filed and closed 2026-09-21**. `refresh` was a `mut` local declared 226 lines above the cache hit that set it and 200 below the tail that read it, with thirteen `.into()` exits in between and a `From<Option<Vec<u8>>>` that fills `refresh: None` for free — #78a is the time one of those exits silently turned prefetching off for any name an `rpz-ip` rule matched. Fixed by deriving it from the lookup: `hit.as_ref().filter(|hit| hit.refresh).map(|_| query.clone())`, immutable, one line below the `lookup` it comes from. The invariant stops being "read all thirteen exits" and becomes one implication — `refresh` is `Some` only when `hit` is, and both exits that could drop it are in the arm that runs when the cache *missed*. **Both halves of the row's own guess were wrong**: the `From` impl was not the defect and stays, because once the local is gone `.into()` is correct by construction at every one of the thirteen sites, and deleting it would have made them noisier and fixed nothing. No behaviour changed, so there is no new test — a test here would agree with the code (§1); #78a's *A rewritten answer still asks for its prefetch* is still the guard. The old comment's argument is struck in place rather than rewritten, because it is the lesson: "falling through leaves one exit, so there is nothing to remember" held for the exit that had just been removed and said nothing about the next one |
 | **81** | what #63h's macro did not reach, and one more copy | **filed 2026-09-19, closed 2026-09-20**, two rows. **81a** measured and mostly declined: of the 27 commits touching `rdnsd/src/config.rs`, 8 touch its TSIG lines and 1 of those also touches `rdnsr`'s — and that one *created* the copy — so the two tables do not co-move and the shared struct is declined; three fields of five are shared, not five, because a resolver authorizes nothing. What was taken is the list and the default under it: `TsigAlgorithm::ALL`, `::ACCEPTED_NAMES`, `::DEFAULT`, with `TsigKey::parse` coming out better than it went in. **81b** merged the two FNV-1a loops into `rdns_core::folded_hash`, and the check was the row's own instruction taken through the observable rather than by comparing the copies: six `expiry_for` offsets measured before the merge, unchanged after it, so no signature's expiry moved |

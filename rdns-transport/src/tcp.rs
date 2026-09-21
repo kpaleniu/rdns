@@ -14,7 +14,7 @@
 //! because a recursion is seconds long and almost all of it waiting. Unifying
 //! that loop loses both reasons at once.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use rdns::shutdown::{Busy, Stop};
@@ -123,6 +123,35 @@ pub enum RateLimit {
     PerMessage,
 }
 
+impl RateLimit {
+    /// Whether a connection just accepted may be served.
+    ///
+    /// Asked by all four accept loops, which had the same six lines each
+    /// (`CLAUDE.md` §7). `PerMessage` admits every connection, because the
+    /// token is spent on the message instead.
+    ///
+    /// The clock is read here rather than taken, because at accept there is no
+    /// message whose instant to reuse — which is the distinction
+    /// [`RateLimit::admits_message`] keeps (`TODO.md` #28a).
+    pub fn admits_connection(self, ctx: &ServeContext, peer: IpAddr) -> bool {
+        self != RateLimit::PerConnection || ctx.allow_source(peer, ctx.clock.now())
+    }
+
+    /// Whether a message on an already admitted connection may be answered.
+    ///
+    /// The other half, and a pair rather than two spellings of one `if`: a
+    /// caller that asks both questions charges once however the policy is set,
+    /// where an adapter that asked `allow_source` outright charged a
+    /// `PerConnection` client twice for its first message. That was `https`,
+    /// the one of the four that was handed `rate` and did not consult it
+    /// (`TODO.md` #105).
+    ///
+    /// `now` is the caller's, for [`ServeContext::allow_source`]'s reason.
+    pub fn admits_message(self, ctx: &ServeContext, peer: IpAddr, now: u64) -> bool {
+        self != RateLimit::PerMessage || ctx.allow_source(peer, now)
+    }
+}
+
 /// Accept connections and serve each in its own task, until told to stop.
 ///
 /// Bounded by [`TransportLimits::max_connections`]: without a ceiling, an accept
@@ -152,11 +181,7 @@ pub async fn serve<H: Handler>(
             },
             _ = stop.wait() => return Ok(()),
         };
-        if rate == RateLimit::PerConnection
-            && !handler
-                .context()
-                .allow_source(peer.ip(), handler.context().clock.now())
-        {
+        if !rate.admits_connection(handler.context(), peer.ip()) {
             continue;
         }
         // Back-pressure on accept rather than unbounded spawning. The semaphore
@@ -265,7 +290,7 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
         // backwards. One clock read for the message, handed to the handler so
         // the limiter, the log and a TSIG check all name the same instant.
         let now = handler.context().clock.now();
-        if rate == RateLimit::PerMessage && !handler.context().allow_source(peer.ip(), now) {
+        if !rate.admits_message(handler.context(), peer.ip(), now) {
             continue;
         }
         // The message is skipped, not the connection: a peer that framed it

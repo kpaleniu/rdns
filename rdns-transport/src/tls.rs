@@ -260,11 +260,7 @@ pub async fn serve<H: Handler>(
             },
             _ = stop.wait() => return Ok(()),
         };
-        if rate == RateLimit::PerConnection
-            && !handler
-                .context()
-                .allow_source(peer.ip(), handler.context().clock.now())
-        {
+        if !rate.admits_connection(handler.context(), peer.ip()) {
             continue;
         }
         let Ok(permit) = permits.clone().acquire_owned().await else {

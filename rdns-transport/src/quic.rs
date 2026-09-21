@@ -113,11 +113,7 @@ pub async fn serve<H: Handler>(
             }
         };
         let peer = incoming.remote_address();
-        if rate == RateLimit::PerConnection
-            && !handler
-                .context()
-                .allow_source(peer.ip(), handler.context().clock.now())
-        {
+        if !rate.admits_connection(handler.context(), peer.ip()) {
             // Refuse before the handshake: a retry-able refusal costs the
             // source a round trip and costs us no crypto at all.
             incoming.refuse();
@@ -198,7 +194,7 @@ async fn serve_connection<H: Handler>(
         };
 
         let now = handler.context().clock.now();
-        if rate == RateLimit::PerMessage && !handler.context().allow_source(peer.ip(), now) {
+        if !rate.admits_message(handler.context(), peer.ip(), now) {
             continue;
         }
         let handler = handler.clone();
