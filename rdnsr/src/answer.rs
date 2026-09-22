@@ -80,7 +80,9 @@ impl Caches {
     /// RFC 8198 §5 rests on the validity period the signer chose, which
     /// RFC 8767 has no standing to extend.
     /// `clock` is the daemon's, the one `ServeContext` reads: one process, one
-    /// idea of the time, and a test that can move it (`TODO.md` #52).
+    /// idea of the time, and a test that can move it (`TODO.md` #52). All
+    /// three, since #107a — it reached two of them for a year, three lines
+    /// above the one it did not.
     pub(crate) fn new(
         capacity: usize,
         denial_zones: usize,
@@ -90,8 +92,8 @@ impl Caches {
         Caches {
             answers: DnsCache::with_stale(capacity, stale, clock.clone()),
             // Negative answers are answers: `--no-cache` means no cache.
-            negatives: NegativeCache::with_stale(capacity, stale, clock),
-            denials: NsecCache::new(denial_zones),
+            negatives: NegativeCache::with_stale(capacity, stale, clock.clone()),
+            denials: NsecCache::with_clock(denial_zones, clock),
         }
     }
 

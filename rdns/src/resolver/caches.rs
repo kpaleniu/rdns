@@ -23,6 +23,10 @@ use super::*;
 pub(super) struct DelegationCache {
     entries: Mutex<HashMap<Box<[u8]>, CachedDelegation>>,
     capacity: usize,
+    /// The resolver's, not the system's (`TODO.md` #107b). Required rather than
+    /// defaulted: an expiry a test cannot move is an expiry tested by forging
+    /// an entry through the mutex, which is what this one's was.
+    clock: Clock,
 }
 
 #[derive(Debug, Clone)]
@@ -47,10 +51,11 @@ pub(super) struct Start {
 const MAX_DELEGATION_TTL: u64 = 86_400;
 
 impl DelegationCache {
-    pub(super) fn new(capacity: usize) -> Self {
+    pub(super) fn new(capacity: usize, clock: Clock) -> Self {
         DelegationCache {
             entries: Mutex::new(HashMap::new()),
             capacity,
+            clock,
         }
     }
 
@@ -68,7 +73,7 @@ impl DelegationCache {
         qname: NameRef<'_>,
         accept: impl Fn(NameRef<'_>) -> bool,
     ) -> Option<Start> {
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
         let mut entries = self.entries.lock().ok()?;
 
         // Keys are folded, so the *walk* is over the folded name; folding once
@@ -114,7 +119,7 @@ impl DelegationCache {
         };
 
         if entries.len() >= self.capacity {
-            let now = current_unix_timestamp();
+            let now = self.clock.now();
             entries.retain(|_, e| e.expires_at > now);
             // Still full of live entries: drop whichever expires soonest, since
             // it is the one we lose the least by re-learning.
@@ -134,7 +139,7 @@ impl DelegationCache {
             CachedDelegation {
                 servers,
                 ns_names,
-                expires_at: current_unix_timestamp() + ttl.min(MAX_DELEGATION_TTL),
+                expires_at: self.clock.now() + ttl.min(MAX_DELEGATION_TTL),
             },
         );
     }
@@ -227,6 +232,10 @@ impl RttStore {
 pub(super) struct KeyCache {
     entries: Mutex<HashMap<Box<[u8]>, CachedKeys>>,
     capacity: usize,
+    /// The resolver's, not the system's (`TODO.md` #107b). Required rather than
+    /// defaulted: an expiry a test cannot move is an expiry tested by forging
+    /// an entry through the mutex, which is what this one's was.
+    clock: Clock,
 }
 
 #[derive(Debug, Clone)]
@@ -240,15 +249,16 @@ struct CachedKeys {
 const MAX_KEY_TTL: u64 = 86_400;
 
 impl KeyCache {
-    pub(super) fn new(capacity: usize) -> Self {
+    pub(super) fn new(capacity: usize, clock: Clock) -> Self {
         KeyCache {
             entries: Mutex::new(HashMap::new()),
             capacity,
+            clock,
         }
     }
 
     pub(super) fn get(&self, zone: NameRef<'_>) -> Option<Vec<Dnskey>> {
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
         let mut entries = self.entries.lock().ok()?;
         // Folded, because `insert` folds: RFC 4343 names differing only in case
         // are one entry, and looking one up unfolded would miss its own write.
@@ -271,7 +281,7 @@ impl KeyCache {
             return;
         };
         if entries.len() >= self.capacity {
-            let now = current_unix_timestamp();
+            let now = self.clock.now();
             entries.retain(|_, e| e.expires_at > now);
             if entries.len() >= self.capacity {
                 if let Some(soonest) = entries
@@ -287,7 +297,7 @@ impl KeyCache {
             zone.folded().into_owned().into_boxed_slice(),
             CachedKeys {
                 keys,
-                expires_at: current_unix_timestamp() + ttl.min(MAX_KEY_TTL),
+                expires_at: self.clock.now() + ttl.min(MAX_KEY_TTL),
             },
         );
     }
@@ -370,7 +380,8 @@ mod tests {
     /// The deepest cached zone wins, because it skips the most round trips.
     #[test]
     fn test_delegation_cache_prefers_the_deepest_match() {
-        let cache = DelegationCache::new(16);
+        let clock = Clock::fixed(1_000_000_000);
+        let cache = DelegationCache::new(16, clock.clone());
         let com: SocketAddr = "192.0.2.1:53".parse().unwrap();
         let example: SocketAddr = "192.0.2.2:53".parse().unwrap();
 
@@ -391,25 +402,26 @@ mod tests {
 
     #[test]
     fn test_delegation_cache_expiry_and_limits() {
-        let cache = DelegationCache::new(16);
+        let clock = Clock::fixed(1_000_000_000);
+        let cache = DelegationCache::new(16, clock.clone());
         let server: SocketAddr = "192.0.2.1:53".parse().unwrap();
 
         // A zero TTL means "don't cache".
         cache.insert(nm("zero.test.").as_ref(), vec![server], Vec::new(), 0);
         assert!(cache.best_match(nm("zero.test.").as_ref()).is_none());
 
-        // An entry already expired is not returned.
-        {
-            let mut entries = cache.entries.lock().unwrap();
-            entries.insert(
-                key_of("stale.test."),
-                CachedDelegation {
-                    servers: vec![server],
-                    ns_names: Vec::new(),
-                    expires_at: current_unix_timestamp().saturating_sub(1),
-                },
-            );
-        }
+        // An entry is returned inside its TTL and not after it. This used to
+        // forge a `CachedDelegation` through the mutex, because `insert` clamps
+        // `expires_at` to `now + ttl` and there was no clock to move
+        // (`TODO.md` #107b) — which tested the comparison and never the insert.
+        cache.insert(nm("stale.test.").as_ref(), vec![server], Vec::new(), 3600);
+        assert!(cache.best_match(nm("stale.test.").as_ref()).is_some());
+        clock.advance(3_599);
+        assert!(
+            cache.best_match(nm("stale.test.").as_ref()).is_some(),
+            "live at the last second of its TTL"
+        );
+        clock.advance(2);
         assert!(cache.best_match(nm("stale.test.").as_ref()).is_none());
 
         // forget() drops a live entry.
@@ -419,14 +431,14 @@ mod tests {
         assert!(cache.best_match(nm("live.test.").as_ref()).is_none());
 
         // A zero-capacity cache stores nothing.
-        let off = DelegationCache::new(0);
+        let off = DelegationCache::new(0, clock.clone());
         off.insert(nm("any.test.").as_ref(), vec![server], Vec::new(), 3600);
         assert!(off.best_match(nm("any.test.").as_ref()).is_none());
     }
 
     #[test]
     fn test_delegation_cache_evicts_at_capacity() {
-        let cache = DelegationCache::new(2);
+        let cache = DelegationCache::new(2, Clock::fixed(1_000_000_000));
         let server: SocketAddr = "192.0.2.1:53".parse().unwrap();
 
         cache.insert(nm("a.test.").as_ref(), vec![server], Vec::new(), 3600);

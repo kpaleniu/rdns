@@ -2,7 +2,7 @@
 //! delegation chain from the root ourselves or by forwarding to a configured
 //! upstream. See [`ResolverMode`].
 
-use crate::clock::current_unix_timestamp;
+use crate::clock::Clock;
 use crate::dnssec::{Dnskey, Rrsig};
 use crate::dnssec_chain::{
     cname_chain_shape, ChainShape, ChainValidator, DelegationEvidence, DelegationVerdict, KeyStore,
@@ -503,18 +503,32 @@ pub struct Resolver {
     rtt: RttStore,
     /// Zones whose DNSKEY set we have already validated.
     keys: KeyCache,
+    /// The one every read on this resolver's request path goes through
+    /// (`TODO.md` #107b). `validate` reads it directly; the two caches hold
+    /// their own clone.
+    clock: Clock,
 }
 
 impl Resolver {
     pub fn new(config: ResolverConfig) -> Self {
-        let delegations = DelegationCache::new(config.delegation_cache_size);
+        Resolver::with_clock(config, Clock::system())
+    }
+
+    /// As [`Resolver::new`], reading `clock` instead of the system's.
+    ///
+    /// The delegation cache, the key cache and `validate` read it: seven reads
+    /// on the request path that were the system's until #107b, so a test could
+    /// only reach an expiry by forging an entry through the cache's own mutex.
+    pub fn with_clock(config: ResolverConfig, clock: Clock) -> Self {
+        let delegations = DelegationCache::new(config.delegation_cache_size, clock.clone());
         let rtt = RttStore::new(config.delegation_cache_size);
-        let keys = KeyCache::new(config.delegation_cache_size);
+        let keys = KeyCache::new(config.delegation_cache_size, clock.clone());
         Resolver {
             config,
             delegations,
             rtt,
             keys,
+            clock,
         }
     }
 

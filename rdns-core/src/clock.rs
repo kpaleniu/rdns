@@ -39,14 +39,32 @@ pub fn current_unix_timestamp() -> u64 {
 /// a branch and a direct call, and `Fixed` names what a test wants — an instant
 /// it can move — rather than leaving each test to assemble one.
 ///
-/// **The seam stops at the request path, and that is a decision rather than a
-/// place nobody got to** (`TODO.md` #92). Twelve wall-clock reads in `rdnsd`
-/// are outside one — the load path's `signed_at`, the NOTIFY client's TSIG
-/// timestamps, the REFRESH/RETRY/EXPIRE timers, the re-signing policy and
-/// `status`'s ages — and the question that was asked of each is whether it
-/// decides a test's outcome. None does, because every one of them already takes
-/// its instant as a parameter one level down: `resign_interval_at`,
-/// `policy_for`, `apply_keeping`, `has_expired`, `expire_if_out_of_contact`.
+/// ~~**The seam stops at the request path, and that is a decision rather than a
+/// place nobody got to**~~ — **true of `rdnsd` and written as if it were true
+/// of the tree** (`TODO.md` #92, corrected by #107). #92 counted one crate.
+/// `rdns` held fifteen production reads, eleven of them on a request path:
+/// `NsecCache`'s four, the delegation and key caches' six and `validate`'s one,
+/// all of which take a `Clock` since #107a and #107b — and `Caches::new` had
+/// been handing two of those three a clock for a year, under a doc comment
+/// saying "one process, one idea of the time".
+///
+/// **One request-reachable read declines, and for #92's own reason.**
+/// `DnssecValidator::validate_rrset` reads the wall clock, and the UPDATE path
+/// reaches it: `dispatch`'s pre-install check calls `FreshlySigned::verify`
+/// (`TODO.md` #100), which validates every touched RRset. It stays, because the
+/// instant it wants can be chosen another way — a test picks the signature's
+/// inception and expiration through `SigningPolicy`, which is the parameter one
+/// level down that #92 declined its twelve for. A `Clock` there would be a seam
+/// nothing passes anything but `Clock::system()` to (`CLAUDE.md` §14).
+///
+/// The rest of #92's reasoning stands, and is about `rdnsd`. Twelve wall-clock
+/// reads there are outside a request path — the load path's `signed_at`, the
+/// NOTIFY client's TSIG timestamps, the REFRESH/RETRY/EXPIRE timers, the
+/// re-signing policy and `status`'s ages — and the question asked of each is
+/// whether it decides a test's outcome. None does, because every one of them
+/// already takes its instant as a parameter one level down:
+/// `resign_interval_at`, `policy_for`, `apply_keeping`, `has_expired`,
+/// `expire_if_out_of_contact`.
 /// Threading a `Clock` through `Reloading`, the NOTIFY task, the replication
 /// timer and `Control` would add four constructor parameters to duplicate a
 /// seam that is already there and already used.

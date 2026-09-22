@@ -9203,3 +9203,300 @@ broken-reference warning `cargo doc` exists here to catch (§4). Clippy and
 `cargo test --workspace` clean on both sides, **1 302 passed on Windows and
 1 323 on Linux**, 0 failed; `cargo doc --workspace --no-deps` and
 `cargo fmt --all --check` clean on Windows.
+
+---
+
+### 107. Eleven wall-clock reads inside the request path, in the crate #92 did not count — **filed 2026-09-21, closed 2026-09-22**, **bug**
+
+`rdns-core/src/clock.rs:42` says "**The seam stops at the request path, and that
+is a decision rather than a place nobody got to**", citing #92. #92's twelve
+reads are all in `rdnsd` and all *outside* a request path. It never counted
+`rdns/`.
+
+Production reads of `current_unix_timestamp()` in `rdns/`, test modules
+excluded:
+
+| file | reads | reached from |
+|---|---|---|
+| `resolver/caches.rs` | 6 — :71, :117, :137, :251, :274, :290 | every `Resolver::resolve` |
+| `nsec_cache.rs` | 4 — :199, :291, :423, :473 | `handle_query`, before the answer cache |
+| `resolver/validate.rs` | 1 — :32 | `resolve_validated` |
+
+The sharp one is `rdnsr/src/answer.rs:82`. `Caches::new` takes a `Clock` under a
+comment saying why — "one process, one idea of the time, and a test that can
+move it (`TODO.md` #52)" — hands it to `DnsCache::with_stale` and
+`NegativeCache::with_stale`, and then builds the third as
+`NsecCache::new(denial_zones)`. Two of three.
+
+**The measurement that could refute this is #92's own**: does the read decide a
+test's outcome? For two of the three it does.
+
+- `NsecCache` has no expiry test but the degenerate one.
+  `test_expired_proofs_are_not_used` (nsec_cache.rs:1320) signs with
+  `Ttl::from_secs(0)` — "a zero TTL means do not reuse this". Nothing asserts
+  that a 3 600-second proof is live at +1 800 and gone at +3 601, because
+  nothing can.
+- `DelegationCache`'s expiry test reaches through the mutex and forges an entry
+  (caches.rs:402-412), because `insert` clamps `expires_at` to `now + ttl` and
+  there is no clock to move.
+
+**Cost, counted before filing, and the two halves are not the same size.**
+`NsecCache::new` has one production caller — `rdnsr/src/answer.rs:94` — and it
+already holds the `Clock`; the other 26 sites are tests and one example.
+`DelegationCache::new` and `KeyCache::new` have one production caller each, both
+in `Resolver::new` (resolver.rs:510, :512), which holds no clock today, so that
+half is a new field on `Resolver` or `ResolverConfig`. Not costed further: the
+row files what was seen (§18).
+
+`RttStore` is not in this. It reads `Instant::now()`, which is an interval and is
+what §6 asks for.
+
+**Closed 2026-09-22 in three parts, and the sweep the row rests on was four
+reads short.** Production reads of `current_unix_timestamp()` in `rdns/`, with
+`#[cfg(test)]` regions excluded, were **15, not 11** — the eleven named are
+exact, line for line. The other four: `RateLimiter::new` and `QueryLogger::new`
+(constructors), `logging`'s anomaly timer (a background loop), all three #92's
+own category — and `DnssecValidator::validate_rrset`, which is not.
+
+- **107a. `NsecCache` takes the clock.** `with_clock` beside `new`, the shape
+  `DnsCache::with_stale` and `NegativeCache::with_stale` already had, and
+  `Caches::new` hands it to all three instead of two. Its four reads are
+  `self.clock.now()`. The test the row said could not be written is
+  `a_proof_is_live_until_its_ttl_runs_out`: live at +0, +1 800 and +3 599, gone
+  at +3 601. **Watched failing against the old shape** — swap `with_clock` back
+  for `new` and the last assertion goes (§1), which is also the proof that the
+  seam is what the test was missing.
+- **107b. The resolver's two caches, and `validate`.** `DelegationCache::new`
+  and `KeyCache::new` **require** a `Clock` rather than defaulting to one: both
+  are `pub(super)` with one production caller, so the argument costs nothing and
+  a cache built without a clock stops compiling (§17). `Resolver` holds one,
+  `Resolver::with_clock` sits beside `new`, and `validate` reads it — seven
+  reads. The forged entry is gone:
+  `test_delegation_cache_expiry_and_limits` now inserts through the public path
+  and moves the clock, so it tests the *insert* as well as the comparison. It
+  had reached through the mutex to build a `CachedDelegation` precisely because
+  `insert` clamps `expires_at` to `now + ttl`.
+- **107c. `validate_rrset` — measured, and declined.** It *is* request-reachable,
+  and **not by the route triage first named**: `dispatch.rs:2433` is inside
+  `#[cfg(test)]`. The production route is `dispatch.rs:1498`, the UPDATE path's
+  pre-install check, through `FreshlySigned::verify` (#100) and `verify_rrsets`.
+  It keeps the wall clock for **#92's own reason**: the instant it wants is
+  choosable another way, because a test picks a signature's inception and
+  expiration through `SigningPolicy`. A `Clock` there would be a seam nothing
+  passes anything but `Clock::system()` to (§14), and the daemon's clock lives
+  on `ServeContext`, built in a different function from the validator.
+
+  **The sentence in `clock.rs` is struck and corrected**, which is what this row
+  was filed for. It now names the crate #92 counted, what `rdns` held, and why
+  the one remaining request-reachable read stays.
+
+After it, 5 production reads are left in `rdns/`: one in a `#[cfg(test)]`
+module, three outside any request, one declined in writing.
+
+---
+
+### 111. The signing cost harness is a copy of `sign_zone_inner`, and it has drifted — **filed 2026-09-21, closed 2026-09-22**, **bug**
+
+`split_passes` (zone_signer.rs:3380) is a hand copy of `sign_zone_inner`'s body,
+written because the production function returns `(Zone, FreshRrsets)` and offers
+no per-phase observation. Its own doc names the hazard: "a second copy of this is
+a second thing that can stop being what `sign_zone_inner` runs (`CLAUDE.md` §7),
+and neither caller would notice." It has, twice:
+
+- **:3415** calls `build_nsec_chain(&layout, Ttl::from_secs(minimum), …)`.
+  Production is `Ttl::from_secs(minimum).min(soa_ttl)` (:412) with RFC 9077 §3
+  written on the three lines above it — #73's fix, which the copy never got. It
+  is #108's arithmetic again, in a sixth place.
+- **:3428** passes `&sep, &rest` to `signatures_for`. Production (:1391-1404)
+  computes `dnskey_signers` and `data_signers` with an empty-set fallback and
+  fails the run outright when every key is inactive.
+
+**The guard cannot see either.** `check_split` (:3453) asserts that
+`zone.records().len()` matches and that the wall-clock ratio is within 0.8-1.25×.
+Both drifts preserve the record count.
+
+**And the guard does not run.** All three cost tests are `#[ignore]` (:3549,
+:3675, :3801), so `cargo test` never executes the assertion that was supposed to
+catch this.
+
+No remedy costed. The shape that removes the copy is the production body handing
+its phase timings back, which changes a return type on the signing path and was
+not built (§18).
+
+**Triaged 2026-09-22. Both drifts confirmed, and both are latent** — which is
+the measurement the row did not take (§19), and it sharpens the row rather than
+refuting it:
+
+- The denial TTL is not merely the same record *count* as production's. The
+  fixture is `$TTL 3600` over a SOA MINIMUM of 3600, so `Ttl::from_secs(minimum)`
+  and `.min(soa_ttl)` are the same number and the two zones are identical. #73
+  hid behind `$TTL 3600` with `minimum 300`; this hides behind 3600 over 3600,
+  which is the same masking one step further along.
+- The signer fallback cannot fire: `signing_keys` is one SEP and one ZSK, so
+  neither half is ever empty. Under a single-key fixture the copy would have
+  signed no data at all — a difference `check_split`'s record count *would*
+  have caught, had it run.
+
+**A third divergence, larger than either, and the row does not name it.** The
+copy calls `build_nsec_chain` unconditionally. Production branches on
+`policy.chain` and builds NSEC3 when asked, having added NSEC3PARAM *before*
+`Layout::of` for RFC 5155 §7.1. It also omits `policy.chain.check()`,
+`check_keys`, the inception-before-expiration check and the imported-DNSKEY
+RRSIG check (RFC 8901 §2.1.1). All three cost tests pass `DenialChain::Nsec`,
+so none of it fires — and the harness cannot measure an NSEC3 zone, which is the
+more expensive chain and the more common deployment.
+
+**And the stronger false claim is in the test, not in `split_passes`.** The row
+quotes the helper's own doc. `incremental_sign_cost_by_pass` said "the parts run
+in `sign_zone_inner`'s order from its own arguments and the sum is asserted
+against the whole, so **the split cannot drift from the function it describes**
+(`CLAUDE.md` §7)" — §4's claim to verify, false three times over. Struck in
+place.
+
+**"The guard does not run" is right and the remedy it implies is not.** The three
+tests are `#[ignore]`d *and* call `refuse_debug`, which panics outright in a debug
+build, and they run to 1 000 000 records. They are benchmarks. Un-ignoring them
+is not available, so the guard cannot be made to run as written — which is the
+fact the shape question below has to answer.
+
+- **111a. The two named drifts and the false claim** — **closed 2026-09-22**.
+  `split_passes` computes `denial_ttl` as production does, derives
+  `dnskey_signers`/`data_signers` with the empty-half fallback, and asserts the
+  all-inactive case production refuses. Provably no change to any published
+  figure: both expressions evaluate identically under the fixtures.
+
+  **The guard was run rather than reasoned about, and this is the first
+  execution it has had.** `incremental_sign_cost_by_pass` in release, Windows:
+  it passes at all three sizes, the 1M row reading the split's sum at 8 503 ms
+  against the whole's 8 205 ms — ratio 1.04, inside `check_split`'s 0.8-1.25x —
+  and the same record count both ways. Which is also the demonstration that the
+  guard cannot see what this row fixed: it was green over both drifts. Green on
+  Windows, that is — on Linux it fails at 10 000 records for a reason that is
+  neither drift and predates the fix, which is 111d.
+- **111b. The chain branch, and the four guards the copy does without** —
+  **closed 2026-09-22**. `split_passes` branches on `policy.chain` as production
+  does, adds NSEC3PARAM before `Layout::of` for RFC 5155 §7.1, and runs the
+  preamble — `policy.chain.check()`, `check_keys`, the inception check and the
+  imported-DNSKEY check, the last three as asserts, since a harness has no
+  caller to return an error to. An NSEC3 zone is measurable now, and measuring
+  one is `policy(DenialChain::Nsec3 { .. })` in a caller rather than a change
+  here, so there is nothing left to file.
+
+  The column named `nsec-chain` is `denial-chain`, because it can be either
+  chain now. `publish` and `key_select` became one `fixed` — every part of
+  `sign_zone_inner` that is not O(zone), the new preamble included — which
+  **still reads 0.0 ms at every size on both platforms** with three more things
+  inside it. Three near-zero columns would have been noise; one that is the
+  answer to "is any of this O(zone)?" is not.
+- **111d. The guard fails on Linux at the smallest size, and it is not this
+  row's drifts.** Filed 2026-09-22 out of running it on both sides, **closed
+  2026-09-22**.
+  `incremental_sign_cost_by_pass` is green on Windows at all three sizes and
+  **fails 2 runs in 3 on Linux at 10 000 records**: "the parts sum to 0.78 of
+  the whole", against `check_split`'s 0.8 floor. Readings 0.77, 0.79, pass.
+
+  **Not a regression, and that is the measurement rather than a presumption**
+  (§19): the same three runs against the pre-111a harness
+  (`git checkout HEAD~1 -- rdns/src/zone_signer.rs`) read 0.78, 0.78, pass. Two
+  in three either side of the change, so the drift fix neither caused nor cured
+  it.
+
+  It is size-dependent, not noise: the 100 000 and 1 000 000 rows are never the
+  ones that fail, and at 1M the parts are *more* expensive than the whole
+  (1.04 on Windows). Something the whole pays at every size is missing from the
+  parts, and at 10 000 records it is a fifth of the run. What is untimed in
+  `split_passes` is `Zone::new`, `publish_dnskeys`, `publish_sync_records` and
+  the key selection — all O(keys) and none of them plausibly 7 ms — so the
+  cause is **not established**, and the first-touch cost of the output zone,
+  which the whole pays first and the parts inherit warm, is a candidate and not
+  a finding.
+
+  **The remedy is not to widen the band** (§10: never lower a floor to make a
+  bench pass without first proving why it moved). Time what is untimed, or
+  assert the ratio only where the fixed cost is noise, and say in the assertion
+  which it is. Neither checked, so neither filed as the fix.
+
+  **Cause established, and it was neither candidate.** The experiment that
+  settled it is one line: time the *same* whole twice. At 10 000 records it read
+  **39.2 ms then 31.1 ms** — 21%, which is the whole of the gap — against
+  519.3/511.5 at 100 000 (1.5%) and 8 593/8 565 at a million (0.3%). Nothing was
+  missing from the parts. The whole's *first* run at a size pays for the
+  allocator reaching that size, and `check_split` was comparing it against parts
+  that inherited the result warm.
+
+  Both candidates the row named were refuted before that, and both are recorded
+  rather than dropped (§10): `publish` and `key_select` are timed now — the
+  untimed `Zone::new`/`publish_dnskeys`/`publish_sync_records` and the key
+  selection — and both read **0.0 ms** at every size, so `Passes::total` is every
+  pass of the function now and the gap was never there. A process-level warm-up
+  at a *different* size moved 0.78 to 0.79-0.80 and no further, which is the
+  measurement that says the one-off scales with the zone rather than being paid
+  once per process.
+
+  ~~**Fixed by discarding a run at the same size in each of the two callers**~~,
+  not by widening the band. **That remedy was half right and 111e is the other
+  half**: warming only the whole fixed the small end and cost the large one.
+  The diagnosis holds; what did not follow from it is that one side's warm-up is
+  enough, because the parts are a second consumer in a state the whole was not
+  in. `incremental_sign_cost_by_pass` is 3 of 3 green on Linux
+  where it was 2 of 3 failing, at ratios around 0.90; `full_sign_cost_by_pass` is
+  3 of 3. Windows stays green, both guards in one run, the 10 000-record
+  incremental row reading 49.9 ms against parts of 51.9 — 1.04, the high side,
+  which is the platform difference the 0.8 floor was quietly carrying. The
+  incremental run costs ~58 s where it cost ~49 s, and the full sign ~92 s. No failure of the full-sign guard was ever observed and the arithmetic
+  says why it had headroom: the same ~8 ms one-off is 3% of its 239 ms whole at
+  10 000 records, not a fifth.
+
+  **And `check_split`'s own doc had the mechanism backwards** — "wide on the
+  high side because the parts pay a cold allocator that the whole, timed first,
+  has already warmed". The whole pays it and the parts inherit it warm, which
+  pushes the ratio *down*. Struck in place; what the 1.25 side is for is
+  unmeasured and now says so.
+
+- **111e. 111d's remedy fixed the small end by breaking the large one** —
+  filed and closed 2026-09-22, **by the guard, on the run meant to confirm
+  111b**. Discarding a run of the *whole* made the timed whole slower at a
+  million records on Windows — **33.2 s against 28.2 with no warm-up at all** —
+  so `check_split` read 0.75 and `full_sign_cost_by_pass` failed where it had
+  passed. Linux never showed it: 1.015 there on the same code.
+
+  Two candidates were checked and dropped before that one. `sign_zone` is
+  `sign_zone_inner` and verifies nothing, so #100's verification is not in the
+  whole. And `Layout`'s teardown — built inside a timer and freed outside every
+  one of them, where production frees it inside `sign_zone_inner` — is **123.6
+  ms of a 26 572 ms run** at a million, 0.5%, so it is real and it is not this.
+
+  **Fixed by discarding one run of *each* side**, so the whole and the parts are
+  both measured in the state the other is in. Windows at a million: 0.999
+  incremental, 0.911 full; at 10 000, 0.94 and 1.01. Linux 3 of 3 on both guards
+  with the 10 000-record incremental row at 0.90-0.94, where 111d's symptom was
+  0.78. The guards cost ~139 s on Windows and ~121 s on Linux, against ~58 s and
+  ~90 s before.
+
+  The lesson is the one 111d half-learned: **a warm-up is a statement about
+  which side you warmed.** The first fix made the two sides *more* different on
+  one platform while making them less different on the other, and no reading
+  taken on one platform could have told the difference.
+
+- **111c. What guards the copy** — **closed 2026-09-22** on the middle shape of
+  the three: `the_split_builds_what_sign_zone_inner_builds`, an ordinary
+  `#[test]` that runs under `cargo test`, over both chains and both key shapes,
+  comparing the two zones **record for record** rather than by length.
+
+  **Ed25519 is what makes it exact.** RFC 8032 signatures are deterministic
+  where ECDSA draws a `k`, so two runs over one RRset are byte-identical and
+  "the same number of records" becomes "the same records" — which is the whole
+  difference between this and `check_split`.
+
+  The fixture is built to make each drift visible rather than trusted to:
+  `$TTL 60` under a SOA MINIMUM of 86400, so the pre-#73 arithmetic is a
+  different number; one case with a SEP key and nothing else, so the signer
+  fallback has to fire; both chains. **All three drifts were watched failing it**
+  (§1), one at a time with the fix reverted and restored: the TTL one puts the
+  NSECs and their RRSIGs at 86400 against 60, the signer one fails at "one SEP
+  key, Nsec", the chain one at "one SEP key, Nsec3".
+
+  The other two shapes stay declined and the reason is now stronger than at
+  triage: production handing its phase timings back changes a return type on the
+  signing path for a benchmark's benefit, and deleting the harness gives up
+  per-phase cost for a copy that a 0.02 s test now holds to the function.

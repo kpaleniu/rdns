@@ -15,7 +15,7 @@
 //! - NXDOMAIN needs the wildcard denied too.
 //! - TTL is bounded by the proof, not by the question.
 
-use crate::clock::current_unix_timestamp;
+use crate::clock::Clock;
 use crate::denial_wire::{canonical_sort_key, CanonicalKey};
 use crate::dnssec::{signed_owner_name, Rrsig};
 use crate::dnssec_denial::{
@@ -154,6 +154,14 @@ pub struct NsecCache {
     /// Zones to remember. With [`MAX_PROOFS_PER_ZONE`] this bounds the whole
     /// structure against a flood of one-off zones or one enormous chain.
     max_zones: usize,
+    /// The one the process reads, as [`crate::cache::DnsCache`] and
+    /// [`crate::negative_cache::NegativeCache`] take (`TODO.md` #107a).
+    ///
+    /// `Caches::new` hands those two a `Clock` under "one process, one idea of
+    /// the time, and a test that can move it" and built this one without: an
+    /// expiry nothing can move is an expiry with no test but the degenerate
+    /// one, which is what `test_expired_proofs_are_not_used` was.
+    clock: Clock,
 }
 
 /// Proof records kept per zone. A chain can be arbitrarily long; the gaps that
@@ -168,9 +176,15 @@ const MAX_WILDCARDS_PER_ZONE: usize = 64;
 
 impl NsecCache {
     pub fn new(max_zones: usize) -> Self {
+        NsecCache::with_clock(max_zones, Clock::system())
+    }
+
+    /// As [`NsecCache::new`], reading `clock` instead of the system's.
+    pub fn with_clock(max_zones: usize, clock: Clock) -> Self {
         NsecCache {
             zones: Mutex::new(HashMap::new()),
             max_zones,
+            clock,
         }
     }
 
@@ -196,7 +210,7 @@ impl NsecCache {
             return;
         };
         let zone = soa_rr.name.as_ref().to_folded();
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
 
         let soa_ttl = soa_rr.ttl.as_secs();
         let negative_ttl = soa_ttl.min(minimum);
@@ -288,7 +302,7 @@ impl NsecCache {
         if self.max_zones == 0 {
             return;
         }
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
 
         // Fewer labels in the RRSIG than in the owner name means the signature
         // was made at a wildcard (RFC 4035 §5.3.4).
@@ -420,7 +434,7 @@ impl NsecCache {
             return None;
         }
         let wildcard = wildcard_for_parent_of(qname)?;
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
         let zones = self.zones.lock().ok()?;
 
         let (_, zone) = zones
@@ -470,7 +484,7 @@ impl NsecCache {
         if !synthesizable_qtype(qtype) {
             return None;
         }
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
 
         // Under the lock: find the zone and take what bears on the question.
         // Whether it proves anything is decided below, with the guard dropped.
@@ -1338,6 +1352,45 @@ mod tests {
                 .is_none(),
             "a zero TTL means do not reuse this"
         );
+    }
+
+    /// A proof is live inside its TTL and gone after it — at 3 600 seconds,
+    /// not at zero.
+    ///
+    /// What `test_expired_proofs_are_not_used` above cannot ask, and the reason
+    /// #107a exists: that one signs with `Ttl::from_secs(0)`, which asserts
+    /// "a zero TTL means do not reuse this" and says nothing about expiry.
+    /// `MAX_PROOF_TTL` is 3 600 too, so this also pins the ceiling and the TTL
+    /// agreeing at the boundary.
+    #[test]
+    fn a_proof_is_live_until_its_ttl_runs_out() {
+        let clock = Clock::fixed(1_000_000_000);
+        let cache = NsecCache::with_clock(16, clock.clone());
+        cache.insert_validated(&negative(
+            "nope.example.com.",
+            ResponseCode::NoSuchDomain,
+            vec![
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
+                nsec_record(
+                    "example.com.",
+                    "www.example.com.",
+                    &[rt::SOA, rt::NS, rt::RRSIG, rt::NSEC],
+                    Ttl::from_secs(3600),
+                ),
+            ],
+        ));
+        let ask = |cache: &NsecCache| {
+            cache
+                .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
+                .is_some()
+        };
+        assert!(ask(&cache), "live at the moment it was cached");
+        clock.advance(1_800);
+        assert!(ask(&cache), "live half way through its TTL");
+        clock.advance(1_799);
+        assert!(ask(&cache), "live at the last second of its TTL");
+        clock.advance(2);
+        assert!(!ask(&cache), "gone once the TTL has run out");
     }
 
     /// The TTL of a synthesized answer is bounded by the proof it rests on and

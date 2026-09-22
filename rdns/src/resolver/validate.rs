@@ -29,7 +29,7 @@ impl Resolver {
         state: &mut Resolution<'_>,
         anchors: &TrustAnchors,
     ) -> ValidationState {
-        let now = current_unix_timestamp();
+        let now = self.clock.now();
 
         // "Negative" is not `answers.is_empty()`: a CNAME chain ending without
         // the queried type is a negative answer with a non-empty answer section.
