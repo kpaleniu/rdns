@@ -7030,12 +7030,41 @@ fact the shape question below has to answer.
   it passes at all three sizes, the 1M row reading the split's sum at 8 503 ms
   against the whole's 8 205 ms — ratio 1.04, inside `check_split`'s 0.8-1.25x —
   and the same record count both ways. Which is also the demonstration that the
-  guard cannot see what this row fixed: it was green over both drifts.
+  guard cannot see what this row fixed: it was green over both drifts. Green on
+  Windows, that is — on Linux it fails at 10 000 records for a reason that is
+  neither drift and predates the fix, which is 111d.
 - **111b. The chain branch, and the four guards the copy does without.** Open.
   Mechanical, but not one line — matching production means the `policy.chain`
   branch *and* the NSEC3PARAM record before `Layout::of`, which changes what the
   harness reports for an NSEC3 policy from "wrong" to "measured". Not folded into
   111a, because 111a was chosen for changing no number and this changes one.
+- **111d. The guard fails on Linux at the smallest size, and it is not this
+  row's drifts.** Filed 2026-09-22 out of running it on both sides.
+  `incremental_sign_cost_by_pass` is green on Windows at all three sizes and
+  **fails 2 runs in 3 on Linux at 10 000 records**: "the parts sum to 0.78 of
+  the whole", against `check_split`'s 0.8 floor. Readings 0.77, 0.79, pass.
+
+  **Not a regression, and that is the measurement rather than a presumption**
+  (§19): the same three runs against the pre-111a harness
+  (`git checkout HEAD~1 -- rdns/src/zone_signer.rs`) read 0.78, 0.78, pass. Two
+  in three either side of the change, so the drift fix neither caused nor cured
+  it.
+
+  It is size-dependent, not noise: the 100 000 and 1 000 000 rows are never the
+  ones that fail, and at 1M the parts are *more* expensive than the whole
+  (1.04 on Windows). Something the whole pays at every size is missing from the
+  parts, and at 10 000 records it is a fifth of the run. What is untimed in
+  `split_passes` is `Zone::new`, `publish_dnskeys`, `publish_sync_records` and
+  the key selection — all O(keys) and none of them plausibly 7 ms — so the
+  cause is **not established**, and the first-touch cost of the output zone,
+  which the whole pays first and the parts inherit warm, is a candidate and not
+  a finding.
+
+  **The remedy is not to widen the band** (§10: never lower a floor to make a
+  bench pass without first proving why it moved). Time what is untimed, or
+  assert the ratio only where the fixed cost is noise, and say in the assertion
+  which it is. Neither checked, so neither filed as the fix.
+
 - **111c. What guards the copy.** Open, and it is the shape question. Three were
   named at triage and none built (§19 says build them, so this row is a
   measurement short): production hands its phase timings back, which the row
