@@ -3350,10 +3350,18 @@ a\.b    IN A   192.0.2.50
     /// timers start and freed after they stop.
     struct Passes {
         carry_over: std::time::Duration,
-        publish: std::time::Duration,
+        /// Everything in `sign_zone_inner` that is not O(zone): the preamble
+        /// checks, `Zone::new`, the DNSKEY and CDS/CDNSKEY publication,
+        /// NSEC3PARAM, and `sign_everything`'s key selection.
+        ///
+        /// One column rather than three because it reads **0.0 ms at every
+        /// size** (`TODO.md` #111d, which timed two of them separately to find
+        /// out). It is here so the split is the whole function rather than most
+        /// of it, and so a zone with many keys has somewhere to show up.
+        fixed: std::time::Duration,
         layout: std::time::Duration,
-        nsec_chain: std::time::Duration,
-        key_select: std::time::Duration,
+        /// NSEC or NSEC3, whichever `policy.chain` asks for (#111b).
+        denial_chain: std::time::Duration,
         build_rrsets: std::time::Duration,
         sign_rrsets: std::time::Duration,
         file_sigs: std::time::Duration,
@@ -3361,11 +3369,11 @@ a\.b    IN A   192.0.2.50
 
     impl Passes {
         fn sign_everything(&self) -> std::time::Duration {
-            self.key_select + self.build_rrsets + self.sign_rrsets + self.file_sigs
+            self.build_rrsets + self.sign_rrsets + self.file_sigs
         }
 
         fn total(&self) -> std::time::Duration {
-            self.carry_over + self.publish + self.layout + self.nsec_chain + self.sign_everything()
+            self.carry_over + self.fixed + self.layout + self.denial_chain + self.sign_everything()
         }
     }
 
@@ -3387,8 +3395,23 @@ a\.b    IN A   192.0.2.50
     ) -> (Passes, Zone) {
         use std::time::Instant;
 
+        // The preamble production runs before anything is built. Not free to
+        // skip even though it is O(keys): `check_keys` is what makes the rest
+        // of this function's `expect`s honest.
+        let start = Instant::now();
+        policy
+            .chain
+            .check()
+            .expect("the chain parameters are in range");
         let origin = zone.origin().to_folded();
+        check_keys(keys, origin.as_ref()).expect("the keys are usable");
+        assert!(
+            policy.expiration > policy.inception,
+            "a signature that expires before it was made"
+        );
         let mut signed = Zone::new(origin.clone());
+        let mut fixed = start.elapsed();
+
         let start = Instant::now();
         let (soa_ttl, minimum) = carry_over_records(zone, origin.as_ref(), policy, &mut signed)
             .expect("the records carry over");
@@ -3409,7 +3432,26 @@ a\.b    IN A   192.0.2.50
             &mut signed,
         )
         .expect("the sync records publish");
-        let publish = start.elapsed();
+        // Before `Layout::of`, as production does it and for RFC 5155 §7.1's
+        // reason: a bitmap taken before NSEC3PARAM is added denies a type that
+        // is there.
+        if let DenialChain::Nsec3 {
+            salt, iterations, ..
+        } = &policy.chain
+        {
+            signed.add_record(ZoneRecord {
+                name: origin.clone(),
+                ttl: dnskey_ttl,
+                class: Class::new(1),
+                rdata: nsec3param_rdata(salt, *iterations),
+            });
+        }
+        assert!(
+            policy.dnskey_signature != DnskeySignature::Imported
+                || has_dnskey_rrsig(&signed, origin.as_ref()),
+            "an imported DNSKEY signature with no RRSIG over the apex DNSKEY"
+        );
+        fixed += start.elapsed();
 
         let start = Instant::now();
         let layout = Layout::of(&signed, origin.as_ref());
@@ -3420,12 +3462,31 @@ a\.b    IN A   192.0.2.50
         // `$TTL 3600` over a SOA MINIMUM of 3600, which is how it survived
         // (`TODO.md` #111).
         let denial_ttl = Ttl::from_secs(minimum).min(soa_ttl);
+        // Production branches here and the copy did not, so an NSEC3 zone was
+        // not measurable at all and the column was named for the only chain it
+        // could build (`TODO.md` #111b).
         let start = Instant::now();
-        build_nsec_chain(&layout, denial_ttl, &mut signed).expect("the chain");
-        let nsec_chain = start.elapsed();
+        match &policy.chain {
+            DenialChain::Nsec => {
+                build_nsec_chain(&layout, denial_ttl, &mut signed).expect("the chain")
+            }
+            DenialChain::Nsec3 {
+                salt,
+                iterations,
+                opt_out,
+            } => build_nsec3_chain(
+                &layout,
+                salt,
+                *iterations,
+                *opt_out,
+                denial_ttl,
+                &mut signed,
+            )
+            .expect("the chain"),
+        }
+        let denial_chain = start.elapsed();
 
-        // `sign_everything`'s own three, and its key selection, which #111d
-        // wanted timed rather than assumed negligible.
+        // `sign_everything`'s own three, and its key selection.
         let start = Instant::now();
         let active = active_signing_keys(keys, policy.signed_at);
         let sep: Vec<&SigningKey> = active.iter().copied().filter(|k| k.is_sep()).collect();
@@ -3441,7 +3502,7 @@ a\.b    IN A   192.0.2.50
             !data_signers.is_empty(),
             "no key is active to sign with; production fails the run here"
         );
-        let key_select = start.elapsed();
+        fixed += start.elapsed();
         let start = Instant::now();
         let rrsets = rrsets_of(&signed);
         let build_rrsets = start.elapsed();
@@ -3465,16 +3526,101 @@ a\.b    IN A   192.0.2.50
         (
             Passes {
                 carry_over,
-                publish,
+                fixed,
                 layout: layout_time,
-                nsec_chain,
-                key_select,
+                denial_chain,
                 build_rrsets,
                 sign_rrsets,
                 file_sigs,
             },
             signed,
         )
+    }
+
+    /// A zone the three drifts of `TODO.md` #111 would each have changed.
+    ///
+    /// The SOA's TTL is under its MINIMUM, so a denial TTL computed the pre-#73
+    /// way (MINIMUM alone) is a different number; `cost_fixture` is 3600 over
+    /// 3600, which is how that drift survived a guard for months.
+    const SPLIT_ZONE: &str = "$ORIGIN example.com.
+$TTL 60
+@   IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 86400
+@   IN NS  ns.example.com.
+ns  IN A   192.0.2.1
+a   IN A   192.0.2.2
+b   IN A   192.0.2.3
+b   IN TXT \"two rrsets at one name\"
+deep.b IN A 192.0.2.4
+";
+
+    /// Every record of `split_passes`'s zone, ordered so two zones compare.
+    fn canonical(zone: &Zone) -> Vec<(String, u16, u32, Vec<u8>)> {
+        let mut records: Vec<_> = zone
+            .records()
+            .iter()
+            .map(|r| {
+                (
+                    r.name.to_string(),
+                    r.rdata.rtype().to_u16(),
+                    r.ttl.as_secs(),
+                    r.rdata.bytes().to_vec(),
+                )
+            })
+            .collect();
+        records.sort();
+        records
+    }
+
+    /// `split_passes` builds the zone `sign_zone_inner` builds — every chain,
+    /// both key shapes, record for record.
+    ///
+    /// This is what #111 needed and did not have. `check_split` compares a
+    /// record count and a wall clock, and all three drifts preserved both: a
+    /// denial TTL computed the pre-#73 way, a signer fallback the cost fixture
+    /// can never need, and a chain branch the copy did not have. It is also the
+    /// guard that *runs* — the three cost tests are `#[ignore]`d benchmarks that
+    /// panic in a debug build, so the assertion that was supposed to catch this
+    /// has never been part of `cargo test` (#111c).
+    ///
+    /// Ed25519 so the comparison can be exact: RFC 8032 signatures are
+    /// deterministic, where ECDSA draws a `k` and two runs over the same RRset
+    /// differ. That turns "the same number of records" into "the same records",
+    /// which is the difference between this and `check_split`.
+    #[test]
+    fn the_split_builds_what_sign_zone_inner_builds() {
+        let zone = parse_zone_file(SPLIT_ZONE, ORIGIN).expect("the fixture parses");
+        let ed = |flags| {
+            SigningKey::generate(SigningAlgorithm::Ed25519, ORIGIN, flags).expect("generate")
+        };
+        // One SEP and nothing else is the shape that makes the signer fallback
+        // fire: `rest` is empty, so production signs the data with `all` and the
+        // copy signed it with nothing.
+        let sep_only = vec![ed(DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP)];
+        let ksk_and_zsk = vec![ed(DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP), ed(DNSKEY_FLAG_ZONE)];
+
+        for (keys, shape) in [
+            (&sep_only, "one SEP key"),
+            (&ksk_and_zsk, "a KSK and a ZSK"),
+        ] {
+            for chain in [
+                DenialChain::Nsec,
+                DenialChain::Nsec3 {
+                    salt: vec![0xde, 0xad, 0xbe, 0xef],
+                    iterations: 5,
+                    opt_out: false,
+                },
+            ] {
+                let policy = policy(chain.clone());
+                let (whole, _) =
+                    sign_zone_inner(&zone, keys, &policy, None).expect("the whole signs");
+                let (_, split) = split_passes(&zone, keys, &policy, None);
+                assert_eq!(
+                    canonical(&whole),
+                    canonical(&split),
+                    "the split is not the function: {shape}, {chain:?}"
+                );
+            }
+        }
     }
 
     /// The parts are the function or they are fiction: the same zone out, and
@@ -3596,17 +3742,16 @@ a\.b    IN A   192.0.2.50
         let keys = signing_keys(ORIGIN);
         let policy = policy(DenialChain::Nsec);
         println!(
-            "{:>9}  {:>11} {:>13} {:>10} {:>7} {:>9} {:>10} {:>15} {:>8}  {:>10} {:>11} {:>11} {:>11}",
+            "{:>9}  {:>11} {:>13} {:>10} {:>7} {:>9} {:>12} {:>15} {:>8}  {:>11} {:>11} {:>11}",
             "records",
             "incremental",
             "previous-sigs",
             "carry-over",
-            "publish",
+            "fixed",
             "layout",
-            "nsec-chain",
+            "denial-chain",
             "sign-everything",
             "free",
-            "key-select",
             "build-rrsets",
             "sign-rrsets",
             "file-sigs",
@@ -3626,17 +3771,23 @@ a\.b    IN A   192.0.2.50
             let zone = update::apply(&source, std::slice::from_ref(&change)).zone;
             drop(source);
 
-            // One run discarded before the timed one, at this size, because the
-            // first pays for the allocator reaching the size it needs: the same
-            // whole read 39.2 ms then 31.1 ms at 10 000 records, 1.5% apart at
-            // 100 000 and 0.3% at a million. Timing the first against warm parts
-            // is what made `check_split` read 0.78 (`TODO.md` #111d), and a
-            // warm-up at a *different* size does not do it — the one-off scales
-            // with the zone.
+            // One run of *each* side discarded before the timed pair, at this
+            // size. A run pays for the allocator reaching the size it needs —
+            // the same whole read 39.2 ms then 31.1 at 10 000 records — so
+            // whichever side goes first is measured in a state the other is not
+            // in. Warming only the whole fixed the small end and cost the large
+            // one: on Windows at a million records it made the whole 33.2 s
+            // against 28.2, and `check_split` read 0.75 (`TODO.md` #111d, #111e).
             drop(
                 sign_zone_incrementally(&previous, &zone, &keys, &policy)
                     .expect("the discarded run signs"),
             );
+            drop(split_passes(
+                &zone,
+                &keys,
+                &policy,
+                Some(&PreviousSignatures::of(&previous)),
+            ));
             let start = Instant::now();
             let whole = sign_zone_incrementally(&previous, &zone, &keys, &policy)
                 .expect("signs")
@@ -3664,16 +3815,15 @@ a\.b    IN A   192.0.2.50
                 records,
             );
             println!(
-                "{records:>9}  {:>9.1}ms {:>11.1}ms {:>8.1}ms {:>5.1}ms {:>7.1}ms {:>8.1}ms {:>13.1}ms {:>6.1}ms  {:>8.1}ms {:>9.1}ms {:>9.1}ms {:>9.1}ms",
+                "{records:>9}  {:>9.1}ms {:>11.1}ms {:>8.1}ms {:>5.1}ms {:>7.1}ms {:>10.1}ms {:>13.1}ms {:>6.1}ms  {:>9.1}ms {:>9.1}ms {:>9.1}ms",
                 incremental.as_secs_f64() * 1000.0,
                 previous_sigs.as_secs_f64() * 1000.0,
                 passes.carry_over.as_secs_f64() * 1000.0,
-                passes.publish.as_secs_f64() * 1000.0,
+                passes.fixed.as_secs_f64() * 1000.0,
                 passes.layout.as_secs_f64() * 1000.0,
-                passes.nsec_chain.as_secs_f64() * 1000.0,
+                passes.denial_chain.as_secs_f64() * 1000.0,
                 passes.sign_everything().as_secs_f64() * 1000.0,
                 free_carried.as_secs_f64() * 1000.0,
-                passes.key_select.as_secs_f64() * 1000.0,
                 passes.build_rrsets.as_secs_f64() * 1000.0,
                 passes.sign_rrsets.as_secs_f64() * 1000.0,
                 passes.file_sigs.as_secs_f64() * 1000.0,
@@ -3860,15 +4010,14 @@ a\.b    IN A   192.0.2.50
         let keys = signing_keys(ORIGIN);
         let policy = policy(DenialChain::Nsec);
         println!(
-            "{:>9}  {:>10} {:>10} {:>7} {:>9} {:>10} {:>15}  {:>10} {:>11} {:>11} {:>11}",
+            "{:>9}  {:>10} {:>10} {:>7} {:>9} {:>12} {:>15}  {:>11} {:>11} {:>11}",
             "records",
             "full",
             "carry-over",
-            "publish",
+            "fixed",
             "layout",
-            "nsec-chain",
+            "denial-chain",
             "sign-everything",
-            "key-select",
             "build-rrsets",
             "sign-rrsets",
             "file-sigs",
@@ -3876,9 +4025,10 @@ a\.b    IN A   192.0.2.50
         for records in [10_000usize, 100_000, 1_000_000] {
             let zone = cost_fixture(records);
 
-            // Discarded first, as in `incremental_sign_cost_by_pass` and for the
-            // same measurement (`TODO.md` #111d).
+            // One of each discarded first, as in `incremental_sign_cost_by_pass`
+            // and for the same measurement (`TODO.md` #111d, #111e).
             drop(sign_zone(&zone, &keys, &policy).expect("the discarded run signs"));
+            drop(split_passes(&zone, &keys, &policy, None));
             let start = Instant::now();
             let whole = sign_zone(&zone, &keys, &policy).expect("signs");
             let full = start.elapsed();
@@ -3892,14 +4042,13 @@ a\.b    IN A   192.0.2.50
                 records,
             );
             println!(
-                "{records:>9}  {:>8.1}ms {:>8.1}ms {:>5.1}ms {:>7.1}ms {:>8.1}ms {:>13.1}ms  {:>8.1}ms {:>9.1}ms {:>9.1}ms {:>9.1}ms",
+                "{records:>9}  {:>8.1}ms {:>8.1}ms {:>5.1}ms {:>7.1}ms {:>10.1}ms {:>13.1}ms  {:>9.1}ms {:>9.1}ms {:>9.1}ms",
                 full.as_secs_f64() * 1000.0,
                 passes.carry_over.as_secs_f64() * 1000.0,
-                passes.publish.as_secs_f64() * 1000.0,
+                passes.fixed.as_secs_f64() * 1000.0,
                 passes.layout.as_secs_f64() * 1000.0,
-                passes.nsec_chain.as_secs_f64() * 1000.0,
+                passes.denial_chain.as_secs_f64() * 1000.0,
                 passes.sign_everything().as_secs_f64() * 1000.0,
-                passes.key_select.as_secs_f64() * 1000.0,
                 passes.build_rrsets.as_secs_f64() * 1000.0,
                 passes.sign_rrsets.as_secs_f64() * 1000.0,
                 passes.file_sigs.as_secs_f64() * 1000.0,

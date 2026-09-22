@@ -37,9 +37,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#107**-**#114**, plus **#21**, as of 2026-09-22 — the seven
-filed out of the architecture review are closed, nine more were filed, and #115
-is closed out of the first triage pass.
+**#58**, **#68**, **#107**-**#110**, **#112**-**#114**, plus **#21**, as of
+2026-09-22 — the seven filed out of the architecture review are closed, nine
+more were filed, and #111 and #115 are closed out of the first triage passes.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -61,7 +61,13 @@ One row corrects a claim's *scope* rather than a claim: #107 against
 `clock.rs:42`. The decision #92 took is right for `rdnsd`; the sentence it
 produced is about the whole tree and the count behind it never left that crate.
 
-**#111a closed** on 2026-09-22 out of triage, with 111b and 111c filed under it. Both drifts the row named turned out latent — the cost fixture is `$TTL 3600` over MINIMUM 3600, so the pre-#73 arithmetic evaluates to the same number, and its two keys are one SEP and one ZSK, so the signer fallback cannot fire. 111d, filed and closed the same day, is the one worth reading: the guard fails
+**#111a closed** on 2026-09-22 out of triage, with 111b and 111c filed under it. Both drifts the row named turned out latent — the cost fixture is `$TTL 3600` over MINIMUM 3600, so the pre-#73 arithmetic evaluates to the same number, and its two keys are one SEP and one ZSK, so the signer fallback cannot fire. **#111 closed** on 2026-09-22, all four sub-items. 111a fixed the two drifts
+the row named, 111b the one it did not — no `policy.chain` branch, so an NSEC3
+zone could not be measured — and 111c is the guard that runs:
+`the_split_builds_what_sign_zone_inner_builds` compares the two zones record for
+record under Ed25519, whose signatures are deterministic, and all three drifts
+were watched failing it. 111d, filed and closed the same day, is the one worth
+reading: the guard fails
 2 runs in 3 on Linux at 10 000 records and always has, and the cause is that the
 whole is timed on its first run at a size while the parts inherit a warm
 allocator — 39.2 ms against 31.1 for the same work. Both candidates the filing
@@ -6960,7 +6966,7 @@ opening it" wearing a benchmark's clothes. Measure before changing.
 
 ---
 
-### 111. The signing cost harness is a copy of `sign_zone_inner`, and it has drifted — **filed 2026-09-21**, **bug**, **ready-for-human**
+### 111. The signing cost harness is a copy of `sign_zone_inner`, and it has drifted — **filed 2026-09-21, closed 2026-09-22**, **bug**
 
 `split_passes` (zone_signer.rs:3380) is a hand copy of `sign_zone_inner`'s body,
 written because the production function returns `(Zone, FreshRrsets)` and offers
@@ -7038,11 +7044,21 @@ fact the shape question below has to answer.
   guard cannot see what this row fixed: it was green over both drifts. Green on
   Windows, that is — on Linux it fails at 10 000 records for a reason that is
   neither drift and predates the fix, which is 111d.
-- **111b. The chain branch, and the four guards the copy does without.** Open.
-  Mechanical, but not one line — matching production means the `policy.chain`
-  branch *and* the NSEC3PARAM record before `Layout::of`, which changes what the
-  harness reports for an NSEC3 policy from "wrong" to "measured". Not folded into
-  111a, because 111a was chosen for changing no number and this changes one.
+- **111b. The chain branch, and the four guards the copy does without** —
+  **closed 2026-09-22**. `split_passes` branches on `policy.chain` as production
+  does, adds NSEC3PARAM before `Layout::of` for RFC 5155 §7.1, and runs the
+  preamble — `policy.chain.check()`, `check_keys`, the inception check and the
+  imported-DNSKEY check, the last three as asserts, since a harness has no
+  caller to return an error to. An NSEC3 zone is measurable now, and measuring
+  one is `policy(DenialChain::Nsec3 { .. })` in a caller rather than a change
+  here, so there is nothing left to file.
+
+  The column named `nsec-chain` is `denial-chain`, because it can be either
+  chain now. `publish` and `key_select` became one `fixed` — every part of
+  `sign_zone_inner` that is not O(zone), the new preamble included — which
+  **still reads 0.0 ms at every size on both platforms** with three more things
+  inside it. Three near-zero columns would have been noise; one that is the
+  answer to "is any of this O(zone)?" is not.
 - **111d. The guard fails on Linux at the smallest size, and it is not this
   row's drifts.** Filed 2026-09-22 out of running it on both sides, **closed
   2026-09-22**.
@@ -7088,8 +7104,12 @@ fact the shape question below has to answer.
   measurement that says the one-off scales with the zone rather than being paid
   once per process.
 
-  **Fixed by discarding a run at the same size in each of the two callers**, not
-  by widening the band. `incremental_sign_cost_by_pass` is 3 of 3 green on Linux
+  ~~**Fixed by discarding a run at the same size in each of the two callers**~~,
+  not by widening the band. **That remedy was half right and 111e is the other
+  half**: warming only the whole fixed the small end and cost the large one.
+  The diagnosis holds; what did not follow from it is that one side's warm-up is
+  enough, because the parts are a second consumer in a state the whole was not
+  in. `incremental_sign_cost_by_pass` is 3 of 3 green on Linux
   where it was 2 of 3 failing, at ratios around 0.90; `full_sign_cost_by_pass` is
   3 of 3. Windows stays green, both guards in one run, the 10 000-record
   incremental row reading 49.9 ms against parts of 51.9 — 1.04, the high side,
@@ -7104,17 +7124,53 @@ fact the shape question below has to answer.
   pushes the ratio *down*. Struck in place; what the 1.25 side is for is
   unmeasured and now says so.
 
-- **111c. What guards the copy.** Open, and it is the shape question. Three were
-  named at triage and none built (§19 says build them, so this row is a
-  measurement short): production hands its phase timings back, which the row
-  names and which changes a return type on the signing path for a benchmark's
-  benefit; **or** a small-zone equivalence test that runs under `cargo test`,
-  asserting `split_passes` and `sign_zone_inner` produce the identical zone under
-  a fixture built to make every drift visible — short SOA TTL against a long
-  MINIMUM, a single key, NSEC3 — which guards the copy instead of removing it and
-  **fails against the tree as it stands**; **or** delete the harness and accept
-  per-phase blindness. The middle one is the only one that is cheap, runs, and
-  would have caught all three drifts.
+- **111e. 111d's remedy fixed the small end by breaking the large one** —
+  filed and closed 2026-09-22, **by the guard, on the run meant to confirm
+  111b**. Discarding a run of the *whole* made the timed whole slower at a
+  million records on Windows — **33.2 s against 28.2 with no warm-up at all** —
+  so `check_split` read 0.75 and `full_sign_cost_by_pass` failed where it had
+  passed. Linux never showed it: 1.015 there on the same code.
+
+  Two candidates were checked and dropped before that one. `sign_zone` is
+  `sign_zone_inner` and verifies nothing, so #100's verification is not in the
+  whole. And `Layout`'s teardown — built inside a timer and freed outside every
+  one of them, where production frees it inside `sign_zone_inner` — is **123.6
+  ms of a 26 572 ms run** at a million, 0.5%, so it is real and it is not this.
+
+  **Fixed by discarding one run of *each* side**, so the whole and the parts are
+  both measured in the state the other is in. Windows at a million: 0.999
+  incremental, 0.911 full; at 10 000, 0.94 and 1.01. Linux 3 of 3 on both guards
+  with the 10 000-record incremental row at 0.90-0.94, where 111d's symptom was
+  0.78. The guards cost ~139 s on Windows and ~121 s on Linux, against ~58 s and
+  ~90 s before.
+
+  The lesson is the one 111d half-learned: **a warm-up is a statement about
+  which side you warmed.** The first fix made the two sides *more* different on
+  one platform while making them less different on the other, and no reading
+  taken on one platform could have told the difference.
+
+- **111c. What guards the copy** — **closed 2026-09-22** on the middle shape of
+  the three: `the_split_builds_what_sign_zone_inner_builds`, an ordinary
+  `#[test]` that runs under `cargo test`, over both chains and both key shapes,
+  comparing the two zones **record for record** rather than by length.
+
+  **Ed25519 is what makes it exact.** RFC 8032 signatures are deterministic
+  where ECDSA draws a `k`, so two runs over one RRset are byte-identical and
+  "the same number of records" becomes "the same records" — which is the whole
+  difference between this and `check_split`.
+
+  The fixture is built to make each drift visible rather than trusted to:
+  `$TTL 60` under a SOA MINIMUM of 86400, so the pre-#73 arithmetic is a
+  different number; one case with a SEP key and nothing else, so the signer
+  fallback has to fire; both chains. **All three drifts were watched failing it**
+  (§1), one at a time with the fix reverted and restored: the TTL one puts the
+  NSECs and their RRSIGs at 86400 against 60, the signer one fails at "one SEP
+  key, Nsec", the chain one at "one SEP key, Nsec3".
+
+  The other two shapes stay declined and the reason is now stronger than at
+  triage: production handing its phase timings back changes a return type on the
+  signing path for a benchmark's benefit, and deleting the harness gives up
+  per-phase cost for a copy that a 0.02 s test now holds to the function.
 
 ---
 
