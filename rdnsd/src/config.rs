@@ -11,9 +11,12 @@
 //! would be silent. ~~`--check-config`, `--generate-keys` and `--config` itself
 //! are exempt~~ — **six are, not three** (`TODO.md` #79f): those, plus
 //! `--key-algorithm`, which is `--generate-keys`' parameter, and `--log-level`
-//! and `--quiet`, which the file has no key for. Of `Cli`'s 46 `#[arg]` fields
-//! the other 40 carry `conflicts_with = "config"`, and that list is the
-//! authority for this sentence.
+//! and `--quiet`, which the file has no key for. Every other flag carries
+//! `conflicts_with = "config"`, and the authority for that is
+//! `a_setting_the_file_can_write_is_refused_beside_config` below: it walks
+//! `Cli::command()` and requires a flag not refused beside `--config` to have no
+//! key in the file, so clap owns one half and serde the other. This sentence
+//! named two counts instead, and both went stale (`TODO.md` #115).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

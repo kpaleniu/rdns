@@ -289,8 +289,6 @@ impl Server {
 
         // TSIG before anything that could answer (RFC 8945 §5.2): checking the
         // signature afterwards means answering whoever asked.
-        // TSIG before anything that could answer (RFC 8945 §5.2): checking the
-        // signature afterwards means answering whoever asked.
         let sent = match tsig::check_request(packet, &self.tsig_keys, now) {
             TsigCheck::Rejected(rejection) => {
                 // WARN, not DEBUG: a key that does not verify is either a

@@ -37,8 +37,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#107**-**#115**, plus **#21**, as of 2026-09-21 — the seven
-filed out of the architecture review are closed and nine more are filed.
+**#58**, **#68**, **#107**-**#114**, plus **#21**, as of 2026-09-22 — the seven
+filed out of the architecture review are closed, nine more were filed, and #115
+is closed out of the first triage pass.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -59,6 +60,8 @@ drift surface, and the row it belongs to is closed.
 One row corrects a claim's *scope* rather than a claim: #107 against
 `clock.rs:42`. The decision #92 took is right for `rdnsd`; the sentence it
 produced is about the whole tree and the count behind it never left that crate.
+
+**#115 closed** on 2026-09-22, and triage found the row's own correction stale before it fixed the prose: a field count written from a scan that cannot see `nsec3`. What shipped drops both counts and cites the test that holds the rule, because this row is now twice the evidence that a number in prose does not stay true.
 
 **#106 closed** the day it was filed, and it was worse than built-and-
 discarded: a zone small enough to fit one envelope *transferred* over DoH, so
@@ -7049,24 +7052,6 @@ remedy costed.
 
 ---
 
-### 115. Two pieces of `rdnsd` prose that are wrong in the tree today — **filed 2026-09-21**
-
-Both are §4's "a claim to verify", in the half no compiler reads.
-
-- **`dispatch.rs:290-293`** — the two-line RFC 8945 §5.2 comment is written twice
-  in a row, verbatim. `git log -S` puts the phrase's last touch at `955504d`
-  (#101), the commit that split `answer_admitted` out of `answer`. Count of the
-  shape tree-wide: **1**; a scan for a repeated two-line comment block over every
-  `.rs` file in the workspace finds this and nothing else. `cargo fmt` and clippy
-  both pass it, which is why it survived.
-- **`config.rs:14-16`** — "Of `Cli`'s 46 `#[arg]` fields the other 40 carry
-  `conflicts_with = "config"`, and that list is the authority for this sentence."
-  Counted 2026-09-21: **51** `#[arg]` attributes over 49 fields, **45** carrying
-  `conflicts_with`. A sentence that names itself the authority for a number it no
-  longer holds.
-
----
-
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -7250,6 +7235,7 @@ the week; the record is under "How the queue kept going stale" in
 | **82** | two modules in the wrong place, and a `pub` with no ratchet | **filed 2026-09-19, closed 2026-09-20**, two rows. **82b** took the ratchet: 43 sites, 38 of them `#[cfg(test)]` fixtures that always meant `pub(crate)`, and `#![warn(unreachable_pub)]` is in all nine crate roots with what it does *not* answer written on the lint. **82a** moved `readiness` to `rdns-transport`, whose metrics server serves `/readyz`; the estimate held except that a move is two `mod` lines, not one. Both halves of the *larger* version stay declined on measurements taken in place: an `rdns-ops` crate takes no package off any binary (`cargo tree -p rdnsd` is 150 either way) and the transport link is ~450 ms of a ~3.3 s rebuild, which is a ceiling and not a saving |
 | **84** | `to_prometheus_format` was 337 lines of one idiom | **filed 2026-09-19, closed 2026-09-20**, and the row's own remedy was wrong by an order of magnitude. Both shapes built (§19): helper calls 278 lines, a table 276, against 337 — because stock rustfmt breaks *every* element of an argument list when one exceeds 100 columns, and §12 forbids a `rustfmt.toml`, so the length was never available to be fixed. The table shipped on what it makes unrepresentable instead: name, help and field on one row, so a counter rendered nowhere is a missing row rather than a missing block among thirty. The `diff` the row asked for came back **byte-identical except the `dns_catalog_members` HELP line**, its 22 stray spaces, exactly as predicted. One it did not ask for: a scrape was **65 allocations and is 16** for the same 4 775 bytes, pinned. Both sub-findings fixed — `the_scrape_is_well_formed` asserts one HELP and one TYPE per family, no undeclared sample and no padded help text, and fails against the padded line put back; the two lock guards read *through* a poisoned lock now, matching the decision every writer in the file had already made, because dropping the series made every zone look withdrawn at once |
 | **78** | `rdnsr`'s query path lost work at three of its exits | **filed 2026-09-19, closed 2026-09-20**, three rows, and the first was verified here while b and c were the review's reading — both held. **78a**: an `rpz-ip` rule over a cache hit dropped the prefetch the answer cache had just asked for, because `impl From<Option<Vec<u8>>> for Answered` fills `refresh: None`. Three shapes built (§19) and the one that shipped is in neither the row nor the review: delete the early `return`, since the hazard is §7's jump over a shared epilogue. **78b**: `Resolver::forward` returned the upstream's AA bit and echoed question verbatim where `recurse` normalized both, so an `rdnsr` in front of an `rdnsr` running 0x20 would have rejected its own answer (RFC 5452 §9.1) — left **#93**. **78c**: QDCOUNT = 0 was dropped by `rdnsr` and answered NOERROR *with AA set* by `rdnsd`. RFC 9619 §4 settles only QDCOUNT > 1; its QDCOUNT = 0 sentence binds firewalls, not responders. RFC 7873 §5.4 says what the query is for and that a server without cookies "will normally send FORMERR", and the peers agree: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all answer it, all FORMERR with no OPT, and none drops it — which is the measurement that could have refuted the finding |
+| **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
