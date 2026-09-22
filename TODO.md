@@ -61,6 +61,8 @@ One row corrects a claim's *scope* rather than a claim: #107 against
 `clock.rs:42`. The decision #92 took is right for `rdnsd`; the sentence it
 produced is about the whole tree and the count behind it never left that crate.
 
+**#111a closed** on 2026-09-22 out of triage, with 111b and 111c filed under it. Both drifts the row named turned out latent — the cost fixture is `$TTL 3600` over MINIMUM 3600, so the pre-#73 arithmetic evaluates to the same number, and its two keys are one SEP and one ZSK, so the signer fallback cannot fire. What the row did not name is the bigger one: the copy has no `policy.chain` branch at all, so an NSEC3 zone is unmeasurable. The claim that had to be struck was in the *test*, not in the helper the row quotes.
+
 **#115 closed** on 2026-09-22, and triage found the row's own correction stale before it fixed the prose: a field count written from a scan that cannot see `nsec3`. What shipped drops both counts and cites the test that holds the rule, because this row is now twice the evidence that a number in prose does not stay true.
 
 **#106 closed** the day it was filed, and it was worse than built-and-
@@ -6953,7 +6955,7 @@ opening it" wearing a benchmark's clothes. Measure before changing.
 
 ---
 
-### 111. The signing cost harness is a copy of `sign_zone_inner`, and it has drifted — **filed 2026-09-21**
+### 111. The signing cost harness is a copy of `sign_zone_inner`, and it has drifted — **filed 2026-09-21**, **bug**, **ready-for-human**
 
 `split_passes` (zone_signer.rs:3380) is a hand copy of `sign_zone_inner`'s body,
 written because the production function returns `(Zone, FreshRrsets)` and offers
@@ -6980,6 +6982,71 @@ catch this.
 No remedy costed. The shape that removes the copy is the production body handing
 its phase timings back, which changes a return type on the signing path and was
 not built (§18).
+
+**Triaged 2026-09-22. Both drifts confirmed, and both are latent** — which is
+the measurement the row did not take (§19), and it sharpens the row rather than
+refuting it:
+
+- The denial TTL is not merely the same record *count* as production's. The
+  fixture is `$TTL 3600` over a SOA MINIMUM of 3600, so `Ttl::from_secs(minimum)`
+  and `.min(soa_ttl)` are the same number and the two zones are identical. #73
+  hid behind `$TTL 3600` with `minimum 300`; this hides behind 3600 over 3600,
+  which is the same masking one step further along.
+- The signer fallback cannot fire: `signing_keys` is one SEP and one ZSK, so
+  neither half is ever empty. Under a single-key fixture the copy would have
+  signed no data at all — a difference `check_split`'s record count *would*
+  have caught, had it run.
+
+**A third divergence, larger than either, and the row does not name it.** The
+copy calls `build_nsec_chain` unconditionally. Production branches on
+`policy.chain` and builds NSEC3 when asked, having added NSEC3PARAM *before*
+`Layout::of` for RFC 5155 §7.1. It also omits `policy.chain.check()`,
+`check_keys`, the inception-before-expiration check and the imported-DNSKEY
+RRSIG check (RFC 8901 §2.1.1). All three cost tests pass `DenialChain::Nsec`,
+so none of it fires — and the harness cannot measure an NSEC3 zone, which is the
+more expensive chain and the more common deployment.
+
+**And the stronger false claim is in the test, not in `split_passes`.** The row
+quotes the helper's own doc. `incremental_sign_cost_by_pass` said "the parts run
+in `sign_zone_inner`'s order from its own arguments and the sum is asserted
+against the whole, so **the split cannot drift from the function it describes**
+(`CLAUDE.md` §7)" — §4's claim to verify, false three times over. Struck in
+place.
+
+**"The guard does not run" is right and the remedy it implies is not.** The three
+tests are `#[ignore]`d *and* call `refuse_debug`, which panics outright in a debug
+build, and they run to 1 000 000 records. They are benchmarks. Un-ignoring them
+is not available, so the guard cannot be made to run as written — which is the
+fact the shape question below has to answer.
+
+- **111a. The two named drifts and the false claim** — **closed 2026-09-22**.
+  `split_passes` computes `denial_ttl` as production does, derives
+  `dnskey_signers`/`data_signers` with the empty-half fallback, and asserts the
+  all-inactive case production refuses. Provably no change to any published
+  figure: both expressions evaluate identically under the fixtures.
+
+  **The guard was run rather than reasoned about, and this is the first
+  execution it has had.** `incremental_sign_cost_by_pass` in release, Windows:
+  it passes at all three sizes, the 1M row reading the split's sum at 8 503 ms
+  against the whole's 8 205 ms — ratio 1.04, inside `check_split`'s 0.8-1.25x —
+  and the same record count both ways. Which is also the demonstration that the
+  guard cannot see what this row fixed: it was green over both drifts.
+- **111b. The chain branch, and the four guards the copy does without.** Open.
+  Mechanical, but not one line — matching production means the `policy.chain`
+  branch *and* the NSEC3PARAM record before `Layout::of`, which changes what the
+  harness reports for an NSEC3 policy from "wrong" to "measured". Not folded into
+  111a, because 111a was chosen for changing no number and this changes one.
+- **111c. What guards the copy.** Open, and it is the shape question. Three were
+  named at triage and none built (§19 says build them, so this row is a
+  measurement short): production hands its phase timings back, which the row
+  names and which changes a return type on the signing path for a benchmark's
+  benefit; **or** a small-zone equivalence test that runs under `cargo test`,
+  asserting `split_passes` and `sign_zone_inner` produce the identical zone under
+  a fixture built to make every drift visible — short SOA TTL against a long
+  MINIMUM, a single key, NSEC3 — which guards the copy instead of removing it and
+  **fails against the tree as it stands**; **or** delete the harness and accept
+  per-phase blindness. The middle one is the only one that is cheap, runs, and
+  would have caught all three drifts.
 
 ---
 

@@ -3411,8 +3411,13 @@ a\.b    IN A   192.0.2.50
         let layout = Layout::of(&signed, origin.as_ref());
         let layout_time = start.elapsed();
 
+        // RFC 9077 §3's lesser, as production computes it (#73). The copy had
+        // MINIMUM alone; it changed no number here because `cost_fixture` is
+        // `$TTL 3600` over a SOA MINIMUM of 3600, which is how it survived
+        // (`TODO.md` #111).
+        let denial_ttl = Ttl::from_secs(minimum).min(soa_ttl);
         let start = Instant::now();
-        build_nsec_chain(&layout, Ttl::from_secs(minimum), &mut signed).expect("the chain");
+        build_nsec_chain(&layout, denial_ttl, &mut signed).expect("the chain");
         let nsec_chain = start.elapsed();
 
         // `sign_everything`'s own three. Its key selection is O(keys) and is
@@ -3420,12 +3425,30 @@ a\.b    IN A   192.0.2.50
         let active = active_signing_keys(keys, policy.signed_at);
         let sep: Vec<&SigningKey> = active.iter().copied().filter(|k| k.is_sep()).collect();
         let rest: Vec<&SigningKey> = active.iter().copied().filter(|k| !k.is_sep()).collect();
+        // The empty-half fallback and the all-inactive refusal, which the copy
+        // did without: with one SEP and one ZSK neither half is ever empty, so a
+        // single-key fixture would have measured a run that signs no data at all
+        // (`TODO.md` #111).
+        let all: Vec<&SigningKey> = active.clone();
+        let dnskey_signers = if sep.is_empty() { &all } else { &sep };
+        let data_signers = if rest.is_empty() { &all } else { &rest };
+        assert!(
+            !data_signers.is_empty(),
+            "no key is active to sign with; production fails the run here"
+        );
         let start = Instant::now();
         let rrsets = rrsets_of(&signed);
         let build_rrsets = start.elapsed();
         let start = Instant::now();
-        let (signatures, _fresh) =
-            signatures_for(rrsets, &layout, policy, previous, &sep, &rest).expect("the signatures");
+        let (signatures, _fresh) = signatures_for(
+            rrsets,
+            &layout,
+            policy,
+            previous,
+            dnskey_signers,
+            data_signers,
+        )
+        .expect("the signatures");
         let sign_rrsets = start.elapsed();
         let start = Instant::now();
         for signature in signatures {
@@ -3534,8 +3557,12 @@ a\.b    IN A   192.0.2.50
     /// A test inside this module rather than beside `scale.rs`, because every
     /// pass but the whole is private; the parts run in `sign_zone_inner`'s
     /// order from its own arguments and the sum is asserted against the whole,
-    /// so the split cannot drift from the function it describes
-    /// (`CLAUDE.md` §7).
+    /// ~~so the split cannot drift from the function it describes
+    /// (`CLAUDE.md` §7)~~ — **it had drifted three times when that was read**
+    /// (`TODO.md` #111). The sum is a timing and `check_split`'s other
+    /// assertion is a record count, and neither sees a denial TTL computed the
+    /// pre-#73 way, a signer fallback the fixture never needs, or a chain
+    /// branch the copy does not have. Two are fixed (#111a); the chain is #111b.
     ///
     /// NSEC, one ECDSA P-256 KSK and one ZSK — 64d's shape, so these columns
     /// are comparable with its table. Three warm runs on the development
