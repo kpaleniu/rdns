@@ -3350,8 +3350,10 @@ a\.b    IN A   192.0.2.50
     /// timers start and freed after they stop.
     struct Passes {
         carry_over: std::time::Duration,
+        publish: std::time::Duration,
         layout: std::time::Duration,
         nsec_chain: std::time::Duration,
+        key_select: std::time::Duration,
         build_rrsets: std::time::Duration,
         sign_rrsets: std::time::Duration,
         file_sigs: std::time::Duration,
@@ -3359,11 +3361,11 @@ a\.b    IN A   192.0.2.50
 
     impl Passes {
         fn sign_everything(&self) -> std::time::Duration {
-            self.build_rrsets + self.sign_rrsets + self.file_sigs
+            self.key_select + self.build_rrsets + self.sign_rrsets + self.file_sigs
         }
 
         fn total(&self) -> std::time::Duration {
-            self.carry_over + self.layout + self.nsec_chain + self.sign_everything()
+            self.carry_over + self.publish + self.layout + self.nsec_chain + self.sign_everything()
         }
     }
 
@@ -3391,6 +3393,7 @@ a\.b    IN A   192.0.2.50
         let (soa_ttl, minimum) = carry_over_records(zone, origin.as_ref(), policy, &mut signed)
             .expect("the records carry over");
         let carry_over = start.elapsed();
+        let start = Instant::now();
         let dnskey_ttl = publish_dnskeys(
             keys,
             origin.as_ref(),
@@ -3406,6 +3409,7 @@ a\.b    IN A   192.0.2.50
             &mut signed,
         )
         .expect("the sync records publish");
+        let publish = start.elapsed();
 
         let start = Instant::now();
         let layout = Layout::of(&signed, origin.as_ref());
@@ -3420,8 +3424,9 @@ a\.b    IN A   192.0.2.50
         build_nsec_chain(&layout, denial_ttl, &mut signed).expect("the chain");
         let nsec_chain = start.elapsed();
 
-        // `sign_everything`'s own three. Its key selection is O(keys) and is
-        // not timed.
+        // `sign_everything`'s own three, and its key selection, which #111d
+        // wanted timed rather than assumed negligible.
+        let start = Instant::now();
         let active = active_signing_keys(keys, policy.signed_at);
         let sep: Vec<&SigningKey> = active.iter().copied().filter(|k| k.is_sep()).collect();
         let rest: Vec<&SigningKey> = active.iter().copied().filter(|k| !k.is_sep()).collect();
@@ -3436,6 +3441,7 @@ a\.b    IN A   192.0.2.50
             !data_signers.is_empty(),
             "no key is active to sign with; production fails the run here"
         );
+        let key_select = start.elapsed();
         let start = Instant::now();
         let rrsets = rrsets_of(&signed);
         let build_rrsets = start.elapsed();
@@ -3459,8 +3465,10 @@ a\.b    IN A   192.0.2.50
         (
             Passes {
                 carry_over,
+                publish,
                 layout: layout_time,
                 nsec_chain,
+                key_select,
                 build_rrsets,
                 sign_rrsets,
                 file_sigs,
@@ -3470,9 +3478,14 @@ a\.b    IN A   192.0.2.50
     }
 
     /// The parts are the function or they are fiction: the same zone out, and
-    /// the sum within 0.8x-1.25x of the whole. Wide on the high side because
-    /// the parts pay a cold allocator that the whole, timed first, has already
-    /// warmed.
+    /// the sum within 0.8x-1.25x of the whole.
+    ///
+    /// ~~Wide on the high side because the parts pay a cold allocator that the
+    /// whole, timed first, has already warmed.~~ **That is backwards, measured
+    /// 2026-09-22** (`TODO.md` #111d). The whole pays the cold allocator and the
+    /// parts inherit it warm, which pushes the ratio *down*: 0.78 at 10 000
+    /// records, 2 runs in 3 on Linux, until both callers learned to discard a
+    /// run at the same size first. What the 1.25 side is for is unmeasured.
     fn check_split(
         parts: std::time::Duration,
         whole: std::time::Duration,
@@ -3583,15 +3596,17 @@ a\.b    IN A   192.0.2.50
         let keys = signing_keys(ORIGIN);
         let policy = policy(DenialChain::Nsec);
         println!(
-            "{:>9}  {:>11} {:>13} {:>10} {:>9} {:>10} {:>15} {:>8}  {:>11} {:>11} {:>11}",
+            "{:>9}  {:>11} {:>13} {:>10} {:>7} {:>9} {:>10} {:>15} {:>8}  {:>10} {:>11} {:>11} {:>11}",
             "records",
             "incremental",
             "previous-sigs",
             "carry-over",
+            "publish",
             "layout",
             "nsec-chain",
             "sign-everything",
             "free",
+            "key-select",
             "build-rrsets",
             "sign-rrsets",
             "file-sigs",
@@ -3611,8 +3626,17 @@ a\.b    IN A   192.0.2.50
             let zone = update::apply(&source, std::slice::from_ref(&change)).zone;
             drop(source);
 
-            // The whole first, so the parts below are not the ones paying for
-            // whatever it warms.
+            // One run discarded before the timed one, at this size, because the
+            // first pays for the allocator reaching the size it needs: the same
+            // whole read 39.2 ms then 31.1 ms at 10 000 records, 1.5% apart at
+            // 100 000 and 0.3% at a million. Timing the first against warm parts
+            // is what made `check_split` read 0.78 (`TODO.md` #111d), and a
+            // warm-up at a *different* size does not do it — the one-off scales
+            // with the zone.
+            drop(
+                sign_zone_incrementally(&previous, &zone, &keys, &policy)
+                    .expect("the discarded run signs"),
+            );
             let start = Instant::now();
             let whole = sign_zone_incrementally(&previous, &zone, &keys, &policy)
                 .expect("signs")
@@ -3640,14 +3664,16 @@ a\.b    IN A   192.0.2.50
                 records,
             );
             println!(
-                "{records:>9}  {:>9.1}ms {:>11.1}ms {:>8.1}ms {:>7.1}ms {:>8.1}ms {:>13.1}ms {:>6.1}ms  {:>9.1}ms {:>9.1}ms {:>9.1}ms",
+                "{records:>9}  {:>9.1}ms {:>11.1}ms {:>8.1}ms {:>5.1}ms {:>7.1}ms {:>8.1}ms {:>13.1}ms {:>6.1}ms  {:>8.1}ms {:>9.1}ms {:>9.1}ms {:>9.1}ms",
                 incremental.as_secs_f64() * 1000.0,
                 previous_sigs.as_secs_f64() * 1000.0,
                 passes.carry_over.as_secs_f64() * 1000.0,
+                passes.publish.as_secs_f64() * 1000.0,
                 passes.layout.as_secs_f64() * 1000.0,
                 passes.nsec_chain.as_secs_f64() * 1000.0,
                 passes.sign_everything().as_secs_f64() * 1000.0,
                 free_carried.as_secs_f64() * 1000.0,
+                passes.key_select.as_secs_f64() * 1000.0,
                 passes.build_rrsets.as_secs_f64() * 1000.0,
                 passes.sign_rrsets.as_secs_f64() * 1000.0,
                 passes.file_sigs.as_secs_f64() * 1000.0,
@@ -3834,13 +3860,15 @@ a\.b    IN A   192.0.2.50
         let keys = signing_keys(ORIGIN);
         let policy = policy(DenialChain::Nsec);
         println!(
-            "{:>9}  {:>10} {:>10} {:>9} {:>10} {:>15}  {:>11} {:>11} {:>11}",
+            "{:>9}  {:>10} {:>10} {:>7} {:>9} {:>10} {:>15}  {:>10} {:>11} {:>11} {:>11}",
             "records",
             "full",
             "carry-over",
+            "publish",
             "layout",
             "nsec-chain",
             "sign-everything",
+            "key-select",
             "build-rrsets",
             "sign-rrsets",
             "file-sigs",
@@ -3848,6 +3876,9 @@ a\.b    IN A   192.0.2.50
         for records in [10_000usize, 100_000, 1_000_000] {
             let zone = cost_fixture(records);
 
+            // Discarded first, as in `incremental_sign_cost_by_pass` and for the
+            // same measurement (`TODO.md` #111d).
+            drop(sign_zone(&zone, &keys, &policy).expect("the discarded run signs"));
             let start = Instant::now();
             let whole = sign_zone(&zone, &keys, &policy).expect("signs");
             let full = start.elapsed();
@@ -3861,12 +3892,14 @@ a\.b    IN A   192.0.2.50
                 records,
             );
             println!(
-                "{records:>9}  {:>8.1}ms {:>8.1}ms {:>7.1}ms {:>8.1}ms {:>13.1}ms  {:>9.1}ms {:>9.1}ms {:>9.1}ms",
+                "{records:>9}  {:>8.1}ms {:>8.1}ms {:>5.1}ms {:>7.1}ms {:>8.1}ms {:>13.1}ms  {:>8.1}ms {:>9.1}ms {:>9.1}ms {:>9.1}ms",
                 full.as_secs_f64() * 1000.0,
                 passes.carry_over.as_secs_f64() * 1000.0,
+                passes.publish.as_secs_f64() * 1000.0,
                 passes.layout.as_secs_f64() * 1000.0,
                 passes.nsec_chain.as_secs_f64() * 1000.0,
                 passes.sign_everything().as_secs_f64() * 1000.0,
+                passes.key_select.as_secs_f64() * 1000.0,
                 passes.build_rrsets.as_secs_f64() * 1000.0,
                 passes.sign_rrsets.as_secs_f64() * 1000.0,
                 passes.file_sigs.as_secs_f64() * 1000.0,

@@ -61,7 +61,12 @@ One row corrects a claim's *scope* rather than a claim: #107 against
 `clock.rs:42`. The decision #92 took is right for `rdnsd`; the sentence it
 produced is about the whole tree and the count behind it never left that crate.
 
-**#111a closed** on 2026-09-22 out of triage, with 111b and 111c filed under it. Both drifts the row named turned out latent — the cost fixture is `$TTL 3600` over MINIMUM 3600, so the pre-#73 arithmetic evaluates to the same number, and its two keys are one SEP and one ZSK, so the signer fallback cannot fire. What the row did not name is the bigger one: the copy has no `policy.chain` branch at all, so an NSEC3 zone is unmeasurable. The claim that had to be struck was in the *test*, not in the helper the row quotes.
+**#111a closed** on 2026-09-22 out of triage, with 111b and 111c filed under it. Both drifts the row named turned out latent — the cost fixture is `$TTL 3600` over MINIMUM 3600, so the pre-#73 arithmetic evaluates to the same number, and its two keys are one SEP and one ZSK, so the signer fallback cannot fire. 111d, filed and closed the same day, is the one worth reading: the guard fails
+2 runs in 3 on Linux at 10 000 records and always has, and the cause is that the
+whole is timed on its first run at a size while the parts inherit a warm
+allocator — 39.2 ms against 31.1 for the same work. Both candidates the filing
+named were wrong, and `check_split`'s doc had the mechanism backwards.
+What the row did not name is the bigger one: the copy has no `policy.chain` branch at all, so an NSEC3 zone is unmeasurable. The claim that had to be struck was in the *test*, not in the helper the row quotes.
 
 **#115 closed** on 2026-09-22, and triage found the row's own correction stale before it fixed the prose: a field count written from a scan that cannot see `nsec3`. What shipped drops both counts and cites the test that holds the rule, because this row is now twice the evidence that a number in prose does not stay true.
 
@@ -7039,7 +7044,8 @@ fact the shape question below has to answer.
   harness reports for an NSEC3 policy from "wrong" to "measured". Not folded into
   111a, because 111a was chosen for changing no number and this changes one.
 - **111d. The guard fails on Linux at the smallest size, and it is not this
-  row's drifts.** Filed 2026-09-22 out of running it on both sides.
+  row's drifts.** Filed 2026-09-22 out of running it on both sides, **closed
+  2026-09-22**.
   `incremental_sign_cost_by_pass` is green on Windows at all three sizes and
   **fails 2 runs in 3 on Linux at 10 000 records**: "the parts sum to 0.78 of
   the whole", against `check_split`'s 0.8 floor. Readings 0.77, 0.79, pass.
@@ -7064,6 +7070,39 @@ fact the shape question below has to answer.
   bench pass without first proving why it moved). Time what is untimed, or
   assert the ratio only where the fixed cost is noise, and say in the assertion
   which it is. Neither checked, so neither filed as the fix.
+
+  **Cause established, and it was neither candidate.** The experiment that
+  settled it is one line: time the *same* whole twice. At 10 000 records it read
+  **39.2 ms then 31.1 ms** — 21%, which is the whole of the gap — against
+  519.3/511.5 at 100 000 (1.5%) and 8 593/8 565 at a million (0.3%). Nothing was
+  missing from the parts. The whole's *first* run at a size pays for the
+  allocator reaching that size, and `check_split` was comparing it against parts
+  that inherited the result warm.
+
+  Both candidates the row named were refuted before that, and both are recorded
+  rather than dropped (§10): `publish` and `key_select` are timed now — the
+  untimed `Zone::new`/`publish_dnskeys`/`publish_sync_records` and the key
+  selection — and both read **0.0 ms** at every size, so `Passes::total` is every
+  pass of the function now and the gap was never there. A process-level warm-up
+  at a *different* size moved 0.78 to 0.79-0.80 and no further, which is the
+  measurement that says the one-off scales with the zone rather than being paid
+  once per process.
+
+  **Fixed by discarding a run at the same size in each of the two callers**, not
+  by widening the band. `incremental_sign_cost_by_pass` is 3 of 3 green on Linux
+  where it was 2 of 3 failing, at ratios around 0.90; `full_sign_cost_by_pass` is
+  3 of 3. Windows stays green, both guards in one run, the 10 000-record
+  incremental row reading 49.9 ms against parts of 51.9 — 1.04, the high side,
+  which is the platform difference the 0.8 floor was quietly carrying. The
+  incremental run costs ~58 s where it cost ~49 s, and the full sign ~92 s. No failure of the full-sign guard was ever observed and the arithmetic
+  says why it had headroom: the same ~8 ms one-off is 3% of its 239 ms whole at
+  10 000 records, not a fifth.
+
+  **And `check_split`'s own doc had the mechanism backwards** — "wide on the
+  high side because the parts pay a cold allocator that the whole, timed first,
+  has already warmed". The whole pays it and the parts inherit it warm, which
+  pushes the ratio *down*. Struck in place; what the 1.25 side is for is
+  unmeasured and now says so.
 
 - **111c. What guards the copy.** Open, and it is the shape question. Three were
   named at triage and none built (§19 says build them, so this row is a
