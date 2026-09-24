@@ -524,29 +524,39 @@ impl Config {
     /// have an empty entry — applies to both.
     fn tsig_specs(&self) -> Result<Vec<String>> {
         let mut specs = Vec::new();
-        for (name, key) in &self.keys {
-            let secret = match (&key.secret, &key.secret_file) {
+        for (
+            name,
+            Key {
+                algorithm,
+                secret,
+                secret_file,
+                zones,
+                update_zones,
+            },
+        ) in &self.keys
+        {
+            let secret = match (secret, secret_file) {
                 (Some(secret), None) => secret.trim().to_string(),
                 (None, Some(file)) => read_secret_file(file)
                     .with_context(|| format!("the secret for TSIG key {name:?}"))?,
                 // `check` has already refused both and neither.
                 _ => unreachable!("checked in Config::check"),
             };
-            let mut spec = format!("{}:{name}:{secret}", key.algorithm);
+            let mut spec = format!("{algorithm}:{name}:{secret}");
             // The update scope is the fifth field, so granting one means
             // spelling the fourth: `*` is how the unrestricted transfer scope is
             // written when it cannot simply be left off the end.
-            if !key.zones.is_empty() || !key.update_zones.is_empty() {
+            if !zones.is_empty() || !update_zones.is_empty() {
                 spec.push(':');
-                if key.zones.is_empty() {
+                if zones.is_empty() {
                     spec.push('*');
                 } else {
-                    spec.push_str(&key.zones.join(","));
+                    spec.push_str(&zones.join(","));
                 }
             }
-            if !key.update_zones.is_empty() {
+            if !update_zones.is_empty() {
                 spec.push(':');
-                spec.push_str(&key.update_zones.join(","));
+                spec.push_str(&update_zones.join(","));
             }
             specs.push(spec);
         }
@@ -565,25 +575,56 @@ impl Config {
     /// thirty-six keys used to be assigned by hand here and in `rdnsr`, where
     /// a key with no assignment parsed and did nothing (`TODO.md` #103). What
     /// is left below is what is not a `[server]` key.
+    ///
+    /// The rest is destructured without `..`, so a key added to a declaration
+    /// does not compile until this names it, and one named and not used is
+    /// `unused_variables`. `dead_code` covered only a key nothing read; one
+    /// `check` validates and this forgot passed silently (`TODO.md` #113).
     pub(crate) fn apply(&self, cli: &mut Cli) -> Result<PerZone> {
-        self.server.apply_to(cli);
+        let Config {
+            server,
+            signing,
+            // `tsig_specs`, which destructures `Key` in turn.
+            keys: _,
+            zones,
+        } = self;
+        server.apply_to(cli);
         cli.tsig_key = self.tsig_specs()?;
         cli.secondary = self.secondary_specs();
         cli.catalog = self.catalog_specs();
 
-        if let Some(signing) = &self.signing {
-            cli.signing_key_dir = Some(signing.key_dir.clone());
-            cli.signature_validity = signing.validity_days;
-            cli.nsec3 = signing.nsec3;
-            cli.nsec3_opt_out = signing.nsec3_opt_out;
-            cli.require_signed = signing.require_signed;
+        if let Some(Signing {
+            key_dir,
+            validity_days,
+            nsec3,
+            nsec3_opt_out,
+            require_signed,
+        }) = signing
+        {
+            cli.signing_key_dir = Some(key_dir.clone());
+            cli.signature_validity = *validity_days;
+            cli.nsec3 = *nsec3;
+            cli.nsec3_opt_out = *nsec3_opt_out;
+            cli.require_signed = *require_signed;
         }
 
         let mut per_zone = PerZone::default();
-        for (zone, settings) in &self.zones {
+        for (zone, settings) in zones {
+            let ZoneConfig {
+                file,
+                // `zone_specs`, above: the `--secondary` and `--catalog` lists.
+                masters: _,
+                also_notify,
+                catalog: _,
+                groups,
+                nsec3,
+                nsec3_opt_out,
+                validity_days,
+                dnskey_rrsig,
+            } = settings;
             let origin = absolute(zone);
-            if let Some(file) = &settings.file {
-                if self.server.zone_dir.is_some() {
+            if let Some(file) = file {
+                if server.zone_dir.is_some() {
                     bail!(
                         "zone {zone:?} names a file and server.zone-dir is also set: \
                          a zone cannot come from two places, and guessing which \
@@ -597,33 +638,30 @@ impl Config {
                 // indication why. Here the operator has said the origin out loud.
                 per_zone.files.insert(origin.clone(), file.clone());
             }
-            if !settings.also_notify.is_empty() {
-                per_zone
-                    .notify
-                    .insert(origin.clone(), settings.also_notify.clone());
+            if !also_notify.is_empty() {
+                per_zone.notify.insert(origin.clone(), also_notify.clone());
             }
-            if !settings.groups.is_empty() {
+            if !groups.is_empty() {
                 per_zone.groups.insert(
                     origin.clone(),
-                    settings
-                        .groups
+                    groups
                         .iter()
-                        .map(|(name, rules)| GroupRule {
+                        .map(|(name, GroupConfig { masters })| GroupRule {
                             value: name.as_bytes().to_vec(),
                             name: name.clone(),
-                            masters: rules.masters.clone(),
+                            masters: masters.clone(),
                         })
                         .collect(),
                 );
             }
             let overrides = ZoneSigningOverride {
-                nsec3: settings.nsec3,
-                nsec3_opt_out: settings.nsec3_opt_out,
-                validity_days: settings.validity_days,
-                dnskey_rrsig: settings.dnskey_rrsig,
+                nsec3: *nsec3,
+                nsec3_opt_out: *nsec3_opt_out,
+                validity_days: *validity_days,
+                dnskey_rrsig: *dnskey_rrsig,
             };
             if overrides.is_set() {
-                if self.signing.is_none() {
+                if signing.is_none() {
                     bail!(
                         "zone {zone:?} has signing settings but there is no \
                          [signing] table, so nothing signs it"

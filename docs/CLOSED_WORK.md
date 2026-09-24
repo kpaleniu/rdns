@@ -9803,3 +9803,55 @@ Verified: 1 311 → 1 314 passed on Windows, 1 332 → 1 335 on Linux, 0 failed;
 clippy clean on both; `cargo doc --workspace --no-deps` clean.
 
 ---
+
+### 113. #103's projection sweep stopped at `[server]` — **filed 2026-09-21, closed 2026-09-24**
+
+`rdnsr/src/config.rs`'s `[resolver]` section lists its 11 fields three times: the
+declaration (:92-114), `impl Default` (:116-132) and `apply` (:360-374).
+`[server]`'s 22 keys come out of `rdns::server_table!` since #103; `[resolver]`
+and `[rpz]` were not swept, and the guard test is `[server]`-only —
+`every_server_key_reaches_its_flag`, config.rs:471.
+
+**#103's own narrowing says when this bites, and half of it is already true
+here.** Its finding was that `dead_code` does warn about a field nothing reads,
+so the silent case is the one where something *else* reads it — "a key that
+arrives with a validation rule". `[rpz]`'s keys have one: `check` parses
+`self.rpz.policy` (config.rs:297) and `apply` re-parses it under
+`expect("checked in Config::check")` (:379). A `[rpz]` key that `check` reads and
+`apply` forgets warns about nothing and does nothing.
+
+`[resolver]`'s 11 are read by `apply` alone today, so a forgotten one still
+warns. That is the shape one validation rule away from #103's silent case, not
+the case itself — which is why this row files the two sections together and names
+neither as a defect today.
+
+**Closed 2026-09-24.** Both halves of the row measured before fixing, by adding
+a key to each section: a `[resolver]` key nothing reads warns `field is never
+read`; an `[rpz]` key `check` reads and `apply` does not compiles clean. The row
+was right about both.
+
+**The shape is eight sections, not two.** Every table outside `[server]` is
+projected field by field: `rdnsr`'s `[resolver]`, `[rpz]`, `[[rpz.feeds]]` and
+`[keys.*]`, and `rdnsd`'s `[signing]`, `[keys.*]`, `[zones.*]` and its
+`.groups`. `rdnsd`'s `check` reads its sections too, so it had the silent case
+as much as `[rpz]` did.
+
+Fixed with exhaustive destructuring at each projection — `let Rpz { feeds,
+policy, notify_from } = rpz;`, no `..` — and the top-level `Config` in both
+daemons, so a new table is caught as well as a new key. A field added and not
+named is `E0027`; one named and not used is `unused_variables`. The same probe
+now fails to compile, naming the field. Not a macro: `server_table!` exists
+because two daemons share 22 keys (#63h), and none of these eight is shared.
+
+Two fields are named `_` at the site, each with the function that reads them:
+`[zones.*].masters` and `.catalog`, which `zone_specs` turns into the
+`--secondary` and `--catalog` lists. `[keys.*]` is destructured in
+`tsig_specs`, which `apply` calls. The feeds loop is one pass now rather than
+two, so one pattern covers all four `FeedEntry` fields.
+
+No behaviour change and no test change; the guard is the compiler, not a test.
+
+Verified: 1 314 passed on Windows, 1 335 on Linux, before and after, 0 failed;
+clippy clean on both; `cargo doc --workspace --no-deps` clean.
+
+---

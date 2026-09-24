@@ -206,8 +206,16 @@ impl Config {
     /// belong to a feed nobody uses this run.
     fn tsig_specs(&self) -> Vec<String> {
         let mut specs = Vec::new();
-        for (name, key) in &self.keys {
-            let secret = match (&key.secret, &key.secret_file) {
+        for (
+            name,
+            Key {
+                algorithm,
+                secret,
+                secret_file,
+            },
+        ) in &self.keys
+        {
+            let secret = match (secret, secret_file) {
                 (Some(secret), None) => secret.trim().to_string(),
                 (None, Some(file)) => match rdns::persist::read_secret(file, "a TSIG secret") {
                     Ok(secret) => secret,
@@ -223,7 +231,7 @@ impl Config {
                 // `check` has already refused both and neither.
                 _ => continue,
             };
-            specs.push(format!("{}:{name}:{secret}", key.algorithm));
+            specs.push(format!("{algorithm}:{name}:{secret}"));
         }
         specs
     }
@@ -354,65 +362,95 @@ impl Config {
     /// file produce the same shape, so there is one code path and not two to
     /// drift apart (`CLAUDE.md` §7). It is sound because the two are mutually
     /// exclusive — nothing in `cli` can be an operator's explicit choice here.
+    ///
+    /// Every table is destructured without `..`, so a key added to a
+    /// declaration does not compile until this names it, and one named and not
+    /// used is `unused_variables`. `dead_code` covered only a key nothing read;
+    /// one `check` validates and this forgot passed silently (`TODO.md` #113,
+    /// #103). `[server]`'s projection is `server_table!`'s.
     pub(crate) fn apply(&self, cli: &mut Cli) {
-        self.server.apply_to(cli);
+        let Config {
+            server,
+            resolver,
+            rpz,
+            // `tsig_specs`, below, which destructures `Key` in turn.
+            keys: _,
+        } = self;
+        server.apply_to(cli);
 
-        cli.upstream = self.resolver.upstream.clone();
-        cli.root_hints = self.resolver.root_hints.clone();
-        cli.cache_size = self.resolver.cache_size;
-        cli.no_cache = self.resolver.no_cache;
-        cli.dnssec_validate = self.resolver.dnssec_validate;
-        cli.trust_anchor = self.resolver.trust_anchor.clone();
-        cli.auto_trust_anchor = self.resolver.auto_trust_anchor.clone();
-        cli.serve_stale = self.resolver.serve_stale;
-        cli.prefetch = self.resolver.prefetch;
-        cli.dns64 = match &self.resolver.dns64 {
+        let ResolverSection {
+            upstream,
+            root_hints,
+            cache_size,
+            no_cache,
+            dnssec_validate,
+            trust_anchor,
+            auto_trust_anchor,
+            serve_stale,
+            prefetch,
+            dns64,
+            dns64_exclude,
+        } = resolver;
+        cli.upstream = upstream.clone();
+        cli.root_hints = root_hints.clone();
+        cli.cache_size = *cache_size;
+        cli.no_cache = *no_cache;
+        cli.dnssec_validate = *dnssec_validate;
+        cli.trust_anchor = trust_anchor.clone();
+        cli.auto_trust_anchor = auto_trust_anchor.clone();
+        cli.serve_stale = *serve_stale;
+        cli.prefetch = *prefetch;
+        cli.dns64 = match dns64 {
             Some(Dns64::On(true)) => Some(rdns::dns64::WELL_KNOWN_PREFIX.to_string()),
             Some(Dns64::On(false)) | None => None,
             Some(Dns64::Prefix(prefix)) => Some(prefix.clone()),
         };
-        cli.dns64_exclude = self.resolver.dns64_exclude.clone();
+        cli.dns64_exclude = dns64_exclude.clone();
 
-        if let Some(policy) = &self.rpz.policy {
+        let Rpz {
+            feeds,
+            policy,
+            notify_from,
+        } = rpz;
+        if let Some(policy) = policy {
             // `check` has already parsed it.
             cli.rpz_policy = policy.parse().expect("checked in Config::check");
         }
         // The global is the default for a feed that does not say, so it is read
         // after being overwritten above and not from the file again.
         let global = cli.rpz_policy;
-        cli.rpz_feeds = self
-            .rpz
-            .feeds
-            .iter()
-            .map(|feed| {
-                let policy = match &feed.policy {
-                    Some(policy) => policy.parse().expect("checked in Config::check"),
-                    None => global,
-                };
-                rdns::rpz::Feed::new(feed.file.clone(), policy)
-            })
-            .collect();
-        cli.rpz_masters = self
-            .rpz
-            .feeds
-            .iter()
-            .filter_map(|feed| {
-                let master = feed.master.as_ref()?;
-                Some(TransferredFeed {
+        cli.rpz_feeds = Vec::with_capacity(feeds.len());
+        cli.rpz_masters = Vec::new();
+        for FeedEntry {
+            file,
+            master,
+            policy,
+            on_expire,
+        } in feeds
+        {
+            let policy = match policy {
+                Some(policy) => policy.parse().expect("checked in Config::check"),
+                None => global,
+            };
+            cli.rpz_feeds
+                .push(rdns::rpz::Feed::new(file.clone(), policy));
+            // `check` refuses `on-expire` without `master`, so skipping it
+            // here drops nothing.
+            if let Some(master) = master {
+                cli.rpz_masters.push(TransferredFeed {
                     spec: MasterSpec::parse(master).expect("checked in Config::check"),
                     // Filled in by `serve`, which owns the keyring: `check` has
                     // already refused a name that defines nothing.
                     key: None,
-                    file: feed.file.clone(),
-                    on_expire: feed
-                        .on_expire
+                    file: file.clone(),
+                    on_expire: on_expire
                         .as_deref()
                         .map(|text| text.parse().expect("checked in Config::check"))
                         .unwrap_or_default(),
-                })
-            })
-            .collect();
-        cli.rpz_notify_from = self.rpz.notify_from.clone();
+                });
+            }
+        }
+        cli.rpz_notify_from = notify_from.clone();
         cli.tsig_key = self.tsig_specs();
     }
 }
