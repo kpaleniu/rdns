@@ -37,10 +37,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#110**, **#112**-**#114**, **#116**, plus **#21**, as of
+**#58**, **#68**, **#112**-**#114**, **#116**, plus **#21**, as of
 2026-09-24 — the seven filed out of the architecture review are closed, nine
-more were filed, and #107-#109, #111 and #115 are closed out of the triage
-passes. #116 is #109's test half.
+more were filed, and #107-#111 and #115 are closed out of the triage passes. #116 is #109's test half.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -6843,37 +6842,6 @@ but the harness and `Server`'s `pub(crate)` surface. No remedy costed.
 
 ---
 
-### 110. Four copies of the eviction idiom `Halving` exists to stop — **filed 2026-09-21**
-
-`rdns/src/eviction.rs:1-17`: "This is that halving, moved (`CLAUDE.md` §7), and
-the reason is here so the next copy is not written." Three maps call it —
-`cache.rs:379`, `negative_cache.rs:346`, `nsec_cache.rs:963`. Four sites still
-write the idiom it replaced, `min_by_key` plus a key clone, one victim per
-insert:
-
-- `resolver/caches.rs:119-131`, `DelegationCache::insert`
-- `resolver/caches.rs:273-285`, `KeyCache::insert` — the same eight lines
-- `nsec_cache.rs:912-918`, `insert_bounded_map`
-- `nsec_cache.rs:939-945`, `insert_bounded`
-
-**One of the four says why it declines, and the reason holds**: nsec_cache.rs:924
-— "this bound is per zone and a constant, so the scan cannot grow with anything
-an operator or a stranger sets, and halving would throw away 128 validated proofs
-to save it". Its twin twenty lines above carries no such sentence and differs
-only in `HashMap` against `BTreeMap`.
-
-The two in `resolver/caches.rs` carry no reason, **and their bound is
-operator-set**: `--delegation-cache-size`, 10 000 by default (resolver.rs:257,
-:344), on the resolver's request path, under the map's own mutex.
-
-**The measurement that could refute this row**: at 10 000 entries the scan is
-cheap enough not to matter. It has not been taken here. `eviction.rs`'s 14.6 µs
-against 0.26 was measured for a different map at `rdnsr`'s default bound, so
-quoting it for this one would be §4's "never state what a function does without
-opening it" wearing a benchmark's clothes. Measure before changing.
-
----
-
 ### 112. Price the reload cluster's constructors — **filed 2026-09-21**
 
 #83's own follow-up, in its words: "give `Reloading` and `ReloadContext`
@@ -7129,6 +7097,7 @@ the week; the record is under "How the queue kept going stale" in
 | **107** | eleven wall-clock reads inside a request path, in the crate #92 did not count | **filed 2026-09-21, closed 2026-09-22**. The eleven are exact and the crate held **fifteen**: the other four are two constructors, a background timer — #92's own category — and `DnssecValidator::validate_rrset`, which is not. `NsecCache`, `DelegationCache` and `KeyCache` take a `Clock` now, `Resolver` holds one and `validate` reads it; the two resolver caches *require* it, since both are `pub(super)` with one production caller, so a cache built without one does not compile (§17). Two tests that could not be written now are: a proof live at +0, +1 800 and +3 599 and gone at +3 601, and a delegation inserted through the public path instead of forged through the mutex — the forgery existed because `insert` clamps `expires_at` to `now + ttl`. **`validate_rrset` declines and the measurement is why**: it is request-reachable, though not by the route triage first named (`dispatch.rs:2433` is `#[cfg(test)]`; the real one is the UPDATE path's pre-install `FreshlySigned::verify`), and the instant it wants is choosable through `SigningPolicy` — #92's own criterion. `clock.rs`'s sentence is struck and corrected, which is what the row was filed for |
 | **108** | `min(SOA MINIMUM, the SOA's own TTL)` written five times | **filed 2026-09-21, closed 2026-09-24**. `Ttl::negative_answer(soa_ttl, minimum)` in `rdns-core::codes`, and the five call it. **The open shape question picked the signature**: four sites hold a record — two `ZoneRecordRef`, two `ResourceRecord`, all four spelling the inputs `ttl` and `rdata.soa_minimum()` — but `zone_signer` holds the `(Ttl, u32)` that `carry_over_records` split out of the SOA 200 lines earlier, so a record-shaped helper would have missed the one site the defect was found in. A sixth candidate is not one: `rdnsr/src/answer.rs:1087` hands the client both numbers and says so. **The larger half is the one the row did not name.** Behaviour is unchanged, so the only thing that can be watched failing is the drift — and reverting `negative_answer` to each one-term spelling found that **not one of the five sites had a test for both**: `rdnsd/answer` had neither, `zone_signer` had only #111c's split guard (which fires because the harness re-spells the rule), `dnssec_answer` had the SOA-TTL direction only and the two caches the mirror of it. Every gap is a fixture: three are `$TTL 3600` over `minimum 300`, #73's masking direction a third time, and the answer path cannot show MINIMUM winning over a zone *this* server signed, because the signer capped the chain first. Five tests added, each watched failing; both drifts now fail at all five sites. 1 304 → 1 309 passed on Windows, 1 330 on Linux, 0 failed |
 | **109** | `struct Server` in the crate root, its implementation in `dispatch` | **filed 2026-09-21, closed 2026-09-24**. `Server` and `UpdateHandling` moved to `dispatch.rs` with all 15 fields private; the root builds one with `Server::new` and six `with_*`, and reads `ctx()`, `tsig_keys()`, `zone_context()`. 13 `pub(crate)` items against 15 fields hidden, #83's predicted loss; paid for by nothing outside `dispatch` reading an ACL, a keyring or the UPDATE lock, and by six test literals losing their refusing defaults. The row counted 2 literals and there were 7. The test half is #116. See `docs/CLOSED_WORK.md` |
+| **110** | one-victim eviction scans left after `Halving` | **filed 2026-09-21, closed 2026-09-24**. Measured before changing, as the row asked: 17-21 µs per insert at the default 10 000, 2.7-8.6 ms at a million, linear in `--delegation-cache-size`, against 0.1 µs with room — #33a's cost again. Five sites, not four: `RttStore` scanned for the slowest server and ranks by speed, so the grep missed it. All three resolver maps halve through `crate::eviction`; `RttStore` slowest first. The two in `nsec_cache` stay, both with the reason. Guard watched failing at 357-418x. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 

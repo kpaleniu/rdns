@@ -9669,3 +9669,71 @@ Verified: 1 309 passed on Windows before and after, 1 330 on Linux, 0 failed;
 clippy clean on both; `cargo doc --workspace --no-deps` clean.
 
 ---
+
+### 110. Four copies of the eviction idiom `Halving` exists to stop — **filed 2026-09-21, closed 2026-09-24**
+
+`rdns/src/eviction.rs:1-17`: "This is that halving, moved (`CLAUDE.md` §7), and
+the reason is here so the next copy is not written." Three maps call it —
+`cache.rs:379`, `negative_cache.rs:346`, `nsec_cache.rs:963`. Four sites still
+write the idiom it replaced, `min_by_key` plus a key clone, one victim per
+insert:
+
+- `resolver/caches.rs:119-131`, `DelegationCache::insert`
+- `resolver/caches.rs:273-285`, `KeyCache::insert` — the same eight lines
+- `nsec_cache.rs:912-918`, `insert_bounded_map`
+- `nsec_cache.rs:939-945`, `insert_bounded`
+
+**One of the four says why it declines, and the reason holds**: nsec_cache.rs:924
+— "this bound is per zone and a constant, so the scan cannot grow with anything
+an operator or a stranger sets, and halving would throw away 128 validated proofs
+to save it". Its twin twenty lines above carries no such sentence and differs
+only in `HashMap` against `BTreeMap`.
+
+The two in `resolver/caches.rs` carry no reason, **and their bound is
+operator-set**: `--delegation-cache-size`, 10 000 by default (resolver.rs:257,
+:344), on the resolver's request path, under the map's own mutex.
+
+**The measurement that could refute this row**: at 10 000 entries the scan is
+cheap enough not to matter. It has not been taken here. `eviction.rs`'s 14.6 µs
+against 0.26 was measured for a different map at `rdnsr`'s default bound, so
+quoting it for this one would be §4's "never state what a function does without
+opening it" wearing a benchmark's clothes. Measure before changing.
+
+**Closed 2026-09-24.** The measurement the row asked for, taken with a
+throwaway release-mode probe: fill to the bound with live entries, time new
+inserts, against the same map at four times the bound. Windows twice, Linux
+once, within 20% of each other:
+
+| bound | insert at the bound | with room | `best_match` on the same lock |
+|---|---|---|---|
+| 1 000 | 1.8-3.3 µs | 0.03-0.1 µs | 0.1 µs |
+| **10 000** (default) | **17-21 µs** | 0.04-0.1 µs | 0.1 µs |
+| 100 000 | ~210 µs | 0.04-0.2 µs | 0.2 µs |
+| 1 000 000 | 2.7-8.6 ms | 0.1-0.3 µs | 0.3 µs |
+
+It does not refute the row: at the default the cost is #33a's 14.6 µs again,
+and it is linear in `--delegation-cache-size`. An insert is one referral to a
+zone not yet cached, which a client can ask for — reasoned, not provoked.
+
+**The count was four and is five.** `RttStore::record` (caches.rs:203) scanned
+with `max_by` for the slowest server on every new address, under the same
+bound, at the same cost. It did not match the row's `min_by_key` grep because
+it ranks by speed rather than expiry.
+
+What shipped: all three resolver maps halve through `crate::eviction` via one
+`halve` in `resolver/caches.rs` — the two caches by expiry after dropping the
+expired, `RttStore` slowest first, ranked by the complement of the SRTT's bits.
+Halving an RTT table was the owner's call; an entry lost costs a server tried
+in a worse order, never an answer. `insert_bounded_map` got the reason its
+twin carries. `eviction.rs`'s own count of the maps it serves was wrong and is
+struck.
+
+Guard: `inserting_at_the_bound_costs_what_inserting_with_room_does`, a ratio
+over all three maps at the default bound, watched failing against the one-victim
+scan — 357-418x in a debug build — and passing five runs of the parallel lib
+suite.
+
+Verified: 1 309 → 1 311 passed on Windows, 1 332 on Linux, 0 failed; clippy
+clean on both; `cargo doc --workspace --no-deps` clean.
+
+---

@@ -16,6 +16,7 @@
 // The parent's `use` block, not a copy per file: these three are continuations
 // of one `impl Resolver`, and a second import list is a second thing to drift.
 use super::*;
+use crate::eviction::Halving;
 
 /// Servers already learned for a zone, so a resolution can start partway down
 /// the tree rather than paying a root round trip per client query.
@@ -121,17 +122,8 @@ impl DelegationCache {
         if entries.len() >= self.capacity {
             let now = self.clock.now();
             entries.retain(|_, e| e.expires_at > now);
-            // Still full of live entries: drop whichever expires soonest, since
-            // it is the one we lose the least by re-learning.
-            if entries.len() >= self.capacity {
-                if let Some(soonest) = entries
-                    .iter()
-                    .min_by_key(|(_, e)| e.expires_at)
-                    .map(|(k, _)| k.clone())
-                {
-                    entries.remove(&soonest);
-                }
-            }
+            // Soonest to expire first: the least lost by re-learning.
+            halve(&mut entries, self.capacity, |e| e.expires_at);
         }
 
         entries.insert(
@@ -198,13 +190,11 @@ impl RttStore {
         match m.get_mut(server) {
             Some(srtt) => *srtt = (1.0 - RTT_ALPHA) * *srtt + RTT_ALPHA * sample_ms,
             None => {
-                // At capacity, drop the slowest entry: least lost by
-                // re-learning it as unknown.
+                // At capacity, slowest first: least lost by re-learning it as
+                // unknown. For a non-negative `f64` the bit pattern orders as
+                // the value does, so its complement puts the slowest lowest.
                 if m.len() >= self.capacity {
-                    if let Some(worst) = m.iter().max_by(|a, b| a.1.total_cmp(b.1)).map(|(k, _)| *k)
-                    {
-                        m.remove(&worst);
-                    }
+                    halve(&mut m, self.capacity, |srtt| !srtt.max(0.0).to_bits());
                 }
                 m.insert(*server, sample_ms);
             }
@@ -283,15 +273,7 @@ impl KeyCache {
         if entries.len() >= self.capacity {
             let now = self.clock.now();
             entries.retain(|_, e| e.expires_at > now);
-            if entries.len() >= self.capacity {
-                if let Some(soonest) = entries
-                    .iter()
-                    .min_by_key(|(_, e)| e.expires_at)
-                    .map(|(k, _)| k.clone())
-                {
-                    entries.remove(&soonest);
-                }
-            }
+            halve(&mut entries, self.capacity, |e| e.expires_at);
         }
         entries.insert(
             zone.folded().into_owned().into_boxed_slice(),
@@ -304,6 +286,20 @@ impl KeyCache {
 
     pub(super) fn holds(&self, zone: NameRef<'_>) -> bool {
         self.get(zone).is_some()
+    }
+}
+
+/// Cut a full map to half its `capacity`, lowest `rank` going first.
+///
+/// All three maps here share `--delegation-cache-size`, an operator's number,
+/// and one victim per insert was a scan per insert under the map's lock:
+/// 17-21 µs at the default 10 000 against 0.1 with room, 5-9 ms at a million
+/// (`TODO.md` #110). The halving and why it admits ties are
+/// [`crate::eviction`]'s.
+fn halve<K, V>(map: &mut HashMap<K, V>, capacity: usize, rank: impl Fn(&V) -> u64) {
+    let ranks = map.values().map(&rank).collect();
+    if let Some(mut plan) = Halving::plan(ranks, capacity / 2) {
+        map.retain(|_, v| plan.keep(rank(v)));
     }
 }
 
@@ -363,6 +359,97 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert!(!m.contains_key(&a), "the slowest entry is dropped");
         assert!(m.contains_key(&b) && m.contains_key(&c));
+    }
+
+    #[test]
+    fn test_rtt_store_halves_keeping_the_fastest() {
+        let store = RttStore::new(4);
+        let at = |i: u8| SocketAddr::from(([192, 0, 2, i], 53));
+        for (i, ms) in [(1, 40.0), (2, 10.0), (3, 30.0), (4, 20.0)] {
+            store.record(&at(i), ms);
+        }
+        store.record(&at(5), 500.0);
+
+        let m = store.rtts.lock().unwrap();
+        let mut kept: Vec<_> = m.keys().copied().collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![at(2), at(4), at(5)],
+            "the two fastest, and the newcomer"
+        );
+    }
+
+    /// #110's measurement as an assertion, for all three maps: an insert at the
+    /// bound costs what one with room does. A ratio, not a floor (`CLAUDE.md`
+    /// §10). At `rdnsr`'s default bound.
+    #[test]
+    fn inserting_at_the_bound_costs_what_inserting_with_room_does() {
+        const BOUND: usize = 10_000;
+        let names: Vec<Name> = (0..2 * BOUND)
+            .map(|i| nm(&format!("z{i}.example.")))
+            .collect();
+        let ttl = |i: usize| 3600 + (i % 1000) as u64;
+        let server: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let clock = Clock::fixed(1_000_000_000);
+
+        let failures: Vec<String> = [
+            costs_more_at_the_bound(
+                "DelegationCache",
+                BOUND,
+                |capacity| DelegationCache::new(capacity, clock.clone()),
+                |cache, i| cache.insert(names[i].as_ref(), vec![server], Vec::new(), ttl(i)),
+            ),
+            costs_more_at_the_bound(
+                "KeyCache",
+                BOUND,
+                |capacity| KeyCache::new(capacity, clock.clone()),
+                |cache, i| {
+                    let key = Dnskey {
+                        owner: names[i].clone(),
+                        flags: 257,
+                        protocol: 3,
+                        algorithm: 13,
+                        public_key: vec![0; 64],
+                    };
+                    cache.insert(names[i].as_ref(), vec![key], ttl(i));
+                },
+            ),
+            costs_more_at_the_bound("RttStore", BOUND, RttStore::new, |store, i| {
+                let server = SocketAddr::from(([10, (i >> 16) as u8, (i >> 8) as u8, i as u8], 53));
+                store.record(&server, (i % 500) as f64);
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        assert!(
+            failures.is_empty(),
+            "an insert at the bound cost more than one with room to spare; eviction \
+             is scanning for one victim per insert again: {failures:?}"
+        );
+    }
+
+    /// Fill a map to `bound`, then time `bound` more inserts into one built with
+    /// `bound` as its capacity and into one with room to spare. `None` if the
+    /// two cost the same, within a factor of three.
+    fn costs_more_at_the_bound<C>(
+        what: &str,
+        bound: usize,
+        make: impl Fn(usize) -> C,
+        insert: impl Fn(&C, usize),
+    ) -> Option<String> {
+        let time = |capacity: usize| {
+            let map = make(capacity);
+            (0..bound).for_each(|i| insert(&map, i));
+            let start = std::time::Instant::now();
+            (bound..2 * bound).for_each(|i| insert(&map, i));
+            start.elapsed()
+        };
+        let with_room = time(bound * 4);
+        let at_the_bound = time(bound);
+        let ratio = at_the_bound.as_secs_f64() / with_room.as_secs_f64().max(1e-9);
+        (ratio >= 3.0).then(|| format!("{what}: {ratio:.1}x ({with_room:?} -> {at_the_bound:?})"))
     }
 
     #[test]

@@ -1,11 +1,15 @@
 //! Halving a bounded cache, in one place.
 //!
-//! Three of this crate's five bounded maps evict on expiry, and they got it
-//! right in different orders: [`crate::cache`] halves with `select_nth_unstable`
-//! and admits ties, [`crate::negative_cache`] and [`crate::nsec_cache`] each
-//! took a `min_by_key` scan plus a key clone per victim — O(n²) with the global
-//! lock held, measured at 14.6 µs per insert against 0.26 for the fixed sibling,
-//! at `rdnsr`'s default bound (`TODO.md` #33a). This is that halving, moved
+//! ~~Three of this crate's five bounded maps evict on expiry~~ — the count
+//! missed the resolver's delegation, key and RTT maps, which had the same
+//! one-victim scan under an operator-set bound and halve here since `TODO.md`
+//! #110; the two scans left in [`crate::nsec_cache`] say why they stay. The
+//! answer caches got it right in different orders: [`crate::cache`] halves
+//! with `select_nth_unstable` and admits ties, [`crate::negative_cache`] and
+//! [`crate::nsec_cache`] each took a `min_by_key` scan plus a key clone per
+//! victim — O(n²) with the global lock held, measured at 14.6 µs per insert
+//! against 0.26 for the fixed sibling, at `rdnsr`'s default bound
+//! (`TODO.md` #33a). This is that halving, moved
 //! (`CLAUDE.md` §7), and the reason is here so the next copy is not written:
 //!
 //! - **One victim per insert is the quadratic.** Once a bounded cache is full it
@@ -29,7 +33,8 @@ pub(crate) struct Halving {
 
 impl Halving {
     /// Plan a pass leaving `target` of `expiries` alive, soonest to expire going
-    /// first. `None` when nothing has to go.
+    /// first. `None` when nothing has to go. Any `u64` rank works, lowest going
+    /// first; the resolver's RTT map ranks by speed.
     ///
     /// `expiries` is consumed: [`slice::select_nth_unstable`] partitions in O(n)
     /// average, in place, without sorting.

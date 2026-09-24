@@ -913,6 +913,9 @@ fn with_ttl(records: &[ResourceRecord], ttl: u32) -> Vec<ResourceRecord> {
 /// otherwise the entry closest to expiring. A zone can hold a wildcard per type
 /// at every level, and this is bounded for the same reason everything else here
 /// is — the alternative is unbounded.
+///
+/// One victim, for [`insert_bounded`]'s reason: the bound is a per-zone
+/// constant, 64.
 fn insert_bounded_map(
     map: &mut HashMap<(Name, Qtype), CachedWildcard>,
     key: (Name, Qtype),
