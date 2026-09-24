@@ -33,6 +33,9 @@ tracing-subscriber.workspace = true
 # same dev-dependency and flags `rdns` and `rdns-transport` use — one version in
 # the lock rather than three, and zero runtime packages.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+# `tokio::time::pause`, so the re-signing timer — hours long — can be tested
+# (`TODO.md` #112). A feature of a package already in the lock, not a package.
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 # Swap in DHAT's allocator shim and write `dhat-heap.json` on exit. Never on by

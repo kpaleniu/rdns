@@ -6578,6 +6578,159 @@ ns.plain  IN A   192.0.2.30
         );
     }
 
+    /// A zone directory holding one unsigned zone, and a `ReloadContext` over
+    /// it serving into `zone_map`. `signing` as the caller has it.
+    fn maintained(
+        dir: &ScratchDir,
+        zone_map: &Arc<RwLock<Zones>>,
+        signing: Option<ZoneSigning>,
+    ) -> ReloadContext {
+        std::fs::write(
+            dir.path().join("example.com.zone"),
+            "$TTL 3600\n\
+             @ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n\
+             @ IN NS ns.example.com.\n\
+             ns IN A 192.0.2.1\n",
+        )
+        .expect("the zone file");
+        ReloadContext {
+            reloading: Reloading {
+                replicating: false,
+                allow_partial: false,
+                secondaries: Arc::new(Secondaries::default()),
+                zone_dir: None,
+                signing: signing.map(Arc::new),
+                validator: Arc::new(DnssecValidator::new(false)),
+                proved: ProvenSigning::default(),
+                files: LoadedFiles::default(),
+            },
+            source: ZoneSource::Directory(dir.path().to_string_lossy().to_string()),
+            served: served(zone_map, &Arc::new(RwLock::new(DeltaLog::new()))),
+            notify: Arc::new(NotifyPolicy::default()),
+            tls: None,
+        }
+    }
+
+    /// `spawn_zone_maintenance` had no test (`TODO.md` #112). Two requests sent
+    /// back to back both get an answer — the second waits for the depth-1
+    /// channel's slot rather than being dropped — and a stop ends the task and
+    /// lets the drain finish.
+    #[tokio::test]
+    async fn zone_maintenance_answers_every_control_reload_and_ends_on_stop() {
+        let dir = ScratchDir::new("maintenance-control");
+        let zone_map = Arc::new(RwLock::new(Zones::default()));
+        let shutdown = Shutdown::new();
+        let reloads = spawn_zone_maintenance(
+            maintained(&dir, &zone_map, None),
+            Vec::new(),
+            shutdown.lifecycle(),
+        );
+
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            reloads
+                .send(ReloadTrigger::Control(tx))
+                .await
+                .expect("the task is listening");
+            replies.push(rx);
+        }
+        for rx in replies {
+            let outcome = tokio::time::timeout(Duration::from_secs(10), rx)
+                .await
+                .expect("answered in time")
+                .expect("answered at all");
+            assert_eq!(outcome, Ok(1));
+        }
+        assert!(zone_map
+            .read()
+            .await
+            .matching(nm("example.com.").as_ref())
+            .is_some());
+
+        shutdown.begin();
+        assert!(
+            shutdown.drain(Duration::from_secs(5)).await,
+            "the maintenance task still held its Busy after the stop"
+        );
+    }
+
+    /// No keys, no timer: a server with nothing to re-sign does not reload on a
+    /// schedule nobody asked for. A year of paused time passes and the map
+    /// stays as it was.
+    #[tokio::test(start_paused = true)]
+    async fn an_unsigned_server_never_reloads_on_a_timer() {
+        let dir = ScratchDir::new("maintenance-unsigned");
+        let zone_map = Arc::new(RwLock::new(Zones::default()));
+        let _reloads = spawn_zone_maintenance(
+            maintained(&dir, &zone_map, None),
+            Vec::new(),
+            test_shutdown().lifecycle(),
+        );
+
+        tokio::time::sleep(Duration::from_secs(365 * 86_400)).await;
+        assert!(
+            zone_map
+                .read()
+                .await
+                .matching(nm("example.com.").as_ref())
+                .is_none(),
+            "a timer reloaded an unsigned server"
+        );
+    }
+
+    /// A signed server reloads on its re-signing interval with nobody asking.
+    /// Paused time: the interval is hours.
+    #[tokio::test(start_paused = true)]
+    async fn a_signed_server_reloads_on_its_timer() {
+        use clap::Parser;
+        use rdns::dnssec::DNSKEY_FLAG_ZONE;
+        use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
+
+        let dir = ScratchDir::new("maintenance-signed");
+        let key_dir = dir.path().join("keys");
+        std::fs::create_dir_all(&key_dir).expect("the key directory");
+        SigningKey::generate(SigningAlgorithm::Ed25519, "example.com.", DNSKEY_FLAG_ZONE)
+            .expect("a key")
+            .write_to_dir(&key_dir)
+            .expect("the key file");
+        let mut cli = Cli::parse_from(["rdnsd"]);
+        cli.signing_key_dir = Some(key_dir);
+        let signing = ZoneSigning::load(&cli, &BTreeMap::new())
+            .expect("the keys load")
+            .expect("a key directory means signing");
+        let interval = signing.resign_interval();
+
+        let zone_map = Arc::new(RwLock::new(Zones::default()));
+        let _reloads = spawn_zone_maintenance(
+            maintained(&dir, &zone_map, Some(signing)),
+            Vec::new(),
+            test_shutdown().lifecycle(),
+        );
+
+        tokio::time::sleep(interval / 2).await;
+        assert!(
+            zone_map
+                .read()
+                .await
+                .matching(nm("example.com.").as_ref())
+                .is_none(),
+            "reloaded before the interval"
+        );
+
+        // Auto-advance is held off while the load runs on the blocking pool, so
+        // a sleep past the interval wakes after the reload, not during it.
+        tokio::time::sleep(interval / 2 + Duration::from_secs(1)).await;
+        assert!(
+            zone_map
+                .read()
+                .await
+                .matching(nm("example.com.").as_ref())
+                .is_some(),
+            "no reload within one re-signing interval"
+        );
+    }
+
     /// What a reload costs when no zone file moved (`TODO.md` #64f).
     ///
     /// `#[ignore]`d and refused in debug, like the update benchmarks it shares

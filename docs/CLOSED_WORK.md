@@ -9737,3 +9737,69 @@ Verified: 1 309 → 1 311 passed on Windows, 1 332 on Linux, 0 failed; clippy
 clean on both; `cargo doc --workspace --no-deps` clean.
 
 ---
+
+### 112. Price the reload cluster's constructors — **filed 2026-09-21, closed 2026-09-24**
+
+#83's own follow-up, in its words: "give `Reloading` and `ReloadContext`
+constructors and the 13 fields stay private — 5 `pub(crate)` against 1, still a
+loss, but a close one. That is a different change from moving a file, and it is
+the one somebody should price if this comes back."
+
+Re-measured 2026-09-21, and one number has moved in its favour. **The cluster's
+reach-backs into `main`'s locals are 0.** #83 predicted the NOTIFY split would
+remove the one it counted, and it did: the only cross-module reference in
+main.rs:1387-1730 is `crate::notify_out::announce_zones` at :1596, which is a
+sibling module and not the root. The 13 fields are confirmed — `Reloading` 8,
+`ReloadContext` 5 — and one of the five items is **already** named from outside
+the root: `control.rs:25` reads `use crate::{ReloadTrigger, ZoneContext};`, so
+that one is paid whether or not anything moves.
+
+**What makes it worth pricing is a test, not a file length.**
+`spawn_zone_maintenance` (main.rs:1634, 82 lines) has no test — two occurrences
+of the name in the file, its definition and `main`'s call. Its two non-obvious
+behaviours are asserted by comments only: the depth-1 channel, so a second
+`rdnsctl reload` arriving during one waits for a slot rather than piling up
+(:1663-1667), and the keepalive sender clone that stops `recv` returning `None`
+when no control socket is configured (:1668-1672). `sleep_for`'s timer is
+`tokio::time::sleep`, which `tokio::time::pause()` moves with no new parameter ~~—
+so the timer is not what blocks the test. The struct literals in `main` are.~~
+**Both halves wrong, found on closing**: `pause` needs tokio's `test-util`
+feature, which nothing enabled, and the test module already built three
+`Reloading` literals (`main.rs:5754`, `:6504`, `:6622`) — one inside a
+`ReloadContext` — because private in the root is visible to its tests. Nothing
+blocked the test but its not having been written.
+
+**Closed 2026-09-24: constructors declined, the test written.** With the
+literals refuted, what is left for constructors is #83's visibility trade — 5
+`pub(crate)` against 1 to seal 13 fields — and that has no test to pay for it
+now. Declined on #83's own number.
+
+The test gap was the real finding, and it is closed:
+
+- `zone_maintenance_answers_every_control_reload_and_ends_on_stop`: two
+  `rdnsctl reload`s sent back to back both get `Ok(1)` — the second waits for
+  the depth-1 slot — and after the stop the drain completes.
+- `an_unsigned_server_never_reloads_on_a_timer`: a year of paused time, no
+  reload.
+- `a_signed_server_reloads_on_its_timer`: nothing at half the interval, the
+  zone served just past it. Auto-advance is held off while the load is on the
+  blocking pool, so one sleep lands after the reload.
+
+Each watched failing against its own mutation: drop the `stop.wait()` arm,
+make `sleep_for(None)` an hour, drop the timer arm.
+
+**The keepalive clone is not observable, and that is recorded rather than
+fixed.** Replacing it with `drop(keepalive)` passes all three. `select!`
+disables an arm whose pattern does not match, so `Some(trigger) =
+receiver.recv()` getting `None` is a disabled arm, not a busy loop. The comment
+at the clone says a `None` *branch* would be a busy loop or a dead arm, which
+is true of a branch and not the claim the row read into it; the clone is
+harmless and one line.
+
+`tokio`'s `test-util` is a dev-dependency feature of `rdnsd`: `Cargo.lock` did
+not move.
+
+Verified: 1 311 → 1 314 passed on Windows, 1 332 → 1 335 on Linux, 0 failed;
+clippy clean on both; `cargo doc --workspace --no-deps` clean.
+
+---

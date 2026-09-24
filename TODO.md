@@ -37,9 +37,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#112**-**#114**, **#116**, plus **#21**, as of
+**#58**, **#68**, **#113**, **#114**, **#116**, plus **#21**, as of
 2026-09-24 — the seven filed out of the architecture review are closed, nine
-more were filed, and #107-#111 and #115 are closed out of the triage passes. #116 is #109's test half.
+more were filed, and #107-#112 and #115 are closed out of the triage passes. #116 is #109's test half.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -6842,34 +6842,6 @@ but the harness and `Server`'s `pub(crate)` surface. No remedy costed.
 
 ---
 
-### 112. Price the reload cluster's constructors — **filed 2026-09-21**
-
-#83's own follow-up, in its words: "give `Reloading` and `ReloadContext`
-constructors and the 13 fields stay private — 5 `pub(crate)` against 1, still a
-loss, but a close one. That is a different change from moving a file, and it is
-the one somebody should price if this comes back."
-
-Re-measured 2026-09-21, and one number has moved in its favour. **The cluster's
-reach-backs into `main`'s locals are 0.** #83 predicted the NOTIFY split would
-remove the one it counted, and it did: the only cross-module reference in
-main.rs:1387-1730 is `crate::notify_out::announce_zones` at :1596, which is a
-sibling module and not the root. The 13 fields are confirmed — `Reloading` 8,
-`ReloadContext` 5 — and one of the five items is **already** named from outside
-the root: `control.rs:25` reads `use crate::{ReloadTrigger, ZoneContext};`, so
-that one is paid whether or not anything moves.
-
-**What makes it worth pricing is a test, not a file length.**
-`spawn_zone_maintenance` (main.rs:1634, 82 lines) has no test — two occurrences
-of the name in the file, its definition and `main`'s call. Its two non-obvious
-behaviours are asserted by comments only: the depth-1 channel, so a second
-`rdnsctl reload` arriving during one waits for a slot rather than piling up
-(:1663-1667), and the keepalive sender clone that stops `recv` returning `None`
-when no control socket is configured (:1668-1672). `sleep_for`'s timer is
-`tokio::time::sleep`, which `tokio::time::pause()` moves with no new parameter —
-so the timer is not what blocks the test. The struct literals in `main` are.
-
----
-
 ### 113. #103's projection sweep stopped at `[server]` — **filed 2026-09-21**
 
 `rdnsr/src/config.rs`'s `[resolver]` section lists its 11 fields three times: the
@@ -7098,6 +7070,7 @@ the week; the record is under "How the queue kept going stale" in
 | **108** | `min(SOA MINIMUM, the SOA's own TTL)` written five times | **filed 2026-09-21, closed 2026-09-24**. `Ttl::negative_answer(soa_ttl, minimum)` in `rdns-core::codes`, and the five call it. **The open shape question picked the signature**: four sites hold a record — two `ZoneRecordRef`, two `ResourceRecord`, all four spelling the inputs `ttl` and `rdata.soa_minimum()` — but `zone_signer` holds the `(Ttl, u32)` that `carry_over_records` split out of the SOA 200 lines earlier, so a record-shaped helper would have missed the one site the defect was found in. A sixth candidate is not one: `rdnsr/src/answer.rs:1087` hands the client both numbers and says so. **The larger half is the one the row did not name.** Behaviour is unchanged, so the only thing that can be watched failing is the drift — and reverting `negative_answer` to each one-term spelling found that **not one of the five sites had a test for both**: `rdnsd/answer` had neither, `zone_signer` had only #111c's split guard (which fires because the harness re-spells the rule), `dnssec_answer` had the SOA-TTL direction only and the two caches the mirror of it. Every gap is a fixture: three are `$TTL 3600` over `minimum 300`, #73's masking direction a third time, and the answer path cannot show MINIMUM winning over a zone *this* server signed, because the signer capped the chain first. Five tests added, each watched failing; both drifts now fail at all five sites. 1 304 → 1 309 passed on Windows, 1 330 on Linux, 0 failed |
 | **109** | `struct Server` in the crate root, its implementation in `dispatch` | **filed 2026-09-21, closed 2026-09-24**. `Server` and `UpdateHandling` moved to `dispatch.rs` with all 15 fields private; the root builds one with `Server::new` and six `with_*`, and reads `ctx()`, `tsig_keys()`, `zone_context()`. 13 `pub(crate)` items against 15 fields hidden, #83's predicted loss; paid for by nothing outside `dispatch` reading an ACL, a keyring or the UPDATE lock, and by six test literals losing their refusing defaults. The row counted 2 literals and there were 7. The test half is #116. See `docs/CLOSED_WORK.md` |
 | **110** | one-victim eviction scans left after `Halving` | **filed 2026-09-21, closed 2026-09-24**. Measured before changing, as the row asked: 17-21 µs per insert at the default 10 000, 2.7-8.6 ms at a million, linear in `--delegation-cache-size`, against 0.1 µs with room — #33a's cost again. Five sites, not four: `RttStore` scanned for the slowest server and ranks by speed, so the grep missed it. All three resolver maps halve through `crate::eviction`; `RttStore` slowest first. The two in `nsec_cache` stay, both with the reason. Guard watched failing at 357-418x. See `docs/CLOSED_WORK.md` |
+| **112** | price the reload cluster's constructors | **filed 2026-09-21, closed 2026-09-24**, constructors declined. The row's reason for them was wrong twice: the test module already built three `Reloading` literals, and `tokio::time::pause` needs `test-util`, which nothing enabled. Left with #83's 5-against-1 visibility loss and no test to pay for it. The test gap was real: three tests for `spawn_zone_maintenance` — control reloads answered and the stop drains, no timer without keys, a timer with them under paused time — each watched failing against its own mutation. The keepalive clone is unobservable (`select!` disables an unmatched arm); recorded, not changed. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
