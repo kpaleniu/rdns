@@ -316,6 +316,25 @@ impl Ttl {
         Ttl(if self.0 > ceiling { ceiling } else { self.0 })
     }
 
+    /// How long a negative answer may be held, and every record proving it: the
+    /// lesser of the SOA record's own TTL and its MINIMUM field (RFC 2308 §5;
+    /// RFC 9077 §§3.1-3.3 say the same of the NSEC or NSEC3 beside it).
+    ///
+    /// Named rather than spelled `min` per site because the drift is an omitted
+    /// *term*, and a call taking both cannot omit one. It was MINIMUM alone here
+    /// for months (`TODO.md` #73) behind fixtures that were every one of them
+    /// `$TTL 3600` over `minimum 300`, where the two terms give the same number.
+    ///
+    /// A cache's own ceiling is policy on top of this and stays at its call
+    /// site: [`Ttl::capped_at`].
+    pub const fn negative_answer(soa_ttl: Ttl, minimum: u32) -> Ttl {
+        Ttl(if soa_ttl.0 < minimum {
+            soa_ttl.0
+        } else {
+            minimum
+        })
+    }
+
     /// The wire encoding — the same 32 bits, since RFC 2181 §8 makes the field
     /// unsigned.
     pub const fn to_wire(self) -> u32 {
@@ -477,5 +496,36 @@ impl ResponseCode {
             ResponseCode::BadCookie => 23,
             ResponseCode::Other(value) => value,
         }
+    }
+}
+
+#[cfg(test)]
+mod ttl_tests {
+    use super::Ttl;
+
+    /// Both terms, either way round. The direction this repo got wrong is the
+    /// second: MINIMUM alone, for months (`TODO.md` #73), because every fixture
+    /// here is `$TTL 3600` over `minimum 300` and those two spellings agree
+    /// there.
+    #[test]
+    fn a_negative_ttl_is_the_lesser_of_the_soa_ttl_and_minimum() {
+        // RFC 2308 §5's usual shape: MINIMUM is the shorter, and wins.
+        assert_eq!(
+            Ttl::negative_answer(Ttl::from_secs(3600), 300),
+            Ttl::from_secs(300)
+        );
+        // The masked one: the SOA's own TTL is the shorter, and wins.
+        assert_eq!(
+            Ttl::negative_answer(Ttl::from_secs(300), 3600),
+            Ttl::from_secs(300)
+        );
+        assert_eq!(
+            Ttl::negative_answer(Ttl::from_secs(300), 300),
+            Ttl::from_secs(300)
+        );
+        // Either term at zero is "do not cache", and there is no underflow to
+        // reach for: this is a `min`, not a subtraction (`CLAUDE.md` §6).
+        assert_eq!(Ttl::negative_answer(Ttl::ZERO, 3600), Ttl::ZERO);
+        assert_eq!(Ttl::negative_answer(Ttl::from_secs(3600), 0), Ttl::ZERO);
     }
 }

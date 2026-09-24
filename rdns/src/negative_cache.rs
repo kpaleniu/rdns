@@ -160,7 +160,9 @@ impl NegativeCache {
         let Ok(ParsedRecord::SOA { minimum, .. }) = soa_rr.rdata.parse() else {
             return;
         };
-        let ttl = soa_rr.ttl.as_secs().min(minimum).min(MAX_NEGATIVE_TTL);
+        let ttl = Ttl::negative_answer(soa_rr.ttl, minimum)
+            .capped_at(MAX_NEGATIVE_TTL)
+            .as_secs();
         if ttl == 0 {
             return;
         }

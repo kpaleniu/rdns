@@ -275,17 +275,13 @@ fn push_soa_signatures(
     push_signatures_at(zone, zone.origin(), rt::SOA, cap, w)
 }
 
-/// The ceiling every record in a negative answer takes: `min(MINIMUM, the SOA
-/// record's own TTL)`.
+/// The ceiling every record in a negative answer takes: [`Ttl::negative_answer`]
+/// over this zone's apex SOA.
 ///
-/// Both terms, and RFC 9077 §3 rather than RFC 2308 §3, because this is applied
-/// to the *denial* as well as to the SOA: "the TTL of the NSEC RR that is
-/// returned MUST be the lesser of the MINIMUM field of the SOA record and the
-/// TTL of the SOA itself" (§§3.1-3.3, which say the same of NSEC3). The
-/// requirement is on what is returned, so it belongs here as well as in the
-/// signer — a zone whose signatures arrived from somewhere else is answered
-/// from this path too, and its chain was built by a signer this server does not
-/// control (`TODO.md` #73, #77a).
+/// RFC 9077 §§3.1-3.3 put the requirement on what is *returned*, so it belongs
+/// here as well as in the signer — a zone whose signatures arrived from
+/// somewhere else is answered from this path too, and its chain was built by a
+/// signer this server does not control (`TODO.md` #73, #77a).
 ///
 /// `None` for a zone with no apex SOA, which is no cap rather than a cap of
 /// zero: such a zone owes no negative answer either, and a ceiling of zero
@@ -295,7 +291,7 @@ fn negative_ttl_cap(zone: &Zone) -> Option<Ttl> {
         .locate(zone.origin())
         .of_type(Qtype::of(rt::SOA))
         .next()?;
-    Some(Ttl::from_secs(soa.rdata.soa_minimum()?).min(soa.ttl))
+    Some(Ttl::negative_answer(soa.ttl, soa.rdata.soa_minimum()?))
 }
 
 /// The RRSIGs at `name` covering `rtype`, each capped at `cap` if there is one.
@@ -747,6 +743,42 @@ deep.a.b IN TXT "down here"
                 "a denial this server did not sign left at {} beside an SOA of {}",
                 record.ttl.as_secs(),
                 soa_ttl.as_secs()
+            );
+        }
+    }
+
+    /// The mirror of the test above: MINIMUM is the lesser here, so it is the
+    /// term that has to win.
+    ///
+    /// Both tests above put the SOA's own TTL below MINIMUM, which cannot tell
+    /// a cap of `min(both)` from a cap of the SOA TTL alone. Nor can a zone
+    /// this server signed, since the signer already capped the chain — so the
+    /// fixture is hand-written with its NSECs at `$TTL`, which is what a signer
+    /// that reads neither term produces. Watched failing against
+    /// `Ttl::negative_answer` returning `soa_ttl`.
+    #[test]
+    fn a_denial_from_another_signer_is_capped_at_minimum_when_minimum_is_lesser() {
+        const LONG_TTL_SHORT_MINIMUM: &str = concat!(
+            "$ORIGIN example.com.\n",
+            "$TTL 3600\n",
+            "@   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n",
+            "@   IN NS  ns1.example.com.\n",
+            "@   IN DNSKEY 257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3\n",
+            "@   IN NSEC www.example.com. NS SOA RRSIG NSEC DNSKEY\n",
+            "ns1 IN A 192.0.2.1\n",
+            "www IN A 192.0.2.10\n",
+            "www IN NSEC example.com. A RRSIG NSEC\n",
+        );
+        let zone = parse_zone_file(LONG_TTL_SHORT_MINIMUM, ORIGIN).expect("the fixture parses");
+        let records = negative(&zone, "nope.example.com.", &NameKind::NotFound);
+        assert!(!records.is_empty(), "the apex NSEC covers the name");
+        for record in records {
+            assert_eq!(
+                record.ttl,
+                Ttl::from_secs(300),
+                "{} went out at {} where MINIMUM says 300",
+                record.rdata.rtype(),
+                record.ttl.as_secs(),
             );
         }
     }

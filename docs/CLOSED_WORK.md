@@ -9500,3 +9500,102 @@ fact the shape question below has to answer.
   triage: production handing its phase timings back changes a return type on the
   signing path for a benchmark's benefit, and deleting the harness gives up
   per-phase cost for a copy that a 0.02 s test now holds to the function.
+
+### 108. `min(SOA MINIMUM, the SOA's own TTL)` is written five times — **filed 2026-09-21, closed 2026-09-24**
+
+RFC 2308 §5, and RFC 9077 §3 for the denial beside it. Counted:
+
+| site | spelling |
+|---|---|
+| `rdns/src/zone_signer.rs:412` | `Ttl::from_secs(minimum).min(soa_ttl)` |
+| `rdns/src/dnssec_answer.rs:298` | `Ttl::from_secs(soa.rdata.soa_minimum()?).min(soa.ttl)` |
+| `rdns/src/negative_cache.rs:163` | `soa_rr.ttl.as_secs().min(minimum).min(MAX_NEGATIVE_TTL)` |
+| `rdns/src/nsec_cache.rs:202` | `soa_ttl.min(minimum)` |
+| `rdnsd/src/answer.rs:675` | `soa.ttl.min(Ttl::from_secs(minimum))` |
+
+Two of the five already carry a *name* — `negative_ttl_cap(zone)`
+(dnssec_answer.rs:293) and `negative_ttl(soa)` (rdnsd/answer.rs:673) — in two
+crates. The concept has been given a home twice and neither home is reachable
+from the other three sites.
+
+**A reason is on record for exactly one pair.** dnssec_answer.rs:280: "The
+requirement is on what is returned, so it belongs here as well as in the signer
+— a zone whose signatures arrived from somewhere else is answered from this path
+too, and its chain was built by a signer this server does not control" (#73,
+#77a). It holds for that pair and says nothing about the other three.
+
+**The sentence that would make this row wrong**: the five are not one rule.
+Checked — the two ceilings (`MAX_NEGATIVE_TTL`, `MAX_PROOF_TTL`, both 3600) are
+policy applied on top; take them off and the five compute the same number from
+the same two inputs.
+
+**#73 is the evidence that it drifts**: MINIMUM alone where RFC 9077 §3 wants
+the lesser, for months, behind fixtures that are every one of them `$TTL 3600`
+with `minimum 300` — the masking direction.
+
+No remedy costed. `Ttl` is `rdns-core::codes` and `soa_minimum()` is on
+`RecordData` in the same crate, so a home exists; what was not checked is whether
+each of the five holds a record or two loose integers where it asks (§18: file
+the fix only if you checked it).
+
+**Closed 2026-09-24.** `Ttl::negative_answer(soa_ttl, minimum)` in
+`rdns-core::codes`, and the five sites call it. The shape question the row left
+open is answered and it is what picks the signature: four of the five hold a
+*record* — `dnssec_answer` and `rdnsd/answer` a `ZoneRecordRef`, the two caches
+a `ResourceRecord`, and both spell the two inputs `ttl` and
+`rdata.soa_minimum()` — but the fifth does not. `zone_signer` reads the SOA in
+`carry_over_records`, which returns `(Ttl, u32)`, and reassembles the pair 200
+lines later, so a record-shaped helper would have served four sites and left the
+one the defect was found in. Two loose values it is.
+
+**A sixth site was counted and is not one.** `rdnsr/src/answer.rs:1087` puts the
+policy zone's SOA in the authority section and says in its own comment that
+"which of them wins is §3's rule and the client's to apply" — it hands over both
+numbers rather than computing with them. §19: the measurement that could have
+made the count five-plus-one instead says five.
+
+**What the row did not name, and is the larger half.** Behaviour is unchanged at
+all five sites, so nothing here could be watched failing (§1) — except the
+drift itself. Reverting `negative_answer` to each of the two one-term spellings
+names which sites had a guard:
+
+| site | MINIMUM alone, which is #73's | the SOA TTL alone |
+|---|---|---|
+| `zone_signer` | only #111c's split guard | — |
+| `dnssec_answer` | 2 tests | — |
+| `negative_cache` | 1 test | 3 tests |
+| `nsec_cache` | — | 1 test, and `resolver` through it |
+| `rdnsd/answer` | — | — |
+
+Not one site had both. The signer's only failure was #111c's split guard, which
+fires because the *harness* re-spells the rule rather than because anything
+asserts a denial's TTL. Every gap is the same fixture problem in one direction
+or the other: `zone_signer`'s `ZONE`, `rdnsd`'s `ZONE` and `nsec_cache`'s are
+the larger `$TTL` over the smaller MINIMUM, `dnssec_answer`'s two are the
+reverse — and a zone signed *here* cannot show MINIMUM winning on the answer
+path at all, because the signer capped the chain before the answer saw it. That
+is #73's masking direction arriving a third time, and §1's fixtures-rather-than-
+assertions is where it lives.
+
+Five tests added, each watched failing against the drift it is for:
+
+- `codes::ttl_tests::a_negative_ttl_is_the_lesser_of_the_soa_ttl_and_minimum`,
+  both directions and either term at zero.
+- `zone_signer::tests::a_denial_is_capped_at_the_lesser_of_the_soa_ttl_and_minimum`
+  — every NSEC and NSEC3 in the chain, both fixtures, both chain kinds.
+- `dnssec_answer::tests::a_denial_from_another_signer_is_capped_at_minimum_when_minimum_is_lesser`,
+  over a hand-written chain at `$TTL` — the only zone that reaches the answer
+  path's cap in this direction.
+- `nsec_cache::tests::test_a_short_soa_ttl_bounds_the_negative_ttl_under_a_long_minimum`.
+- `answer::tests::a_negative_answer_caps_minimum_at_the_soa_ttl` in `rdnsd`.
+
+After them both drifts fail at all five sites. `split_passes`'s hand-spelled
+`min` stays: #111c's guard compares two implementations, and a copy that calls
+the shared function compares one against itself (§1).
+
+Verified: `cargo test --workspace` **1 304 → 1 309 passed, 0 failed on
+Windows**, **1 330 passed, 0 failed on Linux**; clippy clean on both; `cargo
+doc --workspace --no-deps` clean; `cargo fmt --all --check` clean.
+
+
+---

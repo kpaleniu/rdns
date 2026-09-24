@@ -672,7 +672,7 @@ fn add_negative(
 /// good for.
 fn negative_ttl(soa: ZoneRecordRef<'_>) -> Ttl {
     match soa.rdata.soa_minimum() {
-        Some(minimum) => soa.ttl.min(Ttl::from_secs(minimum)),
+        Some(minimum) => Ttl::negative_answer(soa.ttl, minimum),
         // An apex SOA that will not parse is a zone that should not have loaded.
         // Capping at nothing is the conservative direction: the client asks
         // again rather than caching a "no" we cannot bound.
@@ -1255,6 +1255,38 @@ x.sub2   IN A   192.0.2.30
                 "{what}: capped at MINIMUM, not the $TTL"
             );
         }
+    }
+
+    /// The same rule the other way round, which the zone above cannot show:
+    /// its `$TTL` is the larger of the two, so a cap computed from MINIMUM
+    /// alone gives the right number there and the direction #73 got wrong goes
+    /// untested. Watched failing against `Ttl::negative_answer` returning
+    /// `minimum` (`CLAUDE.md` §1).
+    #[test]
+    fn a_negative_answer_caps_minimum_at_the_soa_ttl() {
+        const SHORT_SOA_TTL: &str = r#"$ORIGIN example.com.
+$TTL 60
+@   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 3600 )
+@   IN NS  ns1.example.com.
+ns1 IN A   192.0.2.1
+"#;
+        let zone = parse_zone_file(SHORT_SOA_TTL, "example.com.").expect("the fixture parses");
+        let mut zones = Zones::default();
+        drop(zones.insert(zone));
+        let response = make_response(
+            &query("nope.example.com.", Qtype::of(record_types::A), false),
+            &zones,
+            &DnsMetrics::new(),
+        );
+
+        assert_eq!(response.rcode, ResponseCode::NoSuchDomain);
+        let soa = rdatas(&response.authorities, record_types::SOA);
+        assert_eq!(soa.len(), 1);
+        assert_eq!(
+            soa[0].ttl,
+            Ttl::from_secs(60),
+            "capped at the SOA's own TTL, not at MINIMUM"
+        );
     }
 
     /// And the NXDOMAIN that is still an NXDOMAIN, so the fixes above did not

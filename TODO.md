@@ -37,9 +37,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#108**-**#110**, **#112**-**#114**, plus **#21**, as of
-2026-09-22 — the seven filed out of the architecture review are closed, nine
-more were filed, and #107, #111 and #115 are closed out of the first triage
+**#58**, **#68**, **#109**, **#110**, **#112**-**#114**, plus **#21**, as of
+2026-09-24 — the seven filed out of the architecture review are closed, nine
+more were filed, and #107, #108, #111 and #115 are closed out of the triage
 passes.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
@@ -87,6 +87,13 @@ before it fixed the prose: a field count written from a scan that cannot see
 `nsec3`. What shipped drops both counts and cites the test that holds the rule,
 because this row is now twice the evidence that a number in prose does not stay
 true.
+
+**#108 closed** on 2026-09-24, and the shape question it left open is what
+decided the fix: four of the five sites hold a record and the fifth holds the
+pair `carry_over_records` split out of one, so the home takes two loose values.
+What the row did not name is the larger half — not one of the five had a test
+for *both* one-term spellings, and three of the missing cases are the same
+`$TTL`-over-MINIMUM fixture #73 hid behind.
 
 **#106 closed** the day it was filed, and it was worse than built-and-
 discarded: a zone small enough to fit one envelope *transferred* over DoH, so
@@ -1235,9 +1242,10 @@ Four environment traps that have each cost an hour:
 
 ## Open work
 
-**#58**, **#68**, **#107**-**#115**, plus **#21** —
-see "What is open" above, which is the same list and the only place it is
-written down.
+Which numbers are open is in "What is open" above, and only there. This line
+carried a second copy of the list and it was three numbers stale — #107, #111
+and #115 had closed under it — which is what a sentence claiming to be the one
+place costs when it is not.
 Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
 numbers are stable identifiers referenced from the code, so they move rather
 than being renumbered.
@@ -6822,45 +6830,6 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 108. `min(SOA MINIMUM, the SOA's own TTL)` is written five times — **filed 2026-09-21**
-
-RFC 2308 §5, and RFC 9077 §3 for the denial beside it. Counted:
-
-| site | spelling |
-|---|---|
-| `rdns/src/zone_signer.rs:412` | `Ttl::from_secs(minimum).min(soa_ttl)` |
-| `rdns/src/dnssec_answer.rs:298` | `Ttl::from_secs(soa.rdata.soa_minimum()?).min(soa.ttl)` |
-| `rdns/src/negative_cache.rs:163` | `soa_rr.ttl.as_secs().min(minimum).min(MAX_NEGATIVE_TTL)` |
-| `rdns/src/nsec_cache.rs:202` | `soa_ttl.min(minimum)` |
-| `rdnsd/src/answer.rs:675` | `soa.ttl.min(Ttl::from_secs(minimum))` |
-
-Two of the five already carry a *name* — `negative_ttl_cap(zone)`
-(dnssec_answer.rs:293) and `negative_ttl(soa)` (rdnsd/answer.rs:673) — in two
-crates. The concept has been given a home twice and neither home is reachable
-from the other three sites.
-
-**A reason is on record for exactly one pair.** dnssec_answer.rs:280: "The
-requirement is on what is returned, so it belongs here as well as in the signer
-— a zone whose signatures arrived from somewhere else is answered from this path
-too, and its chain was built by a signer this server does not control" (#73,
-#77a). It holds for that pair and says nothing about the other three.
-
-**The sentence that would make this row wrong**: the five are not one rule.
-Checked — the two ceilings (`MAX_NEGATIVE_TTL`, `MAX_PROOF_TTL`, both 3600) are
-policy applied on top; take them off and the five compute the same number from
-the same two inputs.
-
-**#73 is the evidence that it drifts**: MINIMUM alone where RFC 9077 §3 wants
-the lesser, for months, behind fixtures that are every one of them `$TTL 3600`
-with `minimum 300` — the masking direction.
-
-No remedy costed. `Ttl` is `rdns-core::codes` and `soa_minimum()` is on
-`RecordData` in the same crate, so a home exists; what was not checked is whether
-each of the five holds a record or two loose integers where it asks (§18: file
-the fix only if you checked it).
-
----
-
 ### 109. `struct Server` is in the crate root and its implementation is not — **filed 2026-09-21**
 
 #38d moved the answering out of `main.rs` and left the type behind.
@@ -7184,6 +7153,7 @@ the week; the record is under "How the queue kept going stale" in
 | **84** | `to_prometheus_format` was 337 lines of one idiom | **filed 2026-09-19, closed 2026-09-20**, and the row's own remedy was wrong by an order of magnitude. Both shapes built (§19): helper calls 278 lines, a table 276, against 337 — because stock rustfmt breaks *every* element of an argument list when one exceeds 100 columns, and §12 forbids a `rustfmt.toml`, so the length was never available to be fixed. The table shipped on what it makes unrepresentable instead: name, help and field on one row, so a counter rendered nowhere is a missing row rather than a missing block among thirty. The `diff` the row asked for came back **byte-identical except the `dns_catalog_members` HELP line**, its 22 stray spaces, exactly as predicted. One it did not ask for: a scrape was **65 allocations and is 16** for the same 4 775 bytes, pinned. Both sub-findings fixed — `the_scrape_is_well_formed` asserts one HELP and one TYPE per family, no undeclared sample and no padded help text, and fails against the padded line put back; the two lock guards read *through* a poisoned lock now, matching the decision every writer in the file had already made, because dropping the series made every zone look withdrawn at once |
 | **78** | `rdnsr`'s query path lost work at three of its exits | **filed 2026-09-19, closed 2026-09-20**, three rows, and the first was verified here while b and c were the review's reading — both held. **78a**: an `rpz-ip` rule over a cache hit dropped the prefetch the answer cache had just asked for, because `impl From<Option<Vec<u8>>> for Answered` fills `refresh: None`. Three shapes built (§19) and the one that shipped is in neither the row nor the review: delete the early `return`, since the hazard is §7's jump over a shared epilogue. **78b**: `Resolver::forward` returned the upstream's AA bit and echoed question verbatim where `recurse` normalized both, so an `rdnsr` in front of an `rdnsr` running 0x20 would have rejected its own answer (RFC 5452 §9.1) — left **#93**. **78c**: QDCOUNT = 0 was dropped by `rdnsr` and answered NOERROR *with AA set* by `rdnsd`. RFC 9619 §4 settles only QDCOUNT > 1; its QDCOUNT = 0 sentence binds firewalls, not responders. RFC 7873 §5.4 says what the query is for and that a server without cookies "will normally send FORMERR", and the peers agree: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all answer it, all FORMERR with no OPT, and none drops it — which is the measurement that could have refuted the finding |
 | **107** | eleven wall-clock reads inside a request path, in the crate #92 did not count | **filed 2026-09-21, closed 2026-09-22**. The eleven are exact and the crate held **fifteen**: the other four are two constructors, a background timer — #92's own category — and `DnssecValidator::validate_rrset`, which is not. `NsecCache`, `DelegationCache` and `KeyCache` take a `Clock` now, `Resolver` holds one and `validate` reads it; the two resolver caches *require* it, since both are `pub(super)` with one production caller, so a cache built without one does not compile (§17). Two tests that could not be written now are: a proof live at +0, +1 800 and +3 599 and gone at +3 601, and a delegation inserted through the public path instead of forged through the mutex — the forgery existed because `insert` clamps `expires_at` to `now + ttl`. **`validate_rrset` declines and the measurement is why**: it is request-reachable, though not by the route triage first named (`dispatch.rs:2433` is `#[cfg(test)]`; the real one is the UPDATE path's pre-install `FreshlySigned::verify`), and the instant it wants is choosable through `SigningPolicy` — #92's own criterion. `clock.rs`'s sentence is struck and corrected, which is what the row was filed for |
+| **108** | `min(SOA MINIMUM, the SOA's own TTL)` written five times | **filed 2026-09-21, closed 2026-09-24**. `Ttl::negative_answer(soa_ttl, minimum)` in `rdns-core::codes`, and the five call it. **The open shape question picked the signature**: four sites hold a record — two `ZoneRecordRef`, two `ResourceRecord`, all four spelling the inputs `ttl` and `rdata.soa_minimum()` — but `zone_signer` holds the `(Ttl, u32)` that `carry_over_records` split out of the SOA 200 lines earlier, so a record-shaped helper would have missed the one site the defect was found in. A sixth candidate is not one: `rdnsr/src/answer.rs:1087` hands the client both numbers and says so. **The larger half is the one the row did not name.** Behaviour is unchanged, so the only thing that can be watched failing is the drift — and reverting `negative_answer` to each one-term spelling found that **not one of the five sites had a test for both**: `rdnsd/answer` had neither, `zone_signer` had only #111c's split guard (which fires because the harness re-spells the rule), `dnssec_answer` had the SOA-TTL direction only and the two caches the mirror of it. Every gap is a fixture: three are `$TTL 3600` over `minimum 300`, #73's masking direction a third time, and the answer path cannot show MINIMUM winning over a zone *this* server signed, because the signer capped the chain first. Five tests added, each watched failing; both drifts now fail at all five sites. 1 304 → 1 309 passed on Windows, 1 330 on Linux, 0 failed |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 

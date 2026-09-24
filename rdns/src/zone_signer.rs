@@ -403,13 +403,7 @@ fn sign_zone_inner(
 
     let layout = Layout::of(&signed, origin.as_ref());
 
-    // RFC 9077 §3: the denial's TTL is the *lesser* of MINIMUM and the SOA's own
-    // TTL, not MINIMUM alone. RFC 4034 §4.1.1's "same as MINIMUM" predates
-    // aggressive use (RFC 8198), under which the NSEC's own TTL is how long a
-    // resolver may keep synthesizing this "no" — so a zone with a short SOA TTL
-    // and a long MINIMUM had its denials cached twelve times longer than the SOA
-    // beside them said the negative answer lived.
-    let denial_ttl = Ttl::from_secs(minimum).min(soa_ttl);
+    let denial_ttl = Ttl::negative_answer(soa_ttl, minimum);
     match &policy.chain {
         DenialChain::Nsec => build_nsec_chain(&layout, denial_ttl, &mut signed)?,
         DenialChain::Nsec3 {
@@ -2578,6 +2572,56 @@ a\.b    IN A   192.0.2.50
             crate::denial_wire::bitmap_has_type(&type_bitmap, rt::DNAME),
             "§5.3.2: the DNAME bit belongs in the bitmap"
         );
+    }
+
+    /// Every denial in the chain is capped at [`Ttl::negative_answer`], both
+    /// ways round (RFC 9077 §§3.1-3.3).
+    ///
+    /// The module's `ZONE` is `$TTL 3600` over `minimum 300`, so it can only
+    /// show the direction that was never wrong; the second fixture is the one
+    /// #73's defect survived behind. Watched failing against a `denial_ttl` of
+    /// MINIMUM alone, and of the SOA TTL alone.
+    #[test]
+    fn a_denial_is_capped_at_the_lesser_of_the_soa_ttl_and_minimum() {
+        const SHORT_SOA_TTL: &str = r#"$ORIGIN example.com.
+$TTL 60
+@   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 3600 )
+@   IN NS  ns1.example.com.
+ns1 IN A   192.0.2.1
+www IN A   192.0.2.10
+"#;
+        for (source, origin, expected, which) in [
+            (ZONE, ORIGIN, 300, "MINIMUM is the lesser"),
+            (SHORT_SOA_TTL, ORIGIN, 60, "the SOA's own TTL is the lesser"),
+        ] {
+            let zone = parse_zone_file(source, origin).expect("the fixture parses");
+            for chain in [
+                DenialChain::Nsec,
+                DenialChain::Nsec3 {
+                    salt: Vec::new(),
+                    iterations: 0,
+                    opt_out: false,
+                },
+            ] {
+                let signed = sign_zone(&zone, &signing_keys(origin), &policy(chain))
+                    .expect("signing succeeds");
+                let denials: Vec<_> = signed
+                    .records()
+                    .iter()
+                    .filter(|r| matches!(r.rdata.rtype(), rt::NSEC | rt::NSEC3))
+                    .collect();
+                assert!(!denials.is_empty(), "{which}: the chain was built");
+                for denial in denials {
+                    assert_eq!(
+                        denial.ttl,
+                        Ttl::from_secs(expected),
+                        "{which}: {} {}",
+                        denial.name,
+                        denial.rdata.rtype(),
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -212,8 +212,7 @@ impl NsecCache {
         let zone = soa_rr.name.as_ref().to_folded();
         let now = self.clock.now();
 
-        let soa_ttl = soa_rr.ttl.as_secs();
-        let negative_ttl = soa_ttl.min(minimum);
+        let negative_ttl = Ttl::negative_answer(soa_rr.ttl, minimum).as_secs();
         let soa = CachedSoa {
             records: records_at(&response.authorities, zone.as_ref(), rt::SOA),
             negative_ttl,
@@ -1425,6 +1424,40 @@ mod tests {
         assert!(
             s.authority.iter().all(|rr| rr.ttl <= Ttl::from_secs(60)),
             "the records handed back must count down too"
+        );
+    }
+
+    /// The same bound the other way round: the SOA's own TTL is the shorter
+    /// of the two, so it is the one that wins (RFC 9077 §§3.1-3.3).
+    ///
+    /// The mirror of the test above, which had only the MINIMUM-is-shorter
+    /// direction — the direction that cannot catch #73's defect, since a cap
+    /// computed from MINIMUM alone gives the right answer there. Watched
+    /// failing against `Ttl::negative_answer` returning `minimum`.
+    #[test]
+    fn test_a_short_soa_ttl_bounds_the_negative_ttl_under_a_long_minimum() {
+        let cache = NsecCache::new(16);
+        cache.insert_validated(&negative(
+            "nope.example.com.",
+            ResponseCode::NoSuchDomain,
+            vec![
+                soa_record("example.com.", 3600, Ttl::from_secs(60)),
+                nsec_record(
+                    "example.com.",
+                    "www.example.com.",
+                    &[rt::SOA, rt::NS, rt::RRSIG, rt::NSEC],
+                    Ttl::from_secs(3600),
+                ),
+            ],
+        ));
+
+        let s = cache
+            .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
+            .expect("denied");
+        assert!(
+            s.ttl <= 60,
+            "the SOA's own TTL bounds the negative TTL, got {}",
+            s.ttl
         );
     }
 
