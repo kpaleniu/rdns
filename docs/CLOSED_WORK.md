@@ -9599,3 +9599,73 @@ doc --workspace --no-deps` clean; `cargo fmt --all --check` clean.
 
 
 ---
+
+### 109. `struct Server` is in the crate root and its implementation is not — **filed 2026-09-21, closed 2026-09-24**
+
+#38d moved the answering out of `main.rs` and left the type behind.
+`dispatch.rs:11` states what the move was for: "Everything else is private to
+this module, which is the whole of `TODO.md` #38d: the transfer and UPDATE
+answering used to be `impl Server` blocks in the crate root, where private means
+visible to the root and every descendant (`CLAUDE.md` §17)." The eleven fields
+that code reads are still in the root, so they are still visible to every
+descendant — the condition the move was made to escape.
+
+Measured:
+
+| | |
+|---|---|
+| `struct Server` | 11 fields, `main.rs:717-745` |
+| `impl Server` | `dispatch.rs:212-1247` — 1 035 lines, 9 methods |
+| `impl tcp::Handler for Server` | `dispatch.rs:141-167` |
+| other implementors in the workspace | 0 |
+| ~~production literals~~ | ~~2 — `serve` (main.rs:1099) and the test helper `server_with_keys_at` (main.rs:2719)~~ **7**: `serve` and six in tests (`:2722`, `:3509`, `:3626`, `:3911`, `:3974`, `:5933`), each spelling all 11 fields — counted on closing. "Production" had been read as "the ones worth counting" |
+
+**The type is already being worked around.** `dispatch.rs:1239` holds a private
+`fn zone_context(&self) -> ZoneContext` over four of `Server`'s fields, and
+`main.rs:1263-1267` builds the same four by hand from `server.*` because it
+cannot reach it. Three of the five production `ZoneContext` literals are over the
+same four values.
+
+**The test half is downstream of the same fact.** The harness is built around
+`Server` and `replication.rs:19` says so, so 86 tests and 4 414 lines sit in the
+crate root's test module while `replication.rs` has 702 lines and no tests of its
+own, and `dispatch.rs` has 11 over 1 620.
+
+**Price it #83's way, which is not line count.** #83 read "more `pub(crate)` than
+it makes private" as *reachability* rather than annotation count, and took the
+NOTIFY split on the second reading for that reason. A constructor keeps all 11
+fields private; the annotations are the type and three methods. Not built, so not
+claimed — the number decides it, and a `git revert` is the cost of disagreeing.
+
+**Closed 2026-09-24.** Built as priced: `Server` and `UpdateHandling` are in
+`dispatch.rs`, all 15 fields private. `UpdateHandling` went too because it is
+the same shape one struct over — four fields in the root, read only by
+`dispatch.rs:1091-1132`.
+
+What the root may do now, which is the #83 reading:
+
+| | before | after |
+|---|---|---|
+| fields readable from any module | 15 | 0 |
+| `pub(crate)` items | 0 (root-private) | 13 — 2 types, 2 constructors, 6 `with_*`, 3 readers |
+| root reads | 5 fields direct | `ctx()`, `tsig_keys()`, `zone_context()` |
+| `Server` literals | 7, 11 fields each | 0; `Server::new(zone_map, ctx)` refuses everything until told otherwise |
+| hand-built `ZoneContext` over `Server`'s fields | 1 (`main.rs:1264`, Unix) | 0 — `zone_context()` is the one |
+
+The annotation count is the loss #83 predicted — 13 against 15 fields hidden.
+What pays for it is that nothing outside `dispatch` can *read* a transfer ACL,
+a keyring or the UPDATE lock, and the six test literals went from 13-18 lines to
+1-11, because four to eight fields in each were the refusing default.
+
+The setters are grouped where the fields are one question: `with_transfers`
+takes the ACL, the certificates and `tls_only` (RFC 9103 §11), `with_history`
+the delta log and its journal (`install_zone` writes both or neither). An
+11-argument constructor was the alternative and clippy stops it at 7.
+
+The test half is #116: the harness is still in the root, which is what holds the
+88 tests there now, not the type.
+
+Verified: 1 309 passed on Windows before and after, 1 330 on Linux, 0 failed;
+clippy clean on both; `cargo doc --workspace --no-deps` clean.
+
+---

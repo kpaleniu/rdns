@@ -5,33 +5,37 @@
 //! epilogue every ordinary answer leaves through. What is *not* here is deciding
 //! what a name deserves, which is [`crate::answer`]'s and has no sockets in it.
 //!
-//! `main.rs` reaches two items: [`Wire`], which the UDP loop names to say where
-//! a reply goes, and [`Server::answer`]. Everything else is private to this
-//! module, which is the whole of `TODO.md` #38d: the transfer and UPDATE
-//! answering used to be `impl Server` blocks in the crate root, where private
-//! means visible to the root and every descendant (`CLAUDE.md` §17).
+//! `main.rs` reaches [`Wire`], which the UDP loop names to say where a reply
+//! goes, [`Server`]'s constructor and three readers, [`UpdateHandling::new`],
+//! and [`Server::answer`]. Everything else is private to this module, which is
+//! the whole of `TODO.md` #38d and #109: the transfer and UPDATE answering used
+//! to be `impl Server` blocks in the crate root, and then the fields they read
+//! were, where private means visible to the root and every descendant
+//! (`CLAUDE.md` §17).
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 
 use rdns::dnstap;
 use rdns::{
     dnssec_validation_mode::DnssecValidator,
     ede::InfoCode,
     error::RequestError,
-    ixfr::{ixfr_response, IxfrResponse},
+    ixfr::{ixfr_response, DeltaLog, IxfrResponse},
+    journal::Journal,
     logging::QueryLogger,
     notify,
     response::ClientEdns,
-    security::ResponseVerdict,
+    security::{ResponseVerdict, TransferAcl, TransferCertificates},
     transfer::axfr_envelopes,
-    tsig::{self, TsigCheck, TsigSession},
+    tsig::{self, TsigCheck, TsigKeyring, TsigSession},
     update,
     validation::{Arrival, Privacy, Request, Transport},
     zone::{FileDigest, Zone},
@@ -42,9 +46,9 @@ use rdns_transport::ServeContext;
 
 use crate::answer::{write_response, NOT_OUR_ZONE};
 use crate::replication::{Notified, Secondaries};
-use crate::zones::{install_zone, ZoneContext, ZoneMap, ZoneSigning};
+use crate::zones::{install_zone, ZoneContext, ZoneMap, ZoneSigning, ZoneSource, Zones};
+use crate::Scratch;
 use crate::{bad_request, serving_error};
-use crate::{Scratch, Server};
 
 /// Where one request's reply goes, and the two things that follow from it.
 ///
@@ -129,6 +133,188 @@ impl Wire<'_> {
                     bad_request!(logger, ip, "socket send error: {e}");
                 }
             }
+        }
+    }
+}
+
+/// Everything both transports answer from. One per process, so a connection or
+/// datagram task clones a single `Arc`.
+///
+/// Shared across transports on purpose: a client's rate limit must not reset
+/// because it switched transport, and the metrics are one server's.
+///
+/// Here rather than in the crate root, with every field private, so that what
+/// the root may do with one is build it and read three things (`TODO.md` #109).
+/// [`Server::new`] refuses everything it is not told otherwise about.
+pub(crate) struct Server {
+    zone_map: Arc<RwLock<Zones>>,
+    /// The limiter, the response budget, the validator, the logger and the
+    /// metrics — the five handles serving a request needs that are not the
+    /// answer. `rdnsr` held the same five as its `Shell`, which is how the
+    /// admission sequence came to be written twice (`TODO.md` #30e, #32).
+    ctx: ServeContext,
+    /// Who may ask for a zone transfer. Empty by default, which refuses everyone.
+    transfer_acl: Arc<TransferAcl>,
+    /// Which client certificates may transfer which zones — §7.5's other
+    /// method, additive with the ACL and the keyring (`TODO.md` #59). Empty
+    /// unless `--allow-transfer-cert` named somebody.
+    transfer_clients: Arc<TransferCertificates>,
+    /// Refuse a transfer that did not arrive over TLS 1.3 (RFC 9103 §11,
+    /// `--transfer-tls-only`). Beside the ACL because it is the other half of
+    /// the same question — the ACL says who may ask, this says on what.
+    transfer_tls_only: bool,
+    tsig_keys: Arc<TsigKeyring>,
+    /// The zones we replicate, so a NOTIFY can be told from a plausible one.
+    secondaries: Arc<Secondaries>,
+    /// Per-zone change history, so an IXFR can answer with the difference.
+    /// Derived from the zone map, so the two are only updated together.
+    deltas: Arc<RwLock<DeltaLog>>,
+    /// `None` on a server with no writable zone source: every UPDATE refused.
+    updates: Arc<UpdateHandling>,
+    journal: Option<Arc<Journal>>,
+    /// Where the query stream goes, or `None` when `--dnstap` was not given.
+    /// See [`crate::dnstap`] for why the queue behind it drops.
+    dnstap: Option<crate::dnstap::Sink>,
+}
+
+impl Server {
+    /// A server answering queries from `zone_map`, and refusing every
+    /// transfer, NOTIFY and UPDATE until a `with_*` says otherwise.
+    pub(crate) fn new(zone_map: Arc<RwLock<Zones>>, ctx: ServeContext) -> Self {
+        Server {
+            zone_map,
+            ctx,
+            transfer_acl: Arc::new(TransferAcl::default()),
+            transfer_clients: Arc::new(TransferCertificates::default()),
+            transfer_tls_only: false,
+            tsig_keys: Arc::new(TsigKeyring::default()),
+            secondaries: Arc::new(Secondaries::default()),
+            deltas: Arc::new(RwLock::new(DeltaLog::new())),
+            updates: Arc::new(UpdateHandling::disabled()),
+            journal: None,
+            dnstap: None,
+        }
+    }
+
+    /// Who may transfer, by address and by certificate, and whether only over
+    /// TLS. One setter because they are one question (RFC 9103 §11).
+    pub(crate) fn with_transfers(
+        self,
+        acl: TransferAcl,
+        clients: TransferCertificates,
+        tls_only: bool,
+    ) -> Self {
+        Server {
+            transfer_acl: Arc::new(acl),
+            transfer_clients: Arc::new(clients),
+            transfer_tls_only: tls_only,
+            ..self
+        }
+    }
+
+    pub(crate) fn with_tsig_keys(self, keys: TsigKeyring) -> Self {
+        Server {
+            tsig_keys: Arc::new(keys),
+            ..self
+        }
+    }
+
+    pub(crate) fn with_secondaries(self, secondaries: Arc<Secondaries>) -> Self {
+        Server {
+            secondaries,
+            ..self
+        }
+    }
+
+    /// The change history and where it is persisted. Together because
+    /// [`install_zone`] writes both or neither.
+    pub(crate) fn with_history(
+        self,
+        deltas: Arc<RwLock<DeltaLog>>,
+        journal: Option<Arc<Journal>>,
+    ) -> Self {
+        Server {
+            deltas,
+            journal,
+            ..self
+        }
+    }
+
+    pub(crate) fn with_updates(self, updates: UpdateHandling) -> Self {
+        Server {
+            updates: Arc::new(updates),
+            ..self
+        }
+    }
+
+    pub(crate) fn with_dnstap(self, dnstap: Option<crate::dnstap::Sink>) -> Self {
+        Server { dnstap, ..self }
+    }
+
+    /// The admission handles, for the UDP loop's checks before a datagram
+    /// reaches [`Server::answer`], and for the metrics and anomaly tasks.
+    pub(crate) fn ctx(&self) -> &ServeContext {
+        &self.ctx
+    }
+
+    pub(crate) fn tsig_keys(&self) -> &TsigKeyring {
+        &self.tsig_keys
+    }
+}
+
+/// What answering a dynamic UPDATE (RFC 2136) needs beyond what a query needs.
+///
+/// The update must reach the *file*, not just the map: the re-signing timer
+/// reloads every zone from its file (see [`ZoneSigning::resign_interval`]), so
+/// an in-memory-only edit is discarded within one re-signing interval with
+/// nothing logged. The flow is apply to the zone as the file has it, write the
+/// file, sign the result, verify what was signed, install that.
+pub(crate) struct UpdateHandling {
+    /// `None` when the server has no source it may write — a secondary's
+    /// replicated zones are the master's copy.
+    source: Option<ZoneSource>,
+    /// So the installed version is signed the way a loaded one would be.
+    signing: Option<Arc<ZoneSigning>>,
+    /// And checked the way a loaded one is: the same validator `verify_zones`
+    /// is given, so `--require-signed` means one thing (`TODO.md` #100).
+    validator: Arc<DnssecValidator>,
+    /// Serializes the read-modify-write, which RFC 2136 §3.7 requires.
+    ///
+    /// One lock for all zones rather than one per zone: two concurrent UPDATEs
+    /// is not a workload this has. Held across file I/O and a signing run, so
+    /// `tokio::Mutex` and not a `std` one.
+    ///
+    /// It guards the digest of each zone file as this server last wrote it
+    /// (`TODO.md` #64b), because that fact is *made* under this lock: nothing
+    /// else writes a zone file while it is held, so the map cannot be stale
+    /// with respect to anything the server itself did.
+    applying: tokio::sync::Mutex<HashMap<PathBuf, FileDigest>>,
+}
+
+impl UpdateHandling {
+    /// UPDATEs applied to `source`, signed with `signing` and checked with
+    /// `validator` — the three a reload uses, so the two agree on what a zone is.
+    pub(crate) fn new(
+        source: ZoneSource,
+        signing: Option<Arc<ZoneSigning>>,
+        validator: Arc<DnssecValidator>,
+    ) -> Self {
+        UpdateHandling {
+            source: Some(source),
+            signing,
+            validator,
+            applying: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A server that refuses every UPDATE: [`Server::new`]'s default. `serve`
+    /// always has a zone source, so this is reached from tests.
+    fn disabled() -> Self {
+        UpdateHandling {
+            source: None,
+            signing: None,
+            validator: Arc::new(DnssecValidator::new(false)),
+            applying: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -1234,7 +1420,7 @@ impl Server {
     }
 
     /// The four things `install_zone` moves together — [`ZoneContext`].
-    fn zone_context(&self) -> ZoneContext {
+    pub(crate) fn zone_context(&self) -> ZoneContext {
         ZoneContext {
             zone_map: Arc::clone(&self.zone_map),
             deltas: Arc::clone(&self.deltas),

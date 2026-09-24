@@ -217,7 +217,7 @@ macro_rules! serving_error {
 }
 pub(crate) use serving_error;
 
-use dispatch::Wire;
+use dispatch::{Server, UpdateHandling, Wire};
 
 /// Authoritative DNS server.
 ///
@@ -709,87 +709,6 @@ struct Cli {
     quiet: bool,
 }
 
-/// Everything both transports answer from. One per process, so a connection or
-/// datagram task clones a single `Arc`.
-///
-/// Shared across transports on purpose: a client's rate limit must not reset
-/// because it switched transport, and the metrics are one server's.
-struct Server {
-    zone_map: Arc<RwLock<Zones>>,
-    /// The limiter, the response budget, the validator, the logger and the
-    /// metrics — the five handles serving a request needs that are not the
-    /// answer. `rdnsr` held the same five as its `Shell`, which is how the
-    /// admission sequence came to be written twice (`TODO.md` #30e, #32).
-    ctx: ServeContext,
-    /// Who may ask for a zone transfer. Empty by default, which refuses everyone.
-    transfer_acl: Arc<TransferAcl>,
-    /// Which client certificates may transfer which zones — §7.5's other
-    /// method, additive with the ACL and the keyring (`TODO.md` #59). Empty
-    /// unless `--allow-transfer-cert` named somebody.
-    transfer_clients: Arc<TransferCertificates>,
-    /// Refuse a transfer that did not arrive over TLS 1.3 (RFC 9103 §11,
-    /// `--transfer-tls-only`). Beside the ACL because it is the other half of
-    /// the same question — the ACL says who may ask, this says on what.
-    transfer_tls_only: bool,
-    tsig_keys: Arc<TsigKeyring>,
-    /// The zones we replicate, so a NOTIFY can be told from a plausible one.
-    secondaries: Arc<Secondaries>,
-    /// Per-zone change history, so an IXFR can answer with the difference.
-    /// Derived from the zone map, so the two are only updated together.
-    deltas: Arc<RwLock<DeltaLog>>,
-    /// `None` on a server with no writable zone source: every UPDATE refused.
-    updates: Arc<UpdateHandling>,
-    journal: Option<Arc<Journal>>,
-    /// Where the query stream goes, or `None` when `--dnstap` was not given.
-    /// See [`crate::dnstap`] for why the queue behind it drops.
-    dnstap: Option<crate::dnstap::Sink>,
-}
-
-/// What answering a dynamic UPDATE (RFC 2136) needs beyond what a query needs.
-///
-/// The update must reach the *file*, not just the map: the re-signing timer
-/// reloads every zone from its file (see [`ZoneSigning::resign_interval`]), so
-/// an in-memory-only edit is discarded within one re-signing interval with
-/// nothing logged. The flow is apply to the zone as the file has it, write the
-/// file, sign the result, verify what was signed, install that.
-struct UpdateHandling {
-    /// `None` when the server has no source it may write — a secondary's
-    /// replicated zones are the master's copy.
-    source: Option<ZoneSource>,
-    /// So the installed version is signed the way a loaded one would be.
-    signing: Option<Arc<ZoneSigning>>,
-    /// And checked the way a loaded one is: the same validator `verify_zones`
-    /// is given, so `--require-signed` means one thing (`TODO.md` #100).
-    validator: Arc<DnssecValidator>,
-    /// Serializes the read-modify-write, which RFC 2136 §3.7 requires.
-    ///
-    /// One lock for all zones rather than one per zone: two concurrent UPDATEs
-    /// is not a workload this has. Held across file I/O and a signing run, so
-    /// `tokio::Mutex` and not a `std` one.
-    ///
-    /// It guards the digest of each zone file as this server last wrote it
-    /// (`TODO.md` #64b), because that fact is *made* under this lock: nothing
-    /// else writes a zone file while it is held, so the map cannot be stale
-    /// with respect to anything the server itself did.
-    applying: tokio::sync::Mutex<std::collections::HashMap<PathBuf, rdns::zone::FileDigest>>,
-}
-
-impl UpdateHandling {
-    /// A server that refuses every UPDATE.
-    ///
-    /// `#[cfg(test)]`: `serve` always has a zone source. The `None` case still
-    /// drives the refusal branch in `answer_update`.
-    #[cfg(test)]
-    fn disabled() -> Self {
-        UpdateHandling {
-            source: None,
-            signing: None,
-            validator: Arc::new(DnssecValidator::new(false)),
-            applying: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-}
-
 /// The policy knobs `serve` applies.
 ///
 /// A struct rather than more positional parameters: two `u32`s and two
@@ -823,7 +742,7 @@ struct ServePolicy {
     /// `/readyz` on that same listener.
     readiness: Readiness,
     /// What a dynamic UPDATE needs; refuses everything when unconfigured.
-    updates: Arc<UpdateHandling>,
+    updates: UpdateHandling,
     /// Where the delta log is persisted, if anywhere.
     journal: Option<Arc<Journal>>,
     /// Where the query stream goes, and what a capture file may weigh.
@@ -1096,27 +1015,26 @@ async fn serve(
         None => None,
     };
 
-    let server = Arc::new(Server {
-        zone_map,
-        ctx: ServeContext {
-            limiter: Arc::new(RateLimiter::new(query_limit)),
-            responses: Arc::new(ResponseLimiter::per_second(response_rate)),
-            validator: Arc::new(AdmissionCheck::new(admission.clone())),
-            logger: Arc::new(QueryLogger::new()),
-            metrics,
-            udp,
-            clock: Clock::system(),
-        },
-        transfer_acl: Arc::new(transfer_acl),
-        transfer_clients: Arc::new(transfer_clients),
-        transfer_tls_only,
-        tsig_keys: Arc::new(tsig_keys),
-        secondaries,
-        deltas,
-        updates,
-        journal,
-        dnstap,
-    });
+    let server = Arc::new(
+        Server::new(
+            zone_map,
+            ServeContext {
+                limiter: Arc::new(RateLimiter::new(query_limit)),
+                responses: Arc::new(ResponseLimiter::per_second(response_rate)),
+                validator: Arc::new(AdmissionCheck::new(admission.clone())),
+                logger: Arc::new(QueryLogger::new()),
+                metrics,
+                udp,
+                clock: Clock::system(),
+            },
+        )
+        .with_transfers(transfer_acl, transfer_clients, transfer_tls_only)
+        .with_tsig_keys(tsig_keys)
+        .with_secondaries(secondaries)
+        .with_history(deltas, journal)
+        .with_updates(updates)
+        .with_dnstap(dnstap),
+    );
     // The effective policy, at the default level: a control nobody can observe
     // is a control nobody can debug.
     tracing::info!(
@@ -1126,7 +1044,7 @@ async fn serve(
          UDP reply cap: {reply_cap}B (advertising {advertised}B), \
          UDP workers: {udp_workers}, anomaly warnings: {anomaly_note}, \
          TSIG keys: {}, encrypted: {}, metrics: {}, control: {}",
-        server.tsig_keys.len(),
+        server.tsig_keys().len(),
         match &tls {
             Some(policy) => {
                 let (cert, key) = policy.store.paths();
@@ -1169,7 +1087,7 @@ async fn serve(
     // the process", and this one ends on the stop signal by design. Joined after
     // the drain instead, so it is not a detached task (`CLAUDE.md` §9).
     let anomalies = tokio::spawn(watch_anomalies(
-        server.ctx.logger.clone(),
+        server.ctx().logger.clone(),
         anomaly_thresholds,
         anomaly_interval,
         shutdown.stop_handle(),
@@ -1240,7 +1158,7 @@ async fn serve(
     if let Some(metrics_listener) = metrics_listener {
         loops.spawn(metrics_server::serve(
             metrics_listener,
-            server.ctx.metrics.clone(),
+            server.ctx().metrics.clone(),
             readiness,
             shutdown.stop_handle(),
             shutdown.busy(),
@@ -1260,12 +1178,7 @@ async fn serve(
             control_listener,
             socket.expect("a listener implies a path"),
             Arc::new(control::Control {
-                served: ZoneContext {
-                    zone_map: server.zone_map.clone(),
-                    deltas: server.deltas.clone(),
-                    metrics: server.ctx.metrics.clone(),
-                    journal: server.journal.clone(),
-                },
+                served: server.zone_context(),
                 secondaries,
                 catalogs,
                 reloads,
@@ -1332,14 +1245,17 @@ async fn udp_loop(
         // 24-26 ns a call (`TODO.md` #28a). Through `ctx`, because a
         // `Clock::fixed` that reaches only the accept loops reaches nothing a
         // UDP query touches (`TODO.md` #87).
-        let now = server.ctx.clock.now();
+        let now = server.ctx().clock.now();
 
         // Both are decisions to do nothing, so they run on `&buf[..size]` with
         // nothing copied and nothing spawned.
-        if !server.ctx.allow_source(peer.ip(), now) {
+        if !server.ctx().allow_source(peer.ip(), now) {
             continue;
         }
-        if !server.ctx.accept_packet(peer.ip(), packet, Transport::Udp) {
+        if !server
+            .ctx()
+            .accept_packet(peer.ip(), packet, Transport::Udp)
+        {
             continue;
         }
 
@@ -2241,12 +2157,7 @@ async fn main() -> Result<()> {
     // purpose: an UPDATE is a zone-file edit followed by the load path, so it has
     // to read and sign exactly the way a reload does or the two will disagree
     // about what the zone is.
-    let updates = Arc::new(UpdateHandling {
-        source: Some(source.clone()),
-        signing: signing.clone(),
-        validator: Arc::clone(&validator),
-        applying: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-    });
+    let updates = UpdateHandling::new(source.clone(), signing.clone(), Arc::clone(&validator));
 
     // Reload on SIGHUP or on the control socket, and re-sign on the signature
     // timer. The sender it hands back is how `rdnsctl reload` reaches the same
@@ -2719,19 +2630,15 @@ mod tests {
     fn server_with_keys_at(zone: Zone, keys: Vec<TsigKey>, clock: Clock) -> Arc<Server> {
         let mut zones = HashMap::new();
         zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
-        Arc::new(Server {
-            zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-            ctx: context_at(clock),
-            journal: None,
-            transfer_acl: Arc::new(TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl")),
-            transfer_clients: Arc::new(TransferCertificates::default()),
-            transfer_tls_only: false,
-            tsig_keys: Arc::new(TsigKeyring::new(keys)),
-            secondaries: Arc::new(Secondaries::default()),
-            deltas: Arc::new(RwLock::new(DeltaLog::new())),
-            updates: Arc::new(UpdateHandling::disabled()),
-            dnstap: None,
-        })
+        Arc::new(
+            Server::new(Arc::new(RwLock::new(Zones::new(zones))), context_at(clock))
+                .with_transfers(
+                    TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl"),
+                    TransferCertificates::default(),
+                    false,
+                )
+                .with_tsig_keys(TsigKeyring::new(keys)),
+        )
     }
 
     // The UDP worker pool
@@ -2789,7 +2696,7 @@ mod tests {
         #[tokio::test]
         async fn a_udp_reply_is_capped_by_this_server_and_not_only_by_the_client() {
             let server = server_with(pool_zone(128));
-            let cap = server.ctx.udp.max_response() as usize;
+            let cap = server.ctx().udp.max_response() as usize;
             let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
             let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
             let peer = client.local_addr().expect("addr");
@@ -2868,7 +2775,7 @@ mod tests {
         async fn a_signed_reply_reserves_its_signature_out_of_the_ceiling() {
             let key = TsigKey::new("transfer.key.", TsigAlgorithm::HmacSha256, vec![0x0b; 32]);
             let server = server_with_keys(pool_zone(70), vec![key.clone()]);
-            let cap = server.ctx.udp.max_response() as usize;
+            let cap = server.ctx().udp.max_response() as usize;
             let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
             let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
             let peer = client.local_addr().expect("addr");
@@ -2918,7 +2825,7 @@ mod tests {
                 let probe = rdns::tsig::sign_request(question.clone(), &key, tsig::now())
                     .expect("sign the probe");
                 let rdns::tsig::TsigCheck::Verified(session) =
-                    rdns::tsig::check_request(&probe, &server.tsig_keys, tsig::now())
+                    rdns::tsig::check_request(&probe, server.tsig_keys(), tsig::now())
                 else {
                     panic!("the probe verifies");
                 };
@@ -3053,12 +2960,16 @@ mod tests {
 
             for (transport, server) in [("TCP", &over_tcp), ("UDP", &over_udp)] {
                 assert_eq!(
-                    server.ctx.metrics.queries_received.load(Ordering::Relaxed),
+                    server
+                        .ctx()
+                        .metrics
+                        .queries_received
+                        .load(Ordering::Relaxed),
                     1,
                     "{transport} did not count a TSIG-rejected request as received"
                 );
                 assert_eq!(
-                    server.ctx.metrics.queries_type_a.load(Ordering::Relaxed),
+                    server.ctx().metrics.queries_type_a.load(Ordering::Relaxed),
                     1,
                     "{transport} did not track the query type of a rejected request"
                 );
@@ -3506,21 +3417,14 @@ mod tests {
                 let mut zones = HashMap::new();
                 zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
 
-                let server = Arc::new(Server {
-                    zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-                    ctx: test_context(),
-                    transfer_acl: Arc::new(
-                        TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl"),
-                    ),
-                    transfer_clients: Arc::new(TransferCertificates::default()),
-                    transfer_tls_only: false,
-                    tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
-                    secondaries: Arc::new(Secondaries::default()),
-                    deltas: Arc::new(RwLock::new(DeltaLog::new())),
-                    updates: Arc::new(UpdateHandling::disabled()),
-                    journal: None,
-                    dnstap: None,
-                });
+                let server = Arc::new(
+                    Server::new(Arc::new(RwLock::new(Zones::new(zones))), test_context())
+                        .with_transfers(
+                            TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl"),
+                            TransferCertificates::default(),
+                            false,
+                        ),
+                );
 
                 let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
                 let addr = listener.local_addr().expect("addr");
@@ -3623,21 +3527,14 @@ mod tests {
                 zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
                 let specs: Vec<String> = rules.iter().map(|r| (*r).to_string()).collect();
 
-                let server = Arc::new(Server {
-                    zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-                    ctx: test_context(),
-                    transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
-                    transfer_clients: Arc::new(
-                        TransferCertificates::parse(&specs).expect("the rules parse"),
-                    ),
-                    transfer_tls_only: false,
-                    tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
-                    secondaries: Arc::new(Secondaries::default()),
-                    deltas: Arc::new(RwLock::new(DeltaLog::new())),
-                    updates: Arc::new(UpdateHandling::disabled()),
-                    journal: None,
-                    dnstap: None,
-                });
+                let server = Arc::new(
+                    Server::new(Arc::new(RwLock::new(Zones::new(zones))), test_context())
+                        .with_transfers(
+                            TransferAcl::default(),
+                            TransferCertificates::parse(&specs).expect("the rules parse"),
+                            false,
+                        ),
+                );
 
                 // The arrival a DoT listener builds, with the certificate this
                 // client presented — the one thing the transport contributes.
@@ -3908,19 +3805,16 @@ mod tests {
         let mut zones = HashMap::new();
         zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
 
-        let server = Arc::new(Server {
-            zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-            ctx: test_context(),
-            transfer_acl: Arc::new(TransferAcl::parse(acl).expect("acl")),
-            transfer_clients: Arc::new(TransferCertificates::default()),
-            transfer_tls_only,
-            tsig_keys: Arc::new(keys),
-            secondaries: Arc::new(Secondaries::default()),
-            deltas: Arc::new(RwLock::new(log)),
-            updates: Arc::new(UpdateHandling::disabled()),
-            journal: None,
-            dnstap: None,
-        });
+        let server = Arc::new(
+            Server::new(Arc::new(RwLock::new(Zones::new(zones))), test_context())
+                .with_transfers(
+                    TransferAcl::parse(acl).expect("acl"),
+                    TransferCertificates::default(),
+                    transfer_tls_only,
+                )
+                .with_tsig_keys(keys)
+                .with_history(Arc::new(RwLock::new(log)), None),
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -3971,24 +3865,17 @@ mod tests {
             .map(|l| l.zones)
             .expect("load");
 
-        let server = Arc::new(Server {
-            zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-            ctx: test_context(),
-            transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
-            transfer_clients: Arc::new(TransferCertificates::default()),
-            transfer_tls_only: false,
-            tsig_keys: Arc::new(TsigKeyring::new(vec![key])),
-            secondaries: Arc::new(Secondaries::default()),
-            deltas: Arc::new(RwLock::new(DeltaLog::new())),
-            updates: Arc::new(UpdateHandling {
-                source: Some(source),
-                signing: None,
-                validator: Arc::new(DnssecValidator::new(false)),
-                applying: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            }),
-            journal,
-            dnstap,
-        });
+        let server = Arc::new(
+            Server::new(Arc::new(RwLock::new(Zones::new(zones))), test_context())
+                .with_tsig_keys(TsigKeyring::new(vec![key]))
+                .with_history(Arc::new(RwLock::new(DeltaLog::new())), journal)
+                .with_updates(UpdateHandling::new(
+                    source,
+                    None,
+                    Arc::new(DnssecValidator::new(false)),
+                ))
+                .with_dnstap(dnstap),
+        );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -5930,19 +5817,7 @@ mod tests {
         .expect("parse the zone");
         let mut zones = HashMap::new();
         zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
-        let server = Server {
-            zone_map: Arc::new(RwLock::new(Zones::new(zones))),
-            ctx: test_context(),
-            journal: None,
-            transfer_acl: Arc::new(TransferAcl::parse(&[]).expect("acl")),
-            transfer_clients: Arc::new(TransferCertificates::default()),
-            transfer_tls_only: false,
-            tsig_keys: Arc::new(TsigKeyring::new(Vec::new())),
-            secondaries: Arc::new(Secondaries::default()),
-            deltas: Arc::new(RwLock::new(DeltaLog::new())),
-            updates: Arc::new(UpdateHandling::disabled()),
-            dnstap: None,
-        };
+        let server = Server::new(Arc::new(RwLock::new(Zones::new(zones))), test_context());
         let peer: SocketAddr = "192.0.2.9:5353".parse().unwrap();
 
         let wire = |msg: &DnsMessage| {

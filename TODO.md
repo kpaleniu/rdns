@@ -37,10 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#109**, **#110**, **#112**-**#114**, plus **#21**, as of
+**#58**, **#68**, **#110**, **#112**-**#114**, **#116**, plus **#21**, as of
 2026-09-24 — the seven filed out of the architecture review are closed, nine
-more were filed, and #107, #108, #111 and #115 are closed out of the triage
-passes.
+more were filed, and #107-#109, #111 and #115 are closed out of the triage
+passes. #116 is #109's test half.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -6830,42 +6830,16 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 109. `struct Server` is in the crate root and its implementation is not — **filed 2026-09-21**
+### 116. `rdnsd`'s answering tests are in the crate root — **filed 2026-09-24**
 
-#38d moved the answering out of `main.rs` and left the type behind.
-`dispatch.rs:11` states what the move was for: "Everything else is private to
-this module, which is the whole of `TODO.md` #38d: the transfer and UPDATE
-answering used to be `impl Server` blocks in the crate root, where private means
-visible to the root and every descendant (`CLAUDE.md` §17)." The eleven fields
-that code reads are still in the root, so they are still visible to every
-descendant — the condition the move was made to escape.
-
-Measured:
-
-| | |
-|---|---|
-| `struct Server` | 11 fields, `main.rs:717-745` |
-| `impl Server` | `dispatch.rs:212-1247` — 1 035 lines, 9 methods |
-| `impl tcp::Handler for Server` | `dispatch.rs:141-167` |
-| other implementors in the workspace | 0 |
-| production literals | 2 — `serve` (main.rs:1099) and the test helper `server_with_keys_at` (main.rs:2719) |
-
-**The type is already being worked around.** `dispatch.rs:1239` holds a private
-`fn zone_context(&self) -> ZoneContext` over four of `Server`'s fields, and
-`main.rs:1263-1267` builds the same four by hand from `server.*` because it
-cannot reach it. Three of the five production `ZoneContext` literals are over the
-same four values.
-
-**The test half is downstream of the same fact.** The harness is built around
-`Server` and `replication.rs:19` says so, so 86 tests and 4 414 lines sit in the
-crate root's test module while `replication.rs` has 702 lines and no tests of its
-own, and `dispatch.rs` has 11 over 1 620.
-
-**Price it #83's way, which is not line count.** #83 read "more `pub(crate)` than
-it makes private" as *reachability* rather than annotation count, and took the
-NOTIFY split on the second reading for that reason. A constructor keeps all 11
-fields private; the annotations are the type and three methods. Not built, so not
-claimed — the number decides it, and a `git revert` is the cost of disagreeing.
+What #109 left, and said it would. The root's test module is 4 377 lines and 88
+tests (`main.rs:2335`); `dispatch.rs` has 11 and `replication.rs` 0, and
+`replication.rs:19` says why: its tests are "built on the `Server` harness
+there". #109 made `Server` constructible from any module in the crate
+(`Server::new` and six `with_*`), so the type no longer holds the tests in the
+root. What does is the harness — `server_with*`, `answered`, `test_context` —
+which lives in that module. Not measured: how many of the 88 reach anything
+but the harness and `Server`'s `pub(crate)` surface. No remedy costed.
 
 ---
 
@@ -7154,6 +7128,7 @@ the week; the record is under "How the queue kept going stale" in
 | **78** | `rdnsr`'s query path lost work at three of its exits | **filed 2026-09-19, closed 2026-09-20**, three rows, and the first was verified here while b and c were the review's reading — both held. **78a**: an `rpz-ip` rule over a cache hit dropped the prefetch the answer cache had just asked for, because `impl From<Option<Vec<u8>>> for Answered` fills `refresh: None`. Three shapes built (§19) and the one that shipped is in neither the row nor the review: delete the early `return`, since the hazard is §7's jump over a shared epilogue. **78b**: `Resolver::forward` returned the upstream's AA bit and echoed question verbatim where `recurse` normalized both, so an `rdnsr` in front of an `rdnsr` running 0x20 would have rejected its own answer (RFC 5452 §9.1) — left **#93**. **78c**: QDCOUNT = 0 was dropped by `rdnsr` and answered NOERROR *with AA set* by `rdnsd`. RFC 9619 §4 settles only QDCOUNT > 1; its QDCOUNT = 0 sentence binds firewalls, not responders. RFC 7873 §5.4 says what the query is for and that a server without cookies "will normally send FORMERR", and the peers agree: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all answer it, all FORMERR with no OPT, and none drops it — which is the measurement that could have refuted the finding |
 | **107** | eleven wall-clock reads inside a request path, in the crate #92 did not count | **filed 2026-09-21, closed 2026-09-22**. The eleven are exact and the crate held **fifteen**: the other four are two constructors, a background timer — #92's own category — and `DnssecValidator::validate_rrset`, which is not. `NsecCache`, `DelegationCache` and `KeyCache` take a `Clock` now, `Resolver` holds one and `validate` reads it; the two resolver caches *require* it, since both are `pub(super)` with one production caller, so a cache built without one does not compile (§17). Two tests that could not be written now are: a proof live at +0, +1 800 and +3 599 and gone at +3 601, and a delegation inserted through the public path instead of forged through the mutex — the forgery existed because `insert` clamps `expires_at` to `now + ttl`. **`validate_rrset` declines and the measurement is why**: it is request-reachable, though not by the route triage first named (`dispatch.rs:2433` is `#[cfg(test)]`; the real one is the UPDATE path's pre-install `FreshlySigned::verify`), and the instant it wants is choosable through `SigningPolicy` — #92's own criterion. `clock.rs`'s sentence is struck and corrected, which is what the row was filed for |
 | **108** | `min(SOA MINIMUM, the SOA's own TTL)` written five times | **filed 2026-09-21, closed 2026-09-24**. `Ttl::negative_answer(soa_ttl, minimum)` in `rdns-core::codes`, and the five call it. **The open shape question picked the signature**: four sites hold a record — two `ZoneRecordRef`, two `ResourceRecord`, all four spelling the inputs `ttl` and `rdata.soa_minimum()` — but `zone_signer` holds the `(Ttl, u32)` that `carry_over_records` split out of the SOA 200 lines earlier, so a record-shaped helper would have missed the one site the defect was found in. A sixth candidate is not one: `rdnsr/src/answer.rs:1087` hands the client both numbers and says so. **The larger half is the one the row did not name.** Behaviour is unchanged, so the only thing that can be watched failing is the drift — and reverting `negative_answer` to each one-term spelling found that **not one of the five sites had a test for both**: `rdnsd/answer` had neither, `zone_signer` had only #111c's split guard (which fires because the harness re-spells the rule), `dnssec_answer` had the SOA-TTL direction only and the two caches the mirror of it. Every gap is a fixture: three are `$TTL 3600` over `minimum 300`, #73's masking direction a third time, and the answer path cannot show MINIMUM winning over a zone *this* server signed, because the signer capped the chain first. Five tests added, each watched failing; both drifts now fail at all five sites. 1 304 → 1 309 passed on Windows, 1 330 on Linux, 0 failed |
+| **109** | `struct Server` in the crate root, its implementation in `dispatch` | **filed 2026-09-21, closed 2026-09-24**. `Server` and `UpdateHandling` moved to `dispatch.rs` with all 15 fields private; the root builds one with `Server::new` and six `with_*`, and reads `ctx()`, `tsig_keys()`, `zone_context()`. 13 `pub(crate)` items against 15 fields hidden, #83's predicted loss; paid for by nothing outside `dispatch` reading an ACL, a keyring or the UPDATE lock, and by six test literals losing their refusing defaults. The row counted 2 literals and there were 7. The test half is #116. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
