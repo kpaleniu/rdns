@@ -4,15 +4,20 @@
 //! looks like belongs beside the test that asserts it.
 
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use rdns::dnssec::{Ds, DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE};
+use rdns::dnssec_chain::TrustAnchors;
+use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
 use rdns::logging::QueryLogger;
 use rdns::metrics::DnsMetrics;
 use rdns::record_types;
 use rdns::resolver::{Resolver, ResolverConfig, ResolverMode};
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
 use rdns::validation::AdmissionCheck;
-use rdns::{DnsMessage, OpCode, Qtype, QuerySection, ResponseCode};
+use rdns::zone_signer::{sign_zone, SigningPolicy};
+use rdns::{DnsMessage, OpCode, Qtype, QuerySection, ResourceRecord, ResponseCode, Rtype};
 use rdns_transport::ServeContext;
 
 use rdns::cache::StalePolicy;
@@ -186,6 +191,123 @@ pub(crate) fn message(opcode: OpCode, response: bool) -> Vec<u8> {
     let n = msg.to_bytes(&mut buf).expect("serialize");
     buf.truncate(n);
     buf
+}
+
+/// `example.test.`, signed by the signer `rdnsd` uses, and the answers an
+/// upstream gives about it.
+///
+/// The NSEC chain is apex → `ns` → `*.w` → apex, so the apex NSEC denies every
+/// name between the apex and `ns` together with `*.example.test.`, and the
+/// `*.w` NSEC covers every name the wildcard reaches.
+pub(crate) struct SignedZone {
+    records: Vec<ResourceRecord>,
+    anchor: Ds,
+}
+
+impl SignedZone {
+    pub(crate) fn new() -> SignedZone {
+        const TEXT: &str = "$TTL 300\n\
+            @ IN SOA ns.example.test. hostmaster.example.test. 1 3600 600 86400 300\n\
+            @ IN NS ns.example.test.\n\
+            ns IN A 192.0.2.1\n\
+            *.w IN A 192.0.2.7\n";
+        let zone = rdns::zone::parse_zone_file(TEXT, "example.test.").expect("parses");
+        let key = |flags| {
+            SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, "example.test.", flags)
+                .expect("a key")
+        };
+        let ksk = key(DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP);
+        let anchor = ksk.ds(2).expect("a DS");
+        let keys = [ksk, key(DNSKEY_FLAG_ZONE)];
+        let policy = SigningPolicy::valid_for(rdns::clock::current_unix_timestamp(), 86_400);
+        let signed = sign_zone(&zone, &keys, &policy).expect("signs");
+        let records = signed
+            .records()
+            .iter()
+            .map(|r| {
+                let r = r.to_owned();
+                ResourceRecord {
+                    name: r.name,
+                    class: r.class,
+                    ttl: r.ttl,
+                    rdata: r.rdata,
+                }
+            })
+            .collect();
+        SignedZone { records, anchor }
+    }
+
+    /// The RRset at `owner`, with the signatures over it.
+    fn at(&self, owner: &str, rtype: Rtype) -> Vec<ResourceRecord> {
+        let owner = nm(owner);
+        self.records
+            .iter()
+            .filter(|r| r.name == owner)
+            .filter(|r| r.rdata.rtype() == rtype || r.rdata.rrsig_type_covered() == Some(rtype))
+            .cloned()
+            .collect()
+    }
+
+    /// What the upstream says to `query`. Only the names the fixture is built
+    /// for: the DNSKEY RRset, a name the wildcard reaches, and otherwise
+    /// NXDOMAIN proved by the apex NSEC — true for the gap before `ns` only.
+    pub(crate) fn reply(&self, query: &DnsMessage) -> DnsMessage {
+        let mut reply = query.clone();
+        reply.response = true;
+        reply.recursion_ok = true;
+        let question = &query.queries[0];
+        let w = nm("w.example.test.");
+        if question.qtype.is(record_types::DNSKEY) {
+            reply.answers = self.at("example.test.", record_types::DNSKEY);
+        } else if question.qname.as_ref().is_at_or_under(w.as_ref()) {
+            // Expanded: re-owned onto the name asked for, the RRSIG's label
+            // count left saying a wildcard signed it (RFC 4035 §5.3.2).
+            reply.answers = self.at("*.w.example.test.", record_types::A);
+            for record in &mut reply.answers {
+                record.name = question.qname.clone();
+            }
+            reply.authorities = self.at("*.w.example.test.", record_types::NSEC);
+        } else {
+            reply.rcode = ResponseCode::NoSuchDomain;
+            reply.authorities = self.at("example.test.", record_types::SOA);
+            reply
+                .authorities
+                .extend(self.at("example.test.", record_types::NSEC));
+        }
+        reply
+    }
+
+    /// A forwarder anchored on this zone's KSK, pointed at an upstream that
+    /// answers with [`SignedZone::reply`], and the count of what it was asked
+    /// other than the DNSKEY RRset.
+    pub(crate) async fn upstream(self) -> (Arc<Resolver>, Arc<AtomicUsize>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let addr = socket.local_addr().expect("bound");
+        let asked = Arc::new(AtomicUsize::new(0));
+        let config = ResolverConfig {
+            mode: ResolverMode::Forward,
+            upstream_servers: vec![addr],
+            dnssec: Some(TrustAnchors::new(vec![self.anchor.clone()]).into()),
+            ..Default::default()
+        };
+        let counter = asked.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
+                let Ok(query) = DnsMessage::try_from_bytes(&buf[..n]) else {
+                    continue;
+                };
+                if !query.queries[0].qtype.is(record_types::DNSKEY) {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                let reply = self.reply(&query).to_bytes_within(4096).expect("serialize");
+                let _ = socket.send_to(&reply, peer).await;
+            }
+        });
+        (Arc::new(Resolver::new(config)), asked)
+    }
 }
 
 /// A resolver forwarding to a socket that reads nothing, so every resolution

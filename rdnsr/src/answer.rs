@@ -98,6 +98,49 @@ impl Caches {
         }
     }
 
+    /// Keep what a resolution of `query` concluded, in every cache it belongs
+    /// in.
+    ///
+    /// The one way in for a resolution, whoever asked: the query path, a
+    /// prefetch and DNS64 each wrote their own copy until `TODO.md` #117, and
+    /// the two that ask on nobody's behalf never fed `denials`.
+    pub(crate) fn store(
+        &self,
+        query: &QuerySection,
+        response: &DnsMessage,
+        state: &ValidationState,
+    ) {
+        // A bogus answer in the cache is an attack that outlives the query
+        // that carried it.
+        if state.is_bogus() {
+            return;
+        }
+        let secure = state.is_secure();
+        let (name, qtype) = (query.qname.as_ref(), query.qtype);
+        if !response.answers.is_empty() {
+            self.answers
+                .put_validated(name, qtype, response.answers.clone(), secure);
+        }
+        // A "no" is an answer; re-resolving it makes a typo storm cost one
+        // upstream walk per repeat. The SOA in the authority section says how
+        // long it is good for (RFC 2308).
+        self.negatives.insert(name, qtype, response, secure);
+        // A *validated* "no" covers a whole range of names, so it also goes in
+        // the denial cache. Only when Secure: an unvalidated NSEC is an
+        // attacker's claim about which names do not exist.
+        if !secure {
+            return;
+        }
+        if response.answers.is_empty() {
+            self.denials.insert_validated(response);
+        } else {
+            // A validated wildcard answer is the same kind of statement about
+            // a range (RFC 8198 §5.3), so it is kept under the wildcard rather
+            // than the name asked for.
+            self.denials.insert_validated_wildcard(response);
+        }
+    }
+
     /// Forget everything held, positive and negative.
     ///
     /// All three, because all three answer without walking a delegation, and
@@ -499,39 +542,8 @@ pub(crate) async fn handle_query(
                     }
                 }
 
-                let secure = state.is_secure();
-                // A bogus answer in the cache is an attack that outlives
-                // the query that carried it.
-                if !upstream.answers.is_empty() && !state.is_bogus() {
-                    caches.answers.put_validated(
-                        query.qname.as_ref(),
-                        query.qtype,
-                        upstream.answers.clone(),
-                        secure,
-                    );
-                }
-                // A "no" is an answer; re-resolving it makes a typo storm
-                // cost one upstream walk per repeat. The SOA in the
-                // authority section says how long it is good for (RFC 2308).
-                if !state.is_bogus() {
-                    caches
-                        .negatives
-                        .insert(query.qname.as_ref(), query.qtype, &upstream, secure);
-                }
-                // A *validated* "no" covers a whole range of names, so it
-                // also goes in the denial cache. Only when Secure: an
-                // unvalidated NSEC is an attacker's claim about which names
-                // do not exist.
-                if upstream.answers.is_empty() && secure {
-                    caches.denials.insert_validated(&upstream);
-                }
-                // A validated wildcard answer is the same kind of statement
-                // about a range (RFC 8198 §5.3), so it is kept under the
-                // wildcard rather than the name asked for.
-                if !upstream.answers.is_empty() && secure {
-                    caches.denials.insert_validated_wildcard(&upstream);
-                }
-                (upstream, secure, None)
+                caches.store(&query, &upstream, &state);
+                (upstream, state.is_secure(), None)
             }
             // A nameserver trigger matched, so the walk stopped and the
             // policy has the answer. Nothing was cached: the resolution
@@ -734,10 +746,9 @@ async fn synthesized_aaaa(
 /// Resolve a question and store what comes back, for the callers that ask on
 /// nobody's behalf: a prefetch, and DNS64's A query.
 ///
-/// The answer section, or `None` for a failure or a bogus answer. Not the main
-/// answer path's storing, which also has a client to fail closed for, a CD bit
-/// to honour and denial proofs to keep; what is shared is what these two need
-/// and it is this much (`CLAUDE.md` §7).
+/// The answer section, or `None` for a failure or a bogus answer. What is
+/// stored is what the query path stores: failing closed and CD are about the
+/// reply, not the cache (`TODO.md` #117).
 async fn resolve_and_store(
     serving: &Resolving,
     query: &QuerySection,
@@ -755,24 +766,12 @@ async fn resolve_and_store(
     else {
         return None;
     };
+    // A name that has gone is exactly what a prefetch should notice before a
+    // client does, so the "no" is stored like any other.
+    serving.caches.store(query, &answer, &state);
     if state.is_bogus() {
         return None;
     }
-    let secure = state.is_secure();
-    if !answer.answers.is_empty() {
-        serving.caches.answers.put_validated(
-            query.qname.as_ref(),
-            query.qtype,
-            answer.answers.clone(),
-            secure,
-        );
-    }
-    // A "no" is an answer, and a name that has gone is exactly what a prefetch
-    // should notice before a client does.
-    serving
-        .caches
-        .negatives
-        .insert(query.qname.as_ref(), query.qtype, &answer, secure);
     Some(answer.answers)
 }
 
@@ -782,6 +781,10 @@ async fn resolve_and_store(
 /// A cached negative counts: an A query that found nothing is a name with no
 /// address of either family, and asking the internet again on every AAAA query
 /// for it is how a DNS64 resolver doubles its own traffic.
+///
+/// Not the denial cache: it saves at most one upstream query per AAAA, and the
+/// query path skips it under CD, so this would need the bit passed in to agree
+/// (`TODO.md` #117).
 async fn cached_or_resolve(
     serving: &Resolving,
     query: &QuerySection,
@@ -1885,6 +1888,118 @@ mod tests {
                 .prefetches
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
+        );
+    }
+
+    fn a_question(name: &str) -> QuerySection {
+        QuerySection {
+            qname: nm(name),
+            qtype: Qtype::of(record_types::A),
+            qclass: rdns::QueryClass::IN,
+        }
+    }
+
+    /// Which caches a resolution reaches, by what validation concluded and
+    /// whether it answered (`TODO.md` #117). Read back through the lookups a
+    /// later query makes, so a row is what that query would find.
+    #[test]
+    fn a_resolution_is_stored_by_what_validation_concluded() {
+        let zone = SignedZone::new();
+        let upstream = |name: &str| {
+            let mut asked = DnsMessage::try_from_bytes(&message(OpCode::Query, false)).expect("ok");
+            asked.queries = vec![a_question(name)];
+            zone.reply(&asked)
+        };
+        let a = nm("a.example.test.");
+        let x = nm("x.w.example.test.");
+        let qtype = Qtype::of(record_types::A);
+        let states = [
+            ValidationState::Secure,
+            ValidationState::Insecure,
+            ValidationState::Bogus(Bogus::new(InfoCode::DNSSEC_BOGUS, "a test")),
+        ];
+        for state in &states {
+            let (secure, bogus) = (state.is_secure(), state.is_bogus());
+
+            let caches = Caches::new(16, 4, StalePolicy::OFF, Clock::system());
+            caches.store(
+                &a_question("a.example.test."),
+                &upstream("a.example.test."),
+                state,
+            );
+            assert_eq!(
+                caches.negatives.get(a.as_ref(), qtype).is_some(),
+                !bogus,
+                "{state:?}"
+            );
+            assert!(caches.answers.lookup(a.as_ref(), qtype, false).is_none());
+            // Another name in the same gap: only a Secure proof covers it.
+            let b = nm("b.example.test.");
+            assert_eq!(
+                caches.denials.synthesize(b.as_ref(), qtype).is_some(),
+                secure,
+                "{state:?}"
+            );
+
+            let caches = Caches::new(16, 4, StalePolicy::OFF, Clock::system());
+            caches.store(
+                &a_question("x.w.example.test."),
+                &upstream("x.w.example.test."),
+                state,
+            );
+            assert_eq!(
+                caches.answers.lookup(x.as_ref(), qtype, false).is_some(),
+                !bogus
+            );
+            assert!(caches.negatives.get(x.as_ref(), qtype).is_none());
+            // Another name the wildcard reaches (RFC 8198 §5.3).
+            let y = nm("y.w.example.test.");
+            assert_eq!(
+                caches
+                    .denials
+                    .synthesize_wildcard(y.as_ref(), qtype)
+                    .is_some(),
+                secure,
+                "{state:?}"
+            );
+        }
+    }
+
+    /// A prefetch keeps a validated denial as the query path does, so the rest
+    /// of its gap is answered without asking again (RFC 8198 §5.1).
+    ///
+    /// Watched failing with `resolve_and_store`'s own storing restored — the
+    /// answers and negatives only — as a second upstream query for `b`.
+    #[tokio::test]
+    async fn a_refreshed_denial_answers_the_rest_of_its_gap() {
+        let (resolver, asked) = SignedZone::new().upstream().await;
+        let serving = serving(resolver, test_shell(), PolicyZones::default());
+
+        refresh(&serving, a_question("a.example.test.")).await;
+        let held = serving
+            .caches
+            .negatives
+            .get(nm("a.example.test.").as_ref(), Qtype::of(record_types::A))
+            .expect("the refresh kept the NXDOMAIN");
+        // Otherwise the fixture is what failed, and not the storing.
+        assert!(held.secure, "the fixture validates");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let answered = handle_query(
+            query_for("b.example.test.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await;
+        let reply =
+            DnsMessage::try_from_bytes(&answered.expect("answered")).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "synthesized from the denial the refresh kept, not asked again"
         );
     }
 

@@ -9990,3 +9990,78 @@ Verified: 1 318 passed on Windows, 1 339 on Linux, 0 failed; clippy clean on
 both; `cargo doc --workspace --no-deps` clean.
 
 ---
+
+### 117. `refresh` says it stores what an ordinary resolution stores; the function it calls says it does not — **filed 2026-09-25, closed 2026-09-25**
+
+Two doc comments from one commit (`7d1cb33`, #45c) contradict each other:
+
+- `rdnsr/src/answer.rs:810`, on `refresh`: "The result goes through the same
+  storing as an ordinary resolution, because it *is* one".
+- `:737-740`, on `resolve_and_store`, which `refresh` calls: "Not the main
+  answer path's storing, which also has a client to fail closed for, a CD bit
+  to honour and denial proofs to keep; what is shared is what these two need".
+
+The second is what the code does. The query path (`:505-533`) stores into
+`answers`, `negatives`, and — when Secure — `denials`: `insert_validated` for
+an empty answer, `insert_validated_wildcard` for a non-empty one (RFC 8198
+§5.3). `resolve_and_store` (`:758-775`) stores into the first two.
+`cached_or_resolve` (`:785`), DNS64's lookup, reads `answers` and `negatives`
+and never `denials`, which the query path tries first (`:368-400`).
+
+Measured:
+
+- `insert_validated*` has two production call sites, both on the query path
+  (`:526`, `:532`).
+- The omission predates DNS64: `refresh` at `7d1cb33^` stored the same two
+  caches, so a prefetch has never fed the denial cache. The DNS64 commit wrote
+  the second doc comment, which made it a stated choice.
+- A prefetch is offered only from an answer-cache hit (`:415-422`), so what a
+  refresh can fail to keep is a Secure wildcard answer, or a Secure NXDOMAIN for
+  a name that has since gone. DNS64's A query can miss either.
+- No test in `answer.rs` stores into the denial cache through any path; the
+  test module's hits for `denials`, `insert_validated` and `synthesize` are
+  DNS64 tests.
+
+No client gets a wrong answer. What is lost is RFC 8198 coverage for what the
+two paths that ask on nobody's behalf learn.
+
+The decision is whether "what these two need" is right, and one doc comment
+is wrong either way. The review proposed deepening `Caches` so one store and
+one lookup serve all three sites. That proposal is recorded here and not
+costed; it only follows if the answer is yes.
+
+**Closed 2026-09-25.** Decided yes: a denial that prefetch or DNS64 learned is
+kept. Of the three reasons `resolve_and_store` gave for storing less, failing
+closed and CD decide what goes into the *reply*. The query path stored the
+same things whatever CD said, and bogus answers were never stored on either
+path. The third reason, "denial proofs to keep", was stated without an
+argument. `NsecCache`'s only precondition is Secure, and both writers had
+that.
+
+- **`Caches::store`** holds the four rules, and both writers call it. Its
+  table test reads each row back through the lookups a later query makes: it
+  covers Secure, Insecure and Bogus, each for an NXDOMAIN and for a wildcard
+  answer. Dropping the wildcard rule from `store` fails it on the Secure row.
+- **The regression test is `a_refreshed_denial_answers_the_rest_of_its_gap`.**
+  A Secure NXDOMAIN arrives through `refresh`. Then a second name in the same
+  NSEC gap is answered with no upstream query. With `resolve_and_store`'s old
+  two-cache storing restored, the upstream is asked twice (`left: 2, right:
+  1`). Before that, the test checks that the fixture validated, so a fixture
+  failure cannot pass for the fix failing.
+- **The fixture is `testutil::SignedZone`.** It is `example.test.` signed by
+  `zone_signer::sign_zone`, served by a loopback forwarder and anchored on its
+  own KSK's DS. It is the first Secure resolution `rdnsr`'s tests can reach.
+  `rdns`'s signed hierarchy is `#[cfg(test)]` in another crate, and
+  `resolve_validated` is the only thing that produces a `ValidationState`.
+- **Declined: DNS64's `cached_or_resolve` consulting the denial cache.** It
+  saves at most one upstream query per AAAA. The query path skips the denial
+  cache under CD, and DNS64 runs under CD without DO, so the lookup would need
+  the bit passed in to agree. The reason is on the function.
+
+Sealing `Caches` in a file of its own, so `store` is the only way in, is the
+next commit and changes no behaviour.
+
+Verified: 1 320 passed on Windows and 1 341 on Linux (1 318 and 1 339 before),
+0 failed. Clippy clean on both, and `cargo doc --workspace --no-deps` clean.
+
+---
