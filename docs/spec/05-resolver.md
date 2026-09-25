@@ -163,19 +163,22 @@ process down. Binds 127.0.0.1 by default.
    validated wildcard) is tried first; the two are mutually exclusive by
    construction.
 8. Answer cache, then negative cache.
-9. Miss → `Resolver::resolve`.
-10. Validation, if `--dnssec-validate`: AD is set only on `Secure`; `Bogus` is
+9. With `--serve-stale-first`, an expired answer or "no" inside the window,
+   answered at once with its refresh queued. See §5.5.
+10. Miss → `Resolver::resolve`.
+11. Validation, if `--dnssec-validate`: AD is set only on `Secure`; `Bogus` is
     SERVFAIL unless the client set CD.
-11. On a resolution that failed and `--serve-stale` non-zero: the expired answer
+12. On a resolution that failed and `--serve-stale` non-zero: the expired answer
     or the expired "no", if either is still inside the window. See §5.5.
-12. Cache store by (name, type) with the answer's TTL, and its validation state
+13. Cache store by (name, type) with the answer's TTL, and its validation state
     alongside it, so a cached answer carries the same AD bit the first client
     saw.
-13. Response policy again (`rpz::PolicyZones::on_answer`): the addresses in the
-    answer against the `rpz-ip` triggers. See §5.6.
-14. DNS64 synthesis (`finish_dns64`), when the answer carries no usable AAAA.
+14. Response policy again (`rpz::PolicyZones::on_answer`): the addresses in the
+    answer against the `rpz-ip` triggers. See §5.6. A stale answer is policed
+    here as a cache hit is.
+15. DNS64 synthesis (`finish_dns64`), when the answer carries no usable AAAA.
     See §5.7.
-15. Reply, echoing the transaction id with RA set and the OPT record mirrored
+16. Reply, echoing the transaction id with RA set and the OPT record mirrored
     only if the client used EDNS, sized by transport (`Transport::Udp` uses the
     client's advertised payload size; `Transport::Tcp` uses the 2-byte frame).
 16. A prefetch, if the answer came from a cache entry in the last tenth of its
@@ -260,8 +263,9 @@ the window is arithmetic; with the policy off its predicate is exactly "has not
 expired", so nothing branches on the mode.
 
 - Only reached from the arm where a resolution has already failed (§4 of
-  RFC 8767 has the resolver try the authoritative servers first). A cache that
-  can answer normally never gets here.
+  RFC 8767 has the resolver try the authoritative servers first), unless
+  `--serve-stale-first` says otherwise. A cache that can answer normally never
+  gets here.
 - The answer carries `STALE_ANSWER_TTL` = 30 s (§4), EDE 3 (Stale Answer) or
   EDE 19 (Stale NXDOMAIN Answer), and AD as validation concluded when it was
   stored.
@@ -270,6 +274,31 @@ expired", so nothing branches on the mode.
 - Eviction keeps what the window keeps in both caches. Sweeping the expired
   entries when making room would leave the window to a resolver nobody is
   querying.
+
+#### Answering stale first — `--serve-stale-first`
+
+Off by default, and refused without a window. On a live miss, an entry inside
+the window is answered at once and its refresh is queued to the prefetch pool:
+BIND's `stale-answer-client-timeout 0`.
+
+- **A deviation from RFC 8767 §4**, whose normative text lets a record be used
+  past its TTL only "if the data is unable to be authoritatively refreshed".
+  Nothing has been tried here. Listed in `07-rfc-conformance.md`.
+- **Not §5's 1.8 s client response timer.** BIND removed its non-zero form in
+  9.19.22/9.20 after CVE-2022-3736 and CVE-2022-3924, both of which need a
+  positive value; Knot Resolver answers stale at 3 s and does not finish the
+  resolution; PowerDNS has no client timer (`TODO.md` #58).
+  `dns_slow_resolutions_total{outcome="completed"}` counts the clients a
+  timer — or this switch — would have spared.
+- One refresh per entry per `STALE_REFRESH_INTERVAL` = 30 s, §5's failure
+  recheck timer, claimed under the cache's lock. A period and not a flag: a
+  stale entry is answered without resolving, so a refresh that failed once
+  would otherwise never be tried again.
+- The EDE text says a refresh is under way, not that the servers could not be
+  reached. Counted as a cache hit and in `dns_stale_answers_total`; the refresh
+  in `dns_stale_refreshes_total`.
+- The negative cache takes part: an expired NXDOMAIN or NODATA is answered
+  first the same way, with EDE 19 or 3.
 
 ### Prefetching — `--prefetch`
 
@@ -281,7 +310,9 @@ away.
   at most once per entry, flipped under the lock the lookup already holds. A
   popular name in its last tenth otherwise starts one walk per client.
 - The refresh is offered to a bounded queue (`--prefetch-queue`, 256) and run
-  by a pool (`--prefetch-workers`, 16). A full queue drops the question and
+  by a pool (`--prefetch-workers`, 16). `--serve-stale-first` shares both, and
+  the handle says which of the two uses are on (`prefetch::Refreshes`), so the
+  pool running is not what switches prefetching on. A full queue drops the question and
   counts it in `dns_prefetches_dropped_total`; the entry stays claimed and
   expires like a failed refresh.
 - Not in the task that answered. DoH builds its response only once the

@@ -67,21 +67,26 @@ pub struct StalePolicy {
 /// exactly the resolution path that is already failing.
 pub const STALE_ANSWER_TTL: u32 = 30;
 
-/// How long a client waits before RFC 8767 §4's *client response timer* gives
-/// it what this resolver last knew and lets the resolution finish behind it
-/// (§4, recommended 1.8 seconds).
+/// RFC 8767 §5's *client response timer*, recommended 1.8 seconds: how long a
+/// client waits before the resolver answers stale while the resolution runs on.
 ///
-/// Nothing answers on this yet — `TODO.md` #58 is the feature, and the reason
-/// it is a constant here first is that the number it needs is "how often would
-/// this fire", which cannot be asked without a threshold to ask it about. It is
-/// the bound of one latency bucket ([`crate::metrics`]) and the comparison
-/// behind `dns_slow_resolutions_total`; when #58 lands it is the default of the
-/// flag, in one place rather than three (`CLAUDE.md` §7).
-///
-/// Distinct from the *query resolution* timer, which is the one already in
-/// place: that one answers from the stale window after a resolution has failed,
-/// and this one answers while it is still running.
+/// Not implemented, and declined (`TODO.md` #58): BIND removed its non-zero
+/// form after two CVEs, and `rdnsr --serve-stale-first` is the zero form
+/// instead. Kept as a threshold: the bound of one latency bucket
+/// ([`crate::metrics`]) and the comparison behind
+/// `dns_slow_resolutions_total`, which is how an operator tells whether
+/// clients wait long enough for `--serve-stale-first` to be worth it.
 pub const CLIENT_RESPONSE_TIMER: Duration = Duration::from_millis(1800);
+
+/// How often an expired entry may hand out a refresh when it is being answered
+/// stale (RFC 8767 §5's failure recheck timer: refreshes from failing
+/// authorities "no more frequently than every 30 seconds").
+///
+/// A period and not a flag set once, as `CacheEntry::refreshing` is for a
+/// prefetch: a prefetch that fails leaves the entry to expire and the next
+/// client resolves it, but a stale entry is answered without resolving, so a
+/// refresh that failed once would never be tried again for the whole window.
+pub const STALE_REFRESH_INTERVAL: u64 = 30;
 
 impl StalePolicy {
     /// Serve nothing stale. The default, and what `--serve-stale 0` means.
@@ -142,6 +147,9 @@ struct CacheEntry {
     /// difference between prefetching and a stampede. Not reset on failure: the
     /// entry then expires and the next query resolves the ordinary way.
     refreshing: bool,
+    /// When a stale answer may next hand out a refresh
+    /// ([`STALE_REFRESH_INTERVAL`]). 0 on a new entry: due at once.
+    stale_refresh_after: u64,
 }
 
 impl CacheEntry {
@@ -275,26 +283,29 @@ impl DnsCache {
     /// An answer that has expired but is still inside the stale window
     /// (RFC 8767), with [`STALE_ANSWER_TTL`] on every record.
     ///
-    /// Only for the caller that has already failed to refresh it: §4 has the
-    /// resolver try the authoritative servers first and serve this when that
-    /// does not work, so a cache that can answer normally must not come here.
-    /// `None` when the policy is off, so the check is this function's and not
-    /// every call site's.
-    pub fn get_stale(
-        &self,
-        name: NameRef<'_>,
-        qtype: Qtype,
-    ) -> Option<(Vec<ResourceRecord>, bool)> {
+    /// §4 has the resolver try the authoritative servers first and serve this
+    /// when that does not work, so a cache that can answer normally must not
+    /// come here. The one exception is `rdnsr --serve-stale-first`, which
+    /// answers this before trying and passes `refreshing`: the hit's `refresh`
+    /// is then set at most once per [`STALE_REFRESH_INTERVAL`], and the caller
+    /// told is the caller that queues it. `None` when the policy is off, so the
+    /// check is this function's and not every call site's.
+    pub fn get_stale(&self, name: NameRef<'_>, qtype: Qtype, refreshing: bool) -> Option<Cached> {
         if !self.stale.is_on() {
             return None;
         }
         let now = self.clock.now();
-        let cache = self.cache.lock().ok()?;
+        let mut cache = self.cache.lock().ok()?;
         let folded = name.folded();
         let key: &dyn NameType = &(folded.as_ref(), qtype);
         let entry = cache
-            .get(key)
+            .get_mut(key)
             .filter(|entry| entry.is_expired(now) && self.stale.keeps(entry.expires_at, now))?;
+        // Under the lock the lookup already holds, as `lookup`'s flag is.
+        let refresh = refreshing && now >= entry.stale_refresh_after;
+        if refresh {
+            entry.stale_refresh_after = now.saturating_add(STALE_REFRESH_INTERVAL);
+        }
         let records = entry
             .records
             .iter()
@@ -303,7 +314,11 @@ impl DnsCache {
                 ..rr.clone()
             })
             .collect();
-        Some((records, entry.secure))
+        Some(Cached {
+            records,
+            secure: entry.secure,
+            refresh,
+        })
     }
 
     /// Put records in cache with TTL, unvalidated.
@@ -358,6 +373,7 @@ impl DnsCache {
                 ttl: min_ttl,
                 secure,
                 refreshing: false,
+                stale_refresh_after: 0,
             },
         );
     }
@@ -698,9 +714,14 @@ mod tests {
                 .is_none(),
             "an expired entry is not an answer"
         );
-        let (records, secure) = cache
-            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A))
+        let Cached {
+            records,
+            secure,
+            refresh,
+        } = cache
+            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A), false)
             .expect("but it is still the last thing known");
+        assert!(!refresh, "nothing is owed to a caller that did not ask");
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].ttl.as_secs(),
@@ -712,7 +733,7 @@ mod tests {
         // Past the window it is gone, and the lookup that finds it says so.
         clock.advance(3600);
         assert!(cache
-            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A))
+            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A), false)
             .is_none());
     }
 
@@ -734,8 +755,35 @@ mod tests {
             "nothing will ask for it again"
         );
         assert!(cache
-            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A))
+            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A), false)
             .is_none());
+    }
+
+    /// A stale entry answered first hands out one refresh per
+    /// [`STALE_REFRESH_INTERVAL`] (RFC 8767 §5's failure recheck timer), not one
+    /// per query and not one ever.
+    ///
+    /// The second half is the reason it is a period: with `refreshing`'s
+    /// set-once rule, a refresh that failed would leave the name answered
+    /// stale, untried, for the rest of the window.
+    #[test]
+    fn a_stale_entry_hands_out_one_refresh_per_recheck_interval() {
+        let (cache, clock) = fixed_cache(16, StalePolicy::seconds(3600));
+        put_a(&cache, "example.com.", 300);
+        clock.advance(301);
+        let owed = |cache: &DnsCache| {
+            cache
+                .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A), true)
+                .expect("inside the window")
+                .refresh
+        };
+
+        assert!(owed(&cache), "the first caller refreshes");
+        assert!(!owed(&cache), "the second does not: one is under way");
+        clock.advance(STALE_REFRESH_INTERVAL - 1);
+        assert!(!owed(&cache), "nor within the interval");
+        clock.advance(1);
+        assert!(owed(&cache), "and after it the name is tried again");
     }
 
     /// The lookup keeps it, and so must eviction: a window the cache empties

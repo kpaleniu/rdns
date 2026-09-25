@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#120**, plus **#21**, as of 2026-09-25.
-#68 and #107-#119 are closed. #117-#119 came out of a fourth architecture
+**#120**, plus **#21**, as of 2026-09-25.
+#58, #68 and #107-#119 are closed. #117-#119 came out of a fourth architecture
 review that day and were groomed against the code before filing; #120 came out
 of verifying #68.
 
@@ -1944,163 +1944,6 @@ refresh that only asks for what moved.
   `rdnsd`, for the same reason. Defaulting to `enforce` without it ships the
   silently-stale blocklist this whole finding is about; the difference is that
   it is now on purpose and has a number.
----
-
-### 58. serve-stale answers a dead upstream and not a slow one — **filed 2026-09-13**, **ready-for-agent**
-
-Left behind by 45b. RFC 8767 ~~§4~~ §5 has two timers and this tree implements
-one. (§4 is the amended TTL definition; the timers are §5's "Example Method",
-and nine live places cite them as §4 — see the remedy.)
-
-The **query resolution timer** is the one in place: resolve, and if that fails,
-answer from the stale window. It covers an upstream that is down, refusing, or
-unreachable — which is the outage the 45b row was about.
-
-The **client response timer** is the other, recommended 1.8 seconds: answer from
-the stale window *while the resolution is still running*, and let it finish into
-the cache for the next client. It covers the case a subscriber actually notices
-more often — an authoritative server that is slow rather than dead, where this
-resolver's own `timeout_ms` of 5 seconds is longer than a browser waits.
-
-Why it was not done with the rest: it is not a cache change, it is a lifetime
-change. `handle_query` borrows `&Resolving`, and answering early means the
-resolution has to outlive the request that started it — a task, holding an
-`Arc<Resolving>` and a `Busy` from `rdns::shutdown` so the drain waits for it
-(`CLAUDE.md` §9: dropping a `JoinHandle` detaches, it does not cancel). That
-means `handle_query` takes `&Arc<Resolving>`, and the two socket loops have to
-agree about who owns the guard.
-
-~~**45d moved one of those pieces on 2026-09-13.** `handle_query` returns
-`Answered` now — the reply, plus work the socket loop runs *after* sending it —
-and a prefetch goes down that path.~~ **Gone since #114** (`77399ba`):
-`handle_query` returns `Option<Vec<u8>>` again, and a prefetch is offered to a
-bounded queue that `prefetch::run`'s pool drains, holding `Arc<Resolving>`.
-What it does not solve is this one: a
-prefetch starts after the answer, and the client response timer has to answer
-while a resolution is already running. The return value is the same shape; the
-lifetime is not.
-
-Three things to settle, and the first is a measurement:
-
-- **58a. How often would it fire?** ~~A resolution that takes over 1.8 s and
-  then succeeds is the only case this helps. `LatencyTimer` already feeds the
-  latency histogram, whose buckets stop at 50 ms — so the number is not
-  currently measurable and the first step is a bucket that reaches seconds.~~
-  **The instrument is in as of 2026-09-14 and both halves of that were wrong.**
-
-  The bucket was necessary and is not the measurement. The histogram counts
-  *answers*, and an answer is a cache hit at 1 µs or a recursion at 2 s with no
-  way to tell them apart, and it carries no outcome — so `le="1.8"` against
-  `+Inf` says how many answers were slow and nothing about whether a stale
-  reply would have been the better one. The remedy the row named would have
-  been filed as the number and was not one (`CLAUDE.md` §18).
-
-  And "the only case this helps" is not right either. A resolution that runs
-  long and then *fails* serves stale today — the query resolution timer does
-  it — so the client response timer buys it the seconds in between, not the
-  answer. The two cases are worth different amounts, which is why the
-  measurement is a split and not a total.
-
-  What landed: eleven bucket bounds instead of eight, reaching 5 s, with
-  `le="1.8"` on RFC 8767 §4's number and `le="5"` on `timeout_ms`'s default;
-  `rdns::cache::CLIENT_RESPONSE_TIMER` as the one place 1.8 s is written, which
-  is the flag's default when the feature lands; and
-  `dns_slow_resolutions_total{outcome="completed"|"failed"}`, counted at the one
-  recursion a client waits on. `completed` is the feature's whole case.
-
-  Verified by provoking it rather than by reading the diff (`CLAUDE.md` §4):
-  two tests drive `handle_query` against a forwarder that sleeps 1.9 s and
-  against a black hole, and both fail with the count on the wrong side of the
-  split as well as with it removed. The timing is real — `LatencyTimer` is
-  `std::time::Instant`, which neither this crate's test clock nor tokio's
-  paused timer moves — so the pair costs 2.0 s of suite time. Scraped off a
-  running `rdnsr` as well: one forwarded query rendered
-  `dns_answer_latency_seconds_sum 0.028286` into `le="0.05"`, which the old
-  top bound of 50 ms could not tell from a ten-second answer.
-
-  **The number is still not taken.** An instrument is not a measurement: these
-  counters have to run somewhere with real traffic, and recursion cannot be
-  verified here (see "Verifying"), so the scrape above is a *forwarded* query
-  and not the case 58 is about. Until `completed` has been read off a
-  deployment, 58b and 58c are not worth starting.
-- **58b. What stops a flood of detached resolutions?** The in-flight semaphore
-  bounds tasks *per datagram*; a resolution that outlives its datagram is
-  outside that bound. It needs one of its own, or the permit has to be handed
-  to the task.
-- **58c. Does the early answer suppress the second client's?** Two clients
-  asking the same slow name should not start two resolutions. That is a
-  de-duplicating in-flight table, which this resolver does not have and which
-  is worth more than the timer on its own.
-
-**Groomed 2026-09-25: the 1.8 s timer is declined; BIND's zero timer is taken
-instead.** Decided by the owner on the survey below, which replaces 58a's
-deployment number as the thing that settles it (`CLAUDE.md` §4). Sources read
-that day at their `main`/`master`.
-
-| | client response timer | what runs behind a stale answer |
-|---|---|---|
-| Unbound, `util/config_file.c` | `serve_expired_client_timeout = 1800`, under `serve-expired: no` | the resolution continues |
-| BIND, `doc/arm/reference.rst` | `stale-answer-client-timeout` off by default; "the only supported value … is `0`. Non-zero values generate a warning message and are treated as `0`" | a refresh, at `0` |
-| Knot Resolver, `modules/serve_stale` | 3 s deadline, then stale | nothing: "TODO: probably start the same request that doesn't stale-serve" |
-| PowerDNS Recursor, `docs/performance.rst` | none; stale only for a record that "cannot be refreshed" | "an asynchronous task to resolve the name" per 30 s extension |
-
-- BIND had the non-zero timer and removed it in 9.19.22/9.20 (ISC KB, "Changes
-  to … stale-answer-client-timeout"): "The complexity of the internal
-  processing paths … is significant", with RPZ and client rate limiting named
-  as the interactions, and "in configurations where `stale-answer-enable` has
-  been enabled, `stale-answer-client-timeout` is either given a value of zero
-  or it is disabled entirely". CVE-2022-3736 and CVE-2022-3924 are both crashes
-  that need it "set to a positive integer" / "greater than zero".
-- 58b is answered by #114: the prefetch pool is a bounded set of detached
-  resolutions holding `Arc<Resolving>`, and a zero timer's refresh is exactly a
-  prefetch of an expired name.
-- 58c stays a question, and not this row's: the cache's `refreshing` mark is
-  per entry, which de-duplicates refreshes; a table of in-flight *client*
-  resolutions is the other half and nothing here needs it.
-
-**RFC 8767 conformance, checked.** §4's normative text lets a record be used
-past its TTL "if the data is unable to be authoritatively refreshed when the TTL
-expires". A zero timer answers before any refresh has been tried, so it is a
-deviation, as BIND's `0` is. Opt-in and off by default; it goes in #21 and
-`07-rfc-conformance.md` as one.
-
-**Remedy:**
-
-1. A switch, `--serve-stale-first` and `resolver.serve-stale-first`: on a live
-   miss with an entry inside the stale window, answer stale at once and queue a
-   refresh. Refused at startup with `--serve-stale 0`, since it means nothing
-   there (`CLAUDE.md` §15).
-2. The pool runs when `--prefetch` *or* the switch is on. `Resolving::prefetch`
-   being `Some` currently *is* the prefetch switch — `caches.answer(..,
-   prefetch.is_some())` at `answer.rs:332` — so the pool's presence and
-   "prefetching" must become two values, or turning on the switch turns on
-   prefetch.
-3. One refresh per stale entry, not one per query: `DnsCache::get_stale`
-   (`cache.rs:283`) sets `refreshing` under its lock and reports it, as `lookup`
-   does at `:256`. `NegativeCache` has no such mark (`negative_cache.rs`) and
-   needs one for a stale NXDOMAIN/NODATA.
-4. The answer: `stale_answer` (`answer.rs:711`) as it is, before the resolution
-   rather than after its failure. Its EDE text, "the authoritative servers
-   could not be reached", is false here; the early path needs its own. Its
-   INFO line per stale answer is fine on failure and a flood at query rate
-   here: count, and log at DEBUG. Check that RPZ applies to the early stale
-   answer as it does to the late one.
-5. Declined, so rewritten: `CLIENT_RESPONSE_TIMER`'s doc (`cache.rs:70-84`,
-   "when #58 lands it is the default of the flag") and the spec line at
-   `06-operations.md:318` ("a second stale timer would serve early").
-   `dns_slow_resolutions_total{outcome="completed"}` stays: it is the number
-   that tells an operator to turn the switch on.
-6. The nine live citations of the timers as §4 become §5: `cache.rs:70` and
-   `:72`, `metrics.rs:38` and `:200`, `answer.rs:2446`, `06-operations.md:318`
-   and `:328`, and `07-rfc-conformance.md:61`'s two ("§4's query resolution
-   timer", "§4's client response timer"; its "§4's 30-second TTL" is right).
-   Found by `grep` for §4 beside "timer", "1.8" or "client response"; the
-   closed #45b row in `docs/CLOSED_WORK.md` keeps its wording.
-7. Tests: an expired entry in the window answers at once with TTL 30 and the
-   new EDE while the upstream black-holes; two queries for it queue one
-   refresh; a successful refresh ends the stale answers; the switch without
-   `--serve-stale` is refused. Show each failing first (§1).
-
 ---
 
 ### 59. Nothing here demands a client certificate for a transfer — **filed 2026-09-13, closed 2026-09-16**
@@ -6913,6 +6756,7 @@ one of these is ever taken up it gets its own number.
 | **D-5** | RFC 1035 §2.3.1's LDH "preferred name syntax" is not enforced | **Deliberate, and enforcing it would be a bug.** RFC 2181 §11 settles it; enforcing LDH would refuse `_dmarc`, every `_tcp` SRV owner, DNS-SD instance names and the wildcard `*`. #15 records that a `TODO` asking for this was deleted rather than done, because doing it was the defect |
 | **D-6** | the first compression pointer in a chain may point forward | **Deliberate.** Every *subsequent* pointer must strictly decrease, which is what makes cycles unreachable without a visited-set; the first is unconstrained because a name is parsed from a suffix slice that does not know its own offset. Termination is unaffected, and the reasoning and the cost of the alternative are written at `dname.rs` |
 | **D-7** | class CH and HS are refused rather than served | **Deliberate.** RFC 1034 §4.3.2 step 1 searches the zones *of the question's class*, and holding none in a class is the same situation as holding no zone. The visible cost is that `version.bind CH TXT` — which BIND, NSD and Knot all answer — is not answered here. Serving it would mean a second class in the zone index, which #13d's class-blind index deliberately made unrepresentable |
+| **D-8** | `rdnsr --serve-stale-first` answers from the stale window before any refresh, where RFC 8767 §4 allows stale data only when it "is unable to be authoritatively refreshed" | **Deliberate and opt-in**, as BIND's `stale-answer-client-timeout 0` is. It is what a slow authoritative server costs nobody, where §5's 1.8 s client response timer — the conforming shape — was declined: BIND removed its non-zero form after two CVEs, and it needs a resolution that outlives its query. Refreshes are one per name per 30 s, §5's failure recheck timer. Off by default and refused without a window (#58) |
 
 #### Not implemented
 
@@ -7086,6 +6930,7 @@ the week; the record is under "How the queue kept going stale" in
 | **118** | `answer_update` checked permission before the zone, and its doc claimed the RFC's order | **filed and closed 2026-09-25**. BIND, Knot and PowerDNS read: all check permission before §3.2, two of three check the zone before permission. Now zone → permission → prerequisites, so an unsigned or wrongly scoped UPDATE for a zone not served is NOTAUTH. The conformance row lists the two deviations, one of them the replicated-zone REFUSED where §3.1.1 forwards. See `docs/CLOSED_WORK.md` |
 | **119** | two UPDATE refusals no test reached, and an unreadable zone directory answered REFUSED | **filed and closed 2026-09-25**. SERVFAIL now, as a failed read of the zone file already was: RFC 2136 §4.6 sends the client to the next server on SERVFAIL and ends the update on REFUSED. `file_for` propagates `read_dir` and entry errors as the loader does. Four tests; the task-failure SERVFAIL stays untested, reachable only by a panic. See `docs/CLOSED_WORK.md` |
 | **68** | a socket test failed once under a parallel suite | **filed 2026-09-15, closed 2026-09-25.** The test it named never failed again; two others in `rdnsd` did, 8 in 200 workspace runs. 68a was a defect: dnstap's pump dropped its queue on stop, frames already counted as sent, so a capture lost its last requests (50 of 50 provoked runs). Now drained before STOP. 68b was the test's: an unanswered NOTIFY is resent after 2 s. 0 in 200 runs after. The same 200 runs filed **#120**. See `docs/CLOSED_WORK.md` |
+| **58** | serve-stale answered a dead upstream and not a slow one | **filed 2026-09-13, closed 2026-09-25.** RFC 8767 §5's 1.8 s client response timer declined on a survey of BIND, Unbound, Knot and PowerDNS — BIND removed it after two CVEs — and BIND's zero form taken as `--serve-stale-first`, refreshing through #114's prefetch pool. A deviation from §4, filed as **D-8** in #21. The timers were §5 and nine places said §4. Two things the grooming did not see: a stale refresh has to be a *period* (§5's 30 s failure recheck), or one failure leaves a name stale and untried for the whole window; and the pool's presence had been the prefetch switch. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 

@@ -171,6 +171,9 @@ fn default_rpz_policy() -> rdns::rpz::PolicyOverride {
 /// resolver (an amplification vector).
 #[derive(Parser)]
 #[command(version = rdns::VERSION, about, long_about = None)]
+// The two uses of the refresh pool: its sizes mean something with either.
+// `multiple`, because clap's default makes a group's members conflict.
+#[command(group(clap::ArgGroup::new("refreshing").multiple(true)))]
 struct Cli {
     /// Address to listen on. Defaults to localhost to avoid an open resolver.
     #[arg(long, default_value_t = default_host(), conflicts_with = "config")]
@@ -416,6 +419,24 @@ struct Cli {
     /// DNS Error (RFC 8914 §4.4), and is counted.
     #[arg(long, value_name = "SECONDS", default_value_t = default_serve_stale(), conflicts_with = "config")]
     serve_stale: u64,
+    /// Answer an expired name from the `--serve-stale` window at once, and
+    /// re-resolve it behind the answer — BIND's
+    /// `stale-answer-client-timeout 0`.
+    ///
+    /// A deviation from RFC 8767 §4, which serves stale data only once a
+    /// refresh has failed: here nothing has been tried. What it buys is that a
+    /// slow authoritative server costs the client nothing, where without it
+    /// the client waits for the resolution. The stale answer carries the same
+    /// 30-second TTL and an Extended DNS Error saying it is being refreshed;
+    /// the refresh goes to the `--prefetch-workers` pool, one per name per 30
+    /// seconds (§5's failure recheck timer).
+    ///
+    /// Not §5's 1.8-second client response timer, which answers stale only
+    /// once the resolution has run that long: BIND removed it after two CVEs,
+    /// and it needs a resolution that outlives the query that started it
+    /// (`TODO.md` #58).
+    #[arg(long, conflicts_with = "config", group = "refreshing")]
+    serve_stale_first: bool,
     /// Re-resolve a cached name in the last tenth of its TTL, so a popular
     /// name never makes a client wait for the walk (Unbound's `prefetch`).
     ///
@@ -426,15 +447,18 @@ struct Cli {
     /// Off by default: it turns a client's query into two, for a name nobody
     /// may ask for again, and `dns_prefetches_total` against
     /// `dns_cache_hits_total` is how an operator decides whether that pays.
-    #[arg(long, conflicts_with = "config")]
+    #[arg(long, conflicts_with = "config", group = "refreshing")]
     prefetch: bool,
-    /// How many prefetches may resolve at once. 0 is floored to 1.
-    #[arg(long, value_name = "WALKS", default_value_t = default_prefetch_workers(), conflicts_with = "config", requires = "prefetch")]
+    /// How many refreshes may resolve at once, for `--prefetch` and
+    /// `--serve-stale-first` together. 0 is floored to 1.
+    #[arg(long, value_name = "WALKS", default_value_t = default_prefetch_workers(), conflicts_with = "config", requires = "refreshing")]
     prefetch_workers: usize,
-    /// How many prefetches may wait for a worker. Past it one is dropped and
-    /// counted in `dns_prefetches_dropped_total`: the entry expires and the
-    /// next client for it resolves it. 0 is floored to 1.
-    #[arg(long, value_name = "NAMES", default_value_t = default_prefetch_queue(), conflicts_with = "config", requires = "prefetch")]
+    /// How many refreshes may wait for a worker. Past it one is dropped and
+    /// counted in `dns_prefetches_dropped_total` or
+    /// `dns_stale_refreshes_dropped_total`: a live entry expires and the next
+    /// client for it resolves it, a stale one is offered again after 30
+    /// seconds. 0 is floored to 1.
+    #[arg(long, value_name = "NAMES", default_value_t = default_prefetch_queue(), conflicts_with = "config", requires = "refreshing")]
     prefetch_queue: usize,
     /// What a policy zone's rules mean, when it should not be taken at its
     /// word: given, disabled, passthru, drop, nxdomain, nodata or tcp-only.
@@ -658,6 +682,16 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Above the dry run, with the other settings that can be wrong: without a
+    // window there is nothing to answer first from, so the switch would be a
+    // policy the operator believes is in force and is not (`CLAUDE.md` §15).
+    if cli.serve_stale_first && (cli.serve_stale == 0 || cli.no_cache) {
+        return Err(anyhow!(
+            "--serve-stale-first answers from the --serve-stale window, and \
+             there is none: set --serve-stale SECONDS, and not --no-cache"
+        ));
+    }
+
     // What the flags mean for each cache is `Caches::new`'s to say.
     let capacity = if cli.no_cache { 0 } else { cli.cache_size };
     let denial_zones = if cli.no_cache || !cli.dnssec_validate {
@@ -868,8 +902,13 @@ async fn main() -> anyhow::Result<()> {
             // Printed because an answer known to be out of date is a decision,
             // and because a window measured in days is easy to mistype.
             format!(
-                "{capacity} entries, serving stale for up to {}s past the TTL",
-                cli.serve_stale
+                "{capacity} entries, serving stale for up to {}s past the TTL{}",
+                cli.serve_stale,
+                if cli.serve_stale_first {
+                    ", before refreshing"
+                } else {
+                    ""
+                }
             )
         },
         dnssec_source,
@@ -1019,9 +1058,15 @@ async fn main() -> anyhow::Result<()> {
     // One handle for every listener: the four encrypted ones each built their
     // own copy of the same three fields, and a fourth field to add is a fourth
     // place to forget it (`CLAUDE.md` §7).
-    let (prefetch, prefetch_queue) = if cli.prefetch {
-        let (prefetch, queue) = prefetch::channel(cli.prefetch_queue);
-        (Some(prefetch), Some(queue))
+    let (refreshes, refresh_queue) = if cli.prefetch || cli.serve_stale_first {
+        let (refreshes, queue) = prefetch::channel(
+            cli.prefetch_queue,
+            prefetch::Uses {
+                prefetch: cli.prefetch,
+                stale_first: cli.serve_stale_first,
+            },
+        );
+        (Some(refreshes), Some(queue))
     } else {
         (None, None)
     };
@@ -1029,7 +1074,7 @@ async fn main() -> anyhow::Result<()> {
         resolver,
         caches,
         policy,
-        prefetch,
+        refreshes,
         dns64,
         rpz_notify,
         feed_wakes,
@@ -1044,7 +1089,7 @@ async fn main() -> anyhow::Result<()> {
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
-    if let Some(queue) = prefetch_queue {
+    if let Some(queue) = refresh_queue {
         loops.spawn(prefetch::run(
             queue,
             serving.clone(),

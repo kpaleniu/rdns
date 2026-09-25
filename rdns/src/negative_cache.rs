@@ -21,7 +21,7 @@
 //!   an answer and stays usable for [`crate::cache::StalePolicy`]'s window, so
 //!   an outage does not turn a cached NXDOMAIN into a SERVFAIL.
 
-use crate::cache::{StalePolicy, STALE_ANSWER_TTL};
+use crate::cache::{StalePolicy, STALE_ANSWER_TTL, STALE_REFRESH_INTERVAL};
 use crate::clock::Clock;
 use crate::eviction::Halving;
 use crate::name_keys::{NameKeyBuf, NameType, NameTypeKey};
@@ -51,6 +51,10 @@ pub struct NegativeAnswer {
     pub secure: bool,
     /// What is left of the negative TTL.
     pub ttl: u32,
+    /// A stale "no" whose caller is owed its refresh — the negative half of
+    /// [`crate::cache::Cached::refresh`]. Always false from
+    /// [`NegativeCache::get`].
+    pub refresh: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +63,9 @@ struct Entry {
     authority: Vec<ResourceRecord>,
     secure: bool,
     expires_at: u64,
+    /// When a stale answer may next hand out a refresh
+    /// ([`crate::cache::STALE_REFRESH_INTERVAL`]). 0 on a new entry.
+    stale_refresh_after: u64,
 }
 
 impl Entry {
@@ -173,6 +180,7 @@ impl NegativeCache {
             authority: response.authorities.clone(),
             secure,
             expires_at: now + ttl as u64,
+            stale_refresh_after: 0,
         };
         let Ok(mut entries) = self.entries.lock() else {
             return;
@@ -237,25 +245,30 @@ impl NegativeCache {
     /// (RFC 8767), with [`STALE_ANSWER_TTL`] on it.
     ///
     /// The same walk [`NegativeCache::get`] does and the same rule about who may
-    /// ask: only a caller whose attempt to refresh has already failed. `None`
-    /// when the policy is off.
-    pub fn get_stale(&self, qname: NameRef<'_>, qtype: Qtype) -> Option<NegativeAnswer> {
+    /// ask as [`crate::cache::DnsCache::get_stale`], `refreshing` included.
+    /// `None` when the policy is off.
+    pub fn get_stale(
+        &self,
+        qname: NameRef<'_>,
+        qtype: Qtype,
+        refreshing: bool,
+    ) -> Option<NegativeAnswer> {
         if self.max_entries == 0 || !self.stale.is_on() {
             return None;
         }
         let now = self.clock.now();
         let mut fold_buf = Vec::new();
         let name = qname.folded_in(&mut fold_buf);
-        let entries = self.entries.lock().ok()?;
+        let mut entries = self.entries.lock().ok()?;
 
         let mut ancestor = name;
         loop {
             if let Some(entry) = entries
                 .nxdomain
-                .get(ancestor.as_wire())
+                .get_mut(ancestor.as_wire())
                 .filter(|e| e.stale(now, self.stale))
             {
-                return Some(entry.stale_answer());
+                return Some(entry.stale_answer(now, refreshing));
             }
             match ancestor.parent() {
                 Some(up) => ancestor = up,
@@ -266,9 +279,9 @@ impl NegativeCache {
         let key: &dyn NameType = &(name.as_wire(), qtype);
         entries
             .nodata
-            .get(key)
+            .get_mut(key)
             .filter(|e| e.stale(now, self.stale))
-            .map(|entry| entry.stale_answer())
+            .map(|entry| entry.stale_answer(now, refreshing))
     }
 
     /// How many negative answers are held. For tests and diagnostics.
@@ -296,9 +309,17 @@ impl Entry {
     }
 
     /// The same, with the TTL a stale answer carries: there is none left to
-    /// count down (RFC 8767 §4).
-    fn stale_answer(&self) -> NegativeAnswer {
-        self.with_ttl(STALE_ANSWER_TTL)
+    /// count down (RFC 8767 §4). Claims the refresh if `refreshing` and one is
+    /// due, as the answer cache's `get_stale` does.
+    fn stale_answer(&mut self, now: u64, refreshing: bool) -> NegativeAnswer {
+        let refresh = refreshing && now >= self.stale_refresh_after;
+        if refresh {
+            self.stale_refresh_after = now.saturating_add(STALE_REFRESH_INTERVAL);
+        }
+        NegativeAnswer {
+            refresh,
+            ..self.with_ttl(STALE_ANSWER_TTL)
+        }
     }
 
     fn with_ttl(&self, ttl: u32) -> NegativeAnswer {
@@ -314,6 +335,7 @@ impl Entry {
                 .collect(),
             secure: self.secure,
             ttl,
+            refresh: false,
         }
     }
 }
@@ -395,7 +417,7 @@ mod tests {
             "expired is not an answer"
         );
         let stale = cache
-            .get_stale(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
+            .get_stale(nm("gone.example.com.").as_ref(), Qtype::of(rt::A), false)
             .expect("but it is the last thing known");
         assert_eq!(stale.rcode, ResponseCode::NoSuchDomain);
         assert_eq!(stale.ttl, STALE_ANSWER_TTL);
@@ -403,13 +425,17 @@ mod tests {
 
         // RFC 8020: the denial still covers everything beneath the name.
         assert!(cache
-            .get_stale(nm("a.b.gone.example.com.").as_ref(), Qtype::of(rt::A))
+            .get_stale(
+                nm("a.b.gone.example.com.").as_ref(),
+                Qtype::of(rt::A),
+                false
+            )
             .is_some());
 
         clock.advance(3600);
         assert!(
             cache
-                .get_stale(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
+                .get_stale(nm("gone.example.com.").as_ref(), Qtype::of(rt::A), false)
                 .is_none(),
             "and the window closes"
         );
@@ -430,13 +456,50 @@ mod tests {
         );
         clock.advance(61);
         assert!(cache
-            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::AAAA))
+            .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::AAAA), false)
             .is_some());
         assert!(
             cache
-                .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A))
+                .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A), false)
                 .is_none(),
             "a NODATA denies one type"
+        );
+    }
+
+    /// A stale "no" answered first hands out one refresh per interval, as a
+    /// stale answer does — and the NXDOMAIN that answers for a name's
+    /// descendants is one entry, so they share it.
+    #[test]
+    fn a_stale_denial_hands_out_one_refresh_per_recheck_interval() {
+        let (cache, clock) = fixed_cache(16, StalePolicy::seconds(3600));
+        cache.insert(
+            nm("gone.example.com.").as_ref(),
+            Qtype::of(rt::A),
+            &negative(
+                "gone.example.com.",
+                ResponseCode::NoSuchDomain,
+                vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
+            ),
+            false,
+        );
+        clock.advance(61);
+        let owed = |name: &str| {
+            cache
+                .get_stale(nm(name).as_ref(), Qtype::of(rt::A), true)
+                .expect("inside the window")
+                .refresh
+        };
+
+        assert!(owed("gone.example.com."), "the first caller refreshes");
+        assert!(!owed("gone.example.com."), "the second does not");
+        assert!(!owed("a.gone.example.com."), "nor one below it: one entry");
+        clock.advance(STALE_REFRESH_INTERVAL);
+        assert!(owed("gone.example.com."), "and after the interval, again");
+        assert!(
+            !cache
+                .get(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
+                .is_some_and(|a| a.refresh),
+            "and `get` never owes one"
         );
     }
 
@@ -492,7 +555,7 @@ mod tests {
         );
         clock.advance(61);
         assert!(cache
-            .get_stale(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
+            .get_stale(nm("gone.example.com.").as_ref(), Qtype::of(rt::A), false)
             .is_none());
     }
 

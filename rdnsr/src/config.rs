@@ -106,9 +106,12 @@ struct ResolverSection {
     #[serde(default = "crate::default_serve_stale")]
     serve_stale: u64,
     #[serde(default)]
+    serve_stale_first: bool,
+    #[serde(default)]
     prefetch: bool,
     /// `None` is the flag's default. An `Option` so that `check` can refuse
-    /// one given without `prefetch`, as clap's `requires` does for the flag.
+    /// one given with neither `prefetch` nor `serve-stale-first`, as clap's
+    /// `requires` does for the flag.
     prefetch_workers: Option<usize>,
     prefetch_queue: Option<usize>,
     /// The NAT64 prefix, in `--dns64`'s spelling. Absent is off.
@@ -128,6 +131,7 @@ impl Default for ResolverSection {
             trust_anchor: None,
             auto_trust_anchor: None,
             serve_stale: crate::default_serve_stale(),
+            serve_stale_first: false,
             prefetch: false,
             prefetch_workers: None,
             prefetch_queue: None,
@@ -283,8 +287,11 @@ impl Config {
             ("prefetch-queue", self.resolver.prefetch_queue),
         ] {
             match value {
-                Some(_) if !self.resolver.prefetch => {
-                    bail!("resolver.{key} is set and resolver.prefetch is not: nothing reads it")
+                Some(_) if !self.resolver.prefetch && !self.resolver.serve_stale_first => {
+                    bail!(
+                        "resolver.{key} is set and neither resolver.prefetch nor \
+                         resolver.serve-stale-first is: nothing reads it"
+                    )
                 }
                 Some(0) => bail!("resolver.{key} 0 prefetches nothing; 1 is the smallest pool"),
                 _ => {}
@@ -405,6 +412,7 @@ impl Config {
             trust_anchor,
             auto_trust_anchor,
             serve_stale,
+            serve_stale_first,
             prefetch,
             prefetch_workers,
             prefetch_queue,
@@ -419,6 +427,7 @@ impl Config {
         cli.trust_anchor = trust_anchor.clone();
         cli.auto_trust_anchor = auto_trust_anchor.clone();
         cli.serve_stale = *serve_stale;
+        cli.serve_stale_first = *serve_stale_first;
         cli.prefetch = *prefetch;
         cli.prefetch_workers = prefetch_workers.unwrap_or_else(crate::default_prefetch_workers);
         cli.prefetch_queue = prefetch_queue.unwrap_or_else(crate::default_prefetch_queue);

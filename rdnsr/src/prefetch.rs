@@ -1,5 +1,6 @@
-//! Re-resolving a cached name in the last tenth of its TTL, off the path of
-//! the client that noticed (Unbound's `prefetch`).
+//! Re-resolving a cached name off the path of the client that noticed: in the
+//! last tenth of its TTL (Unbound's `prefetch`), or once it has been answered
+//! stale (`--serve-stale-first`, `TODO.md` #58).
 //!
 //! A queue and a pool rather than work done by the task that answered
 //! (`TODO.md` #114). That task is `tcp::Handler::handle` on four transports,
@@ -20,29 +21,78 @@ use tokio::task::JoinSet;
 
 use crate::answer::{refresh, Resolving};
 
-/// The answer path's end of the queue.
-pub(crate) struct Prefetch(mpsc::Sender<QuerySection>);
+/// Why a name is being re-resolved, which is what decides how it is counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Why {
+    /// A live entry in the last tenth of its TTL.
+    Prefetch,
+    /// An expired entry that was just answered stale.
+    Stale,
+}
+
+/// One question for the pool.
+#[derive(Debug)]
+pub(crate) struct Refresh {
+    pub(crate) query: QuerySection,
+    pub(crate) why: Why,
+}
+
+/// Which of the queue's two uses are switched on.
+///
+/// Named fields rather than two `bool` arguments: they are the same type and
+/// swapping them is a different resolver with nothing to catch it
+/// (`CLAUDE.md` §14).
+pub(crate) struct Uses {
+    pub(crate) prefetch: bool,
+    pub(crate) stale_first: bool,
+}
+
+/// The answer path's end of the queue, and what it is for.
+///
+/// The two switches live here, with the sender, so neither can be on without a
+/// pool to run it. `Resolving` held an `Option<Prefetch>` whose presence *was*
+/// `--prefetch`, and a second use of the pool would have switched prefetching
+/// on with it (`TODO.md` #58).
+pub(crate) struct Refreshes {
+    tx: mpsc::Sender<Refresh>,
+    uses: Uses,
+}
 
 /// The pool's end, handed to [`run`].
-pub(crate) struct Queue(mpsc::Receiver<QuerySection>);
+pub(crate) struct Queue(mpsc::Receiver<Refresh>);
 
 /// `depth` is floored at 1: tokio refuses a channel of 0, and a mistyped flag
 /// should be wrong rather than fatal.
-pub(crate) fn channel(depth: usize) -> (Prefetch, Queue) {
+pub(crate) fn channel(depth: usize, uses: Uses) -> (Refreshes, Queue) {
     let (tx, rx) = mpsc::channel(depth.max(1));
-    (Prefetch(tx), Queue(rx))
+    (Refreshes { tx, uses }, Queue(rx))
 }
 
-impl Prefetch {
+impl Refreshes {
+    /// `--prefetch`.
+    pub(crate) fn prefetching(&self) -> bool {
+        self.uses.prefetch
+    }
+
+    /// `--serve-stale-first`.
+    pub(crate) fn stale_first(&self) -> bool {
+        self.uses.stale_first
+    }
+
     /// Never waits: the caller is answering a client.
     ///
     /// A full queue drops the question. The cache has already marked the entry
-    /// as being refreshed, so it runs out and the next client resolves it —
-    /// which is what a failed refresh costs as well.
-    pub(crate) fn offer(&self, query: QuerySection, metrics: &DnsMetrics) {
+    /// as being refreshed: a live one runs out and the next client resolves
+    /// it, a stale one is offered again after
+    /// [`rdns::cache::STALE_REFRESH_INTERVAL`] — which is what a failed refresh
+    /// costs as well.
+    pub(crate) fn offer(&self, query: QuerySection, why: Why, metrics: &DnsMetrics) {
         // `Closed` is shutdown, and nothing is owed for it.
-        if let Err(TrySendError::Full(_)) = self.0.try_send(query) {
-            metrics.count(&metrics.prefetches_dropped);
+        if let Err(TrySendError::Full(_)) = self.tx.try_send(Refresh { query, why }) {
+            metrics.count(match why {
+                Why::Prefetch => &metrics.prefetches_dropped,
+                Why::Stale => &metrics.stale_refreshes_dropped,
+            });
         }
     }
 }
@@ -73,8 +123,8 @@ pub(crate) async fn run(
                 // through the refresh and leave one worker doing all of them.
                 let next = queue.lock().await.recv().await;
                 // `None` cannot happen while `serving` holds the sender.
-                let Some(query) = next else { return };
-                refresh(&serving, query).await;
+                let Some(next) = next else { return };
+                refresh(&serving, next).await;
             }
         });
     }
@@ -84,7 +134,7 @@ pub(crate) async fn run(
 
 #[cfg(test)]
 impl Queue {
-    pub(crate) fn try_recv(&mut self) -> Option<QuerySection> {
+    pub(crate) fn try_recv(&mut self) -> Option<Refresh> {
         self.0.try_recv().ok()
     }
 }
@@ -120,16 +170,27 @@ mod tests {
         .is_ok()
     }
 
-    /// Past its depth the queue drops, and says so.
+    const PREFETCH: Uses = Uses {
+        prefetch: true,
+        stale_first: false,
+    };
+
+    /// Past its depth the queue drops, and says so under the reason it was
+    /// offered for.
     #[test]
     fn a_full_queue_drops_and_counts() {
         let metrics = DnsMetrics::new();
-        let (prefetch, mut queue) = channel(1);
-        prefetch.offer(question("a.example."), &metrics);
-        prefetch.offer(question("b.example."), &metrics);
+        let (refreshes, mut queue) = channel(1, PREFETCH);
+        refreshes.offer(question("a.example."), Why::Prefetch, &metrics);
+        refreshes.offer(question("b.example."), Why::Prefetch, &metrics);
+        refreshes.offer(question("c.example."), Why::Stale, &metrics);
 
         assert_eq!(metrics.prefetches_dropped.load(Ordering::Relaxed), 1);
-        assert_eq!(queue.try_recv().map(|q| q.qname), Some(nm("a.example.")));
+        assert_eq!(metrics.stale_refreshes_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            queue.try_recv().map(|r| r.query.qname),
+            Some(nm("a.example."))
+        );
     }
 
     /// Two workers resolve two names at once, against an upstream that never
@@ -141,13 +202,14 @@ mod tests {
     #[tokio::test]
     async fn the_workers_run_at_once_and_the_stop_abandons_them() {
         let (resolver, _upstream) = silent_resolver();
-        let (prefetch, queue) = channel(4);
+        let (refreshes, queue) = channel(4, PREFETCH);
         let serving = serving(resolver, test_shell(), rdns::rpz::PolicyZones::default());
         let shutdown = Shutdown::new();
         let pool = tokio::spawn(run(queue, serving.clone(), 2, shutdown.stop_handle()));
 
-        prefetch.offer(question("a.example."), &serving.ctx.metrics);
-        prefetch.offer(question("b.example."), &serving.ctx.metrics);
+        let metrics = &serving.ctx.metrics;
+        refreshes.offer(question("a.example."), Why::Prefetch, metrics);
+        refreshes.offer(question("b.example."), Why::Prefetch, metrics);
         assert!(started(&serving, 2).await, "both refreshes started");
 
         shutdown.begin();

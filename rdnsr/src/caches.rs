@@ -10,7 +10,7 @@ use rdns::clock::Clock;
 use rdns::dnssec_chain::ValidationState;
 use rdns::negative_cache::{NegativeAnswer, NegativeCache};
 use rdns::nsec_cache::{NsecCache, Synthesis, WildcardSynthesis};
-use rdns::{DnsCache, DnsMessage, NameRef, Qtype, QuerySection, ResourceRecord};
+use rdns::{DnsCache, DnsMessage, NameRef, Qtype, QuerySection};
 
 /// Three caches with three shapes, which is why they are not one.
 ///
@@ -133,13 +133,19 @@ impl Caches {
         &self,
         name: NameRef<'_>,
         qtype: Qtype,
-    ) -> Option<(Vec<ResourceRecord>, bool)> {
-        self.answers.get_stale(name, qtype)
+        refreshing: bool,
+    ) -> Option<Cached> {
+        self.answers.get_stale(name, qtype, refreshing)
     }
 
     /// [`NegativeCache::get_stale`].
-    pub(crate) fn stale_negative(&self, name: NameRef<'_>, qtype: Qtype) -> Option<NegativeAnswer> {
-        self.negatives.get_stale(name, qtype)
+    pub(crate) fn stale_negative(
+        &self,
+        name: NameRef<'_>,
+        qtype: Qtype,
+        refreshing: bool,
+    ) -> Option<NegativeAnswer> {
+        self.negatives.get_stale(name, qtype, refreshing)
     }
 
     /// Put an answer in without resolving for it.
@@ -147,7 +153,12 @@ impl Caches {
     /// For tests about *serving* a cached answer, which must not pay for or
     /// depend on the storing rules — `crate::allocations` among them.
     #[cfg(test)]
-    pub(crate) fn remember(&self, name: NameRef<'_>, qtype: Qtype, records: Vec<ResourceRecord>) {
+    pub(crate) fn remember(
+        &self,
+        name: NameRef<'_>,
+        qtype: Qtype,
+        records: Vec<rdns::ResourceRecord>,
+    ) {
         self.answers.put(name, qtype, records);
     }
 

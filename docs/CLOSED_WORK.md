@@ -10412,3 +10412,201 @@ against 8 before. The same runs failed three other tests 4 times — **#120**.
 clean on both; `cargo doc` and `cargo fmt --check` clean.
 
 ---
+
+### 58. serve-stale answers a dead upstream and not a slow one — **filed 2026-09-13, closed 2026-09-25**
+
+Left behind by 45b. RFC 8767 ~~§4~~ §5 has two timers and this tree implements
+one. (§4 is the amended TTL definition; the timers are §5's "Example Method",
+and nine live places cite them as §4 — see the remedy.)
+
+The **query resolution timer** is the one in place: resolve, and if that fails,
+answer from the stale window. It covers an upstream that is down, refusing, or
+unreachable — which is the outage the 45b row was about.
+
+The **client response timer** is the other, recommended 1.8 seconds: answer from
+the stale window *while the resolution is still running*, and let it finish into
+the cache for the next client. It covers the case a subscriber actually notices
+more often — an authoritative server that is slow rather than dead, where this
+resolver's own `timeout_ms` of 5 seconds is longer than a browser waits.
+
+Why it was not done with the rest: it is not a cache change, it is a lifetime
+change. `handle_query` borrows `&Resolving`, and answering early means the
+resolution has to outlive the request that started it — a task, holding an
+`Arc<Resolving>` and a `Busy` from `rdns::shutdown` so the drain waits for it
+(`CLAUDE.md` §9: dropping a `JoinHandle` detaches, it does not cancel). That
+means `handle_query` takes `&Arc<Resolving>`, and the two socket loops have to
+agree about who owns the guard.
+
+~~**45d moved one of those pieces on 2026-09-13.** `handle_query` returns
+`Answered` now — the reply, plus work the socket loop runs *after* sending it —
+and a prefetch goes down that path.~~ **Gone since #114** (`77399ba`):
+`handle_query` returns `Option<Vec<u8>>` again, and a prefetch is offered to a
+bounded queue that `prefetch::run`'s pool drains, holding `Arc<Resolving>`.
+What it does not solve is this one: a
+prefetch starts after the answer, and the client response timer has to answer
+while a resolution is already running. The return value is the same shape; the
+lifetime is not.
+
+Three things to settle, and the first is a measurement:
+
+- **58a. How often would it fire?** ~~A resolution that takes over 1.8 s and
+  then succeeds is the only case this helps. `LatencyTimer` already feeds the
+  latency histogram, whose buckets stop at 50 ms — so the number is not
+  currently measurable and the first step is a bucket that reaches seconds.~~
+  **The instrument is in as of 2026-09-14 and both halves of that were wrong.**
+
+  The bucket was necessary and is not the measurement. The histogram counts
+  *answers*, and an answer is a cache hit at 1 µs or a recursion at 2 s with no
+  way to tell them apart, and it carries no outcome — so `le="1.8"` against
+  `+Inf` says how many answers were slow and nothing about whether a stale
+  reply would have been the better one. The remedy the row named would have
+  been filed as the number and was not one (`CLAUDE.md` §18).
+
+  And "the only case this helps" is not right either. A resolution that runs
+  long and then *fails* serves stale today — the query resolution timer does
+  it — so the client response timer buys it the seconds in between, not the
+  answer. The two cases are worth different amounts, which is why the
+  measurement is a split and not a total.
+
+  What landed: eleven bucket bounds instead of eight, reaching 5 s, with
+  `le="1.8"` on RFC 8767 §4's number and `le="5"` on `timeout_ms`'s default;
+  `rdns::cache::CLIENT_RESPONSE_TIMER` as the one place 1.8 s is written, which
+  is the flag's default when the feature lands; and
+  `dns_slow_resolutions_total{outcome="completed"|"failed"}`, counted at the one
+  recursion a client waits on. `completed` is the feature's whole case.
+
+  Verified by provoking it rather than by reading the diff (`CLAUDE.md` §4):
+  two tests drive `handle_query` against a forwarder that sleeps 1.9 s and
+  against a black hole, and both fail with the count on the wrong side of the
+  split as well as with it removed. The timing is real — `LatencyTimer` is
+  `std::time::Instant`, which neither this crate's test clock nor tokio's
+  paused timer moves — so the pair costs 2.0 s of suite time. Scraped off a
+  running `rdnsr` as well: one forwarded query rendered
+  `dns_answer_latency_seconds_sum 0.028286` into `le="0.05"`, which the old
+  top bound of 50 ms could not tell from a ten-second answer.
+
+  **The number is still not taken.** An instrument is not a measurement: these
+  counters have to run somewhere with real traffic, and recursion cannot be
+  verified here (see "Verifying"), so the scrape above is a *forwarded* query
+  and not the case 58 is about. Until `completed` has been read off a
+  deployment, 58b and 58c are not worth starting.
+- **58b. What stops a flood of detached resolutions?** The in-flight semaphore
+  bounds tasks *per datagram*; a resolution that outlives its datagram is
+  outside that bound. It needs one of its own, or the permit has to be handed
+  to the task.
+- **58c. Does the early answer suppress the second client's?** Two clients
+  asking the same slow name should not start two resolutions. That is a
+  de-duplicating in-flight table, which this resolver does not have and which
+  is worth more than the timer on its own.
+
+**Groomed 2026-09-25: the 1.8 s timer is declined; BIND's zero timer is taken
+instead.** Decided by the owner on the survey below, which replaces 58a's
+deployment number as the thing that settles it (`CLAUDE.md` §4). Sources read
+that day at their `main`/`master`.
+
+| | client response timer | what runs behind a stale answer |
+|---|---|---|
+| Unbound, `util/config_file.c` | `serve_expired_client_timeout = 1800`, under `serve-expired: no` | the resolution continues |
+| BIND, `doc/arm/reference.rst` | `stale-answer-client-timeout` off by default; "the only supported value … is `0`. Non-zero values generate a warning message and are treated as `0`" | a refresh, at `0` |
+| Knot Resolver, `modules/serve_stale` | 3 s deadline, then stale | nothing: "TODO: probably start the same request that doesn't stale-serve" |
+| PowerDNS Recursor, `docs/performance.rst` | none; stale only for a record that "cannot be refreshed" | "an asynchronous task to resolve the name" per 30 s extension |
+
+- BIND had the non-zero timer and removed it in 9.19.22/9.20 (ISC KB, "Changes
+  to … stale-answer-client-timeout"): "The complexity of the internal
+  processing paths … is significant", with RPZ and client rate limiting named
+  as the interactions, and "in configurations where `stale-answer-enable` has
+  been enabled, `stale-answer-client-timeout` is either given a value of zero
+  or it is disabled entirely". CVE-2022-3736 and CVE-2022-3924 are both crashes
+  that need it "set to a positive integer" / "greater than zero".
+- 58b is answered by #114: the prefetch pool is a bounded set of detached
+  resolutions holding `Arc<Resolving>`, and a zero timer's refresh is exactly a
+  prefetch of an expired name.
+- 58c stays a question, and not this row's: the cache's `refreshing` mark is
+  per entry, which de-duplicates refreshes; a table of in-flight *client*
+  resolutions is the other half and nothing here needs it.
+
+**RFC 8767 conformance, checked.** §4's normative text lets a record be used
+past its TTL "if the data is unable to be authoritatively refreshed when the TTL
+expires". A zero timer answers before any refresh has been tried, so it is a
+deviation, as BIND's `0` is. Opt-in and off by default; it goes in #21 and
+`07-rfc-conformance.md` as one.
+
+**Remedy:**
+
+1. A switch, `--serve-stale-first` and `resolver.serve-stale-first`: on a live
+   miss with an entry inside the stale window, answer stale at once and queue a
+   refresh. Refused at startup with `--serve-stale 0`, since it means nothing
+   there (`CLAUDE.md` §15).
+2. The pool runs when `--prefetch` *or* the switch is on. `Resolving::prefetch`
+   being `Some` currently *is* the prefetch switch — `caches.answer(..,
+   prefetch.is_some())` at `answer.rs:332` — so the pool's presence and
+   "prefetching" must become two values, or turning on the switch turns on
+   prefetch.
+3. One refresh per stale entry, not one per query: `DnsCache::get_stale`
+   (`cache.rs:283`) sets `refreshing` under its lock and reports it, as `lookup`
+   does at `:256`. `NegativeCache` has no such mark (`negative_cache.rs`) and
+   needs one for a stale NXDOMAIN/NODATA.
+4. The answer: `stale_answer` (`answer.rs:711`) as it is, before the resolution
+   rather than after its failure. Its EDE text, "the authoritative servers
+   could not be reached", is false here; the early path needs its own. Its
+   INFO line per stale answer is fine on failure and a flood at query rate
+   here: count, and log at DEBUG. Check that RPZ applies to the early stale
+   answer as it does to the late one.
+5. Declined, so rewritten: `CLIENT_RESPONSE_TIMER`'s doc (`cache.rs:70-84`,
+   "when #58 lands it is the default of the flag") and the spec line at
+   `06-operations.md:318` ("a second stale timer would serve early").
+   `dns_slow_resolutions_total{outcome="completed"}` stays: it is the number
+   that tells an operator to turn the switch on.
+6. The nine live citations of the timers as §4 become §5: `cache.rs:70` and
+   `:72`, `metrics.rs:38` and `:200`, `answer.rs:2446`, `06-operations.md:318`
+   and `:328`, and `07-rfc-conformance.md:61`'s two ("§4's query resolution
+   timer", "§4's client response timer"; its "§4's 30-second TTL" is right).
+   Found by `grep` for §4 beside "timer", "1.8" or "client response"; the
+   closed #45b row in `docs/CLOSED_WORK.md` keeps its wording.
+7. Tests: an expired entry in the window answers at once with TTL 30 and the
+   new EDE while the upstream black-holes; two queries for it queue one
+   refresh; a successful refresh ends the stale answers; the switch without
+   `--serve-stale` is refused. Show each failing first (§1).
+
+**Done 2026-09-25**, all seven remedy items, and two things the remedy did not
+name:
+
+- **The refresh claim is a period, not a flag.** The remedy said to set
+  `refreshing` as `lookup` does. That flag is set once and never reset, which
+  is right for a live entry — a failed prefetch leaves it to expire — and wrong
+  for a stale one, which is answered without resolving: one failed refresh
+  would have left the name answered stale, untried, for the rest of the
+  window. `stale_refresh_after` in both caches instead, one claim per
+  `STALE_REFRESH_INTERVAL` = 30 s, §5's failure recheck timer.
+- **The queue carries its reason.** A stale refresh counted in
+  `dns_prefetches_total` would make that counter's name a false claim
+  (`CLAUDE.md` §14): `prefetch::Refresh { query, why }`, with
+  `dns_stale_refreshes_total` and `_dropped_total` beside the prefetch pair.
+- Item 2 went further than two values: `prefetch::Refreshes` holds the sender
+  *and* both switches, so neither use can be on without the pool.
+- Item 4's RPZ check: the early answer joins the cache hit's reply tuple, so
+  `on_answer`'s `rpz-ip` pass applies to it as it does to a hit, and
+  `before_query` has already run. Nameserver triggers are not asked, as they
+  are not for a hit.
+- `--prefetch-workers` and `--prefetch-queue` were `requires = "prefetch"`;
+  they now require either use (a clap `ArgGroup` with `multiple`, since a
+  group's members otherwise conflict), and the file's check says the same.
+
+Verified, each watched failing first (§1):
+
+- early arm removed: the three answer-first tests fail, the query waiting out
+  a silent upstream past a 2 s bound;
+- lookup's switch read as `refreshes.is_some()`:
+  `the_stale_first_pool_alone_does_not_prefetch` fails;
+- the claim made set-once: both cache tests and the answer-path test fail at
+  "tried again after the interval";
+- the startup check removed: `serving_stale_first_needs_a_stale_window` fails
+  on the bare flag passing the dry run.
+
+1 333 passed on Windows and 1 354 on Linux, 0 failed; clippy clean on both;
+`cargo doc` and `cargo fmt --check` clean. Not verified against a real
+authoritative server: recursion cannot be verified on the development
+machine's network (see "Verifying"), and forwarding does not reach this path
+any differently.
+
+---

@@ -145,6 +145,7 @@ cache-size = 10000
 dnssec-validate = true
 auto-trust-anchor = "/var/lib/rdns/anchors.xml"   # RFC 5011
 serve-stale = 0             # RFC 8767 window in seconds; 0 is off
+serve-stale-first = false   # answer from that window before refreshing
 dns64 = true                # or a prefix; true is the Well-Known Prefix
 
 [rpz]
@@ -265,6 +266,7 @@ specified in `05-resolver.md`.
 |---|---|---|
 | `--rpz PATH` (repeatable, ordered) | none | response policy zones; `--rpz-policy` overrides every action in every zone, and `[[rpz.feeds]]` in the config file does it per feed (§5.6) |
 | `--serve-stale SECONDS` | `0`, off | answering from expired cache when a refresh fails (RFC 8767, §5.5) |
+| `--serve-stale-first` | off; refused without `--serve-stale` | answering from that window at once and refreshing behind the answer — a deviation from RFC 8767 §4 (§5.5) |
 | `--prefetch` | off | re-resolving a cache entry in the last tenth of its TTL (§5.5) |
 | `--dns64 [PREFIX]` | off; the Well-Known Prefix when given no value | synthesizing AAAA from A (RFC 6147, §5.7). `--dns64-exclude` adds to §5.1.4's `::ffff:0:0/96` |
 
@@ -312,10 +314,11 @@ invisible on the wire (see `05-resolver.md` §5.5-§5.7):
 |---|---|
 | `dns_policy_rewrites_total` | answers a response policy zone replaced |
 | `dns_policy_drops_total` | queries an `rpz-drop` rule answered with silence — without this, one is indistinguishable from a lost packet |
-| `dns_stale_answers_total` | answers served from expired cache because a refresh failed (RFC 8767) |
+| `dns_stale_answers_total` | answers served from expired cache (RFC 8767): after a failed refresh, or first under `--serve-stale-first` |
+| `dns_stale_refreshes_total`, `dns_stale_refreshes_dropped_total` | expired names re-resolved behind a stale answer, and those the queue had no room for; at most one per name per 30 s |
 | `dns_prefetches_total` | names re-resolved before expiry; against `dns_cache_hits_total` it says whether `--prefetch` is paying for itself |
 | `dns_synthesized_total` | AAAA records DNS64 built from an A record; it does not fall to zero on its own when a NAT64 is retired |
-| `dns_slow_resolutions_total{outcome=...}` | recursions that ran past RFC 8767 §4's 1.8 s client response timer, split `completed`/`failed` — `completed` is the case a second stale timer would serve early, `failed` is one the timer already in place covers (`TODO.md` #58) |
+| `dns_slow_resolutions_total{outcome=...}` | recursions that ran past RFC 8767 §5's 1.8 s client response timer, split `completed`/`failed` — `completed` is a client `--serve-stale-first` would have answered at once, `failed` is one the stale window already covers (`TODO.md` #58) |
 
 > Gap G-3 — fixed 2026-08-03. ~~Those three counters are exported by `rdnsd` and
 > nothing increments them.~~ See `07-rfc-conformance.md`.
@@ -325,8 +328,8 @@ invisible on the wire (see `05-resolver.md` §5.5-§5.7):
 `dns_answer_latency_seconds` — base units. Eleven bounds, 1 µs to 5 s,
 because one histogram serves both daemons: an in-memory zone lookup is tens of
 microseconds and a recursion is tens of milliseconds to seconds. `le="1.8"` is
-RFC 8767 §4's client response timer, so that bound against `+Inf` counts the
-resolutions a second stale timer could cut short (`TODO.md` #58).
+RFC 8767 §5's client response timer, so that bound against `+Inf` counts the
+resolutions a client waited on past it (`TODO.md` #58).
 
 ### Per-zone gauges
 

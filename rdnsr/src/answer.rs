@@ -31,7 +31,7 @@ use rdns::{
 use rdns_transport::ServeContext;
 
 use crate::caches::Caches;
-use crate::prefetch::Prefetch;
+use crate::prefetch::{Refresh, Refreshes, Why};
 use crate::reload::PolicyReload;
 
 /// Everything answering a query needs, in one handle.
@@ -47,9 +47,10 @@ pub(crate) struct Resolving {
     /// The response policy zones, and the files a SIGHUP re-reads them from.
     /// Empty unless `--rpz` named one, and empty costs one `is_empty` a query.
     pub(crate) policy: Arc<PolicyStore>,
-    /// Where a cache hit in the last tenth of its TTL is queued to be
-    /// re-resolved (`--prefetch`). `None` is off.
-    pub(crate) prefetch: Option<Prefetch>,
+    /// Where a name is queued to be re-resolved: a cache hit in the last tenth
+    /// of its TTL (`--prefetch`), or an expired one just answered stale
+    /// (`--serve-stale-first`). `None` is both off.
+    pub(crate) refreshes: Option<Refreshes>,
     /// The NAT64 prefix to synthesize AAAA records into, if any (`--dns64`).
     pub(crate) dns64: Option<Dns64>,
     /// Who may send a NOTIFY asking for the `--rpz` files to be re-read, and
@@ -112,7 +113,7 @@ pub(crate) async fn handle_query(
         resolver,
         caches,
         policy,
-        prefetch,
+        refreshes,
         dns64: _,
         rpz_notify,
         feed_wakes,
@@ -329,16 +330,25 @@ pub(crate) async fn handle_query(
 
     // Build the response: from cache if we have it, else by resolving. The
     // third is RFC 8914's reason, which only the two failing arms have.
-    let hit = caches.answer(query.qname.as_ref(), query.qtype, prefetch.is_some());
+    let prefetching = refreshes.as_ref().is_some_and(Refreshes::prefetching);
+    let hit = caches.answer(query.qname.as_ref(), query.qtype, prefetching);
     // The cache said this entry is in the last tenth of its TTL and nobody has
     // been asked to refresh it yet. Offered here, at the lookup, so no exit
     // below can drop it (`TODO.md` #78a, #102), and to a queue, so nothing
     // runs in this task after the reply (#114).
-    if let (Some(prefetch), Some(hit)) = (prefetch, &hit) {
+    if let (Some(refreshes), Some(hit)) = (refreshes, &hit) {
         if hit.refresh {
-            prefetch.offer(query.clone(), &ctx.metrics);
+            refreshes.offer(query.clone(), Why::Prefetch, &ctx.metrics);
         }
     }
+    // `--serve-stale-first`: what this resolver last knew, now, and the
+    // resolution queued behind it — BIND's `stale-answer-client-timeout 0`.
+    // A deviation from RFC 8767 §4, which serves stale only once a refresh
+    // has failed; see `TODO.md` #58 for why not §5's 1.8 s timer instead.
+    let first = refreshes
+        .as_ref()
+        .filter(|r| r.stale_first())
+        .map(StaleBecause::First);
     let (mut resp, secure, why) = if let Some(hit) = hit {
         ctx.metrics.count(&ctx.metrics.cache_hits);
         let (records, secure) = (hit.records, hit.secure);
@@ -347,6 +357,13 @@ pub(crate) async fn handle_query(
             secure,
             None,
         )
+    } else if let Some(stale) =
+        first.and_then(|because| stale_answer(&msg, caches, &query, ctx, because))
+    {
+        // A hit: answered out of the cache, with no recursion behind it on
+        // this client's account.
+        ctx.metrics.count(&ctx.metrics.cache_hits);
+        stale
     } else {
         // Everything above answered from something held; from here the
         // query costs a recursion. This is the line a cache hit rate is
@@ -361,7 +378,7 @@ pub(crate) async fn handle_query(
             .watches_delegations()
             .then(|| policy.at_delegations(query.qname.as_ref(), query.qtype));
         // Not `timer`: that one started at the datagram and this has to
-        // measure the recursion alone, which is the only part RFC 8767 §4's
+        // measure the recursion alone, which is the only part RFC 8767 §5's
         // client response timer could cut short.
         let walk = LatencyTimer::new();
         // Async: each upstream round trip is an await, so this yields the
@@ -461,7 +478,7 @@ pub(crate) async fn handle_query(
                 // the authoritative servers and serve what it last knew when
                 // that does not work. Everything above answered from something
                 // still valid, so this is the one place stale data is right.
-                match stale_answer(&msg, caches, &query, ctx) {
+                match stale_answer(&msg, caches, &query, ctx, StaleBecause::Failed) {
                     Some(stale) => stale,
                     None => (
                         build_response(&msg, Vec::new(), ResponseCode::ServerFailure),
@@ -686,18 +703,34 @@ async fn cached_or_resolve(
 /// it *is* one — the only difference is that nobody is listening. A failure is
 /// left to the entry's own expiry: the name is still in the cache with a tenth
 /// of its TTL left, so the next client either finds it or resolves it.
-pub(crate) async fn refresh(serving: &Resolving, query: QuerySection) {
-    let ctx = &serving.ctx;
-    ctx.metrics.count(&ctx.metrics.prefetches);
+pub(crate) async fn refresh(serving: &Resolving, Refresh { query, why }: Refresh) {
+    let m = &serving.ctx.metrics;
+    m.count(match why {
+        Why::Prefetch => &m.prefetches,
+        Why::Stale => &m.stale_refreshes,
+    });
     if resolve_and_store(serving, &query).await.is_none() {
-        // DEBUG: nobody is waiting, and a failure here costs the next client a
-        // resolution it would have paid for anyway.
-        tracing::debug!(qname = %query.qname, qtype = %query.qtype, "prefetch failed");
+        // DEBUG: nobody is waiting. A failed prefetch costs the next client a
+        // resolution it would have paid for anyway; a failed stale refresh
+        // leaves the name answered stale until the recheck interval.
+        tracing::debug!(qname = %query.qname, qtype = %query.qtype, ?why, "refresh failed");
     }
 }
 
-/// The last thing this resolver knew about `query`, for a resolution that has
-/// just failed (RFC 8767).
+/// Why a stale answer is going out: what its EDE says, and whether it owes the
+/// pool a refresh.
+#[derive(Clone, Copy)]
+enum StaleBecause<'a> {
+    /// The resolution just failed (RFC 8767 §4).
+    Failed,
+    /// `--serve-stale-first`: nothing has been tried yet, and the refresh is
+    /// queued here. Carries the queue, so the one cannot happen without the
+    /// other.
+    First(&'a Refreshes),
+}
+
+/// The last thing this resolver knew about `query`: for a resolution that has
+/// just failed (RFC 8767), or before one under `--serve-stale-first`.
 ///
 /// Returns what the answer path's own arms return — the response, whether it is
 /// authenticated, and the reason to put in the OPT — so the caller has nothing
@@ -713,42 +746,63 @@ fn stale_answer(
     caches: &Caches,
     query: &QuerySection,
     ctx: &ServeContext,
+    because: StaleBecause<'_>,
 ) -> Option<(DnsMessage, bool, Option<ExtendedError>)> {
-    const WHY_POSITIVE: ExtendedError = ExtendedError::new(
-        InfoCode::STALE_ANSWER,
-        "the authoritative servers could not be reached",
-    );
-    const WHY_NEGATIVE: ExtendedError = ExtendedError::new(
-        InfoCode::STALE_NXDOMAIN,
-        "the authoritative servers could not be reached",
-    );
+    const UNREACHABLE: &str = "the authoritative servers could not be reached";
+    // Not the text above: nothing has been tried, and saying so sends an
+    // operator after an outage that is not happening.
+    const REFRESHING: &str = "answered from expired cache while it is refreshed";
+    let text = match because {
+        StaleBecause::Failed => UNREACHABLE,
+        StaleBecause::First(_) => REFRESHING,
+    };
+    let refreshes = match because {
+        StaleBecause::Failed => None,
+        StaleBecause::First(refreshes) => Some(refreshes),
+    };
+    let (name, qtype) = (query.qname.as_ref(), query.qtype);
+    let served = |owed: bool| {
+        ctx.metrics.count(&ctx.metrics.stale_answers);
+        if let (Some(refreshes), true) = (refreshes, owed) {
+            refreshes.offer(query.clone(), Why::Stale, &ctx.metrics);
+        }
+        match because {
+            // INFO: serving data known to be out of date is a decision the
+            // operator turned on, and the line beside the counter is how the
+            // decision is seen taking effect.
+            StaleBecause::Failed => {
+                tracing::info!(qname = %query.qname, qtype = %query.qtype, "answered from expired cache")
+            }
+            // DEBUG: here it happens at the query rate for every expired
+            // name, which is what the switch asks for; the counter is the
+            // signal.
+            StaleBecause::First(_) => {
+                tracing::debug!(qname = %query.qname, qtype = %query.qtype, "answered from expired cache first")
+            }
+        }
+    };
 
     // A "yes" before a "no": both may be held for one name, and the answer is
     // the more specific thing known about it.
-    if let Some((records, secure)) = caches.stale_answer(query.qname.as_ref(), query.qtype) {
-        ctx.metrics.count(&ctx.metrics.stale_answers);
-        // INFO: serving data known to be out of date is a decision the operator
-        // turned on, and the line beside the counter is how the decision is
-        // seen taking effect.
-        tracing::info!(qname = %query.qname, qtype = %query.qtype, "answered from expired cache");
+    if let Some(hit) = caches.stale_answer(name, qtype, refreshes.is_some()) {
+        served(hit.refresh);
         return Some((
-            build_response(request, records, ResponseCode::Ok),
-            secure,
-            Some(WHY_POSITIVE),
+            build_response(request, hit.records, ResponseCode::Ok),
+            hit.secure,
+            Some(ExtendedError::new(InfoCode::STALE_ANSWER, text)),
         ));
     }
 
-    let negative = caches.stale_negative(query.qname.as_ref(), query.qtype)?;
-    ctx.metrics.count(&ctx.metrics.stale_answers);
-    tracing::info!(qname = %query.qname, qtype = %query.qtype, "answered from expired cache");
+    let negative = caches.stale_negative(name, qtype, refreshes.is_some())?;
+    served(negative.refresh);
     let mut resp = build_response(request, Vec::new(), negative.rcode);
     resp.authorities = negative.authority;
-    let why = if negative.rcode == ResponseCode::NoSuchDomain {
-        WHY_NEGATIVE
+    let code = if negative.rcode == ResponseCode::NoSuchDomain {
+        InfoCode::STALE_NXDOMAIN
     } else {
-        WHY_POSITIVE
+        InfoCode::STALE_ANSWER
     };
-    Some((resp, negative.secure, Some(why)))
+    Some((resp, negative.secure, Some(ExtendedError::new(code, text))))
 }
 
 /// What each policy zone holds, by trigger kind.
@@ -1181,7 +1235,7 @@ mod tests {
     use rdns::clock::Clock;
 
     use super::*;
-    use crate::prefetch::Queue;
+    use crate::prefetch::{Queue, Uses};
     use crate::testutil::*;
 
     /// AD is two claims at once — this resolver checked the data (RFC 6840
@@ -1564,15 +1618,39 @@ mod tests {
 
     /// With `--prefetch` on, and the queue a refresh is offered to.
     fn prefetching(resolver: Arc<Resolver>, zones: PolicyZones) -> (Arc<Resolving>, Clock, Queue) {
-        let (prefetch, queue) = crate::prefetch::channel(4);
-        let (serving, clock) = timed_with(StalePolicy::OFF, resolver, Some(prefetch), zones);
+        let (refreshes, queue) = crate::prefetch::channel(
+            4,
+            Uses {
+                prefetch: true,
+                stale_first: false,
+            },
+        );
+        let (serving, clock) = timed_with(StalePolicy::OFF, resolver, Some(refreshes), zones);
+        (serving, clock, queue)
+    }
+
+    /// With `--serve-stale 3600 --serve-stale-first`, and the queue.
+    fn stale_first(resolver: Arc<Resolver>) -> (Arc<Resolving>, Clock, Queue) {
+        let (refreshes, queue) = crate::prefetch::channel(
+            4,
+            Uses {
+                prefetch: false,
+                stale_first: true,
+            },
+        );
+        let (serving, clock) = timed_with(
+            StalePolicy::seconds(3600),
+            resolver,
+            Some(refreshes),
+            PolicyZones::default(),
+        );
         (serving, clock, queue)
     }
 
     fn timed_with(
         stale: StalePolicy,
         resolver: Arc<Resolver>,
-        prefetch: Option<Prefetch>,
+        refreshes: Option<Refreshes>,
         zones: PolicyZones,
     ) -> (Arc<Resolving>, Clock) {
         let clock = Clock::fixed(1_000_000_000);
@@ -1586,7 +1664,7 @@ mod tests {
                 resolver,
                 caches,
                 policy: PolicyStore::in_memory(zones),
-                prefetch,
+                refreshes,
                 dns64: None,
                 rpz_notify: None,
                 feed_wakes: Vec::new(),
@@ -1721,6 +1799,242 @@ mod tests {
         );
     }
 
+    /// `name`/`qtype` asked with EDNS, so the reply can carry an EDE, and
+    /// bounded at two seconds: an answer that waited for a resolution against
+    /// `silent_resolver`'s ten-second timeout fails here instead of passing
+    /// slowly.
+    async fn asked_at_once(serving: &Resolving, name: &rdns::Name, qtype: Qtype) -> DnsMessage {
+        let query = rdns::DnsMessageBuilder::new()
+            .with_id(9)
+            .with_query(name.clone(), qtype)
+            .with_recursion(true)
+            .with_edns(1232, false)
+            .build()
+            .to_bytes_within(4096)
+            .expect("serialize");
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            handle_query(
+                query,
+                TEST_PEER,
+                current_unix_timestamp(),
+                serving,
+                Transport::Udp,
+            ),
+        )
+        .await
+        .expect("answered without waiting for the upstream")
+        .expect("answered");
+        DnsMessage::try_from_bytes(&answered).expect("a well-formed reply")
+    }
+
+    fn stale_errors(reply: &DnsMessage) -> Vec<(InfoCode, String)> {
+        let edns = reply.edns.as_ref().expect("the OPT is mirrored");
+        ExtendedError::all_in(edns).expect("a well-formed option list")
+    }
+
+    /// `--serve-stale-first`: an expired name inside the window is answered at
+    /// once from what was last known, and its refresh goes to the queue —
+    /// BIND's `stale-answer-client-timeout 0` (`TODO.md` #58).
+    ///
+    /// Against an upstream that never answers, so an answer that waited for
+    /// the resolution misses `asked_at_once`'s two seconds. The EDE says a
+    /// refresh is under way and not that the servers were unreachable: nothing
+    /// has asked them yet. Watched failing with the early arm removed: the
+    /// query waited out the upstream and `asked_at_once` timed out.
+    #[tokio::test]
+    async fn an_expired_answer_is_served_first_and_refreshed_behind_it() {
+        let (resolver, _upstream) = silent_resolver();
+        let (serving, clock, mut queue) = stale_first(resolver);
+        let name = nm("example.com.");
+        let a = Qtype::of(record_types::A);
+        serving
+            .caches
+            .remember(name.as_ref(), a, vec![a_record(&name, 300)]);
+        clock.advance(301);
+
+        let reply = asked_at_once(&serving, &name, a).await;
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(reply.answers[0].ttl.as_secs(), 30, "RFC 8767 §4");
+        assert_eq!(
+            stale_errors(&reply),
+            vec![(
+                InfoCode::STALE_ANSWER,
+                "answered from expired cache while it is refreshed".to_string()
+            )]
+        );
+        let queued = queue.try_recv().expect("the refresh is queued");
+        assert_eq!((queued.query.qname, queued.why), (name.clone(), Why::Stale));
+
+        // One refresh per interval, however many clients ask meanwhile.
+        asked_at_once(&serving, &name, a).await;
+        assert!(queue.try_recv().is_none(), "one is already under way");
+        clock.advance(rdns::cache::STALE_REFRESH_INTERVAL);
+        asked_at_once(&serving, &name, a).await;
+        assert!(
+            queue.try_recv().is_some(),
+            "and a refresh that failed is tried again after the interval"
+        );
+
+        let m = &serving.ctx.metrics;
+        let read = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(read(&m.stale_answers), 3);
+        assert_eq!(read(&m.cache_hits), 3, "answered from the cache");
+        assert_eq!(
+            read(&m.queries_recursive),
+            0,
+            "and nobody waited for a walk"
+        );
+    }
+
+    /// The negative half: an expired NXDOMAIN is answered first too, with
+    /// RFC 8914's code for a stale NXDOMAIN and the same text.
+    #[tokio::test]
+    async fn an_expired_denial_is_served_first_and_refreshed_behind_it() {
+        let (resolver, _upstream) = silent_resolver();
+        let (serving, clock, mut queue) = stale_first(resolver);
+        let name = nm("gone.example.com.");
+        let a = Qtype::of(record_types::A);
+        let mut denial = DnsMessage::try_from_bytes(&message(OpCode::Query, true)).expect("parses");
+        denial.rcode = ResponseCode::NoSuchDomain;
+        denial.answers.clear();
+        denial.authorities = vec![soa("example.com.")];
+        serving.caches.store(
+            &QuerySection {
+                qname: name.clone(),
+                qtype: a,
+                qclass: rdns::QueryClass::IN,
+            },
+            &denial,
+            &ValidationState::Insecure,
+        );
+        clock.advance(3601);
+
+        let reply = asked_at_once(&serving, &name, a).await;
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
+        assert_eq!(
+            stale_errors(&reply),
+            vec![(
+                InfoCode::STALE_NXDOMAIN,
+                "answered from expired cache while it is refreshed".to_string()
+            )]
+        );
+        assert_eq!(
+            queue.try_recv().map(|r| (r.query.qname, r.why)),
+            Some((name, Why::Stale))
+        );
+    }
+
+    /// The refresh is what ends it: once the queued resolution has stored a
+    /// fresh answer, the next client gets that and not the stale one.
+    #[tokio::test]
+    async fn a_refresh_behind_a_stale_answer_ends_the_stale_answers() {
+        let (resolver, asked) = SignedZone::new().upstream().await;
+        let (serving, clock, mut queue) = stale_first(resolver);
+        let name = nm("x.w.example.test.");
+        let a = Qtype::of(record_types::A);
+        serving
+            .caches
+            .remember(name.as_ref(), a, vec![a_record(&name, 300)]);
+        clock.advance(301);
+
+        let stale = asked_at_once(&serving, &name, a).await;
+        assert_eq!(stale.answers[0].ttl.as_secs(), 30, "stale first");
+        refresh(&serving, queue.try_recv().expect("queued")).await;
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let fresh = asked_at_once(&serving, &name, a).await;
+        assert!(
+            fresh.answers.iter().all(|r| r.ttl.as_secs() > 30),
+            "the refreshed answer, not the stale one: {:?}",
+            fresh.answers
+        );
+        assert_eq!(
+            serving
+                .ctx
+                .metrics
+                .stale_refreshes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+    }
+
+    /// Without the switch nothing changes: an expired name is resolved first,
+    /// and served stale only when that fails. The stale-window tests above
+    /// hold the rest of that; this holds that the pool's presence is not the
+    /// switch — `--prefetch` alone runs the same pool.
+    #[tokio::test]
+    async fn the_prefetch_pool_alone_does_not_answer_stale_first() {
+        let (resolver, _upstream) = silent_resolver();
+        let (refreshes, _queue) = crate::prefetch::channel(
+            4,
+            Uses {
+                prefetch: true,
+                stale_first: false,
+            },
+        );
+        let (serving, clock) = timed_with(
+            StalePolicy::seconds(3600),
+            resolver,
+            Some(refreshes),
+            PolicyZones::default(),
+        );
+        let name = nm("example.com.");
+        let a = Qtype::of(record_types::A);
+        serving
+            .caches
+            .remember(name.as_ref(), a, vec![a_record(&name, 300)]);
+        clock.advance(301);
+
+        let query = rdns::DnsMessageBuilder::new()
+            .with_id(9)
+            .with_query(name.clone(), a)
+            .with_recursion(true)
+            .build()
+            .to_bytes_within(4096)
+            .expect("serialize");
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            handle_query(
+                query,
+                TEST_PEER,
+                current_unix_timestamp(),
+                &serving,
+                Transport::Udp,
+            ),
+        )
+        .await;
+        assert!(
+            waited.is_err(),
+            "it resolves first, and the upstream is silent"
+        );
+    }
+
+    /// And the other way round: the pool `--serve-stale-first` starts does not
+    /// switch prefetching on. `Resolving` held an `Option<Prefetch>` whose
+    /// presence was `--prefetch`, so running the pool for a second reason
+    /// would have been. Watched failing with the lookup's switch read as
+    /// `refreshes.is_some()`: the live entry in its last tenth was queued.
+    #[tokio::test]
+    async fn the_stale_first_pool_alone_does_not_prefetch() {
+        let (serving, clock, mut queue) = stale_first(test_resolver());
+        let name = nm("hot.example.com.");
+        let a = Qtype::of(record_types::A);
+        serving
+            .caches
+            .remember(name.as_ref(), a, vec![a_record(&name, 100)]);
+        clock.advance(95);
+
+        let reply = asked_at_once(&serving, &name, a).await;
+        assert_eq!(
+            reply.answers[0].ttl.as_secs(),
+            100,
+            "a live answer, not a stale one"
+        );
+        assert!(queue.try_recv().is_none(), "and no prefetch");
+    }
+
     /// The answer path's half of prefetching: a cache hit in its last tenth
     /// offers the question to the queue. Nothing here waits for it.
     #[tokio::test]
@@ -1746,12 +2060,13 @@ mod tests {
         let reply = DnsMessage::try_from_bytes(&answered.expect("answered from the cache"))
             .expect("a well-formed reply");
         assert_eq!(reply.answers.len(), 1, "the client is answered");
-        let query = queue.try_recv().expect("and the name is due a refresh");
-        assert_eq!(query.qname, name);
+        let queued = queue.try_recv().expect("and the name is due a refresh");
+        assert_eq!(queued.query.qname, name);
+        assert_eq!(queued.why, Why::Prefetch);
 
         // The refresh itself: the upstream is unreachable, so this is about it
         // being counted and returning rather than about what it learns.
-        refresh(&serving, query).await;
+        refresh(&serving, queued).await;
         assert_eq!(
             serving
                 .ctx
@@ -1840,7 +2155,14 @@ mod tests {
         let (resolver, asked) = SignedZone::new().upstream().await;
         let serving = serving(resolver, test_shell(), PolicyZones::default());
 
-        refresh(&serving, a_question("a.example.test.")).await;
+        refresh(
+            &serving,
+            Refresh {
+                query: a_question("a.example.test."),
+                why: Why::Prefetch,
+            },
+        )
+        .await;
         let held = serving
             .caches
             .negative(nm("a.example.test.").as_ref(), Qtype::of(record_types::A))
@@ -1919,7 +2241,7 @@ mod tests {
             "the handler waited on something after its reply"
         );
         assert_eq!(
-            queue.try_recv().map(|q| q.qname),
+            queue.try_recv().map(|q| q.query.qname),
             Some(name),
             "and the refresh was queued rather than lost"
         );
@@ -1971,7 +2293,7 @@ mod tests {
             "the rule rewrote the cached answer"
         );
         assert_eq!(
-            queue.try_recv().map(|q| q.qname),
+            queue.try_recv().map(|q| q.query.qname),
             Some(name),
             "and the entry in its last tenth is still due a refresh"
         );
@@ -2019,7 +2341,7 @@ mod tests {
         .await;
 
         assert!(answered.is_none(), "rpz-drop answers nothing");
-        assert_eq!(queue.try_recv().map(|q| q.qname), Some(name));
+        assert_eq!(queue.try_recv().map(|q| q.query.qname), Some(name));
     }
 
     /// Without the switch there is nothing to run, whatever the TTL says.
@@ -2043,7 +2365,7 @@ mod tests {
         .await;
         assert!(answered.is_some());
         assert!(
-            serving.prefetch.is_none(),
+            serving.refreshes.is_none(),
             "and nothing to offer a refresh to"
         );
     }
@@ -2053,7 +2375,7 @@ mod tests {
             resolver: test_resolver(),
             caches: Caches::new(16, 4, StalePolicy::OFF, rdns::clock::Clock::system()),
             policy: PolicyStore::in_memory(PolicyZones::default()),
-            prefetch: None,
+            refreshes: None,
             dns64: Some(
                 rdns::dns64::Dns64::new(rdns::dns64::Nat64Prefix::well_known(), &[])
                     .expect("the Well-Known Prefix"),
@@ -2442,11 +2764,12 @@ mod tests {
         );
     }
 
-    /// The measurement `TODO.md` #58 is blocked on. A resolution slower than
-    /// RFC 8767 §4's client response timer that then *answers* is the case the
-    /// second timer exists for; one that takes just as long and fails serves
-    /// stale today, so summing the two would credit the feature with work the
-    /// query resolution timer already does (`CLAUDE.md` §19).
+    /// The measurement `TODO.md` #58 was blocked on, kept as the one that says
+    /// whether `--serve-stale-first` pays. A resolution slower than RFC 8767
+    /// §5's client response timer that then *answers* is a client that waited
+    /// for what the stale window already held; one that takes just as long and
+    /// fails serves stale anyway, so summing the two would credit the switch
+    /// with work the query resolution timer already does (`CLAUDE.md` §19).
     ///
     /// Slow for real, and 1.9 s of it. `LatencyTimer` is `std::time::Instant`,
     /// which neither this crate's test clock nor tokio's paused timer moves —

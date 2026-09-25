@@ -144,6 +144,54 @@ fn a_flag_beside_config_is_refused_by_the_process() {
     assert!(message.contains("--config"), "got: {message}");
 }
 
+/// `--serve-stale-first` answers from the `--serve-stale` window, so without
+/// one it is a setting that does nothing, refused before the dry run answers
+/// (`CLAUDE.md` §15, `TODO.md` #58). With one it is accepted, and so are the
+/// pool's sizes, which clap refused beside anything but `--prefetch` until the
+/// pool had a second use.
+#[test]
+fn serving_stale_first_needs_a_stale_window() {
+    for args in [
+        &["--check-config", "--serve-stale-first"][..],
+        &[
+            "--check-config",
+            "--serve-stale-first",
+            "--serve-stale",
+            "3600",
+            "--no-cache",
+        ],
+    ] {
+        let out = rdnsr(args);
+        assert!(!out.status.success(), "{args:?} passed the dry run");
+        assert!(
+            stderr(&out).contains("--serve-stale-first"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
+
+    let out = rdnsr(&[
+        "--check-config",
+        "--serve-stale",
+        "3600",
+        "--serve-stale-first",
+        "--prefetch-workers",
+        "2",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    let dir = ScratchDir::new("rdnsr-stale-first");
+    let config = dir.join("rdnsr.toml");
+    std::fs::write(&config, "[resolver]\nserve-stale-first = true\n").expect("write");
+    let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
+    assert!(!out.status.success(), "the file is refused the same way");
+    assert!(
+        stderr(&out).contains("--serve-stale-first"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 #[test]
 fn the_binary_reports_a_version() {
     let out = rdnsr(&["--version"]);

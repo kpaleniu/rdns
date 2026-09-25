@@ -35,7 +35,7 @@ use crate::ResponseCode;
 /// milliseconds before anything goes wrong — was `+Inf` and the tail had no
 /// shape at all. The three added bounds are each a number something already
 /// decides on: 0.5 s is a slow recursion that still finished, **1.8 s is
-/// RFC 8767 §4's recommended client response timer**, so `le="1.8"` against
+/// RFC 8767 §5's recommended client response timer**, so `le="1.8"` against
 /// `+Inf` is how often that timer would fire (`TODO.md` #58), and 5 s is
 /// [`crate::resolver::ResolverConfig::timeout_ms`]'s default, so past it at
 /// least one upstream round trip has already timed out.
@@ -196,19 +196,27 @@ pub struct Counters {
     /// Prefetches the queue had no room for (`--prefetch-queue`). Each is a
     /// name left to expire, so the next client for it waits for the walk.
     pub prefetches_dropped: AtomicU64,
+    /// Expired names re-resolved behind a stale answer (`--serve-stale-first`).
+    ///
+    /// Apart from `prefetches` because they are a different cost: a prefetch
+    /// is a live name refreshed early, this is a name already being answered
+    /// out of date, one per [`crate::cache::STALE_REFRESH_INTERVAL`] at most.
+    pub stale_refreshes: AtomicU64,
+    /// Stale refreshes the queue had no room for. The name is tried again
+    /// after the interval, and answered stale until then.
+    pub stale_refreshes_dropped: AtomicU64,
 
-    /// Resolutions that ran past RFC 8767 §4's client response timer, by what
+    /// Resolutions that ran past RFC 8767 §5's client response timer, by what
     /// they did next (`TODO.md` #58).
     ///
     /// The pair, not the sum, because the two say different things about
-    /// whether the second timer is worth building. **`completed`** is a client
-    /// that waited over [`crate::cache::CLIENT_RESPONSE_TIMER`] for an answer
-    /// this resolver could have had from the stale window immediately; every
-    /// one of those is the timer's whole case. **`failed`** is a resolution
-    /// that was going to serve stale anyway — the *query resolution* timer
-    /// already covers it — so the second timer buys only the seconds between
-    /// the two, and summing the pair would credit the feature with work it
-    /// does not do (`CLAUDE.md` §19).
+    /// whether answering stale first is worth turning on. **`completed`** is a
+    /// client that waited over [`crate::cache::CLIENT_RESPONSE_TIMER`] for an
+    /// answer this resolver could have had from the stale window immediately;
+    /// those are what `--serve-stale-first` saves. **`failed`** is a resolution
+    /// that was going to serve stale anyway, so answering first buys only the
+    /// seconds of the failure, and summing the pair would credit the switch
+    /// with work it does not do (`CLAUDE.md` §19).
     ///
     /// A completed resolution whose answer was refused as bogus counts as
     /// completed: what this measures is whether the walk would have finished
@@ -220,7 +228,8 @@ pub struct Counters {
     pub slow_resolutions_completed: AtomicU64,
     pub slow_resolutions_failed: AtomicU64,
 
-    /// Answers served from expired cache because a refresh failed (RFC 8767).
+    /// Answers served from expired cache (RFC 8767): because a refresh failed,
+    /// or first, under `--serve-stale-first`.
     ///
     /// The number an operator watches during somebody else's outage, and the
     /// one that says whether `--serve-stale` is doing anything at all: a
@@ -296,6 +305,8 @@ impl DnsMetrics {
             synthesized: AtomicU64::new(0),
             prefetches: AtomicU64::new(0),
             prefetches_dropped: AtomicU64::new(0),
+            stale_refreshes: AtomicU64::new(0),
+            stale_refreshes_dropped: AtomicU64::new(0),
             stale_answers: AtomicU64::new(0),
             slow_resolutions_completed: AtomicU64::new(0),
             slow_resolutions_failed: AtomicU64::new(0),
@@ -547,6 +558,16 @@ impl DnsMetrics {
                 "dns_prefetches_dropped_total",
                 "Prefetches dropped because the queue was full",
                 &self.prefetches_dropped,
+            ),
+            (
+                "dns_stale_refreshes_total",
+                "Expired names re-resolved behind a stale answer",
+                &self.stale_refreshes,
+            ),
+            (
+                "dns_stale_refreshes_dropped_total",
+                "Stale refreshes dropped because the queue was full",
+                &self.stale_refreshes_dropped,
             ),
             (
                 "dns_stale_answers_total",
@@ -994,6 +1015,8 @@ mod tests {
             &m.synthesized,
             &m.prefetches,
             &m.prefetches_dropped,
+            &m.stale_refreshes,
+            &m.stale_refreshes_dropped,
             &m.slow_resolutions_completed,
             &m.slow_resolutions_failed,
             &m.stale_answers,
