@@ -16,8 +16,8 @@
 //! server, where `rdns::journal` — which loses nothing but a full transfer —
 //! only warns.
 //!
-//! The tests live in `main.rs`: a secondary test needs a live primary, so it is
-//! built on the `Server` harness there.
+//! A secondary test needs a live primary, which `testutil::spawn_primary`
+//! builds out of `dispatch`'s own transfer path.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -699,4 +699,794 @@ pub(crate) fn parse_secondary_specs(specs: &[String]) -> Result<Vec<MasterSpec>>
         .filter(|spec| !spec.trim().is_empty())
         .map(|spec| MasterSpec::parse(spec).map_err(|e| anyhow!("--secondary {e}")))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{
+        nm, spawn_primary, spawn_primary_full, spawn_primary_with_acl, spawn_primary_with_history,
+        test_shutdown, zkey, zone_at_serial, ScratchDir,
+    };
+    use crate::zones::{zone_key, ZoneContext, Zones};
+    use rdns::clock::current_unix_timestamp;
+    use rdns::ixfr::DeltaLog;
+    use rdns::metrics::DnsMetrics;
+    use rdns::notify::{self, NotifyPeer, NotifyPolicy};
+    use rdns::secondary::{
+        state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile, TransferState,
+    };
+    use rdns::tsig::{self, TsigAlgorithm, TsigKey, TsigKeyring};
+    use rdns::validation::{Arrival, PeerCertificate, TlsVersion};
+    use rdns::zone::{parse_zone_file_at, Zone};
+    use rdns::{record_types, DnsMessage, OpCode, Qtype, ResponseCode, Serial};
+    use rdns_transport::readiness::Readiness;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpStream, UdpSocket};
+    use tokio::sync::RwLock;
+
+    #[test]
+    fn test_secondary_specs_are_parsed_or_refused() {
+        let specs = parse_secondary_specs(&[
+            "example.com@127.0.0.1:5353".to_string(),
+            "  ".to_string(), // an empty repetition is not a zone
+        ])
+        .expect("parse");
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].zone, nm("example.com."));
+
+        let err = parse_secondary_specs(&["nonsense".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_string().contains("--secondary"),
+            "the error names the flag: {err}"
+        );
+    }
+
+    /// A consumer of no catalogs, for the refresh tests: they are about the
+    /// transfer, and `--catalog` adds nothing to it until a catalog arrives.
+    fn no_catalogs() -> Arc<crate::catalog::Catalogs> {
+        crate::catalog::Catalogs::new(
+            Vec::new(),
+            &TsigKeyring::default(),
+            std::collections::HashSet::new(),
+            Vec::new(),
+            Path::new("."),
+            Arc::new(Secondaries::default()),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("no specs, nothing to resolve")
+    }
+
+    /// The replication context a refresh runs in, over a scratch directory.
+    fn replication(dir: &ScratchDir, notify: NotifyPolicy) -> ReplicationContext {
+        ReplicationContext {
+            served: ZoneContext {
+                zone_map: Arc::new(RwLock::new(Zones::default())),
+                deltas: Arc::new(RwLock::new(DeltaLog::new())),
+                metrics: Arc::new(DnsMetrics::new()),
+                journal: None,
+            },
+            state: Arc::new(Mutex::new(StateFile::load(&state_file_path(dir.path())))),
+            zone_dir: dir.path().to_path_buf(),
+            notify: Arc::new(notify),
+            // Nothing here probes `/readyz`; `readiness::tests` is where the
+            // latch itself is checked.
+            readiness: Readiness::ready(),
+            catalogs: no_catalogs(),
+            xot: None,
+        }
+    }
+
+    /// The whole of step 3 in one test: a zone this server has never seen is
+    /// fetched, served, written down, and remembered.
+    #[tokio::test]
+    async fn test_a_secondary_fetches_serves_and_persists_a_zone() {
+        let dir = ScratchDir::new("fetch");
+        let master = spawn_primary(&zone_at_serial(7)).await;
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        let r = replication(&dir, NotifyPolicy::default());
+
+        let outcome = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("refresh");
+        assert!(outcome.contains("transferred serial 7"), "got: {outcome}");
+
+        // Served from memory...
+        let zones = r.served.zone_map.read().await;
+        let held = zones
+            .get(nm("example.com.").as_ref().folded().as_ref())
+            .expect("the zone is now served");
+        assert_eq!(held.serial(), Some(Serial::new(7)));
+        assert_eq!(
+            held.query(nm("www.example.com.").as_ref(), Qtype::of(record_types::A))
+                .len(),
+            1
+        );
+        drop(zones);
+
+        // ...written to disk, in the form the ordinary load path reads...
+        let path = zone_file_path(dir.path(), "example.com.");
+        let reloaded = parse_zone_file_at(&path, "example.com.").expect("reload from disk");
+        assert_eq!(reloaded.serial(), Some(Serial::new(7)));
+        assert_eq!(reloaded.records().len(), 4);
+
+        // ...and remembered, so a restart knows when contact was last made.
+        let entry = r
+            .state
+            .lock()
+            .unwrap()
+            .get("example.com.", master)
+            .cloned()
+            .expect("state recorded");
+        assert_eq!(entry.serial, Serial::new(7));
+        assert!(entry.refreshed_at > 0);
+
+        // ...*on disk*, and not only in the copy held in memory. The assertion
+        // above passes whether or not the sidecar was ever written, which is
+        // exactly what a restart depends on — and the half a refactor of the
+        // write path can break in silence. `record_state` updates under the
+        // mutex and writes after dropping it, so "the entry is there" and "the
+        // file has it" became two separate claims.
+        let on_disk = StateFile::load(&state_file_path(dir.path()))
+            .get("example.com.", master)
+            .cloned()
+            .expect("the sidecar on disk has the entry, not just the copy in memory");
+        assert_eq!(on_disk.serial, Serial::new(7));
+        assert_eq!(on_disk.refreshed_at, entry.refreshed_at);
+    }
+
+    /// The serial comparison is the point of the SOA probe: an unchanged zone
+    /// must not be transferred again, or every refresh interval would move the
+    /// whole zone for nothing.
+    #[tokio::test]
+    async fn test_an_unchanged_serial_is_not_transferred_again() {
+        let dir = ScratchDir::new("unchanged");
+        let master = spawn_primary(&zone_at_serial(7)).await;
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        let r = replication(&dir, NotifyPolicy::default());
+
+        refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("first refresh");
+        let second = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("second refresh");
+
+        assert!(second.contains("current"), "got: {second}");
+        assert_eq!(
+            r.served
+                .zone_map
+                .read()
+                .await
+                .get(zkey("example.com.").as_slice())
+                .unwrap()
+                .serial(),
+            Some(Serial::new(7))
+        );
+    }
+
+    /// And a serial that moved forward *is* transferred, replacing the zone
+    /// wholesale rather than merging into it.
+    #[tokio::test]
+    async fn test_a_bumped_serial_replaces_the_zone() {
+        let dir = ScratchDir::new("bumped");
+        let spec_zone = "example.com.".to_string();
+        let r = replication(&dir, NotifyPolicy::default());
+
+        let old = spawn_primary(&zone_at_serial(7)).await;
+        refresh_once(
+            &MasterSpec {
+                zone: nm(&spec_zone.clone()),
+                master: old,
+                key_name: None,
+                tls: None,
+            },
+            None,
+            &r,
+            &test_shutdown().busy(),
+        )
+        .await
+        .expect("first");
+
+        // A primary whose zone has moved on — and lost a record, which is what
+        // proves the zone is replaced rather than added to.
+        let new = spawn_primary(
+            "$TTL 3600\n\
+             @    IN SOA ns1.example.com. admin.example.com. 8 3600 1800 604800 86400\n\
+             @    IN NS  ns1.example.com.\n\
+             ns1  IN A   192.0.2.1\n",
+        )
+        .await;
+        let outcome = refresh_once(
+            &MasterSpec {
+                zone: nm(&spec_zone),
+                master: new,
+                key_name: None,
+                tls: None,
+            },
+            None,
+            &r,
+            &test_shutdown().busy(),
+        )
+        .await
+        .expect("second");
+
+        assert!(outcome.contains("serial 7 -> 8"), "got: {outcome}");
+        let zones = r.served.zone_map.read().await;
+        let held = zones.get(zkey("example.com.").as_slice()).unwrap();
+        assert_eq!(held.serial(), Some(Serial::new(8)));
+        assert!(
+            held.query(nm("www.example.com.").as_ref(), Qtype::of(record_types::A))
+                .is_empty(),
+            "a record the new zone does not have must be gone, not merged"
+        );
+    }
+
+    /// EXPIRE is the timer with teeth: out of contact past it, the zone stops
+    /// being served rather than being answered for with stale data and AA set.
+    #[tokio::test]
+    async fn test_a_zone_out_of_contact_past_expire_is_withdrawn() {
+        let dir = ScratchDir::new("expire");
+        let master = "127.0.0.1:1"
+            .parse()
+            .expect("an address nothing answers on");
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+
+        let zone = rdns::zone::parse_zone_file(&zone_at_serial(7), "example.com.").expect("zone");
+        let timers = RefreshTimers::from_zone(&zone).expect("timers");
+        let mut zones = HashMap::new();
+        zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
+        let zone_map = Arc::new(RwLock::new(Zones::new(zones)));
+
+        let mut state_file = StateFile::load(&state_file_path(dir.path()));
+        // Contact was made, a very long time ago.
+        state_file
+            .record(TransferState {
+                zone: "example.com.".to_string(),
+                serial: Serial::new(7),
+                refreshed_at: current_unix_timestamp() - timers.expire - 1,
+                master,
+            })
+            .expect("record");
+        let state = Arc::new(Mutex::new(state_file));
+
+        let r = ReplicationContext {
+            served: ZoneContext {
+                zone_map: zone_map.clone(),
+                deltas: Arc::new(RwLock::new(DeltaLog::new())),
+                metrics: Arc::new(DnsMetrics::new()),
+                journal: None,
+            },
+            state: state.clone(),
+            zone_dir: dir.path().to_path_buf(),
+            notify: Arc::new(NotifyPolicy::default()),
+            readiness: Readiness::ready(),
+            catalogs: no_catalogs(),
+            xot: None,
+        };
+        expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
+        assert!(
+            zone_map.read().await.is_empty(),
+            "an expired zone is no longer served"
+        );
+
+        // And the state line survives, so a restart still knows it is expired
+        // rather than reading "nothing known" as "fetch and serve".
+        assert!(state.lock().unwrap().get("example.com.", master).is_some());
+    }
+
+    /// Within EXPIRE, a failure to reach the master changes nothing: that is the
+    /// whole point of having three timers rather than one.
+    #[tokio::test]
+    async fn test_a_recent_failure_does_not_withdraw_the_zone() {
+        let dir = ScratchDir::new("still-good");
+        let master = "127.0.0.1:1".parse().unwrap();
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+
+        let zone = rdns::zone::parse_zone_file(&zone_at_serial(7), "example.com.").expect("zone");
+        let timers = RefreshTimers::from_zone(&zone).expect("timers");
+        let mut zones = HashMap::new();
+        zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
+        let zone_map = Arc::new(RwLock::new(Zones::new(zones)));
+
+        let mut state_file = StateFile::load(&state_file_path(dir.path()));
+        state_file
+            .record(TransferState {
+                zone: "example.com.".to_string(),
+                serial: Serial::new(7),
+                refreshed_at: current_unix_timestamp() - 60,
+                master,
+            })
+            .expect("record");
+        let state = Arc::new(Mutex::new(state_file));
+
+        let r = ReplicationContext {
+            served: ZoneContext {
+                zone_map: zone_map.clone(),
+                deltas: Arc::new(RwLock::new(DeltaLog::new())),
+                metrics: Arc::new(DnsMetrics::new()),
+                journal: None,
+            },
+            state: state.clone(),
+            zone_dir: dir.path().to_path_buf(),
+            notify: Arc::new(NotifyPolicy::default()),
+            readiness: Readiness::ready(),
+            catalogs: no_catalogs(),
+            xot: None,
+        };
+        expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
+        assert_eq!(zone_map.read().await.len(), 1, "still served");
+    }
+
+    /// A refresh against a master that remembers the change moves only the
+    /// difference — and lands on the same zone a full transfer would have.
+    ///
+    /// The equality is the assertion that matters: an incremental transfer that
+    /// produces a *nearly* right zone is the failure mode this whole path has,
+    /// and no serial comparison afterwards would ever notice it.
+    #[tokio::test]
+    async fn test_a_refresh_takes_the_increment_when_the_master_has_one() {
+        let dir = ScratchDir::new("ixfr-in");
+        let old_text = zone_at_serial(7);
+        let new_text = "$TTL 3600\n\
+             @    IN SOA ns1.example.com. admin.example.com. 8 3600 1800 604800 86400\n\
+             @    IN NS  ns1.example.com.\n\
+             ns1  IN A   192.0.2.1\n\
+             www  IN A   192.0.2.250\n\
+             extra IN TXT \"added in version 8\"\n";
+
+        let r = replication(&dir, NotifyPolicy::default());
+
+        // Start from version 7, fetched in full because we hold nothing yet.
+        let first = spawn_primary(&old_text).await;
+        let spec = |master| MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        refresh_once(&spec(first), None, &r, &test_shutdown().busy())
+            .await
+            .expect("initial transfer");
+
+        // Now a master that knows how to get from 7 to 8.
+        let master = spawn_primary_with_history(&old_text, new_text).await;
+        let outcome = refresh_once(&spec(master), None, &r, &test_shutdown().busy())
+            .await
+            .expect("incremental refresh");
+        assert!(
+            outcome.contains("1 incremental step(s)"),
+            "expected an increment, got: {outcome}"
+        );
+
+        let zones = r.served.zone_map.read().await;
+        let held = zones
+            .get(zkey("example.com.").as_slice())
+            .expect("still served");
+        assert_eq!(held.serial(), Some(Serial::new(8)));
+        assert_eq!(
+            held.query(
+                nm("extra.example.com.").as_ref(),
+                Qtype::of(record_types::TXT)
+            )
+            .len(),
+            1
+        );
+        assert!(
+            held.query(nm("www.example.com.").as_ref(), Qtype::of(record_types::A))
+                .iter()
+                .all(|r| r
+                    .rdata
+                    .parse()
+                    .map(
+                        |p| matches!(p, rdns::ParsedRecord::A(a) if a.octets() == [192, 0, 2, 250])
+                    )
+                    .unwrap_or(false)),
+            "the old address must be gone, not merged"
+        );
+
+        // Record for record, the zone the master serves.
+        let expected = rdns::zone::parse_zone_file(new_text, "example.com.").unwrap();
+        let key = |z: &Zone| {
+            let mut rows: Vec<_> = z
+                .records()
+                .iter()
+                .map(|r| (r.name.to_folded().to_string(), r.ttl, r.rdata.to_owned()))
+                .collect();
+            rows.sort_by_key(|r| (r.0.clone(), r.2.rtype()));
+            rows
+        };
+        assert_eq!(
+            key(held),
+            key(&expected),
+            "the increment reproduced the zone"
+        );
+    }
+
+    /// A secondary that takes a transfer tells its own secondaries at once.
+    ///
+    /// Without this, only a *primary* ever announces — at startup and on SIGHUP —
+    /// so the first level of a replication tree updates immediately and every
+    /// level below it waits out a refresh timer. RFC 1996 §3.2's "master" is
+    /// whoever serves the zone to someone, which a secondary in the middle is.
+    #[tokio::test]
+    async fn test_a_secondary_announces_what_it_transferred() {
+        let dir = ScratchDir::new("announce");
+        let master = spawn_primary(&zone_at_serial(11)).await;
+
+        // A socket standing in for a downstream secondary, so the NOTIFY is
+        // caught on the wire rather than inferred from a log line.
+        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let target = downstream.local_addr().expect("addr");
+
+        let r = replication(
+            &dir,
+            NotifyPolicy::new(vec![NotifyPeer {
+                addr: target,
+                key: None,
+            }]),
+        );
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+
+        refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("transfer");
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _from) =
+            tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
+                .await
+                .expect("a NOTIFY should arrive")
+                .expect("recv");
+
+        let msg = DnsMessage::try_from_bytes(&buf[..n]).expect("parse the NOTIFY");
+        assert_eq!(msg.opcode, OpCode::Notify, "a NOTIFY, not a query");
+        assert!(!msg.response);
+        assert_eq!(
+            notify::notified_zone(&msg),
+            Some(nm("example.com.")),
+            "for the zone that moved"
+        );
+        assert_eq!(
+            notify::notified_serial(&msg),
+            Some(Serial::new(11)),
+            "carrying the serial we just transferred, so the downstream \
+             secondary need not ask"
+        );
+    }
+
+    /// Nothing is announced when nothing moved: a refresh that confirms the
+    /// serial is unchanged is not news, and telling anyone would cost them a
+    /// pointless SOA probe every refresh interval.
+    #[tokio::test]
+    async fn test_an_unchanged_refresh_announces_nothing() {
+        let dir = ScratchDir::new("announce-quiet");
+        let master = spawn_primary(&zone_at_serial(11)).await;
+        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let target = downstream.local_addr().expect("addr");
+
+        let r = replication(
+            &dir,
+            NotifyPolicy::new(vec![NotifyPeer {
+                addr: target,
+                key: None,
+            }]),
+        );
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+
+        // The first transfer announces; drain it.
+        refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("transfer");
+        let mut buf = vec![0u8; 4096];
+        let _ = tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
+            .await
+            .expect("the first NOTIFY");
+
+        // The second finds the same serial and must say nothing.
+        let outcome = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("second refresh");
+        assert!(outcome.contains("current"), "got: {outcome}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), downstream.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "an unchanged zone is not news"
+        );
+    }
+
+    /// A secondary that receives a change can answer an IXFR for it — which is
+    /// what makes one of these an interior node of a replication tree rather than
+    /// a leaf. The delta only exists if the swap recorded it, so this is really a
+    /// test that the zone map and the delta log move together.
+    #[tokio::test]
+    async fn test_a_transferred_change_becomes_an_increment_we_can_serve() {
+        let dir = ScratchDir::new("ixfr-out");
+        let r = replication(&dir, NotifyPolicy::default());
+        let spec = |master| MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+
+        let first = spawn_primary(&zone_at_serial(7)).await;
+        refresh_once(&spec(first), None, &r, &test_shutdown().busy())
+            .await
+            .expect("first transfer");
+        assert_eq!(
+            r.served
+                .deltas
+                .read()
+                .await
+                .len(nm("example.com.").as_ref()),
+            0,
+            "a first fetch has no previous version to differ from"
+        );
+
+        let second = spawn_primary(
+            "$TTL 3600\n\
+             @    IN SOA ns1.example.com. admin.example.com. 8 3600 1800 604800 86400\n\
+             @    IN NS  ns1.example.com.\n\
+             ns1  IN A   192.0.2.1\n\
+             www  IN A   192.0.2.250\n",
+        )
+        .await;
+        refresh_once(&spec(second), None, &r, &test_shutdown().busy())
+            .await
+            .expect("second transfer");
+
+        let log = r.served.deltas.read().await;
+        assert_eq!(
+            log.len(nm("example.com.").as_ref()),
+            1,
+            "the change was recorded"
+        );
+        let chain = log
+            .chain_from(nm("example.com.").as_ref(), Serial::new(7))
+            .expect("a chain from 7");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].to_serial, Serial::new(8));
+        // www's address changed: one deletion, one addition.
+        assert_eq!(chain[0].deleted.len(), 1);
+        assert_eq!(chain[0].added.len(), 1);
+    }
+
+    /// RFC 9103 §11's server half: with `--transfer-tls-only` a transfer that
+    /// arrived in clear is refused, whatever the ACL says about the peer.
+    ///
+    /// The ACL here *allows* 127.0.0.1, so the only thing that can refuse this
+    /// is the transport policy — which is what makes it a test of the policy
+    /// and not of the ACL.
+    #[tokio::test]
+    async fn a_transfer_in_clear_is_refused_when_tls_is_required() {
+        let zone = rdns::zone::parse_zone_file(&zone_at_serial(7), "example.com.").expect("zone");
+        let master = spawn_primary_full(
+            zone,
+            &["127.0.0.1".to_string()],
+            DeltaLog::new(),
+            TsigKeyring::new(Vec::new()),
+            true,
+            Arrival::Tcp,
+        )
+        .await;
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        let dir = ScratchDir::new("xot-required");
+        let r = replication(&dir, NotifyPolicy::default());
+
+        let err = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Refused"), "got: {err}");
+    }
+
+    /// And the same server answers the same request when the connection is one
+    /// RFC 9103 §7.2 accepts. Without this the test above is equally consistent
+    /// with a server that refuses every transfer.
+    #[tokio::test]
+    async fn the_same_transfer_is_answered_over_tls() {
+        let zone = rdns::zone::parse_zone_file(&zone_at_serial(7), "example.com.").expect("zone");
+        let master = spawn_primary_full(
+            zone,
+            &["127.0.0.1".to_string()],
+            DeltaLog::new(),
+            TsigKeyring::new(Vec::new()),
+            true,
+            Arrival::Dot(TlsVersion::Tls13, PeerCertificate::none()),
+        )
+        .await;
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        let dir = ScratchDir::new("xot-allowed");
+        let r = replication(&dir, NotifyPolicy::default());
+
+        refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("a transfer over an encrypted connection");
+        assert!(
+            r.served
+                .zone_map
+                .read()
+                .await
+                .matching(nm("example.com.").as_ref())
+                .is_some(),
+            "the zone should have been installed"
+        );
+    }
+
+    /// TLS 1.2 is a fine way to ask a question and not a way to take a zone:
+    /// RFC 9103 §7.2 is "MUST use only TLS 1.3 [RFC8446] or later", where
+    /// RFC 7858 §4.1 asks only for 1.2. A bool in place of [`Privacy`] would
+    /// have made this case invisible.
+    #[tokio::test]
+    async fn tls_older_than_1_3_does_not_satisfy_the_transfer_policy() {
+        let zone = rdns::zone::parse_zone_file(&zone_at_serial(7), "example.com.").expect("zone");
+        let master = spawn_primary_full(
+            zone,
+            &["127.0.0.1".to_string()],
+            DeltaLog::new(),
+            TsigKeyring::new(Vec::new()),
+            true,
+            Arrival::Dot(TlsVersion::Older, PeerCertificate::none()),
+        )
+        .await;
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        let dir = ScratchDir::new("xot-tls12");
+        let r = replication(&dir, NotifyPolicy::default());
+
+        let err = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Refused"), "got: {err}");
+    }
+
+    /// An IXFR is gated by the same ACL as an AXFR, and it has to be: it may
+    /// *answer* with the whole zone (RFC 1995 §4), so a policy that let it
+    /// through would be no policy at all. The default is to refuse everyone, and
+    /// this is the test that a new transfer type did not quietly escape it.
+    #[tokio::test]
+    async fn test_an_ixfr_is_refused_by_the_same_default_that_refuses_an_axfr() {
+        let master = spawn_primary_with_acl(&zone_at_serial(7), &[]).await;
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        let dir = ScratchDir::new("refused");
+        let r = replication(&dir, NotifyPolicy::default());
+
+        // The AXFR our own client makes is refused, which is the baseline.
+        let err = refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Refused"), "got: {err}");
+
+        // And so is an IXFR, over the same connection path.
+        let request = {
+            let mut msg = rdns::xfr::axfr_request(nm("example.com.").as_ref(), 0x33);
+            msg.queries[0].qtype = Qtype::of(record_types::IXFR);
+            msg
+        };
+        let mut buf = vec![0u8; 512];
+        let n = request.to_bytes(&mut buf).expect("serialize");
+        let mut framed = (n as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&buf[..n]);
+
+        let mut stream = TcpStream::connect(master).await.expect("connect");
+        stream.write_all(&framed).await.expect("send");
+        let mut length = [0u8; 2];
+        stream.read_exact(&mut length).await.expect("length");
+        let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+        stream.read_exact(&mut packet).await.expect("reply");
+
+        let reply = DnsMessage::try_from_bytes(&packet).expect("parse");
+        assert_eq!(reply.rcode, ResponseCode::Refused);
+        assert!(reply.answers.is_empty(), "a refusal carries no zone");
+    }
+
+    /// #46a: a NOTIFY signed, and verified by the *reader* rather than by
+    /// looking at it. `check_request` is the same function the answering path
+    /// runs on an inbound message, so this is the check a real secondary makes.
+    ///
+    /// Against the old code this fails at `TsigCheck::Unsigned`: `notify.rs`
+    /// mentioned TSIG nowhere and `--also-notify` had no way to name a key.
+    #[tokio::test]
+    async fn test_a_notify_can_be_signed_and_verifies_as_a_request() {
+        let dir = ScratchDir::new("announce-signed");
+        let master = spawn_primary(&zone_at_serial(11)).await;
+        let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let target = downstream.local_addr().expect("addr");
+
+        let key = TsigKey::new("notify.key.", TsigAlgorithm::HmacSha256, vec![0x2b; 32]);
+        let r = replication(
+            &dir,
+            NotifyPolicy::new(vec![NotifyPeer {
+                addr: target,
+                key: Some(key.clone()),
+            }]),
+        );
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        refresh_once(&spec, None, &r, &test_shutdown().busy())
+            .await
+            .expect("transfer");
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _from) =
+            tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
+                .await
+                .expect("a NOTIFY should arrive")
+                .expect("recv");
+
+        let keyring = TsigKeyring::new(vec![key]);
+        match tsig::check_request(&buf[..n], &keyring, tsig::now()) {
+            rdns::tsig::TsigCheck::Verified(session) => {
+                assert_eq!(session.key_name(), "notify.key.");
+            }
+            rdns::tsig::TsigCheck::Unsigned => panic!("the NOTIFY went out unsigned"),
+            rdns::tsig::TsigCheck::Rejected(r) => {
+                panic!("the NOTIFY did not verify: {}", r.error.reason())
+            }
+        }
+
+        let msg = DnsMessage::try_from_bytes(&buf[..n]).expect("parse");
+        assert_eq!(msg.opcode, OpCode::Notify, "still a NOTIFY, signed or not");
+        assert_eq!(notify::notified_zone(&msg), Some(nm("example.com.")));
+    }
 }

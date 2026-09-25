@@ -9934,3 +9934,59 @@ Verified: 1 318 passed on Windows, 1 339 on Linux, 0 failed; clippy clean
 on both; `cargo doc --workspace --no-deps` clean.
 
 ---
+
+### 116. `rdnsd`'s answering tests are in the crate root — **filed 2026-09-24, closed 2026-09-25**
+
+What #109 left, and said it would. The root's test module is 4 377 lines and 88
+tests (`main.rs:2335`); `dispatch.rs` has 11 and `replication.rs` 0, and
+`replication.rs:19` says why: its tests are "built on the `Server` harness
+there". #109 made `Server` constructible from any module in the crate
+(`Server::new` and six `with_*`), so the type no longer holds the tests in the
+root. What does is the harness — `server_with*`, `answered`, `test_context` —
+which lives in that module. Not measured: how many of the 88 reach anything
+but the harness and `Server`'s `pub(crate)` surface. No remedy costed.
+
+**Closed 2026-09-25.** The open measurement first. All 90 tests (88 when
+filed; #112 added two) reach either the harness or a root-private item such as
+`Cli`, `Reloading`, `udp_loop`, `Scratch` or `generate_keys`. The second kind
+costs nothing to move, because a private item in the crate root is visible to
+every module under it (`CLAUDE.md` §17), so no item was widened. The row was
+right: the harness was the only thing keeping the tests in the root.
+
+**Moved by what they test, not by what they call.** 58 tests left the root:
+- 23 to `dispatch`: transfer authorization, UPDATE end to end, the dnstap tail,
+  the shutdown drain of an AXFR, QR=1 dropped, and the XoT refusal's reason.
+- 15 to `replication`, which had none: the secondary role, XoT from the
+  client side, IXFR, and #83's "replication test wearing a NOTIFY test's name".
+- 13 to `answer`: the `dnssec` module, since `make_response` is what it asks.
+- 7 to `zones`: `validate_zone_source` and `install_all_zones`'s two reload
+  tests.
+
+**32 stay, and correctly.** Their subjects are root items: `udp_loop`, the
+reload cluster (kept in the root by #83, 18 against 1), `validate_cli_args`,
+`admission_limits` and `bad_request!`. The root file is 6 864 → 3 771 lines.
+
+**The harness is in `testutil`**: 17 fixtures, two of them private to it.
+`zone_text(serial)` is now `zone_at_serial`, because `dispatch`'s test module
+already had a `zone_text(records)` for its benchmarks. The two had never been
+in one scope, so nothing had shown the clash.
+
+**Three wrong docs found on the way, all older than this change:**
+- `query`'s doc comment was attached to `nm` at HEAD, leaving `query` with
+  none.
+- `spawn_primary` named `Server::serve_connection`, which does not exist; it
+  spawns `tcp::serve_one`.
+- `server_with`'s paragraph was attached to `test_context`, and still said
+  "up here rather than in `mod shutdown`".
+
+`replication.rs`'s module doc no longer says its tests live in `main.rs`. The
+root's `#[cfg(test)]` imports in its production header moved into its test
+module, along with the comment that existed only to explain them.
+
+**No test changed** beyond its imports and the one rename. The 210 test names
+are the same before and after, and the totals are unchanged on both platforms.
+
+Verified: 1 318 passed on Windows, 1 339 on Linux, 0 failed; clippy clean on
+both; `cargo doc --workspace --no-deps` clean.
+
+---

@@ -742,9 +742,25 @@ fn refer_to_child(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{make_response, nm, query};
-    use rdns::zone::parse_zone_file;
-    use rdns::{ResourceRecord, Rtype};
+    use crate::testutil::{make_response, nm, query, zkey, ScratchDir};
+    use crate::zones::{
+        load_zones, verify_zones, zone_key, ProvenSigning, SigningRun, ZoneSigning, ZoneSource,
+        Zones,
+    };
+    use crate::{generate_keys, Cli};
+    use clap::Parser;
+    use rdns::clock::current_unix_timestamp;
+    use rdns::dnssec::{DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE};
+    use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
+    use rdns::dnssec_validation_mode::DnssecValidator;
+    use rdns::metrics::DnsMetrics;
+    use rdns::zone::{parse_zone_file, Zone};
+    use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
+    use rdns::{
+        record_types, Class, DnsMessage, OpCode, Qtype, QueryClass, ResourceRecord, ResponseCode,
+        Rtype, Ttl,
+    };
+    use std::collections::{BTreeMap, HashMap};
 
     /// A zone with everything the algorithm has to branch on: an alias, an
     /// alias out of the zone, a two-deep wildcard, a delegation with glue,
@@ -1590,5 +1606,615 @@ ns1 IN A   192.0.2.1
         assert_eq!(response.rcode, ResponseCode::Ok);
         assert!(response.authoritive);
         assert_eq!(rdatas(&response.answers, record_types::SOA).len(), 1);
+    }
+
+    // Signing, and answering a client that can read the result
+
+    mod dnssec {
+        use super::*;
+        use rdns::dnssec::{dnskeys_in, rrsigs_in, verify_rrset, Dnskey, Rrset, RrsetProof};
+        use rdns::dnssec_denial::{
+            nsec3s_in, nsecs_in, proves_no_ds, proves_nxdomain, proves_wildcard_expansion, Denial,
+            WildcardVerdict,
+        };
+        use rdns::zone::parse_zone_file;
+        use rdns::RecordData;
+
+        const SIGNED_ZONE: &str = r#"$ORIGIN example.com.
+$TTL 3600
+@   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )
+@   IN NS  ns1.example.com.
+ns1 IN A   192.0.2.1
+www IN A   192.0.2.10
+deep.a.b IN TXT "down here"
+"#;
+
+        /// A server holding one signed zone, and the keys it was signed with.
+        fn signed_server(nsec3: bool) -> (Zones, Vec<SigningKey>) {
+            let keys = vec![
+                SigningKey::generate(
+                    SigningAlgorithm::EcdsaP256Sha256,
+                    "example.com.",
+                    DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+                )
+                .unwrap(),
+                SigningKey::generate(
+                    SigningAlgorithm::EcdsaP256Sha256,
+                    "example.com.",
+                    DNSKEY_FLAG_ZONE,
+                )
+                .unwrap(),
+            ];
+            let policy = SigningPolicy::valid_for(current_unix_timestamp(), 30 * 86_400)
+                .with_chain(if nsec3 {
+                    DenialChain::nsec3()
+                } else {
+                    DenialChain::Nsec
+                });
+            let zone = sign_zone(
+                &parse_zone_file(SIGNED_ZONE, "example.com.").unwrap(),
+                &keys,
+                &policy,
+            )
+            .unwrap();
+            let mut zones = Zones::default();
+            drop(zones.insert(zone));
+            (zones, keys)
+        }
+
+        fn keys_of(zones: &Zones) -> Vec<Dnskey> {
+            let zone = &zones[zkey("example.com.").as_slice()];
+            dnskeys_in(
+                &zone
+                    .query(nm("example.com.").as_ref(), Qtype::of(record_types::DNSKEY))
+                    .into_iter()
+                    .map(|r| ResourceRecord {
+                        name: r.name.to_owned(),
+                        class: r.class,
+                        ttl: r.ttl,
+                        rdata: r.rdata.to_owned(),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        /// A zone with a wildcard and both kinds of delegation, which is what the
+        /// referral and deep-synthesis proofs need and what `SIGNED_ZONE` above
+        /// deliberately does not have — a wildcard at the apex would turn its
+        /// NXDOMAIN tests into wildcard answers.
+        const DELEGATING_ZONE: &str = r#"$ORIGIN example.com.
+$TTL 3600
+@         IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )
+@         IN NS  ns1.example.com.
+ns1       IN A   192.0.2.1
+*         IN A   192.0.2.99
+secure    IN NS  ns.secure.example.com.
+secure    IN DS  12345 13 2 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF
+ns.secure IN A   192.0.2.20
+plain     IN NS  ns.plain.example.com.
+ns.plain  IN A   192.0.2.30
+"#;
+
+        fn signed_zones(text: &str, nsec3: bool) -> (Zones, Vec<SigningKey>) {
+            let keys = vec![
+                SigningKey::generate(
+                    SigningAlgorithm::EcdsaP256Sha256,
+                    "example.com.",
+                    DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+                )
+                .unwrap(),
+                SigningKey::generate(
+                    SigningAlgorithm::EcdsaP256Sha256,
+                    "example.com.",
+                    DNSKEY_FLAG_ZONE,
+                )
+                .unwrap(),
+            ];
+            let policy = SigningPolicy::valid_for(current_unix_timestamp(), 30 * 86_400)
+                .with_chain(if nsec3 {
+                    DenialChain::nsec3()
+                } else {
+                    DenialChain::Nsec
+                });
+            let zone = sign_zone(
+                &parse_zone_file(text, "example.com.").unwrap(),
+                &keys,
+                &policy,
+            )
+            .unwrap();
+            let mut zones = Zones::default();
+            drop(zones.insert(zone));
+            (zones, keys)
+        }
+
+        /// The failure this is the regression test for: a signed zone with a
+        /// wildcard SERVFAILed at every validator for every non-existent name two
+        /// or more labels deep. The synthesis reached one label, so a deeper
+        /// name became an NXDOMAIN — and then the wildcard denial asked the chain
+        /// to cover `*.example.com.`, a name that is *in* the chain, so nothing
+        /// covered it and the proof came back unproved. Failing closed is worse
+        /// than failing open here: the zone was unusable rather than merely
+        /// wrong.
+        #[test]
+        fn a_deep_wildcard_answer_verifies_and_proves_its_own_expansion() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_zones(DELEGATING_ZONE, nsec3);
+                let qname = "x.y.z.example.com.";
+                let response = make_response(
+                    &query(qname, Qtype::of(record_types::A), true),
+                    &zones,
+                    &DnsMetrics::new(),
+                );
+
+                assert_eq!(response.rcode, ResponseCode::Ok, "nsec3={nsec3}");
+                let rdatas: Vec<RecordData> = response
+                    .answers
+                    .iter()
+                    .filter(|r| r.rdata.rtype() == record_types::A)
+                    .map(|r| r.rdata.clone())
+                    .collect();
+                assert_eq!(rdatas.len(), 1, "nsec3={nsec3}: no wildcard answer");
+
+                let proof = verify_rrset(
+                    &Rrset::new(nm(qname).as_ref(), record_types::A, Class::new(1), &rdatas),
+                    &rrsigs_in(&response.answers),
+                    &keys_of(&zones),
+                    nm("example.com.").as_ref(),
+                    current_unix_timestamp(),
+                );
+                let RrsetProof::Verified {
+                    wildcard: Some(wildcard),
+                    ..
+                } = proof
+                else {
+                    panic!("nsec3={nsec3}: expected a wildcard expansion, got {proof:?}");
+                };
+                assert_eq!(wildcard, nm("*.example.com."));
+
+                // And the denial it owes: without it one captured answer is a
+                // valid answer for every name the wildcard reaches
+                // (RFC 4035 §3.1.3).
+                let verdict = proves_wildcard_expansion(
+                    nm(qname).as_ref(),
+                    wildcard.as_ref(),
+                    &nsecs_in(&response.authorities),
+                    &nsec3s_in(&response.authorities),
+                );
+                assert!(
+                    matches!(verdict, WildcardVerdict::Proved),
+                    "nsec3={nsec3}: {verdict:?}"
+                );
+            }
+        }
+
+        /// An ANY answer from a signed zone owes a signature over every
+        /// RRset it returns, and the filter that finds them was
+        /// `sig.type_covered != qtype` — which matches nothing for QTYPE 255,
+        /// because no RRSIG covers a QTYPE. Left alone, making ANY return every
+        /// type would have handed a validator the whole of a signed name's data
+        /// with no signatures on it at all: bogus, not merely unsigned, and a
+        /// SERVFAIL for the name.
+        ///
+        /// Judged with `verify_rrset` — the same code that judges a real zone
+        /// off the internet — rather than by counting RRSIG records, because a
+        /// signature that is present and does not verify passes a count
+        /// (`CLAUDE.md` §1).
+        #[test]
+        fn an_any_answer_from_a_signed_zone_is_signed_rrset_by_rrset() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_zones(SIGNED_ZONE, nsec3);
+                let response = make_response(
+                    &query("example.com.", Qtype::of(record_types::ANY), true),
+                    &zones,
+                    &DnsMetrics::new(),
+                );
+
+                assert_eq!(response.rcode, ResponseCode::Ok, "nsec3={nsec3}");
+
+                // Every type the apex actually holds must be in the answer, and
+                // the DNSSEC meta types must not: RFC 4035 §3.1.1 keeps NSEC and
+                // the signatures out of the answer section, and an NSEC there
+                // would also make an empty non-terminal look like data.
+                for rtype in [record_types::SOA, record_types::NS, record_types::DNSKEY] {
+                    assert!(
+                        response.answers.iter().any(|r| r.rdata.rtype() == rtype),
+                        "nsec3={nsec3}: type {rtype} missing from the ANY answer"
+                    );
+                }
+                assert!(
+                    !response.answers.iter().any(|r| matches!(
+                        r.rdata.rtype(),
+                        record_types::NSEC | record_types::NSEC3
+                    )),
+                    "nsec3={nsec3}: a denial record is not answer-section data"
+                );
+
+                // Then the part that matters: each RRset, against the zone's own
+                // keys.
+                let signatures = rrsigs_in(&response.answers);
+                let keys = keys_of(&zones);
+                for rtype in [record_types::SOA, record_types::NS, record_types::DNSKEY] {
+                    let rdatas: Vec<RecordData> = response
+                        .answers
+                        .iter()
+                        .filter(|r| r.rdata.rtype() == rtype)
+                        .map(|r| r.rdata.clone())
+                        .collect();
+                    let proof = verify_rrset(
+                        &Rrset::new(nm("example.com.").as_ref(), rtype, Class::new(1), &rdatas),
+                        &signatures,
+                        &keys,
+                        nm("example.com.").as_ref(),
+                        current_unix_timestamp(),
+                    );
+                    assert!(
+                        matches!(proof, RrsetProof::Verified { .. }),
+                        "nsec3={nsec3}: type {rtype} in an ANY answer: {proof:?}"
+                    );
+                }
+            }
+        }
+
+        /// And without DO, an ANY answer carries the data and nothing else — the
+        /// signatures are not volunteered to a client that did not ask for them
+        /// (RFC 4035 §3.1.1), which is the other half of the same rule.
+        #[test]
+        fn an_any_answer_without_do_carries_no_dnssec_records() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_zones(SIGNED_ZONE, nsec3);
+                let response = make_response(
+                    &query("example.com.", Qtype::of(record_types::ANY), false),
+                    &zones,
+                    &DnsMetrics::new(),
+                );
+
+                assert_eq!(response.rcode, ResponseCode::Ok, "nsec3={nsec3}");
+                assert!(
+                    !response.answers.iter().any(|r| matches!(
+                        r.rdata.rtype(),
+                        record_types::RRSIG | record_types::NSEC | record_types::NSEC3
+                    )),
+                    "nsec3={nsec3}: DNSSEC records went out to a client that did not set DO"
+                );
+                assert!(
+                    response
+                        .answers
+                        .iter()
+                        .any(|r| r.rdata.rtype() == record_types::SOA),
+                    "nsec3={nsec3}: but the zone's own data is still there"
+                );
+            }
+        }
+
+        /// A secure delegation hands down the DS and its signature, and the NS
+        /// RRset goes out unsigned — it is the child's data (RFC 4035 §2.2).
+        #[test]
+        fn a_secure_referral_carries_the_ds_and_leaves_the_ns_rrset_unsigned() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_zones(DELEGATING_ZONE, nsec3);
+                let response = make_response(
+                    &query("host.secure.example.com.", Qtype::of(record_types::A), true),
+                    &zones,
+                    &DnsMetrics::new(),
+                );
+
+                assert!(!response.authoritive, "nsec3={nsec3}");
+                let ds: Vec<RecordData> = response
+                    .authorities
+                    .iter()
+                    .filter(|r| r.rdata.rtype() == record_types::DS)
+                    .map(|r| r.rdata.clone())
+                    .collect();
+                assert_eq!(
+                    ds.len(),
+                    1,
+                    "nsec3={nsec3}: the DS is what continues the chain"
+                );
+
+                let sigs = rrsigs_in(&response.authorities);
+                let proof = verify_rrset(
+                    &Rrset::new(
+                        nm("secure.example.com.").as_ref(),
+                        record_types::DS,
+                        Class::new(1),
+                        &ds,
+                    ),
+                    &sigs,
+                    &keys_of(&zones),
+                    nm("example.com.").as_ref(),
+                    current_unix_timestamp(),
+                );
+                assert!(
+                    matches!(proof, RrsetProof::Verified { .. }),
+                    "nsec3={nsec3}: an unsigned DS proves nothing: {proof:?}"
+                );
+                assert!(
+                    !sigs.iter().any(|s| s.type_covered == record_types::NS),
+                    "nsec3={nsec3}: the delegation's NS RRset must not be signed — every \
+                     validator ignores the signature and the type shows up in the parent's \
+                     bitmap as one that is not there"
+                );
+            }
+        }
+
+        /// An insecure delegation is the other half, and the more dangerous one:
+        /// "there is no DS here" has to be *proved*, or stripping the DS is a
+        /// downgrade to insecure and anything in the child may then be forged.
+        #[test]
+        fn an_insecure_referral_carries_a_signed_denial_of_the_ds() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_zones(DELEGATING_ZONE, nsec3);
+                let response = make_response(
+                    &query("host.plain.example.com.", Qtype::of(record_types::A), true),
+                    &zones,
+                    &DnsMetrics::new(),
+                );
+
+                assert!(!response.authoritive, "nsec3={nsec3}");
+                assert!(
+                    !response
+                        .authorities
+                        .iter()
+                        .any(|r| r.rdata.rtype() == record_types::DS),
+                    "nsec3={nsec3}: this child is not signed"
+                );
+                let denial = proves_no_ds(
+                    nm("plain.example.com.").as_ref(),
+                    &nsecs_in(&response.authorities),
+                    &nsec3s_in(&response.authorities),
+                );
+                assert!(
+                    matches!(denial, Denial::Proved),
+                    "nsec3={nsec3}: {denial:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_do_query_gets_an_answer_a_validator_accepts() {
+            let (zones, _keys) = signed_server(false);
+            let metrics = DnsMetrics::new();
+            let response = make_response(
+                &query("www.example.com.", Qtype::of(record_types::A), true),
+                &zones,
+                &metrics,
+            );
+
+            // Judge it the way a client would: only what came back.
+            let rdatas: Vec<RecordData> = response
+                .answers
+                .iter()
+                .filter(|r| r.rdata.rtype() == record_types::A)
+                .map(|r| r.rdata.clone())
+                .collect();
+            let proof = verify_rrset(
+                &Rrset::new(
+                    nm("www.example.com.").as_ref(),
+                    record_types::A,
+                    Class::new(1),
+                    &rdatas,
+                ),
+                &rrsigs_in(&response.answers),
+                &keys_of(&zones),
+                nm("example.com.").as_ref(),
+                current_unix_timestamp(),
+            );
+            assert!(matches!(proof, RrsetProof::Verified { .. }), "{proof:?}");
+        }
+
+        #[test]
+        fn a_do_query_for_a_name_that_is_not_there_gets_the_proof() {
+            for nsec3 in [false, true] {
+                let (zones, _keys) = signed_server(nsec3);
+                let metrics = DnsMetrics::new();
+                let response = make_response(
+                    &query("gone.a.b.example.com.", Qtype::of(record_types::A), true),
+                    &zones,
+                    &metrics,
+                );
+                assert_eq!(response.rcode, ResponseCode::NoSuchDomain);
+
+                let denial = proves_nxdomain(
+                    nm("gone.a.b.example.com.").as_ref(),
+                    nm("example.com.").as_ref(),
+                    &nsecs_in(&response.authorities),
+                    &nsec3s_in(&response.authorities),
+                );
+                assert!(
+                    matches!(denial, Denial::Proved),
+                    "nsec3={nsec3}: {denial:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_client_that_did_not_ask_gets_no_dnssec_records() {
+            // The DO bit is what says the client can read them. Sending them
+            // anyway is bytes on an amplification path for a client that will
+            // ignore them, and a response that may no longer fit a datagram.
+            let (zones, _keys) = signed_server(false);
+            let metrics = DnsMetrics::new();
+
+            let answer = make_response(
+                &query("www.example.com.", Qtype::of(record_types::A), false),
+                &zones,
+                &metrics,
+            );
+            assert!(rrsigs_in(&answer.answers).is_empty());
+            assert!(!answer.edns().unwrap().do_bit);
+
+            let denial = make_response(
+                &query("nope.example.com.", Qtype::of(record_types::A), false),
+                &zones,
+                &metrics,
+            );
+            assert!(nsecs_in(&denial.authorities).is_empty());
+            // The SOA is still there: a negative answer has always carried one
+            // (RFC 2308), signed zone or not.
+            assert!(denial
+                .authorities
+                .iter()
+                .any(|r| r.rdata.rtype() == record_types::SOA));
+        }
+
+        #[test]
+        fn the_do_bit_comes_back_set() {
+            // RFC 3225 §3. Without it the client cannot tell an answer with no
+            // DNSSEC records from a server that dropped them.
+            let (zones, _keys) = signed_server(false);
+            let metrics = DnsMetrics::new();
+            let response = make_response(
+                &query("www.example.com.", Qtype::of(record_types::A), true),
+                &zones,
+                &metrics,
+            );
+            assert!(response.edns().unwrap().do_bit);
+        }
+
+        #[test]
+        fn an_unsigned_zone_answers_a_do_query_the_way_it_answers_any_other() {
+            let mut zones = Zones::default();
+            drop(zones.insert(parse_zone_file(SIGNED_ZONE, "example.com.").unwrap()));
+            let metrics = DnsMetrics::new();
+
+            let response = make_response(
+                &query("www.example.com.", Qtype::of(record_types::A), true),
+                &zones,
+                &metrics,
+            );
+            assert_eq!(response.answers.len(), 1);
+            assert!(rrsigs_in(&response.answers).is_empty());
+        }
+
+        #[test]
+        fn keys_are_generated_loaded_and_used_without_anything_in_between() {
+            // The whole operator path in one test: make the keys, point the
+            // server at the directory, and have what it serves verify. Each
+            // step is checked elsewhere; what this catches is the two ends not
+            // meeting — a key written under a name the loader does not look
+            // for, or loaded for a zone whose origin is spelled differently.
+            let dir = ScratchDir::new("signing");
+            generate_keys("example.com", dir.path(), "ECDSAP256SHA256").expect("generate");
+
+            let zone_path = dir.join("example.com.zone");
+            std::fs::write(&zone_path, SIGNED_ZONE).unwrap();
+
+            let cli = Cli::parse_from([
+                "rdnsd",
+                "--zone-dir",
+                dir.path().to_str().unwrap(),
+                "--signing-key-dir",
+                dir.path().to_str().unwrap(),
+            ]);
+            let signing = ZoneSigning::load(&cli, &BTreeMap::new())
+                .expect("load keys")
+                .expect("configured");
+
+            let mut zones = load_zones(
+                &ZoneSource::Directory(dir.path().to_string_lossy().to_string()),
+                false,
+                false,
+                None,
+            )
+            .map(|l| l.zones)
+            .expect("zones");
+            let run = signing.apply(&mut zones, None).expect("sign");
+
+            // Checked with the same validator the server runs before serving.
+            let mut validator = DnssecValidator::new(true);
+            validator.set_require_signed(true);
+            let proved = ProvenSigning::default();
+            verify_zones(&zones, &validator, &run, &proved)
+                .expect("the zone we just signed verifies");
+
+            // And the same zones again, without re-signing: the run is the same
+            // and the keys have not moved, so nothing is checked a second time
+            // (`TODO.md` #53).
+            assert_eq!(
+                verify_zones(&zones, &validator, &run, &proved).expect("verifies"),
+                crate::zones::Checked {
+                    zones: 0,
+                    rrsets: 0,
+                    skipped: 1,
+                    resigned: 0,
+                },
+            );
+
+            let zones = Zones::new(zones);
+            let metrics = DnsMetrics::new();
+            let response = make_response(
+                &query("www.example.com.", Qtype::of(record_types::A), true),
+                &zones,
+                &metrics,
+            );
+            assert_eq!(rrsigs_in(&response.answers).len(), 1);
+        }
+
+        #[test]
+        fn require_signed_refuses_an_unsigned_zone_rather_than_serving_it() {
+            let zone = parse_zone_file(SIGNED_ZONE, "example.com.").unwrap();
+            let mut zones = HashMap::new();
+            zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
+
+            let mut validator = DnssecValidator::new(true);
+            validator.set_require_signed(true);
+            let err = verify_zones(
+                &zones,
+                &validator,
+                &SigningRun::default(),
+                &ProvenSigning::default(),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("not signed"), "{err}");
+
+            // And without the assertion, the same zone is fine: most zones are
+            // unsigned and serving them is the normal case.
+            let permissive = DnssecValidator::new(true);
+            assert!(verify_zones(
+                &zones,
+                &permissive,
+                &SigningRun::default(),
+                &ProvenSigning::default()
+            )
+            .is_ok());
+        }
+
+        #[test]
+        fn a_signature_that_stopped_matching_its_records_stops_the_server() {
+            // The failure this check exists for: the zone file was edited and
+            // the signatures were not renewed, so what goes out is signed data
+            // that no longer says what the signature says it says.
+            let (mut zones, _keys) = signed_server(false);
+            let edited = {
+                let zone = zones
+                    .matching(nm("example.com.").as_ref())
+                    .expect("the signed zone");
+                let mut edited = Zone::new(nm(&zone.origin().to_string()));
+                for record in zone.records() {
+                    let mut record = record.to_owned();
+                    if record.name == nm("www.example.com.")
+                        && record.rdata.rtype() == record_types::A
+                    {
+                        record.rdata = RecordData::from_parsed(&rdns::ParsedRecord::A(
+                            "198.51.100.9".parse().unwrap(),
+                        ))
+                        .unwrap();
+                    }
+                    edited.add_record(record.to_owned());
+                }
+                edited
+            };
+            drop(zones.insert(edited));
+
+            let validator = DnssecValidator::new(true);
+            let err = verify_zones(
+                &zones,
+                &validator,
+                &SigningRun::default(),
+                &ProvenSigning::default(),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("does not verify"), "{err}");
+        }
     }
 }

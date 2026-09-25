@@ -1653,8 +1653,19 @@ fn enumerate_zone_files(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{nm, ScratchDir};
-    use rdns::dnssec_key::KeyTiming;
+    use crate::testutil::{nm, served, zone_at_serial, ScratchDir};
+    use rdns::clock::current_unix_timestamp;
+    use rdns::dnssec_key::{KeyTiming, SigningKey};
+    use rdns::dnssec_validation_mode::DnssecValidator;
+    use rdns::ixfr::DeltaLog;
+    use rdns::journal::Journal;
+    use rdns::zone::Zone;
+    use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
+    use rdns::{record_types, Name, Qtype};
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
 
     /// The re-signing timer follows the nearest key rollover step when one is
     /// closer than the ordinary tick (`TODO.md` #44f).
@@ -2540,6 +2551,260 @@ ns1 IN A 192.0.2.1
                 .kept
                 .is_empty(),
             "the key signs at this moment and did not at the last one"
+        );
+    }
+
+    #[test]
+    fn test_validate_zone_source_file_present() {
+        // Test zone source validation error when file doesn't exist
+        // This documents that validate_zone_source checks file existence
+        let result = validate_zone_source(Some("nonexistent.zone".to_string()), None, false);
+        assert!(result.is_err(), "Non-existent file should fail validation");
+    }
+
+    #[test]
+    fn test_validate_zone_source_dir_present() {
+        // Test zone source validation error when directory doesn't exist
+        // This documents that validate_zone_source checks directory existence
+        let result = validate_zone_source(None, Some("/nonexistent/path".to_string()), false);
+        assert!(
+            result.is_err(),
+            "Non-existent directory should fail validation"
+        );
+    }
+
+    #[test]
+    fn test_validate_zone_source_both_present_error() {
+        // Test zone source validation rejects when both file and dir provided
+        let result = validate_zone_source(
+            Some("test.zone".to_string()),
+            Some("/etc/dns".to_string()),
+            false,
+        );
+        assert!(
+            result.is_err(),
+            "Should reject when both file and dir specified"
+        );
+    }
+
+    #[test]
+    fn test_validate_zone_source_neither_present_error() {
+        // Test zone source validation rejects when neither file nor dir provided
+        let result = validate_zone_source(None, None, false);
+        assert!(
+            result.is_err(),
+            "Should reject when neither file nor dir specified"
+        );
+    }
+
+    /// A transferred zone has to be written somewhere, and one file is not a
+    /// place to put zones whose names we may not have seen yet.
+    #[test]
+    fn test_secondary_requires_a_zone_directory() {
+        let Err(err) = validate_zone_source(Some("test.zone".to_string()), None, true) else {
+            panic!("--secondary with only --zone-file should be refused");
+        };
+        assert!(err.to_string().contains("--zone-dir"), "got: {err}");
+    }
+
+    /// A reload is a version step too, and a zone that leaves the configuration
+    /// takes its history with it — we cannot offer increments of a zone we no
+    /// longer serve.
+    #[tokio::test]
+    async fn test_a_reload_records_its_changes_and_forgets_removed_zones() {
+        let zone_map = Arc::new(RwLock::new(Zones::default()));
+        let deltas = Arc::new(RwLock::new(DeltaLog::new()));
+        let parse = |text: &str, origin: &str| {
+            rdns::zone::parse_zone_file(text, origin).expect("zone should parse")
+        };
+
+        let v7 = parse(&zone_at_serial(7), "example.com.");
+        let other = parse(
+            "@ IN SOA ns1.other.test. admin.other.test. 1 3600 1800 604800 86400\n\
+             @ IN NS ns1.other.test.\n",
+            "other.test.",
+        );
+        let mut initial = HashMap::new();
+        initial.insert(zone_key(&v7), std::sync::Arc::new(v7));
+        initial.insert(zone_key(&other), std::sync::Arc::new(other));
+        install_all_zones(&served(&zone_map, &deltas), initial).await;
+        assert!(deltas.read().await.is_empty(), "nothing to differ from yet");
+
+        // example.com. moves on; other.test. is dropped from the configuration.
+        let v8 = parse(
+            "$TTL 3600\n\
+             @    IN SOA ns1.example.com. admin.example.com. 8 3600 1800 604800 86400\n\
+             @    IN NS  ns1.example.com.\n\
+             ns1  IN A   192.0.2.1\n\
+             www  IN A   192.0.2.222\n",
+            "example.com.",
+        );
+        let mut reloaded = HashMap::new();
+        reloaded.insert(zone_key(&v8), std::sync::Arc::new(v8));
+        install_all_zones(&served(&zone_map, &deltas), reloaded).await;
+
+        let log = deltas.read().await;
+        assert_eq!(
+            log.len(nm("example.com.").as_ref()),
+            1,
+            "the reload is a version step"
+        );
+        assert_eq!(
+            log.len(nm("other.test.").as_ref()),
+            0,
+            "a zone we no longer serve"
+        );
+        assert_eq!(zone_map.read().await.len(), 1);
+    }
+
+    /// A reload must not block every query for the length of its diffs:
+    /// `ixfr::diff` runs under the read lock, and only the swap under the write
+    /// lock.
+    ///
+    /// Self-calibrating: time one unlocked diff, then require a contiguous
+    /// window at least half that long inside the reload in which a reader could
+    /// have been admitted. Such a window exists only if the diff ran under a
+    /// shared lock, and a slower box stretches baseline and window together. 90%
+    /// of the reload with the split, 9% with the diff under the write lock.
+    ///
+    /// Not a ratio of `try_read` samples: `tokio::sync::RwLock` is fair, so
+    /// `try_read` fails while a writer is merely queued, which measures wake
+    /// latency against a denominator that is the sampler's spin rate.
+    ///
+    /// Multi-threaded, because the diff has no `.await`: on one thread the
+    /// reload finishes before the reader is polled and the test passes against
+    /// both versions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_does_not_hold_the_write_lock_across_its_diffs() {
+        // Every record differs between the two versions, so nothing cancels out
+        // and the diff does the most work it can — which is the work that used
+        // to happen with every query waiting on it.
+        const RECORDS: u32 = 6000;
+        let version = |serial: u32, tail: u8| {
+            let mut text = format!(
+                "$TTL 3600\n\
+                 @    IN SOA ns1.example.com. admin.example.com. {serial} 3600 1800 604800 86400\n\
+                 @    IN NS  ns1.example.com.\n"
+            );
+            for i in 0..RECORDS {
+                text.push_str(&format!("h{i} IN A 10.{}.{}.{tail}\n", i / 256, i % 256));
+            }
+            rdns::zone::parse_zone_file(&text, "example.com.").expect("zone should parse")
+        };
+
+        let v1 = version(1, 1);
+        let v2 = version(2, 2);
+
+        // Observing this is a race, and losing it is not a failure. If this
+        // task is descheduled between spawning the reload and starting to
+        // sample, the whole reload can be over before the first probe — there is
+        // then nothing to measure and no verdict to give either way. On a
+        // machine pinned to two cores with the rest of the suite running, about
+        // one attempt in four saw nothing at all. So the *observation* is
+        // retried, and only never managing to observe anything is a failure.
+        // Each attempt gets its own map and log, so a retry cannot inherit
+        // anything from the one before it.
+        let mut observed = None;
+        for _ in 0..16 {
+            let zone_map = Arc::new(RwLock::new(Zones::default()));
+            let deltas = Arc::new(RwLock::new(DeltaLog::new()));
+            let mut initial = HashMap::new();
+            initial.insert(zone_key(&v1), std::sync::Arc::new(v1.clone()));
+            install_all_zones(&served(&zone_map, &deltas), initial).await;
+
+            // What one diff costs on this machine right now, with no locks and
+            // nothing else running: the yardstick the window below is measured
+            // against. Timed here rather than assumed, because it is what makes
+            // the assertion portable — CI's runner is several times slower than
+            // this one and the comparison has to survive that.
+            let mut baseline_zones = HashMap::new();
+            baseline_zones.insert(zone_key(&v2), std::sync::Arc::new(v2.clone()));
+            let baseline = {
+                let zones = zone_map.read().await;
+                let started = std::time::Instant::now();
+                let plan = plan_reload(&zones, &baseline_zones);
+                let elapsed = started.elapsed();
+                std::hint::black_box(&plan);
+                elapsed
+            };
+
+            let mut reloaded = HashMap::new();
+            reloaded.insert(zone_key(&v2), std::sync::Arc::new(v2.clone()));
+            let reloading = served(&zone_map, &deltas);
+            let reload = tokio::spawn(async move {
+                install_all_zones(&reloading, reloaded).await;
+            });
+
+            // Sample continuously for as long as the reload runs, rather than
+            // asking once after a fixed delay: a single probe times out against
+            // how long the diff happens to take on this machine, and a probe
+            // that arrives after the reload has finished measures nothing.
+            // Every sample is one query's worth of "could I have been answered
+            // right now?".
+            //
+            // What is kept is the longest *contiguous stretch of time* over
+            // which every sample was admitted. A stretch, rather than a count or
+            // a fraction: the count depends on how often this loop gets
+            // scheduled, and the fraction has the writer's wake latency in its
+            // denominator. A stretch of wall-clock time has neither in it. Gaps
+            // in sampling cannot shorten one either — only a refusal ends a
+            // stretch — so a starved sampler measures the same window as an idle
+            // one.
+            let mut attempts = 0u32;
+            let started = std::time::Instant::now();
+            let mut stretch_began = started;
+            let mut longest = std::time::Duration::ZERO;
+            let mut admitted = true;
+            while !reload.is_finished() {
+                attempts += 1;
+                let now = std::time::Instant::now();
+                if zone_map.try_read().is_err() {
+                    if admitted {
+                        longest = longest.max(now - stretch_began);
+                        admitted = false;
+                    }
+                } else if !admitted {
+                    stretch_began = now;
+                    admitted = true;
+                }
+                tokio::task::yield_now().await;
+            }
+            if admitted {
+                longest = longest.max(std::time::Instant::now() - stretch_began);
+            }
+            reload.await.expect("the reload finished");
+
+            assert_eq!(
+                deltas.read().await.len(nm("example.com.").as_ref()),
+                1,
+                "the version step is recorded whether or not this attempt saw \
+                 anything"
+            );
+            if attempts > 100 {
+                observed = Some((longest, baseline, attempts));
+                break;
+            }
+        }
+
+        let Some((longest, baseline, attempts)) = observed else {
+            panic!(
+                "sixteen attempts and not one of them sampled the reload while it \
+                 was running — this proves nothing either way, so it is a broken \
+                 measurement rather than a broken lock discipline"
+            );
+        };
+
+        // Half the baseline, which is a factor of five clear of both measured
+        // shapes: the window is ~90% of a reload with the split and ~9% without
+        // it, and the reload is a little longer than one diff. Halving leaves
+        // room for the diff inside the reload to run slower than the unlocked
+        // baseline — it is competing with this sampler, after all — without
+        // leaving room for the old behaviour to pass.
+        assert!(
+            longest * 2 > baseline,
+            "over {attempts} samples the longest window in which a reader could be \
+             admitted was {longest:?}, against a {baseline:?} diff on this machine: \
+             the diff is being held under the write lock again"
         );
     }
 }

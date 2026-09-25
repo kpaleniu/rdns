@@ -1805,13 +1805,37 @@ fn notify_reply(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::testutil::{nm, query};
-    use crate::zones::zone_key;
-    use rdns::clock::current_unix_timestamp;
-    use rdns::record_types;
-    use rdns::zone::parse_zone_file_at;
-    use rdns::UdpSizes;
+    use crate::replication::Secondaries;
+    use crate::testutil::{
+        answered, nm, query, server_with, server_with_keys_at, spawn_primary_full,
+        spawn_primary_with_keys, test_context, test_shutdown, update_key, update_message,
+        zone_at_serial, ScratchDir,
+    };
+    use crate::zones::{load_zones, zone_key, ZoneSigning, ZoneSource, Zones};
+    use crate::Scratch;
+    use rdns::clock::{current_unix_timestamp, Clock};
+    use rdns::dnssec_validation_mode::DnssecValidator;
+    use rdns::ixfr::DeltaLog;
+    use rdns::metrics::DnsMetrics;
+    use rdns::security::{TransferAcl, TransferCertificates};
+    use rdns::shutdown::Shutdown;
+    use rdns::tsig::{self, TsigAlgorithm, TsigKey, TsigKeyring};
+    use rdns::validation::{Arrival, Transport};
+    use rdns::zone::{parse_zone_file_at, Zone};
+    use rdns::{
+        notify, record_types, DnsMessage, OpCode, Qtype, ResourceRecord, ResponseCode, Serial, Ttl,
+        UdpSizes,
+    };
+    use rdns_transport::tcp::{self, Reply};
+    use rdns_transport::TransportLimits;
     use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream, UdpSocket};
+    use tokio::sync::{mpsc, RwLock};
 
     pub(crate) use rdns::testutil::one_at_a_time;
 
@@ -2848,5 +2872,1232 @@ pub(crate) mod tests {
                 "DO must be copied in the response"
             );
         }
+    }
+
+    // Graceful shutdown
+
+    mod shutdown {
+        use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        /// A zone big enough that its AXFR spans many messages, so a transfer is
+        /// reliably still in flight when the stop arrives. One message would make
+        /// this test pass for the wrong reason.
+        fn big_zone() -> Zone {
+            let mut text = String::from(
+                "$ORIGIN example.com.\n\
+                 $TTL 3600\n\
+                 @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                 @   IN NS  ns1.example.com.\n\
+                 ns1 IN A   192.0.2.1\n",
+            );
+            for i in 0..4000 {
+                text.push_str(&format!(
+                    "host{i} IN A 10.{}.{}.{}\n",
+                    (i >> 16) & 255,
+                    (i >> 8) & 255,
+                    i & 255
+                ));
+            }
+            rdns::zone::parse_zone_file(&text, "example.com.").expect("the big zone parses")
+        }
+
+        /// Read one length-prefixed message.
+        async fn read_message(stream: &mut TcpStream) -> Option<DnsMessage> {
+            let mut len = [0u8; 2];
+            stream.read_exact(&mut len).await.ok()?;
+            let mut body = vec![0u8; u16::from_be_bytes(len) as usize];
+            stream.read_exact(&mut body).await.ok()?;
+            DnsMessage::try_from_bytes(&body).ok()
+        }
+
+        async fn send_axfr_request(stream: &mut TcpStream) {
+            let msg = query("example.com.", Qtype::of(record_types::AXFR), false);
+            let bytes = msg.to_bytes_within(u16::MAX as usize).expect("serialize");
+            let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+            framed.extend_from_slice(&bytes);
+            stream.write_all(&framed).await.expect("send the request");
+        }
+
+        /// The harm the whole item is about: `systemctl stop` used to cut an
+        /// in-flight AXFR mid-stream, and the client cannot tell a truncated
+        /// transfer from a complete one — it sees records, then silence, and a
+        /// secondary that believes it holds a zone it holds half of.
+        ///
+        /// Drives the real `tcp_loop` and the real `serve_connection`, and stops
+        /// the server after the first message of a multi-message transfer has
+        /// arrived — so the stop is unambiguously mid-transfer.
+        #[tokio::test]
+        async fn a_transfer_in_flight_survives_the_stop() {
+            let shutdown = Shutdown::new();
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let loop_handle = tokio::spawn(tcp::serve(
+                listener,
+                server_with(big_zone()),
+                TransportLimits::default(),
+                tcp::RateLimit::PerMessage,
+                shutdown.stop_handle(),
+                shutdown.busy(),
+            ));
+
+            let mut stream = TcpStream::connect(addr).await.expect("connect");
+            send_axfr_request(&mut stream).await;
+
+            // One message in: the transfer has begun and is not finished.
+            let first = read_message(&mut stream).await.expect("the first message");
+            assert!(!first.answers.is_empty());
+
+            shutdown.begin();
+
+            // Everything else must still arrive, ending with the closing SOA
+            // that RFC 5936 §2.2 uses to bracket a transfer — which is exactly
+            // the thing a cut connection withholds.
+            let mut records = first.answers.len();
+            let mut messages = 1;
+            while let Some(msg) = read_message(&mut stream).await {
+                records += msg.answers.len();
+                messages += 1;
+                let closed = msg
+                    .answers
+                    .last()
+                    .is_some_and(|rr| rr.rdata.rtype() == record_types::SOA);
+                if closed {
+                    break;
+                }
+            }
+            assert!(
+                messages > 1,
+                "the zone must not fit in one message or this proves nothing"
+            );
+            // 4000 hosts + SOA + NS + ns1 + the closing SOA.
+            assert_eq!(
+                records, 4004,
+                "the transfer arrived short after {messages} messages"
+            );
+
+            // And the loop stopped accepting, so the drain can complete.
+            let _ = tokio::time::timeout(Duration::from_secs(5), loop_handle)
+                .await
+                .expect("the accept loop must return on stop");
+            assert!(
+                shutdown.drain(Duration::from_secs(5)).await,
+                "the drain must complete once the transfer is done"
+            );
+        }
+
+        /// The other half: once stopped, nothing new is taken on. A connection
+        /// opened after the signal gets no answer — the loop has returned, so the
+        /// kernel's backlog holds the socket and the peer's retry goes to whatever
+        /// replaces us.
+        #[tokio::test]
+        async fn nothing_new_is_accepted_after_the_stop() {
+            let shutdown = Shutdown::new();
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let loop_handle = tokio::spawn(tcp::serve(
+                listener,
+                server_with(big_zone()),
+                TransportLimits::default(),
+                tcp::RateLimit::PerMessage,
+                shutdown.stop_handle(),
+                shutdown.busy(),
+            ));
+
+            shutdown.begin();
+            let _ = tokio::time::timeout(Duration::from_secs(5), loop_handle)
+                .await
+                .expect("the accept loop must return on stop");
+
+            // The listener is dropped with the loop, so this either fails to
+            // connect or connects and is never answered. Both are "not served";
+            // what must not happen is a reply.
+            if let Ok(Ok(mut stream)) =
+                tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr)).await
+            {
+                send_axfr_request(&mut stream).await;
+                let answered =
+                    tokio::time::timeout(Duration::from_secs(1), read_message(&mut stream)).await;
+                assert!(
+                    !matches!(answered, Ok(Some(_))),
+                    "a stopped server answered a query it accepted after stopping"
+                );
+            }
+
+            assert!(shutdown.drain(Duration::from_secs(5)).await);
+        }
+
+        /// A connection sitting idle between queries closes on the stop rather
+        /// than holding the drain for its full idle timeout. This is the case
+        /// that decides whether a shutdown takes milliseconds or the whole
+        /// budget, since a resolver keeps connections open by design (RFC 7766
+        /// §6.2.3) and most of them are idle at any moment.
+        #[tokio::test]
+        async fn an_idle_connection_does_not_hold_the_drain() {
+            let shutdown = Shutdown::new();
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            tokio::spawn(tcp::serve(
+                listener,
+                server_with(big_zone()),
+                TransportLimits::default(),
+                tcp::RateLimit::PerMessage,
+                shutdown.stop_handle(),
+                shutdown.busy(),
+            ));
+
+            // Connect, ask one question, read the answer, then go quiet — which
+            // is what a pooled connection does for most of its life.
+            let mut stream = TcpStream::connect(addr).await.expect("connect");
+            let msg = query("example.com.", Qtype::of(record_types::SOA), false);
+            let bytes = msg.to_bytes_within(u16::MAX as usize).expect("serialize");
+            let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+            framed.extend_from_slice(&bytes);
+            stream.write_all(&framed).await.expect("send");
+            read_message(&mut stream).await.expect("answer");
+
+            shutdown.begin();
+
+            // TCP_IDLE_TIMEOUT is ten seconds; this budget is well under it, so
+            // passing means the connection observed the stop rather than timing
+            // out. Keep the client end alive so nothing else can close it.
+            let drained = shutdown.drain(Duration::from_secs(3)).await;
+            drop(stream);
+            assert!(
+                drained,
+                "an idle connection held the drain for its idle timeout"
+            );
+        }
+    }
+
+    // Who a TSIG key authorizes
+
+    mod transfer_authorization {
+        use super::*;
+        /// A transfer is a sequence of messages, and DoH carries one.
+        ///
+        /// `TODO.md` #106. `Server::answer` decided to stream from the QTYPE
+        /// and `Wire::Framed` alone, so a DoH request reached
+        /// `answer_transfer` and the whole zone was serialized one envelope at
+        /// a time into a channel `https::answer` drains and discards — the
+        /// client waiting on the producer to finish before it is handed the
+        /// first envelope. RFC 8484 defines no framing that would carry the
+        /// rest and RFC 9103 §7.1 puts DoH outside zone transfer, so the
+        /// answer is a refusal rather than a stream nothing can read.
+        ///
+        /// The arrival is the whole of what this drives, so the socket is a
+        /// plain one — the same shape `transfer_by_certificate` uses to test
+        /// authorization without a handshake.
+        mod transfer_needs_a_transport_that_carries_a_sequence {
+            use super::*;
+            use rdns::validation::{Arrival, PeerCertificate, TlsVersion};
+
+            /// A primary that allows this address to transfer, arriving as
+            /// whatever `arrival` says.
+            async fn primary_arriving_over(arrival: Arrival) -> SocketAddr {
+                let zone = rdns::zone::parse_zone_file(
+                    "$ORIGIN example.com.\n\
+                     $TTL 3600\n\
+                     @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                     @   IN NS  ns1.example.com.\n\
+                     ns1 IN A   192.0.2.1\n",
+                    "example.com.",
+                )
+                .expect("parse");
+                let mut zones = HashMap::new();
+                zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
+
+                let server = Arc::new(
+                    Server::new(Arc::new(RwLock::new(Zones::new(zones))), test_context())
+                        .with_transfers(
+                            TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl"),
+                            TransferCertificates::default(),
+                            false,
+                        ),
+                );
+
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    while let Ok((stream, peer)) = listener.accept().await {
+                        tokio::spawn(tcp::serve_one(
+                            stream,
+                            peer,
+                            server.clone(),
+                            TransportLimits::default(),
+                            tcp::RateLimit::PerMessage,
+                            arrival.clone(),
+                            test_shutdown().stop_handle(),
+                        ));
+                    }
+                });
+                addr
+            }
+
+            async fn transfer(master: SocketAddr) -> rdns::error::TransferResult<rdns::zone::Zone> {
+                rdns::xfr::fetch_zone(
+                    &rdns::xfr::Master::plain(master),
+                    nm("example.com.").as_ref(),
+                    None,
+                )
+                .await
+            }
+
+            /// The three that frame a stream answer it. This is the control:
+            /// the ACL is the same and only the arrival differs, so a failure
+            /// below is about the transport and not about permission.
+            #[tokio::test]
+            async fn tcp_dot_and_doq_still_transfer() {
+                for arrival in [
+                    Arrival::Tcp,
+                    Arrival::Dot(TlsVersion::Tls13, PeerCertificate::none()),
+                    Arrival::Doq(PeerCertificate::none()),
+                ] {
+                    let master = primary_arriving_over(arrival.clone()).await;
+                    let zone = transfer(master)
+                        .await
+                        .unwrap_or_else(|e| panic!("{arrival:?} carries a sequence: {e}"));
+                    assert_eq!(zone.serial(), Some(Serial::new(1)));
+                }
+            }
+
+            /// And DoH is refused, however small the zone.
+            ///
+            /// **This narrows something that worked** (`CLAUDE.md` §16), and
+            /// the narrowing is the point: a zone that fitted one envelope
+            /// transferred over DoH and a zone that did not was built in full
+            /// and thrown away. Succeeding by zone size is the shape §4 is
+            /// about — it passes every test fixture and fails the deployment.
+            #[tokio::test]
+            async fn doh_is_refused_however_small_the_zone() {
+                let master =
+                    primary_arriving_over(Arrival::Doh(TlsVersion::Tls13, PeerCertificate::none()))
+                        .await;
+                let err = transfer(master)
+                    .await
+                    .expect_err("one HTTP response is one message");
+                assert!(
+                    err.to_string().contains("Refused"),
+                    "want a refusal, got: {err}"
+                );
+            }
+        }
+
+        /// RFC 9103 §7.5's other method: a transfer authorized by the certificate
+        /// the client presented, with no TSIG key and an empty address ACL —
+        /// `TODO.md` #59.
+        ///
+        /// The handshake half is `rdns_transport::tls`'s
+        /// `a_client_certificate_reaches_the_handler`; what these drive is the
+        /// authorization, which is the half §16 is about.
+        mod transfer_by_certificate {
+            use super::*;
+            use rdns::validation::{Arrival, PeerCertificate, TlsVersion};
+
+            /// A certificate carrying `name`, generated per run.
+            fn certificate_for(name: &str) -> PeerCertificate {
+                let issued = rcgen::generate_simple_self_signed(vec![name.to_string()])
+                    .expect("a certificate");
+                PeerCertificate::presented(issued.cert.der().to_vec())
+            }
+
+            /// A primary with no ACL and no keys, so the certificate is the only
+            /// thing that can authorize anything.
+            async fn primary_trusting(rules: &[&str], presented: PeerCertificate) -> SocketAddr {
+                let zone = rdns::zone::parse_zone_file(
+                    "$ORIGIN example.com.\n\
+                 $TTL 3600\n\
+                 @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                 @   IN NS  ns1.example.com.\n\
+                 ns1 IN A   192.0.2.1\n",
+                    "example.com.",
+                )
+                .expect("parse");
+                let mut zones = HashMap::new();
+                zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
+                let specs: Vec<String> = rules.iter().map(|r| (*r).to_string()).collect();
+
+                let server = Arc::new(
+                    Server::new(Arc::new(RwLock::new(Zones::new(zones))), test_context())
+                        .with_transfers(
+                            TransferAcl::default(),
+                            TransferCertificates::parse(&specs).expect("the rules parse"),
+                            false,
+                        ),
+                );
+
+                // The arrival a DoT listener builds, with the certificate this
+                // client presented — the one thing the transport contributes.
+                let arrival = Arrival::Dot(TlsVersion::Tls13, presented);
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+                let addr = listener.local_addr().expect("addr");
+                tokio::spawn(async move {
+                    while let Ok((stream, peer)) = listener.accept().await {
+                        tokio::spawn(tcp::serve_one(
+                            stream,
+                            peer,
+                            server.clone(),
+                            TransportLimits::default(),
+                            tcp::RateLimit::PerMessage,
+                            arrival.clone(),
+                            test_shutdown().stop_handle(),
+                        ));
+                    }
+                });
+                addr
+            }
+
+            async fn transfer(master: SocketAddr) -> rdns::error::TransferResult<rdns::zone::Zone> {
+                rdns::xfr::fetch_zone(
+                    &rdns::xfr::Master::plain(master),
+                    nm("example.com.").as_ref(),
+                    None,
+                )
+                .await
+            }
+
+            /// The case the row exists for: an operator who has standardized on
+            /// mTLS, with no addresses listed and no keys defined.
+            #[tokio::test]
+            async fn a_listed_certificate_transfers_its_zone() {
+                let master = primary_trusting(
+                    &["partner.example.:example.com."],
+                    certificate_for("partner.example"),
+                )
+                .await;
+
+                let zone = transfer(master).await.expect("a listed client transfers");
+                assert_eq!(zone.serial(), Some(Serial::new(1)));
+            }
+
+            /// #16's lesson, for the credential #59 adds: the certificate proves
+            /// who, and the zone list decides what. A partner's certificate must
+            /// not be every zone on the server.
+            #[tokio::test]
+            async fn a_certificate_scoped_to_another_zone_cannot_transfer_this_one() {
+                let master = primary_trusting(
+                    &["partner.example.:other.test."],
+                    certificate_for("partner.example"),
+                )
+                .await;
+
+                let err = transfer(master).await.expect_err(
+                    "a certificate scoped to other.test. must not transfer example.com.",
+                );
+                assert!(
+                    err.to_string().contains("Refused"),
+                    "want a refusal, got: {err}"
+                );
+            }
+
+            /// And a certificate nobody listed authorizes nothing, however it was
+            /// issued. The handshake verified it against the operator's anchors,
+            /// which is authentication and not permission (`CLAUDE.md` §16).
+            #[tokio::test]
+            async fn a_certificate_nobody_listed_transfers_nothing() {
+                let master = primary_trusting(
+                    &["partner.example.:example.com."],
+                    certificate_for("stranger.example"),
+                )
+                .await;
+
+                let err = transfer(master)
+                    .await
+                    .expect_err("an unlisted certificate is not a credential");
+                assert!(
+                    err.to_string().contains("Refused"),
+                    "want a refusal, got: {err}"
+                );
+            }
+
+            /// The control from the other direction: with no certificate the rules
+            /// change nothing, and the address ACL is still what decides.
+            #[tokio::test]
+            async fn a_client_with_no_certificate_falls_back_to_the_other_rules() {
+                let master =
+                    primary_trusting(&["partner.example.:example.com."], PeerCertificate::none())
+                        .await;
+
+                let err = transfer(master)
+                    .await
+                    .expect_err("no certificate, no key, and an empty ACL is a refusal");
+                assert!(
+                    err.to_string().contains("Refused"),
+                    "want a refusal, got: {err}"
+                );
+            }
+        }
+
+        use rdns::tsig::{TsigAlgorithm, TsigKey, TsigKeyring};
+
+        fn key(zones: &[&str]) -> TsigKey {
+            TsigKey::new(
+                "partner.key.",
+                TsigAlgorithm::HmacSha256,
+                b"0123456789012345678901234567890123456789".to_vec(),
+            )
+            .for_zones(zones.iter().copied())
+        }
+
+        /// A primary holding both zones, with an empty ACL — so the key is the
+        /// only thing that can authorize a transfer, which is the situation the
+        /// bug was about.
+        async fn primary_with(key: TsigKey) -> SocketAddr {
+            let zone = rdns::zone::parse_zone_file(
+                "$ORIGIN example.com.\n\
+                 $TTL 3600\n\
+                 @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                 @   IN NS  ns1.example.com.\n\
+                 ns1 IN A   192.0.2.1\n",
+                "example.com.",
+            )
+            .expect("parse");
+            spawn_primary_with_keys(zone, &[], DeltaLog::new(), TsigKeyring::new(vec![key])).await
+        }
+
+        /// The bug: `answer_transfer` asked only whether a session *existed*, so
+        /// any key in the keyring transferred any zone and bypassed
+        /// `--allow-transfer` entirely. Hand a per-customer key to one partner and
+        /// you handed them every zone on the server.
+        #[tokio::test]
+        async fn a_key_scoped_to_another_zone_cannot_transfer_this_one() {
+            let scoped = key(&["other.test."]);
+            let master = primary_with(scoped.clone()).await;
+
+            let err = rdns::xfr::fetch_zone(
+                &rdns::xfr::Master::plain(master),
+                nm("example.com.").as_ref(),
+                Some(&scoped),
+            )
+            .await
+            .expect_err("a key scoped to other.test. must not transfer example.com.");
+            // REFUSED, and reported as a refusal rather than as a bad signature:
+            // the peer proved who it is and the answer is still no.
+            assert!(
+                err.to_string().contains("Refused"),
+                "want a refusal, got: {err}"
+            );
+        }
+
+        /// The control. Narrowing must not break the case it exists to serve.
+        #[tokio::test]
+        async fn a_key_scoped_to_this_zone_transfers_it() {
+            let scoped = key(&["example.com."]);
+            let master = primary_with(scoped.clone()).await;
+
+            let zone = rdns::xfr::fetch_zone(
+                &rdns::xfr::Master::plain(master),
+                nm("example.com.").as_ref(),
+                Some(&scoped),
+            )
+            .await
+            .expect("a key naming this zone must transfer it");
+            assert_eq!(zone.serial(), Some(Serial::new(1)));
+        }
+
+        /// Case-insensitively, and with or without the trailing dot — a zone name
+        /// is a domain name, and every other comparison in this codebase folds
+        /// ASCII case (RFC 4343). An operator who wrote `EXAMPLE.COM` in a flag
+        /// must not get a silent refusal at 3am.
+        #[tokio::test]
+        async fn the_zone_list_is_matched_as_a_domain_name() {
+            let scoped = key(&["EXAMPLE.com"]);
+            let master = primary_with(scoped.clone()).await;
+
+            let zone = rdns::xfr::fetch_zone(
+                &rdns::xfr::Master::plain(master),
+                nm("example.com.").as_ref(),
+                Some(&scoped),
+            )
+            .await
+            .expect("case and the trailing dot must not decide authorization");
+            assert_eq!(zone.serial(), Some(Serial::new(1)));
+        }
+
+        /// The preserved default, stated as a test so that changing it is a
+        /// deliberate act rather than a side effect. A key with no zone list still
+        /// transfers everything: making it deny instead would mean upgrading the
+        /// binary silently stops every transfer on a working deployment.
+        #[tokio::test]
+        async fn a_key_with_no_zone_list_still_transfers_everything() {
+            let unscoped = key(&[]);
+            let master = primary_with(unscoped.clone()).await;
+
+            let zone = rdns::xfr::fetch_zone(
+                &rdns::xfr::Master::plain(master),
+                nm("example.com.").as_ref(),
+                Some(&unscoped),
+            )
+            .await
+            .expect("an unscoped key is unrestricted, as it always was");
+            assert_eq!(zone.serial(), Some(Serial::new(1)));
+        }
+    }
+
+    // Dynamic UPDATE, end to end (RFC 2136)
+
+    /// The zone every UPDATE test starts from.
+    const UPDATE_ZONE: &str = "$ORIGIN example.com.\n\
+         $TTL 3600\n\
+         @    IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+         @    IN NS  ns1.example.com.\n\
+         ns1  IN A   192.0.2.1\n\
+         www  IN A   192.0.2.10\n";
+
+    /// A server serving `example.com.` out of a real directory it can write.
+    async fn spawn_updatable(dir: &Path, key: TsigKey) -> SocketAddr {
+        spawn_updatable_with(dir, key, None, None).await
+    }
+
+    async fn spawn_updatable_with(
+        dir: &Path,
+        key: TsigKey,
+        journal: Option<Arc<rdns::journal::Journal>>,
+        dnstap: Option<crate::dnstap::Sink>,
+    ) -> SocketAddr {
+        std::fs::write(dir.join("example.com.zone"), UPDATE_ZONE).expect("write the zone file");
+        let source = ZoneSource::Directory(dir.to_string_lossy().to_string());
+        let zones = load_zones(&source, false, false, None)
+            .map(|l| l.zones)
+            .expect("load");
+
+        let server = Arc::new(
+            Server::new(Arc::new(RwLock::new(Zones::new(zones))), test_context())
+                .with_tsig_keys(TsigKeyring::new(vec![key]))
+                .with_history(Arc::new(RwLock::new(DeltaLog::new())), journal)
+                .with_updates(UpdateHandling::new(
+                    source,
+                    None,
+                    Arc::new(DnssecValidator::new(false)),
+                ))
+                .with_dnstap(dnstap),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, peer)) = listener.accept().await {
+                tokio::spawn(tcp::serve_one(
+                    stream,
+                    peer,
+                    server.clone(),
+                    TransportLimits::default(),
+                    tcp::RateLimit::PerMessage,
+                    Arrival::Tcp,
+                    test_shutdown().stop_handle(),
+                ));
+            }
+        });
+        addr
+    }
+
+    fn a_record(name: &str, addr: &str) -> ResourceRecord {
+        ResourceRecord {
+            name: nm(name),
+            class: rdns::Class::new(1),
+            ttl: Ttl::from_secs(3600),
+            rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                addr.parse().expect("an address"),
+            ))
+            .expect("encodes"),
+        }
+    }
+
+    /// Send one message over TCP and read one reply.
+    async fn round_trip(addr: SocketAddr, bytes: Vec<u8>) -> DnsMessage {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(&rdns::framed(&bytes).expect("the test message frames"))
+            .await
+            .expect("write");
+        let mut len = [0u8; 2];
+        stream.read_exact(&mut len).await.expect("length prefix");
+        let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
+        stream.read_exact(&mut buf).await.expect("body");
+        DnsMessage::try_from_bytes(&buf).expect("a reply")
+    }
+
+    /// Watched failing against a handler that installed the new zone without
+    /// writing the file: the map assertion passed, the file assertion did not.
+    #[tokio::test]
+    async fn an_update_is_applied_persisted_and_served() {
+        let dir = ScratchDir::new("update-applied");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let addr = spawn_updatable(dir.path(), key.clone()).await;
+
+        let message = update_message(
+            "example.com.",
+            vec![a_record("new.example.com.", "192.0.2.50")],
+        );
+        let bytes = message.to_bytes_within(4096).expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+        let reply = round_trip(addr, signed).await;
+
+        assert_eq!(reply.rcode, ResponseCode::Ok, "RFC 2136 §3.4.2.5");
+        assert_eq!(reply.opcode, OpCode::Update, "the opcode is echoed");
+
+        // Served: asked over the same socket, so this is the zone map answering
+        // and not an inspection of internals.
+        let asked = round_trip(
+            addr,
+            query("new.example.com.", Qtype::of(record_types::A), false)
+                .to_bytes_within(4096)
+                .expect("serialize"),
+        )
+        .await;
+        assert_eq!(asked.rcode, ResponseCode::Ok);
+        assert_eq!(
+            asked.answers.len(),
+            1,
+            "the new record is being served: {:?}",
+            asked.answers
+        );
+
+        // The file, which is the half that survives a reload.
+        let written = std::fs::read_to_string(dir.join("example.com.zone")).expect("read back");
+        assert!(
+            written.contains("new.example.com."),
+            "the record reached the file:\n{written}"
+        );
+
+        // And it reads back as a zone with the record and a moved serial, rather
+        // than merely containing the right substring.
+        let reloaded = rdns::zone::parse_zone_file(&written, "example.com.").expect("reparses");
+        assert_eq!(
+            reloaded
+                .query(nm("new.example.com.").as_ref(), Qtype::of(record_types::A))
+                .len(),
+            1
+        );
+        assert_eq!(
+            reloaded.serial(),
+            Some(Serial::new(2)),
+            "RFC 2136 §3.6: the serial moved with the contents"
+        );
+    }
+
+    /// Data frames in a Frame Streams capture, START and STOP skipped.
+    ///
+    /// A control frame is escaped by a zero length and carries its own length
+    /// after it; anything else is a payload. Counted rather than decoded: what
+    /// #77b is about is which paths reach the stream, and the payloads
+    /// themselves are `rdns::dnstap`'s own tests.
+    fn data_frames(capture: &[u8]) -> usize {
+        let word = |at: usize| -> Option<usize> {
+            let bytes: [u8; 4] = capture.get(at..at + 4)?.try_into().ok()?;
+            Some(u32::from_be_bytes(bytes) as usize)
+        };
+        let (mut at, mut frames) = (0, 0);
+        while let Some(len) = word(at) {
+            at += 4;
+            match len {
+                0 => match word(at) {
+                    Some(control) => at += 4 + control,
+                    None => break,
+                },
+                len => {
+                    at += len;
+                    frames += 1;
+                }
+            }
+        }
+        frames
+    }
+
+    /// All four answering paths reach the query stream, not just the ordinary
+    /// one.
+    ///
+    /// `TODO.md` #77b, the test #75 landed without. `record_dnstap` used to sit
+    /// behind `finish`, which the transfer and UPDATE branches returned above,
+    /// so a capture held neither — while `--dnstap` says "every answered
+    /// request" and `MessageType::UpdateQuery` was an arm nothing could reach.
+    /// Watched failing against that shape: one data frame, not three — and
+    /// again at three against the TSIG-rejection branch, which #75 left
+    /// returning past the tail and #101 took out.
+    ///
+    /// The transfer is refused, because this server has no ACL. That is the
+    /// case worth capturing anyway — `answer_transfer` logs every attempt for
+    /// the same reason — and it exercises the branch rather than the zone.
+    #[tokio::test]
+    async fn every_answering_path_reaches_the_dnstap_stream() {
+        let dir = ScratchDir::new("dnstap-paths");
+        let capture = dir.join("capture.fstrm");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        // Its own `Shutdown`: the pump flushes when it stops, and
+        // `test_shutdown` is one static that every other test's accept loop is
+        // holding.
+        let shutdown = Shutdown::new();
+        let sink = crate::dnstap::Sink::spawn(
+            &crate::dnstap::Target::File(capture.clone()),
+            0,
+            Vec::new(),
+            Vec::new(),
+            DnsMetrics::new(),
+            shutdown.stop_handle(),
+        )
+        .await
+        .expect("the capture file opens");
+        let addr = spawn_updatable_with(dir.path(), key.clone(), None, Some(sink)).await;
+
+        let asked = round_trip(
+            addr,
+            query("www.example.com.", Qtype::of(record_types::A), false)
+                .to_bytes_within(4096)
+                .expect("serialize"),
+        )
+        .await;
+        assert_eq!(asked.rcode, ResponseCode::Ok, "an ordinary query");
+
+        let update = update_message(
+            "example.com.",
+            vec![a_record("new.example.com.", "192.0.2.50")],
+        );
+        let bytes = update.to_bytes_within(4096).expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::Ok,
+            "RFC 2136 §3.4.2.5"
+        );
+
+        let transfer = round_trip(
+            addr,
+            query("example.com.", Qtype::AXFR, false)
+                .to_bytes_within(4096)
+                .expect("serialize"),
+        )
+        .await;
+        assert_eq!(
+            transfer.rcode,
+            ResponseCode::Refused,
+            "an empty ACL refuses everyone"
+        );
+
+        // The fourth door (`TODO.md` #101). A key the server does not hold is
+        // *answered* — NOTAUTH, signed per RFC 8945 §5.3 — and the branch used
+        // to `return` sixty lines above the tail, so the one capture an
+        // operator wants during a key-guessing probe held nothing.
+        let stranger = TsigKey::new("stranger.key.", TsigAlgorithm::HmacSha256, vec![9u8; 32]);
+        let probe = update_message(
+            "example.com.",
+            vec![a_record("probe.example.com.", "192.0.2.51")],
+        );
+        let bytes = probe.to_bytes_within(4096).expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &stranger, tsig::now()).expect("sign");
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::NotAuthorized,
+            "a key this server does not hold"
+        );
+
+        // Polled rather than slept: the pump writes STOP and flushes as it
+        // stops, so the capture is closed when it ends with one, and a fixed
+        // sleep would make a loaded machine decide the result.
+        shutdown.begin();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let capture = loop {
+            let bytes = std::fs::read(&capture).expect("the capture file");
+            if bytes.ends_with(&rdns::dnstap::stop_frame()) {
+                break bytes;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the capture never closed: {} octets, {} data frames",
+                bytes.len(),
+                data_frames(&bytes)
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            data_frames(&capture),
+            4,
+            "a query, an UPDATE, a transfer attempt and a TSIG refusal"
+        );
+    }
+
+    /// A refused UPDATE is signed at the instant that verified it.
+    ///
+    /// `signed_error` used to read the wall clock itself, 464 lines below the
+    /// `finish` that signs with the `now` the request was checked against
+    /// (`TODO.md` #87). Latent, because `Clock::System` *is* that read — which
+    /// is why it takes a fixed clock to see, and why the fix is a type
+    /// (`Refused`) rather than a thirteenth careful call site.
+    ///
+    /// Fails against the old `session.sign(bytes, current_unix_timestamp())`
+    /// with `TsigError::BadTime`. Checked by reverting that one call.
+    #[tokio::test]
+    async fn a_refused_update_is_signed_at_the_instant_that_verified_it() {
+        // Fixed, and far outside RFC 8945 §5.2.3's 300-second fudge from any
+        // real now, so the wrong clock cannot pass by luck.
+        const WHEN: u64 = 1_700_000_000;
+        // Valid, and scoped to a zone this server does not hold: the TSIG
+        // verifies, so there is a session to sign the refusal with, and §3.3
+        // refuses it.
+        let key = update_key(rdns::tsig::UpdatePolicy::Zones(vec![
+            "elsewhere.test.".to_string()
+        ]));
+        let zone = rdns::zone::parse_zone_file(
+            "$ORIGIN example.com.\n\
+             $TTL 3600\n\
+             @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+             @   IN NS  ns1.example.com.\n\
+             ns1 IN A   192.0.2.1\n",
+            "example.com.",
+        )
+        .expect("the zone parses");
+        let server = server_with_keys_at(zone, vec![key.clone()], Clock::fixed(WHEN));
+
+        let bytes = update_message(
+            "example.com.",
+            vec![a_record("new.example.com.", "192.0.2.50")],
+        )
+        .to_bytes_within(4096)
+        .expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, WHEN).expect("sign");
+        let request_mac = rdns::tsig::request_mac(&signed).expect("our own MAC");
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+        let peer = client.local_addr().expect("addr");
+        let mut scratch = Scratch::default();
+        server
+            .answer(
+                &signed,
+                peer,
+                WHEN,
+                &Wire::Datagram(&socket, peer),
+                &mut scratch,
+            )
+            .await;
+
+        let mut buf = vec![0u8; 4096];
+        let (n, _) = client.recv_from(&mut buf).await.expect("a refusal");
+        let reply = &buf[..n];
+        assert_eq!(
+            DnsMessage::try_from_bytes(reply).expect("it parses").rcode,
+            ResponseCode::Refused,
+            "§3.3: the key grants nothing here"
+        );
+        // The whole point: a client whose clock agrees with the server's must
+        // be able to verify the refusal. RFC 8945 §5.3 — unsigned, or signed
+        // off a different instant, a refusal is indistinguishable from a
+        // tampered reply.
+        rdns::tsig::check_response(reply, &key, &request_mac, true, WHEN)
+            .expect("the refusal verifies at the instant it was signed at");
+    }
+
+    /// The refusal says why, to a client that sent an OPT to hear it in
+    /// (RFC 8914 §2).
+    ///
+    /// PROHIBITED for all four ways permission can be missing, and no finer:
+    /// telling a stranger *which* of them it was is telling it about the
+    /// keyring. The text is what an operator reads, and the RCODE is still
+    /// REFUSED whatever §3 says about EDE â "applications MUST continue to
+    /// follow requirements ... on how to process RCODEs".
+    #[tokio::test]
+    async fn a_refused_update_says_why_when_the_client_used_edns() {
+        let dir = ScratchDir::new("update-ede");
+        let key = update_key(rdns::tsig::UpdatePolicy::Zones(vec![
+            "elsewhere.test.".to_string()
+        ]));
+        let addr = spawn_updatable(dir.path(), key).await;
+        let changes = vec![a_record("new.example.com.", "192.0.2.50")];
+
+        let mut asked = update_message("example.com.", changes.clone());
+        asked.set_edns(rdns::Edns::with_payload_size(4096));
+        let reply = round_trip(addr, asked.to_bytes_within(4096).expect("serialize")).await;
+        assert_eq!(reply.rcode, ResponseCode::Refused);
+        let edns = reply.edns.as_ref().expect("the OPT is mirrored");
+        let errors = rdns::ExtendedError::all_in(edns).expect("a well-formed option list");
+        assert_eq!(
+            errors
+                .iter()
+                .map(|(code, _)| *code)
+                .collect::<Vec<rdns::InfoCode>>(),
+            vec![rdns::InfoCode::PROHIBITED]
+        );
+
+        // The same UPDATE with no OPT: the same refusal, and nowhere to say why.
+        let plain = update_message("example.com.", changes);
+        let reply = round_trip(addr, plain.to_bytes_within(4096).expect("serialize")).await;
+        assert_eq!(reply.rcode, ResponseCode::Refused);
+        assert!(reply.edns.is_none(), "an unsolicited OPT is not mirroring");
+    }
+
+    /// The three refusals, each with the code RFC 2136 gives it.
+    ///
+    /// They are not interchangeable and that is the point: NOTAUTH says "not my
+    /// zone" (§3.1.1) and REFUSED says "not you" (§3.3), and a client uses the
+    /// difference to decide whether to look for a different server or a
+    /// different key.
+    #[tokio::test]
+    async fn an_unauthorized_update_is_refused_and_an_unknown_zone_is_notauth() {
+        let dir = ScratchDir::new("update-refused");
+        // Scoped to a zone this server does not serve, so the key is valid and
+        // grants nothing here.
+        let key = update_key(rdns::tsig::UpdatePolicy::Zones(vec![
+            "elsewhere.test.".to_string()
+        ]));
+        let addr = spawn_updatable(dir.path(), key.clone()).await;
+        let changes = vec![a_record("new.example.com.", "192.0.2.50")];
+
+        // Unsigned: an UPDATE has no address-based path in, by design.
+        let unsigned = update_message("example.com.", changes.clone())
+            .to_bytes_within(4096)
+            .expect("serialize");
+        assert_eq!(
+            round_trip(addr, unsigned).await.rcode,
+            ResponseCode::Refused,
+            "§3.3: an unsigned UPDATE has no credential"
+        );
+
+        // Signed with a key scoped to another zone.
+        let bytes = update_message("example.com.", changes)
+            .to_bytes_within(4096)
+            .expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::Refused,
+            "§3.3: the key may not rewrite this zone"
+        );
+
+        // A zone this server is not authoritative for is NOTAUTH, not REFUSED —
+        // the opposite of the query path's rule (`CLAUDE.md` §8).
+        let elsewhere = update_message(
+            "elsewhere.test.",
+            vec![a_record("new.elsewhere.test.", "192.0.2.50")],
+        )
+        .to_bytes_within(4096)
+        .expect("serialize");
+        let signed = rdns::tsig::sign_request(elsewhere, &key, tsig::now()).expect("sign");
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::NotAuthorized,
+            "§3.1.1: not one of this server's authority zones"
+        );
+
+        // Nothing was written on any of the three paths.
+        let written = std::fs::read_to_string(dir.join("example.com.zone")).expect("read back");
+        assert!(
+            !written.contains("new.example.com."),
+            "a refused UPDATE changes nothing:\n{written}"
+        );
+    }
+
+    /// A server with no writable zone source refuses an UPDATE rather than
+    /// applying it to memory alone.
+    ///
+    /// The distinction this protects is the one in [`UpdateHandling`]'s docs: an
+    /// in-memory-only change is discarded by the next reload or re-signing run,
+    /// silently, after the client was told it succeeded. Refusing is the honest
+    /// answer, and it is the branch that exists because the field is an `Option`.
+    #[tokio::test]
+    async fn an_update_is_refused_without_a_writable_source() {
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let zone = rdns::zone::parse_zone_file(UPDATE_ZONE, "example.com.").expect("parse");
+        let addr = spawn_primary_with_keys(
+            zone,
+            &[],
+            DeltaLog::new(),
+            TsigKeyring::new(vec![key.clone()]),
+        )
+        .await;
+
+        let bytes = update_message(
+            "example.com.",
+            vec![a_record("new.example.com.", "192.0.2.50")],
+        )
+        .to_bytes_within(4096)
+        .expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::Refused,
+            "a key that grants everything still cannot write a zone we cannot persist"
+        );
+    }
+
+    /// An UPDATE leaves a journal, and the journal answers an IXFR from
+    /// before it.
+    ///
+    /// Asserting on the file alone would not show it: what matters is that a
+    /// *fresh* `DeltaLog`, as after a restart, can chain from the serial a
+    /// secondary held beforehand. Anything less is a file that exists rather
+    /// than a history that works.
+    ///
+    /// Watched failing with the journal write removed from `install_zone`:
+    /// the update still applied and was still served, and `Journal::load` came
+    /// back empty, so `chain_from` had nothing to answer with — which is
+    /// precisely the pre-journal behaviour it is meant to replace.
+    #[tokio::test]
+    async fn an_update_leaves_a_journal_that_survives_the_process() {
+        let dir = ScratchDir::new("update-journal");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let journal = Arc::new(rdns::journal::Journal::new(dir.path().to_path_buf()));
+        let addr = spawn_updatable_with(dir.path(), key.clone(), Some(journal.clone()), None).await;
+
+        for (n, addr_text) in [(1u8, "192.0.2.51"), (2, "192.0.2.52")] {
+            let bytes = update_message(
+                "example.com.",
+                vec![a_record(&format!("host{n}.example.com."), addr_text)],
+            )
+            .to_bytes_within(4096)
+            .expect("serialize");
+            let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+            assert_eq!(round_trip(addr, signed).await.rcode, ResponseCode::Ok);
+        }
+
+        // A new process would see exactly this: the file, and nothing in memory.
+        let restored = journal
+            .load(nm("example.com.").as_ref())
+            .expect("the journal reads back");
+        assert_eq!(restored.len(), 2, "one step per update");
+        assert_eq!(restored[0].from_serial, Serial::new(1), "the zone's serial");
+        assert_eq!(restored[1].to_serial, Serial::new(3), "after two bumps");
+
+        let mut log = DeltaLog::new();
+        log.restore(nm("example.com.").as_ref(), restored);
+        let chain = log
+            .chain_from(nm("example.com.").as_ref(), Serial::new(1))
+            .expect("a secondary at the pre-update serial can still be caught up");
+        assert_eq!(chain.len(), 2);
+        assert!(
+            chain
+                .iter()
+                .flat_map(|d| d.added.iter())
+                .any(|r| r.name == nm("host1.example.com.")),
+            "and the records it was missing are in it"
+        );
+    }
+
+    /// A prerequisite that does not hold stops the update, with its own RCODE
+    /// (§3.2) and with the zone untouched — which is what makes an UPDATE a
+    /// transaction rather than a sequence of edits.
+    #[tokio::test]
+    async fn a_failed_prerequisite_leaves_the_zone_alone() {
+        let dir = ScratchDir::new("update-prereq");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let addr = spawn_updatable(dir.path(), key.clone()).await;
+
+        let mut message = update_message(
+            "example.com.",
+            vec![a_record("new.example.com.", "192.0.2.50")],
+        );
+        // §2.4.3 CLASS=NONE: "no RRset of this type exists at this name" — and
+        // `www` has an A, so it does not hold.
+        message.answers = vec![ResourceRecord {
+            name: nm("www.example.com."),
+            class: rdns::Class::new(254),
+            ttl: Ttl::ZERO,
+            rdata: rdns::RecordData::new(record_types::A, Vec::new()).expect("bare"),
+        }];
+        let bytes = message.to_bytes_within(4096).expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::ResourceRecordSetExistsForSomeReason,
+            "§3.2.2 YXRRSET, not a generic failure"
+        );
+        let written = std::fs::read_to_string(dir.join("example.com.zone")).expect("read back");
+        assert!(!written.contains("new.example.com."), "{written}");
+        let reloaded = rdns::zone::parse_zone_file(&written, "example.com.").expect("reparses");
+        assert_eq!(
+            reloaded.serial(),
+            Some(Serial::new(1)),
+            "and the serial did not move either"
+        );
+    }
+
+    /// And the refusal says which policy refused it, because "REFUSED" over a
+    /// working TLS connection is otherwise an afternoon's debugging
+    /// (RFC 8914, `TODO.md` #44b). Read off the wire rather than from the
+    /// constant: the reply's OPT is where it has to be (RFC 8914 §2), and an
+    /// EDE that never reaches it is the same as none.
+    #[tokio::test]
+    async fn the_refusal_says_the_transfer_must_be_encrypted() {
+        let zone = rdns::zone::parse_zone_file(&zone_at_serial(7), "example.com.").expect("zone");
+        let master = spawn_primary_full(
+            zone,
+            &["127.0.0.1".to_string()],
+            DeltaLog::new(),
+            TsigKeyring::new(Vec::new()),
+            true,
+            Arrival::Tcp,
+        )
+        .await;
+
+        // With an OPT, because that is where the reason rides and a request
+        // without one gets a reply without one.
+        let mut request = rdns::xfr::axfr_request(nm("example.com.").as_ref(), 0x77);
+        request.edns = Some(rdns::Edns::with_payload_size(4096));
+        let mut buf = vec![0u8; 512];
+        let n = request.to_bytes(&mut buf).expect("serialize");
+        let mut framed = (n as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&buf[..n]);
+
+        let mut stream = TcpStream::connect(master).await.expect("connect");
+        stream.write_all(&framed).await.expect("send");
+        let mut length = [0u8; 2];
+        stream.read_exact(&mut length).await.expect("length");
+        let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+        stream.read_exact(&mut packet).await.expect("reply");
+        let reply = rdns::DnsMessage::try_from_bytes(&packet).expect("parse the reply");
+
+        assert_eq!(reply.rcode, ResponseCode::Refused);
+        let edns = reply.edns.as_ref().expect("the reply mirrors the OPT");
+        let reasons = rdns::ExtendedError::all_in(edns).expect("readable options");
+        assert!(
+            reasons
+                .iter()
+                .any(|(_, text)| text.contains("over TLS 1.3 only")),
+            "the refusal should say which policy refused it: {reasons:?}"
+        );
+    }
+
+    /// A *response* arriving at the server port is dropped, not answered.
+    ///
+    /// `AdmissionCheck` deliberately accepts QR=1 — it is used on both
+    /// directions of the wire — so nothing between the socket and the zone lookup
+    /// tested it, and `make_response` would happily build a reply to a reply. Two
+    /// servers pointed at each other, or one spoofed datagram with a forged
+    /// source, is then a packet loop that neither end can see is one.
+    #[tokio::test]
+    async fn a_response_sent_to_the_server_port_is_dropped() {
+        let zone = rdns::zone::parse_zone_file(
+            "@ IN SOA ns1.example.com. admin.example.com. 1 3600 600 604800 300\n\
+             @ IN NS ns1.example.com.\n\
+             ns1 IN A 192.0.2.1\n",
+            "example.com.",
+        )
+        .expect("parse the zone");
+        let mut zones = HashMap::new();
+        zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
+        let server = Server::new(Arc::new(RwLock::new(Zones::new(zones))), test_context());
+        let peer: SocketAddr = "192.0.2.9:5353".parse().unwrap();
+
+        let wire = |msg: &DnsMessage| {
+            let mut buf = vec![0u8; 512];
+            let n = msg.to_bytes(&mut buf).expect("serialize");
+            buf.truncate(n);
+            buf
+        };
+
+        // The control: the same question, asked as a question, is answered.
+        let mut question = query("ns1.example.com.", Qtype::of(record_types::A), false);
+        assert!(
+            !answered(&server, &wire(&question), peer).await.is_empty(),
+            "a real query must still be answered — the check has to be narrow"
+        );
+
+        // The same bytes with QR set are a response, and get nothing back.
+        question.response = true;
+        assert!(
+            answered(&server, &wire(&question), peer).await.is_empty(),
+            "a response is not a question, and replying to one is a packet loop"
+        );
     }
 }
