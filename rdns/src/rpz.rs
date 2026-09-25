@@ -1371,17 +1371,22 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
             }
             text
         }
+        // Best of five, each indexing its own copy of the zone: the copy is
+        // made outside the timing, and indexing consumes it.
         fn index(rules: usize) -> std::time::Duration {
             let zone = parse_zone_file(&feed(rules), ORIGIN).expect("parses");
-            let start = std::time::Instant::now();
-            let indexed = PolicyZone::new(zone, PolicyOverride::Given).expect("indexes");
-            let took = start.elapsed();
-            assert_eq!(
-                indexed.trigger_counts()[2],
-                rules,
-                "every rule is a trigger"
-            );
-            took
+            crate::testutil::fastest(5, || {
+                let zone = zone.clone();
+                let start = std::time::Instant::now();
+                let indexed = PolicyZone::new(zone, PolicyOverride::Given).expect("indexes");
+                let took = start.elapsed();
+                assert_eq!(
+                    indexed.trigger_counts()[2],
+                    rules,
+                    "every rule is a trigger"
+                );
+                took
+            })
         }
 
         let small = index(8_000);
@@ -1434,18 +1439,23 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
             let qtype = Qtype::of(rt::A);
             let reps = 200;
 
-            let mut matched = 0usize;
-            let start = std::time::Instant::now();
-            for _ in 0..reps {
-                for addr in &miss {
-                    let addr = std::hint::black_box(*addr);
-                    if indexed.client_action(addr, qname.as_ref(), qtype).is_some() {
-                        matched += 1;
+            // Best of five: lookups change nothing, so the same index is
+            // timed each time.
+            let took = crate::testutil::fastest(5, || {
+                let mut matched = 0usize;
+                let start = std::time::Instant::now();
+                for _ in 0..reps {
+                    for addr in &miss {
+                        let addr = std::hint::black_box(*addr);
+                        if indexed.client_action(addr, qname.as_ref(), qtype).is_some() {
+                            matched += 1;
+                        }
                     }
                 }
-            }
-            let took = start.elapsed();
-            assert_eq!(matched, 0, "203.0.113.0/24 is not in the feed");
+                let took = start.elapsed();
+                assert_eq!(matched, 0, "203.0.113.0/24 is not in the feed");
+                took
+            });
             took / (reps * miss.len()) as u32
         }
 

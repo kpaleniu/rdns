@@ -3053,12 +3053,8 @@ deep.a.b IN TXT \"down here\"
             took
         }
 
-        fn best_of_five(records: usize) -> std::time::Duration {
-            (0..5).map(|_| parse(records)).min().expect("five samples")
-        }
-
-        let small = best_of_five(1_000);
-        let large = best_of_five(2_000);
+        let small = crate::testutil::fastest(5, || parse(1_000));
+        let large = crate::testutil::fastest(5, || parse(2_000));
         assert!(
             large < small * 3,
             "twice the records must not cost four times the work: \

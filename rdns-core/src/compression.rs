@@ -289,24 +289,20 @@ mod tests {
         let per_name = |count: usize| {
             let names: Vec<Name> = (0..count).map(|i| nm(&format!("h{i}.e.com."))).collect();
             let mut buf = vec![0u8; 0x4000];
-            // Best of three: a lost timeslice can only make a run look slower.
-            (0..3)
-                .map(|_| {
-                    let start = std::time::Instant::now();
-                    for _ in 0..20 {
-                        let mut c = NameCompressor::new();
-                        let mut pos = 12;
-                        for name in &names {
-                            pos = c.write_name(name.as_ref(), &mut buf, pos).expect("fits");
-                        }
-                        // Every name here must be a compression target, so none
-                        // may land past the 14-bit pointer range.
-                        assert!(pos < POINTER_MASK as usize);
+            crate::testutil::fastest(3, || {
+                let start = std::time::Instant::now();
+                for _ in 0..20 {
+                    let mut c = NameCompressor::new();
+                    let mut pos = 12;
+                    for name in &names {
+                        pos = c.write_name(name.as_ref(), &mut buf, pos).expect("fits");
                     }
-                    start.elapsed() / (20 * count) as u32
-                })
-                .min()
-                .expect("three runs")
+                    // Every name here must be a compression target, so none
+                    // may land past the 14-bit pointer range.
+                    assert!(pos < POINTER_MASK as usize);
+                }
+                start.elapsed() / (20 * count) as u32
+            })
         };
 
         let few = per_name(25);

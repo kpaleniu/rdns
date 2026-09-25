@@ -432,7 +432,8 @@ mod tests {
 
     /// Fill a map to `bound`, then time `bound` more inserts into one built with
     /// `bound` as its capacity and into one with room to spare. `None` if the
-    /// two cost the same, within a factor of three.
+    /// two cost the same, within a factor of three. Best of five, each sample
+    /// on a map of its own: the timed inserts fill it.
     fn costs_more_at_the_bound<C>(
         what: &str,
         bound: usize,
@@ -446,8 +447,8 @@ mod tests {
             (bound..2 * bound).for_each(|i| insert(&map, i));
             start.elapsed()
         };
-        let with_room = time(bound * 4);
-        let at_the_bound = time(bound);
+        let with_room = crate::testutil::fastest(5, || time(bound * 4));
+        let at_the_bound = crate::testutil::fastest(5, || time(bound));
         let ratio = at_the_bound.as_secs_f64() / with_room.as_secs_f64().max(1e-9);
         (ratio >= 3.0).then(|| format!("{what}: {ratio:.1}x ({with_room:?} -> {at_the_bound:?})"))
     }

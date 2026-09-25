@@ -1989,18 +1989,23 @@ mod tests {
         const SMALL: usize = 1000;
         const LARGE: usize = 4000;
 
+        // Best of five of the verification alone: signing is setup, and
+        // verifying changes nothing it would verify again.
         let per_rrset = |hosts: usize| -> f64 {
             let (map, rrsets) = signed_zone_of(hosts);
             let validator = DnssecValidator::new(true);
-            let start = std::time::Instant::now();
-            verify_zones(
-                &map,
-                &validator,
-                &SigningRun::default(),
-                &ProvenSigning::default(),
-            )
-            .expect("the zone we just signed verifies");
-            start.elapsed().as_secs_f64() / rrsets as f64
+            let took = rdns::testutil::fastest(5, || {
+                let start = std::time::Instant::now();
+                verify_zones(
+                    &map,
+                    &validator,
+                    &SigningRun::default(),
+                    &ProvenSigning::default(),
+                )
+                .expect("the zone we just signed verifies");
+                start.elapsed()
+            });
+            took.as_secs_f64() / rrsets as f64
         };
 
         // Small first, so the large run is not the one paying for a cold
@@ -2362,27 +2367,22 @@ www IN A 192.0.2.2
         map
     }
 
-    /// The same lookup, timed. Best of three: a lost timeslice can only make a
-    /// run look slower, so the minimum is the closest either side gets to the
-    /// truth.
+    /// The same lookup, timed: [`rdns::testutil::fastest`] of three.
     fn time_lookups(zones: &Zones, qname: &str, expect_hit: bool) -> Duration {
         const QUERIES: usize = 20_000;
         let qname = nm(qname);
-        (0..3)
-            .map(|_| {
-                let start = std::time::Instant::now();
-                for _ in 0..QUERIES {
-                    assert_eq!(
-                        zones
-                            .for_query(std::hint::black_box(qname.as_ref()))
-                            .is_some(),
-                        expect_hit
-                    );
-                }
-                start.elapsed()
-            })
-            .min()
-            .expect("three runs")
+        rdns::testutil::fastest(3, || {
+            let start = std::time::Instant::now();
+            for _ in 0..QUERIES {
+                assert_eq!(
+                    zones
+                        .for_query(std::hint::black_box(qname.as_ref()))
+                        .is_some(),
+                    expect_hit
+                );
+            }
+            start.elapsed()
+        })
     }
 
     /// A [`Keepable`] for a server that signs nothing — the common shape in

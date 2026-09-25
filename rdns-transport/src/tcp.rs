@@ -356,6 +356,12 @@ mod tests {
     struct Echo {
         ctx: ServeContext,
         answer: Answer,
+        /// Signalled as `handle` starts, for a test that must stop the server
+        /// only once a message is in flight. A sleep stood in for it and lost
+        /// the race under load (`TODO.md` #120a). `notify_one` keeps a permit
+        /// when nobody waits yet, so the order of the two sides does not
+        /// matter.
+        started: Arc<tokio::sync::Notify>,
     }
 
     impl Echo {
@@ -372,7 +378,16 @@ mod tests {
                     ..context(rate)
                 },
                 answer,
+                started: Arc::new(tokio::sync::Notify::new()),
             })
+        }
+
+        /// Until `handle` has been given a message, or a failure after five
+        /// seconds rather than a hang.
+        async fn in_flight(&self) {
+            tokio::time::timeout(Duration::from_secs(5), self.started.notified())
+                .await
+                .expect("the handler was given the message");
         }
     }
 
@@ -389,6 +404,7 @@ mod tests {
             _arrival: Arrival,
             out: mpsc::Sender<Reply>,
         ) {
+            self.started.notify_one();
             match self.answer {
                 Answer::AfterIdMillis => {
                     let pause = u64::from(id_of(&packet) & 0xff);
@@ -541,16 +557,17 @@ mod tests {
     #[tokio::test]
     async fn a_stop_ends_the_reading_but_not_the_reply_already_in_flight() {
         let shutdown = Shutdown::new();
+        let echo = Echo::new(Answer::AfterIdMillis, 0);
         let (mut client, task) = connected(
-            Echo::new(Answer::AfterIdMillis, 0),
+            echo.clone(),
             TransportLimits::default(),
             shutdown.stop_handle(),
         )
         .await;
 
-        // 200ms of handler, stopped after 20.
+        // 200ms of handler, stopped once it has started.
         send(&mut client, &query(0x00c8)).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        echo.in_flight().await;
         shutdown.begin();
 
         let reply = next_reply(&mut client)
@@ -580,9 +597,10 @@ mod tests {
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
+        let echo = Echo::new(Answer::AfterIdMillis, 0);
         let server = tokio::spawn(serve(
             listener,
-            Echo::new(Answer::AfterIdMillis, 0),
+            echo.clone(),
             TransportLimits::default(),
             RateLimit::PerMessage,
             shutdown.stop_handle(),
@@ -590,10 +608,10 @@ mod tests {
         ));
 
         let mut client = TcpStream::connect(addr).await.expect("connect");
-        // 200ms of handler, stopped after 20 — so the drain has 180ms to get
-        // the answer wrong in.
+        // 200ms of handler, stopped once it has started — so the drain has
+        // most of 200ms to get the answer wrong in.
         send(&mut client, &query(0x00c8)).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        echo.in_flight().await;
         let began = std::time::Instant::now();
         shutdown.begin();
         let waited = tokio::spawn(async move {
@@ -605,7 +623,7 @@ mod tests {
         let reply = next_reply(&mut client).await.expect("the answer");
         assert_eq!(id_of(&reply), 0x00c8);
         // Not a performance floor (`CLAUDE.md` §10): the two outcomes are "did
-        // not wait at all" and "waited out the 180ms the handler had left", so
+        // not wait at all" and "waited out the ~200ms the handler had left", so
         // anything between them cannot happen.
         let waited = waited.await.expect("the drain task");
         assert!(

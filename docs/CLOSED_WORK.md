@@ -10610,3 +10610,118 @@ machine's network (see "Verifying"), and forwarding does not reach this path
 any differently.
 
 ---
+
+### 120. Three more timing flakes, found while verifying #68 — **filed and closed 2026-09-25**
+
+The 200 workspace runs that verified #68 (150 Windows, 50 Linux, whole logs)
+turned up three tests #68's own 200 runs had not failed:
+
+| test | failed | shape |
+|---|---|---|
+| `rdns::rpz::tests::a_query_costs_the_same_however_many_address_rules_the_feed_holds` | 2 / 150 Windows | one-sample ratio: "86ns at 1k against 356ns at 10k" |
+| `rdns::rpz::tests::indexing_address_triggers_does_not_grow_quadratically` | 1 / 150 Windows | one-sample ratio: "32.4ms at 8k against 102.2ms at 16k" |
+| `rdns_transport::tcp::tests::the_drain_waits_for_a_reply_still_being_written` | 1 / 50 Linux | a 20 ms head start, `tcp.rs:605` "the answer" |
+
+#### 120a. The TCP stop tests assume the query is read within 20 ms
+
+`tcp.rs:596` sends a query, sleeps 20 ms and calls `begin()`. If the server has
+not read the query by then, the stop lands between messages, where
+`serve_one` checks it by design (`CLAUDE.md` §9), and the connection closes
+unanswered. Checked: with the sleep at 0 ms the test failed 1 in 10 runs, at
+the same line with the same message. `a_stop_ends_the_reading_but_not_the_reply_already_in_flight`
+(`:553`) has the same 20 ms sleep and the same exposure.
+
+Remedy: make the handler say it has the message before the test stops. `Echo`
+signals a `tokio::sync::Notify` (or a oneshot) on entering `handle`; both tests
+await it in place of the sleep. The drain test's 100 ms floor stays: the
+handler still has ~200 ms left when the stop lands.
+
+#### 120b. Ratio tests that take one sample
+
+`zone.rs:3043` failed the same way in CI (run 35538607349) and was fixed with
+best-of-five, with the reason in its doc: contention only adds time, so the
+minimum is the least-disturbed sample. The two `rpz.rs` tests (`:1361`,
+`:1405`) take one sample each side.
+
+Count, by `grep` for ratio assertions over test timings: twelve. Two take a
+minimum (`compression.rs:315`, `zone.rs:3063`). The other ten — `logging.rs:625`,
+`negative_cache.rs:907`, `nsec_cache.rs:1137`, `resolver/caches.rs:452`,
+`rpz.rs:1390`, `:1458`, `zone_signer.rs:3687`, `rdnsd/src/zones.rs:1937`,
+`:1964`, `:2011` — showed none inside the test function. A minimum taken in a
+helper would not show there, so each needs opening before it is changed.
+
+~~Remedy: best-of-five on both sides, as `zone.rs:3056`, for the two `rpz`
+tests. For the other eight, open each and apply the same where it takes one
+sample; say in the closing row which already had a minimum and which had
+reasons not to (§19).~~ Superseded by the audit below.
+
+**Groomed 2026-09-25: all twelve opened.**
+
+| test | samples | state the timed work changes | in `cargo test` |
+|---|---|---|---|
+| `compression.rs` `writing_a_name_…` | best of 3 | none | yes |
+| `zone.rs` `parsing_does_not_cost_more_…` | best of 5 | none | yes |
+| `rdnsd/src/zones.rs` `choosing_a_zone_…`, `a_long_qname_…` | best of 3, in `time_lookups` — the minimum the grep could not see | none | yes |
+| `zone_signer.rs:3687` `check_split` | one | — | **no**: only the three `#[ignore]`d release benchmarks call it |
+| `rpz.rs` `a_query_costs_the_same_…` | one | none | yes |
+| `rpz.rs` `indexing_address_triggers_…` | one | none; the zone is parsed outside the timing | yes |
+| `nsec_cache.rs` `a_lookup_costs_the_same_…` | one, after a warm-up pass | none | yes |
+| `rdnsd/src/zones.rs` `verifying_a_zone_…` | one | none; signing is setup | yes |
+| `resolver/caches.rs` `costs_more_at_the_bound`, three caches | one | the map, built inside `time` | yes |
+| `negative_cache.rs` `inserting_into_a_full_cache_…` | one | **both caches**: the timed inserts fill them | yes |
+| `logging.rs` `logging_a_query_…` | one | **the window**: every timed query deepens it | yes |
+
+Seven one-sample tests in `cargo test`, and two of them that failed. The
+refuting measurement for the `rpz` lookup test: 30 unloaded runs in a debug
+build read **1.24× to 2.17×**, median 1.33, against its bound of 4. Its two
+failures read 4.14× and 4.08×, and the indexing test's one 3.15× against 3, so
+the bounds are right and the samples are not. Each of
+the seven takes 0.02–0.80 s today; five samples of the timed part adds about
+2 s of suite time in total, spread across parallel test threads.
+
+**Remedy:**
+
+1. The four with no state to rebuild — both `rpz` tests, `nsec_cache.rs`,
+   `verifying_a_zone_…` — take the best of five on each side, as
+   `zone.rs:3056` does, with its doc's reason: contention only adds time.
+2. `costs_more_at_the_bound`: best of five calls to `time(capacity)`, which
+   already builds a fresh map each call.
+3. `negative_cache.rs` and `logging.rs`: the same, but each sample builds its
+   own fresh state — two new caches, a new `QueryLogger` — because timing the
+   same object twice measures a different fill level or window depth the
+   second time.
+4. `check_split` unchanged: not a suite test, and its lower bound was set by
+   #111d's measurement of which side pays the cold allocator.
+5. The red is already recorded: #68's verification runs, 3 failures in 150
+   on Windows. The green is the same measurement repeated — 150 whole-workspace
+   runs on Windows and 50 on Linux with none of the seven failing. No revert
+   of the defects the docs name is needed to show the minimum has not blunted
+   them: a quadratic reads as its multiplier in every sample, so it reads so
+   in the smallest.
+
+**Done 2026-09-25**, both halves as remedied.
+
+- 120a: `Echo` signals a `tokio::sync::Notify` as `handle` starts, and both
+  tests wait on it (`Echo::in_flight`, five-second bound) instead of sleeping
+  20 ms. `notify_one` keeps a permit when nobody is waiting yet, so the order
+  of the two sides does not matter. 60 runs of both tests: 0 failures.
+- 120b: `rdns::testutil::fastest(samples, run)`, one copy of the minimum and
+  its reason, used by the seven one-sample tests at five samples and by the
+  three that already took a minimum (`zone.rs`, `compression.rs`,
+  `time_lookups`) at their existing counts. `logging.rs` and
+  `negative_cache.rs` rebuild their state per sample; so does the resolver
+  caches' helper, which already built a map per call.
+- Cost: the `rdnsd` verify test went from 0.80 s to 2.67 s, five
+  verifications of a 4 000-record zone. The `rdnsd` suite still finishes in
+  4.2 s, inside the 4.2-5.1 s of the runs before, so it is not the long pole.
+  The others moved by fractions of a second.
+
+Verified: 150 whole-workspace runs on Windows and 50 on Linux, concurrent,
+whole logs. None of the seven, and neither TCP test, failed, against 4
+failures in the same measurement before. Two failures of other tests: `zone.rs`'s
+ratio test, which already took five samples — filed as **#122** — and a key-tag
+collision in the signer, which is not a flake but a defect — **#121**. 1 333
+passed on Windows and 1 354 on Linux in a clean run, 0 failed; clippy clean on
+both; `cargo doc` and `cargo fmt --check` clean.
+
+---

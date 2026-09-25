@@ -599,26 +599,25 @@ mod tests {
     fn logging_a_query_costs_the_same_however_many_came_before() {
         use std::time::Instant;
 
-        let logger = QueryLogger::new();
         let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
         let batch = 5_000;
         let depth = 50_000;
-
-        let start = Instant::now();
-        for _ in 0..batch {
-            logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
-        }
-        let shallow = start.elapsed();
-
-        for _ in 0..depth {
-            logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
-        }
-
-        let start = Instant::now();
-        for _ in 0..batch {
-            logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
-        }
-        let deep = start.elapsed();
+        let log = |logger: &QueryLogger, n: usize| {
+            for _ in 0..n {
+                logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
+            }
+        };
+        // A batch timed after `before` queries. Best of five, each on a logger
+        // of its own: every timed query deepens the window being measured.
+        let batch_after = |before: usize| {
+            let logger = QueryLogger::new();
+            log(&logger, before);
+            let start = Instant::now();
+            log(&logger, batch);
+            start.elapsed()
+        };
+        let shallow = crate::testutil::fastest(5, || batch_after(0));
+        let deep = crate::testutil::fastest(5, || batch_after(depth));
 
         let ratio = deep.as_secs_f64() / shallow.as_secs_f64().max(1e-9);
         assert!(

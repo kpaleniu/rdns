@@ -951,19 +951,18 @@ mod tests {
                 );
             }
         };
-        let full = NegativeCache::new(BOUND);
-        let roomy = NegativeCache::new(BOUND * 4);
-        fill(&full, 0..BOUND);
-        fill(&roomy, 0..BOUND);
-        assert_eq!(full.len(), BOUND, "the bound is reached, not passed");
-
-        let time = |cache: &NegativeCache, from: usize| {
+        // Best of five, each sample on caches of its own: the timed inserts
+        // fill them, so timing one twice times a different cache.
+        let time = |capacity: usize| {
+            let cache = NegativeCache::new(capacity);
+            fill(&cache, 0..BOUND);
+            assert_eq!(cache.len(), BOUND, "the bound is reached, not passed");
             let start = Instant::now();
-            fill(cache, from..from + BOUND);
+            fill(&cache, BOUND..2 * BOUND);
             start.elapsed()
         };
-        let with_room = time(&roomy, BOUND);
-        let at_the_bound = time(&full, BOUND);
+        let with_room = crate::testutil::fastest(5, || time(BOUND * 4));
+        let at_the_bound = crate::testutil::fastest(5, || time(BOUND));
 
         let ratio = at_the_bound.as_secs_f64() / with_room.as_secs_f64().max(1e-9);
         assert!(

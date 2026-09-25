@@ -64,6 +64,28 @@ impl Drop for ScratchDir {
     }
 }
 
+/// The smallest of `samples` timings of `run`, for a ratio test
+/// (`CLAUDE.md` §10).
+///
+/// Contention only ever adds time, so the minimum is the sample the machine was
+/// least busy for. One sample a side is how three ratio tests failed under a
+/// loaded suite while their bounds held with room at rest — 4.14× against a
+/// bound of 4, where 30 quiet runs read 1.24× to 2.17× (`TODO.md` #120b). A
+/// real regression reads as its multiplier in every sample, so the smallest
+/// cannot hide it.
+///
+/// `run` rebuilds whatever its timed work changes: timing one object twice
+/// measures a fuller cache, or a deeper window, the second time.
+pub fn fastest(
+    samples: usize,
+    mut run: impl FnMut() -> std::time::Duration,
+) -> std::time::Duration {
+    (0..samples.max(1))
+        .map(|_| run())
+        .min()
+        .expect("at least one sample")
+}
+
 /// Every `.rs` file under `dir`, `target/` and `.git/` skipped.
 ///
 /// Two test binaries read the workspace's own source as data —

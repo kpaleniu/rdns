@@ -37,10 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#120**, plus **#21**, as of 2026-09-25.
-#58, #68 and #107-#119 are closed. #117-#119 came out of a fourth architecture
+**#121**, **#122**, plus **#21**, as of 2026-09-25.
+#58, #68 and #107-#120 are closed. #117-#119 came out of a fourth architecture
 review that day and were groomed against the code before filing; #120 came out
-of verifying #68.
+of verifying #68, and #121 and #122 out of verifying #120.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -6688,93 +6688,66 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 120. Three more timing flakes, found while verifying #68 — **filed 2026-09-25**, **ready-for-agent**
+### 121. Incremental signing identifies a key by its tag, and tags collide — **filed 2026-09-25**, **ready-for-agent**
 
-The 200 workspace runs that verified #68 (150 Windows, 50 Linux, whole logs)
-turned up three tests #68's own 200 runs had not failed:
+Found while verifying #120: `zone_signer::tests::a_signature_is_not_carried_forward_when_anything_it_covers_changed`
+failed once in 50 Linux workspace runs, "both zone-signing keys now sign it",
+1 against 2. It adds a freshly generated ZSK to the key set and expects every
+RRset signed by both ZSKs.
 
-| test | failed | shape |
-|---|---|---|
-| `rdns::rpz::tests::a_query_costs_the_same_however_many_address_rules_the_feed_holds` | 2 / 150 Windows | one-sample ratio: "86ns at 1k against 356ns at 10k" |
-| `rdns::rpz::tests::indexing_address_triggers_does_not_grow_quadratically` | 1 / 150 Windows | one-sample ratio: "32.4ms at 8k against 102.2ms at 16k" |
-| `rdns_transport::tcp::tests::the_drain_waits_for_a_reply_still_being_written` | 1 / 50 Linux | a 20 ms head start, `tcp.rs:605` "the answer" |
+`PreviousSignatures::reuse` (`zone_signer.rs:580-588`) decides "the signing
+keys are unchanged" by comparing key tags *as a de-duplicated set*: the tags of
+the carried signatures against the tags of the keys now signing. RFC 4034
+Appendix B: a key tag "is not a unique identifier". When the new key's tag
+equals an existing key's, the two sets are equal and the old signature is
+carried forward alone.
 
-#### 120a. The TCP stop tests assume the query is read within 20 ms
+Provoked: generating P-256 ZSKs until one's tag matched the fixture ZSK's took
+19 724 tries; incrementally signing with it added produced **1** RRSIG over
+`www A`, where `sign_zone` with the same keys produced **2**. The zone then
+publishes a DNSKEY that has signed none of the zone's data — the half of a
+rollover the carry-forward rule exists to refuse (its condition 3). About one
+new key in 65 536 per existing key of the same role.
 
-`tcp.rs:596` sends a query, sleeps 20 ms and calls `begin()`. If the server has
-not read the query by then, the stop lands between messages, where
-`serve_one` checks it by design (`CLAUDE.md` §9), and the connection closes
-unanswered. Checked: with the sleep at 0 ms the test failed 1 in 10 runs, at
-the same line with the same message. `a_stop_ends_the_reading_but_not_the_reply_already_in_flight`
-(`:553`) has the same 20 ms sleep and the same exposure.
+Instances, by `grep` for tag comparisons in `rdns/src`: this is the one in
+production code that treats a tag as a key's identity. `dnssec.rs:846-851`
+matches by tag too and is right: it tries every key with that tag, as RFC 4035
+§5.3.1 expects. The rest are tests.
 
-Remedy: make the handler say it has the message before the test stops. `Echo`
-signals a `tokio::sync::Notify` (or a oneshot) on entering `handle`; both tests
-await it in place of the sleep. The drain test's 100 ms floor stays: the
-handler still has ~200 ms left when the stop lands.
+By reading and not provoked: a key *replaced* by one with the same tag — old
+ZSK removed, new added, in one run — passes the same check, and carries a
+signature whose key is no longer published.
 
-#### 120b. Ratio tests that take one sample
+Remedy: condition 3 compares the keys, not the tags — the previous zone's
+apex DNSKEY RDATA against the DNSKEY RDATA of `keys` (the signature itself
+names only a tag, so nothing on the RRSIG side can tell colliding keys apart).
+A test for each case, using a colliding key found once and stored as a fixture
+rather than searched for per run (19 724 generations is a second of release
+build and much more in debug). Not in scope and worth a number of its own if
+wanted: refusing to *generate* a key whose tag collides with the zone's, which
+is what BIND's `dnssec-keygen` does.
 
-`zone.rs:3043` failed the same way in CI (run 35538607349) and was fixed with
-best-of-five, with the reason in its doc: contention only adds time, so the
-minimum is the least-disturbed sample. The two `rpz.rs` tests (`:1361`,
-`:1405`) take one sample each side.
+---
 
-Count, by `grep` for ratio assertions over test timings: twelve. Two take a
-minimum (`compression.rs:315`, `zone.rs:3063`). The other ten — `logging.rs:625`,
-`negative_cache.rs:907`, `nsec_cache.rs:1137`, `resolver/caches.rs:452`,
-`rpz.rs:1390`, `:1458`, `zone_signer.rs:3687`, `rdnsd/src/zones.rs:1937`,
-`:1964`, `:2011` — showed none inside the test function. A minimum taken in a
-helper would not show there, so each needs opening before it is changed.
+### 122. A ratio test that takes the best of five on each side, one side after the other — **filed 2026-09-25**
 
-~~Remedy: best-of-five on both sides, as `zone.rs:3056`, for the two `rpz`
-tests. For the other eight, open each and apply the same where it takes one
-sample; say in the closing row which already had a minimum and which had
-reasons not to (§19).~~ Superseded by the audit below.
+Found while verifying #120. `zone.rs`'s
+`parsing_does_not_cost_more_per_record_when_every_record_moves_the_origin`
+already took the best of five when #120 opened it, and failed once in 150
+Windows runs under load: "8.8465ms at 1k against 27.6729ms at 2k", 3.13×
+against a bound of 3. At rest, 30 debug runs read **1.92× to 1.96×**, median
+1.95.
 
-**Groomed 2026-09-25: all twelve opened.**
+So the minimum is not the whole answer. The five small samples are taken, then
+the five large ones: about 150 ms of one side, then the other, so contention
+lasting that long lands on one side only. `rdns::testutil::fastest` has the
+same shape wherever a test calls it twice, which after #120 is every ratio test
+in the suite (ten, less `check_split`).
 
-| test | samples | state the timed work changes | in `cargo test` |
-|---|---|---|---|
-| `compression.rs` `writing_a_name_…` | best of 3 | none | yes |
-| `zone.rs` `parsing_does_not_cost_more_…` | best of 5 | none | yes |
-| `rdnsd/src/zones.rs` `choosing_a_zone_…`, `a_long_qname_…` | best of 3, in `time_lookups` — the minimum the grep could not see | none | yes |
-| `zone_signer.rs:3687` `check_split` | one | — | **no**: only the three `#[ignore]`d release benchmarks call it |
-| `rpz.rs` `a_query_costs_the_same_…` | one | none | yes |
-| `rpz.rs` `indexing_address_triggers_…` | one | none; the zone is parsed outside the timing | yes |
-| `nsec_cache.rs` `a_lookup_costs_the_same_…` | one, after a warm-up pass | none | yes |
-| `rdnsd/src/zones.rs` `verifying_a_zone_…` | one | none; signing is setup | yes |
-| `resolver/caches.rs` `costs_more_at_the_bound`, three caches | one | the map, built inside `time` | yes |
-| `negative_cache.rs` `inserting_into_a_full_cache_…` | one | **both caches**: the timed inserts fill them | yes |
-| `logging.rs` `logging_a_query_…` | one | **the window**: every timed query deepens it | yes |
-
-Seven one-sample tests in `cargo test`, and two of them that failed. The
-refuting measurement for the `rpz` lookup test: 30 unloaded runs in a debug
-build read **1.24× to 2.17×**, median 1.33, against its bound of 4. Its two
-failures read 4.14× and 4.08×, and the indexing test's one 3.15× against 3, so
-the bounds are right and the samples are not. Each of
-the seven takes 0.02–0.80 s today; five samples of the timed part adds about
-2 s of suite time in total, spread across parallel test threads.
-
-**Remedy:**
-
-1. The four with no state to rebuild — both `rpz` tests, `nsec_cache.rs`,
-   `verifying_a_zone_…` — take the best of five on each side, as
-   `zone.rs:3056` does, with its doc's reason: contention only adds time.
-2. `costs_more_at_the_bound`: best of five calls to `time(capacity)`, which
-   already builds a fresh map each call.
-3. `negative_cache.rs` and `logging.rs`: the same, but each sample builds its
-   own fresh state — two new caches, a new `QueryLogger` — because timing the
-   same object twice measures a different fill level or window depth the
-   second time.
-4. `check_split` unchanged: not a suite test, and its lower bound was set by
-   #111d's measurement of which side pays the cold allocator.
-5. The red is already recorded: #68's verification runs, 3 failures in 150
-   on Windows. The green is the same measurement repeated — 150 whole-workspace
-   runs on Windows and 50 on Linux with none of the seven failing. No revert
-   of the defects the docs name is needed to show the minimum has not blunted
-   them: a quadratic reads as its multiplier in every sample, so it reads so
-   in the smallest.
+Not taken: interleaving the samples — small, large, small, large — so both
+sides see the same stretch of the machine. Unmeasured; the check is the 150
+Windows / 50 Linux run #68 and #120 used, with this test's failures before and
+after.
 
 ---
 
@@ -6975,6 +6948,7 @@ the week; the record is under "How the queue kept going stale" in
 | **119** | two UPDATE refusals no test reached, and an unreadable zone directory answered REFUSED | **filed and closed 2026-09-25**. SERVFAIL now, as a failed read of the zone file already was: RFC 2136 §4.6 sends the client to the next server on SERVFAIL and ends the update on REFUSED. `file_for` propagates `read_dir` and entry errors as the loader does. Four tests; the task-failure SERVFAIL stays untested, reachable only by a panic. See `docs/CLOSED_WORK.md` |
 | **68** | a socket test failed once under a parallel suite | **filed 2026-09-15, closed 2026-09-25.** The test it named never failed again; two others in `rdnsd` did, 8 in 200 workspace runs. 68a was a defect: dnstap's pump dropped its queue on stop, frames already counted as sent, so a capture lost its last requests (50 of 50 provoked runs). Now drained before STOP. 68b was the test's: an unanswered NOTIFY is resent after 2 s. 0 in 200 runs after. The same 200 runs filed **#120**. See `docs/CLOSED_WORK.md` |
 | **58** | serve-stale answered a dead upstream and not a slow one | **filed 2026-09-13, closed 2026-09-25.** RFC 8767 §5's 1.8 s client response timer declined on a survey of BIND, Unbound, Knot and PowerDNS — BIND removed it after two CVEs — and BIND's zero form taken as `--serve-stale-first`, refreshing through #114's prefetch pool. A deviation from §4, filed as **D-8** in #21. The timers were §5 and nine places said §4. Two things the grooming did not see: a stale refresh has to be a *period* (§5's 30 s failure recheck), or one failure leaves a name stale and untried for the whole window; and the pool's presence had been the prefetch switch. See `docs/CLOSED_WORK.md` |
+| **120** | three timing flakes found verifying #68 | **filed and closed 2026-09-25.** 120a: the TCP stop tests slept 20 ms and hoped the server had read the query; the handler now says so. 120b: all twelve ratio tests opened — four already took a minimum, one is not a suite test, seven took one sample and now take the best of five through `rdns::testutil::fastest`. After: 0 failures of any of them in 150 Windows and 50 Linux runs, against 4 before. The same runs filed **#121**, a real signing defect, and **#122**. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
