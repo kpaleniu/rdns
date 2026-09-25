@@ -6829,7 +6829,7 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 118. `answer_update`'s doc states an RFC check order the code does not follow — **filed 2026-09-25**, **ready-for-human**
+### 118. `answer_update`'s doc states an RFC check order the code does not follow — **filed 2026-09-25**, **ready-for-agent**
 
 - `rdnsd/src/dispatch.rs:1173-1176`: "The check order is the RFC's, each one
   keeping the next from running: §3.1 reads the message, §3.1.1 asks whether
@@ -6850,8 +6850,9 @@ On the wire: an unsigned UPDATE, or one signed by a key scoped elsewhere, for
 a zone this server does not serve is REFUSED, not NOTAUTH. The NOTAUTH test
 (`an_unauthorized_update_is_refused_and_an_unknown_zone_is_notauth`, `:3836`)
 signs with a key scoped to the zone it asks about, so it cannot see this. Its
-own doc (`:3829-3834`) states the reason the code's order defeats: "a client uses the difference to decide whether to look for a
-different server or a different key".
+own doc (`:3829-3834`) states the reason the code's order defeats: "a client
+uses the difference to decide whether to look for a different server or a
+different key".
 
 Refuting check. The reason to check permission before §3.1.1 would be not
 telling a stranger which zones are served; the query path already tells it
@@ -6860,9 +6861,50 @@ Permission before §3.2 has a reason that may — prerequisites answer
 NXDOMAIN/YXDOMAIN about the zone's contents to whoever may send them — and it
 is recorded nowhere either.
 
-Not taken: what BIND, Knot and PowerDNS do (`CLAUDE.md` §4). That survey
-decides the order. The doc and the conformance table are wrong under any
-answer.
+**Survey, 2026-09-25** (sources read at their `main`/`master` that day):
+
+| | order | permission denied |
+|---|---|---|
+| BIND, `lib/ns/update.c` | zone section FORMERR → `ns_update_start` NOTAUTH → `send_update` query ACL, update ACL / `update-policy` → `update_action` prerequisites | REFUSED |
+| Knot, `update_process_query` | FORMERR → `NS_NEED_ZONE` NOTAUTH → `NS_NEED_AUTH` → queued; prerequisites in the update event | NOTAUTH (`process_query_acl_check`) |
+| PowerDNS, `PacketHandler::processUpdate` | `isUpdateAllowed` (address, then TSIG) → FORMERR → NOTAUTH → prerequisites | REFUSED |
+
+- All three check permission before §3.2. BIND says why, at the ACL check:
+  "Update message processing can leak record existence information so check
+  that we are allowed to query this zone". That is the unrecorded reason
+  above, and it holds here.
+- Zone before permission: BIND and Knot. PowerDNS's first gate is an address
+  list read before the message is parsed. `rdnsd` has no address gate for
+  UPDATE and no query ACL (`grep -i allow.query` finds only `xfr.rs`
+  comments), so zone membership is public and nothing is hidden by checking
+  permission first.
+- Knot's NOTAUTH for a denied ACL is not RFC 2136 §3.3.1's REFUSED; not
+  followed.
+
+Decided: BIND's order. It is the only one under which the NOTAUTH test's stated
+reason holds.
+
+**Remedy:**
+
+1. `answer_update`: move the §3.1.1 `snapshot` and its NOTAUTH exit above the
+   unsigned and key-scope exits. The unsigned NOTAUTH goes out with
+   `session: None`, as the unsigned REFUSED does now. Order becomes parse
+   (FORMERR / NOTZONE) → NOTAUTH → unsigned → key scope → replicated →
+   writable → §3.2 → §3.4. Cost to an unauthorized request: one read guard and
+   an `Arc` clone.
+2. Rewrite the doc at `:1173-1176` to state that order and its two reasons:
+   NOTAUTH before REFUSED so the rcode says server-or-key; permission before
+   §3.2, per §3.3.2 and BIND's leak argument.
+3. `docs/spec/03-authoritative-server.md` "The order of the checks": reorder
+   the table to match.
+4. `07-rfc-conformance.md` 2136 row: list two deviations. Permission is checked
+   before §3.2, where the RFC lists it after, as BIND, Knot and PowerDNS all
+   do. A replicated zone is REFUSED (`REPLICATED_ZONE`), where §3.1.1 says a
+   slave forwards toward the primary. BIND (`send_forward`) and PowerDNS
+   (`forwardPacket`) forward; Knot's forwarding was not checked.
+5. Tests: an unsigned UPDATE and one signed by a key scoped to another zone,
+   each for a zone not served, both NOTAUTH. Show both failing against the
+   current order first (§1).
 
 ---
 
