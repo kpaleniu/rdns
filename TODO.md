@@ -3942,7 +3942,7 @@ A split that makes the graph prettier and no binary smaller has bought nothing.
 
 ---
 
-### 68. A socket test that binds a real port fails under a parallel suite — **filed 2026-09-15**
+### 68. A socket test that binds a real port fails under a parallel suite — **filed 2026-09-15**, **ready-for-agent**
 
 `rdns_transport::metrics_server::tests::a_server_with_nothing_to_wait_for_is_ready_at_once`
 failed once during a `cargo test --workspace` run and passed on the two runs
@@ -4000,6 +4000,81 @@ neither the flake: **#69**, every accept loop in the crate treats any accept
 error as fatal while the UDP side has `recv_error_is_transient` and a written
 reason; and **#70**, the module header claimed two hyper behaviours that hyper
 does not have.
+
+**Groomed 2026-09-25: reproduced, and not where the row looked.** 150 whole
+`cargo test --workspace` runs on Windows and 50 on Linux, run concurrently for
+the first 65 Windows runs, every log kept whole (the 2026-09-20 lesson).
+CI has no sighting since the row was filed: its one test failure since, run
+35538607349, is the ratio test `zone.rs:3043` already cites and fixed.
+
+| test | Windows | Linux |
+|---|---|---|
+| `dispatch::tests::every_answering_path_reaches_the_dnstap_stream` | 7 / 150 | 1 / 50 |
+| `replication::tests::test_an_unchanged_refresh_announces_nothing` | 1 / 150 | 0 / 50 |
+| `metrics_server::tests::a_server_with_nothing_to_wait_for_is_ready_at_once` | 0 / 150 | 0 / 50 |
+
+Both failures are in `rdnsd`, which is the crate of the second sighting. Both
+tests existed on 2026-09-20 (`1a0422c`, `e5df9bc`), so that sighting was
+probably one of them; which one cannot now be known.
+
+#### 68a. dnstap drops what is queued when it stops — a defect, not only a flake
+
+The assertion reads 3 frames where 4 are expected
+(`dispatch.rs:3744`). Two causes, one of them in the product:
+
+- **The pump discards its queue on stop.** `pump` (`dnstap.rs:196-200`)
+  `select!`s `queue.recv()` against `stop.wait()` and `break`s on the stop,
+  with frames still queued. Provoked: 100 frames `send`, then `begin()`, 50
+  times — **50 of 50 runs lost frames**, writing 0 or 1 of the 100. Those frames
+  were counted in `dnstap_frames` by `Sink::send` (`:101-107`) and are in
+  neither counter, so the metric claims payloads the capture does not hold
+  (`CLAUDE.md` §14). In service: whatever is queued when a stop begins, and
+  everything answered during the drain, is missing from the capture.
+- **The test races the record.** `answer` sends the reply, then calls
+  `record_dnstap` (`dispatch.rs:504-529`), by design: it records what went
+  out. The client can have its reply and call `shutdown.begin()` before the
+  fourth `record`. Draining the queue does not close this, because a frame
+  queued after the pump exits is still dropped.
+
+Remedy:
+
+1. `pump`: on stop, take what `try_recv` still returns, subject to the same
+   `max_bytes` cap, then write STOP. Test: queue N frames, `begin()` with no
+   sleep, all N in the file. Show it failing first (§1).
+2. `every_answering_path_reaches_the_dnstap_stream`: poll the capture for four
+   data frames before `begin()`, under the same 10 s deadline, then poll for
+   STOP as now.
+3. The three 50 ms sleeps in `dnstap.rs`'s tests work around the same stop.
+   `:403` and `:463` come before `begin()`, so the pump takes the frames first.
+   With (1) they go, and `:401-402`'s comment ("the drain is the queue
+   emptying") becomes true. `:466` waits for the pump to finish, so it becomes
+   a poll for STOP, as in the `dispatch.rs` test.
+
+Seen and not provoked, so no remedy: nothing waits for the pump. It holds no
+`Busy`, and the two `tokio::spawn(pump(..))` at `:155` and `:164` discard the
+handle, so `drain_reporting` can return and the runtime end with STOP
+unwritten or the file unflushed. Measure it (a process test that stops
+`rdnsd --dnstap file:..` and reads the capture's tail) before fixing it.
+
+#### 68b. `test_an_unchanged_refresh_announces_nothing` receives a retransmission
+
+`replication.rs:1227`, "an unchanged zone is not news". The downstream socket
+never answers the first NOTIFY, and `send_notify` retransmits an unanswered
+one after `NOTIFY_RETRY_SECS` = 2 s (`notify_out.rs:177`, RFC 1996 §3.6). The
+test's window is the second refresh plus 500 ms; under load that passes the
+2 s mark and the retransmission arrives. The server is right; the test cannot
+tell a retransmission from a new NOTIFY.
+
+Remedy: answer the first NOTIFY from the downstream socket (NOERROR, same ID,
+QR set), which ends the retries (`notify_out.rs:158`), then assert silence as
+now. Not by comparing IDs: each attempt takes a fresh `rand_id`.
+
+#### What stays open
+
+The first sighting, `metrics_server`, has not recurred in 1 100 module runs and
+200 workspace runs, and its failure now names the socket call. Close #68 when
+68a and 68b land. A recurrence gets a new number with the evidence it now
+prints.
 
 ---
 
