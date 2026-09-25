@@ -1946,9 +1946,11 @@ refresh that only asks for what moved.
   it is now on purpose and has a number.
 ---
 
-### 58. serve-stale answers a dead upstream and not a slow one — **filed 2026-09-13**
+### 58. serve-stale answers a dead upstream and not a slow one — **filed 2026-09-13**, **ready-for-agent**
 
-Left behind by 45b. RFC 8767 §4 has two timers and this tree implements one.
+Left behind by 45b. RFC 8767 ~~§4~~ §5 has two timers and this tree implements
+one. (§4 is the amended TTL definition; the timers are §5's "Example Method",
+and nine live places cite them as §4 — see the remedy.)
 
 The **query resolution timer** is the one in place: resolve, and if that fails,
 answer from the stale window. It covers an upstream that is down, refusing, or
@@ -1968,9 +1970,12 @@ resolution has to outlive the request that started it — a task, holding an
 means `handle_query` takes `&Arc<Resolving>`, and the two socket loops have to
 agree about who owns the guard.
 
-**45d moved one of those pieces on 2026-09-13.** `handle_query` returns
+~~**45d moved one of those pieces on 2026-09-13.** `handle_query` returns
 `Answered` now — the reply, plus work the socket loop runs *after* sending it —
-and a prefetch goes down that path. What it does not solve is this one: a
+and a prefetch goes down that path.~~ **Gone since #114** (`77399ba`):
+`handle_query` returns `Option<Vec<u8>>` again, and a prefetch is offered to a
+bounded queue that `prefetch::run`'s pool drains, holding `Arc<Resolving>`.
+What it does not solve is this one: a
 prefetch starts after the answer, and the client response timer has to answer
 while a resolution is already running. The return value is the same shape; the
 lifetime is not.
@@ -2026,6 +2031,75 @@ Three things to settle, and the first is a measurement:
   asking the same slow name should not start two resolutions. That is a
   de-duplicating in-flight table, which this resolver does not have and which
   is worth more than the timer on its own.
+
+**Groomed 2026-09-25: the 1.8 s timer is declined; BIND's zero timer is taken
+instead.** Decided by the owner on the survey below, which replaces 58a's
+deployment number as the thing that settles it (`CLAUDE.md` §4). Sources read
+that day at their `main`/`master`.
+
+| | client response timer | what runs behind a stale answer |
+|---|---|---|
+| Unbound, `util/config_file.c` | `serve_expired_client_timeout = 1800`, under `serve-expired: no` | the resolution continues |
+| BIND, `doc/arm/reference.rst` | `stale-answer-client-timeout` off by default; "the only supported value … is `0`. Non-zero values generate a warning message and are treated as `0`" | a refresh, at `0` |
+| Knot Resolver, `modules/serve_stale` | 3 s deadline, then stale | nothing: "TODO: probably start the same request that doesn't stale-serve" |
+| PowerDNS Recursor, `docs/performance.rst` | none; stale only for a record that "cannot be refreshed" | "an asynchronous task to resolve the name" per 30 s extension |
+
+- BIND had the non-zero timer and removed it in 9.19.22/9.20 (ISC KB, "Changes
+  to … stale-answer-client-timeout"): "The complexity of the internal
+  processing paths … is significant", with RPZ and client rate limiting named
+  as the interactions, and "in configurations where `stale-answer-enable` has
+  been enabled, `stale-answer-client-timeout` is either given a value of zero
+  or it is disabled entirely". CVE-2022-3736 and CVE-2022-3924 are both crashes
+  that need it "set to a positive integer" / "greater than zero".
+- 58b is answered by #114: the prefetch pool is a bounded set of detached
+  resolutions holding `Arc<Resolving>`, and a zero timer's refresh is exactly a
+  prefetch of an expired name.
+- 58c stays a question, and not this row's: the cache's `refreshing` mark is
+  per entry, which de-duplicates refreshes; a table of in-flight *client*
+  resolutions is the other half and nothing here needs it.
+
+**RFC 8767 conformance, checked.** §4's normative text lets a record be used
+past its TTL "if the data is unable to be authoritatively refreshed when the TTL
+expires". A zero timer answers before any refresh has been tried, so it is a
+deviation, as BIND's `0` is. Opt-in and off by default; it goes in #21 and
+`07-rfc-conformance.md` as one.
+
+**Remedy:**
+
+1. A switch, `--serve-stale-first` and `resolver.serve-stale-first`: on a live
+   miss with an entry inside the stale window, answer stale at once and queue a
+   refresh. Refused at startup with `--serve-stale 0`, since it means nothing
+   there (`CLAUDE.md` §15).
+2. The pool runs when `--prefetch` *or* the switch is on. `Resolving::prefetch`
+   being `Some` currently *is* the prefetch switch — `caches.answer(..,
+   prefetch.is_some())` at `answer.rs:332` — so the pool's presence and
+   "prefetching" must become two values, or turning on the switch turns on
+   prefetch.
+3. One refresh per stale entry, not one per query: `DnsCache::get_stale`
+   (`cache.rs:283`) sets `refreshing` under its lock and reports it, as `lookup`
+   does at `:256`. `NegativeCache` has no such mark (`negative_cache.rs`) and
+   needs one for a stale NXDOMAIN/NODATA.
+4. The answer: `stale_answer` (`answer.rs:711`) as it is, before the resolution
+   rather than after its failure. Its EDE text, "the authoritative servers
+   could not be reached", is false here; the early path needs its own. Its
+   INFO line per stale answer is fine on failure and a flood at query rate
+   here: count, and log at DEBUG. Check that RPZ applies to the early stale
+   answer as it does to the late one.
+5. Declined, so rewritten: `CLIENT_RESPONSE_TIMER`'s doc (`cache.rs:70-84`,
+   "when #58 lands it is the default of the flag") and the spec line at
+   `06-operations.md:318` ("a second stale timer would serve early").
+   `dns_slow_resolutions_total{outcome="completed"}` stays: it is the number
+   that tells an operator to turn the switch on.
+6. The nine live citations of the timers as §4 become §5: `cache.rs:70` and
+   `:72`, `metrics.rs:38` and `:200`, `answer.rs:2446`, `06-operations.md:318`
+   and `:328`, and `07-rfc-conformance.md:61`'s two ("§4's query resolution
+   timer", "§4's client response timer"; its "§4's 30-second TTL" is right).
+   Found by `grep` for §4 beside "timer", "1.8" or "client response"; the
+   closed #45b row in `docs/CLOSED_WORK.md` keeps its wording.
+7. Tests: an expired entry in the window answers at once with TTL 30 and the
+   new EDE while the upstream black-holes; two queries for it queue one
+   refresh; a successful refresh ends the stale answers; the switch without
+   `--serve-stale` is refused. Show each failing first (§1).
 
 ---
 
