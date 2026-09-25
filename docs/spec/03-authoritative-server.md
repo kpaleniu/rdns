@@ -469,9 +469,9 @@ On both transports. `rdns::update` reads the message and applies the changes;
 |---|---|---|
 | §3.1 | one zone in the Zone section, and it is an SOA | FORMERR |
 | §3.4.1 | prescan: no meta-type added, nothing outside the named zone | FORMERR / NOTZONE |
+| §3.1.1 | the zone is one this server is authoritative for | NOTAUTH |
 | §3.3 | the request is TSIG-signed | REFUSED |
 | §3.3 | the key's own update scope covers this apex | REFUSED |
-| §3.1.1 | the zone is one this server is authoritative for | NOTAUTH |
 | — | the zone is not one this server *replicates* | REFUSED |
 | — | the zone has a file this server can write | REFUSED |
 | §3.2 | every prerequisite holds | NXRRSET / YXRRSET / NXDOMAIN / YXDOMAIN |
@@ -480,6 +480,12 @@ On both transports. `rdns::update` reads the message and applies the changes;
 A zone this server does not hold is NOTAUTH, not REFUSED — the opposite of the
 query path's rule (§3.2.5); RFC 2136 §3.1.1 gives it its own code. An unsigned
 UPDATE is refused outright, with no address-based alternative.
+
+The zone is checked before permission, so an unsigned UPDATE for a zone not
+served here is NOTAUTH too: the rcode tells a client whether to change server
+or key. Permission is checked before §3.2, where RFC 2136 lists it after,
+because prerequisites answer NXDOMAIN/YXDOMAIN about the zone's contents. BIND,
+Knot and PowerDNS order both the same way (`TODO.md` #118).
 
 ### Authorization
 

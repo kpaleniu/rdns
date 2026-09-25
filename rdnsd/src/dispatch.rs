@@ -1170,10 +1170,13 @@ impl Server {
     /// Answered here rather than in `make_response`: gated on a permission, it
     /// touches the disk, and it changes what this server says next.
     ///
-    /// The check order is the RFC's, each one keeping the next from running:
-    /// §3.1 reads the message, §3.1.1 asks whether the zone is ours, §3.3
-    /// whether the requestor may write it, §3.2 checks the prerequisites, and
-    /// only then does §3.4 change anything.
+    /// Order: §3.1 reads the message, §3.1.1 asks whether the zone is ours,
+    /// §3.3 whether the requestor may write it, §3.2 checks the prerequisites,
+    /// and only then does §3.4 change anything. Zone before permission, so
+    /// NOTAUTH and REFUSED tell a client whether to change server or key.
+    /// Permission before §3.2, where the RFC lists it after: prerequisites
+    /// answer NXDOMAIN/YXDOMAIN about the zone's contents, and BIND, Knot and
+    /// PowerDNS all check permission first (`TODO.md` #118).
     async fn answer_update(
         &self,
         msg: &DnsMessage,
@@ -1202,6 +1205,29 @@ impl Server {
         };
         let zone_name = request.zone.clone();
 
+        // §3.1.1: a zone we are not an authority for is NOTAUTH — not the query
+        // path's REFUSED, because an UPDATE names the zone and asks whether we
+        // are its authority.
+        //
+        // Taken, not merely tested for, and in the one read guard: "do we serve
+        // it" and the version the signer works against must be the same one.
+        // `snapshot` rather than `matching(..).cloned()` — the map holds
+        // `Arc<Zone>`, so this is a refcount and not a copy of the whole zone,
+        // which was 150 ms at a million records (`TODO.md` #64a).
+        let previous = {
+            let zones = self.zone_map.read().await;
+            zones.snapshot(zone_name.as_ref())
+        };
+        let Some(previous) = previous else {
+            tracing::info!(peer = %ip, "UPDATE of {zone_name}: NOTAUTH (not a zone served here)");
+            return self.signed_error(
+                refused,
+                ResponseCode::NotAuthorized,
+                Some(NOT_OUR_ZONE),
+                session,
+            );
+        };
+
         // §3.3: no permission, REFUSED. An unsigned UPDATE is refused outright,
         // with no address-based alternative: a write is not handed out on a
         // source address UDP makes nobody prove. A key is the only credential,
@@ -1228,29 +1254,6 @@ impl Server {
                 Some(session),
             );
         }
-
-        // §3.1.1: a zone we are not an authority for is NOTAUTH — not the query
-        // path's REFUSED, because an UPDATE names the zone and asks whether we
-        // are its authority.
-        //
-        // Taken, not merely tested for, and in the one read guard: "do we serve
-        // it" and the version the signer works against must be the same one.
-        // `snapshot` rather than `matching(..).cloned()` — the map holds
-        // `Arc<Zone>`, so this is a refcount and not a copy of the whole zone,
-        // which was 150 ms at a million records (`TODO.md` #64a).
-        let previous = {
-            let zones = self.zone_map.read().await;
-            zones.snapshot(zone_name.as_ref())
-        };
-        let Some(previous) = previous else {
-            tracing::info!(peer = %ip, "UPDATE of {zone_name}: NOTAUTH (not a zone served here)");
-            return self.signed_error(
-                refused,
-                ResponseCode::NotAuthorized,
-                Some(NOT_OUR_ZONE),
-                Some(session),
-            );
-        };
 
         // A zone we replicate is the master's copy: the next refresh transfers
         // over the change, so accepting it tells the client a write succeeded
@@ -3826,7 +3829,7 @@ pub(crate) mod tests {
         assert!(reply.edns.is_none(), "an unsolicited OPT is not mirroring");
     }
 
-    /// The three refusals, each with the code RFC 2136 gives it.
+    /// The refusals, each with the code RFC 2136 gives it.
     ///
     /// They are not interchangeable and that is the point: NOTAUTH says "not my
     /// zone" (§3.1.1) and REFUSED says "not you" (§3.3), and a client uses the
@@ -3879,7 +3882,27 @@ pub(crate) mod tests {
             "§3.1.1: not one of this server's authority zones"
         );
 
-        // Nothing was written on any of the three paths.
+        // NOTAUTH whatever the credential: the zone is checked first, or the
+        // rcode no longer says which of server and key to change (#118).
+        let unsigned_elsewhere = update_message(
+            "nowhere.test.",
+            vec![a_record("new.nowhere.test.", "192.0.2.50")],
+        )
+        .to_bytes_within(4096)
+        .expect("serialize");
+        assert_eq!(
+            round_trip(addr, unsigned_elsewhere.clone()).await.rcode,
+            ResponseCode::NotAuthorized,
+            "§3.1.1 before §3.3: unsigned, for a zone not served here"
+        );
+        let signed = rdns::tsig::sign_request(unsigned_elsewhere, &key, tsig::now()).expect("sign");
+        assert_eq!(
+            round_trip(addr, signed).await.rcode,
+            ResponseCode::NotAuthorized,
+            "§3.1.1 before §3.3: a key scoped elsewhere, for a zone not served here"
+        );
+
+        // Nothing was written on any of the paths.
         let written = std::fs::read_to_string(dir.join("example.com.zone")).expect("read back");
         assert!(
             !written.contains("new.example.com."),

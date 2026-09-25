@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#118**, **#119**, plus **#21**, as of 2026-09-25.
-#107-#117 are closed. #117-#119 came out of a fourth architecture review that
+**#58**, **#68**, **#119**, plus **#21**, as of 2026-09-25.
+#107-#118 are closed. #117-#119 came out of a fourth architecture review that
 day and were groomed against the code before filing.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
@@ -6829,85 +6829,6 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 118. `answer_update`'s doc states an RFC check order the code does not follow — **filed 2026-09-25**, **ready-for-agent**
-
-- `rdnsd/src/dispatch.rs:1173-1176`: "The check order is the RFC's, each one
-  keeping the next from running: §3.1 reads the message, §3.1.1 asks whether
-  the zone is ours, §3.3 whether the requestor may write it, §3.2 checks the
-  prerequisites".
-- The code runs §3.1 (`:1196`), then §3.3 — unsigned (`:1208`), key scope
-  (`:1219`) — then §3.1.1 (`:1244`), replicated, writable, then §3.2.
-- RFC 2136's order is §3.1, §3.2, §3.3, §3.4, and §3.3.2 places the
-  permission check: "this is the point in the server's processing where such
-  performance should take place, since if a REFUSED condition is encountered
-  after an update has been partially applied, it will be necessary to undo the
-  partial update". Neither the doc's order nor the code's is the RFC's.
-- `docs/spec/03-authoritative-server.md` "The order of the checks" tabulates
-  the code's order correctly; the 2136 row of `07-rfc-conformance.md` lists no
-  deviation.
-
-On the wire: an unsigned UPDATE, or one signed by a key scoped elsewhere, for
-a zone this server does not serve is REFUSED, not NOTAUTH. The NOTAUTH test
-(`an_unauthorized_update_is_refused_and_an_unknown_zone_is_notauth`, `:3836`)
-signs with a key scoped to the zone it asks about, so it cannot see this. Its
-own doc (`:3829-3834`) states the reason the code's order defeats: "a client
-uses the difference to decide whether to look for a different server or a
-different key".
-
-Refuting check. The reason to check permission before §3.1.1 would be not
-telling a stranger which zones are served; the query path already tells it
-(REFUSED for a zone not served, `CLAUDE.md` §8), so that does not hold.
-Permission before §3.2 has a reason that may — prerequisites answer
-NXDOMAIN/YXDOMAIN about the zone's contents to whoever may send them — and it
-is recorded nowhere either.
-
-**Survey, 2026-09-25** (sources read at their `main`/`master` that day):
-
-| | order | permission denied |
-|---|---|---|
-| BIND, `lib/ns/update.c` | zone section FORMERR → `ns_update_start` NOTAUTH → `send_update` query ACL, update ACL / `update-policy` → `update_action` prerequisites | REFUSED |
-| Knot, `update_process_query` | FORMERR → `NS_NEED_ZONE` NOTAUTH → `NS_NEED_AUTH` → queued; prerequisites in the update event | NOTAUTH (`process_query_acl_check`) |
-| PowerDNS, `PacketHandler::processUpdate` | `isUpdateAllowed` (address, then TSIG) → FORMERR → NOTAUTH → prerequisites | REFUSED |
-
-- All three check permission before §3.2. BIND says why, at the ACL check:
-  "Update message processing can leak record existence information so check
-  that we are allowed to query this zone". That is the unrecorded reason
-  above, and it holds here.
-- Zone before permission: BIND and Knot. PowerDNS's first gate is an address
-  list read before the message is parsed. `rdnsd` has no address gate for
-  UPDATE and no query ACL (`grep -i allow.query` finds only `xfr.rs`
-  comments), so zone membership is public and nothing is hidden by checking
-  permission first.
-- Knot's NOTAUTH for a denied ACL is not RFC 2136 §3.3.1's REFUSED; not
-  followed.
-
-Decided: BIND's order. It is the only one under which the NOTAUTH test's stated
-reason holds.
-
-**Remedy:**
-
-1. `answer_update`: move the §3.1.1 `snapshot` and its NOTAUTH exit above the
-   unsigned and key-scope exits. The unsigned NOTAUTH goes out with
-   `session: None`, as the unsigned REFUSED does now. Order becomes parse
-   (FORMERR / NOTZONE) → NOTAUTH → unsigned → key scope → replicated →
-   writable → §3.2 → §3.4. Cost to an unauthorized request: one read guard and
-   an `Arc` clone.
-2. Rewrite the doc at `:1173-1176` to state that order and its two reasons:
-   NOTAUTH before REFUSED so the rcode says server-or-key; permission before
-   §3.2, per §3.3.2 and BIND's leak argument.
-3. `docs/spec/03-authoritative-server.md` "The order of the checks": reorder
-   the table to match.
-4. `07-rfc-conformance.md` 2136 row: list two deviations. Permission is checked
-   before §3.2, where the RFC lists it after, as BIND, Knot and PowerDNS all
-   do. A replicated zone is REFUSED (`REPLICATED_ZONE`), where §3.1.1 says a
-   slave forwards toward the primary. BIND (`send_forward`) and PowerDNS
-   (`forwardPacket`) forward; Knot's forwarding was not checked.
-5. Tests: an unsigned UPDATE and one signed by a key scoped to another zone,
-   each for a zone not served, both NOTAUTH. Show both failing against the
-   current order first (§1).
-
----
-
 ### 119. Two UPDATE refusals no test reaches, and one that reports an I/O error as absence — **filed 2026-09-25**, **ready-for-agent**
 
 `answer_update` has twelve exits (`dispatch.rs:1196-1419`).
@@ -7139,6 +7060,7 @@ the week; the record is under "How the queue kept going stale" in
 | **114** | the prefetch ran inside `Handler::handle`, before DoH's answer | **filed 2026-09-21, closed 2026-09-25**. The row counted two hand-written discharges; the TCP one is shared by four transports, and on DoH and DoQ it was a live defect. DoH responds once the handler task is joined and DoQ sends FIN once the sink closes, so a prefetch-due name's reply waited for the upstream (0.9 ms reply, 1.51 s to close, provoked). `rdnsr/src/prefetch.rs` puts refreshes on a bounded queue and pool (`--prefetch-workers` 16, `--prefetch-queue` 256, drops counted in `dns_prefetches_dropped_total`, no `Busy`); `Answered` is gone and the contract is on `Handler::handle`. Three remedies that keep the work in the handler are declined in the section. See `docs/CLOSED_WORK.md` |
 | **116** | `rdnsd`'s answering tests were in the crate root | **filed 2026-09-24, closed 2026-09-25**. The harness was the only thing holding them: a root-private item is visible to every descendant (§17), so moving the tests widened nothing. 58 of 90 moved by subject — 23 to `dispatch`, 15 to `replication` (which had none), 13 to `answer`, 7 to `zones` — and 32 stay because they test root items, the reload cluster among them (#83). 17 fixtures to `testutil`; `zone_text(serial)` became `zone_at_serial` to stop it clashing with `dispatch`'s benchmark helper. Three docs older than the change were wrong, `Server::serve_connection` among them. Same 210 test names, same totals. See `docs/CLOSED_WORK.md` |
 | **117** | `refresh` claimed the query path's storing; prefetch and DNS64 never fed the denial cache | **filed and closed 2026-09-25**. The reason given for storing less was about the reply, not the cache. `Caches::store` holds the four rules and both writers call it. Regression test: a refreshed Secure NXDOMAIN answers the rest of its NSEC gap with no second upstream query, asked twice with the old storing restored. `testutil::SignedZone` is the first Secure resolution `rdnsr`'s tests can reach. Declined: DNS64 consulting the denial cache, since CD would have to be passed in to agree. See `docs/CLOSED_WORK.md` |
+| **118** | `answer_update` checked permission before the zone, and its doc claimed the RFC's order | **filed and closed 2026-09-25**. BIND, Knot and PowerDNS read: all check permission before §3.2, two of three check the zone before permission. Now zone → permission → prerequisites, so an unsigned or wrongly scoped UPDATE for a zone not served is NOTAUTH. The conformance row lists the two deviations, one of them the replicated-zone REFUSED where §3.1.1 forwards. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
