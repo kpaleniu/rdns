@@ -6727,10 +6727,54 @@ minimum (`compression.rs:315`, `zone.rs:3063`). The other ten — `logging.rs:62
 `:1964`, `:2011` — showed none inside the test function. A minimum taken in a
 helper would not show there, so each needs opening before it is changed.
 
-Remedy: best-of-five on both sides, as `zone.rs:3056`, for the two `rpz`
+~~Remedy: best-of-five on both sides, as `zone.rs:3056`, for the two `rpz`
 tests. For the other eight, open each and apply the same where it takes one
 sample; say in the closing row which already had a minimum and which had
-reasons not to (§19).
+reasons not to (§19).~~ Superseded by the audit below.
+
+**Groomed 2026-09-25: all twelve opened.**
+
+| test | samples | state the timed work changes | in `cargo test` |
+|---|---|---|---|
+| `compression.rs` `writing_a_name_…` | best of 3 | none | yes |
+| `zone.rs` `parsing_does_not_cost_more_…` | best of 5 | none | yes |
+| `rdnsd/src/zones.rs` `choosing_a_zone_…`, `a_long_qname_…` | best of 3, in `time_lookups` — the minimum the grep could not see | none | yes |
+| `zone_signer.rs:3687` `check_split` | one | — | **no**: only the three `#[ignore]`d release benchmarks call it |
+| `rpz.rs` `a_query_costs_the_same_…` | one | none | yes |
+| `rpz.rs` `indexing_address_triggers_…` | one | none; the zone is parsed outside the timing | yes |
+| `nsec_cache.rs` `a_lookup_costs_the_same_…` | one, after a warm-up pass | none | yes |
+| `rdnsd/src/zones.rs` `verifying_a_zone_…` | one | none; signing is setup | yes |
+| `resolver/caches.rs` `costs_more_at_the_bound`, three caches | one | the map, built inside `time` | yes |
+| `negative_cache.rs` `inserting_into_a_full_cache_…` | one | **both caches**: the timed inserts fill them | yes |
+| `logging.rs` `logging_a_query_…` | one | **the window**: every timed query deepens it | yes |
+
+Seven one-sample tests in `cargo test`, and two of them that failed. The
+refuting measurement for the `rpz` lookup test: 30 unloaded runs in a debug
+build read **1.24× to 2.17×**, median 1.33, against its bound of 4. Its two
+failures read 4.14× and 4.08×, and the indexing test's one 3.15× against 3, so
+the bounds are right and the samples are not. Each of
+the seven takes 0.02–0.80 s today; five samples of the timed part adds about
+2 s of suite time in total, spread across parallel test threads.
+
+**Remedy:**
+
+1. The four with no state to rebuild — both `rpz` tests, `nsec_cache.rs`,
+   `verifying_a_zone_…` — take the best of five on each side, as
+   `zone.rs:3056` does, with its doc's reason: contention only adds time.
+2. `costs_more_at_the_bound`: best of five calls to `time(capacity)`, which
+   already builds a fresh map each call.
+3. `negative_cache.rs` and `logging.rs`: the same, but each sample builds its
+   own fresh state — two new caches, a new `QueryLogger` — because timing the
+   same object twice measures a different fill level or window depth the
+   second time.
+4. `check_split` unchanged: not a suite test, and its lower bound was set by
+   #111d's measurement of which side pays the cold allocator.
+5. The red is already recorded: #68's verification runs, 3 failures in 150
+   on Windows. The green is the same measurement repeated — 150 whole-workspace
+   runs on Windows and 50 on Linux with none of the seven failing. No revert
+   of the defects the docs name is needed to show the minimum has not blunted
+   them: a quadratic reads as its multiplier in every sample, so it reads so
+   in the smallest.
 
 ---
 
