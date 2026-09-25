@@ -37,9 +37,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#114**, **#116**, plus **#21**, as of 2026-09-24 — the
+**#58**, **#68**, **#116**, plus **#21**, as of 2026-09-25 — the
 seven filed out of the architecture review are closed, nine more were filed,
-and #107-#113 and #115 are closed out of the triage passes. #116 is #109's test half.
+and #107-#115 are closed out of the triage passes. #116 is #109's test half.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -6842,24 +6842,6 @@ but the harness and `Server`'s `pub(crate)` surface. No remedy costed.
 
 ---
 
-### 114. `Answered.refresh` is discharged by hand at each transport — **filed 2026-09-21**
-
-`rdnsr/src/serve.rs:115-117` (UDP) and `:145-147` (TCP) are the same three lines
-under the same comment: "After the reply, never before it" and "As on UDP: after
-the reply is on the wire, in the task that sent it". The obligation is prose on a
-struct field (answer.rs:166-172).
-
-#102 narrowed how `refresh` is *derived* — from the lookup rather than assigned
-in an arm, so an exit added between the write and the read cannot drop it — and
-was honest about its predecessor's argument: "it held for the exit that had just
-been removed and said nothing about the next one." The same sentence applies to
-the *discharge*, which #102 did not touch.
-
-Count of the shape: 2. A third transport is a third copy or a third bug. No
-remedy costed.
-
----
-
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -7049,6 +7031,7 @@ the week; the record is under "How the queue kept going stale" in
 | **110** | one-victim eviction scans left after `Halving` | **filed 2026-09-21, closed 2026-09-24**. Measured before changing, as the row asked: 17-21 µs per insert at the default 10 000, 2.7-8.6 ms at a million, linear in `--delegation-cache-size`, against 0.1 µs with room — #33a's cost again. Five sites, not four: `RttStore` scanned for the slowest server and ranks by speed, so the grep missed it. All three resolver maps halve through `crate::eviction`; `RttStore` slowest first. The two in `nsec_cache` stay, both with the reason. Guard watched failing at 357-418x. See `docs/CLOSED_WORK.md` |
 | **112** | price the reload cluster's constructors | **filed 2026-09-21, closed 2026-09-24**, constructors declined. The row's reason for them was wrong twice: the test module already built three `Reloading` literals, and `tokio::time::pause` needs `test-util`, which nothing enabled. Left with #83's 5-against-1 visibility loss and no test to pay for it. The test gap was real: three tests for `spawn_zone_maintenance` — control reloads answered and the stop drains, no timer without keys, a timer with them under paused time — each watched failing against its own mutation. The keepalive clone is unobservable (`select!` disables an unmatched arm); recorded, not changed. See `docs/CLOSED_WORK.md` |
 | **113** | #103's projection sweep stopped at `[server]` | **filed 2026-09-21, closed 2026-09-24**. Measured first: a `[resolver]` key nothing reads warns, an `[rpz]` key only `check` reads compiles clean — both as the row said. The shape is eight sections across both daemons, not two. Each projection now destructures its table with no `..`, the top-level `Config` too, so a key added and not handled is `E0027`; the probe that compiled clean now fails naming the field. No macro: none of the eight is shared between daemons. See `docs/CLOSED_WORK.md` |
+| **114** | the prefetch ran inside `Handler::handle`, before DoH's answer | **filed 2026-09-21, closed 2026-09-25**. The row counted two hand-written discharges; the TCP one is shared by four transports, and on DoH and DoQ it was a live defect. DoH responds once the handler task is joined and DoQ sends FIN once the sink closes, so a prefetch-due name's reply waited for the upstream (0.9 ms reply, 1.51 s to close, provoked). `rdnsr/src/prefetch.rs` puts refreshes on a bounded queue and pool (`--prefetch-workers` 16, `--prefetch-queue` 256, drops counted in `dns_prefetches_dropped_total`, no `Busy`); `Answered` is gone and the contract is on `Handler::handle`. Three remedies that keep the work in the handler are declined in the section. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 

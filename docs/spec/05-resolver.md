@@ -179,8 +179,8 @@ process down. Binds 127.0.0.1 by default.
     only if the client used EDNS, sized by transport (`Transport::Udp` uses the
     client's advertised payload size; `Transport::Tcp` uses the 2-byte frame).
 16. A prefetch, if the answer came from a cache entry in the last tenth of its
-    TTL and `--prefetch` is on: run by the socket loop **after** the reply is
-    sent, in the same task. See §5.5.
+    TTL and `--prefetch` is on: offered to a queue at the lookup and run by a
+    pool of its own, never in the task that answered. See §5.5.
 
 Steps 5, 6, 11, 13, 14 and 16 do nothing at all unless the flag that turns them
 on was given; each costs one `is_empty`, one `Option` test or one comparison
@@ -280,9 +280,16 @@ away.
 - The obligation is handed to **exactly one** caller: `Cached::refresh` is true
   at most once per entry, flipped under the lock the lookup already holds. A
   popular name in its last tenth otherwise starts one walk per client.
-- The refresh runs in the task that sent the reply, so it is bounded by that
-  task's in-flight permit and held open by its shutdown guard. Nothing is
-  spawned.
+- The refresh is offered to a bounded queue (`--prefetch-queue`, 256) and run
+  by a pool (`--prefetch-workers`, 16). A full queue drops the question and
+  counts it in `dns_prefetches_dropped_total`; the entry stays claimed and
+  expires like a failed refresh.
+- Not in the task that answered. DoH builds its response only once the
+  handler task is joined and DoQ sends FIN only once the sink closes, so a
+  refresh there put an upstream resolution in front of the reply
+  (`TODO.md` #114).
+- The pool holds no shutdown guard: nobody waits on a prefetch, so the stop
+  aborts one part-way rather than waiting out an upstream timeout.
 - A failure leaves the entry claimed and expiring: the next client either finds
   it or resolves it the ordinary way.
 

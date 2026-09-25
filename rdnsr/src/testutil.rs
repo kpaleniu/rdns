@@ -73,7 +73,7 @@ pub(crate) fn serving(
         resolver,
         caches,
         policy: PolicyStore::in_memory(policy),
-        prefetch: false,
+        prefetch: None,
         dns64: None,
         rpz_notify: None,
         feed_wakes: Vec::new(),
@@ -90,7 +90,7 @@ pub(crate) fn serving_policy(policy: Arc<PolicyStore>) -> Arc<Resolving> {
         resolver: test_resolver(),
         caches,
         policy,
-        prefetch: false,
+        prefetch: None,
         dns64: None,
         rpz_notify: None,
         feed_wakes: Vec::new(),
@@ -112,7 +112,7 @@ pub(crate) fn serving_notified(
         resolver: test_resolver(),
         caches,
         policy,
-        prefetch: false,
+        prefetch: None,
         dns64: None,
         rpz_notify: Some(NotifyAcl {
             from: TransferAcl::parse_named(&specs, "--rpz-notify-from").expect("the list parses"),
@@ -186,4 +186,17 @@ pub(crate) fn message(opcode: OpCode, response: bool) -> Vec<u8> {
     let n = msg.to_bytes(&mut buf).expect("serialize");
     buf.truncate(n);
     buf
+}
+
+/// A resolver forwarding to a socket that reads nothing, so every resolution
+/// runs to its timeout. Keep the socket alive for as long as the resolver.
+pub(crate) fn silent_resolver() -> (Arc<Resolver>, std::net::UdpSocket) {
+    let upstream = std::net::UdpSocket::bind("127.0.0.1:0").expect("a loopback port");
+    let config = ResolverConfig {
+        mode: ResolverMode::Forward,
+        upstream_servers: vec![upstream.local_addr().expect("bound")],
+        timeout_ms: 10_000,
+        ..Default::default()
+    };
+    (Arc::new(Resolver::new(config)), upstream)
 }

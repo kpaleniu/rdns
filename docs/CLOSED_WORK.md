@@ -9855,3 +9855,82 @@ Verified: 1 314 passed on Windows, 1 335 on Linux, before and after, 0 failed;
 clippy clean on both; `cargo doc --workspace --no-deps` clean.
 
 ---
+
+### 114. `Answered.refresh` is discharged by hand at each transport — **filed 2026-09-21, closed 2026-09-25**, **bug**
+
+`rdnsr/src/serve.rs:115-117` (UDP) and `:145-147` (TCP) are the same three lines
+under the same comment: "After the reply, never before it" and "As on UDP: after
+the reply is on the wire, in the task that sent it". The obligation is prose on a
+struct field (answer.rs:166-172).
+
+#102 narrowed how `refresh` is *derived* — from the lookup rather than assigned
+in an arm, so an exit added between the write and the read cannot drop it — and
+was honest about its predecessor's argument: "it held for the exit that had just
+been removed and said nothing about the next one." The same sentence applies to
+the *discharge*, which #102 did not touch.
+
+Count of the shape: 2. A third transport is a third copy or a third bug. No
+remedy costed.
+
+**Closed 2026-09-25, and the row undercounted its own shape.** Two copies in
+`serve.rs`, but the TCP one is `tcp::Handler::handle`, which four transports
+call: TCP, DoT, DoQ and DoH. "A third transport is a third copy or a third bug"
+had already happened twice, as a bug, and not as a copy.
+
+**The defect.** `Resolving::handle` ran `refresh` after `send_framed` and while
+still holding `out`. DoH (`https::answer`) reads the sink until it closes, joins
+the handler task and only then builds the HTTP response. DoQ writes each frame
+as it arrives but sends FIN only once the sink closes, and RFC 9250 §4.2 uses
+FIN to mark the end of the response. So a DoH client asking for a name due a
+prefetch waited for the whole upstream resolution, which the struct's own doc
+said must not happen. TCP and DoT were right only because a writer task sends
+each frame on its own; they still lost one of the connection's in-flight slots
+while the refresh ran. Provoked with a probe calling `handle` against an
+upstream that never answers: frame at 0.9 ms, sink closed at 1.51 s (Windows).
+
+**Remedies declined, each after checking the transport:**
+- Dropping `out` before `refresh` fixes DoQ and not DoH, because DoH joins the
+  handler task before it responds.
+- DoH responding before joining would leave the task outliving the
+  connection's permit, with nothing bounding it (`CLAUDE.md` §9).
+- A `Handler` that hands back a future to run after the reply: DoH cannot run
+  anything after its service future has returned the response, so it would
+  have to detach the future.
+
+**Fixed by taking the work out of the answering task.** `rdnsr/src/prefetch.rs`:
+the lookup offers the question to a bounded queue with `try_send`, and a pool
+owned by `main`'s listener set resolves it. `Answered` is gone, `handle_query`
+returns `Option<Vec<u8>>` again, and no transport has anything to discharge.
+The offer is made at the lookup, before any exit, so #78a's and #102's argument
+about which exits could drop it no longer applies. The contract DoH and DoQ
+depend on is now written on `Handler::handle`.
+
+What the move changes, decided with the owner:
+- **Bounded by the pool**, not by whichever task found the prefetch. Two flags:
+  `--prefetch-workers` (16) and `--prefetch-queue` (256), with
+  `resolver.prefetch-workers`/`-queue` in the file. Both `requires` `--prefetch`
+  (the file refuses one without `prefetch = true`), 0 is floored on the flag and
+  refused in the file, as `max-inflight-udp` is.
+- **A full queue drops and counts** in `dns_prefetches_dropped_total` (§5, §14).
+  The cache has already marked the entry as being refreshed, so it expires and
+  the next client resolves it, which is what a failed refresh costs as well.
+- **No `Busy`.** Nobody waits on a prefetch and the cache it fills goes with
+  the process, so the stop aborts one part-way instead of waiting out an
+  upstream's timeout for it.
+
+**Tests.** `a_handler_is_done_when_its_reply_is_sent` is the probe with a
+bound: against the old handler the probe measured the close at 1.5 s, the
+test allows 500 ms, and it was watched failing with a refresh put back after
+the reply in `handle`. `the_workers_run_at_once_and_the_stop_abandons_them` was
+watched failing against a `while let` worker loop, whose scrutinee's lock guard
+lives through the loop body and serializes the pool.
+`a_full_queue_drops_and_counts` covers the drop and its counter, and
+`a_prefetch_pool_needs_prefetch_and_a_worker` the file's refusals, watched
+failing with the `requires` arm deleted. Three existing tests changed, because
+they read `Answered::refresh` and now read the queue; the fourth asserted
+`refresh` was `None` and now asserts there is no queue.
+
+Verified: 1 318 passed on Windows, 1 339 on Linux, 0 failed; clippy clean
+on both; `cargo doc --workspace --no-deps` clean.
+
+---

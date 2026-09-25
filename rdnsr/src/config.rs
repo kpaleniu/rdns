@@ -107,6 +107,10 @@ struct ResolverSection {
     serve_stale: u64,
     #[serde(default)]
     prefetch: bool,
+    /// `None` is the flag's default. An `Option` so that `check` can refuse
+    /// one given without `prefetch`, as clap's `requires` does for the flag.
+    prefetch_workers: Option<usize>,
+    prefetch_queue: Option<usize>,
     /// The NAT64 prefix, in `--dns64`'s spelling. Absent is off.
     dns64: Option<Dns64>,
     #[serde(default)]
@@ -125,6 +129,8 @@ impl Default for ResolverSection {
             auto_trust_anchor: None,
             serve_stale: crate::default_serve_stale(),
             prefetch: false,
+            prefetch_workers: None,
+            prefetch_queue: None,
             dns64: None,
             dns64_exclude: Vec::new(),
         }
@@ -272,6 +278,18 @@ impl Config {
                  it; 1 is the smallest resolver"
             );
         }
+        for (key, value) in [
+            ("prefetch-workers", self.resolver.prefetch_workers),
+            ("prefetch-queue", self.resolver.prefetch_queue),
+        ] {
+            match value {
+                Some(_) if !self.resolver.prefetch => {
+                    bail!("resolver.{key} is set and resolver.prefetch is not: nothing reads it")
+                }
+                Some(0) => bail!("resolver.{key} 0 prefetches nothing; 1 is the smallest pool"),
+                _ => {}
+            }
+        }
         // clap's `requires` for the three listeners, which the file has no
         // equivalent of: a listener with no certificate binds 853 and presents
         // nothing.
@@ -388,6 +406,8 @@ impl Config {
             auto_trust_anchor,
             serve_stale,
             prefetch,
+            prefetch_workers,
+            prefetch_queue,
             dns64,
             dns64_exclude,
         } = resolver;
@@ -400,6 +420,8 @@ impl Config {
         cli.auto_trust_anchor = auto_trust_anchor.clone();
         cli.serve_stale = *serve_stale;
         cli.prefetch = *prefetch;
+        cli.prefetch_workers = prefetch_workers.unwrap_or_else(crate::default_prefetch_workers);
+        cli.prefetch_queue = prefetch_queue.unwrap_or_else(crate::default_prefetch_queue);
         cli.dns64 = match dns64 {
             Some(Dns64::On(true)) => Some(rdns::dns64::WELL_KNOWN_PREFIX.to_string()),
             Some(Dns64::On(false)) | None => None,
@@ -588,6 +610,8 @@ tls-key = "./key.pem"
             https_path => "server.https-path",
             cache_size => "resolver.cache-size",
             serve_stale => "resolver.serve-stale",
+            prefetch_workers => "resolver.prefetch-workers",
+            prefetch_queue => "resolver.prefetch-queue",
             rpz_policy => "rpz.policy",
         }
     }
@@ -705,6 +729,21 @@ hsot = \"127.0.0.1\"
     fn a_tls_listener_needs_a_certificate() {
         let err = parse("[server]\ntls-listen = \"0.0.0.0:853\"\n").expect_err("no certificate");
         assert!(err.to_string().contains("tls-cert"), "got: {err}");
+    }
+
+    /// The file's side of `requires = "prefetch"` and the flag's floor.
+    #[test]
+    fn a_prefetch_pool_needs_prefetch_and_a_worker() {
+        let err = parse("[resolver]\nprefetch-workers = 4\n").expect_err("prefetch is off");
+        assert!(err.to_string().contains("nothing reads it"), "got: {err}");
+        let err = parse("[resolver]\nprefetch = true\nprefetch-queue = 0\n").expect_err("no room");
+        assert!(err.to_string().contains("prefetch-queue 0"), "got: {err}");
+
+        let mut cli = Cli::parse_from(["rdnsr"]);
+        parse("[resolver]\nprefetch = true\nprefetch-workers = 4\n")
+            .expect("parses")
+            .apply(&mut cli);
+        assert_eq!((cli.prefetch_workers, cli.prefetch_queue), (4, 256));
     }
 
     #[test]

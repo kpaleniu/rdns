@@ -112,7 +112,7 @@ fn a_cached_answer_costs_what_it_costs() {
         &serving,
         Transport::Udp,
     ));
-    let bytes = warm.reply.expect("a cache hit is answered");
+    let bytes = warm.expect("a cache hit is answered");
     let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
     assert_eq!(reply.rcode, ResponseCode::Ok);
     assert_eq!(reply.answers.len(), 1, "the A record, out of the cache");
@@ -121,7 +121,7 @@ fn a_cached_answer_costs_what_it_costs() {
     let wire = query_bytes(&name);
     let (answered, count) =
         allocations(|| rt.block_on(handle_query(wire, TEST_PEER, now, &serving, Transport::Udp)));
-    assert!(answered.reply.is_some(), "still a cache hit");
+    assert!(answered.is_some(), "still a cache hit");
     within("answer one query from the cache", count, 13..=13);
 
     // The two ends of it, priced separately so the total is attributed. Both

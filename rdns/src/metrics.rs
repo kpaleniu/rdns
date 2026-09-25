@@ -193,6 +193,9 @@ pub struct Counters {
     /// switch buys and what it costs: against `dns_cache_hits_total` it says
     /// whether prefetching is paying for itself.
     pub prefetches: AtomicU64,
+    /// Prefetches the queue had no room for (`--prefetch-queue`). Each is a
+    /// name left to expire, so the next client for it waits for the walk.
+    pub prefetches_dropped: AtomicU64,
 
     /// Resolutions that ran past RFC 8767 §4's client response timer, by what
     /// they did next (`TODO.md` #58).
@@ -292,6 +295,7 @@ impl DnsMetrics {
             quic_handshake_failures: AtomicU64::new(0),
             synthesized: AtomicU64::new(0),
             prefetches: AtomicU64::new(0),
+            prefetches_dropped: AtomicU64::new(0),
             stale_answers: AtomicU64::new(0),
             slow_resolutions_completed: AtomicU64::new(0),
             slow_resolutions_failed: AtomicU64::new(0),
@@ -538,6 +542,11 @@ impl DnsMetrics {
                 "dns_prefetches_total",
                 "Names re-resolved before expiry",
                 &self.prefetches,
+            ),
+            (
+                "dns_prefetches_dropped_total",
+                "Prefetches dropped because the queue was full",
+                &self.prefetches_dropped,
             ),
             (
                 "dns_stale_answers_total",
@@ -984,6 +993,7 @@ mod tests {
             &m.policy_drops,
             &m.synthesized,
             &m.prefetches,
+            &m.prefetches_dropped,
             &m.slow_resolutions_completed,
             &m.slow_resolutions_failed,
             &m.stale_answers,

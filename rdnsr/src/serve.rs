@@ -16,7 +16,7 @@ use rdns_transport::{recv_error_is_transient, tcp, ServeContext, UDP_RECEIVE_BUF
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Semaphore};
 
-use crate::answer::{handle_query, refresh, truncate_reply, Resolving};
+use crate::answer::{handle_query, truncate_reply, Resolving};
 
 /// Receive datagrams and resolve each in its own task, up to `max_inflight`.
 ///
@@ -88,8 +88,8 @@ pub(crate) async fn udp_main(
             let _busy = busy;
             let _permit = permit;
             let ctx = &serving.ctx;
-            let answered = handle_query(data, peer.ip(), now, &serving, Transport::Udp).await;
-            if let Some(reply) = answered.reply {
+            if let Some(reply) = handle_query(data, peer.ip(), now, &serving, Transport::Udp).await
+            {
                 // Charge the response, not the query. Over budget, TC=1 is
                 // the useful refusal: no records to amplify, and a real client
                 // retries over TCP where the handshake proves who it is.
@@ -108,12 +108,6 @@ pub(crate) async fn udp_main(
                     }
                     ResponseVerdict::Drop => {}
                 }
-            }
-            // After the reply, never before it: a prefetch is for the *next*
-            // client. In this task, so it is bounded by the in-flight permit
-            // and held open by the drain guard this task already owns.
-            if let Some(query) = answered.refresh {
-                refresh(&serving, query).await;
             }
         });
     }
@@ -137,13 +131,8 @@ impl tcp::Handler for Resolving {
         _arrival: Arrival,
         out: mpsc::Sender<tcp::Reply>,
     ) {
-        let answered = handle_query(packet, peer.ip(), now, self, Transport::Tcp).await;
-        if let Some(reply) = answered.reply {
+        if let Some(reply) = handle_query(packet, peer.ip(), now, self, Transport::Tcp).await {
             tcp::send_framed(&out, &reply).await;
-        }
-        // As on UDP: after the reply is on the wire, in the task that sent it.
-        if let Some(query) = answered.refresh {
-            refresh(self, query).await;
         }
     }
 }

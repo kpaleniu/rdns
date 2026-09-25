@@ -34,6 +34,7 @@ use rdns::{
 };
 use rdns_transport::ServeContext;
 
+use crate::prefetch::Prefetch;
 use crate::reload::PolicyReload;
 
 /// What `rdnsr` remembers between queries.
@@ -124,9 +125,9 @@ pub(crate) struct Resolving {
     /// The response policy zones, and the files a SIGHUP re-reads them from.
     /// Empty unless `--rpz` named one, and empty costs one `is_empty` a query.
     pub(crate) policy: Arc<PolicyStore>,
-    /// Whether a cache hit in the last tenth of its TTL should be re-resolved
-    /// once the client's own answer is away (`--prefetch`).
-    pub(crate) prefetch: bool,
+    /// Where a cache hit in the last tenth of its TTL is queued to be
+    /// re-resolved (`--prefetch`). `None` is off.
+    pub(crate) prefetch: Option<Prefetch>,
     /// The NAT64 prefix to synthesize AAAA records into, if any (`--dns64`).
     pub(crate) dns64: Option<Dns64>,
     /// Who may send a NOTIFY asking for the `--rpz` files to be re-read, and
@@ -157,31 +158,6 @@ pub(crate) struct NotifyAcl {
     pub(crate) reload: PolicyReload,
 }
 
-/// What answering one query produced: the reply, and any work it left behind.
-///
-/// The second field is the whole reason this is not `Option<Vec<u8>>`. A
-/// prefetch must not delay the answer that discovered it, so it is handed back
-/// to the socket loop to run *after* the reply is sent — in the same task,
-/// which already holds its in-flight permit and its shutdown guard. A task
-/// spawned here would hold neither, and `CLAUDE.md` §9 is about what happens to
-/// the ones nobody owns.
-pub(crate) struct Answered {
-    /// The bytes to send back, or `None` to send nothing at all.
-    pub(crate) reply: Option<Vec<u8>>,
-    /// A question to re-resolve into the cache, now that the client has its
-    /// answer.
-    pub(crate) refresh: Option<QuerySection>,
-}
-
-impl From<Option<Vec<u8>>> for Answered {
-    fn from(reply: Option<Vec<u8>>) -> Answered {
-        Answered {
-            reply,
-            refresh: None,
-        }
-    }
-}
-
 /// What the client asked for and what it can take: everything about a request
 /// that shapes the reply once the answer itself is decided.
 struct Client {
@@ -209,7 +185,7 @@ pub(crate) async fn handle_query(
     now: u64,
     serving: &Resolving,
     transport: Transport,
-) -> Answered {
+) -> Option<Vec<u8>> {
     let Resolving {
         resolver,
         caches,
@@ -233,7 +209,7 @@ pub(crate) async fn handle_query(
         Ok(msg) => msg,
         Err(_) => {
             ctx.logger.count_error(peer);
-            return None.into();
+            return None;
         }
     };
     let timer = LatencyTimer::new();
@@ -267,7 +243,7 @@ pub(crate) async fn handle_query(
                 client_max,
             );
             ctx.record_answer(rcode, timer);
-            return reply.into();
+            return reply;
         }
     }
 
@@ -275,7 +251,7 @@ pub(crate) async fn handle_query(
     // plausible QUERY-shaped reply the sender will misread (RFC 1035 §4.1.1).
     if msg.opcode != OpCode::Query {
         ctx.record_answer(ResponseCode::NotImplemented, timer);
-        return unsupported_opcode(&msg, ctx.udp.advertised(), client_max).into();
+        return unsupported_opcode(&msg, ctx.udp.advertised(), client_max);
     }
 
     let id = msg.id;
@@ -289,7 +265,7 @@ pub(crate) async fn handle_query(
         Ok(edns) => edns,
         Err(rcode) => {
             ctx.record_answer(rcode, timer);
-            return edns_error(&msg, rcode, client_max, ctx.udp.advertised()).into();
+            return edns_error(&msg, rcode, client_max, ctx.udp.advertised());
         }
     };
     // Exactly one question, or FORMERR — after the EDNS-level rejections above,
@@ -318,8 +294,7 @@ pub(crate) async fn handle_query(
             None,
             ctx.udp.advertised(),
             client_max,
-        )
-        .into();
+        );
     };
     let query = query.clone();
 
@@ -351,7 +326,7 @@ pub(crate) async fn handle_query(
         tracing::debug!(qname = %query.qname, why = %local.why, "answered locally");
         // Never authenticated: this was decided by specification rather than
         // validated, and a validating client cannot check the claim itself.
-        return finish(resp, false, None, &client, &query, ctx, timer).into();
+        return finish(resp, false, None, &client, &query, ctx, timer);
     }
 
     // The operator's policy, before every cache and before any resolution: a
@@ -366,7 +341,7 @@ pub(crate) async fn handle_query(
             if let Applied::Replied(reply) =
                 apply_policy(&msg, rewrite, &client, &query, ctx, timer, transport)
             {
-                return reply.into();
+                return reply;
             }
         }
     }
@@ -386,7 +361,7 @@ pub(crate) async fn handle_query(
             .and_then(|dns64| dns64.reverse_target(query.qname.as_ref()))
         {
             let resp = reverse_dns64(&msg, &query, target, serving).await;
-            return finish(resp, false, None, &client, &query, ctx, timer).into();
+            return finish(resp, false, None, &client, &query, ctx, timer);
         }
     }
 
@@ -408,9 +383,7 @@ pub(crate) async fn handle_query(
             resp.authorities = wildcard.authority;
             // A wildcard signature verifies at this name unchanged, so the
             // client can check this for itself.
-            return finish_dns64(resp, true, None, &client, &query, serving, timer)
-                .await
-                .into();
+            return finish_dns64(resp, true, None, &client, &query, serving, timer).await;
         }
     }
 
@@ -421,9 +394,7 @@ pub(crate) async fn handle_query(
             resp.authorities = denial.authority;
             // The proofs were validated before storage, so what is derived
             // from them is authentic on the same terms.
-            return finish_dns64(resp, true, None, &client, &query, serving, timer)
-                .await
-                .into();
+            return finish_dns64(resp, true, None, &client, &query, serving, timer).await;
         }
     }
 
@@ -434,30 +405,23 @@ pub(crate) async fn handle_query(
         ctx.metrics.count(&ctx.metrics.cache_hits);
         let mut resp = build_response(&msg, Vec::new(), negative.rcode);
         resp.authorities = negative.authority;
-        return finish_dns64(resp, negative.secure, None, &client, &query, serving, timer)
-            .await
-            .into();
+        return finish_dns64(resp, negative.secure, None, &client, &query, serving, timer).await;
     }
 
     // Build the response: from cache if we have it, else by resolving. The
     // third is RFC 8914's reason, which only the two failing arms have.
     let hit = caches
         .answers
-        .lookup(query.qname.as_ref(), query.qtype, *prefetch);
+        .lookup(query.qname.as_ref(), query.qtype, prefetch.is_some());
     // The cache said this entry is in the last tenth of its TTL and nobody has
-    // been asked to refresh it yet. Not here: the client is waiting.
-    //
-    // Derived from the lookup rather than assigned inside the arm below, which
-    // is what makes it provable instead of inspectable (`TODO.md` #102). It
-    // used to be a `mut` declared 226 lines above and set in the hit arm, so
-    // the invariant was "none of the thirteen exits in between returns" —
-    // checked by reading all thirteen, and #78a is the time one of them did.
-    // Now it is `Some` only when `hit` is, and every exit that could drop it is
-    // inside the arm that runs when `hit` is `None`.
-    let refresh = hit
-        .as_ref()
-        .filter(|hit| hit.refresh)
-        .map(|_| query.clone());
+    // been asked to refresh it yet. Offered here, at the lookup, so no exit
+    // below can drop it (`TODO.md` #78a, #102), and to a queue, so nothing
+    // runs in this task after the reply (#114).
+    if let (Some(prefetch), Some(hit)) = (prefetch, &hit) {
+        if hit.refresh {
+            prefetch.offer(query.clone(), &ctx.metrics);
+        }
+    }
     let (mut resp, secure, why) = if let Some(hit) = hit {
         ctx.metrics.count(&ctx.metrics.cache_hits);
         let (records, secure) = (hit.records, hit.secure);
@@ -531,8 +495,7 @@ pub(crate) async fn handle_query(
                             &query,
                             ctx,
                             timer,
-                        )
-                        .into();
+                        );
                     }
                 }
 
@@ -580,7 +543,7 @@ pub(crate) async fn handle_query(
                         if let Applied::Replied(reply) =
                             apply_policy(&msg, rewrite, &client, &query, ctx, timer, transport)
                         {
-                            return reply.into();
+                            return reply;
                         }
                         // `Passthru` never stops the walk, and the other five
                         // actions all reply. Unreachable rather than ignorable.
@@ -631,16 +594,6 @@ pub(crate) async fn handle_query(
     // after a recursion — the cache holds what the internet said, and the
     // policy is applied to what leaves.
     //
-    // No `return` here. This one had one, and it silently turned prefetching
-    // off for any name an `rpz-ip` rule matched (`TODO.md` #78a, `CLAUDE.md`
-    // §7's early return over a shared epilogue), because `refresh` was set at
-    // the cache hit and read below and an exit between the two dropped it.
-    // ~~Falling through leaves one exit, so there is nothing to remember.~~
-    // That was the argument and it was the weak kind: it held for the exit
-    // that had just been removed and said nothing about the next one. #102
-    // moved `refresh` to the lookup, so it is now `Some` only when the cache
-    // hit, and the exits that could drop it are in the arm the cache *missed*.
-    // Falling through is still right, and no longer the only thing holding it.
     let rewritten = if !policy.is_empty() && !resp.answers.is_empty() {
         match policy.on_answer(&resp.answers, query.qname.as_ref(), query.qtype) {
             Some(rewrite) => {
@@ -655,12 +608,9 @@ pub(crate) async fn handle_query(
         None
     };
 
-    Answered {
-        reply: match rewritten {
-            Some(reply) => reply,
-            None => finish_dns64(resp, secure, why, &client, &query, serving, timer).await,
-        },
-        refresh,
+    match rewritten {
+        Some(reply) => reply,
+        None => finish_dns64(resp, secure, why, &client, &query, serving, timer).await,
     }
 }
 
@@ -854,12 +804,8 @@ async fn cached_or_resolve(
     resolve_and_store(serving, query).await
 }
 
-/// Re-resolve a name into the cache, after the client that asked for it has its
-/// answer (Unbound's `prefetch`).
-///
-/// Called by the socket loop rather than by [`handle_query`], in the task that
-/// has already sent the reply: nothing is waiting on this, and the in-flight
-/// permit that task holds is what bounds how many may run at once.
+/// Re-resolve a name into the cache (Unbound's `prefetch`). Run by
+/// [`crate::prefetch`]'s pool, whose size is what bounds how many run at once.
 ///
 /// The result goes through the same storing as an ordinary resolution, because
 /// it *is* one — the only difference is that nobody is listening. A failure is
@@ -1361,6 +1307,7 @@ mod tests {
     use rdns::clock::Clock;
 
     use super::*;
+    use crate::prefetch::Queue;
     use crate::testutil::*;
 
     /// AD is two claims at once — this resolver checked the data (RFC 6840
@@ -1482,8 +1429,7 @@ mod tests {
             &serving,
             Transport::Udp,
         )
-        .await
-        .reply;
+        .await;
         assert!(
             reply.is_none(),
             "answering a response is how a resolver becomes a packet engine"
@@ -1504,7 +1450,6 @@ mod tests {
                 Transport::Udp,
             )
             .await
-            .reply
             .unwrap_or_else(|| panic!("{opcode:?} should be answered, not dropped"));
             let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
 
@@ -1537,7 +1482,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("an UPDATE is answered, not dropped");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
 
@@ -1568,7 +1512,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("a NOTIFY is answered, not dropped");
         DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply")
     }
@@ -1648,7 +1591,6 @@ mod tests {
                 Transport::Udp,
             )
             .await
-            .reply
             .expect("answered");
             let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
 
@@ -1695,7 +1637,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
 
@@ -1740,16 +1681,24 @@ mod tests {
     /// whole seconds, so every other way of reaching expiry is a sleep
     /// (`TODO.md` #52).
     fn serving_stale(seconds: u64) -> (Arc<Resolving>, Clock) {
-        timed(StalePolicy::seconds(seconds), false)
+        timed(StalePolicy::seconds(seconds))
     }
 
-    fn timed(stale: StalePolicy, prefetch: bool) -> (Arc<Resolving>, Clock) {
-        timed_with_policy(stale, prefetch, PolicyZones::default())
+    fn timed(stale: StalePolicy) -> (Arc<Resolving>, Clock) {
+        timed_with(stale, test_resolver(), None, PolicyZones::default())
     }
 
-    fn timed_with_policy(
+    /// With `--prefetch` on, and the queue a refresh is offered to.
+    fn prefetching(resolver: Arc<Resolver>, zones: PolicyZones) -> (Arc<Resolving>, Clock, Queue) {
+        let (prefetch, queue) = crate::prefetch::channel(4);
+        let (serving, clock) = timed_with(StalePolicy::OFF, resolver, Some(prefetch), zones);
+        (serving, clock, queue)
+    }
+
+    fn timed_with(
         stale: StalePolicy,
-        prefetch: bool,
+        resolver: Arc<Resolver>,
+        prefetch: Option<Prefetch>,
         zones: PolicyZones,
     ) -> (Arc<Resolving>, Clock) {
         let clock = Clock::fixed(1_000_000_000);
@@ -1760,7 +1709,7 @@ mod tests {
         let caches = Caches::new(16, 4, stale, clock.clone());
         (
             Arc::new(Resolving {
-                resolver: test_resolver(),
+                resolver,
                 caches,
                 policy: PolicyStore::in_memory(zones),
                 prefetch,
@@ -1818,7 +1767,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
 
@@ -1844,7 +1792,7 @@ mod tests {
     /// Off is the default, and off means the answer is the failure.
     #[tokio::test]
     async fn without_the_flag_a_failed_resolution_is_servfail() {
-        let (serving, clock) = timed(StalePolicy::OFF, false);
+        let (serving, clock) = timed(StalePolicy::OFF);
         let name = nm("example.com.");
         serving.caches.answers.put(
             name.as_ref(),
@@ -1860,7 +1808,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::ServerFailure);
@@ -1887,7 +1834,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.answers[0].ttl.as_secs(), 300, "its own TTL, not 30");
@@ -1902,13 +1848,10 @@ mod tests {
     }
 
     /// The answer path's half of prefetching: a cache hit in its last tenth
-    /// comes back with the question to re-resolve, and the socket loop runs it
-    /// after the reply. Nothing here waits for it.
-    ///
-    /// Watched failing with `prefetch: false`: `refresh` was `None`.
+    /// offers the question to the queue. Nothing here waits for it.
     #[tokio::test]
     async fn a_nearly_expired_cache_hit_asks_for_a_refresh() {
-        let (serving, clock) = timed(StalePolicy::OFF, true);
+        let (serving, clock, mut queue) = prefetching(test_resolver(), PolicyZones::default());
         let name = nm("hot.example.com.");
         serving.caches.answers.put(
             name.as_ref(),
@@ -1926,10 +1869,10 @@ mod tests {
             Transport::Udp,
         )
         .await;
-        let reply = DnsMessage::try_from_bytes(&answered.reply.expect("answered from the cache"))
+        let reply = DnsMessage::try_from_bytes(&answered.expect("answered from the cache"))
             .expect("a well-formed reply");
-        assert_eq!(reply.answers.len(), 1, "the client is answered first");
-        let query = answered.refresh.expect("and the name is due a refresh");
+        assert_eq!(reply.answers.len(), 1, "the client is answered");
+        let query = queue.try_recv().expect("and the name is due a refresh");
         assert_eq!(query.qname, name);
 
         // The refresh itself: the upstream is unreachable, so this is about it
@@ -1945,21 +1888,77 @@ mod tests {
         );
     }
 
+    /// The sink closes when the reply is in it, not when the prefetch the
+    /// reply discovered has finished (`TODO.md` #114).
+    ///
+    /// DoH answers once the handler task is joined and DoQ sends FIN once the
+    /// sink closes, so for them this *is* the reply's latency. Against an
+    /// upstream that never answers, the refresh that used to run inside
+    /// `handle` held the sink open for 1.5 s after a reply ready in 0.9 ms.
+    /// Watched failing with a refresh put back after the reply in `handle`.
+    #[tokio::test]
+    async fn a_handler_is_done_when_its_reply_is_sent() {
+        use rdns_transport::tcp::{Handler, Reply};
+
+        let (resolver, _upstream) = silent_resolver();
+        let (serving, clock, mut queue) = prefetching(resolver, PolicyZones::default());
+        let name = nm("hot.example.com.");
+        serving.caches.answers.put(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![a_record(&name, 100)],
+        );
+        clock.advance(95);
+
+        let (out, mut sink) = tokio::sync::mpsc::channel::<Reply>(4);
+        let handling = tokio::spawn({
+            let serving = serving.clone();
+            async move {
+                serving
+                    .handle(
+                        query_for("hot.example.com.", 1, false),
+                        std::net::SocketAddr::new(TEST_PEER, 5353),
+                        current_unix_timestamp(),
+                        rdns::validation::Arrival::Tcp,
+                        out,
+                    )
+                    .await;
+            }
+        });
+
+        let done = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            assert!(matches!(sink.recv().await, Some(Reply::Frame(_))));
+            assert!(
+                sink.recv().await.is_none(),
+                "one reply, then the sink closes"
+            );
+            handling.await.expect("the handler did not panic");
+        })
+        .await;
+        assert!(
+            done.is_ok(),
+            "the handler waited on something after its reply"
+        );
+        assert_eq!(
+            queue.try_recv().map(|q| q.qname),
+            Some(name),
+            "and the refresh was queued rather than lost"
+        );
+    }
+
     /// A rewritten answer still asks for its prefetch.
     ///
-    /// `refresh` is set at the cache hit and read by the tail; the `rpz-ip`
+    /// `refresh` was set at the cache hit and read by the tail; the `rpz-ip`
     /// exit between them returned `reply.into()`, and `From<Option<Vec<u8>>>`
-    /// fills `refresh: None` — so one rule matching one address turned
+    /// filled `refresh: None` — so one rule matching one address turned
     /// prefetching off for that name with nothing to see (`TODO.md` #78a).
     /// §7's early return over a shared epilogue, with the epilogue in a
-    /// struct field.
+    /// struct field. Since #114 the offer is made at the lookup, before any
+    /// exit.
     #[tokio::test]
     async fn a_rewritten_answer_still_asks_for_its_refresh() {
-        let (serving, clock) = timed_with_policy(
-            StalePolicy::OFF,
-            true,
-            policy("10.0.2.0.198.rpz-ip IN CNAME .\n"),
-        );
+        let (serving, clock, mut queue) =
+            prefetching(test_resolver(), policy("10.0.2.0.198.rpz-ip IN CNAME .\n"));
         let name = nm("hot.example.com.");
         serving.caches.answers.put(
             name.as_ref(),
@@ -1985,15 +1984,15 @@ mod tests {
         )
         .await;
 
-        let reply = DnsMessage::try_from_bytes(&answered.reply.expect("answered"))
-            .expect("a well-formed reply");
+        let reply =
+            DnsMessage::try_from_bytes(&answered.expect("answered")).expect("a well-formed reply");
         assert_eq!(
             reply.rcode,
             ResponseCode::NoSuchDomain,
             "the rule rewrote the cached answer"
         );
         assert_eq!(
-            answered.refresh.map(|q| q.qname),
+            queue.try_recv().map(|q| q.qname),
             Some(name),
             "and the entry in its last tenth is still due a refresh"
         );
@@ -2008,9 +2007,8 @@ mod tests {
     /// lose the prefetch with the rewrite path.
     #[tokio::test]
     async fn a_dropped_answer_still_asks_for_its_refresh() {
-        let (serving, clock) = timed_with_policy(
-            StalePolicy::OFF,
-            true,
+        let (serving, clock, mut queue) = prefetching(
+            test_resolver(),
             policy(
                 "10.0.2.0.198.rpz-ip IN CNAME rpz-drop.
 ",
@@ -2041,14 +2039,14 @@ mod tests {
         )
         .await;
 
-        assert!(answered.reply.is_none(), "rpz-drop answers nothing");
-        assert_eq!(answered.refresh.map(|q| q.qname), Some(name));
+        assert!(answered.is_none(), "rpz-drop answers nothing");
+        assert_eq!(queue.try_recv().map(|q| q.qname), Some(name));
     }
 
     /// Without the switch there is nothing to run, whatever the TTL says.
     #[tokio::test]
     async fn without_the_switch_no_refresh_is_asked_for() {
-        let (serving, clock) = timed(StalePolicy::OFF, false);
+        let (serving, clock) = timed(StalePolicy::OFF);
         let name = nm("hot.example.com.");
         serving.caches.answers.put(
             name.as_ref(),
@@ -2064,8 +2062,11 @@ mod tests {
             Transport::Udp,
         )
         .await;
-        assert!(answered.reply.is_some());
-        assert!(answered.refresh.is_none());
+        assert!(answered.is_some());
+        assert!(
+            serving.prefetch.is_none(),
+            "and nothing to offer a refresh to"
+        );
     }
 
     fn with_dns64() -> Arc<Resolving> {
@@ -2073,7 +2074,7 @@ mod tests {
             resolver: test_resolver(),
             caches: Caches::new(16, 4, StalePolicy::OFF, rdns::clock::Clock::system()),
             policy: PolicyStore::in_memory(PolicyZones::default()),
-            prefetch: false,
+            prefetch: None,
             dns64: Some(
                 rdns::dns64::Dns64::new(rdns::dns64::Nat64Prefix::well_known(), &[])
                     .expect("the Well-Known Prefix"),
@@ -2147,7 +2148,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply")
     }
@@ -2335,7 +2335,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         // `query_for` asks for A; the PTR rewrite is about the name, so ask
@@ -2364,7 +2363,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::Ok);
@@ -2443,7 +2441,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
@@ -2511,7 +2508,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::Ok);
@@ -2561,7 +2557,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::ServerFailure);
@@ -2604,8 +2599,7 @@ mod tests {
             &serving,
             transport,
         )
-        .await
-        .reply?;
+        .await?;
         Some(DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply"))
     }
 
@@ -2657,7 +2651,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         let edns = reply.edns.as_ref().expect("the OPT is mirrored");
@@ -2685,7 +2678,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::Ok);
@@ -2717,8 +2709,7 @@ mod tests {
             &serving,
             Transport::Udp,
         )
-        .await
-        .reply;
+        .await;
         assert!(reply.is_none(), "rpz-drop means no reply at all");
         assert_eq!(
             serving
@@ -2796,7 +2787,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
@@ -2869,7 +2859,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered from the cache");
         assert!(
             bytes.len() <= cap,
@@ -2907,7 +2896,6 @@ mod tests {
                 Transport::Udp,
             )
             .await
-            .reply
             .expect("localhost is answered from the table");
             let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
             assert!(!reply.answers.is_empty(), "the ordinary answer path");
@@ -2933,7 +2921,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered, not dropped");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::FormatError);
@@ -2972,7 +2959,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered, not dropped");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::FormatError);
@@ -3005,7 +2991,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("answered, not dropped");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
         assert_eq!(reply.rcode, ResponseCode::FormatError);
@@ -3037,7 +3022,6 @@ mod tests {
                 Transport::Udp,
             )
             .await
-            .reply
             .expect("answered from the table");
         }
         // Not a question at all: dropped, and counted as an error rather than
@@ -3050,7 +3034,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .is_none());
 
         let stats = serving.ctx.logger.take_stats(now + 60);
@@ -3114,7 +3097,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("the policy answered");
         let reply = DnsMessage::try_from_bytes(&reply).expect("parses");
         assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
@@ -3176,7 +3158,6 @@ mod tests {
             Transport::Udp,
         )
         .await
-        .reply
         .expect("the policy answered");
         let reply = DnsMessage::try_from_bytes(&reply).expect("parses");
         assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);

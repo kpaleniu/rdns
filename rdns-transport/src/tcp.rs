@@ -100,6 +100,10 @@ pub trait Handler: Send + Sync + 'static {
     /// the socket is three layers below it: what the connection hid, which
     /// RFC 9103 §11 needs to decide whether a transfer may be answered, and
     /// which protocol carried it, which a dnstap reader displays.
+    ///
+    /// Return once the last reply is in `out`. DoH answers when this returns
+    /// and DoQ sends FIN when `out` drops, so work done here after the reply is
+    /// the client's latency on those two (`TODO.md` #114).
     fn handle(
         &self,
         packet: Vec<u8>,

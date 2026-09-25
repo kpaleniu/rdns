@@ -17,6 +17,7 @@ mod allocations;
 mod anchors;
 mod answer;
 mod config;
+mod prefetch;
 mod reload;
 mod rpz_transfer;
 mod serve;
@@ -107,6 +108,12 @@ fn default_cache_size() -> usize {
 }
 fn default_max_inflight_udp() -> usize {
     MAX_INFLIGHT_UDP
+}
+fn default_prefetch_workers() -> usize {
+    16
+}
+fn default_prefetch_queue() -> usize {
+    256
 }
 fn default_query_rate() -> u32 {
     200
@@ -410,15 +417,23 @@ struct Cli {
     /// Re-resolve a cached name in the last tenth of its TTL, so a popular
     /// name never makes a client wait for the walk (Unbound's `prefetch`).
     ///
-    /// The refresh runs in the task that just answered, after the reply is
-    /// sent, and at most one is started per cache entry — a popular name in its
-    /// last tenth costs one upstream query and not one per client.
+    /// The refresh is queued for a pool of its own, and at most one is started
+    /// per cache entry — a popular name in its last tenth costs one upstream
+    /// query and not one per client.
     ///
     /// Off by default: it turns a client's query into two, for a name nobody
     /// may ask for again, and `dns_prefetches_total` against
     /// `dns_cache_hits_total` is how an operator decides whether that pays.
     #[arg(long, conflicts_with = "config")]
     prefetch: bool,
+    /// How many prefetches may resolve at once. 0 is floored to 1.
+    #[arg(long, value_name = "WALKS", default_value_t = default_prefetch_workers(), conflicts_with = "config", requires = "prefetch")]
+    prefetch_workers: usize,
+    /// How many prefetches may wait for a worker. Past it one is dropped and
+    /// counted in `dns_prefetches_dropped_total`: the entry expires and the
+    /// next client for it resolves it. 0 is floored to 1.
+    #[arg(long, value_name = "NAMES", default_value_t = default_prefetch_queue(), conflicts_with = "config", requires = "prefetch")]
+    prefetch_queue: usize,
     /// What a policy zone's rules mean, when it should not be taken at its
     /// word: given, disabled, passthru, drop, nxdomain, nodata or tcp-only.
     ///
@@ -1002,11 +1017,17 @@ async fn main() -> anyhow::Result<()> {
     // One handle for every listener: the four encrypted ones each built their
     // own copy of the same three fields, and a fourth field to add is a fourth
     // place to forget it (`CLAUDE.md` §7).
+    let (prefetch, prefetch_queue) = if cli.prefetch {
+        let (prefetch, queue) = prefetch::channel(cli.prefetch_queue);
+        (Some(prefetch), Some(queue))
+    } else {
+        (None, None)
+    };
     let serving = Arc::new(Resolving {
         resolver,
         caches,
         policy,
-        prefetch: cli.prefetch,
+        prefetch,
         dns64,
         rpz_notify,
         feed_wakes,
@@ -1021,6 +1042,14 @@ async fn main() -> anyhow::Result<()> {
         shutdown.stop_handle(),
         shutdown.busy(),
     ));
+    if let Some(queue) = prefetch_queue {
+        loops.spawn(prefetch::run(
+            queue,
+            serving.clone(),
+            cli.prefetch_workers,
+            shutdown.stop_handle(),
+        ));
+    }
     // Per connection, not per message: a resolver's clients open a connection
     // and ask a few things (`TODO.md` #30e).
     loops.spawn(tcp::serve(
