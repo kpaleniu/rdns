@@ -176,7 +176,8 @@ pub(crate) enum ZoneSource {
 
 impl ZoneSource {
     /// The file a zone's records live in, or `None` if this source has none for
-    /// it.
+    /// it. `Err` is a directory that could not be read, which is a server
+    /// failure rather than an absence (`TODO.md` #119).
     ///
     /// Derived by the same function the loader uses, not reconstructed at the
     /// call site: a write landing anywhere but where the next load reads from is
@@ -186,25 +187,32 @@ impl ZoneSource {
     /// The directory case scans rather than composing `<dir>/<origin>.zone`:
     /// `enumerate_zone_files` derives each origin from its *file name*, and a
     /// zone's own `$ORIGIN` may say something else.
-    pub(crate) fn file_for(&self, origin: &str) -> Option<PathBuf> {
+    pub(crate) fn file_for(&self, origin: &str) -> std::io::Result<Option<PathBuf>> {
         let wanted = absolute_name(origin);
         let matches = |candidate: &str| absolute_name(candidate).eq_ignore_ascii_case(&wanted);
         match self {
             ZoneSource::SingleFile(path) => {
-                matches(&rdns::zone::origin_from_path(path)).then(|| PathBuf::from(path))
+                Ok(matches(&rdns::zone::origin_from_path(path)).then(|| PathBuf::from(path)))
             }
-            ZoneSource::Files(files) => files
+            ZoneSource::Files(files) => Ok(files
                 .iter()
                 .find(|(zone, _)| matches(zone))
-                .map(|(_, path)| PathBuf::from(path)),
-            ZoneSource::Directory(dir) => std::fs::read_dir(dir)
-                .ok()?
-                .flatten()
-                .map(|entry| entry.path())
-                .find(|path| {
-                    path.extension().and_then(|s| s.to_str()) == Some("zone")
+                .map(|(_, path)| PathBuf::from(path))),
+            // Every entry error propagated, as `enumerate_zone_files` does: a
+            // skipped entry could be this zone's file.
+            ZoneSource::Directory(dir) => {
+                let named =
+                    |e: std::io::Error| std::io::Error::new(e.kind(), format!("{dir}: {e}"));
+                for entry in std::fs::read_dir(dir).map_err(named)? {
+                    let path = entry.map_err(named)?.path();
+                    if path.extension().and_then(|s| s.to_str()) == Some("zone")
                         && matches(&rdns::zone::origin_from_path(&path.to_string_lossy()))
-                }),
+                    {
+                        return Ok(Some(path));
+                    }
+                }
+                Ok(None)
+            }
         }
     }
 }

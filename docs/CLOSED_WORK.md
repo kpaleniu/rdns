@@ -10151,3 +10151,107 @@ function added: the assertions extend the existing NOTAUTH test. Clippy clean on
 both, and `cargo doc --workspace --no-deps` clean.
 
 ---
+
+### 119. Two UPDATE refusals no test reaches, and one that reports an I/O error as absence — **filed 2026-09-25, closed 2026-09-25**
+
+`answer_update` has twelve exits (`dispatch.rs:1199-1422`).
+
+- **Reached by a test through `answer_update`**: unsigned, key scope,
+  NOTAUTH, no writable source (`:3921`), success.
+- **Tested below it**: the parse and prerequisite rcodes it passes through
+  (`rdns::update`); the `$INCLUDE` refusal, through `apply_update_to_file`
+  (`:2373`).
+- **Tested nowhere**:
+  - the replicated-zone refusal (`:1262-1275`, EDE `REPLICATED_ZONE`);
+  - the no-file refusal (`:1293-1305`, `NOT_WRITABLE`);
+  - the two SERVFAILs (`:1349`, `:1384`).
+
+No test asserts either EDE. A grep of `rdnsd` for both constant names and both
+log texts finds only their definitions and use sites.
+
+The transfer ladder counted the same way has no such gap:
+
+| Transfer branch | Tests |
+|---|---|
+| certificates | `:3266-3320` |
+| keys | `:3367-3426` |
+| TLS-only | `:4024` |
+| one-message transport | `:3095-3176` |
+| NOTAUTH | `:2812-2848` |
+
+`ZoneSource::file_for` (`zones.rs:189-209`) is the no-file branch's only
+caller. Its `Directory` arm is `std::fs::read_dir(dir).ok()?` followed by
+`.flatten()` over entries. So an unreadable zone directory answers "REFUSED:
+no zone file to write it back to", which is §4's first example. It is the only
+`.ok()` on a filesystem call in the seven crates' `src` (multiline grep; the
+two single-line hits, `control.rs:859` and `dnstap.rs:478`, are in tests).
+
+~~Nothing here is wrong on the wire today.~~ **Wrong** (groomed 2026-09-25):
+the `.ok()?` is. RFC 2136 §4.5-§4.6 give the two rcodes different client
+behaviour: on SERVFAIL the requestor "will delete the unusable server from its
+internal name server list and try the next one"; on anything else it "returns
+an appropriate response to its caller". REFUSED for a disk error ends the
+update at a server that could not attempt it.
+
+**Decided: SERVFAIL, no EDE.**
+
+- RFC 2136 §2.2 defines SERVFAIL as "an internal failure while processing this
+  request, for example an operating system error", and §3.4.2.1 names "a
+  hardware error in persistent storage".
+- The tree already answers it one level down: `apply_update_to_file`'s
+  `std::fs::read(path)` (`dispatch.rs:1610-1612`) maps a failed read of the
+  zone file to `UpdateFailure::System`, SERVFAIL. The directory above it
+  answering REFUSED is the same failure spelled twice (§7).
+- The loader reading the same directory, `enumerate_zone_files`
+  (`zones.rs:1585`), propagates both `read_dir` and the per-entry error with
+  `?`. `file_for`'s `.flatten()` skips a failed entry, which could be the
+  zone's file, so the entry errors go the same way.
+- Refuting check: is there a directory error that means "no file"? A missing
+  directory is not one — the next reload fails on it
+  (`std::fs::read_dir(dir)?`), so the server is broken, not unconfigured.
+  Readable directory, file gone, stays `Ok(None)` and REFUSED `NOT_WRITABLE`,
+  since the operator removed the zone's source.
+- No EDE: the `System` SERVFAIL carries none, and the text would describe the
+  server's disk to a client.
+
+**Remedy:**
+
+1. `ZoneSource::file_for` returns `std::io::Result<Option<PathBuf>>`.
+   `Directory`: `read_dir(dir)?`, each entry `?`, as `enumerate_zone_files`
+   does. The other two arms wrap in `Ok`. Doc: `Err` is the directory, `None`
+   is the configuration.
+2. `answer_update`: `Err(e)` → `serving_error!` with the path and `e`, SERVFAIL,
+   no EDE, `Some(session)` — as the `System` arm at `:1382-1389`. Update the
+   `refused` comment's count ("eleven ways out") to what it is after this.
+3. Tests, through `answer_update` over `spawn_updatable_with`'s harness, all
+   with a key granting `UpdatePolicy::Any`:
+   - **replicated**: the same server plus `.with_secondaries` from
+     `Secondaries::replicating` naming `example.com.` (as `:2747`). REFUSED,
+     EDE `REPLICATED_ZONE`'s text, file unchanged.
+   - **no file**: load, then delete `example.com.zone`. REFUSED, EDE
+     `NOT_WRITABLE`'s text.
+   - **unreadable directory**: load, then `remove_dir_all` the directory — a
+     portable `read_dir` failure; mode 000 is not, and root ignores it.
+     SERVFAIL. Show it REFUSED against the current `.ok()?` first (§1).
+   - **System SERVFAIL**: load, then overwrite the file with text that does
+     not parse. SERVFAIL, and the served zone unchanged.
+   The EDE tests set `Edns` on the request, as
+   `a_refused_update_says_why_when_the_client_used_edns` (`:3803`) does.
+4. Not tested, and saying so in the row that closes this: the task-failure
+   SERVFAIL (`:1349`) is reached only by a panic in `apply_update_to_file`.
+   Nothing to inject one with.
+
+Done as remedied, all four items. The log line names the directory rather
+than the zone's path, which is not known until the directory is read.
+`spawn_updatable_with` was split into `updatable_server` and
+`listen_updatable` so the replicated test could add `with_secondaries`.
+
+The unreadable-directory test failed against `.ok()?` with `(Refused, ["this
+server has nowhere to write this zone back to"])`. The other three passed
+against the old code, as expected: they cover branches that were correct but
+untested.
+
+Verified: 1 324 passed on Windows and 1 345 on Linux, 0 failed, four new tests
+on each. Clippy clean on both, `cargo doc --workspace --no-deps` clean.
+
+---

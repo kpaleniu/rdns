@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, **#119**, plus **#21**, as of 2026-09-25.
-#107-#118 are closed. #117-#119 came out of a fourth architecture review that
+**#58**, **#68**, plus **#21**, as of 2026-09-25.
+#107-#119 are closed. #117-#119 came out of a fourth architecture review that
 day and were groomed against the code before filing.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
@@ -6829,97 +6829,6 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 119. Two UPDATE refusals no test reaches, and one that reports an I/O error as absence — **filed 2026-09-25**, **ready-for-agent**
-
-`answer_update` has twelve exits (`dispatch.rs:1199-1422`).
-
-- **Reached by a test through `answer_update`**: unsigned, key scope,
-  NOTAUTH, no writable source (`:3921`), success.
-- **Tested below it**: the parse and prerequisite rcodes it passes through
-  (`rdns::update`); the `$INCLUDE` refusal, through `apply_update_to_file`
-  (`:2373`).
-- **Tested nowhere**:
-  - the replicated-zone refusal (`:1262-1275`, EDE `REPLICATED_ZONE`);
-  - the no-file refusal (`:1293-1305`, `NOT_WRITABLE`);
-  - the two SERVFAILs (`:1349`, `:1384`).
-
-No test asserts either EDE. A grep of `rdnsd` for both constant names and both
-log texts finds only their definitions and use sites.
-
-The transfer ladder counted the same way has no such gap:
-
-| Transfer branch | Tests |
-|---|---|
-| certificates | `:3266-3320` |
-| keys | `:3367-3426` |
-| TLS-only | `:4024` |
-| one-message transport | `:3095-3176` |
-| NOTAUTH | `:2812-2848` |
-
-`ZoneSource::file_for` (`zones.rs:189-209`) is the no-file branch's only
-caller. Its `Directory` arm is `std::fs::read_dir(dir).ok()?` followed by
-`.flatten()` over entries. So an unreadable zone directory answers "REFUSED:
-no zone file to write it back to", which is §4's first example. It is the only
-`.ok()` on a filesystem call in the seven crates' `src` (multiline grep; the
-two single-line hits, `control.rs:859` and `dnstap.rs:478`, are in tests).
-
-~~Nothing here is wrong on the wire today.~~ **Wrong** (groomed 2026-09-25):
-the `.ok()?` is. RFC 2136 §4.5-§4.6 give the two rcodes different client
-behaviour: on SERVFAIL the requestor "will delete the unusable server from its
-internal name server list and try the next one"; on anything else it "returns
-an appropriate response to its caller". REFUSED for a disk error ends the
-update at a server that could not attempt it.
-
-**Decided: SERVFAIL, no EDE.**
-
-- RFC 2136 §2.2 defines SERVFAIL as "an internal failure while processing this
-  request, for example an operating system error", and §3.4.2.1 names "a
-  hardware error in persistent storage".
-- The tree already answers it one level down: `apply_update_to_file`'s
-  `std::fs::read(path)` (`dispatch.rs:1610-1612`) maps a failed read of the
-  zone file to `UpdateFailure::System`, SERVFAIL. The directory above it
-  answering REFUSED is the same failure spelled twice (§7).
-- The loader reading the same directory, `enumerate_zone_files`
-  (`zones.rs:1585`), propagates both `read_dir` and the per-entry error with
-  `?`. `file_for`'s `.flatten()` skips a failed entry, which could be the
-  zone's file, so the entry errors go the same way.
-- Refuting check: is there a directory error that means "no file"? A missing
-  directory is not one — the next reload fails on it
-  (`std::fs::read_dir(dir)?`), so the server is broken, not unconfigured.
-  Readable directory, file gone, stays `Ok(None)` and REFUSED `NOT_WRITABLE`,
-  since the operator removed the zone's source.
-- No EDE: the `System` SERVFAIL carries none, and the text would describe the
-  server's disk to a client.
-
-**Remedy:**
-
-1. `ZoneSource::file_for` returns `std::io::Result<Option<PathBuf>>`.
-   `Directory`: `read_dir(dir)?`, each entry `?`, as `enumerate_zone_files`
-   does. The other two arms wrap in `Ok`. Doc: `Err` is the directory, `None`
-   is the configuration.
-2. `answer_update`: `Err(e)` → `serving_error!` with the path and `e`, SERVFAIL,
-   no EDE, `Some(session)` — as the `System` arm at `:1382-1389`. Update the
-   `refused` comment's count ("eleven ways out") to what it is after this.
-3. Tests, through `answer_update` over `spawn_updatable_with`'s harness, all
-   with a key granting `UpdatePolicy::Any`:
-   - **replicated**: the same server plus `.with_secondaries` from
-     `Secondaries::replicating` naming `example.com.` (as `:2747`). REFUSED,
-     EDE `REPLICATED_ZONE`'s text, file unchanged.
-   - **no file**: load, then delete `example.com.zone`. REFUSED, EDE
-     `NOT_WRITABLE`'s text.
-   - **unreadable directory**: load, then `remove_dir_all` the directory — a
-     portable `read_dir` failure; mode 000 is not, and root ignores it.
-     SERVFAIL. Show it REFUSED against the current `.ok()?` first (§1).
-   - **System SERVFAIL**: load, then overwrite the file with text that does
-     not parse. SERVFAIL, and the served zone unchanged.
-   The EDE tests set `Edns` on the request, as
-   `a_refused_update_says_why_when_the_client_used_edns` (`:3803`) does.
-4. Not tested, and saying so in the row that closes this: the task-failure
-   SERVFAIL (`:1349`) is reached only by a panic in `apply_update_to_file`.
-   Nothing to inject one with.
-
----
-
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -7113,6 +7022,7 @@ the week; the record is under "How the queue kept going stale" in
 | **116** | `rdnsd`'s answering tests were in the crate root | **filed 2026-09-24, closed 2026-09-25**. The harness was the only thing holding them: a root-private item is visible to every descendant (§17), so moving the tests widened nothing. 58 of 90 moved by subject — 23 to `dispatch`, 15 to `replication` (which had none), 13 to `answer`, 7 to `zones` — and 32 stay because they test root items, the reload cluster among them (#83). 17 fixtures to `testutil`; `zone_text(serial)` became `zone_at_serial` to stop it clashing with `dispatch`'s benchmark helper. Three docs older than the change were wrong, `Server::serve_connection` among them. Same 210 test names, same totals. See `docs/CLOSED_WORK.md` |
 | **117** | `refresh` claimed the query path's storing; prefetch and DNS64 never fed the denial cache | **filed and closed 2026-09-25**. The reason given for storing less was about the reply, not the cache. `Caches::store` holds the four rules and both writers call it. Regression test: a refreshed Secure NXDOMAIN answers the rest of its NSEC gap with no second upstream query, asked twice with the old storing restored. `testutil::SignedZone` is the first Secure resolution `rdnsr`'s tests can reach. Declined: DNS64 consulting the denial cache, since CD would have to be passed in to agree. See `docs/CLOSED_WORK.md` |
 | **118** | `answer_update` checked permission before the zone, and its doc claimed the RFC's order | **filed and closed 2026-09-25**. BIND, Knot and PowerDNS read: all check permission before §3.2, two of three check the zone before permission. Now zone → permission → prerequisites, so an unsigned or wrongly scoped UPDATE for a zone not served is NOTAUTH. The conformance row lists the two deviations, one of them the replicated-zone REFUSED where §3.1.1 forwards. See `docs/CLOSED_WORK.md` |
+| **119** | two UPDATE refusals no test reached, and an unreadable zone directory answered REFUSED | **filed and closed 2026-09-25**. SERVFAIL now, as a failed read of the zone file already was: RFC 2136 §4.6 sends the client to the next server on SERVFAIL and ends the update on REFUSED. `file_for` propagates `read_dir` and entry errors as the loader does. Four tests; the task-failure SERVFAIL stays untested, reachable only by a panic. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 

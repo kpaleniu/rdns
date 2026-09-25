@@ -1186,7 +1186,7 @@ impl Server {
         max_len: usize,
     ) -> Option<Vec<u8>> {
         let ip = peer.ip();
-        // One for all eleven ways out of this function, for the reason
+        // One for all thirteen ways out of this function, for the reason
         // `answer_transfer` builds its own.
         let refused = Refused {
             msg,
@@ -1290,18 +1290,36 @@ impl Server {
                 Some(session),
             );
         };
-        let Some(path) = source.file_for(&zone_name.as_ref().to_presentation()) else {
-            serving_error!(
-                self.ctx.logger,
-                ip,
-                "UPDATE of {zone_name} REFUSED: no zone file to write it back to"
-            );
-            return self.signed_error(
-                refused,
-                ResponseCode::Refused,
-                Some(NOT_WRITABLE),
-                Some(session),
-            );
+        let path = match source.file_for(&zone_name.as_ref().to_presentation()) {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                serving_error!(
+                    self.ctx.logger,
+                    ip,
+                    "UPDATE of {zone_name} REFUSED: no zone file to write it back to"
+                );
+                return self.signed_error(
+                    refused,
+                    ResponseCode::Refused,
+                    Some(NOT_WRITABLE),
+                    Some(session),
+                );
+            }
+            // SERVFAIL, not the REFUSED above: RFC 2136 §4.6 sends the client
+            // to another server on SERVFAIL, and ends the update on REFUSED.
+            Err(e) => {
+                serving_error!(
+                    self.ctx.logger,
+                    ip,
+                    "UPDATE of {zone_name} failed: reading the zone directory: {e}"
+                );
+                return self.signed_error(
+                    refused,
+                    ResponseCode::ServerFailure,
+                    None,
+                    Some(session),
+                );
+            }
         };
 
         // §3.7's serialization, held across the whole read-modify-write — and
@@ -3459,24 +3477,34 @@ pub(crate) mod tests {
         journal: Option<Arc<rdns::journal::Journal>>,
         dnstap: Option<crate::dnstap::Sink>,
     ) -> SocketAddr {
+        listen_updatable(
+            updatable_server(dir, key)
+                .with_history(Arc::new(RwLock::new(DeltaLog::new())), journal)
+                .with_dnstap(dnstap),
+        )
+        .await
+    }
+
+    /// [`spawn_updatable`]'s server, before it listens, for a test that needs
+    /// one more piece of configuration.
+    fn updatable_server(dir: &Path, key: TsigKey) -> Server {
         std::fs::write(dir.join("example.com.zone"), UPDATE_ZONE).expect("write the zone file");
         let source = ZoneSource::Directory(dir.to_string_lossy().to_string());
         let zones = load_zones(&source, false, false, None)
             .map(|l| l.zones)
             .expect("load");
 
-        let server = Arc::new(
-            Server::new(Arc::new(RwLock::new(Zones::new(zones))), test_context())
-                .with_tsig_keys(TsigKeyring::new(vec![key]))
-                .with_history(Arc::new(RwLock::new(DeltaLog::new())), journal)
-                .with_updates(UpdateHandling::new(
-                    source,
-                    None,
-                    Arc::new(DnssecValidator::new(false)),
-                ))
-                .with_dnstap(dnstap),
-        );
+        Server::new(Arc::new(RwLock::new(Zones::new(zones))), test_context())
+            .with_tsig_keys(TsigKeyring::new(vec![key]))
+            .with_updates(UpdateHandling::new(
+                source,
+                None,
+                Arc::new(DnssecValidator::new(false)),
+            ))
+    }
 
+    async fn listen_updatable(server: Server) -> SocketAddr {
+        let server = Arc::new(server);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
@@ -3941,6 +3969,123 @@ pub(crate) mod tests {
             ResponseCode::Refused,
             "a key that grants everything still cannot write a zone we cannot persist"
         );
+    }
+
+    /// A signed UPDATE of `example.com.` adding `new.example.com.`, asking for
+    /// EDE, and the reply's rcode and extended errors.
+    async fn update_with_edns(addr: SocketAddr, key: &TsigKey) -> (ResponseCode, Vec<String>) {
+        let mut asked = update_message(
+            "example.com.",
+            vec![a_record("new.example.com.", "192.0.2.50")],
+        );
+        asked.set_edns(rdns::Edns::with_payload_size(4096));
+        let bytes = asked.to_bytes_within(4096).expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, key, tsig::now()).expect("sign");
+        let reply = round_trip(addr, signed).await;
+        let texts = match reply.edns.as_ref() {
+            Some(edns) => rdns::ExtendedError::all_in(edns)
+                .expect("a well-formed option list")
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect(),
+            None => Vec::new(),
+        };
+        (reply.rcode, texts)
+    }
+
+    /// An UPDATE of a zone this server replicates is refused, whatever the key
+    /// grants: the master's next transfer would undo it.
+    #[tokio::test]
+    async fn an_update_of_a_replicated_zone_is_refused() {
+        let dir = ScratchDir::new("update-replicated");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let secondaries = Secondaries::replicating(&[rdns::secondary::MasterSpec {
+            zone: nm("example.com."),
+            master: "192.0.2.1:53".parse().expect("a test address"),
+            key_name: None,
+            tls: None,
+        }]);
+        let addr = listen_updatable(
+            updatable_server(dir.path(), key.clone()).with_secondaries(Arc::new(secondaries)),
+        )
+        .await;
+
+        assert_eq!(
+            update_with_edns(addr, &key).await,
+            (
+                ResponseCode::Refused,
+                vec![REPLICATED_ZONE.extra_text().to_string()]
+            )
+        );
+        let written = std::fs::read_to_string(dir.join("example.com.zone")).expect("read back");
+        assert!(!written.contains("new.example.com."), "{written}");
+    }
+
+    /// A readable directory without the zone's file: the operator removed the
+    /// source, so there is nowhere to write the change and nothing failed.
+    #[tokio::test]
+    async fn an_update_whose_zone_file_is_gone_is_refused() {
+        let dir = ScratchDir::new("update-no-file");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let addr = spawn_updatable(dir.path(), key.clone()).await;
+        std::fs::remove_file(dir.join("example.com.zone")).expect("remove the zone file");
+
+        assert_eq!(
+            update_with_edns(addr, &key).await,
+            (
+                ResponseCode::Refused,
+                vec![NOT_WRITABLE.extra_text().to_string()]
+            )
+        );
+    }
+
+    /// A zone directory that cannot be read is a server failure, not a refusal
+    /// (RFC 2136 §2.2: "for example an operating system error"). The client
+    /// acts on the difference: SERVFAIL sends it to the next server, anything
+    /// else ends the update (§4.5, §4.6).
+    ///
+    /// Removed rather than chmod'ed: a mode does not stop root, and Windows
+    /// has none. Watched failing against `file_for`'s `read_dir(dir).ok()?`,
+    /// which answered REFUSED with `NOT_WRITABLE` (`TODO.md` #119).
+    #[tokio::test]
+    async fn an_update_when_the_zone_directory_cannot_be_read_is_servfail() {
+        let dir = ScratchDir::new("update-no-dir");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let addr = spawn_updatable(dir.path(), key.clone()).await;
+        std::fs::remove_dir_all(dir.path()).expect("remove the zone directory");
+
+        assert_eq!(
+            update_with_edns(addr, &key).await,
+            (ResponseCode::ServerFailure, Vec::new())
+        );
+    }
+
+    /// A zone file that no longer parses fails the UPDATE (§3.4.2.1) and
+    /// leaves the served zone as it was.
+    #[tokio::test]
+    async fn an_update_to_a_zone_file_that_no_longer_parses_is_servfail() {
+        let dir = ScratchDir::new("update-unparsable");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let addr = spawn_updatable(dir.path(), key.clone()).await;
+        std::fs::write(
+            dir.join("example.com.zone"),
+            "this is not a zone
+",
+        )
+        .expect("overwrite the zone file");
+
+        assert_eq!(
+            update_with_edns(addr, &key).await,
+            (ResponseCode::ServerFailure, Vec::new())
+        );
+        let asked = round_trip(
+            addr,
+            query("www.example.com.", Qtype::of(record_types::A), false)
+                .to_bytes_within(4096)
+                .expect("serialize"),
+        )
+        .await;
+        assert_eq!(asked.answers.len(), 1, "still serving: {:?}", asked.answers);
     }
 
     /// An UPDATE leaves a journal, and the journal answers an IXFR from

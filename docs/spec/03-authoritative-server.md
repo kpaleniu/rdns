@@ -185,7 +185,7 @@ mirrored OPT and the TSIG, TC=1, RCODE 0.
 | NOTIMP | any opcode but QUERY, NOTIFY and UPDATE |
 | REFUSED | a class we do not serve; a name in no zone we hold; a transfer the ACL or key scope denies, or one not over TLS 1.3 under `--transfer-tls-only`; an UPDATE that is unsigned, outside its key's scope, for a zone we replicate, or for a zone we cannot write — including one whose file `$INCLUDE`s another |
 | NOTAUTH | a transfer or NOTIFY for a zone not served here; a TSIG that did not verify; an UPDATE for a zone we are not authoritative for (RFC 2136 §3.1.1) |
-| SERVFAIL | a transfer that would not build or serialize; an UPDATE that could not be read, written or signed (RFC 2136 §3.4.2.1) |
+| SERVFAIL | a transfer that would not build or serialize; an UPDATE that could not be read, written or signed (RFC 2136 §3.4.2.1), or whose zone directory could not be read |
 | BADVERS | EDNS version > 0 |
 | NOTZONE | an UPDATE record outside the zone its own Zone section names (RFC 2136 §3.4.1) |
 | YXDOMAIN, YXRRSET, NXRRSET | the other three UPDATE prerequisite failures (RFC 2136 §3.2) |
@@ -473,7 +473,7 @@ On both transports. `rdns::update` reads the message and applies the changes;
 | §3.3 | the request is TSIG-signed | REFUSED |
 | §3.3 | the key's own update scope covers this apex | REFUSED |
 | — | the zone is not one this server *replicates* | REFUSED |
-| — | the zone has a file this server can write | REFUSED |
+| — | the zone has a file this server can write | REFUSED; SERVFAIL if the zone directory cannot be read |
 | §3.2 | every prerequisite holds | NXRRSET / YXRRSET / NXDOMAIN / YXDOMAIN |
 | §3.4.2 | apply | NOERROR, or SERVFAIL on a system failure (§3.4.2.1) |
 
@@ -486,6 +486,10 @@ served here is NOTAUTH too: the rcode tells a client whether to change server
 or key. Permission is checked before §3.2, where RFC 2136 lists it after,
 because prerequisites answer NXDOMAIN/YXDOMAIN about the zone's contents. BIND,
 Knot and PowerDNS order both the same way (`TODO.md` #118).
+
+A zone directory that cannot be read is SERVFAIL, not the REFUSED of a zone
+with no file: RFC 2136 §4.6 sends a client to the next server on SERVFAIL and
+ends the update on anything else (`TODO.md` #119).
 
 ### Authorization
 
