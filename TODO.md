@@ -37,9 +37,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, plus **#21**, as of 2026-09-25 — the
-seven filed out of the architecture review are closed, nine more were filed,
-and #107-#116 are closed out of the triage passes.
+**#58**, **#68**, **#117**, **#118**, **#119**, plus **#21**, as of
+2026-09-25. #107-#116 are closed; #117-#119 came out of a fourth architecture
+review that day, groomed against the code before filing.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -6826,6 +6826,123 @@ refused however small the zone, and was watched failing against the unfixed
 predicate — where it transferred the whole fixture. 1 302 tests on Windows
 (1 300 before) and 1 323 on Linux, clippy clean on both, `cargo doc` and
 `cargo fmt --check` clean.
+
+---
+
+### 117. `refresh` says it stores what an ordinary resolution stores; the function it calls says it does not — **filed 2026-09-25**, **ready-for-human**
+
+Two doc comments from one commit (`7d1cb33`, #45c) contradict each other:
+
+- `rdnsr/src/answer.rs:810`, on `refresh`: "The result goes through the same
+  storing as an ordinary resolution, because it *is* one".
+- `:737-740`, on `resolve_and_store`, which `refresh` calls: "Not the main
+  answer path's storing, which also has a client to fail closed for, a CD bit
+  to honour and denial proofs to keep; what is shared is what these two need".
+
+The second is what the code does. The query path (`:505-533`) stores into
+`answers`, `negatives`, and — when Secure — `denials`: `insert_validated` for
+an empty answer, `insert_validated_wildcard` for a non-empty one (RFC 8198
+§5.3). `resolve_and_store` (`:758-775`) stores into the first two.
+`cached_or_resolve` (`:785`), DNS64's lookup, reads `answers` and `negatives`
+and never `denials`, which the query path tries first (`:368-400`).
+
+Measured:
+
+- `insert_validated*` has two production call sites, both on the query path
+  (`:526`, `:532`).
+- The omission predates DNS64: `refresh` at `7d1cb33^` stored the same two
+  caches, so a prefetch has never fed the denial cache. The DNS64 commit wrote
+  the second doc comment, which made it a stated choice.
+- A prefetch is offered only from an answer-cache hit (`:415-422`), so what a
+  refresh can fail to keep is a Secure wildcard answer, or a Secure NXDOMAIN for
+  a name that has since gone. DNS64's A query can miss either.
+- No test in `answer.rs` stores into the denial cache through any path; the
+  test module's hits for `denials`, `insert_validated` and `synthesize` are
+  DNS64 tests.
+
+No client gets a wrong answer. What is lost is RFC 8198 coverage for what the
+two paths that ask on nobody's behalf learn.
+
+The decision is whether "what these two need" is right, and one doc comment
+is wrong either way. The review proposed deepening `Caches` so one store and
+one lookup serve all three sites. That proposal is recorded here and not
+costed; it only follows if the answer is yes.
+
+---
+
+### 118. `answer_update`'s doc states an RFC check order the code does not follow — **filed 2026-09-25**, **ready-for-human**
+
+- `rdnsd/src/dispatch.rs:1173-1176`: "The check order is the RFC's, each one
+  keeping the next from running: §3.1 reads the message, §3.1.1 asks whether
+  the zone is ours, §3.3 whether the requestor may write it, §3.2 checks the
+  prerequisites".
+- The code runs §3.1 (`:1196`), then §3.3 — unsigned (`:1208`), key scope
+  (`:1219`) — then §3.1.1 (`:1244`), replicated, writable, then §3.2.
+- RFC 2136's order is §3.1, §3.2, §3.3, §3.4, and §3.3.2 places the
+  permission check: "this is the point in the server's processing where such
+  performance should take place, since if a REFUSED condition is encountered
+  after an update has been partially applied, it will be necessary to undo the
+  partial update". Neither the doc's order nor the code's is the RFC's.
+- `docs/spec/03-authoritative-server.md` "The order of the checks" tabulates
+  the code's order correctly; the 2136 row of `07-rfc-conformance.md` lists no
+  deviation.
+
+On the wire: an unsigned UPDATE, or one signed by a key scoped elsewhere, for
+a zone this server does not serve is REFUSED, not NOTAUTH. The NOTAUTH test
+(`an_unauthorized_update_is_refused_and_an_unknown_zone_is_notauth`, `:3836`)
+signs with a key scoped to the zone it asks about, so it cannot see this. Its
+own doc (`:3829-3834`) states the reason the code's order defeats: "a client uses the difference to decide whether to look for a
+different server or a different key".
+
+Refuting check. The reason to check permission before §3.1.1 would be not
+telling a stranger which zones are served; the query path already tells it
+(REFUSED for a zone not served, `CLAUDE.md` §8), so that does not hold.
+Permission before §3.2 has a reason that may — prerequisites answer
+NXDOMAIN/YXDOMAIN about the zone's contents to whoever may send them — and it
+is recorded nowhere either.
+
+Not taken: what BIND, Knot and PowerDNS do (`CLAUDE.md` §4). That survey
+decides the order. The doc and the conformance table are wrong under any
+answer.
+
+---
+
+### 119. Two UPDATE refusals no test reaches, and one that reports an I/O error as absence — **filed 2026-09-25**, **ready-for-agent**
+
+`answer_update` has twelve exits (`dispatch.rs:1196-1419`).
+
+- **Reached by a test through `answer_update`**: unsigned, key scope,
+  NOTAUTH, no writable source (`:3898`), success.
+- **Tested below it**: the parse and prerequisite rcodes it passes through
+  (`rdns::update`); the `$INCLUDE` refusal, through `apply_update_to_file`
+  (`:2370`).
+- **Tested nowhere**:
+  - the replicated-zone refusal (`:1259-1271`, EDE `REPLICATED_ZONE`);
+  - the no-file refusal (`:1290-1301`, `NOT_WRITABLE`);
+  - the two SERVFAILs (`:1346`, `:1381`).
+
+No test asserts either EDE. A grep of `rdnsd` for both constant names and both
+log texts finds only their definitions and use sites.
+
+The transfer ladder counted the same way has no such gap:
+
+| Transfer branch | Tests |
+|---|---|
+| certificates | `:3263-3317` |
+| keys | `:3364-3423` |
+| TLS-only | `:4021` |
+| one-message transport | `:3092-3173` |
+| NOTAUTH | `:2809-2845` |
+
+`ZoneSource::file_for` (`zones.rs:189-209`) is the no-file branch's only
+caller. Its `Directory` arm is `std::fs::read_dir(dir).ok()?` followed by
+`.flatten()` over entries. So an unreadable zone directory answers "REFUSED:
+no zone file to write it back to", which is §4's first example. It is the only
+`.ok()` on a filesystem call in the seven crates' `src` (multiline grep). This
+row does not decide what it should answer instead.
+
+Nothing here is wrong on the wire today. The two tests are specified by the
+branches they cover. The `.ok()?` needs its answer chosen before it is fixed.
 
 ---
 
