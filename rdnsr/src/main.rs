@@ -16,6 +16,7 @@
 mod allocations;
 mod anchors;
 mod answer;
+mod caches;
 mod config;
 mod prefetch;
 mod reload;
@@ -63,7 +64,8 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
 
 use crate::anchors::spawn_anchor_manager;
-use crate::answer::{log_policy, Caches, NotifyAcl, Resolving};
+use crate::answer::{log_policy, NotifyAcl, Resolving};
+use crate::caches::Caches;
 use crate::reload::PolicyReload;
 use crate::rpz_transfer::{refresh_task, FeedWake, TransferredFeed};
 use crate::serve::udp_main;

@@ -23,7 +23,8 @@ use rdns_transport::ServeContext;
 use rdns::cache::StalePolicy;
 use rdns::rpz::{PolicyStore, PolicyZones};
 
-use crate::answer::{Caches, NotifyAcl, Resolving};
+use crate::answer::{NotifyAcl, Resolving};
+use crate::caches::Caches;
 use crate::reload::PolicyReload;
 
 /// A name from a literal, for tests only: `Name` is fallible to build and a

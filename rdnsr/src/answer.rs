@@ -1,5 +1,5 @@
-//! Turning a query into the bytes that answer it: the caches, the answer path
-//! and the shaping every reply goes through.
+//! Turning a query into the bytes that answer it: the answer path and the
+//! shaping every reply goes through. What it remembers is [`crate::caches`].
 //!
 //! No sockets and no listener state — [`handle_query`] takes a datagram and
 //! gives back the reply, which is what lets the UDP loop and the TCP handler in
@@ -9,15 +9,11 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use rdns::cache::StalePolicy;
-use rdns::clock::Clock;
 use rdns::dns64::Dns64;
 use rdns::dnssec::Bogus;
 use rdns::dnssec_chain::ValidationState;
 use rdns::ede::InfoCode;
 use rdns::metrics::LatencyTimer;
-use rdns::negative_cache::NegativeCache;
-use rdns::nsec_cache::NsecCache;
 use rdns::record_types;
 use rdns::resolver::ResolveError;
 use rdns::resolver::{NameserverPolicy, Resolver};
@@ -29,131 +25,14 @@ use rdns::validation::{Request, Transport};
 use rdns::Qtype;
 use rdns::Rtype;
 use rdns::{
-    DnsCache, DnsMessage, Edns, ExtendedError, OpCode, QuerySection, ResourceRecord, ResponseCode,
+    DnsMessage, Edns, ExtendedError, OpCode, QuerySection, ResourceRecord, ResponseCode,
     OPT_RECORD_TYPE,
 };
 use rdns_transport::ServeContext;
 
+use crate::caches::Caches;
 use crate::prefetch::Prefetch;
 use crate::reload::PolicyReload;
-
-/// What `rdnsr` remembers between queries.
-///
-/// Three caches with three shapes, which is why they are not one.
-///
-/// - `answers` maps a question to the records that answered it.
-/// - `negatives` maps a question to the *absence* of records (RFC 2308): a
-///   different thing, because there are no records to key on and the TTL comes
-///   from the SOA rather than from an answer.
-/// - `denials` maps a *range* of names to the signed statement that none exist —
-///   a lookup neither of the others can express (RFC 8198). Validated material
-///   only, so it is empty without `--dnssec-validate`, which is why `negatives`
-///   is not redundant with it.
-pub(crate) struct Caches {
-    answers: DnsCache,
-    negatives: NegativeCache,
-    denials: NsecCache,
-}
-
-impl Caches {
-    /// Put an answer in without resolving for it.
-    ///
-    /// For `crate::allocations`, which measures what *serving* a cached answer
-    /// costs and so must not pay for putting it there. The fields are private
-    /// to this module and stay that way (`TODO.md` #82b's ratchet).
-    #[cfg(test)]
-    pub(crate) fn remember(
-        &self,
-        name: rdns::NameRef<'_>,
-        qtype: Qtype,
-        records: Vec<ResourceRecord>,
-    ) {
-        self.answers.put(name, qtype, records);
-    }
-
-    /// `answers` at 0 is a cache that holds nothing (`DnsCache::put` is a
-    /// no-op), which is what `--no-cache` means. `denial_zones` is separately 0
-    /// without validation: aggressive use rests on the proofs having been
-    /// checked.
-    ///
-    /// `stale` reaches the first two and not `denials`: a denial is served
-    /// because its signature proves it, and an expired proof proves nothing —
-    /// RFC 8198 §5 rests on the validity period the signer chose, which
-    /// RFC 8767 has no standing to extend.
-    /// `clock` is the daemon's, the one `ServeContext` reads: one process, one
-    /// idea of the time, and a test that can move it (`TODO.md` #52). All
-    /// three, since #107a — it reached two of them for a year, three lines
-    /// above the one it did not.
-    pub(crate) fn new(
-        capacity: usize,
-        denial_zones: usize,
-        stale: StalePolicy,
-        clock: Clock,
-    ) -> Caches {
-        Caches {
-            answers: DnsCache::with_stale(capacity, stale, clock.clone()),
-            // Negative answers are answers: `--no-cache` means no cache.
-            negatives: NegativeCache::with_stale(capacity, stale, clock.clone()),
-            denials: NsecCache::with_clock(denial_zones, clock),
-        }
-    }
-
-    /// Keep what a resolution of `query` concluded, in every cache it belongs
-    /// in.
-    ///
-    /// The one way in for a resolution, whoever asked: the query path, a
-    /// prefetch and DNS64 each wrote their own copy until `TODO.md` #117, and
-    /// the two that ask on nobody's behalf never fed `denials`.
-    pub(crate) fn store(
-        &self,
-        query: &QuerySection,
-        response: &DnsMessage,
-        state: &ValidationState,
-    ) {
-        // A bogus answer in the cache is an attack that outlives the query
-        // that carried it.
-        if state.is_bogus() {
-            return;
-        }
-        let secure = state.is_secure();
-        let (name, qtype) = (query.qname.as_ref(), query.qtype);
-        if !response.answers.is_empty() {
-            self.answers
-                .put_validated(name, qtype, response.answers.clone(), secure);
-        }
-        // A "no" is an answer; re-resolving it makes a typo storm cost one
-        // upstream walk per repeat. The SOA in the authority section says how
-        // long it is good for (RFC 2308).
-        self.negatives.insert(name, qtype, response, secure);
-        // A *validated* "no" covers a whole range of names, so it also goes in
-        // the denial cache. Only when Secure: an unvalidated NSEC is an
-        // attacker's claim about which names do not exist.
-        if !secure {
-            return;
-        }
-        if response.answers.is_empty() {
-            self.denials.insert_validated(response);
-        } else {
-            // A validated wildcard answer is the same kind of statement about
-            // a range (RFC 8198 §5.3), so it is kept under the wildcard rather
-            // than the name asked for.
-            self.denials.insert_validated_wildcard(response);
-        }
-    }
-
-    /// Forget everything held, positive and negative.
-    ///
-    /// All three, because all three answer without walking a delegation, and
-    /// the walk is where a nameserver trigger is asked — a synthesized
-    /// NXDOMAIN (RFC 8198) skips it exactly as a cache hit does. The one
-    /// caller is the policy reload (`TODO.md` #57); there is no index from a
-    /// nameserver to the names it served, so the sweep is the whole cache.
-    pub(crate) fn clear(&self) {
-        self.answers.clear();
-        self.negatives.clear();
-        self.denials.clear();
-    }
-}
 
 /// Everything answering a query needs, in one handle.
 ///
@@ -418,10 +297,7 @@ pub(crate) async fn handle_query(
     // exclusive — a cached NXDOMAIN needs the wildcard *denied* — so trying the
     // more specific one first costs nothing.
     if !checking_disabled {
-        if let Some(wildcard) = caches
-            .denials
-            .synthesize_wildcard(query.qname.as_ref(), query.qtype)
-        {
+        if let Some(wildcard) = caches.synthesize_wildcard(query.qname.as_ref(), query.qtype) {
             let mut resp = build_response(&msg, wildcard.answers, ResponseCode::Ok);
             resp.authorities = wildcard.authority;
             // A wildcard signature verifies at this name unchanged, so the
@@ -431,7 +307,7 @@ pub(crate) async fn handle_query(
     }
 
     if !checking_disabled {
-        if let Some(denial) = caches.denials.synthesize(query.qname.as_ref(), query.qtype) {
+        if let Some(denial) = caches.synthesize_denial(query.qname.as_ref(), query.qtype) {
             ctx.metrics.count(&ctx.metrics.cache_hits);
             let mut resp = build_response(&msg, Vec::new(), denial.rcode);
             resp.authorities = denial.authority;
@@ -444,7 +320,7 @@ pub(crate) async fn handle_query(
     // A cached "no" (RFC 2308), separate from the answer cache only because
     // there are no records to key on. Nothing is synthesized — this is the
     // answer this question got — so a CD client may have it too.
-    if let Some(negative) = caches.negatives.get(query.qname.as_ref(), query.qtype) {
+    if let Some(negative) = caches.negative(query.qname.as_ref(), query.qtype) {
         ctx.metrics.count(&ctx.metrics.cache_hits);
         let mut resp = build_response(&msg, Vec::new(), negative.rcode);
         resp.authorities = negative.authority;
@@ -453,9 +329,7 @@ pub(crate) async fn handle_query(
 
     // Build the response: from cache if we have it, else by resolving. The
     // third is RFC 8914's reason, which only the two failing arms have.
-    let hit = caches
-        .answers
-        .lookup(query.qname.as_ref(), query.qtype, prefetch.is_some());
+    let hit = caches.answer(query.qname.as_ref(), query.qtype, prefetch.is_some());
     // The cache said this entry is in the last tenth of its TTL and nobody has
     // been asked to refresh it yet. Offered here, at the lookup, so no exit
     // below can drop it (`TODO.md` #78a, #102), and to a queue, so nothing
@@ -791,15 +665,13 @@ async fn cached_or_resolve(
 ) -> Option<Vec<ResourceRecord>> {
     if let Some(hit) = serving
         .caches
-        .answers
-        .lookup(query.qname.as_ref(), query.qtype, false)
+        .answer(query.qname.as_ref(), query.qtype, false)
     {
         return Some(hit.records);
     }
     if serving
         .caches
-        .negatives
-        .get(query.qname.as_ref(), query.qtype)
+        .negative(query.qname.as_ref(), query.qtype)
         .is_some()
     {
         return None;
@@ -853,7 +725,7 @@ fn stale_answer(
 
     // A "yes" before a "no": both may be held for one name, and the answer is
     // the more specific thing known about it.
-    if let Some((records, secure)) = caches.answers.get_stale(query.qname.as_ref(), query.qtype) {
+    if let Some((records, secure)) = caches.stale_answer(query.qname.as_ref(), query.qtype) {
         ctx.metrics.count(&ctx.metrics.stale_answers);
         // INFO: serving data known to be out of date is a decision the operator
         // turned on, and the line beside the counter is how the decision is
@@ -866,9 +738,7 @@ fn stale_answer(
         ));
     }
 
-    let negative = caches
-        .negatives
-        .get_stale(query.qname.as_ref(), query.qtype)?;
+    let negative = caches.stale_negative(query.qname.as_ref(), query.qtype)?;
     ctx.metrics.count(&ctx.metrics.stale_answers);
     tracing::info!(qname = %query.qname, qtype = %query.qtype, "answered from expired cache");
     let mut resp = build_response(request, Vec::new(), negative.rcode);
@@ -1303,6 +1173,7 @@ pub(crate) fn truncate_reply(reply: &[u8]) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use rdns::cache::StalePolicy;
     use rdns::clock::current_unix_timestamp;
     use rdns::rpz::{Feed, PolicyOverride};
     use rdns::Qtype;
@@ -1747,7 +1618,7 @@ mod tests {
     async fn an_expired_answer_is_served_when_the_resolution_fails() {
         let (serving, clock) = serving_stale(3600);
         let name = nm("example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::A),
             vec![a_record(&name, 300)],
@@ -1797,7 +1668,7 @@ mod tests {
     async fn without_the_flag_a_failed_resolution_is_servfail() {
         let (serving, clock) = timed(StalePolicy::OFF);
         let name = nm("example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::A),
             vec![a_record(&name, 300)],
@@ -1824,7 +1695,7 @@ mod tests {
     async fn a_live_entry_is_not_a_stale_answer() {
         let (serving, _clock) = serving_stale(3600);
         let name = nm("example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::A),
             vec![a_record(&name, 300)],
@@ -1856,7 +1727,7 @@ mod tests {
     async fn a_nearly_expired_cache_hit_asks_for_a_refresh() {
         let (serving, clock, mut queue) = prefetching(test_resolver(), PolicyZones::default());
         let name = nm("hot.example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::A),
             vec![a_record(&name, 100)],
@@ -1928,15 +1799,15 @@ mod tests {
                 state,
             );
             assert_eq!(
-                caches.negatives.get(a.as_ref(), qtype).is_some(),
+                caches.negative(a.as_ref(), qtype).is_some(),
                 !bogus,
                 "{state:?}"
             );
-            assert!(caches.answers.lookup(a.as_ref(), qtype, false).is_none());
+            assert!(caches.answer(a.as_ref(), qtype, false).is_none());
             // Another name in the same gap: only a Secure proof covers it.
             let b = nm("b.example.test.");
             assert_eq!(
-                caches.denials.synthesize(b.as_ref(), qtype).is_some(),
+                caches.synthesize_denial(b.as_ref(), qtype).is_some(),
                 secure,
                 "{state:?}"
             );
@@ -1947,18 +1818,12 @@ mod tests {
                 &upstream("x.w.example.test."),
                 state,
             );
-            assert_eq!(
-                caches.answers.lookup(x.as_ref(), qtype, false).is_some(),
-                !bogus
-            );
-            assert!(caches.negatives.get(x.as_ref(), qtype).is_none());
+            assert_eq!(caches.answer(x.as_ref(), qtype, false).is_some(), !bogus);
+            assert!(caches.negative(x.as_ref(), qtype).is_none());
             // Another name the wildcard reaches (RFC 8198 §5.3).
             let y = nm("y.w.example.test.");
             assert_eq!(
-                caches
-                    .denials
-                    .synthesize_wildcard(y.as_ref(), qtype)
-                    .is_some(),
+                caches.synthesize_wildcard(y.as_ref(), qtype).is_some(),
                 secure,
                 "{state:?}"
             );
@@ -1978,8 +1843,7 @@ mod tests {
         refresh(&serving, a_question("a.example.test.")).await;
         let held = serving
             .caches
-            .negatives
-            .get(nm("a.example.test.").as_ref(), Qtype::of(record_types::A))
+            .negative(nm("a.example.test.").as_ref(), Qtype::of(record_types::A))
             .expect("the refresh kept the NXDOMAIN");
         // Otherwise the fixture is what failed, and not the storing.
         assert!(held.secure, "the fixture validates");
@@ -2018,7 +1882,7 @@ mod tests {
         let (resolver, _upstream) = silent_resolver();
         let (serving, clock, mut queue) = prefetching(resolver, PolicyZones::default());
         let name = nm("hot.example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::A),
             vec![a_record(&name, 100)],
@@ -2075,7 +1939,7 @@ mod tests {
         let (serving, clock, mut queue) =
             prefetching(test_resolver(), policy("10.0.2.0.198.rpz-ip IN CNAME .\n"));
         let name = nm("hot.example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::A),
             vec![ResourceRecord {
@@ -2130,7 +1994,7 @@ mod tests {
             ),
         );
         let name = nm("hot.example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::A),
             vec![ResourceRecord {
@@ -2163,7 +2027,7 @@ mod tests {
     async fn without_the_switch_no_refresh_is_asked_for() {
         let (serving, clock) = timed(StalePolicy::OFF);
         let name = nm("hot.example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::A),
             vec![a_record(&name, 100)],
@@ -2225,13 +2089,16 @@ mod tests {
         denial.rcode = ResponseCode::Ok;
         denial.answers.clear();
         denial.authorities = vec![soa("example.com.")];
-        serving.caches.negatives.insert(
-            name.as_ref(),
-            Qtype::of(record_types::AAAA),
+        serving.caches.store(
+            &QuerySection {
+                qname: name.clone(),
+                qtype: Qtype::of(record_types::AAAA),
+                qclass: rdns::QueryClass::IN,
+            },
             &denial,
-            false,
+            &ValidationState::Insecure,
         );
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::A),
             vec![ResourceRecord {
@@ -2338,7 +2205,7 @@ mod tests {
     async fn an_answer_of_only_mapped_addresses_is_synthesized_over() {
         let serving = with_dns64();
         let name = nm("mapped.example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::AAAA),
             vec![ResourceRecord {
@@ -2351,7 +2218,7 @@ mod tests {
                 .expect("encodes"),
             }],
         );
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::A),
             vec![ResourceRecord {
@@ -2378,7 +2245,7 @@ mod tests {
     async fn a_name_that_has_an_aaaa_is_left_alone() {
         let serving = with_dns64();
         let name = nm("dual.example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::AAAA),
             vec![ResourceRecord {
@@ -2417,11 +2284,14 @@ mod tests {
         denial.rcode = ResponseCode::NoSuchDomain;
         denial.answers.clear();
         denial.authorities = vec![soa("example.com.")];
-        serving.caches.negatives.insert(
-            name.as_ref(),
-            Qtype::of(record_types::AAAA),
+        serving.caches.store(
+            &QuerySection {
+                qname: name.clone(),
+                qtype: Qtype::of(record_types::AAAA),
+                qclass: rdns::QueryClass::IN,
+            },
             &denial,
-            false,
+            &ValidationState::Insecure,
         );
 
         let reply = aaaa_reply(&serving, "gone.example.com.", false, false).await;
@@ -2562,8 +2432,7 @@ mod tests {
         assert!(
             serving
                 .caches
-                .answers
-                .lookup(
+                .answer(
                     nm("www.example.test.").as_ref(),
                     Qtype::of(record_types::A),
                     false
@@ -2881,7 +2750,7 @@ mod tests {
             policy("24.0.2.0.198.rpz-ip IN CNAME .\n"),
         );
         let name = nm("www.example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             name.as_ref(),
             Qtype::of(record_types::A),
             vec![ResourceRecord {
@@ -2940,7 +2809,7 @@ mod tests {
     async fn a_udp_reply_is_capped_by_this_resolver_and_not_only_by_the_client() {
         let serving = context();
         let pool = nm("pool.example.com.");
-        serving.caches.answers.put(
+        serving.caches.remember(
             pool.as_ref(),
             Qtype::of(record_types::A),
             (0..128u32)
@@ -3234,11 +3103,11 @@ mod tests {
 
         // A QNAME rule that moved: what is held is still what the internet
         // said, and the new rule is consulted before the cache anyway.
-        serving.caches.answers.put(held.as_ref(), qtype, cached());
+        serving.caches.remember(held.as_ref(), qtype, cached());
         std::fs::write(&path, feed(2, "second.example.com", None)).expect("rewrite");
         reload_policy(&serving);
         assert!(
-            serving.caches.answers.get(held.as_ref(), qtype).is_some(),
+            serving.caches.answer(held.as_ref(), qtype, false).is_some(),
             "an hourly reload that emptied the cache would be its own outage"
         );
 
@@ -3249,7 +3118,7 @@ mod tests {
         )
         .expect("rewrite");
         reload_policy(&serving);
-        assert!(serving.caches.answers.get(held.as_ref(), qtype).is_none());
+        assert!(serving.caches.answer(held.as_ref(), qtype, false).is_none());
     }
 
     /// A half-written feed must not lift a block: the previous set stays in
