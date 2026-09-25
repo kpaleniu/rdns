@@ -191,33 +191,37 @@ async fn pump<W>(
         return;
     }
 
-    let mut written: u64 = 0;
-    let mut capped = false;
+    let mut cap = Cap {
+        max_bytes,
+        written: 0,
+        capped: false,
+    };
     loop {
         let frame = tokio::select! {
             frame = queue.recv() => frame,
             _ = stop.wait() => break,
         };
         let Some(frame) = frame else { break };
-
-        if max_bytes != 0 && written.saturating_add(frame.len() as u64) > max_bytes {
-            if !capped {
-                // Once, not per frame: a capped sink would otherwise log at the
-                // query rate, which is the thing this feature exists to avoid.
-                tracing::warn!(
-                    "dnstap file reached --dnstap-max-bytes ({max_bytes}); \
-                     nothing further is written and every payload is counted as dropped"
-                );
-                capped = true;
-            }
-            metrics.count(&metrics.dnstap_dropped);
+        if !cap.admits(frame.len(), &metrics) {
             continue;
         }
         if let Err(e) = writer.write_all(&frame).await {
             tracing::error!("dnstap write failed, closing the stream: {e}");
             return;
         }
-        written = written.saturating_add(frame.len() as u64);
+    }
+
+    // What was queued before the stop: `Sink::send` counted it as sent, and it
+    // is the last requests a capture holds (`TODO.md` #68a). A payload sent
+    // after this is counted as dropped by `send`, once the receiver is gone.
+    while let Ok(frame) = queue.try_recv() {
+        if !cap.admits(frame.len(), &metrics) {
+            continue;
+        }
+        if let Err(e) = writer.write_all(&frame).await {
+            tracing::error!("dnstap write failed, closing the stream: {e}");
+            return;
+        }
     }
 
     // STOP says the stream ended rather than the reader losing its peer, which
@@ -227,6 +231,36 @@ async fn pump<W>(
         let _ = writer.write_all(&dnstap::finish_frame()).await;
     }
     let _ = writer.flush().await;
+}
+
+/// `--dnstap-max-bytes`: octets written so far, against the limit.
+struct Cap {
+    max_bytes: u64,
+    written: u64,
+    capped: bool,
+}
+
+impl Cap {
+    /// Whether a frame of `len` octets may be written; counted as dropped if not.
+    fn admits(&mut self, len: usize, metrics: &DnsMetrics) -> bool {
+        let after = self.written.saturating_add(len as u64);
+        if self.max_bytes != 0 && after > self.max_bytes {
+            if !self.capped {
+                // Once, not per frame: a capped sink would otherwise log at the
+                // query rate, which is the thing this feature exists to avoid.
+                tracing::warn!(
+                    "dnstap file reached --dnstap-max-bytes ({}); \
+                     nothing further is written and every payload is counted as dropped",
+                    self.max_bytes
+                );
+                self.capped = true;
+            }
+            metrics.count(&metrics.dnstap_dropped);
+            return false;
+        }
+        self.written = after;
+        true
+    }
 }
 
 /// READY/ACCEPT/START for a socket, START alone for a file.
@@ -344,6 +378,63 @@ mod tests {
         c.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The capture at `path` once the pump has written STOP.
+    ///
+    /// Polled rather than slept: a fixed sleep lets a loaded machine decide
+    /// the result, which is how #68a hid.
+    async fn closed_capture(path: &std::path::Path) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let bytes = std::fs::read(path).unwrap_or_default();
+            if bytes.ends_with(&dnstap::stop_frame()) {
+                return bytes;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the capture never closed: {} octets",
+                bytes.len()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// What was queued before the stop is written before STOP.
+    ///
+    /// `Sink::send` has already counted each of these in `dnstap_frames`, so a
+    /// pump that dropped them on stop left a capture missing the last requests
+    /// and a counter claiming them. Watched failing against the `break` on
+    /// `stop.wait()`: 0 or 1 of 100 written (`TODO.md` #68a).
+    #[tokio::test]
+    async fn what_is_queued_when_the_stop_begins_is_written() {
+        let dir = rdns::testutil::ScratchDir::new("dnstap-stop-drains");
+        let path = dir.join("capture.fstrm");
+        let metrics = DnsMetrics::new();
+        let shutdown = Shutdown::new();
+        let sink = Sink::spawn(
+            &Target::File(path.clone()),
+            0,
+            Vec::new(),
+            Vec::new(),
+            metrics.clone(),
+            shutdown.stop_handle(),
+        )
+        .await
+        .expect("the file opens");
+
+        for _ in 0..100 {
+            let mut frame = Vec::new();
+            dnstap::put_data_frame(&mut frame, b"payload");
+            sink.send(frame);
+        }
+        shutdown.begin();
+
+        let written = closed_capture(&path).await;
+        let frames = written.windows(11).filter(|w| *w == b"   payload").count();
+        assert_eq!(frames, 100, "every queued frame, then STOP");
+        assert_eq!(counter(&metrics.dnstap_frames), 100);
+        assert_eq!(counter(&metrics.dnstap_dropped), 0);
+    }
+
     /// The whole exchange against a listener that behaves like a collector:
     /// READY out, ACCEPT back, START out, a data frame, then STOP and FINISH on
     /// shutdown. Judged by reading the socket, not by inspecting the writer.
@@ -398,9 +489,6 @@ mod tests {
         let mut frame = Vec::new();
         dnstap::put_data_frame(&mut frame, b"payload");
         sink.send(frame);
-        // Give the writer task the frame before asking it to stop; the drain is
-        // the queue emptying, and `begin` races the send otherwise.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         shutdown.begin();
         drop(sink);
 
@@ -460,12 +548,10 @@ mod tests {
             dnstap::put_data_frame(&mut frame, b"payload");
             sink.send(frame);
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         shutdown.begin();
         drop(sink);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let written = std::fs::read(&path).expect("the capture file");
+        let written = closed_capture(&path).await;
         let start = dnstap::start_frame();
         assert_eq!(&written[..start.len()], &start[..], "START, and no READY");
         assert_eq!(

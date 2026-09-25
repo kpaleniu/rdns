@@ -3723,11 +3723,22 @@ pub(crate) mod tests {
             "a key this server does not hold"
         );
 
-        // Polled rather than slept: the pump writes STOP and flushes as it
-        // stops, so the capture is closed when it ends with one, and a fixed
-        // sleep would make a loaded machine decide the result.
-        shutdown.begin();
+        // Polled rather than slept, twice, because a loaded machine decided
+        // the result (`TODO.md` #68a). A frame is recorded after its reply is
+        // sent, so the client can hold the fourth reply before the server has
+        // queued the fourth frame; stopping then left three.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while data_frames(&std::fs::read(&capture).expect("the capture file")) < 4 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "four frames never reached the capture"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The pump writes STOP and flushes as it stops, so the capture is
+        // closed when it ends with one.
+        shutdown.begin();
         let capture = loop {
             let bytes = std::fs::read(&capture).expect("the capture file");
             if bytes.ends_with(&rdns::dnstap::stop_frame()) {

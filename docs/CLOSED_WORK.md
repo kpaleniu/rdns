@@ -10255,3 +10255,160 @@ Verified: 1 324 passed on Windows and 1 345 on Linux, 0 failed, four new tests
 on each. Clippy clean on both, `cargo doc --workspace --no-deps` clean.
 
 ---
+
+### 68. A socket test that binds a real port fails under a parallel suite — **filed 2026-09-15, closed 2026-09-25**
+
+`rdns_transport::metrics_server::tests::a_server_with_nothing_to_wait_for_is_ready_at_once`
+failed once during a `cargo test --workspace` run and passed on the two runs
+after it, on three runs of its own crate's suite and on three of the module
+alone. Not caused by the change it was seen under (#67's crate move touches
+nothing in `rdns-transport`); seen there, so filed there.
+
+~~It binds a listener and scrapes it over TCP, which is what makes it worth
+having and also what makes it the one shape `CLAUDE.md` §10 warns about: under
+a whole-workspace run every test binary is competing for ephemeral ports and
+for the scheduler, and the assertion has no headroom.~~ ~~What would settle it
+is reading `start()` and `scrape()` for where the wait is — whether the server
+is accepting before the scrape connects.~~
+
+**Both guesses were wrong, and the row's own instruction is what showed it**
+(2026-09-16). Reading the twenty lines:
+
+- **There is no wait to get wrong.** `start_with` binds the listener and *then*
+  spawns `serve`, so a `connect` that beats the accept loop waits in the
+  kernel's backlog rather than failing. The accept-before-connect race the row
+  named cannot happen.
+- **That test has no wall-clock assertion**, so "the assertion has no headroom"
+  is about a different test — the only `Duration` in the module is
+  `the_endpoint_stops_with_the_server`'s 3 s drain budget.
+- **Ephemeral ports are not scarce here**, which was the third guess and the
+  one a measurement kills outright: the box sits at ~3 320 sockets in
+  `TIME_WAIT` against a 16 384-port dynamic range, and a whole `--workspace` run
+  adds about **100**. Sampled every 5 s across a run: 3 320 → 3 422 → 3 374.
+
+**Not reproduced.** 900 runs of the module (`--test-threads 8`), 600 of them
+with four concurrent `cargo test --workspace` runs as load: **0 failures**. 200
+more on Linux after the change below: 0.
+
+**What was wrong and is fixed**: the test that failed is one of the two in the
+module whose assertions printed *nothing* — no body, and `scrape`'s three
+`expect`s named neither the failing call's error nor the address. One run in
+nine hundred failed and left no evidence, which is why the row could say the
+failure mode but not the failure. Every assertion carries its body now and
+every socket call names itself; the next occurrence says which of connect,
+send, read or the status went wrong. **Left open** on that footing: there is
+one unexplained failure and no explanation, only a smaller cost to seeing the
+next one.
+
+**A second sighting, 2026-09-20, in a different crate and with no name
+captured.** One `cargo test --workspace` run reported `rdnsd` at 190 passed and
+1 failed where every other run reports 191 and 0. Thirteen further workspace
+runs and a `-p rdnsd` run were clean. The name was lost to the *reader*, not to
+the test — the run was filtered to `^test result` lines — which is the same
+evidence failure the paragraph above fixed for one module and is worth
+repeating as advice: never filter a suite run down to its totals when the point
+is to catch something rare.
+
+**Two findings on the way out**, both in the file the row points at and
+neither the flake: **#69**, every accept loop in the crate treats any accept
+error as fatal while the UDP side has `recv_error_is_transient` and a written
+reason; and **#70**, the module header claimed two hyper behaviours that hyper
+does not have.
+
+**Groomed 2026-09-25: reproduced, and not where the row looked.** 150 whole
+`cargo test --workspace` runs on Windows and 50 on Linux, run concurrently for
+the first 65 Windows runs, every log kept whole (the 2026-09-20 lesson).
+CI has no sighting since the row was filed: its one test failure since, run
+35538607349, is the ratio test `zone.rs:3043` already cites and fixed.
+
+| test | Windows | Linux |
+|---|---|---|
+| `dispatch::tests::every_answering_path_reaches_the_dnstap_stream` | 7 / 150 | 1 / 50 |
+| `replication::tests::test_an_unchanged_refresh_announces_nothing` | 1 / 150 | 0 / 50 |
+| `metrics_server::tests::a_server_with_nothing_to_wait_for_is_ready_at_once` | 0 / 150 | 0 / 50 |
+
+Both failures are in `rdnsd`, which is the crate of the second sighting. Both
+tests existed on 2026-09-20 (`1a0422c`, `e5df9bc`), so that sighting was
+probably one of them; which one cannot now be known.
+
+#### 68a. dnstap drops what is queued when it stops — a defect, not only a flake
+
+The assertion reads 3 frames where 4 are expected
+(`dispatch.rs:3744`). Two causes, one of them in the product:
+
+- **The pump discards its queue on stop.** `pump` (`dnstap.rs:196-200`)
+  `select!`s `queue.recv()` against `stop.wait()` and `break`s on the stop,
+  with frames still queued. Provoked: 100 frames `send`, then `begin()`, 50
+  times — **50 of 50 runs lost frames**, writing 0 or 1 of the 100. Those frames
+  were counted in `dnstap_frames` by `Sink::send` (`:101-107`) and are in
+  neither counter, so the metric claims payloads the capture does not hold
+  (`CLAUDE.md` §14). In service: whatever is queued when a stop begins, and
+  everything answered during the drain, is missing from the capture.
+- **The test races the record.** `answer` sends the reply, then calls
+  `record_dnstap` (`dispatch.rs:504-529`), by design: it records what went
+  out. The client can have its reply and call `shutdown.begin()` before the
+  fourth `record`. Draining the queue does not close this, because a frame
+  queued after the pump exits is still dropped.
+
+Remedy:
+
+1. `pump`: on stop, take what `try_recv` still returns, subject to the same
+   `max_bytes` cap, then write STOP. Test: queue N frames, `begin()` with no
+   sleep, all N in the file. Show it failing first (§1).
+2. `every_answering_path_reaches_the_dnstap_stream`: poll the capture for four
+   data frames before `begin()`, under the same 10 s deadline, then poll for
+   STOP as now.
+3. The three 50 ms sleeps in `dnstap.rs`'s tests work around the same stop.
+   `:403` and `:463` come before `begin()`, so the pump takes the frames first.
+   With (1) they go, and `:401-402`'s comment ("the drain is the queue
+   emptying") becomes true. `:466` waits for the pump to finish, so it becomes
+   a poll for STOP, as in the `dispatch.rs` test.
+
+Seen and not provoked, so no remedy: nothing waits for the pump. It holds no
+`Busy`, and the two `tokio::spawn(pump(..))` at `:155` and `:164` discard the
+handle, so `drain_reporting` can return and the runtime end with STOP
+unwritten or the file unflushed. Measure it (a process test that stops
+`rdnsd --dnstap file:..` and reads the capture's tail) before fixing it.
+
+#### 68b. `test_an_unchanged_refresh_announces_nothing` receives a retransmission
+
+`replication.rs:1227`, "an unchanged zone is not news". The downstream socket
+never answers the first NOTIFY, and `send_notify` retransmits an unanswered
+one after `NOTIFY_RETRY_SECS` = 2 s (`notify_out.rs:177`, RFC 1996 §3.6). The
+test's window is the second refresh plus 500 ms; under load that passes the
+2 s mark and the retransmission arrives. The server is right; the test cannot
+tell a retransmission from a new NOTIFY.
+
+Remedy: answer the first NOTIFY from the downstream socket (NOERROR, same ID,
+QR set), which ends the retries (`notify_out.rs:158`), then assert silence as
+now. Not by comparing IDs: each attempt takes a fresh `rand_id`.
+
+#### What stays open
+
+The first sighting, `metrics_server`, has not recurred in 1 100 module runs and
+200 workspace runs, and its failure now names the socket call. Close #68 when
+68a and 68b land. A recurrence gets a new number with the evidence it now
+prints.
+
+**Done 2026-09-25**, as remedied.
+
+- 68a: `pump` takes what `try_recv` still returns after the stop, under the
+  same cap (`Cap::admits`, one copy of the cap logic for both loops).
+  `what_is_queued_when_the_stop_begins_is_written` failed against the old
+  `break` with 0 of 100 frames. The dispatch test polls for four frames before
+  `begin()`. Provoked: with a 200 ms delay put between the send and the record,
+  the old test read 0 frames and the new one passed. The three 50 ms sleeps in
+  `dnstap.rs`'s tests are gone; the file test polls for STOP
+  (`closed_capture`).
+- 68b: the downstream answers the first NOTIFY. Provoked: a 2 s pause before the
+  silence window failed the old test every time and passes the new one.
+- Not done, and still unmeasured: nothing waits for the pump at process exit.
+  It stays recorded in the section above, with the measurement it needs.
+
+Verified: 200 whole-workspace runs after the change, 150 Windows and 50 Linux,
+concurrent for the first ~67 Windows runs: **0 failures** of either test,
+against 8 before. The same runs failed three other tests 4 times — **#120**.
+1 325 passed on Windows and 1 346 on Linux in a clean run, 0 failed; clippy
+clean on both; `cargo doc` and `cargo fmt --check` clean.
+
+---

@@ -1210,14 +1210,24 @@ mod tests {
             tls: None,
         };
 
-        // The first transfer announces; drain it.
+        // The first transfer announces; answer it. Unanswered, it is resent
+        // after `NOTIFY_RETRY_SECS` (RFC 1996 §3.6), and under load that resend
+        // landed in the silence window below (`TODO.md` #68b).
         refresh_once(&spec, None, &r, &test_shutdown().busy())
             .await
             .expect("transfer");
         let mut buf = vec![0u8; 4096];
-        let _ = tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
+        let (n, from) =
+            tokio::time::timeout(Duration::from_secs(5), downstream.recv_from(&mut buf))
+                .await
+                .expect("the first NOTIFY")
+                .expect("recv");
+        let request = DnsMessage::try_from_bytes(&buf[..n]).expect("parse the NOTIFY");
+        let ack = notify::notify_response(&request, ResponseCode::Ok, 1232, None);
+        downstream
+            .send_to(&ack.to_bytes_within(512).expect("serialize"), from)
             .await
-            .expect("the first NOTIFY");
+            .expect("acknowledge");
 
         // The second finds the same serial and must say nothing.
         let outcome = refresh_once(&spec, None, &r, &test_shutdown().busy())

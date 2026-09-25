@@ -37,9 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#58**, **#68**, plus **#21**, as of 2026-09-25.
-#107-#119 are closed. #117-#119 came out of a fourth architecture review that
-day and were groomed against the code before filing.
+**#58**, **#120**, plus **#21**, as of 2026-09-25.
+#68 and #107-#119 are closed. #117-#119 came out of a fourth architecture
+review that day and were groomed against the code before filing; #120 came out
+of verifying #68.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -272,8 +273,8 @@ to every enum carrying one by value. **#64 is closed** — 64c, 64e and 64f
 all went the same day, and 64c is the one whose remedy was declined on its own
 re-measurement; **64g closed with it**, and its own filing was the thing it
 refuted — the "core type's shape and its call sites" it was not taken for is a
-default type parameter and zero call sites. **#68 stays open and both of its
-guesses are gone**: the
+default type parameter and zero call sites. **#68 stayed open then** (closed
+2026-09-25, see its row) **and both of its guesses are gone**: the
 accept-before-connect race it named cannot happen (the listener is bound before
 the loop is spawned), the test it names has no wall-clock assertion, and
 ephemeral ports are not scarce here — a whole `--workspace` run adds ~100
@@ -3942,142 +3943,6 @@ A split that makes the graph prettier and no binary smaller has bought nothing.
 
 ---
 
-### 68. A socket test that binds a real port fails under a parallel suite — **filed 2026-09-15**, **ready-for-agent**
-
-`rdns_transport::metrics_server::tests::a_server_with_nothing_to_wait_for_is_ready_at_once`
-failed once during a `cargo test --workspace` run and passed on the two runs
-after it, on three runs of its own crate's suite and on three of the module
-alone. Not caused by the change it was seen under (#67's crate move touches
-nothing in `rdns-transport`); seen there, so filed there.
-
-~~It binds a listener and scrapes it over TCP, which is what makes it worth
-having and also what makes it the one shape `CLAUDE.md` §10 warns about: under
-a whole-workspace run every test binary is competing for ephemeral ports and
-for the scheduler, and the assertion has no headroom.~~ ~~What would settle it
-is reading `start()` and `scrape()` for where the wait is — whether the server
-is accepting before the scrape connects.~~
-
-**Both guesses were wrong, and the row's own instruction is what showed it**
-(2026-09-16). Reading the twenty lines:
-
-- **There is no wait to get wrong.** `start_with` binds the listener and *then*
-  spawns `serve`, so a `connect` that beats the accept loop waits in the
-  kernel's backlog rather than failing. The accept-before-connect race the row
-  named cannot happen.
-- **That test has no wall-clock assertion**, so "the assertion has no headroom"
-  is about a different test — the only `Duration` in the module is
-  `the_endpoint_stops_with_the_server`'s 3 s drain budget.
-- **Ephemeral ports are not scarce here**, which was the third guess and the
-  one a measurement kills outright: the box sits at ~3 320 sockets in
-  `TIME_WAIT` against a 16 384-port dynamic range, and a whole `--workspace` run
-  adds about **100**. Sampled every 5 s across a run: 3 320 → 3 422 → 3 374.
-
-**Not reproduced.** 900 runs of the module (`--test-threads 8`), 600 of them
-with four concurrent `cargo test --workspace` runs as load: **0 failures**. 200
-more on Linux after the change below: 0.
-
-**What was wrong and is fixed**: the test that failed is one of the two in the
-module whose assertions printed *nothing* — no body, and `scrape`'s three
-`expect`s named neither the failing call's error nor the address. One run in
-nine hundred failed and left no evidence, which is why the row could say the
-failure mode but not the failure. Every assertion carries its body now and
-every socket call names itself; the next occurrence says which of connect,
-send, read or the status went wrong. **Left open** on that footing: there is
-one unexplained failure and no explanation, only a smaller cost to seeing the
-next one.
-
-**A second sighting, 2026-09-20, in a different crate and with no name
-captured.** One `cargo test --workspace` run reported `rdnsd` at 190 passed and
-1 failed where every other run reports 191 and 0. Thirteen further workspace
-runs and a `-p rdnsd` run were clean. The name was lost to the *reader*, not to
-the test — the run was filtered to `^test result` lines — which is the same
-evidence failure the paragraph above fixed for one module and is worth
-repeating as advice: never filter a suite run down to its totals when the point
-is to catch something rare.
-
-**Two findings on the way out**, both in the file the row points at and
-neither the flake: **#69**, every accept loop in the crate treats any accept
-error as fatal while the UDP side has `recv_error_is_transient` and a written
-reason; and **#70**, the module header claimed two hyper behaviours that hyper
-does not have.
-
-**Groomed 2026-09-25: reproduced, and not where the row looked.** 150 whole
-`cargo test --workspace` runs on Windows and 50 on Linux, run concurrently for
-the first 65 Windows runs, every log kept whole (the 2026-09-20 lesson).
-CI has no sighting since the row was filed: its one test failure since, run
-35538607349, is the ratio test `zone.rs:3043` already cites and fixed.
-
-| test | Windows | Linux |
-|---|---|---|
-| `dispatch::tests::every_answering_path_reaches_the_dnstap_stream` | 7 / 150 | 1 / 50 |
-| `replication::tests::test_an_unchanged_refresh_announces_nothing` | 1 / 150 | 0 / 50 |
-| `metrics_server::tests::a_server_with_nothing_to_wait_for_is_ready_at_once` | 0 / 150 | 0 / 50 |
-
-Both failures are in `rdnsd`, which is the crate of the second sighting. Both
-tests existed on 2026-09-20 (`1a0422c`, `e5df9bc`), so that sighting was
-probably one of them; which one cannot now be known.
-
-#### 68a. dnstap drops what is queued when it stops — a defect, not only a flake
-
-The assertion reads 3 frames where 4 are expected
-(`dispatch.rs:3744`). Two causes, one of them in the product:
-
-- **The pump discards its queue on stop.** `pump` (`dnstap.rs:196-200`)
-  `select!`s `queue.recv()` against `stop.wait()` and `break`s on the stop,
-  with frames still queued. Provoked: 100 frames `send`, then `begin()`, 50
-  times — **50 of 50 runs lost frames**, writing 0 or 1 of the 100. Those frames
-  were counted in `dnstap_frames` by `Sink::send` (`:101-107`) and are in
-  neither counter, so the metric claims payloads the capture does not hold
-  (`CLAUDE.md` §14). In service: whatever is queued when a stop begins, and
-  everything answered during the drain, is missing from the capture.
-- **The test races the record.** `answer` sends the reply, then calls
-  `record_dnstap` (`dispatch.rs:504-529`), by design: it records what went
-  out. The client can have its reply and call `shutdown.begin()` before the
-  fourth `record`. Draining the queue does not close this, because a frame
-  queued after the pump exits is still dropped.
-
-Remedy:
-
-1. `pump`: on stop, take what `try_recv` still returns, subject to the same
-   `max_bytes` cap, then write STOP. Test: queue N frames, `begin()` with no
-   sleep, all N in the file. Show it failing first (§1).
-2. `every_answering_path_reaches_the_dnstap_stream`: poll the capture for four
-   data frames before `begin()`, under the same 10 s deadline, then poll for
-   STOP as now.
-3. The three 50 ms sleeps in `dnstap.rs`'s tests work around the same stop.
-   `:403` and `:463` come before `begin()`, so the pump takes the frames first.
-   With (1) they go, and `:401-402`'s comment ("the drain is the queue
-   emptying") becomes true. `:466` waits for the pump to finish, so it becomes
-   a poll for STOP, as in the `dispatch.rs` test.
-
-Seen and not provoked, so no remedy: nothing waits for the pump. It holds no
-`Busy`, and the two `tokio::spawn(pump(..))` at `:155` and `:164` discard the
-handle, so `drain_reporting` can return and the runtime end with STOP
-unwritten or the file unflushed. Measure it (a process test that stops
-`rdnsd --dnstap file:..` and reads the capture's tail) before fixing it.
-
-#### 68b. `test_an_unchanged_refresh_announces_nothing` receives a retransmission
-
-`replication.rs:1227`, "an unchanged zone is not news". The downstream socket
-never answers the first NOTIFY, and `send_notify` retransmits an unanswered
-one after `NOTIFY_RETRY_SECS` = 2 s (`notify_out.rs:177`, RFC 1996 §3.6). The
-test's window is the second refresh plus 500 ms; under load that passes the
-2 s mark and the retransmission arrives. The server is right; the test cannot
-tell a retransmission from a new NOTIFY.
-
-Remedy: answer the first NOTIFY from the downstream socket (NOERROR, same ID,
-QR set), which ends the retries (`notify_out.rs:158`), then assert silence as
-now. Not by comparing IDs: each attempt takes a fresh `rand_id`.
-
-#### What stays open
-
-The first sighting, `metrics_server`, has not recurred in 1 100 module runs and
-200 workspace runs, and its failure now names the socket call. Close #68 when
-68a and 68b land. A recurrence gets a new number with the evidence it now
-prints.
-
----
-
 ### 69. Four accept loops end on any error; the UDP side has a helper for that — **filed and closed 2026-09-16**
 
 `tcp.rs:144`, `tls.rs:221`, `https.rs:108` and `metrics_server.rs:66` all spell
@@ -5965,8 +5830,10 @@ which is a property of the process rather than of the parser.
 **What this does not cover, named rather than implied** (§18): binding sockets,
 the drain, and signals. CI's `image` job covers those for `rdnsd` and remains
 the one job no local `cargo` invocation stands in for — which is also why #91
-matters. A process test that binds a port would be #68's shape, and #68 is open
-for exactly that reason.
+matters. ~~A process test that binds a port would be #68's shape, and #68 is open
+for exactly that reason.~~ **Wrong about the shape** (2026-09-25): #68's
+failures were a dnstap queue dropped on stop and a NOTIFY retransmission, not
+port binding; 1 100 runs of the port-binding test it named never failed.
 
 ---
 
@@ -6904,6 +6771,52 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
+### 120. Three more timing flakes, found while verifying #68 — **filed 2026-09-25**, **ready-for-agent**
+
+The 200 workspace runs that verified #68 (150 Windows, 50 Linux, whole logs)
+turned up three tests #68's own 200 runs had not failed:
+
+| test | failed | shape |
+|---|---|---|
+| `rdns::rpz::tests::a_query_costs_the_same_however_many_address_rules_the_feed_holds` | 2 / 150 Windows | one-sample ratio: "86ns at 1k against 356ns at 10k" |
+| `rdns::rpz::tests::indexing_address_triggers_does_not_grow_quadratically` | 1 / 150 Windows | one-sample ratio: "32.4ms at 8k against 102.2ms at 16k" |
+| `rdns_transport::tcp::tests::the_drain_waits_for_a_reply_still_being_written` | 1 / 50 Linux | a 20 ms head start, `tcp.rs:605` "the answer" |
+
+#### 120a. The TCP stop tests assume the query is read within 20 ms
+
+`tcp.rs:596` sends a query, sleeps 20 ms and calls `begin()`. If the server has
+not read the query by then, the stop lands between messages, where
+`serve_one` checks it by design (`CLAUDE.md` §9), and the connection closes
+unanswered. Checked: with the sleep at 0 ms the test failed 1 in 10 runs, at
+the same line with the same message. `a_stop_ends_the_reading_but_not_the_reply_already_in_flight`
+(`:553`) has the same 20 ms sleep and the same exposure.
+
+Remedy: make the handler say it has the message before the test stops. `Echo`
+signals a `tokio::sync::Notify` (or a oneshot) on entering `handle`; both tests
+await it in place of the sleep. The drain test's 100 ms floor stays: the
+handler still has ~200 ms left when the stop lands.
+
+#### 120b. Ratio tests that take one sample
+
+`zone.rs:3043` failed the same way in CI (run 35538607349) and was fixed with
+best-of-five, with the reason in its doc: contention only adds time, so the
+minimum is the least-disturbed sample. The two `rpz.rs` tests (`:1361`,
+`:1405`) take one sample each side.
+
+Count, by `grep` for ratio assertions over test timings: twelve. Two take a
+minimum (`compression.rs:315`, `zone.rs:3063`). The other ten — `logging.rs:625`,
+`negative_cache.rs:907`, `nsec_cache.rs:1137`, `resolver/caches.rs:452`,
+`rpz.rs:1390`, `:1458`, `zone_signer.rs:3687`, `rdnsd/src/zones.rs:1937`,
+`:1964`, `:2011` — showed none inside the test function. A minimum taken in a
+helper would not show there, so each needs opening before it is changed.
+
+Remedy: best-of-five on both sides, as `zone.rs:3056`, for the two `rpz`
+tests. For the other eight, open each and apply the same where it takes one
+sample; say in the closing row which already had a minimum and which had
+reasons not to (§19).
+
+---
+
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -7098,6 +7011,7 @@ the week; the record is under "How the queue kept going stale" in
 | **117** | `refresh` claimed the query path's storing; prefetch and DNS64 never fed the denial cache | **filed and closed 2026-09-25**. The reason given for storing less was about the reply, not the cache. `Caches::store` holds the four rules and both writers call it. Regression test: a refreshed Secure NXDOMAIN answers the rest of its NSEC gap with no second upstream query, asked twice with the old storing restored. `testutil::SignedZone` is the first Secure resolution `rdnsr`'s tests can reach. Declined: DNS64 consulting the denial cache, since CD would have to be passed in to agree. See `docs/CLOSED_WORK.md` |
 | **118** | `answer_update` checked permission before the zone, and its doc claimed the RFC's order | **filed and closed 2026-09-25**. BIND, Knot and PowerDNS read: all check permission before §3.2, two of three check the zone before permission. Now zone → permission → prerequisites, so an unsigned or wrongly scoped UPDATE for a zone not served is NOTAUTH. The conformance row lists the two deviations, one of them the replicated-zone REFUSED where §3.1.1 forwards. See `docs/CLOSED_WORK.md` |
 | **119** | two UPDATE refusals no test reached, and an unreadable zone directory answered REFUSED | **filed and closed 2026-09-25**. SERVFAIL now, as a failed read of the zone file already was: RFC 2136 §4.6 sends the client to the next server on SERVFAIL and ends the update on REFUSED. `file_for` propagates `read_dir` and entry errors as the loader does. Four tests; the task-failure SERVFAIL stays untested, reachable only by a panic. See `docs/CLOSED_WORK.md` |
+| **68** | a socket test failed once under a parallel suite | **filed 2026-09-15, closed 2026-09-25.** The test it named never failed again; two others in `rdnsd` did, 8 in 200 workspace runs. 68a was a defect: dnstap's pump dropped its queue on stop, frames already counted as sent, so a capture lost its last requests (50 of 50 provoked runs). Now drained before STOP. 68b was the test's: an unanswered NOTIFY is resent after 2 s. 0 in 200 runs after. The same 200 runs filed **#120**. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
