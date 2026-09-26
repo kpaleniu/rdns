@@ -10915,3 +10915,68 @@ clean.
 
 
 ---
+
+### 124. `compression.rs`'s ratio test sits at 3.0-3.6× in debug against a bound of 5 — **filed 2026-09-26, closed 2026-09-26**
+
+Found while verifying #122:
+`compression::tests::writing_a_name_costs_the_same_however_many_the_message_holds`
+failed once in 50 Linux workspace runs, "800 names cost 1.52µs each against
+299ns for 25", 5.08× against 5.
+
+Its doc says "the true ratio is ~2 (53 ns to 112 …) and an unindexed scan's is
+13, so 5 discriminates". Measured at rest in a debug build, 200 runs of each
+sampling shape: **median 3.0× on Windows, 3.5-3.6× on Linux**, p99 3.2× and
+3.75×. Loaded, on Windows, 600 runs: p99 4.0-4.3×, max 6.09× sequential and
+4.75× taking turns. The ~2 reads as a release figure; `cargo test` is debug.
+So the bound sits 1.4× above the Linux median, where `zone.rs`'s sits 1.5× and
+`rpz`'s lookup test's 3×.
+
+Taking turns (#122) does not move it: the two shapes' medians and tails agree
+within noise. Each small sample is 500 name writes — 150 µs in the failing
+run — so a best of three is three short windows.
+
+Not measured, and what a remedy has to start from: the unindexed scan's ratio
+*in debug*, which decides whether the bound can rise, and whether more
+samples of the small side narrow the tail.
+
+**Measured 2026-09-26**, both questions the row left, from a throwaway probe
+repeating the test's measurement 200 times a process, built as is and with
+`SCAN_LIMIT` raised past 800 so the table is never indexed. Load is 32 CPU
+spinners on 16 cores.
+
+| | indexed, median / max | unindexed scan, min |
+|---|---|---|
+| Windows, at rest | 3.05× / 3.96× | 9.29× |
+| Windows, loaded | 3.14× / 4.25× | 13.56× |
+| Linux, at rest | 3.48× / 3.58× | 15.18× |
+| Linux, loaded | **6.16× / 8.98×**, 195 of 200 over 5 | 14.53× |
+| Windows, release | 2.14× / 3.38× | |
+
+The scan's ratio in debug is 13-15, so the bound need not rise. More samples
+do not help: best of seven read 6.17× on loaded Linux. The cause is the
+row's last observation. A small sample is 500 writes, which fit in one
+scheduler slice, and a large sample is 16 000, which do not, so under load
+only the large side is preempted and the minimum cannot remove it. The scan's
+ratio doubled too, to 30.9×. With the same 16 000 writes on both sides the
+median fell back to 3.29×, but the max was still 6.19×.
+
+**Done 2026-09-26.** Both sides write 800 names a sample, 32 messages of 25
+against one of 800, so both usually fit in a slice; best of fifteen, bound
+unchanged at 5. Measured in that shape, max ratio over 200: 3.18× Windows
+at rest, 3.32× loaded, 3.64× Linux at rest, **3.26× loaded**; the scan never
+below 12.6×. The doc's "~2" was release, and it now gives the debug figures.
+
+Of the ten other `fastest_of_each` callers, seven give both sides the same
+number of operations. `zone.rs` and `rpz`'s indexing test time twice the
+work because growth is what they test, and `zone.rs`'s held under #122's
+load. `rdnsd`'s verify test weighs 1 000 RRsets against 4 000 per unit, but
+both samples take milliseconds, so both are preempted in proportion and
+neither gets the asymmetry. Not measured.
+
+Verified: the real test on Linux under the same load, 100 runs a side: old
+83 failed, new 0. It still fails against the unindexed scan, at 12.7×.
+1 334 passed on Windows and 1 355 on Linux, 0 failed; clippy clean on both;
+`cargo doc` and `cargo fmt --check` clean.
+
+
+---

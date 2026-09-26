@@ -282,16 +282,20 @@ mod tests {
     /// Cost per name written does not grow with the size of the message: a
     /// ratio between 25 names and 800, so it is machine-independent.
     ///
-    /// The true ratio is ~2 (53 ns to 112, the residue being cache, not the
-    /// table) and an unindexed scan's is 13, so 5 discriminates.
+    /// In debug the ratio is 3.0 on Windows and 3.5 on Linux, and an unindexed
+    /// scan's is 13-15, so 5 discriminates; the ~2 once quoted here is release.
+    /// Both sides write 800 names a sample, short enough to fit one scheduler
+    /// slice: with 500 against 16 000 only the long side was preempted, and
+    /// on loaded Linux the ratio read 6.2 (`TODO.md` #124).
     #[test]
     fn writing_a_name_costs_the_same_however_many_the_message_holds() {
+        const WRITES: usize = 800;
         let per_name = |count: usize| {
             let names: Vec<Name> = (0..count).map(|i| nm(&format!("h{i}.e.com."))).collect();
             let mut buf = vec![0u8; 0x4000];
             move || {
                 let start = std::time::Instant::now();
-                for _ in 0..20 {
+                for _ in 0..WRITES / count {
                     let mut c = NameCompressor::new();
                     let mut pos = 12;
                     for name in &names {
@@ -301,11 +305,11 @@ mod tests {
                     // may land past the 14-bit pointer range.
                     assert!(pos < POINTER_MASK as usize);
                 }
-                start.elapsed() / (20 * count) as u32
+                start.elapsed() / WRITES as u32
             }
         };
 
-        let (few, many) = crate::testutil::fastest_of_each(3, per_name(25), per_name(800));
+        let (few, many) = crate::testutil::fastest_of_each(15, per_name(25), per_name(800));
         assert!(
             many < few * 5,
             "800 names cost {many:?} each against {few:?} for 25: \
