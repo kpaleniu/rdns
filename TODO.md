@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#123**, **#124**, **#125**, plus **#21**, as of 2026-09-26.
-#58, #68 and #107-#122 are closed. #117-#119 came out of a fourth
+**#124**, **#125**, plus **#21**, as of 2026-09-26.
+#58, #68 and #107-#123 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
 #123 and #124 out of verifying #122, and #125 out of closing #121.
@@ -6689,30 +6689,6 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 123. Two resolver tests gave up before their own timeout under load — **filed 2026-09-26**
-
-Found while verifying #122. Each failed once in 150 Windows workspace runs,
-five `cargo test --workspace` running at once, in different runs:
-
-| test | panic |
-|---|---|
-| `resolver::tests::a_bogus_answer_names_the_way_it_is_bogus` | `NoResponse("no server for exaMple.TEST. answered while resolving www.example.test.")` at `resolver.rs:3216` |
-| `resolver::tests::test_wildcard_nodata_validates_as_secure` | `NoResponse("no server for test. answered while resolving wild-nodata.example.test.")` at `resolver.rs:3590` |
-
-Neither failed in the 452 Windows logs kept from verifying #68 and #120.
-Both use `validating_config` over `recursing_config`, `timeout_ms: 4000`, but the
-`rdns` test binary finished in 3.85 s and 3.59 s: the lookup failed without
-waiting out the timeout, so this is not a slow fake server.
-
-The fakes are `bind_hierarchy`: up to eight sockets on `127.0.0.1-8`, one port
-drawn from 20 000-39 999 and shared by all of them, because glue carries no
-port. By reading only: another process, or another test, holding that port
-on one of those addresses, or on the wildcard, is one way a query could be
-answered by something else or refused. Not provoked, and nothing here says
-which; no remedy named (`CLAUDE.md` §18).
-
----
-
 ### 124. `compression.rs`'s ratio test sits at 3.0-3.6× in debug against a bound of 5 — **filed 2026-09-26**
 
 Found while verifying #122:
@@ -6961,6 +6937,7 @@ the week; the record is under "How the queue kept going stale" in
 | **120** | three timing flakes found verifying #68 | **filed and closed 2026-09-25.** 120a: the TCP stop tests slept 20 ms and hoped the server had read the query; the handler now says so. 120b: all twelve ratio tests opened — four already took a minimum, one is not a suite test, seven took one sample and now take the best of five through `rdns::testutil::fastest`. After: 0 failures of any of them in 150 Windows and 50 Linux runs, against 4 before. The same runs filed **#121**, a real signing defect, and **#122**. See `docs/CLOSED_WORK.md` |
 | **122** | ratio tests took five of one side, then five of the other | **filed 2026-09-25, closed 2026-09-26.** Measured first: `zone.rs`'s test under load failed 5 in 900 sampling one side then the other, 0 in 900 taking turns, with the same median. `rdns::testutil::fastest_of_each` takes turns, and all eleven suite ratio tests use it; `fastest` is gone. The verification filed **#123** and **#124**. See `docs/CLOSED_WORK.md` |
 | **121** | incremental signing took a key tag for a key | **filed 2026-09-25, closed 2026-09-26.** A new ZSK whose tag matched the old one's read as "keys unchanged", so the old signature was carried alone and the new DNSKEY signed nothing; a swapped-in twin carried a signature from a withdrawn key. Condition 3 now holds only when each signer's tag names exactly its own DNSKEY in the previous run's RRset, checked once per run. A stored colliding Ed25519 pair tests both cases, each watched failing before. Filed **#125**, a collision in `--generate-keys` overwriting a private key file. See `docs/CLOSED_WORK.md` |
+| **123** | two resolver tests timed out under load | **filed and closed 2026-09-26.** The row said they failed before their timeout; each server gets `timeout_ms / 2`, and every failure was that 2 s expiring. The fake never received the query: CPU load alone reproduced it, 7 in 20 runs, with no other network traffic. It polled its stop flag with a 50 ms `SO_RCVTIMEO`, which Windows documents as leaving the socket "in an indeterminate state"; a datagram arriving as it fired was lost. Now a task on the test runtime, aborted on drop. Under 64 spinners, old 25 of 25 runs failing, new 0 of 25 — `zone.rs`'s ratio test included, which the old fakes were disturbing. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 

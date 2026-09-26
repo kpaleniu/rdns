@@ -10778,7 +10778,8 @@ measured the same way and the two shapes do not differ: medians 3.02× and
 Verified: 150 whole-workspace runs on Windows and 50 on Linux, concurrent,
 whole logs. `zone.rs`'s test did not fail, against 1 in 150 before; no ratio
 test failed on Windows. Three failures of other tests, each filed rather than
-chased: two resolver tests that gave up faster than their own timeout, one on
+chased: two resolver tests ~~that gave up faster than their own timeout~~ (wrong:
+they waited out the 2 s per-server timeout, see #123), one on
 each of two Windows runs (**#123**), and `compression.rs`'s ratio test once on
 Linux, 5.08× against 5 (**#124**). 1 333 passed on Windows and 1 354 on Linux
 in a clean run, 0 failed; clippy clean on both; `cargo doc` and
@@ -10854,5 +10855,63 @@ a collision than the one it named: a key file overwritten.
 
 Verified: 1 334 passed on Windows, 1 355 on Linux, 0 failed; clippy clean on
 both; `cargo doc` and `cargo fmt --check` clean.
+
+---
+
+### 123. Two resolver tests gave up before their own timeout under load — **filed 2026-09-26, closed 2026-09-26**
+
+Found while verifying #122. Each failed once in 150 Windows workspace runs,
+five `cargo test --workspace` running at once, in different runs:
+
+| test | panic |
+|---|---|
+| `resolver::tests::a_bogus_answer_names_the_way_it_is_bogus` | `NoResponse("no server for exaMple.TEST. answered while resolving www.example.test.")` at `resolver.rs:3216` |
+| `resolver::tests::test_wildcard_nodata_validates_as_secure` | `NoResponse("no server for test. answered while resolving wild-nodata.example.test.")` at `resolver.rs:3590` |
+
+Neither failed in the 452 Windows logs kept from verifying #68 and #120.
+Both use `validating_config` over `recursing_config`, `timeout_ms: 4000`, but the
+`rdns` test binary finished in 3.85 s and 3.59 s: ~~the lookup failed without
+waiting out the timeout, so this is not a slow fake server.~~ **Wrong:**
+`query_server` waits `timeout_ms / 2` per server, and each zone here has one,
+so a 2 s wait fits in either run. Every failure measured below was that 2 s
+expiring.
+
+The fakes are `bind_hierarchy`: up to eight sockets on `127.0.0.1-8`, one port
+drawn from 20 000-39 999 and shared by all of them, because glue carries no
+port. By reading only: another process, or another test, holding that port
+on one of those addresses, or on the wildcard, is one way a query could be
+answered by something else or refused. Not provoked, and nothing here says
+which; no remedy named (`CLAUDE.md` §18).
+
+**Measured 2026-09-26.** `ask_any` discards `query_server`'s error, so it was
+logged, and the fake logged each query it received. The `rdns` unit binary,
+six at once: 12 of 48 runs failed; alone, 0 of 30; alone beside 64 CPU
+spinners and no other network traffic, 7 of 20. Every resolver failure was a
+read timeout at 2.00-2.23 s, and the fake never saw the query: its loop never
+paused longer than 90 µs, its `recv_from` returned no error, the query was not
+unparseable, and on stop it held nothing unread. The row's port collision is
+ruled out by that last run, and nothing in the tree sets `SO_REUSEADDR`.
+
+What fits is Windows's own warning on `SO_RCVTIMEO`: "If a blocking receive
+call times out, the connection is in an indeterminate state and should be
+closed." The fake polled its stop flag with a 50 ms receive timeout, so it
+timed out twenty times a second, and a datagram arriving as one did was lost.
+Load widens that window. Linux, which has no such caveat, never showed it.
+
+**Done 2026-09-26.** `spawn_server` runs the fake as a task on the test's
+runtime and `FakeServer`'s drop aborts it: no timeout to race, and no shutdown
+datagram that could itself be lost and hang the drop. The only such polling
+loop in the tree; `rdnsc`'s two read timeouts are one-shot, where a timeout is
+already the failure.
+
+Verified against the old binary, alternating, 25 runs each under one
+sustained load of 64 spinners on Windows: old failed 25 of 25, 21 with a
+resolver test; new 0 of 25. `zone.rs`'s ratio test failed in all 25 old runs
+and none of the new: the old binary with `resolver::` skipped passed it 10 of
+10 under the same load, so the old fakes' threads running beside it were the
+cause there. Not isolated further. 1 334 passed on Windows and 1 355 on
+Linux, 0 failed; clippy clean on both; `cargo doc` and `cargo fmt --check`
+clean.
+
 
 ---

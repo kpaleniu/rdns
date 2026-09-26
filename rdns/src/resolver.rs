@@ -780,7 +780,7 @@ mod tests {
     // these shadow the async tokio `UdpSocket`/`TcpStream` from `super::*`.
     use std::io::{Read, Write};
     use std::net::{TcpListener, UdpSocket};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::thread;
 
@@ -1060,19 +1060,15 @@ this line has no record and is skipped
     }
 
     /// A UDP server that answers with whatever the closure builds. Stops when
-    /// the returned guard is dropped, so tests don't leak threads.
+    /// the returned guard is dropped.
     struct FakeServer {
         addr: SocketAddr,
-        stop: Arc<AtomicBool>,
-        handle: Option<thread::JoinHandle<()>>,
+        task: tokio::task::JoinHandle<()>,
     }
 
     impl Drop for FakeServer {
         fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(h) = self.handle.take() {
-                let _ = h.join();
-            }
+            self.task.abort();
         }
     }
 
@@ -1105,22 +1101,25 @@ this line has no record and is skipped
         panic!("could not bind a shared port across loopback addresses");
     }
 
+    /// A task on the test's runtime, not a thread polling a timed receive: on
+    /// Windows, under load, such a fake never saw some queries and the resolver
+    /// waited out its timeout. `SO_RCVTIMEO`'s doc: a timed-out receive leaves
+    /// the socket "in an indeterminate state" (`TODO.md` #123).
     fn spawn_server<F>(socket: UdpSocket, answer: F) -> FakeServer
     where
         F: Fn(&DnsMessage) -> DnsMessage + Send + 'static,
     {
-        socket
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
         let addr = socket.local_addr().unwrap();
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = stop.clone();
 
-        let handle = thread::spawn(move || {
+        let task = tokio::spawn(async move {
             let mut buf = [0u8; 4096];
-            while !flag.load(Ordering::Relaxed) {
-                let Ok((n, peer)) = socket.recv_from(&mut buf) else {
-                    continue; // read timeout; re-check the stop flag
+            loop {
+                // An ICMP error from a peer that has gone arrives here as an
+                // `Err`, and says nothing about the next query.
+                let Ok((n, peer)) = socket.recv_from(&mut buf).await else {
+                    continue;
                 };
                 let Ok(query) = DnsMessage::try_from_bytes(&buf[..n]) else {
                     continue;
@@ -1128,16 +1127,12 @@ this line has no record and is skipped
                 let response = answer(&query);
                 let mut out = vec![0u8; 4096];
                 if let Ok(len) = response.to_bytes(&mut out) {
-                    let _ = socket.send_to(&out[..len], peer);
+                    let _ = socket.send_to(&out[..len], peer).await;
                 }
             }
         });
 
-        FakeServer {
-            addr,
-            stop,
-            handle: Some(handle),
-        }
+        FakeServer { addr, task }
     }
 
     fn ns_record(owner: &str, target: &str) -> ResourceRecord {
