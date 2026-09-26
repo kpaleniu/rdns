@@ -23,7 +23,9 @@ is signed as it loads; zones with no key are served unchanged.
 
 `--generate-keys <zone>` writes a KSK and a ZSK into that directory, prints the
 DS to give the parent, and exits. Algorithm from `--key-algorithm`. Two keys
-because only the KSK is digested into the DS.
+because only the KSK is digested into the DS. A new key's tag, and its tag with
+REVOKE set, avoid every key already there for the zone, and a key file is never
+replaced.
 
 | algorithm | code | generate | sign | verify |
 |---|---|---|---|---|

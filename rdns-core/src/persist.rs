@@ -5,6 +5,9 @@
 //! Windows. The same directory matters: a cross-filesystem rename is a copy,
 //! which is the non-atomic thing being avoided. The fsync before the rename is
 //! what makes "the rename happened" imply "the contents are there".
+//!
+//! A private file is created, never replaced, so it is published by a hard
+//! link instead: see [`create_atomically_private`].
 
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -55,23 +58,42 @@ pub fn read_secret(path: &Path, what: &str) -> io::Result<String> {
     Ok(secret)
 }
 
-/// Same, for a file nobody but the owner may read: a private key, a shared
-/// secret.
+/// Create `path`, which must not exist, holding something nobody but the
+/// owner may read: a private key.
 ///
-/// The restriction goes on the temporary, before the rename: setting the mode
-/// on the target afterwards leaves a window at whatever the umask allowed. A
+/// Never replaces. The one caller is `SigningKey::write_to_dir`, whose file
+/// name is the key tag, so an existing file is a tag collision and replacing
+/// it destroys the other key's private half (`TODO.md` #125). Published by
+/// `hard_link`, which fails on an existing target on Unix and Windows alike and
+/// is as atomic as the rename; std's `rename` has no no-replace form. The cost
+/// is a filesystem without hard links (FAT), where this always fails.
+///
+/// The restriction goes on the temporary, before the link: setting the mode on
+/// the target afterwards leaves a window at whatever the umask allowed. A
 /// failure to restrict is a failure to write — reporting success would hand back
 /// a path the caller believes is private and is not.
-pub fn write_atomically_private(path: &Path, contents: &str) -> io::Result<()> {
+pub fn create_atomically_private(path: &Path, contents: &str) -> io::Result<()> {
     let temp = temp_path_for(path)?;
 
     let result = write_and_sync(&temp, contents.as_bytes())
         .and_then(|()| restrict_to_owner(&temp))
-        .and_then(|()| fs::rename(&temp, path));
+        .and_then(|()| fs::hard_link(&temp, path));
     if result.is_err() {
         let _ = fs::remove_file(&temp);
         return result;
     }
+    // Reported, not ignored: left behind it is a second name for the key. The
+    // message says the target is written, or a retry is the next mistake.
+    fs::remove_file(&temp).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "{} is written, but its temporary {} could not be removed: {e}",
+                path.display(),
+                temp.display()
+            ),
+        )
+    })?;
 
     sync_dir(path.parent());
     Ok(())
@@ -283,7 +305,7 @@ mod tests {
         let dir = ScratchDir::new("persist-private-write");
         let path = dir.join("key.rdnskey");
 
-        write_atomically_private(&path, "PrivateKey: not-really\n").expect("write");
+        create_atomically_private(&path, "PrivateKey: not-really\n").expect("write");
 
         let mode = fs::metadata(&path).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "got mode {:o}", mode & 0o777);
@@ -293,6 +315,23 @@ mod tests {
         );
         assert_eq!(dir.entries(), vec!["key.rdnskey".to_string()]);
         ensure_private(&path, "a DNSSEC private key").expect("what we just wrote passes");
+    }
+
+    /// Unlike every other write here, an existing file is not replaced.
+    #[test]
+    fn test_a_private_write_refuses_an_existing_file() {
+        let dir = ScratchDir::new("persist-private-exists");
+        let path = dir.join("key.rdnskey");
+        create_atomically_private(&path, "PrivateKey: first\n").expect("write");
+
+        let err = create_atomically_private(&path, "PrivateKey: second\n").unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read back"),
+            "PrivateKey: first\n"
+        );
+        assert_eq!(dir.entries(), vec!["key.rdnskey".to_string()]);
     }
 
     #[test]

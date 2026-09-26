@@ -37,8 +37,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#125**, plus **#21**, as of 2026-09-26.
-#58, #68 and #107-#124 are closed. #117-#119 came out of a fourth
+**#21** only, as of 2026-09-26.
+#58, #68 and #107-#125 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
 #123 and #124 out of verifying #122, and #125 out of closing #121.
@@ -6689,29 +6689,6 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 125. `--generate-keys` overwrites a key whose tag it collides with — **filed 2026-09-26**
-
-Found closing #121. A key file is named `K<owner>+<alg>+<tag>.rdnskey`
-(`SigningKey::file_name`), and `write_to_dir` ends in `fs::rename`, which
-replaces an existing file. So a new key whose owner, algorithm and tag match
-one already in the directory silently replaces its private half. Provoked
-with #121's `colliding_zsks`: two `write_to_dir` calls, one path, one file,
-and `load_dir` returns only the second key.
-
-Two ways in: `--generate-keys` into a key directory already holding a key
-for the zone, as a rollover would (`rdnsd/src/main.rs`, `generate_keys`), one
-in 65 536 per existing key of that algorithm; and the KSK and ZSK of one run
-colliding with each other, where the ZSK is written second and replaces the
-KSK whose DS is then printed.
-Mid-rollover, losing the private half of the key the parent's DS names is the
-expensive case.
-
-#121's row named refusing such a key as what BIND's `dnssec-keygen` does,
-for the signing cost; not checked against its source for this row. The
-overwrite is the new half, and no remedy is costed here (`CLAUDE.md` §18).
-
----
-
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -6914,6 +6891,7 @@ the week; the record is under "How the queue kept going stale" in
 | **121** | incremental signing took a key tag for a key | **filed 2026-09-25, closed 2026-09-26.** A new ZSK whose tag matched the old one's read as "keys unchanged", so the old signature was carried alone and the new DNSKEY signed nothing; a swapped-in twin carried a signature from a withdrawn key. Condition 3 now holds only when each signer's tag names exactly its own DNSKEY in the previous run's RRset, checked once per run. A stored colliding Ed25519 pair tests both cases, each watched failing before. Filed **#125**, a collision in `--generate-keys` overwriting a private key file. See `docs/CLOSED_WORK.md` |
 | **123** | two resolver tests timed out under load | **filed and closed 2026-09-26.** The row said they failed before their timeout; each server gets `timeout_ms / 2`, and every failure was that 2 s expiring. The fake never received the query: CPU load alone reproduced it, 7 in 20 runs, with no other network traffic. It polled its stop flag with a 50 ms `SO_RCVTIMEO`, which Windows documents as leaving the socket "in an indeterminate state"; a datagram arriving as it fired was lost. Now a task on the test runtime, aborted on drop. Under 64 spinners, old 25 of 25 runs failing, new 0 of 25 — `zone.rs`'s ratio test included, which the old fakes were disturbing. See `docs/CLOSED_WORK.md` |
 | **124** | `compression.rs`'s ratio test near its bound in debug | **filed and closed 2026-09-26.** The bound was right: the unindexed scan reads 13-15× in debug, the ~2 was release. The samples were not: 500 writes against 16 000, so under load only the long side was preempted — loaded Linux read 6.16× median, 195 of 200 over 5, and more samples did not help. Both sides now write 800 names a sample, best of fifteen: max 3.26× loaded, and the real test failed 0 of 100 there against 83 before. See `docs/CLOSED_WORK.md` |
+| **125** | `--generate-keys` replaced a key file whose tag it collided with | **filed and closed 2026-09-26.** Checked against BIND first: `dnssec-keygen` generates again while a new key's tag, or its tag with REVOKE set, equals either tag of a key of that name and algorithm in the directory (`key_collision`, `dnssectool.c`). `SigningKey::distinct_from` does the same against the directory and the run's other key, bounded at 100 attempts; `write_to_dir` publishes by hard link and refuses an existing file. Tested over #121's stored pair, a stored REVOKE-apart pair and a same-tag pair of two algorithms; the overwrite test watched failing against the old rename, and `rdnsd`'s wiring test against dropping either list. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 

@@ -16,8 +16,8 @@
 
 use crate::codecs::base64_encode;
 use crate::dnssec::{
-    ds_digest, key_tag, rrsig_labels_of, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_SEP,
-    DNSKEY_FLAG_ZONE,
+    ds_digest, key_tag, rrsig_labels_of, signed_data, Dnskey, Ds, Rrset, Rrsig, DNSKEY_FLAG_REVOKE,
+    DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE,
 };
 use crate::error::DnssecError;
 use crate::error::DnssecResult as Result;
@@ -499,6 +499,59 @@ impl SigningKey {
         key_tag(self.flags, 3, self.algorithm.code(), &self.public_key)
     }
 
+    /// The tag this key would have with REVOKE set (RFC 5011 §3).
+    fn revoked_key_tag(&self) -> u16 {
+        key_tag(
+            self.flags | DNSKEY_FLAG_REVOKE,
+            3,
+            self.algorithm.code(),
+            &self.public_key,
+        )
+    }
+
+    /// Whether the two cannot be told apart by tag, now or once either is
+    /// revoked: same owner, same algorithm, and a tag of one equal to either
+    /// tag of the other. BIND's `key_collision` (`dnssectool.c`) draws the
+    /// line in the same place, and `dnssec-keygen` generates again when it is
+    /// crossed.
+    ///
+    /// Not a correctness question for the signer, which #121 made tell keys
+    /// apart by DNSKEY. It is one for [`SigningKey::write_to_dir`], which names
+    /// the file by tag (`TODO.md` #125).
+    fn tag_collides_with(&self, other: &SigningKey) -> bool {
+        if self.owner != other.owner || self.algorithm != other.algorithm {
+            return false;
+        }
+        let tag = self.key_tag();
+        let other_tag = other.key_tag();
+        tag == other_tag || tag == other.revoked_key_tag() || self.revoked_key_tag() == other_tag
+    }
+
+    /// The first key out of `generate` whose tag, now or once either is
+    /// revoked, is none of `others`' of its owner and algorithm; `generate` is
+    /// [`SigningKey::generate`] outside a test.
+    ///
+    /// Bounded, where `dnssec-keygen` loops forever. Beside a thousand keys of
+    /// one zone and algorithm one attempt in 22 collides, so a hundred in a
+    /// row is not chance.
+    pub fn distinct_from(
+        others: &[&SigningKey],
+        mut generate: impl FnMut() -> Result<SigningKey>,
+    ) -> Result<SigningKey> {
+        const ATTEMPTS: usize = 100;
+        for _ in 0..ATTEMPTS {
+            let key = generate()?;
+            if !others.iter().any(|other| key.tag_collides_with(other)) {
+                return Ok(key);
+            }
+        }
+        Err(DnssecError::key(format!(
+            "{ATTEMPTS} new keys in a row shared a key tag with one of the {} \
+             they had to differ from",
+            others.len(),
+        )))
+    }
+
     /// The DS record a parent must publish to make this key an entry point.
     pub fn ds(&self, digest_type: u8) -> Result<Ds> {
         let key = self.dnskey();
@@ -681,10 +734,14 @@ impl SigningKey {
     ///
     /// The restriction is applied before the file reaches its final name, and
     /// failing to apply it fails the write — see
-    /// [`crate::persist::write_atomically_private`].
+    /// [`crate::persist::create_atomically_private`].
+    ///
+    /// An existing file of that name is an error, never replaced: it holds a
+    /// key with this key's tag, and the file is its only private half
+    /// (`TODO.md` #125).
     pub fn write_to_dir(&self, dir: &Path) -> Result<PathBuf> {
         let path = dir.join(self.file_name());
-        crate::persist::write_atomically_private(&path, &self.to_key_file())
+        crate::persist::create_atomically_private(&path, &self.to_key_file())
             .map_err(|e| DnssecError::key(format!("writing {}: {e}", path.display(),)))?;
         Ok(path)
     }
@@ -830,6 +887,7 @@ mod tests {
 
     use super::*;
     use crate::dnssec::{verify, verify_rrset, RrsetProof};
+    use crate::dnssec_test_util::{colliding_zsks, one_tag_two_algorithms, revoke_colliding_zsks};
     use crate::record_types as rt;
     use crate::test_records::a_rdata;
     use crate::test_records::nm;
@@ -890,14 +948,14 @@ mod tests {
             SigningKey::generate(SigningAlgorithm::Ed25519, "example.com.", 0x0100).expect("a key");
         let text = key.to_key_file();
 
-        // `write_atomically_private`, not `ScratchDir::write`: `load_dir`
+        // `create_atomically_private`, not `ScratchDir::write`: `load_dir`
         // refuses a key file the group can read, and that check is `cfg(unix)`
         // — so a 0644 fixture passes on Windows and fails on Linux. It did,
         // before this line (`CLAUDE.md` §1).
         let old = dir.join("Kold.rdnskey");
-        crate::persist::write_atomically_private(&old, &text).expect("write");
+        crate::persist::create_atomically_private(&old, &text).expect("write");
         let from_future = dir.join("Kfuture.rdnskey");
-        crate::persist::write_atomically_private(
+        crate::persist::create_atomically_private(
             &from_future,
             &format!("{text}Publish: 1700000000\nSomethingElse: 7\n"),
         )
@@ -921,7 +979,7 @@ mod tests {
             SigningKey::generate(SigningAlgorithm::Ed25519, "example.com.", 0x0100).expect("a key");
         let text = key.to_key_file();
 
-        crate::persist::write_atomically_private(
+        crate::persist::create_atomically_private(
             &dir.join("Kbad.rdnskey"),
             &format!("{text}Publish: last Tuesday\n"),
         )
@@ -930,7 +988,7 @@ mod tests {
         assert!(err.to_string().contains("Publish"), "got: {err}");
 
         let dir = ScratchDir::new("key-timing-order");
-        crate::persist::write_atomically_private(
+        crate::persist::create_atomically_private(
             &dir.join("Korder.rdnskey"),
             &format!("{text}Publish: 200\nActivate: 100\n"),
         )
@@ -1177,6 +1235,86 @@ mod tests {
         assert!(
             format!("{err:#}").contains("Flags"),
             "the parse failure, not the permission check: {err:#}"
+        );
+    }
+
+    /// Two keys with one file name: the second write is refused and the first
+    /// key's private half is what is on disk (`TODO.md` #125).
+    #[test]
+    fn a_key_is_not_written_over_one_with_its_file_name() {
+        let dir = ScratchDir::new("key-file-collision");
+        let [zsk, twin] = colliding_zsks("example.com.");
+        assert_eq!(zsk.file_name(), twin.file_name());
+
+        zsk.write_to_dir(dir.path()).expect("write");
+        let err = twin
+            .write_to_dir(dir.path())
+            .expect_err("the name is taken");
+
+        assert!(err.to_string().contains(&zsk.file_name()), "{err}");
+        let loaded = SigningKey::load_dir(dir.path()).expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].dnskey_public_key(), zsk.dnskey_public_key());
+        assert_eq!(dir.entries(), vec![zsk.file_name()], "no temporary left");
+    }
+
+    /// Equal tags collide, and so do tags one REVOKE apart, which do not
+    /// share a file name and would share a tag once one key is revoked. A key
+    /// of another zone collides with nothing.
+    #[test]
+    fn a_tag_collision_is_the_tag_or_the_tag_once_revoked() {
+        let [zsk, twin] = colliding_zsks("example.com.");
+        let [plain, revokes_onto_plain] = revoke_colliding_zsks("example.com.");
+        assert_ne!(plain.file_name(), revokes_onto_plain.file_name());
+
+        for (a, b) in [(&zsk, &twin), (&plain, &revokes_onto_plain)] {
+            assert!(a.tag_collides_with(b), "{a:?} {b:?}");
+            assert!(b.tag_collides_with(a), "{b:?} {a:?}");
+        }
+        assert!(!zsk.tag_collides_with(&plain));
+
+        let [elsewhere, _] = colliding_zsks("example.net.");
+        assert!(!zsk.tag_collides_with(&elsewhere), "another owner");
+
+        let [ed25519, p256] = one_tag_two_algorithms("example.com.");
+        assert_eq!(ed25519.key_tag(), p256.key_tag());
+        assert!(!ed25519.tag_collides_with(&p256), "another algorithm");
+    }
+
+    #[test]
+    fn a_colliding_new_key_is_generated_again() {
+        let [zsk, twin] = colliding_zsks("example.com.");
+        let [plain, revokes_onto_plain] = revoke_colliding_zsks("example.com.");
+        let [elsewhere, _] = colliding_zsks("example.net.");
+        let mut candidates = vec![elsewhere, revokes_onto_plain, twin];
+
+        let key = SigningKey::distinct_from(&[&zsk, &plain], || {
+            Ok(candidates.pop().expect("a candidate"))
+        })
+        .expect("the third is distinct");
+
+        assert!(candidates.is_empty(), "all three were drawn");
+        assert_eq!(key.owner(), nm("example.net.").as_ref());
+    }
+
+    /// Bounded, not a hang.
+    #[test]
+    fn generating_again_gives_up() {
+        let [zsk, _] = colliding_zsks("example.com.");
+        let mut attempts = 0;
+
+        let err = SigningKey::distinct_from(&[&zsk], || {
+            attempts += 1;
+            let [_, twin] = colliding_zsks("example.com.");
+            Ok(twin)
+        })
+        .expect_err("every candidate collides");
+
+        assert_eq!(attempts, 100);
+        assert!(
+            err.to_string()
+                .contains("one of the 1 they had to differ from"),
+            "{err}"
         );
     }
 

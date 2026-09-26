@@ -32,6 +32,10 @@ const DNSKEY_PROTOCOL_DNSSEC: u8 = 3;
 /// only a hint that a DS points here, and nothing treats it as more.
 pub const DNSKEY_FLAG_SEP: u16 = 0x0001;
 
+/// DNSKEY flags bit 8 (0x0080): REVOKE (RFC 5011 §3). Setting it changes the
+/// key tag, which is why generating a key checks both tags (`TODO.md` #125).
+pub(crate) const DNSKEY_FLAG_REVOKE: u16 = 0x0080;
+
 /// The DNSSEC algorithms we can verify, by IANA number (RFC 8624 §3.1).
 ///
 /// Everything else — RSAMD5 (1), DSA (3 and 6), GOST (12), Ed448 (16) — is

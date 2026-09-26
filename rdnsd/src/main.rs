@@ -2274,15 +2274,7 @@ fn generate_keys(zone: &str, dir: &Path, algorithm: &str) -> Result<()> {
         format!("{zone}.")
     };
 
-    let ksk = SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP)?;
-    let zsk = SigningKey::generate(algorithm, &zone, DNSKEY_FLAG_ZONE)?;
-    for key in [&ksk, &zsk] {
-        let path = key.write_to_dir(dir)?;
-        // Also stdout on purpose, for the same reason as `--check-config`:
-        // `--generate-keys` exists to print a DS record somebody pastes into a
-        // registrar form, and that is output, not logging.
-        println!("Wrote {}", path.display());
-    }
+    let ksk = write_key_pair(dir, |flags| SigningKey::generate(algorithm, &zone, flags))?;
 
     // SHA-256, which RFC 8624 §3.3 is the only digest that is both mandatory to
     // implement and not deprecated.
@@ -2318,6 +2310,31 @@ fn generate_keys(zone: &str, dir: &Path, algorithm: &str) -> Result<()> {
     Ok(())
 }
 
+/// A KSK and a ZSK out of `generate`, which is given the flags, written into
+/// `dir`. Returns the KSK, for its DS.
+///
+/// Distinct from every key already there as well as from each other: the file
+/// name is the tag, and a rollover generates beside the live keys (`TODO.md`
+/// #125). `generate` is a parameter so a test can hand it a colliding key.
+fn write_key_pair(
+    dir: &Path,
+    mut generate: impl FnMut(u16) -> rdns::error::DnssecResult<SigningKey>,
+) -> Result<SigningKey> {
+    let existing = SigningKey::load_dir(dir)?;
+    let mut others: Vec<&SigningKey> = existing.iter().collect();
+    let ksk = SigningKey::distinct_from(&others, || generate(DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP))?;
+    others.push(&ksk);
+    let zsk = SigningKey::distinct_from(&others, || generate(DNSKEY_FLAG_ZONE))?;
+    for key in [&ksk, &zsk] {
+        let path = key.write_to_dir(dir)?;
+        // Also stdout on purpose, for the same reason as `--check-config`:
+        // `--generate-keys` exists to print a DS record somebody pastes into a
+        // registrar form, and that is output, not logging.
+        println!("Wrote {}", path.display());
+    }
+    Ok(ksk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2335,6 +2352,73 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::net::{IpAddr, SocketAddr};
+
+    /// A new key colliding with one in the directory, or with the run's own
+    /// KSK, is generated again rather than written over it (`TODO.md` #125).
+    /// The collisions are copies of one key: the only colliding pair `rdnsd`
+    /// can make without `rdns`'s stored fixtures. The ZSK's is a copy of the
+    /// KSK, SEP flag and all, since only an identical tag collides.
+    #[test]
+    fn a_new_key_pair_differs_from_the_directory_and_from_itself() {
+        let key = |flags| {
+            SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, "example.com.", flags)
+                .expect("a key")
+        };
+        let dir = ScratchDir::new("key-pair");
+        let live = key(DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP);
+        live.write_to_dir(dir.path()).expect("the live key");
+
+        let copies = ScratchDir::new("key-pair-copies");
+        let ksk = key(DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP);
+        live.write_to_dir(copies.path()).expect("write");
+        ksk.write_to_dir(copies.path()).expect("write");
+        let (mut live_copy, mut ksk_copy): (Vec<_>, Vec<_>) = SigningKey::load_dir(copies.path())
+            .expect("load")
+            .into_iter()
+            .partition(|k| k.dnskey_public_key() == live.dnskey_public_key());
+        let (live_copy, ksk_copy) = (live_copy.pop().expect("live"), ksk_copy.pop().expect("ksk"));
+        let zsk = key(DNSKEY_FLAG_ZONE);
+        let (ksk_public, zsk_public) = (
+            ksk.dnskey_public_key().to_vec(),
+            zsk.dnskey_public_key().to_vec(),
+        );
+        let mut candidates = vec![zsk, ksk_copy, ksk, live_copy];
+
+        let written = write_key_pair(dir.path(), |_| Ok(candidates.pop().expect("a candidate")))
+            .expect("both copies refused, both others written");
+
+        assert!(candidates.is_empty(), "all four were drawn");
+        assert_eq!(written.dnskey_public_key(), ksk_public);
+        let mut on_disk: Vec<Vec<u8>> = SigningKey::load_dir(dir.path())
+            .expect("load")
+            .iter()
+            .map(|k| k.dnskey_public_key().to_vec())
+            .collect();
+        let mut expected = vec![live.dnskey_public_key().to_vec(), ksk_public, zsk_public];
+        on_disk.sort();
+        expected.sort();
+        assert_eq!(on_disk, expected);
+    }
+
+    /// Reading the directory first means a directory the server would refuse
+    /// is refused here, before anything is written.
+    #[test]
+    fn a_key_pair_is_not_written_beside_a_broken_key() {
+        let dir = ScratchDir::new("key-pair-broken");
+        rdns::persist::create_atomically_private(
+            &dir.join("broken.rdnskey"),
+            "Owner: example.com.\n",
+        )
+        .expect("write");
+
+        let err = write_key_pair(dir.path(), |flags| {
+            SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, "example.com.", flags)
+        })
+        .expect_err("the directory does not load");
+
+        assert!(format!("{err:#}").contains("broken.rdnskey"), "{err:#}");
+        assert_eq!(dir.entries(), vec!["broken.rdnskey".to_string()]);
+    }
 
     /// A suppressed log line must not build its message.
     ///

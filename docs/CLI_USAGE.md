@@ -845,6 +845,13 @@ Two keys rather than one because only the key-signing key is digested into the
 DS: the zone-signing key can then be replaced whenever, while replacing the other
 means a conversation with the registrar.
 
+Keys already in the directory are read first, so running it into a live
+directory for a rollover is safe: a new key never shares a key tag with one
+there, nor with it once either is revoked, and a key file is never replaced. A
+directory the server would refuse to load is refused here too. The directory
+must be on a filesystem with hard links, which rules out FAT: a key file is
+published by one, because unlike a rename it cannot replace an existing file.
+
 ```bash
 mkdir -p /etc/rdns/keys
 rdnsd --signing-key-dir /etc/rdns/keys --generate-keys example.com

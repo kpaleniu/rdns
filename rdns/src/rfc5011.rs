@@ -18,15 +18,12 @@ use crate::Class;
 use std::path::Path;
 
 use crate::codecs::{base64_encode, hex_decode, hex_encode};
-use crate::dnssec::{ds_digest, Dnskey, Ds, Rrset};
+use crate::dnssec::{ds_digest, Dnskey, Ds, Rrset, DNSKEY_FLAG_REVOKE};
 use crate::record_types as rt;
 use crate::{Name, NameRef, RecordData, ResourceRecord};
 // `key_record` alone: it builds the DNSKEY records the tests feed back in.
 #[cfg(test)]
 use crate::{ParsedRecord, Ttl};
-
-/// The REVOKE bit (RFC 5011 §3), flags bit 8.
-const DNSKEY_FLAG_REVOKE: u16 = 0x0080;
 
 /// How long a new key must be continuously present before it is trusted
 /// (RFC 5011 §2.4.1: 30 days).

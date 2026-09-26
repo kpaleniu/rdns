@@ -10823,8 +10823,11 @@ names only a tag, so nothing on the RRSIG side can tell colliding keys apart).
 A test for each case, using a colliding key found once and stored as a fixture
 rather than searched for per run (19 724 generations is a second of release
 build and much more in debug). Not in scope and worth a number of its own if
-wanted: refusing to *generate* a key whose tag collides with the zone's, which
-is what BIND's `dnssec-keygen` does.
+wanted: ~~refusing to *generate* a key whose tag collides with the zone's, which
+is what BIND's `dnssec-keygen` does.~~ **Not what it does**: it generates
+again, and counts a tag equal once either key is revoked as a collision too
+(#125, read from its source). Filed from memory, which is how the word
+"refusing" got in.
 
 **Done 2026-09-26**, as the row's remedy said, with one difference: the
 check runs once per signing run, not per RRset.
@@ -10977,6 +10980,75 @@ Verified: the real test on Linux under the same load, 100 runs a side: old
 83 failed, new 0. It still fails against the unindexed scan, at 12.7×.
 1 334 passed on Windows and 1 355 on Linux, 0 failed; clippy clean on both;
 `cargo doc` and `cargo fmt --check` clean.
+
+
+---
+
+### 125. `--generate-keys` overwrites a key whose tag it collides with — **filed 2026-09-26, closed 2026-09-26**
+
+Found closing #121. A key file is named `K<owner>+<alg>+<tag>.rdnskey`
+(`SigningKey::file_name`), and `write_to_dir` ends in `fs::rename`, which
+replaces an existing file. So a new key whose owner, algorithm and tag match
+one already in the directory silently replaces its private half. Provoked
+with #121's `colliding_zsks`: two `write_to_dir` calls, one path, one file,
+and `load_dir` returns only the second key.
+
+Two ways in: `--generate-keys` into a key directory already holding a key
+for the zone, as a rollover would (`rdnsd/src/main.rs`, `generate_keys`), one
+in 65 536 per existing key of that algorithm; and the KSK and ZSK of one run
+colliding with each other, where the ZSK is written second and replaces the
+KSK whose DS is then printed.
+Mid-rollover, losing the private half of the key the parent's DS names is the
+expensive case.
+
+#121's row named refusing such a key as what BIND's `dnssec-keygen` does,
+for the signing cost; not checked against its source for this row. The
+overwrite is the new half, and no remedy is costed here (`CLAUDE.md` §18).
+
+**Groomed 2026-09-26**, against BIND's source, which the row had not read.
+`dnssec-keygen` does not refuse: it frees the key and generates another while
+`key_collision` (`bin/dnssec/dnssectool.c`) holds. That function reads every
+key of the name in the directory, skips another algorithm, and conflicts on
+`oldid == rid || roldid == id || id == oldid` — a tag equal to the other's, or
+equal to it once either is revoked, since REVOKE moves the tag. BIND makes one
+key per run, so its check never meets the second way in above; here both keys
+of a run are checked, the ZSK against the KSK too. The signer never sets
+REVOKE, but a key file's `Flags` accepts it, and RFC 5011 is how an operator
+retires a trust-anchor key.
+
+**Done 2026-09-26.**
+
+- `SigningKey::tag_collides_with`, private, is `key_collision`'s test.
+  `SigningKey::distinct_from` draws from a generator until no key in the list
+  collides. Bounded at 100 attempts, where BIND loops forever: beside a
+  thousand keys of one zone and algorithm one attempt in 22 collides.
+- `rdnsd`'s `write_key_pair` loads the directory first and passes it, then
+  the KSK, as the list; its generator is a parameter so a test can hand it
+  colliding keys. A directory the server would refuse to load is now refused
+  here, and a missing one is refused on the read rather than the write.
+- The write never replaces, whatever the caller checked:
+  `persist::write_atomically_private` is now `create_atomically_private` and
+  publishes by `hard_link`, which fails on an existing target on both
+  platforms and is as atomic as the rename. `write_to_dir` was its one
+  caller. The cost is a key directory on a filesystem without hard links,
+  now said in `CLI_USAGE.md`. If removing the temporary fails after the link,
+  the error says the key is written.
+- `DNSKEY_FLAG_REVOKE` moved from `rfc5011.rs` to `dnssec.rs` beside the other
+  flags, for its second user.
+
+Verified: `a_key_is_not_written_over_one_with_its_file_name` over #121's pair
+failed against the old rename, the second write succeeding. A second stored
+pair, tags 27154 and 27026 (27154 once revoked, found after 200 keys), tests
+the REVOKE half, and a third, an Ed25519 and a P-256 key both tagged 60966,
+that another algorithm is no collision. The retry and the bound are tested by
+injecting candidates. Reviewing the first draft found the `rdnsd` wiring
+untested: passing none of the directory's keys survived all 222 `rdnsd`
+tests. `a_new_key_pair_differs_from_the_directory_and_from_itself` now fails
+against that and against leaving the KSK out of the ZSK's list; the
+temporary-removal message has no test, as no portable way to fail only that
+removal was found. Two `--generate-keys` runs into one directory, on Windows,
+left four key files and no temporary. 1 341 passed on Windows and 1 362 on
+Linux, 0 failed; clippy clean on both; `cargo doc` and `cargo fmt --check` clean.
 
 
 ---

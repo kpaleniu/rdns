@@ -339,6 +339,37 @@ pub(crate) fn colliding_zsks(origin: &str) -> [SigningKey; 2] {
     })
 }
 
+/// Two Ed25519 zone-signing keys whose tags differ by REVOKE alone: 27154,
+/// and 27026 which is 27154 once revoked (`TODO.md` #125). Found after 200
+/// keys, and stored for the same reason as [`colliding_zsks`].
+pub(crate) fn revoke_colliding_zsks(origin: &str) -> [SigningKey; 2] {
+    [
+        "MFECAQEwBQYDK2VwBCIEIKps8ryK7LmUswbtMCdAhdXIiihssSEiu2QGJMGhoBuTgSEAWPfsmIoL8ThjgCq/TnRpyJopLvZnab98pJPolZ9yQhA=",
+        "MFECAQEwBQYDK2VwBCIEIEANsXC7qgu+K6es4inMs3J2FuSTkP30yJDJzYZ5Fy+cgSEAQDAAQ5ulhNmIyZDqEzPLOaHU97El8ze09K99+T91YyM=",
+    ]
+    .map(|pkcs8| {
+        SigningKey::from_pkcs8_base64(SigningAlgorithm::Ed25519, origin, DNSKEY_FLAG_ZONE, pkcs8)
+    })
+}
+
+/// An Ed25519 and a P-256 zone-signing key with one key tag, 60966
+/// (`TODO.md` #125). Found after 128 of each.
+pub(crate) fn one_tag_two_algorithms(origin: &str) -> [SigningKey; 2] {
+    [
+        (
+            SigningAlgorithm::Ed25519,
+            "MFECAQEwBQYDK2VwBCIEIO+IZuvJrtoxUOuGADSTBsCoVu9n2F68AWSUQN0lHl7EgSEAqtqUMDV7dUnqNffTEmZEXiJI14DhRp1eOL0qoTH9ua8=",
+        ),
+        (
+            SigningAlgorithm::EcdsaP256Sha256,
+            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAKCaBelYlEm3z6BQYYYYGfBGNFGY3rlrSckaQt7UIfOhRANCAARhAz+VTjdwdkZsHRN2gDj5QcE9C3XXvZg9I5MBtV10m7vVASJsZY67bOYn1mzZj79OdZoQPO/DH4mO3QSxA4Hl",
+        ),
+    ]
+    .map(|(algorithm, pkcs8)| {
+        SigningKey::from_pkcs8_base64(algorithm, origin, DNSKEY_FLAG_ZONE, pkcs8)
+    })
+}
+
 /// Thirty days' validity from `now`, which is the default the daemon runs and
 /// the only value either signing test has wanted.
 pub(crate) fn signing_policy(now: u64, chain: DenialChain) -> SigningPolicy {
