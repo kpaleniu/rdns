@@ -1373,9 +1373,9 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
         }
         // Best of five, each indexing its own copy of the zone: the copy is
         // made outside the timing, and indexing consumes it.
-        fn index(rules: usize) -> std::time::Duration {
+        fn index(rules: usize) -> impl FnMut() -> std::time::Duration {
             let zone = parse_zone_file(&feed(rules), ORIGIN).expect("parses");
-            crate::testutil::fastest(5, || {
+            move || {
                 let zone = zone.clone();
                 let start = std::time::Instant::now();
                 let indexed = PolicyZone::new(zone, PolicyOverride::Given).expect("indexes");
@@ -1386,11 +1386,10 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
                     "every rule is a trigger"
                 );
                 took
-            })
+            }
         }
 
-        let small = index(8_000);
-        let large = index(16_000);
+        let (small, large) = crate::testutil::fastest_of_each(5, index(8_000), index(16_000));
         assert!(
             large < small * 3,
             "twice the rules must not cost four times the work: \
@@ -1420,7 +1419,7 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
             }
             text
         }
-        fn per_lookup(rules: usize) -> std::time::Duration {
+        fn per_lookup(rules: usize) -> impl FnMut() -> std::time::Duration {
             let zone = parse_zone_file(&feed(rules), ORIGIN).expect("parses");
             let indexed = PolicyZone::new(zone, PolicyOverride::Given).expect("indexes");
             assert_eq!(
@@ -1441,7 +1440,7 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
 
             // Best of five: lookups change nothing, so the same index is
             // timed each time.
-            let took = crate::testutil::fastest(5, || {
+            move || {
                 let mut matched = 0usize;
                 let start = std::time::Instant::now();
                 for _ in 0..reps {
@@ -1454,13 +1453,12 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
                 }
                 let took = start.elapsed();
                 assert_eq!(matched, 0, "203.0.113.0/24 is not in the feed");
-                took
-            });
-            took / (reps * miss.len()) as u32
+                took / (reps * miss.len()) as u32
+            }
         }
 
-        let small = per_lookup(1_000);
-        let large = per_lookup(10_000);
+        let (small, large) =
+            crate::testutil::fastest_of_each(5, per_lookup(1_000), per_lookup(10_000));
         // `--nocapture` is how the two figures are read; the assertion is the
         // ratio, which is the part that does not depend on the machine.
         println!("client-IP lookup: {small:?} at 1k rules, {large:?} at 10k");

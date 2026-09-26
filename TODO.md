@@ -37,10 +37,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#121**, **#122**, plus **#21**, as of 2026-09-25.
-#58, #68 and #107-#120 are closed. #117-#119 came out of a fourth architecture
-review that day and were groomed against the code before filing; #120 came out
-of verifying #68, and #121 and #122 out of verifying #120.
+**#121**, **#123**, **#124**, plus **#21**, as of 2026-09-26.
+#58, #68 and #107-#120 and #122 are closed. #117-#119 came out of a fourth
+architecture review on 2026-09-25 and were groomed against the code before
+filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
+and #123 and #124 out of verifying #122.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -6729,25 +6730,52 @@ is what BIND's `dnssec-keygen` does.
 
 ---
 
-### 122. A ratio test that takes the best of five on each side, one side after the other — **filed 2026-09-25**
+### 123. Two resolver tests gave up before their own timeout under load — **filed 2026-09-26**
 
-Found while verifying #120. `zone.rs`'s
-`parsing_does_not_cost_more_per_record_when_every_record_moves_the_origin`
-already took the best of five when #120 opened it, and failed once in 150
-Windows runs under load: "8.8465ms at 1k against 27.6729ms at 2k", 3.13×
-against a bound of 3. At rest, 30 debug runs read **1.92× to 1.96×**, median
-1.95.
+Found while verifying #122. Each failed once in 150 Windows workspace runs,
+five `cargo test --workspace` running at once, in different runs:
 
-So the minimum is not the whole answer. The five small samples are taken, then
-the five large ones: about 150 ms of one side, then the other, so contention
-lasting that long lands on one side only. `rdns::testutil::fastest` has the
-same shape wherever a test calls it twice, which after #120 is every ratio test
-in the suite (ten, less `check_split`).
+| test | panic |
+|---|---|
+| `resolver::tests::a_bogus_answer_names_the_way_it_is_bogus` | `NoResponse("no server for exaMple.TEST. answered while resolving www.example.test.")` at `resolver.rs:3216` |
+| `resolver::tests::test_wildcard_nodata_validates_as_secure` | `NoResponse("no server for test. answered while resolving wild-nodata.example.test.")` at `resolver.rs:3590` |
 
-Not taken: interleaving the samples — small, large, small, large — so both
-sides see the same stretch of the machine. Unmeasured; the check is the 150
-Windows / 50 Linux run #68 and #120 used, with this test's failures before and
-after.
+Neither failed in the 452 Windows logs kept from verifying #68 and #120.
+Both use `validating_config` over `recursing_config`, `timeout_ms: 4000`, but the
+`rdns` test binary finished in 3.85 s and 3.59 s: the lookup failed without
+waiting out the timeout, so this is not a slow fake server.
+
+The fakes are `bind_hierarchy`: up to eight sockets on `127.0.0.1-8`, one port
+drawn from 20 000-39 999 and shared by all of them, because glue carries no
+port. By reading only: another process, or another test, holding that port
+on one of those addresses, or on the wildcard, is one way a query could be
+answered by something else or refused. Not provoked, and nothing here says
+which; no remedy named (`CLAUDE.md` §18).
+
+---
+
+### 124. `compression.rs`'s ratio test sits at 3.0-3.6× in debug against a bound of 5 — **filed 2026-09-26**
+
+Found while verifying #122:
+`compression::tests::writing_a_name_costs_the_same_however_many_the_message_holds`
+failed once in 50 Linux workspace runs, "800 names cost 1.52µs each against
+299ns for 25", 5.08× against 5.
+
+Its doc says "the true ratio is ~2 (53 ns to 112 …) and an unindexed scan's is
+13, so 5 discriminates". Measured at rest in a debug build, 200 runs of each
+sampling shape: **median 3.0× on Windows, 3.5-3.6× on Linux**, p99 3.2× and
+3.75×. Loaded, on Windows, 600 runs: p99 4.0-4.3×, max 6.09× sequential and
+4.75× taking turns. The ~2 reads as a release figure; `cargo test` is debug.
+So the bound sits 1.4× above the Linux median, where `zone.rs`'s sits 1.5× and
+`rpz`'s lookup test's 3×.
+
+Taking turns (#122) does not move it: the two shapes' medians and tails agree
+within noise. Each small sample is 500 name writes — 150 µs in the failing
+run — so a best of three is three short windows.
+
+Not measured, and what a remedy has to start from: the unindexed scan's ratio
+*in debug*, which decides whether the bound can rise, and whether more
+samples of the small side narrow the tail.
 
 ---
 
@@ -6949,6 +6977,7 @@ the week; the record is under "How the queue kept going stale" in
 | **68** | a socket test failed once under a parallel suite | **filed 2026-09-15, closed 2026-09-25.** The test it named never failed again; two others in `rdnsd` did, 8 in 200 workspace runs. 68a was a defect: dnstap's pump dropped its queue on stop, frames already counted as sent, so a capture lost its last requests (50 of 50 provoked runs). Now drained before STOP. 68b was the test's: an unanswered NOTIFY is resent after 2 s. 0 in 200 runs after. The same 200 runs filed **#120**. See `docs/CLOSED_WORK.md` |
 | **58** | serve-stale answered a dead upstream and not a slow one | **filed 2026-09-13, closed 2026-09-25.** RFC 8767 §5's 1.8 s client response timer declined on a survey of BIND, Unbound, Knot and PowerDNS — BIND removed it after two CVEs — and BIND's zero form taken as `--serve-stale-first`, refreshing through #114's prefetch pool. A deviation from §4, filed as **D-8** in #21. The timers were §5 and nine places said §4. Two things the grooming did not see: a stale refresh has to be a *period* (§5's 30 s failure recheck), or one failure leaves a name stale and untried for the whole window; and the pool's presence had been the prefetch switch. See `docs/CLOSED_WORK.md` |
 | **120** | three timing flakes found verifying #68 | **filed and closed 2026-09-25.** 120a: the TCP stop tests slept 20 ms and hoped the server had read the query; the handler now says so. 120b: all twelve ratio tests opened — four already took a minimum, one is not a suite test, seven took one sample and now take the best of five through `rdns::testutil::fastest`. After: 0 failures of any of them in 150 Windows and 50 Linux runs, against 4 before. The same runs filed **#121**, a real signing defect, and **#122**. See `docs/CLOSED_WORK.md` |
+| **122** | ratio tests took five of one side, then five of the other | **filed 2026-09-25, closed 2026-09-26.** Measured first: `zone.rs`'s test under load failed 5 in 900 sampling one side then the other, 0 in 900 taking turns, with the same median. `rdns::testutil::fastest_of_each` takes turns, and all eleven suite ratio tests use it; `fastest` is gone. The verification filed **#123** and **#124**. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 

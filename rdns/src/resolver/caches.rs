@@ -447,8 +447,8 @@ mod tests {
             (bound..2 * bound).for_each(|i| insert(&map, i));
             start.elapsed()
         };
-        let with_room = crate::testutil::fastest(5, || time(bound * 4));
-        let at_the_bound = crate::testutil::fastest(5, || time(bound));
+        let (with_room, at_the_bound) =
+            crate::testutil::fastest_of_each(5, || time(bound * 4), || time(bound));
         let ratio = at_the_bound.as_secs_f64() / with_room.as_secs_f64().max(1e-9);
         (ratio >= 3.0).then(|| format!("{what}: {ratio:.1}x ({with_room:?} -> {at_the_bound:?})"))
     }

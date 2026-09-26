@@ -3053,8 +3053,7 @@ deep.a.b IN TXT \"down here\"
             took
         }
 
-        let small = crate::testutil::fastest(5, || parse(1_000));
-        let large = crate::testutil::fastest(5, || parse(2_000));
+        let (small, large) = crate::testutil::fastest_of_each(5, || parse(1_000), || parse(2_000));
         assert!(
             large < small * 3,
             "twice the records must not cost four times the work: \

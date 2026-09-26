@@ -10725,3 +10725,63 @@ passed on Windows and 1 354 on Linux in a clean run, 0 failed; clippy clean on
 both; `cargo doc` and `cargo fmt --check` clean.
 
 ---
+
+### 122. A ratio test that takes the best of five on each side, one side after the other — **filed 2026-09-25, closed 2026-09-26**
+
+Found while verifying #120. `zone.rs`'s
+`parsing_does_not_cost_more_per_record_when_every_record_moves_the_origin`
+already took the best of five when #120 opened it, and failed once in 150
+Windows runs under load: "8.8465ms at 1k against 27.6729ms at 2k", 3.13×
+against a bound of 3. At rest, 30 debug runs read **1.92× to 1.96×**, median
+1.95.
+
+So the minimum is not the whole answer. The five small samples are taken, then
+the five large ones: about 150 ms of one side, then the other, so contention
+lasting that long lands on one side only. `rdns::testutil::fastest` has the
+same shape wherever a test calls it twice, which after #120 is every ratio test
+in the suite (ten, less `check_split`).
+
+Not taken: interleaving the samples — small, large, small, large — so both
+sides see the same stretch of the machine. Unmeasured; the check is the 150
+Windows / 50 Linux run #68 and #120 used, with this test's failures before and
+after.
+
+
+**Groomed 2026-09-26: measured before changing.** The row's remedy was
+unmeasured, so the refuting measurement came first: this test's two shapes
+side by side in one throwaway test, alternating which ran first, while three
+loops of the whole workspace's test binaries ran beside it on Windows.
+
+| shape | runs | median | p99 | max | over 3× |
+|---|---|---|---|---|---|
+| five small, then five large | 900 | 1.96× | 2.72-2.96× | 3.10× | **5** |
+| taking turns | 900 | 1.96-1.97× | 2.37-2.42× | 2.84× | **0** |
+
+At rest the two read the same, 1.92× to 1.97×. The sequential shape's floor
+under load was 1.18×: contention lands on the small side as often as on the
+large one, so the ratio moves both ways.
+
+**Done 2026-09-26.** `rdns::testutil::fastest_of_each(samples, a, b)` replaces
+`fastest`: the two sides take turns, `a` first, and it returns the minimum of
+each. All eleven suite ratio tests call it — #120's twelve less
+`check_split`, which calls neither. Five already had both sides' state in hand
+and changed one line. Four timed inside a per-size helper — both `rpz` tests,
+`compression.rs`, `rdnsd`'s verify test — and `rdnsd`'s `time_lookups`, used
+by two tests: each helper now returns the timer instead of its result, so
+both sides are built before either is timed. `fastest` had no other caller and
+is gone; its reason moved to the new doc.
+
+Not every test gains. `compression.rs`'s ratio, 25 names against 800, was
+measured the same way and the two shapes do not differ: medians 3.02× and
+2.99× at rest and 3.08× and 3.06× loaded, p99 4.00× and 4.34× — see **#124**.
+
+Verified: 150 whole-workspace runs on Windows and 50 on Linux, concurrent,
+whole logs. `zone.rs`'s test did not fail, against 1 in 150 before; no ratio
+test failed on Windows. Three failures of other tests, each filed rather than
+chased: two resolver tests that gave up faster than their own timeout, one on
+each of two Windows runs (**#123**), and `compression.rs`'s ratio test once on
+Linux, 5.08× against 5 (**#124**). 1 333 passed on Windows and 1 354 on Linux
+in a clean run, 0 failed; clippy clean on both; `cargo doc` and
+`cargo fmt --check` clean.
+
+---

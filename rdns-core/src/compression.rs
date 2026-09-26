@@ -289,7 +289,7 @@ mod tests {
         let per_name = |count: usize| {
             let names: Vec<Name> = (0..count).map(|i| nm(&format!("h{i}.e.com."))).collect();
             let mut buf = vec![0u8; 0x4000];
-            crate::testutil::fastest(3, || {
+            move || {
                 let start = std::time::Instant::now();
                 for _ in 0..20 {
                     let mut c = NameCompressor::new();
@@ -302,11 +302,10 @@ mod tests {
                     assert!(pos < POINTER_MASK as usize);
                 }
                 start.elapsed() / (20 * count) as u32
-            })
+            }
         };
 
-        let few = per_name(25);
-        let many = per_name(800);
+        let (few, many) = crate::testutil::fastest_of_each(3, per_name(25), per_name(800));
         assert!(
             many < few * 5,
             "800 names cost {many:?} each against {few:?} for 25: \

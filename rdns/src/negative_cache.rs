@@ -961,8 +961,8 @@ mod tests {
             fill(&cache, BOUND..2 * BOUND);
             start.elapsed()
         };
-        let with_room = crate::testutil::fastest(5, || time(BOUND * 4));
-        let at_the_bound = crate::testutil::fastest(5, || time(BOUND));
+        let (with_room, at_the_bound) =
+            crate::testutil::fastest_of_each(5, || time(BOUND * 4), || time(BOUND));
 
         let ratio = at_the_bound.as_secs_f64() / with_room.as_secs_f64().max(1e-9);
         assert!(

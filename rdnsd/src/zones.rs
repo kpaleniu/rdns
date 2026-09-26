@@ -1931,8 +1931,11 @@ mod tests {
         }
         assert_eq!(many.len(), ZONES, "z500 is one of the thousand");
 
-        let with_one = time_lookups(&one, QNAME, true);
-        let with_many = time_lookups(&many, QNAME, true);
+        let (with_one, with_many) = rdns::testutil::fastest_of_each(
+            3,
+            time_lookups(&one, QNAME, true),
+            time_lookups(&many, QNAME, true),
+        );
         assert!(
             with_many < with_one * 10,
             "choosing among {ZONES} zones took {with_many:?} against {with_one:?} for one: \
@@ -1958,8 +1961,11 @@ mod tests {
 
         let long: String =
             (0..32).map(|i| format!("{}.", i % 10)).collect::<String>() + "ip6.arpa.";
-        let short = time_lookups(&zones, "nothing.here.test.", false);
-        let deep = time_lookups(&zones, &long, false);
+        let (short, deep) = rdns::testutil::fastest_of_each(
+            3,
+            time_lookups(&zones, "nothing.here.test.", false),
+            time_lookups(&zones, &long, false),
+        );
         assert!(
             deep < short * 10,
             "a {}-label name cost {deep:?} against {short:?} for a 3-label one: \
@@ -1991,10 +1997,10 @@ mod tests {
 
         // Best of five of the verification alone: signing is setup, and
         // verifying changes nothing it would verify again.
-        let per_rrset = |hosts: usize| -> f64 {
+        let per_rrset = |hosts: usize| {
             let (map, rrsets) = signed_zone_of(hosts);
             let validator = DnssecValidator::new(true);
-            let took = rdns::testutil::fastest(5, || {
+            move || {
                 let start = std::time::Instant::now();
                 verify_zones(
                     &map,
@@ -2003,15 +2009,14 @@ mod tests {
                     &ProvenSigning::default(),
                 )
                 .expect("the zone we just signed verifies");
-                start.elapsed()
-            });
-            took.as_secs_f64() / rrsets as f64
+                start.elapsed() / rrsets as u32
+            }
         };
 
         // Small first, so the large run is not the one paying for a cold
         // allocator or a cold cache.
-        let small = per_rrset(SMALL);
-        let large = per_rrset(LARGE);
+        let (small, large) = rdns::testutil::fastest_of_each(5, per_rrset(SMALL), per_rrset(LARGE));
+        let (small, large) = (small.as_secs_f64(), large.as_secs_f64());
         assert!(
             large < small * 1.5,
             "verifying cost {:.1} µs/RRset at {LARGE} records against {:.1} at {SMALL}: \
@@ -2367,11 +2372,15 @@ www IN A 192.0.2.2
         map
     }
 
-    /// The same lookup, timed: [`rdns::testutil::fastest`] of three.
-    fn time_lookups(zones: &Zones, qname: &str, expect_hit: bool) -> Duration {
+    /// A timer for the same lookup, repeated.
+    fn time_lookups<'a>(
+        zones: &'a Zones,
+        qname: &str,
+        expect_hit: bool,
+    ) -> impl FnMut() -> Duration + 'a {
         const QUERIES: usize = 20_000;
         let qname = nm(qname);
-        rdns::testutil::fastest(3, || {
+        move || {
             let start = std::time::Instant::now();
             for _ in 0..QUERIES {
                 assert_eq!(
@@ -2382,7 +2391,7 @@ www IN A 192.0.2.2
                 );
             }
             start.elapsed()
-        })
+        }
     }
 
     /// A [`Keepable`] for a server that signs nothing — the common shape in

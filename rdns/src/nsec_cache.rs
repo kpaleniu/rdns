@@ -1131,8 +1131,7 @@ mod tests {
         time(&many);
 
         // Best of five: a lookup changes nothing it would look up again.
-        let small = crate::testutil::fastest(5, || time(&few));
-        let large = crate::testutil::fastest(5, || time(&many));
+        let (small, large) = crate::testutil::fastest_of_each(5, || time(&few), || time(&many));
         let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-9);
         assert!(
             ratio < 3.0,

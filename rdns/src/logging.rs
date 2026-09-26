@@ -616,8 +616,8 @@ mod tests {
             log(&logger, batch);
             start.elapsed()
         };
-        let shallow = crate::testutil::fastest(5, || batch_after(0));
-        let deep = crate::testutil::fastest(5, || batch_after(depth));
+        let (shallow, deep) =
+            crate::testutil::fastest_of_each(5, || batch_after(0), || batch_after(depth));
 
         let ratio = deep.as_secs_f64() / shallow.as_secs_f64().max(1e-9);
         assert!(

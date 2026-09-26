@@ -64,7 +64,7 @@ impl Drop for ScratchDir {
     }
 }
 
-/// The smallest of `samples` timings of `run`, for a ratio test
+/// The smallest of `samples` timings of each of `a` and `b`, for a ratio test
 /// (`CLAUDE.md` §10).
 ///
 /// Contention only ever adds time, so the minimum is the sample the machine was
@@ -74,16 +74,24 @@ impl Drop for ScratchDir {
 /// real regression reads as its multiplier in every sample, so the smallest
 /// cannot hide it.
 ///
-/// `run` rebuilds whatever its timed work changes: timing one object twice
-/// measures a fuller cache, or a deeper window, the second time.
-pub fn fastest(
+/// The two sides take turns, `a` first. Five of `a` and then five of `b` is
+/// ~150 ms of one side and then the other, so a stretch of contention that
+/// long lands on one side only. Under a loaded suite `zone.rs`'s ratio test
+/// failed 5 times in 900 that way and 0 in 900 taking turns (#122).
+///
+/// Each closure rebuilds whatever its timed work changes: timing one object
+/// twice measures a fuller cache, or a deeper window, the second time.
+pub fn fastest_of_each(
     samples: usize,
-    mut run: impl FnMut() -> std::time::Duration,
-) -> std::time::Duration {
-    (0..samples.max(1))
-        .map(|_| run())
-        .min()
-        .expect("at least one sample")
+    mut a: impl FnMut() -> std::time::Duration,
+    mut b: impl FnMut() -> std::time::Duration,
+) -> (std::time::Duration, std::time::Duration) {
+    let mut fastest = (std::time::Duration::MAX, std::time::Duration::MAX);
+    for _ in 0..samples.max(1) {
+        fastest.0 = fastest.0.min(a());
+        fastest.1 = fastest.1.min(b());
+    }
+    fastest
 }
 
 /// Every `.rs` file under `dir`, `target/` and `.git/` skipped.
