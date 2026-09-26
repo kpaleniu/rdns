@@ -325,6 +325,20 @@ pub(crate) fn signing_keys(origin: &str) -> Vec<SigningKey> {
     ]
 }
 
+/// Two Ed25519 zone-signing keys with one key tag, 19835 (`TODO.md` #121).
+///
+/// Stored, not searched for per run: a birthday search took 232 keys, and a
+/// search for a partner to one given key took 19 724.
+pub(crate) fn colliding_zsks(origin: &str) -> [SigningKey; 2] {
+    [
+        "MFECAQEwBQYDK2VwBCIEIGwlLjV+0P/r/GdsxSlSf7k04aQ6Df2xzHrFvXUYC3y0gSEAmARa3FQeCXrLkplsYLElPrxCKHBTzpHJH4B+88nc22g=",
+        "MFECAQEwBQYDK2VwBCIEIPmjfYRgV1ZvI6UfCAzxqDC/2ekS+qL5q85Fg2jU23bNgSEA9pUvSsiZuvOhP9cAVyxfXuants1CwRFtQEXWoVhUEFQ=",
+    ]
+    .map(|pkcs8| {
+        SigningKey::from_pkcs8_base64(SigningAlgorithm::Ed25519, origin, DNSKEY_FLAG_ZONE, pkcs8)
+    })
+}
+
 /// Thirty days' validity from `now`, which is the default the daemon runs and
 /// the only value either signing test has wanted.
 pub(crate) fn signing_policy(now: u64, chain: DenialChain) -> SigningPolicy {

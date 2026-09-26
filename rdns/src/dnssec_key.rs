@@ -360,6 +360,23 @@ impl SigningKey {
         Self::from_pkcs8(algorithm, owner, flags, &pkcs8)
     }
 
+    /// A fixture whose key material is the point, as base64 PKCS#8.
+    #[cfg(test)]
+    pub(crate) fn from_pkcs8_base64(
+        algorithm: SigningAlgorithm,
+        owner: &str,
+        flags: u16,
+        pkcs8: &str,
+    ) -> Self {
+        Self::from_pkcs8(
+            algorithm,
+            owner,
+            flags,
+            &base64_decode(pkcs8).expect("base64"),
+        )
+        .expect("a PKCS#8 key")
+    }
+
     /// Adopt an existing PKCS#8 private key.
     fn from_pkcs8(
         algorithm: SigningAlgorithm,

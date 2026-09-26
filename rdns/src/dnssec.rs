@@ -474,7 +474,11 @@ pub fn key_tag(flags: u16, protocol: u8, algorithm: u8, public_key: &[u8]) -> u1
     rdata.push(protocol);
     rdata.push(algorithm);
     rdata.extend_from_slice(public_key);
+    key_tag_of_rdata(&rdata)
+}
 
+/// [`key_tag`] over DNSKEY RDATA already in wire form.
+pub(crate) fn key_tag_of_rdata(rdata: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     for (i, &byte) in rdata.iter().enumerate() {
         sum += if i % 2 == 0 {

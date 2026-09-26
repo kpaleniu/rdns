@@ -10785,3 +10785,74 @@ in a clean run, 0 failed; clippy clean on both; `cargo doc` and
 `cargo fmt --check` clean.
 
 ---
+
+### 121. Incremental signing identifies a key by its tag, and tags collide — **filed 2026-09-25, closed 2026-09-26**
+
+Found while verifying #120: `zone_signer::tests::a_signature_is_not_carried_forward_when_anything_it_covers_changed`
+failed once in 50 Linux workspace runs, "both zone-signing keys now sign it",
+1 against 2. It adds a freshly generated ZSK to the key set and expects every
+RRset signed by both ZSKs.
+
+`PreviousSignatures::reuse` (`zone_signer.rs:580-588`) decides "the signing
+keys are unchanged" by comparing key tags *as a de-duplicated set*: the tags of
+the carried signatures against the tags of the keys now signing. RFC 4034
+Appendix B: a key tag "is not a unique identifier". When the new key's tag
+equals an existing key's, the two sets are equal and the old signature is
+carried forward alone.
+
+Provoked: generating P-256 ZSKs until one's tag matched the fixture ZSK's took
+19 724 tries; incrementally signing with it added produced **1** RRSIG over
+`www A`, where `sign_zone` with the same keys produced **2**. The zone then
+publishes a DNSKEY that has signed none of the zone's data — the half of a
+rollover the carry-forward rule exists to refuse (its condition 3). About one
+new key in 65 536 per existing key of the same role.
+
+Instances, by `grep` for tag comparisons in `rdns/src`: this is the one in
+production code that treats a tag as a key's identity. `dnssec.rs:846-851`
+matches by tag too and is right: it tries every key with that tag, as RFC 4035
+§5.3.1 expects. The rest are tests.
+
+By reading and not provoked: a key *replaced* by one with the same tag — old
+ZSK removed, new added, in one run — passes the same check, and carries a
+signature whose key is no longer published.
+
+Remedy: condition 3 compares the keys, not the tags — the previous zone's
+apex DNSKEY RDATA against the DNSKEY RDATA of `keys` (the signature itself
+names only a tag, so nothing on the RRSIG side can tell colliding keys apart).
+A test for each case, using a colliding key found once and stored as a fixture
+rather than searched for per run (19 724 generations is a second of release
+build and much more in debug). Not in scope and worth a number of its own if
+wanted: refusing to *generate* a key whose tag collides with the zone's, which
+is what BIND's `dnssec-keygen` does.
+
+**Done 2026-09-26**, as the row's remedy said, with one difference: the
+check runs once per signing run, not per RRset.
+`PreviousSignatures::tags_naming` returns the signers' tags only if each tag
+names exactly one DNSKEY in the previous run's apex RRset and that DNSKEY's
+RDATA is the signer's own; otherwise nothing is carried and everything is
+signed afresh. The previous RRset is already indexed for condition 1, so no
+new pass; `key_tag_of_rdata` tags its octets unparsed. The per-RRset `Vec` of
+tags `reuse` used to build is gone with it.
+
+One consequence the row did not name: two *published* keys sharing a tag —
+a pre-published successor, or another provider's key under RFC 8901 — also
+refuse, so every UPDATE re-signs the whole zone until one leaves. Telling
+their signatures apart means verifying each carried one, and the case is one
+pair in 65 536. Written on `tags_naming`.
+
+Test: `a_key_sharing_a_tag_with_the_one_it_joins_or_replaces_still_signs`,
+over two Ed25519 ZSKs with tag 19835 stored as `colliding_zsks` (a birthday
+search found them in 232 keys). Both cases were watched failing against the
+tag-set comparison: joined, 1 RRSIG over `www A` where 2 were wanted;
+replaced, the carried RRSIG was bogus against the published keys. The row's
+original test,
+`a_signature_is_not_carried_forward_when_anything_it_covers_changed`, is
+unchanged: its one-in-65 536 flake is now a collision the signer handles.
+
+The row's out-of-scope item is filed as **#125**, with a worse consequence of
+a collision than the one it named: a key file overwritten.
+
+Verified: 1 334 passed on Windows, 1 355 on Linux, 0 failed; clippy clean on
+both; `cargo doc` and `cargo fmt --check` clean.
+
+---

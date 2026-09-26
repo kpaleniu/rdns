@@ -22,7 +22,7 @@
 use std::borrow::Cow;
 
 use crate::denial_wire::{build_type_bitmap, canonical_sort_key, CanonicalKey};
-use crate::dnssec::{Dnskey, Rrset};
+use crate::dnssec::{key_tag_of_rdata, Dnskey, Rrset};
 use crate::dnssec_denial::{nsec3_hash_name, nsec3_owner_name_at, Nsec3Hash, MAX_NSEC3_ITERATIONS};
 use crate::dnssec_key::SigningKey;
 use crate::error::DnssecError;
@@ -525,6 +525,7 @@ impl<'a> PreviousSignatures<'a> {
     ///    being copied.
     /// 3. The signing keys are unchanged, by key tag as a set. A key added is a
     ///    rollover starting; a key removed must not leave its signature behind.
+    ///    Sound only for tags [`PreviousSignatures::tags_naming`] vouched for.
     /// 4. No carried signature has already expired.
     ///
     /// Nearness to expiry is deliberately not a condition: refreshing here would
@@ -588,6 +589,35 @@ impl<'a> PreviousSignatures<'a> {
         }
 
         Some(carried)
+    }
+
+    /// The signers' tags, if each names that signer and nothing else in the
+    /// previous run's apex DNSKEY RRset; `None` if any does not.
+    ///
+    /// A carried RRSIG names its key by tag alone, and a tag "is not a unique
+    /// identifier" (RFC 4034 Appendix B). A key added or swapped in with an
+    /// existing key's tag read as no change and carried the old signature
+    /// alone (`TODO.md` #121). Two published keys sharing a tag also refuse,
+    /// re-signing everything until one leaves: telling their signatures apart
+    /// means verifying each one, and a pair collides once in 65 536.
+    fn tags_naming(&self, origin: NameRef<'_>, signers: &[&SigningKey]) -> Option<Vec<u16>> {
+        let (_, published) = &self
+            .rrsets
+            .get(origin.folded().as_ref())?
+            .iter()
+            .find(|(t, _)| *t == rt::DNSKEY)?
+            .1;
+        signers
+            .iter()
+            .map(|key| {
+                let tag = key.key_tag();
+                let mut same_tag = published
+                    .iter()
+                    .filter(|r| key_tag_of_rdata(r.bytes()) == tag);
+                let only = same_tag.next()?;
+                (same_tag.next().is_none() && only.bytes() == key.dnskey().rdata()).then_some(tag)
+            })
+            .collect()
     }
 }
 
@@ -1279,22 +1309,25 @@ fn signatures_for(
     // Only on the incremental path — see [`Resigned`] for why a full run does
     // not pay for the clones.
     let mut fresh = Vec::new();
+    let origin = layout.origin.as_ref();
+    let dnskey_tags = previous.and_then(|p| p.tags_naming(origin, dnskey_signers));
+    let data_tags = previous.and_then(|p| p.tags_naming(origin, data_signers));
     for ((key, rtype), (name, ttl, rdatas)) in rrsets {
         // The key the map is already keyed by, rather than `Layout::entry`
         // deriving it again and cloning the entry to read two bools: two
         // allocations per RRset, four million on a million-record zone
         // (`TODO.md` #64e).
-        if !signable(layout.at(&key), name, rtype, layout.origin.as_ref()) {
+        if !signable(layout.at(&key), name, rtype, origin) {
             continue;
         }
-        let signers = if rtype == rt::DNSKEY {
+        let (signers, tags) = if rtype == rt::DNSKEY {
             // Model 1's signature is already in `signed`, carried through by
             // `carry_over_records`; signing again would publish a second RRSIG
             // from a key the parent's DS does not name.
             if policy.dnskey_signature == DnskeySignature::Imported {
                 continue;
             }
-            dnskey_signers
+            (dnskey_signers, &dnskey_tags)
         } else if rtype == rt::CDS || rtype == rt::CDNSKEY {
             // RFC 7344 §4.1: the CDS/CDNSKEY RRset "MUST be signed with a key
             // that is represented in both the current DNSKEY and DS RRsets".
@@ -1304,17 +1337,15 @@ fn signatures_for(
             // validating resolver would say so, because the RRset *does* verify
             // against the zone's own keys. The SEP keys are the ones a DS
             // names.
-            dnskey_signers
+            (dnskey_signers, &dnskey_tags)
         } else {
-            data_signers
+            (data_signers, &data_tags)
         };
 
         // The whole of the incremental path: not re-signed, so the RDATA does
         // not move, so it does not appear in the next IXFR delta.
-        if let Some(previous) = previous {
-            let tags: Vec<u16> = signers.iter().map(|k| k.key_tag()).collect();
-            if let Some(carried) =
-                previous.reuse(name, rtype, ttl, &rdatas, &tags, policy.signed_at)
+        if let (Some(previous), Some(tags)) = (previous, tags) {
+            if let Some(carried) = previous.reuse(name, rtype, ttl, &rdatas, tags, policy.signed_at)
             {
                 for signature in carried {
                     signatures.push(ZoneRecord {
@@ -1464,7 +1495,7 @@ mod tests {
         proves_wildcard_expansion, Denial, Nsec, Nsec3, WildcardVerdict,
     };
     use crate::dnssec_key::{KeyTiming, SigningAlgorithm, SigningKey};
-    use crate::dnssec_test_util::{signing_keys, signing_policy};
+    use crate::dnssec_test_util::{colliding_zsks, signing_keys, signing_policy};
     use crate::test_records::nm;
     use crate::zone::parse_zone_file;
     use crate::ResourceRecord;
@@ -3248,6 +3279,50 @@ www IN A   192.0.2.10
             sig_at(&signed, "www.example.com.", rt::A).len(),
             2,
             "both zone-signing keys now sign it"
+        );
+    }
+
+    /// A key tag "is not a unique identifier" (RFC 4034 Appendix B), so a key
+    /// sharing its tag with the one it joins or replaces is still a new key
+    /// (`TODO.md` #121).
+    #[test]
+    fn a_key_sharing_a_tag_with_the_one_it_joins_or_replaces_still_signs() {
+        let [zsk, twin] = colliding_zsks(ORIGIN);
+        assert_eq!(zsk.key_tag(), twin.key_tag(), "the fixture's premise");
+        let ksk = SigningKey::generate(
+            SigningAlgorithm::Ed25519,
+            ORIGIN,
+            DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+        )
+        .unwrap();
+        let zone = parse_zone_file(ZONE, ORIGIN).unwrap();
+        let mut keys = vec![ksk, zsk];
+        let before = sign_zone(&zone, &keys, &policy(DenialChain::Nsec)).unwrap();
+        let later = SigningPolicy::valid_for(NOW + 60, 30 * 86_400).with_chain(DenialChain::Nsec);
+        let signatures_over_www = |z: &Zone| {
+            rrsigs_in(&resources(z))
+                .iter()
+                .filter(|s| s.owner == nm("www.example.com.") && s.type_covered == rt::A)
+                .count()
+        };
+
+        keys.push(twin);
+        let joined = sign_zone_incrementally(&before, &zone, &keys, &later)
+            .unwrap()
+            .zone;
+        assert_eq!(signatures_over_www(&joined), 2, "both twins sign it");
+
+        keys.remove(1);
+        let replaced = sign_zone_incrementally(&before, &zone, &keys, &later)
+            .unwrap()
+            .zone;
+        assert_eq!(signatures_over_www(&replaced), 1);
+        assert!(
+            matches!(
+                proof_for(&replaced, "www.example.com.", rt::A),
+                RrsetProof::Verified { .. }
+            ),
+            "signed by the key now published, not carried from the one withdrawn"
         );
     }
 

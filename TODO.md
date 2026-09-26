@@ -37,11 +37,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#121**, **#123**, **#124**, plus **#21**, as of 2026-09-26.
-#58, #68 and #107-#120 and #122 are closed. #117-#119 came out of a fourth
+**#123**, **#124**, **#125**, plus **#21**, as of 2026-09-26.
+#58, #68 and #107-#122 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
-and #123 and #124 out of verifying #122.
+#123 and #124 out of verifying #122, and #125 out of closing #121.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -6689,47 +6689,6 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 121. Incremental signing identifies a key by its tag, and tags collide — **filed 2026-09-25**, **ready-for-agent**
-
-Found while verifying #120: `zone_signer::tests::a_signature_is_not_carried_forward_when_anything_it_covers_changed`
-failed once in 50 Linux workspace runs, "both zone-signing keys now sign it",
-1 against 2. It adds a freshly generated ZSK to the key set and expects every
-RRset signed by both ZSKs.
-
-`PreviousSignatures::reuse` (`zone_signer.rs:580-588`) decides "the signing
-keys are unchanged" by comparing key tags *as a de-duplicated set*: the tags of
-the carried signatures against the tags of the keys now signing. RFC 4034
-Appendix B: a key tag "is not a unique identifier". When the new key's tag
-equals an existing key's, the two sets are equal and the old signature is
-carried forward alone.
-
-Provoked: generating P-256 ZSKs until one's tag matched the fixture ZSK's took
-19 724 tries; incrementally signing with it added produced **1** RRSIG over
-`www A`, where `sign_zone` with the same keys produced **2**. The zone then
-publishes a DNSKEY that has signed none of the zone's data — the half of a
-rollover the carry-forward rule exists to refuse (its condition 3). About one
-new key in 65 536 per existing key of the same role.
-
-Instances, by `grep` for tag comparisons in `rdns/src`: this is the one in
-production code that treats a tag as a key's identity. `dnssec.rs:846-851`
-matches by tag too and is right: it tries every key with that tag, as RFC 4035
-§5.3.1 expects. The rest are tests.
-
-By reading and not provoked: a key *replaced* by one with the same tag — old
-ZSK removed, new added, in one run — passes the same check, and carries a
-signature whose key is no longer published.
-
-Remedy: condition 3 compares the keys, not the tags — the previous zone's
-apex DNSKEY RDATA against the DNSKEY RDATA of `keys` (the signature itself
-names only a tag, so nothing on the RRSIG side can tell colliding keys apart).
-A test for each case, using a colliding key found once and stored as a fixture
-rather than searched for per run (19 724 generations is a second of release
-build and much more in debug). Not in scope and worth a number of its own if
-wanted: refusing to *generate* a key whose tag collides with the zone's, which
-is what BIND's `dnssec-keygen` does.
-
----
-
 ### 123. Two resolver tests gave up before their own timeout under load — **filed 2026-09-26**
 
 Found while verifying #122. Each failed once in 150 Windows workspace runs,
@@ -6776,6 +6735,29 @@ run — so a best of three is three short windows.
 Not measured, and what a remedy has to start from: the unindexed scan's ratio
 *in debug*, which decides whether the bound can rise, and whether more
 samples of the small side narrow the tail.
+
+---
+
+### 125. `--generate-keys` overwrites a key whose tag it collides with — **filed 2026-09-26**
+
+Found closing #121. A key file is named `K<owner>+<alg>+<tag>.rdnskey`
+(`SigningKey::file_name`), and `write_to_dir` ends in `fs::rename`, which
+replaces an existing file. So a new key whose owner, algorithm and tag match
+one already in the directory silently replaces its private half. Provoked
+with #121's `colliding_zsks`: two `write_to_dir` calls, one path, one file,
+and `load_dir` returns only the second key.
+
+Two ways in: `--generate-keys` into a key directory already holding a key
+for the zone, as a rollover would (`rdnsd/src/main.rs`, `generate_keys`), one
+in 65 536 per existing key of that algorithm; and the KSK and ZSK of one run
+colliding with each other, where the ZSK is written second and replaces the
+KSK whose DS is then printed.
+Mid-rollover, losing the private half of the key the parent's DS names is the
+expensive case.
+
+#121's row named refusing such a key as what BIND's `dnssec-keygen` does,
+for the signing cost; not checked against its source for this row. The
+overwrite is the new half, and no remedy is costed here (`CLAUDE.md` §18).
 
 ---
 
@@ -6978,6 +6960,7 @@ the week; the record is under "How the queue kept going stale" in
 | **58** | serve-stale answered a dead upstream and not a slow one | **filed 2026-09-13, closed 2026-09-25.** RFC 8767 §5's 1.8 s client response timer declined on a survey of BIND, Unbound, Knot and PowerDNS — BIND removed it after two CVEs — and BIND's zero form taken as `--serve-stale-first`, refreshing through #114's prefetch pool. A deviation from §4, filed as **D-8** in #21. The timers were §5 and nine places said §4. Two things the grooming did not see: a stale refresh has to be a *period* (§5's 30 s failure recheck), or one failure leaves a name stale and untried for the whole window; and the pool's presence had been the prefetch switch. See `docs/CLOSED_WORK.md` |
 | **120** | three timing flakes found verifying #68 | **filed and closed 2026-09-25.** 120a: the TCP stop tests slept 20 ms and hoped the server had read the query; the handler now says so. 120b: all twelve ratio tests opened — four already took a minimum, one is not a suite test, seven took one sample and now take the best of five through `rdns::testutil::fastest`. After: 0 failures of any of them in 150 Windows and 50 Linux runs, against 4 before. The same runs filed **#121**, a real signing defect, and **#122**. See `docs/CLOSED_WORK.md` |
 | **122** | ratio tests took five of one side, then five of the other | **filed 2026-09-25, closed 2026-09-26.** Measured first: `zone.rs`'s test under load failed 5 in 900 sampling one side then the other, 0 in 900 taking turns, with the same median. `rdns::testutil::fastest_of_each` takes turns, and all eleven suite ratio tests use it; `fastest` is gone. The verification filed **#123** and **#124**. See `docs/CLOSED_WORK.md` |
+| **121** | incremental signing took a key tag for a key | **filed 2026-09-25, closed 2026-09-26.** A new ZSK whose tag matched the old one's read as "keys unchanged", so the old signature was carried alone and the new DNSKEY signed nothing; a swapped-in twin carried a signature from a withdrawn key. Condition 3 now holds only when each signer's tag names exactly its own DNSKEY in the previous run's RRset, checked once per run. A stored colliding Ed25519 pair tests both cases, each watched failing before. Filed **#125**, a collision in `--generate-keys` overwriting a private key file. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
