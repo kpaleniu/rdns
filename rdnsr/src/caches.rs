@@ -12,6 +12,12 @@ use rdns::negative_cache::{NegativeAnswer, NegativeCache};
 use rdns::nsec_cache::{NsecCache, Synthesis, WildcardSynthesis};
 use rdns::{DnsCache, DnsMessage, NameRef, Qtype, QuerySection};
 
+/// What [`Caches::stale`] found.
+pub(crate) enum Stale {
+    Answer(Cached),
+    Negative(NegativeAnswer),
+}
+
 /// Three caches with three shapes, which is why they are not one.
 ///
 /// - `answers` maps a question to the records that answered it.
@@ -128,24 +134,33 @@ impl Caches {
         self.denials.synthesize(name, qtype)
     }
 
-    /// [`DnsCache::get_stale`].
-    pub(crate) fn stale_answer(
-        &self,
-        name: NameRef<'_>,
-        qtype: Qtype,
-        refreshing: bool,
-    ) -> Option<Cached> {
-        self.answers.get_stale(name, qtype, refreshing)
-    }
-
-    /// [`NegativeCache::get_stale`].
-    pub(crate) fn stale_negative(
-        &self,
-        name: NameRef<'_>,
-        qtype: Qtype,
-        refreshing: bool,
-    ) -> Option<NegativeAnswer> {
-        self.negatives.get_stale(name, qtype, refreshing)
+    /// The last thing learned about this question, expired but inside the
+    /// stale window (RFC 8767).
+    ///
+    /// Both caches can hold the question at once: `store` retires neither, and
+    /// an NXDOMAIN is keyed by name, so one learned for AAAA covers an A held
+    /// from before. The later one wins, because RFC 8767 §4 has an NXDomain
+    /// answer "considered to have refreshed the data at the resolver"; serving
+    /// the older "yes" hands out an address its zone has since denied
+    /// (`TODO.md` #132). BIND, Unbound and Knot Resolver hold one entry per
+    /// question and get this by overwriting.
+    ///
+    /// Stored in the same second is a tie, and the "no" takes it: a name taken
+    /// down is the case this ordering exists for.
+    ///
+    /// Both lookups spend their entry's refresh, which is right: they are one
+    /// question, and one refresh answers it.
+    pub(crate) fn stale(&self, name: NameRef<'_>, qtype: Qtype, refreshing: bool) -> Option<Stale> {
+        let answer = self.answers.get_stale(name, qtype, refreshing);
+        let negative = self.negatives.get_stale(name, qtype, refreshing);
+        match (answer, negative) {
+            (Some(answer), Some(negative)) if answer.learned_at > negative.learned_at => {
+                Some(Stale::Answer(answer))
+            }
+            (_, Some(negative)) => Some(Stale::Negative(negative)),
+            (Some(answer), None) => Some(Stale::Answer(answer)),
+            (None, None) => None,
+        }
     }
 
     /// Put an answer in without resolving for it.

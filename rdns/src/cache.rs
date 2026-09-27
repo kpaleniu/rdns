@@ -150,6 +150,7 @@ struct CacheEntry {
     /// When a stale answer may next hand out a refresh
     /// ([`STALE_REFRESH_INTERVAL`]). 0 on a new entry: due at once.
     stale_refresh_after: u64,
+    learned_at: u64,
 }
 
 impl CacheEntry {
@@ -176,6 +177,10 @@ pub struct Cached {
     ///
     /// True at most once per entry: whoever is told carries the obligation.
     pub refresh: bool,
+    /// When this was stored. Stale, it is weighed against a negative answer
+    /// for the same question, and the later one is what the resolver last
+    /// learned (`TODO.md` #132).
+    pub learned_at: u64,
 }
 
 /// DNS response cache with TTL support.
@@ -269,6 +274,7 @@ impl DnsCache {
                     records: entry.records.clone(),
                     secure: entry.secure,
                     refresh,
+                    learned_at: entry.learned_at,
                 });
             } else if !self.stale.keeps(entry.expires_at, now) {
                 // Expired and past its stale window: nothing will ask for it
@@ -318,6 +324,7 @@ impl DnsCache {
             records,
             secure: entry.secure,
             refresh,
+            learned_at: entry.learned_at,
         })
     }
 
@@ -374,6 +381,7 @@ impl DnsCache {
                 secure,
                 refreshing: false,
                 stale_refresh_after: 0,
+                learned_at: now,
             },
         );
     }
@@ -718,6 +726,7 @@ mod tests {
             records,
             secure,
             refresh,
+            ..
         } = cache
             .get_stale(nm("example.com.").as_ref(), Qtype::of(rt::A), false)
             .expect("but it is still the last thing known");

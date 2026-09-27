@@ -30,7 +30,7 @@ use rdns::{
 };
 use rdns_transport::ServeContext;
 
-use crate::caches::Caches;
+use crate::caches::{Caches, Stale};
 use crate::prefetch::{Refresh, Refreshes, Why};
 use crate::reload::PolicyReload;
 
@@ -783,18 +783,17 @@ fn stale_answer(
         }
     };
 
-    // A "yes" before a "no": both may be held for one name, and the answer is
-    // the more specific thing known about it.
-    if let Some(hit) = caches.stale_answer(name, qtype, refreshes.is_some()) {
-        served(hit.refresh);
-        return Some((
-            build_response(request, hit.records, ResponseCode::Ok),
-            hit.secure,
-            Some(ExtendedError::new(InfoCode::STALE_ANSWER, text)),
-        ));
-    }
-
-    let negative = caches.stale_negative(name, qtype, refreshes.is_some())?;
+    let negative = match caches.stale(name, qtype, refreshes.is_some())? {
+        Stale::Answer(hit) => {
+            served(hit.refresh);
+            return Some((
+                build_response(request, hit.records, ResponseCode::Ok),
+                hit.secure,
+                Some(ExtendedError::new(InfoCode::STALE_ANSWER, text)),
+            ));
+        }
+        Stale::Negative(negative) => negative,
+    };
     served(negative.refresh);
     let mut resp = build_response(request, Vec::new(), negative.rcode);
     resp.authorities = negative.authority;
@@ -1887,6 +1886,85 @@ mod tests {
             0,
             "and nobody waited for a walk"
         );
+    }
+
+    /// An NXDOMAIN for `name`, with a negative TTL of 60 (`soa`'s MINIMUM).
+    fn store_nxdomain(caches: &Caches, name: &rdns::Name, qtype: Qtype) {
+        let mut denial = DnsMessage::try_from_bytes(&message(OpCode::Query, true)).expect("parses");
+        denial.rcode = ResponseCode::NoSuchDomain;
+        denial.answers.clear();
+        denial.authorities = vec![soa("example.com.")];
+        let question = QuerySection {
+            qname: name.clone(),
+            qtype,
+            qclass: rdns::QueryClass::IN,
+        };
+        caches.store(&question, &denial, &ValidationState::Insecure);
+    }
+
+    /// Stale, the later of a "yes" and a "no" answers, and here the "no" is
+    /// later: an address cached, then the name deleted (`TODO.md` #132).
+    /// RFC 8767 §4: an NXDomain answer "MUST be considered to have refreshed
+    /// the data at the resolver". Watched failing with the "yes" asked first:
+    /// NOERROR with the address.
+    #[tokio::test]
+    async fn a_stale_denial_learned_later_beats_a_stale_address() {
+        let (resolver, _upstream) = silent_resolver();
+        let (serving, clock, _queue) = stale_first(resolver);
+        let name = nm("gone.example.com.");
+        let a = Qtype::of(record_types::A);
+        serving
+            .caches
+            .remember(name.as_ref(), a, vec![a_record(&name, 300)]);
+        clock.advance(301);
+        store_nxdomain(&serving.caches, &name, a);
+        clock.advance(61);
+
+        let reply = asked_at_once(&serving, &name, a).await;
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
+        assert!(reply.answers.is_empty());
+        assert_eq!(stale_errors(&reply)[0].0, InfoCode::STALE_NXDOMAIN);
+    }
+
+    /// An NXDOMAIN is about the name, so one learned asking for AAAA beats an
+    /// A held from before it. Watched failing as the test above.
+    #[tokio::test]
+    async fn a_stale_denial_of_the_name_covers_every_type_held_before_it() {
+        let (resolver, _upstream) = silent_resolver();
+        let (serving, clock, _queue) = stale_first(resolver);
+        let name = nm("gone.example.com.");
+        let a = Qtype::of(record_types::A);
+        serving
+            .caches
+            .remember(name.as_ref(), a, vec![a_record(&name, 300)]);
+        clock.advance(301);
+        store_nxdomain(&serving.caches, &name, Qtype::of(record_types::AAAA));
+        clock.advance(61);
+
+        let reply = asked_at_once(&serving, &name, a).await;
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
+        assert!(reply.answers.is_empty());
+    }
+
+    /// The control: the rule is "later", not "no". A name that did not exist
+    /// and then did is answered with the address.
+    #[tokio::test]
+    async fn a_stale_address_learned_later_beats_a_stale_denial() {
+        let (resolver, _upstream) = silent_resolver();
+        let (serving, clock, _queue) = stale_first(resolver);
+        let name = nm("new.example.com.");
+        let a = Qtype::of(record_types::A);
+        store_nxdomain(&serving.caches, &name, a);
+        clock.advance(61);
+        serving
+            .caches
+            .remember(name.as_ref(), a, vec![a_record(&name, 300)]);
+        clock.advance(301);
+
+        let reply = asked_at_once(&serving, &name, a).await;
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(stale_errors(&reply)[0].0, InfoCode::STALE_ANSWER);
     }
 
     /// The negative half: an expired NXDOMAIN is answered first too, with

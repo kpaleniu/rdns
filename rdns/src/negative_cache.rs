@@ -55,6 +55,8 @@ pub struct NegativeAnswer {
     /// [`crate::cache::Cached::refresh`]. Always false from
     /// [`NegativeCache::get`].
     pub refresh: bool,
+    /// When this was stored: [`crate::cache::Cached::learned_at`]'s reason.
+    pub learned_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +68,7 @@ struct Entry {
     /// When a stale answer may next hand out a refresh
     /// ([`crate::cache::STALE_REFRESH_INTERVAL`]). 0 on a new entry.
     stale_refresh_after: u64,
+    learned_at: u64,
 }
 
 impl Entry {
@@ -181,6 +184,7 @@ impl NegativeCache {
             secure,
             expires_at: now + ttl as u64,
             stale_refresh_after: 0,
+            learned_at: now,
         };
         let Ok(mut entries) = self.entries.lock() else {
             return;
@@ -336,6 +340,7 @@ impl Entry {
             secure: self.secure,
             ttl,
             refresh: false,
+            learned_at: self.learned_at,
         }
     }
 }

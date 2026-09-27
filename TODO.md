@@ -37,14 +37,14 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21, #128-#130 and #132**, as of 2026-09-27.
+**#21, #128-#130 and #133**, as of 2026-09-27.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
 defect (#127, closed the same day) and three places where a module's
 interface is its callers' problem. Grooming those three found #131 and
-#132, both bugs; #131 closed the same day. Checked and not filed: the
-transfer ladder (#130 says why), the `[server]` keys (#63h's macro), the two
-UDP loops (#30), the reload seam (#83, #112).
-#58, #68, #107-#127 and #131 are closed. #117-#119 came out of a fourth
+#132, both bugs, and both closed the same day; closing #132 found #133.
+Checked and not filed: the transfer ladder (#130 says why), the `[server]`
+keys (#63h's macro), the two UDP loops (#30), the reload seam (#83, #112).
+#58, #68, #107-#127, #131 and #132 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
 #123 and #124 out of verifying #122, #125 out of closing #121, and #126 out
@@ -6832,7 +6832,9 @@ arm by arm before anything moves. No remedy named.
 #132: `stale_answer`'s "a yes before a no" serves an expired positive answer
 over a *newer* expired NXDOMAIN, because `store` never retires the other
 cache's entry for the same question. The row's claim stands and is
-stronger: the read-side order is where #127 and #132 both lived.
+stronger: the read-side order is where #127 and #132 both lived. **Since
+#132**, `Caches::stale` replaces `stale_answer` and `stale_negative` with the
+decision between them, so four of the forwards are left.
 
 ### 130. `answer_update` decides and replies in one pass, so its test surface is a TCP server — **filed 2026-09-27**, **needs-triage**
 
@@ -6863,48 +6865,20 @@ write is the open question; no remedy named.
 (zone, permission, then the rest). The replicated-zone REFUSED is a recorded
 deviation (#118 item 4: RFC 2136 §3.1.1 forwards, BIND and PowerDNS do).
 
-### 132. A stale lookup serves an older "yes" over a newer "no" — **filed 2026-09-27**, **bug**, **needs-triage**
+### 133. The fresh path can serve an older "no" over a newer "yes" — **filed 2026-09-27**, **bug**, **needs-triage**
 
-Found grooming #129. `Caches::store` (`rdnsr/src/caches.rs:65`) puts a
-positive answer in `answers` and a negative one in `negatives`, and never
-retires the other cache's entry for the same question. While both are fresh
-this is harmless: `handle_query` asks `negatives` first. Once both have
-expired, `stale_answer` (`rdnsr/src/answer.rs:786-797`) asks `answers`
-first, under the comment "A 'yes' before a 'no': both may be held for one
-name, and the answer is the more specific thing known about it". That
-reasons about specificity, not age.
+Found closing #132, which fixed the stale path only. `handle_query` asks
+`negatives` before `answers` (`rdnsr/src/answer.rs:325`, `:335`), so with
+both fresh the "no" answers whichever is newer. The query path cannot store
+a "yes" under a fresh NXDOMAIN, because the NXDOMAIN answers first. A
+prefetch or stale refresh queued *before* the NXDOMAIN arrived can: an A
+refresh in flight while an AAAA query learns NXDOMAIN, or while the name is
+re-created. The older "no" then answers until its negative TTL runs out, at
+most `MAX_NEGATIVE_TTL` (3 600 s).
 
-Measured with a probe test, `--serve-stale` 3600: an A record with TTL 300
-cached at t, expired at t+301, an NXDOMAIN (negative TTL 60) stored at
-t+301, both expired at t+362. `stale_answer` and `stale_negative` both
-return `Some`, so the stale path answers with the address from t that the
-name's authority denied at t+301. The takedown of a malicious domain is the
-case where that matters.
-
-None of the three read can hold both for one question:
-
-- BIND, `lib/dns/qpcache.c` `add`: a negative entry covering all types
-  (NXDOMAIN) makes it "Delete all other data so that the only rdataset that
-  can be found at this node is the negative cache entry", unless the
-  existing data is secure and the negative is not. The reverse: "There's
-  an existing NXDOMAIN or negative covered type in the cache. If it's more
-  trusted than the new data, keep it, but if not, purge and replace it."
-  Separately, `STALE_TTL` is `NXDOMAIN(header) ? 0 : serve_stale_ttl`, so
-  BIND serves no stale NXDOMAIN at all, where `rdnsr` does
-  (`STALE_NXDOMAIN`).
-- Unbound, `services/cache/dns.c` `dns_cache_store_msg`: one message per
-  question, keyed by `query_info_hash`, stored by `slabhash_insert`, whose
-  `lruhash_insert` on an existing key does "if so: update data". The
-  comment beside it lists "NXDOMAIN", "NODATA" and "an older record" as
-  what that one slot may hold.
-- Knot Resolver, `lib/cache/entry_pkt.c` `stash_pkt`: a negative packet is
-  stored under `key_exact_type_maypkt(k, pkt_type)`, the same key
-  `key_exact_type` gives that type's RRset. Whether it displaces an
-  existing entry is `entry_h_splice`'s rank rule, which was not read.
-
-So the newest thing learned about a question is the only thing held, in
-all three. No remedy named; BIND's no-stale-NXDOMAIN is a second question
-the remedy should answer rather than copy.
+Not probed: this is read from the code, not provoked. #132's `learned_at`
+is the measure a fix would compare. The ordering it would change is #129's
+subject. No remedy named.
 
 ---
 
@@ -7052,6 +7026,7 @@ the week; the record is under "How the queue kept going stale" in
 | **126** | `--generate-keys` left a KSK with no DS when the ZSK's write failed | **filed and closed 2026-09-27.** Found reviewing #125. `write_key_pair` now removes whatever of the pair reached the directory on any write error, by `SigningKey::remove_from_dir`, which compares content rather than trusting the name: the name is the tag, and a file under it holding anything else is a colliding key. A key that cannot be removed is named in the error. |
 | **127** | a cached wildcard synthesis counted neither a hit nor a miss | **filed and closed 2026-09-27.** Found by the deepening sweep that filed #128-#130. `rdnsr`'s RFC 8198 §5.3 arm returned before `cache_hits`, where the other three arms answered from something held count one. One line; the test failed on 0 hits against the old arm. |
 | **131** | a zone with two masters was withdrawn when one of them was down | **filed and closed 2026-09-27.** Found grooming #128. EXPIRE and the startup/reload vouch read the sidecar per (zone, master); RFC 1034 §4.3.5, BIND and Knot count contact per zone. `StateFile::last_contact` over the masters configured now, so a line from a master no longer configured still vouches for nothing. Both regression tests failed against the per-master lookup. |
+| **132** | a stale lookup served an older "yes" over a newer "no" | **filed and closed 2026-09-27.** Found grooming #129. `Caches::stale` serves the later of the two by `learned_at` (RFC 8767 §4), deciding at read time because an NXDOMAIN is keyed by name and retiring on store would scan the answer cache. Covers other types at the name. Stale NXDOMAIN kept (RFC 8914 §4.20). Both regression tests failed with the "yes" asked first. |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 

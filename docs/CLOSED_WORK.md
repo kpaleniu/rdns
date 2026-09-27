@@ -11220,3 +11220,85 @@ was expected), each on its first assertion.
 
 
 ---
+
+### 132. A stale lookup serves an older "yes" over a newer "no" — **filed 2026-09-27, closed 2026-09-27**, **bug**
+
+Found grooming #129. `Caches::store` (`rdnsr/src/caches.rs:65`) puts a
+positive answer in `answers` and a negative one in `negatives`, and never
+retires the other cache's entry for the same question. While both are fresh
+this is harmless: `handle_query` asks `negatives` first. Once both have
+expired, `stale_answer` (`rdnsr/src/answer.rs:786-797`) asks `answers`
+first, under the comment "A 'yes' before a 'no': both may be held for one
+name, and the answer is the more specific thing known about it". That
+reasons about specificity, not age.
+
+Measured with a probe test, `--serve-stale` 3600: an A record with TTL 300
+cached at t, expired at t+301, an NXDOMAIN (negative TTL 60) stored at
+t+301, both expired at t+362. `stale_answer` and `stale_negative` both
+return `Some`, so the stale path answers with the address from t that the
+name's authority denied at t+301. The takedown of a malicious domain is the
+case where that matters.
+
+None of the three read can hold both for one question:
+
+- BIND, `lib/dns/qpcache.c` `add`: a negative entry covering all types
+  (NXDOMAIN) makes it "Delete all other data so that the only rdataset that
+  can be found at this node is the negative cache entry", unless the
+  existing data is secure and the negative is not. The reverse: "There's
+  an existing NXDOMAIN or negative covered type in the cache. If it's more
+  trusted than the new data, keep it, but if not, purge and replace it."
+  Separately, `STALE_TTL` is `NXDOMAIN(header) ? 0 : serve_stale_ttl`, so
+  BIND serves no stale NXDOMAIN at all, where `rdnsr` does
+  (`STALE_NXDOMAIN`).
+- Unbound, `services/cache/dns.c` `dns_cache_store_msg`: one message per
+  question, keyed by `query_info_hash`, stored by `slabhash_insert`, whose
+  `lruhash_insert` on an existing key does "if so: update data". The
+  comment beside it lists "NXDOMAIN", "NODATA" and "an older record" as
+  what that one slot may hold.
+- Knot Resolver, `lib/cache/entry_pkt.c` `stash_pkt`: a negative packet is
+  stored under `key_exact_type_maypkt(k, pkt_type)`, the same key
+  `key_exact_type` gives that type's RRset. Whether it displaces an
+  existing entry is `entry_h_splice`'s rank rule, which was not read.
+
+So the newest thing learned about a question is the only thing held, in
+all three. No remedy named; BIND's no-stale-NXDOMAIN is a second question
+the remedy should answer rather than copy.
+
+**Done, on the read side**: `Caches::stale` asks both caches and serves
+whichever entry was learned later, by a `learned_at` both now carry; a tie
+inside one second goes to the "no". RFC 8767 §4 is the rule: an NXDomain
+answer "MUST be considered to have refreshed the data at the resolver".
+
+**Read side rather than retiring on store**, which is what the three
+implementations above do. An NXDOMAIN here is keyed by *name* and covers
+every type at it, and its ancestors' NXDOMAINs cover it too (RFC 8020), so
+retiring on store would mean a scan of the answer cache per NXDOMAIN, and a
+typo storm is an NXDOMAIN storm (`CLAUDE.md` §5, §13). Deciding at the one
+reader reaches every type at the name for two map probes. The row named the
+same question only; the cross-type case is the same bug and is tested.
+
+**Stale NXDOMAIN stays**, the second question the row left: RFC 8914 §4.20
+defines code 19 for "a previously cached NXDOMAIN answer" served when
+resolution fails, and RFC 8767 §7 discusses stale negative records. BIND's
+zero window is its choice rather than the standard's.
+
+Not changed: the *fresh* path still asks `negatives` before `answers`. Both
+fresh with the "yes" later needs a positive stored while a fresh NXDOMAIN
+covers the name. The query path cannot do that, since a fresh NXDOMAIN
+answers the lookup before any resolution. A prefetch or stale refresh queued
+*before* the NXDOMAIN arrived can, and the older "no" then answers until its
+negative TTL runs out, at most `MAX_NEGATIVE_TTL` (3 600 s). That is this
+bug's mirror on the fresh path, filed as #133.
+
+Tests: `a_stale_denial_learned_later_beats_a_stale_address`,
+`a_stale_denial_of_the_name_covers_every_type_held_before_it`, and the
+control `a_stale_address_learned_later_beats_a_stale_denial`, all through
+`handle_query` with `--serve-stale-first`. The first two failed with the
+"yes" asked first (NOERROR where NXDOMAIN was expected); the control passed
+both ways, as a control should.
+
+1 350 passed on Windows, 0 failed; clippy, `cargo doc` and `cargo fmt
+--check` clean. Linux not run: none of the four files touched is
+cfg-gated.
+
+---
