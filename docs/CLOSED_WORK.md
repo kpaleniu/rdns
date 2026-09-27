@@ -11109,3 +11109,37 @@ fails, and the temporary-removal case, for #125's reason. One
 
 
 ---
+
+### 127. A cached wildcard synthesis counts neither a hit nor a miss — **filed 2026-09-27, closed 2026-09-27**, **bug**
+
+`rdnsr/src/answer.rs:301-308` answers from `NsecCache::synthesize_wildcard`
+and returns without touching `cache_hits` or `cache_misses`. The three
+siblings answered from something held all count a hit: the denial synthesis
+(`:312`), the negative cache (`:325`), the answer cache (`:353`), and the
+stale-first answer (`:365`). The comment above the miss (`:366-368`) says
+"Everything above answered from something held … This is the line a cache
+hit rate is drawn on", which the wildcard arm makes untrue.
+
+So `dns_cache_hits_total / (hits + misses)` omits every RFC 8198 §5.3
+answer, and those are the answers `--dnssec-validate` exists to make cheap
+(`CLAUDE.md` §14: a counter's name is a claim about what it counts).
+
+Refuting check taken: no reason is recorded. `git log -S` finds the arm
+arriving in `rdnsr/src/main.rs` with `d6dc622`, uncounted then; neither `TODO.md`
+nor `docs/CLOSED_WORK.md` mentions the metric beside it. The test at
+`:1883` asserts three hits and none of them is a wildcard.
+
+A one-line fix plus a test that watches it fail. #129 is the shape that let
+it happen.
+
+**Done** as named: the arm counts a hit before building its reply.
+`a_synthesized_wildcard_answer_is_a_cache_hit` stores a Secure wildcard
+answer for `x.w.example.test.`, asks for `y.w.example.test.` and asserts one
+hit and no miss. Against the old arm it failed on the hit count (0) after the
+reply assertions passed, so the fixture does reach the wildcard arm.
+
+1 344 passed on Windows, 0 failed; clippy clean. Not run on Linux: nothing
+touched is cfg-gated.
+
+
+---

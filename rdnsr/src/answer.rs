@@ -299,6 +299,7 @@ pub(crate) async fn handle_query(
     // more specific one first costs nothing.
     if !checking_disabled {
         if let Some(wildcard) = caches.synthesize_wildcard(query.qname.as_ref(), query.qtype) {
+            ctx.metrics.count(&ctx.metrics.cache_hits);
             let mut resp = build_response(&msg, wildcard.answers, ResponseCode::Ok);
             resp.authorities = wildcard.authority;
             // A wildcard signature verifies at this name unchanged, so the
@@ -2187,6 +2188,42 @@ mod tests {
             1,
             "synthesized from the denial the refresh kept, not asked again"
         );
+    }
+
+    /// An answer synthesized from a cached wildcard is a cache hit, as the
+    /// other three arms answered from something held are (`TODO.md` #127).
+    /// Watched failing with the count removed: 0 hits.
+    #[tokio::test]
+    async fn a_synthesized_wildcard_answer_is_a_cache_hit() {
+        let zone = SignedZone::new();
+        let mut asked = DnsMessage::try_from_bytes(&message(OpCode::Query, false)).expect("ok");
+        asked.queries = vec![a_question("x.w.example.test.")];
+        let upstream = zone.reply(&asked);
+        let (resolver, _upstream) = silent_resolver();
+        let serving = serving(resolver, test_shell(), PolicyZones::default());
+        serving.caches.store(
+            &a_question("x.w.example.test."),
+            &upstream,
+            &ValidationState::Secure,
+        );
+
+        let answered = handle_query(
+            query_for("y.w.example.test.", 1, false),
+            TEST_PEER,
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await;
+        let reply =
+            DnsMessage::try_from_bytes(&answered.expect("answered")).expect("a well-formed reply");
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers.len(), 1, "synthesized from the wildcard");
+
+        let m = &serving.ctx.metrics;
+        let read = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(read(&m.cache_hits), 1);
+        assert_eq!(read(&m.cache_misses), 0);
     }
 
     /// The sink closes when the reply is in it, not when the prefetch the

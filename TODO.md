@@ -37,13 +37,13 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21 and #127-#130**, as of 2026-09-27.
+**#21 and #128-#130**, as of 2026-09-27.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
-defect (#127) and three places where a module's interface is its callers'
-problem. Checked and not filed: the transfer ladder (#130 says why), the
+defect (#127, closed the same day) and three places where a module's
+interface is its callers' problem. Checked and not filed: the transfer ladder (#130 says why), the
 `[server]` keys (#63h's macro), the two UDP loops (#30), the reload seam
 (#83, #112).
-#58, #68 and #107-#126 are closed. #117-#119 came out of a fourth
+#58, #68 and #107-#127 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
 #123 and #124 out of verifying #122, #125 out of closing #121, and #126 out
@@ -6757,28 +6757,6 @@ untested. A line that says a thing is expensive is a claim to measure
 
 ---
 
-### 127. A cached wildcard synthesis counts neither a hit nor a miss — **filed 2026-09-27**, **bug**, **ready-for-agent**
-
-`rdnsr/src/answer.rs:301-308` answers from `NsecCache::synthesize_wildcard`
-and returns without touching `cache_hits` or `cache_misses`. The three
-siblings answered from something held all count a hit: the denial synthesis
-(`:312`), the negative cache (`:325`), the answer cache (`:353`), and the
-stale-first answer (`:365`). The comment above the miss (`:366-368`) says
-"Everything above answered from something held … This is the line a cache
-hit rate is drawn on", which the wildcard arm makes untrue.
-
-So `dns_cache_hits_total / (hits + misses)` omits every RFC 8198 §5.3
-answer, and those are the answers `--dnssec-validate` exists to make cheap
-(`CLAUDE.md` §14: a counter's name is a claim about what it counts).
-
-Refuting check taken: no reason is recorded. `git log -S` finds the arm
-arriving in `rdnsr/src/main.rs` with `d6dc622`, uncounted then; neither `TODO.md`
-nor `docs/CLOSED_WORK.md` mentions the metric beside it. The test at
-`:1883` asserts three hits and none of them is a wildcard.
-
-A one-line fix plus a test that watches it fail. #129 is the shape that let
-it happen.
-
 ### 128. RFC 1035 §4.3.5's refresh cycle is written twice, and neither copy has a test — **filed 2026-09-27**, **needs-triage**
 
 `rdnsd`'s `secondary_loop` (`rdnsd/src/replication.rs:383`, ~65 lines) and
@@ -7011,6 +6989,7 @@ the week; the record is under "How the queue kept going stale" in
 | **124** | `compression.rs`'s ratio test near its bound in debug | **filed and closed 2026-09-26.** The bound was right: the unindexed scan reads 13-15× in debug, the ~2 was release. The samples were not: 500 writes against 16 000, so under load only the long side was preempted — loaded Linux read 6.16× median, 195 of 200 over 5, and more samples did not help. Both sides now write 800 names a sample, best of fifteen: max 3.26× loaded, and the real test failed 0 of 100 there against 83 before. See `docs/CLOSED_WORK.md` |
 | **125** | `--generate-keys` replaced a key file whose tag it collided with | **filed and closed 2026-09-26.** Checked against BIND first: `dnssec-keygen` generates again while a new key's tag, or its tag with REVOKE set, equals either tag of a key of that name and algorithm in the directory (`key_collision`, `dnssectool.c`). `SigningKey::distinct_from` does the same against the directory and the run's other key, bounded at 100 attempts; `write_to_dir` publishes by hard link and refuses an existing file. Tested over #121's stored pair, a stored REVOKE-apart pair and a same-tag pair of two algorithms; the overwrite test watched failing against the old rename, and `rdnsd`'s wiring test against dropping either list. See `docs/CLOSED_WORK.md` |
 | **126** | `--generate-keys` left a KSK with no DS when the ZSK's write failed | **filed and closed 2026-09-27.** Found reviewing #125. `write_key_pair` now removes whatever of the pair reached the directory on any write error, by `SigningKey::remove_from_dir`, which compares content rather than trusting the name: the name is the tag, and a file under it holding anything else is a colliding key. A key that cannot be removed is named in the error. |
+| **127** | a cached wildcard synthesis counted neither a hit nor a miss | **filed and closed 2026-09-27.** Found by the deepening sweep that filed #128-#130. `rdnsr`'s RFC 8198 §5.3 arm returned before `cache_hits`, where the other three arms answered from something held count one. One line; the test failed on 0 hits against the old arm. |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
