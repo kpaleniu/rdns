@@ -11604,3 +11604,149 @@ and the lifted feed was not re-read"), passes with the fix.
 `cargo doc` and `cargo fmt --check` clean.
 
 ---
+
+### 128. RFC 1035 §4.3.5's refresh cycle is written twice, and neither copy has a test — **filed 2026-09-27, closed 2026-09-28**
+
+`rdnsd`'s `secondary_loop` (`rdnsd/src/replication.rs:383`, ~65 lines) and
+`rdnsr`'s `refresh_task` (`rdnsr/src/rpz_transfer.rs:157`, ~80 lines) are
+the same cycle, one per daemon: hold `Busy` across the refresh and never
+across the sleep (`CLAUDE.md` §9), `after_success` / `after_failure`,
+EXPIRE counted from last contact, and a `select!` over the timer, a
+NOTIFY wake and `Stop`. Both call `xfr::refresh_zone` and
+`RefreshTimers`. What differs, read in both:
+
+| | `rdnsd` | `rdnsr` |
+|---|---|---|
+| last contact | `StateFile` sidecar, else process start | a local, from process start |
+| timers after a success | re-read from the zone map after install | taken from the fetched zone |
+| after a success | catalog `reconcile` | gauge, "back in contact" WARN |
+| at EXPIRE | `withdraw` | `on-expire`: WARN, or remove file and reload |
+| once only | `withdraw` returns false second time | a `lifted` flag |
+
+**Neither loop is reached by any test.** `grep` for either name finds only
+the spawns (`replication.rs:354`, `rdnsr/src/main.rs:1047`). The tests stop
+one level down, at `refresh_once`, `fetch_and_write` and the two
+`expire_if_out_of_contact`. That is the level where the live two-process run
+caught the timers-read-before-the-transfer bug that "no unit test would
+have" ("Architecture: the secondary role"). The row for this is the
+cadence: a first transfer followed by the zone's REFRESH and not the
+default hour, a NOTIFY cutting the wait short, `Busy` released across the
+sleep, the EXPIRE action once. `rdnsd` already enables `tokio`'s
+`test-util` for `start_paused` (`rdnsd/Cargo.toml:36`); `rdnsr` does not.
+
+Refuting check taken: nothing decided this. `grep` for both function names
+and for `rpz_transfer` across `TODO.md` and `docs/CLOSED_WORK.md` finds only
+#20's table placing `secondary_loop`. 57d built two shapes for *where the
+zone goes*, not for the cycle. ~~No drift found between the copies today:
+the timer difference in the table is two correct spellings of one rule.~~
+**Wrong, found triaging (#135):** the table compared the timers *after a
+success* and nothing before one. `rdnsd` reads them from the zone it holds,
+fetched or not; `rdnsr` starts from `RefreshTimers::default()`, whose EXPIRE
+is `u64::MAX`, and sets them only on a success. A resolver restarted with
+its master gone never reaches EXPIRE.
+
+No remedy named. The candidate a build would test is one cycle in
+`rdns::secondary` with the four differing rows as the caller's part. §19
+says build it against the alternative of paused-time tests on each loop as
+it stands, and compare.
+
+**Groomed 2026-09-27.** The table's "last contact" row hid a defect, now
+#131: `rdnsd` keys contact by (zone, master), so with two masters one dead
+master withdraws a zone the other keeps current. `rdnsr` has one master per
+feed and is not affected. A shared cycle would have to choose the contact
+key, so #131 goes first. **It went, and chose per zone** over the masters
+configured now (`StateFile::last_contact`).
+
+**Triaged 2026-09-27.** Three things the row did not have, each read in
+both loops:
+
+- **The copies have drifted twice.** #135, above. And `rdnsd` checks
+  `stop.is_set()` before each refresh while `rdnsr` does not: with a NOTIFY
+  and the stop both pending, `select!` picks at random, so `rdnsr` can
+  start a transfer after shutdown began and the drain waits for it. Minor,
+  not filed separately; a shared cycle carries the guard once.
+- **Paused time cannot reach EXPIRE in either loop.** Both read
+  `current_unix_timestamp` directly (`started_at` and
+  `expire_if_out_of_contact` in `rdnsd`, `last_contact` and
+  `expire_if_out_of_contact` in `rdnsr`), and `start_paused` moves tokio's
+  clock, not `SystemTime`. RETRY is floored at 60 s, so a real-time test
+  waits a minute per attempt. Either shape needs `rdns_core::clock::Clock`
+  passed in; `Clock::fixed` exists for this (#52).
+- **The harnesses exist.** `rdnsr`'s tests have `spawn_master`, which
+  records what it was asked; `rdnsd`'s have `two_masters`. `rdnsr` needs
+  `tokio` `test-util` as a dev-dependency, as `rdnsd` has.
+
+Remedy, in order:
+
+1. #135 first, with its own regression test, so neither shape starts from
+   a known-wrong copy. **Done**, and it did `rdnsr`'s half of step 2.
+2. Thread a `Clock` into both loops. Needed by both shapes, so not part of
+   the choice. **Done**: `rdnsd`'s is a field of `ReplicationContext`.
+3. Build both shapes (§19): (A) one cycle in `rdns::secondary`, the
+   differing rows of the table plus "timers of what is held" as the
+   caller's part; (B) paused-time tests on each loop as it stands. Tests,
+   the same list for both: first transfer then the zone's REFRESH, not the
+   default hour; a failure then RETRY; a NOTIFY cutting the wait short;
+   `Busy` released across the sleep (`Shutdown::drain` returns during it);
+   the EXPIRE action once over several failures; a stop during a pending
+   NOTIFY starts no transfer.
+4. Choose on: whether (A) makes #135's question a required hook rather
+   than an initial value somebody picks, the diff each needs, and whether
+   (B)'s tests are two copies of one list. Keep both patches and put the
+   numbers here.
+
+What (A) does not buy, so it is not credited with it: the hook for the held
+zone's timers is still written per caller, and `rdnsr` could still answer
+it wrongly. It makes the question impossible to skip, not the answer right.
+
+**Closed 2026-09-28: shape A**, `c140c94` and `bda5ec5`. Both shapes are kept
+as branches, `128-shape-a` and `128-shape-b`.
+
+| | A: one cycle | B: tests on each loop |
+|---|---|---|
+| production | +265 −176, three files | +5, `rdnsr`'s stop guard |
+| tests | +314 −73: 7 on the cycle, 1 through `rdnsd`'s loop | +422: the list of 6, twice |
+| harness | a scripted replica, no I/O, paused time exact | loopback I/O under paused time |
+| #135's question | `Replica::held_timers`, required | an initial value, as before |
+| copies of the rule | one | two, and two of the test list |
+
+What decided it:
+
+- B's tests need real I/O under paused time, which auto-advances whenever
+  the runtime idles: a busy-yield `settle` for every "it happened", and a
+  200 ms real-time `quiet` before every "nothing yet". Without `quiet`, the
+  REFRESH test passed with the timers read before the transfer, the bug it
+  existed for. With it, 0 failures in 100 runs per module on each platform,
+  but it is a wall-clock assumption (§10).
+- B is §7 in test code: six tests and four helpers per daemon.
+- A's cycle tests cannot see the order `ZoneReplica::refresh` reads the
+  timers in, so B's REFRESH test for `rdnsd` was kept, through the real
+  loop and a real primary. Failed with the timers read before
+  `refresh_once`; 0/100 on each platform.
+- Mutation checks on A: without the stop guard the cycle's stop test fails
+  at round 0; with `held_timers` returning the default, #135's test fails.
+
+Behaviour changed:
+
+- `rdnsr` has the stop guard.
+- A third drift, found building B: after a withdraw `rdnsd` falls back to
+  the default timers (RETRY 60), `rdnsr` kept the feed's after a lift.
+  Under A both read the held zone after a failure, so `rdnsr` retries on
+  60 s after a lift too.
+- The EXPIRE action runs once per spell out of contact. `rdnsd` used to
+  call `withdraw` on every failure past EXPIRE, a no-op after the first; a
+  reload that re-reads an expired file is still withdrawn by
+  `withdraw_unvouched_zones`.
+
+Tests changed: `rdnsd`'s three expiry tests call `recorded_contact` and
+`withdraw_expired`, which replaced `expire_if_out_of_contact`; `rdnsr`'s
+`the_expiry_warning_is_a_transition_and_not_a_repeat` is deleted, its
+property is the cycle's `expire_acts_once_per_spell`.
+
+Not changed: `withdraw_unvouched_zones` reads the wall clock. It runs from
+`main` at startup and reload, not from the cycle.
+
+1 365 passed on Windows and 1 386 on Linux, 0 failed; clippy clean on both,
+`cargo doc` and `cargo fmt --check` clean.
+
+---

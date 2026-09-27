@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21, #128 and #130**, as of 2026-09-27.
+**#21 and #130**, as of 2026-09-28.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
 defect (#127, closed the same day) and three places where a module's
 interface is its callers' problem. Grooming those three found #131 and
@@ -45,7 +45,7 @@ interface is its callers' problem. Grooming those three found #131 and
 and closing #133 found #134.
 Checked and not filed: the transfer ladder (#130 says why), the `[server]`
 keys (#63h's macro), the two UDP loops (#30), the reload seam (#83, #112).
-#58, #68, #107-#127, #129 and #131-#135 are closed. #117-#119 came out of a fourth
+#58, #68, #107-#129 and #131-#135 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
 #123 and #124 out of verifying #122, #125 out of closing #121, and #126 out
@@ -6759,99 +6759,6 @@ untested. A line that says a thing is expensive is a claim to measure
 
 ---
 
-### 128. RFC 1035 §4.3.5's refresh cycle is written twice, and neither copy has a test — **filed 2026-09-27**, **ready-for-agent**
-
-`rdnsd`'s `secondary_loop` (`rdnsd/src/replication.rs:383`, ~65 lines) and
-`rdnsr`'s `refresh_task` (`rdnsr/src/rpz_transfer.rs:157`, ~80 lines) are
-the same cycle, one per daemon: hold `Busy` across the refresh and never
-across the sleep (`CLAUDE.md` §9), `after_success` / `after_failure`,
-EXPIRE counted from last contact, and a `select!` over the timer, a
-NOTIFY wake and `Stop`. Both call `xfr::refresh_zone` and
-`RefreshTimers`. What differs, read in both:
-
-| | `rdnsd` | `rdnsr` |
-|---|---|---|
-| last contact | `StateFile` sidecar, else process start | a local, from process start |
-| timers after a success | re-read from the zone map after install | taken from the fetched zone |
-| after a success | catalog `reconcile` | gauge, "back in contact" WARN |
-| at EXPIRE | `withdraw` | `on-expire`: WARN, or remove file and reload |
-| once only | `withdraw` returns false second time | a `lifted` flag |
-
-**Neither loop is reached by any test.** `grep` for either name finds only
-the spawns (`replication.rs:354`, `rdnsr/src/main.rs:1047`). The tests stop
-one level down, at `refresh_once`, `fetch_and_write` and the two
-`expire_if_out_of_contact`. That is the level where the live two-process run
-caught the timers-read-before-the-transfer bug that "no unit test would
-have" ("Architecture: the secondary role"). The row for this is the
-cadence: a first transfer followed by the zone's REFRESH and not the
-default hour, a NOTIFY cutting the wait short, `Busy` released across the
-sleep, the EXPIRE action once. `rdnsd` already enables `tokio`'s
-`test-util` for `start_paused` (`rdnsd/Cargo.toml:36`); `rdnsr` does not.
-
-Refuting check taken: nothing decided this. `grep` for both function names
-and for `rpz_transfer` across `TODO.md` and `docs/CLOSED_WORK.md` finds only
-#20's table placing `secondary_loop`. 57d built two shapes for *where the
-zone goes*, not for the cycle. ~~No drift found between the copies today:
-the timer difference in the table is two correct spellings of one rule.~~
-**Wrong, found triaging (#135):** the table compared the timers *after a
-success* and nothing before one. `rdnsd` reads them from the zone it holds,
-fetched or not; `rdnsr` starts from `RefreshTimers::default()`, whose EXPIRE
-is `u64::MAX`, and sets them only on a success. A resolver restarted with
-its master gone never reaches EXPIRE.
-
-No remedy named. The candidate a build would test is one cycle in
-`rdns::secondary` with the four differing rows as the caller's part. §19
-says build it against the alternative of paused-time tests on each loop as
-it stands, and compare.
-
-**Groomed 2026-09-27.** The table's "last contact" row hid a defect, now
-#131: `rdnsd` keys contact by (zone, master), so with two masters one dead
-master withdraws a zone the other keeps current. `rdnsr` has one master per
-feed and is not affected. A shared cycle would have to choose the contact
-key, so #131 goes first. **It went, and chose per zone** over the masters
-configured now (`StateFile::last_contact`).
-
-**Triaged 2026-09-27.** Three things the row did not have, each read in
-both loops:
-
-- **The copies have drifted twice.** #135, above. And `rdnsd` checks
-  `stop.is_set()` before each refresh while `rdnsr` does not: with a NOTIFY
-  and the stop both pending, `select!` picks at random, so `rdnsr` can
-  start a transfer after shutdown began and the drain waits for it. Minor,
-  not filed separately; a shared cycle carries the guard once.
-- **Paused time cannot reach EXPIRE in either loop.** Both read
-  `current_unix_timestamp` directly (`started_at` and
-  `expire_if_out_of_contact` in `rdnsd`, `last_contact` and
-  `expire_if_out_of_contact` in `rdnsr`), and `start_paused` moves tokio's
-  clock, not `SystemTime`. RETRY is floored at 60 s, so a real-time test
-  waits a minute per attempt. Either shape needs `rdns_core::clock::Clock`
-  passed in; `Clock::fixed` exists for this (#52).
-- **The harnesses exist.** `rdnsr`'s tests have `spawn_master`, which
-  records what it was asked; `rdnsd`'s have `two_masters`. `rdnsr` needs
-  `tokio` `test-util` as a dev-dependency, as `rdnsd` has.
-
-Remedy, in order:
-
-1. #135 first, with its own regression test, so neither shape starts from
-   a known-wrong copy. **Done**, and it did `rdnsr`'s half of step 2.
-2. Thread a `Clock` into both loops. Needed by both shapes, so not part of
-   the choice. **Done**: `rdnsd`'s is a field of `ReplicationContext`.
-3. Build both shapes (§19): (A) one cycle in `rdns::secondary`, the
-   differing rows of the table plus "timers of what is held" as the
-   caller's part; (B) paused-time tests on each loop as it stands. Tests,
-   the same list for both: first transfer then the zone's REFRESH, not the
-   default hour; a failure then RETRY; a NOTIFY cutting the wait short;
-   `Busy` released across the sleep (`Shutdown::drain` returns during it);
-   the EXPIRE action once over several failures; a stop during a pending
-   NOTIFY starts no transfer.
-4. Choose on: whether (A) makes #135's question a required hook rather
-   than an initial value somebody picks, the diff each needs, and whether
-   (B)'s tests are two copies of one list. Keep both patches and put the
-   numbers here.
-
-What (A) does not buy, so it is not credited with it: the hook for the held
-zone's timers is still written per caller, and `rdnsr` could still answer
-it wrongly. It makes the question impossible to skip, not the answer right.
 
 ### 130. `answer_update` decides and replies in one pass, so its test surface is a TCP server — **filed 2026-09-27**, **needs-triage**
 
@@ -7027,6 +6934,7 @@ the week; the record is under "How the queue kept going stale" in
 | **125** | `--generate-keys` replaced a key file whose tag it collided with | **filed and closed 2026-09-26.** Checked against BIND first: `dnssec-keygen` generates again while a new key's tag, or its tag with REVOKE set, equals either tag of a key of that name and algorithm in the directory (`key_collision`, `dnssectool.c`). `SigningKey::distinct_from` does the same against the directory and the run's other key, bounded at 100 attempts; `write_to_dir` publishes by hard link and refuses an existing file. Tested over #121's stored pair, a stored REVOKE-apart pair and a same-tag pair of two algorithms; the overwrite test watched failing against the old rename, and `rdnsd`'s wiring test against dropping either list. See `docs/CLOSED_WORK.md` |
 | **126** | `--generate-keys` left a KSK with no DS when the ZSK's write failed | **filed and closed 2026-09-27.** Found reviewing #125. `write_key_pair` now removes whatever of the pair reached the directory on any write error, by `SigningKey::remove_from_dir`, which compares content rather than trusting the name: the name is the tag, and a file under it holding anything else is a colliding key. A key that cannot be removed is named in the error. |
 | **127** | a cached wildcard synthesis counted neither a hit nor a miss | **filed and closed 2026-09-27.** Found by the deepening sweep that filed #128-#130. `rdnsr`'s RFC 8198 §5.3 arm returned before `cache_hits`, where the other three arms answered from something held count one. One line; the test failed on 0 hits against the old arm. |
+| **128** | RFC 1035 §4.3.5's refresh cycle was written twice and neither copy was tested | **filed 2026-09-27, closed 2026-09-28.** Both shapes built: one cycle in `rdns::secondary` (A) against paused-time tests on each loop (B). A taken: B's tests need real loopback I/O under paused time and a 200 ms real-time quiet period, without which the REFRESH test passed the bug it was for, and they are the same six tests twice. The copies had drifted three times: #135, `rdnsr`'s missing stop guard, and the timers after an expiry. Branches `128-shape-a` and `128-shape-b` kept. See `docs/CLOSED_WORK.md` |
 | **129** | `Caches` sealed its write side and left the read order to its callers | **filed and closed 2026-09-27.** `Caches::lookup` holds the order; `handle_query` has one hit arm. Found doing it: `cached_or_resolve` asked `answers` before `negatives`, so DNS64 synthesized from an A a newer "no" had replaced. Regression test failed against the old order. See `docs/CLOSED_WORK.md` |
 | **131** | a zone with two masters was withdrawn when one of them was down | **filed and closed 2026-09-27.** Found grooming #128. EXPIRE and the startup/reload vouch read the sidecar per (zone, master); RFC 1034 §4.3.5, BIND and Knot count contact per zone. `StateFile::last_contact` over the masters configured now, so a line from a master no longer configured still vouches for nothing. Both regression tests failed against the per-master lookup. |
 | **132** | a stale lookup served an older "yes" over a newer "no" | **filed and closed 2026-09-27.** Found grooming #129. `Caches::stale` serves the later of the two by `learned_at` (RFC 8767 §4), deciding at read time because an NXDOMAIN is keyed by name and retiring on store would scan the answer cache. Covers other types at the name. Stale NXDOMAIN kept (RFC 8914 §4.20). Both regression tests failed with the "yes" asked first. |
