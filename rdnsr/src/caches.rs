@@ -9,8 +9,21 @@ use rdns::cache::{Cached, StalePolicy};
 use rdns::clock::Clock;
 use rdns::dnssec_chain::ValidationState;
 use rdns::negative_cache::{NegativeAnswer, NegativeCache};
-use rdns::nsec_cache::{NsecCache, Synthesis, WildcardSynthesis};
-use rdns::{DnsCache, DnsMessage, NameRef, Qtype, QuerySection};
+use rdns::nsec_cache::NsecCache;
+use rdns::{DnsCache, DnsMessage, NameRef, Qtype, QuerySection, ResourceRecord, ResponseCode};
+
+/// What [`Caches::lookup`] found.
+pub(crate) enum Held {
+    /// The answer cache's, the one holding a prefetch can refresh.
+    Answer(Cached),
+    /// Anything else, which is the reply as it stands.
+    Reply {
+        rcode: ResponseCode,
+        answers: Vec<ResourceRecord>,
+        authority: Vec<ResourceRecord>,
+        secure: bool,
+    },
+}
 
 /// What [`Caches::stale`] found.
 pub(crate) enum Stale {
@@ -110,7 +123,68 @@ impl Caches {
         }
     }
 
-    /// [`DnsCache::lookup`].
+    /// What is held for this question, unexpired.
+    ///
+    /// The order is the caches' business rather than the caller's, because
+    /// whether it is right depends on what `store` retires: #127 and #132 both
+    /// lived in an order spelled out by the answer path (`TODO.md` #129).
+    ///
+    /// `synthesize` false skips the RFC 8198 arms; the caller decides, since it
+    /// is the client's CD bit.
+    pub(crate) fn lookup(
+        &self,
+        name: NameRef<'_>,
+        qtype: Qtype,
+        synthesize: bool,
+        prefetching: bool,
+    ) -> Option<Held> {
+        // Before the answer cache: a cached NSEC answers every question in its
+        // gap, so a flood of random names under one zone costs one upstream
+        // query, not one per name (RFC 8198). The positive half (§5.3) first:
+        // a cached NXDOMAIN needs the wildcard *denied*, so the two are
+        // mutually exclusive and trying the more specific one first costs
+        // nothing.
+        if synthesize {
+            // A wildcard signature verifies at this name unchanged, so the
+            // client can check this for itself.
+            if let Some(wildcard) = self.denials.synthesize_wildcard(name, qtype) {
+                return Some(Held::Reply {
+                    rcode: ResponseCode::Ok,
+                    answers: wildcard.answers,
+                    authority: wildcard.authority,
+                    secure: true,
+                });
+            }
+            // The proofs were validated before storage, so what is derived
+            // from them is authentic on the same terms.
+            if let Some(denial) = self.denials.synthesize(name, qtype) {
+                return Some(Held::Reply {
+                    rcode: denial.rcode,
+                    answers: Vec::new(),
+                    authority: denial.authority,
+                    secure: true,
+                });
+            }
+        }
+        // Before `answers`, so a newer "no" outranks an older "yes" with no
+        // retiring on store; `store` retires only the "no" an answer refutes
+        // (`TODO.md` #133). Nothing is synthesized — this is the answer this
+        // question got — so a CD client may have it too.
+        if let Some(negative) = self.negatives.get(name, qtype) {
+            return Some(Held::Reply {
+                rcode: negative.rcode,
+                answers: Vec::new(),
+                authority: negative.authority,
+                secure: negative.secure,
+            });
+        }
+        self.answers
+            .lookup(name, qtype, prefetching)
+            .map(Held::Answer)
+    }
+
+    /// One cache at a time, for tests about which caches `store` reached.
+    #[cfg(test)]
     pub(crate) fn answer(
         &self,
         name: NameRef<'_>,
@@ -120,22 +194,26 @@ impl Caches {
         self.answers.lookup(name, qtype, prefetching)
     }
 
-    /// [`NegativeCache::get`].
+    #[cfg(test)]
     pub(crate) fn negative(&self, name: NameRef<'_>, qtype: Qtype) -> Option<NegativeAnswer> {
         self.negatives.get(name, qtype)
     }
 
-    /// [`NsecCache::synthesize_wildcard`].
+    #[cfg(test)]
     pub(crate) fn synthesize_wildcard(
         &self,
         name: NameRef<'_>,
         qtype: Qtype,
-    ) -> Option<WildcardSynthesis> {
+    ) -> Option<rdns::nsec_cache::WildcardSynthesis> {
         self.denials.synthesize_wildcard(name, qtype)
     }
 
-    /// [`NsecCache::synthesize`].
-    pub(crate) fn synthesize_denial(&self, name: NameRef<'_>, qtype: Qtype) -> Option<Synthesis> {
+    #[cfg(test)]
+    pub(crate) fn synthesize_denial(
+        &self,
+        name: NameRef<'_>,
+        qtype: Qtype,
+    ) -> Option<rdns::nsec_cache::Synthesis> {
         self.denials.synthesize(name, qtype)
     }
 

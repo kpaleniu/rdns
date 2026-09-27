@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21, #128-#130 and #134**, as of 2026-09-27.
+**#21, #128, #130 and #134**, as of 2026-09-27.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
 defect (#127, closed the same day) and three places where a module's
 interface is its callers' problem. Grooming those three found #131 and
@@ -45,7 +45,7 @@ interface is its callers' problem. Grooming those three found #131 and
 and closing #133 found #134.
 Checked and not filed: the transfer ladder (#130 says why), the `[server]`
 keys (#63h's macro), the two UDP loops (#30), the reload seam (#83, #112).
-#58, #68, #107-#127 and #131-#133 are closed. #117-#119 came out of a fourth
+#58, #68, #107-#127, #129 and #131-#133 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
 #123 and #124 out of verifying #122, #125 out of closing #121, and #126 out
@@ -6806,63 +6806,6 @@ feed and is not affected. A shared cycle would have to choose the contact
 key, so #131 goes first. **It went, and chose per zone** over the masters
 configured now (`StateFile::last_contact`).
 
-### 129. `rdnsr`'s `Caches` seals the write side and forwards the read side — **filed 2026-09-27**, **ready-for-agent**
-
-#117 made `Caches::store` the one writer, so a writer that forgets a cache
-does not compile. The read side got no equivalent. Six of `Caches`'s ten
-methods are one-line forwards (`rdnsr/src/caches.rs:103-148`: `answer`,
-`negative`, `synthesize_wildcard`, `synthesize_denial`, `stale_answer`,
-`stale_negative`). The *order* they are asked in lives in `handle_query`
-(`rdnsr/src/answer.rs:301-334`: wildcard, denial, negative, answer) and in
-`stale_answer` (`:787-796`: "a yes before a no"). A mechanical scan of every
-crate's `pub` functions for one-line forwarding bodies puts `caches.rs`
-highest after `rdns::error`'s constructors. Everything else it flags is an
-accessor.
-
-What the forwarding cost: #127, a fourth "answered from something held" arm
-that does not count as one. Each arm spells its own metric, response build
-and `finish_dns64` call.
-
-What must stay in `handle_query`, and would refute a naive move: the CD gate
-(`:300`, `:310`) is the client's request and not the cache's knowledge; the
-DNS64 finish and the prefetch offer are answer-path. Which of the four
-orderings belong to the cache and which to the answer path has to be read
-arm by arm before anything moves. No remedy named.
-
-**Groomed 2026-09-27.** The ordering the row points at hid a defect, now
-#132: `stale_answer`'s "a yes before a no" serves an expired positive answer
-over a *newer* expired NXDOMAIN, because `store` never retires the other
-cache's entry for the same question. The row's claim stands and is
-stronger: the read-side order is where #127 and #132 both lived. **Since
-#132**, `Caches::stale` replaces `stale_answer` and `stale_negative` with the
-decision between them, so four of the forwards are left.
-
-**Triaged 2026-09-27.** Read the four fresh-path arms (`answer.rs:301-335`):
-
-| arm | who owns the order | right today? |
-|---|---|---|
-| wildcard synthesis | the cache: which of it and a held answer is newer | no, served over a newer answer (below) |
-| denial synthesis | the cache | no, #134 |
-| negative before answer | the cache: `store`'s #133 comment relies on `answer.rs` asking `negatives` first | yes, but the invariant lives in two files |
-| stale | the cache | yes since #132, `Caches::stale` |
-
-What stays in `handle_query`: whether synthesis is allowed (CD), the
-metric, `build_response`, `finish_dns64`, the prefetch offer and the
-stale-first/resolve fallback. Three arms build the same reply from (rcode,
-answers, authority, secure); the answer arm adds `refresh`.
-
-Found triaging: #134's shape in the wildcard arm too. Probed: a Secure
-wildcard answer for `x.w.example.test.` (`SignedZone`), then a Secure A
-192.0.2.99 for `y.w` through `Caches::store`: `synthesize_wildcard(y)`
-returns the wildcard's 192.0.2.7, and `handle_query` asks it first. Added
-to #134.
-
-Remedy: `Caches::lookup(name, qtype, synthesize, prefetching)` returning
-one enum over the four holdings, the order moved in verbatim, and one hit
-arm in `handle_query`. Behaviour-preserving, so the existing arm tests
-(#127's hit count among them) must pass unchanged. Lands before #134, whose
-fix is then one function. Not built.
-
 ### 130. `answer_update` decides and replies in one pass, so its test surface is a TCP server — **filed 2026-09-27**, **needs-triage**
 
 `answer_update` (`rdnsd/src/dispatch.rs:1180-1441`) has 13 exits through
@@ -6918,6 +6861,8 @@ BIND does here was not checked. No remedy named.
 **Two instances, not one** (found triaging #129): the wildcard arm
 (`answer.rs:301`) serves a cached wildcard synthesis over a newer answer
 held for the name itself. Same cause, same fix site. #129 goes first.
+**#129 is done**: both arms are now in `Caches::lookup`
+(`rdnsr/src/caches.rs`), and the line numbers above are from before it.
 
 ---
 
@@ -7064,6 +7009,7 @@ the week; the record is under "How the queue kept going stale" in
 | **125** | `--generate-keys` replaced a key file whose tag it collided with | **filed and closed 2026-09-26.** Checked against BIND first: `dnssec-keygen` generates again while a new key's tag, or its tag with REVOKE set, equals either tag of a key of that name and algorithm in the directory (`key_collision`, `dnssectool.c`). `SigningKey::distinct_from` does the same against the directory and the run's other key, bounded at 100 attempts; `write_to_dir` publishes by hard link and refuses an existing file. Tested over #121's stored pair, a stored REVOKE-apart pair and a same-tag pair of two algorithms; the overwrite test watched failing against the old rename, and `rdnsd`'s wiring test against dropping either list. See `docs/CLOSED_WORK.md` |
 | **126** | `--generate-keys` left a KSK with no DS when the ZSK's write failed | **filed and closed 2026-09-27.** Found reviewing #125. `write_key_pair` now removes whatever of the pair reached the directory on any write error, by `SigningKey::remove_from_dir`, which compares content rather than trusting the name: the name is the tag, and a file under it holding anything else is a colliding key. A key that cannot be removed is named in the error. |
 | **127** | a cached wildcard synthesis counted neither a hit nor a miss | **filed and closed 2026-09-27.** Found by the deepening sweep that filed #128-#130. `rdnsr`'s RFC 8198 §5.3 arm returned before `cache_hits`, where the other three arms answered from something held count one. One line; the test failed on 0 hits against the old arm. |
+| **129** | `Caches` sealed its write side and left the read order to its callers | **filed and closed 2026-09-27.** `Caches::lookup` holds the order; `handle_query` has one hit arm. Found doing it: `cached_or_resolve` asked `answers` before `negatives`, so DNS64 synthesized from an A a newer "no" had replaced. Regression test failed against the old order. See `docs/CLOSED_WORK.md` |
 | **131** | a zone with two masters was withdrawn when one of them was down | **filed and closed 2026-09-27.** Found grooming #128. EXPIRE and the startup/reload vouch read the sidecar per (zone, master); RFC 1034 §4.3.5, BIND and Knot count contact per zone. `StateFile::last_contact` over the masters configured now, so a line from a master no longer configured still vouches for nothing. Both regression tests failed against the per-master lookup. |
 | **132** | a stale lookup served an older "yes" over a newer "no" | **filed and closed 2026-09-27.** Found grooming #129. `Caches::stale` serves the later of the two by `learned_at` (RFC 8767 §4), deciding at read time because an NXDOMAIN is keyed by name and retiring on store would scan the answer cache. Covers other types at the name. Stale NXDOMAIN kept (RFC 8914 §4.20). Both regression tests failed with the "yes" asked first. |
 | **133** | the fresh path could serve an older "no" over a newer "yes" | **filed and closed 2026-09-27.** Found closing #132. `Caches::store` has an answer retire the NODATA for its question and the NXDOMAIN at its name and every ancestor (`NegativeCache::forget_refuted`), so asking `negatives` first is right by construction; one removal per label, no scan. The read side was not built. Both regression tests failed without the call. The denial cache has the same shape: #134. |

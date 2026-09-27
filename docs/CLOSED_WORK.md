@@ -11144,6 +11144,84 @@ touched is cfg-gated.
 
 ---
 
+### 129. `rdnsr`'s `Caches` seals the write side and forwards the read side — **filed 2026-09-27, closed 2026-09-27**
+
+#117 made `Caches::store` the one writer, so a writer that forgets a cache
+does not compile. The read side got no equivalent. Six of `Caches`'s ten
+methods are one-line forwards (`rdnsr/src/caches.rs:103-148`: `answer`,
+`negative`, `synthesize_wildcard`, `synthesize_denial`, `stale_answer`,
+`stale_negative`). The *order* they are asked in lives in `handle_query`
+(`rdnsr/src/answer.rs:301-334`: wildcard, denial, negative, answer) and in
+`stale_answer` (`:787-796`: "a yes before a no"). A mechanical scan of every
+crate's `pub` functions for one-line forwarding bodies puts `caches.rs`
+highest after `rdns::error`'s constructors. Everything else it flags is an
+accessor.
+
+What the forwarding cost: #127, a fourth "answered from something held" arm
+that does not count as one. Each arm spells its own metric, response build
+and `finish_dns64` call.
+
+What must stay in `handle_query`, and would refute a naive move: the CD gate
+(`:300`, `:310`) is the client's request and not the cache's knowledge; the
+DNS64 finish and the prefetch offer are answer-path. Which of the four
+orderings belong to the cache and which to the answer path has to be read
+arm by arm before anything moves. No remedy named.
+
+**Groomed 2026-09-27.** The ordering the row points at hid a defect, now
+#132: `stale_answer`'s "a yes before a no" serves an expired positive answer
+over a *newer* expired NXDOMAIN, because `store` never retires the other
+cache's entry for the same question. The row's claim stands and is
+stronger: the read-side order is where #127 and #132 both lived. **Since
+#132**, `Caches::stale` replaces `stale_answer` and `stale_negative` with the
+decision between them, so four of the forwards are left.
+
+**Triaged 2026-09-27.** Read the four fresh-path arms (`answer.rs:301-335`):
+
+| arm | who owns the order | right today? |
+|---|---|---|
+| wildcard synthesis | the cache: which of it and a held answer is newer | no, served over a newer answer (below) |
+| denial synthesis | the cache | no, #134 |
+| negative before answer | the cache: `store`'s #133 comment relies on `answer.rs` asking `negatives` first | yes, but the invariant lives in two files |
+| stale | the cache | yes since #132, `Caches::stale` |
+
+What stays in `handle_query`: whether synthesis is allowed (CD), the
+metric, `build_response`, `finish_dns64`, the prefetch offer and the
+stale-first/resolve fallback. Three arms build the same reply from (rcode,
+answers, authority, secure); the answer arm adds `refresh`.
+
+Found triaging: #134's shape in the wildcard arm too. Probed: a Secure
+wildcard answer for `x.w.example.test.` (`SignedZone`), then a Secure A
+192.0.2.99 for `y.w` through `Caches::store`: `synthesize_wildcard(y)`
+returns the wildcard's 192.0.2.7, and `handle_query` asks it first. Added
+to #134.
+
+Remedy: `Caches::lookup(name, qtype, synthesize, prefetching)` returning
+one enum over the four holdings, the order moved in verbatim, and one hit
+arm in `handle_query`. Behaviour-preserving, so the existing arm tests
+(#127's hit count among them) must pass unchanged. Lands before #134, whose
+fix is then one function. Not built.
+
+**Done.** `Caches::lookup(name, qtype, synthesize, prefetching)` returns
+`Held::Answer(Cached)` or `Held::Reply { rcode, answers, authority, secure }`,
+with the order moved in verbatim and each arm's reason beside it.
+`handle_query` has one hit arm; CD arrives as `synthesize`. The four
+forwards are `#[cfg(test)]`, kept for #117's test of which caches `store`
+reached, which `lookup` cannot tell apart.
+
+**A second reader, missed by the triage above** (§18): `cached_or_resolve`,
+DNS64's A lookup (`answer.rs:665`), which the triage's `grep` did not match
+because the call is split across lines. It asked `answers` before
+`negatives`, the reverse of `handle_query`, so a prefetch storing a "no" for
+the A left the older A to synthesize from: #132's shape on a fresh path #132
+did not count. It now goes through `lookup` with `synthesize` false.
+`a_newer_no_for_the_a_is_not_synthesized_over` failed against the old order
+(64:ff9b::c000:221 in the reply) and passes now; no other test changed.
+
+1 355 passed on Windows and 1 376 on Linux, 0 failed; clippy clean on both,
+`cargo doc` and `cargo fmt --check` clean.
+
+---
+
 ### 131. A zone with two masters is withdrawn when one of them is down — **filed 2026-09-27, closed 2026-09-27**, **bug**
 
 Found grooming #128. `--secondary` may be repeated "for more masters of one
@@ -11367,6 +11445,10 @@ question. That fixes all three readers (`handle_query`, `cached_or_resolve`,
 the stale path) in one place, where the read side would have needed a
 comparison at each. **The read side was not built**, against §19: the
 reason is that one-place argument, and it is not a measurement.
+
+**Corrected by #129:** not all three. `cached_or_resolve` asked `answers`
+first, so it never had this defect and had the reverse one: an older "yes"
+served over a newer "no", #132's shape on a path #132 did not count.
 
 No trust check of the kind BIND's `add` makes: with validation on, an
 answer that contradicts a signed denial and does not itself validate is

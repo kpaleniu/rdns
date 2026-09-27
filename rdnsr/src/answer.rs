@@ -30,7 +30,7 @@ use rdns::{
 };
 use rdns_transport::ServeContext;
 
-use crate::caches::{Caches, Stale};
+use crate::caches::{Caches, Held, Stale};
 use crate::prefetch::{Refresh, Refreshes, Why};
 use crate::reload::PolicyReload;
 
@@ -288,51 +288,32 @@ pub(crate) async fn handle_query(
         }
     }
 
-    // Aggressive use of the validated denial cache (RFC 8198). A cached NSEC
-    // answers every question in its gap, so it goes before the answer cache: a
-    // flood of random names under one zone costs one upstream query, not one per
-    // name. Skipped for CD, which asks us not to filter on the client's behalf.
-    //
-    // The positive half (§5.3) first: a validated wildcard answer is a signed
-    // statement about every name the wildcard reaches. The two are mutually
-    // exclusive — a cached NXDOMAIN needs the wildcard *denied* — so trying the
-    // more specific one first costs nothing.
-    if !checking_disabled {
-        if let Some(wildcard) = caches.synthesize_wildcard(query.qname.as_ref(), query.qtype) {
-            ctx.metrics.count(&ctx.metrics.cache_hits);
-            let mut resp = build_response(&msg, wildcard.answers, ResponseCode::Ok);
-            resp.authorities = wildcard.authority;
-            // A wildcard signature verifies at this name unchanged, so the
-            // client can check this for itself.
-            return finish_dns64(resp, true, None, &client, &query, serving, timer).await;
-        }
-    }
-
-    if !checking_disabled {
-        if let Some(denial) = caches.synthesize_denial(query.qname.as_ref(), query.qtype) {
-            ctx.metrics.count(&ctx.metrics.cache_hits);
-            let mut resp = build_response(&msg, Vec::new(), denial.rcode);
-            resp.authorities = denial.authority;
-            // The proofs were validated before storage, so what is derived
-            // from them is authentic on the same terms.
-            return finish_dns64(resp, true, None, &client, &query, serving, timer).await;
-        }
-    }
-
-    // A cached "no" (RFC 2308), separate from the answer cache only because
-    // there are no records to key on. Nothing is synthesized — this is the
-    // answer this question got — so a CD client may have it too.
-    if let Some(negative) = caches.negative(query.qname.as_ref(), query.qtype) {
-        ctx.metrics.count(&ctx.metrics.cache_hits);
-        let mut resp = build_response(&msg, Vec::new(), negative.rcode);
-        resp.authorities = negative.authority;
-        return finish_dns64(resp, negative.secure, None, &client, &query, serving, timer).await;
-    }
-
     // Build the response: from cache if we have it, else by resolving. The
     // third is RFC 8914's reason, which only the two failing arms have.
+    //
+    // RFC 8198 synthesis is skipped for CD, which asks us not to filter on the
+    // client's behalf.
     let prefetching = refreshes.as_ref().is_some_and(Refreshes::prefetching);
-    let hit = caches.answer(query.qname.as_ref(), query.qtype, prefetching);
+    let hit = match caches.lookup(
+        query.qname.as_ref(),
+        query.qtype,
+        !checking_disabled,
+        prefetching,
+    ) {
+        Some(Held::Answer(hit)) => Some(hit),
+        Some(Held::Reply {
+            rcode,
+            answers,
+            authority,
+            secure,
+        }) => {
+            ctx.metrics.count(&ctx.metrics.cache_hits);
+            let mut resp = build_response(&msg, answers, rcode);
+            resp.authorities = authority;
+            return finish_dns64(resp, secure, None, &client, &query, serving, timer).await;
+        }
+        None => None,
+    };
     // The cache said this entry is in the last tenth of its TTL and nobody has
     // been asked to refresh it yet. Offered here, at the lookup, so no exit
     // below can drop it (`TODO.md` #78a, #102), and to a queue, so nothing
@@ -677,24 +658,22 @@ async fn resolve_and_store(
 /// Not the denial cache: it saves at most one upstream query per AAAA, and the
 /// query path skips it under CD, so this would need the bit passed in to agree
 /// (`TODO.md` #117).
+///
+/// [`Caches::lookup`] rather than the caches one at a time: asked "yes" first,
+/// this synthesized from an A that a newer "no" had replaced
+/// (`TODO.md` #129).
 async fn cached_or_resolve(
     serving: &Resolving,
     query: &QuerySection,
 ) -> Option<Vec<ResourceRecord>> {
-    if let Some(hit) = serving
+    match serving
         .caches
-        .answer(query.qname.as_ref(), query.qtype, false)
+        .lookup(query.qname.as_ref(), query.qtype, false, false)
     {
-        return Some(hit.records);
+        Some(Held::Answer(hit)) => Some(hit.records),
+        Some(Held::Reply { .. }) => None,
+        None => resolve_and_store(serving, query).await,
     }
-    if serving
-        .caches
-        .negative(query.qname.as_ref(), query.qtype)
-        .is_some()
-    {
-        return None;
-    }
-    resolve_and_store(serving, query).await
 }
 
 /// Re-resolve a name into the cache (Unbound's `prefetch`). Run by
@@ -2777,6 +2756,33 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+    }
+
+    /// A newer "no" for the A outranks the older A still held, as it does for a
+    /// client's A query: both caches can hold the question, because a prefetch
+    /// finding the A gone stores the "no" without retiring the "yes"
+    /// (`TODO.md` #129).
+    #[tokio::test]
+    async fn a_newer_no_for_the_a_is_not_synthesized_over() {
+        let serving = with_dns64();
+        let name = nm("gone.example.com.");
+        nodata_aaaa_with_an_a(&serving, &name);
+        let mut nodata = DnsMessage::try_from_bytes(&message(OpCode::Query, true)).expect("parses");
+        nodata.answers.clear();
+        nodata.authorities = vec![soa("example.com.")];
+        serving.caches.store(
+            &QuerySection {
+                qname: name.clone(),
+                qtype: Qtype::of(record_types::A),
+                qclass: rdns::QueryClass::IN,
+            },
+            &nodata,
+            &ValidationState::Insecure,
+        );
+
+        let reply = aaaa_reply(&serving, "gone.example.com.", false, false).await;
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert!(reply.answers.is_empty(), "{:?}", reply.answers);
     }
 
     /// §5.1.2: a name that does not exist has no A to build from either, so
