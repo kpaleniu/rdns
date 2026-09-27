@@ -37,10 +37,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21 and #128-#130**, as of 2026-09-27.
+**#21 and #128-#132**, as of 2026-09-27.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
 defect (#127, closed the same day) and three places where a module's
-interface is its callers' problem. Checked and not filed: the transfer ladder (#130 says why), the
+interface is its callers' problem. Grooming those three found #131 and
+#132, both bugs. Checked and not filed: the transfer ladder (#130 says why), the
 `[server]` keys (#63h's macro), the two UDP loops (#30), the reload seam
 (#83, #112).
 #58, #68 and #107-#127 are closed. #117-#119 came out of a fourth
@@ -6797,6 +6798,12 @@ No remedy named. The candidate a build would test is one cycle in
 says build it against the alternative of paused-time tests on each loop as
 it stands, and compare.
 
+**Groomed 2026-09-27.** The table's "last contact" row hid a defect, now
+#131: `rdnsd` keys contact by (zone, master), so with two masters one dead
+master withdraws a zone the other keeps current. `rdnsr` has one master per
+feed and is not affected. A shared cycle would have to choose the contact
+key, so #131 goes first.
+
 ### 129. `rdnsr`'s `Caches` seals the write side and forwards the read side — **filed 2026-09-27**, **needs-triage**
 
 #117 made `Caches::store` the one writer, so a writer that forgets a cache
@@ -6819,6 +6826,12 @@ What must stay in `handle_query`, and would refute a naive move: the CD gate
 DNS64 finish and the prefetch offer are answer-path. Which of the four
 orderings belong to the cache and which to the answer path has to be read
 arm by arm before anything moves. No remedy named.
+
+**Groomed 2026-09-27.** The ordering the row points at hid a defect, now
+#132: `stale_answer`'s "a yes before a no" serves an expired positive answer
+over a *newer* expired NXDOMAIN, because `store` never retires the other
+cache's entry for the same question. The row's claim stands and is
+stronger: the read-side order is where #127 and #132 both lived.
 
 ### 130. `answer_update` decides and replies in one pass, so its test surface is a TCP server — **filed 2026-09-27**, **needs-triage**
 
@@ -6844,6 +6857,100 @@ not included. And the one exit #119 left untested, the `spawn_blocking`
 What is left is the order and the rcode/EDE mapping as a table a test can
 enumerate. Whether that earns a type between `update::parse` and the file
 write is the open question; no remedy named.
+
+**Groomed 2026-09-27, nothing hidden.** The order in the code is #118's
+(zone, permission, then the rest). The replicated-zone REFUSED is a recorded
+deviation (#118 item 4: RFC 2136 §3.1.1 forwards, BIND and PowerDNS do).
+
+### 131. A zone with two masters is withdrawn when one of them is down — **filed 2026-09-27**, **bug**, **needs-triage**
+
+Found grooming #128. `--secondary` may be repeated "for more masters of one
+zone" (How to run), and a catalog group may name several masters
+(`rdnsd/src/catalog.rs:759-761`). Each (zone, master) gets its own refresh
+task. Both decisions that withdraw a zone read the sidecar for *that task's
+master only*: `StateFile::get(zone, master)`, at
+`rdnsd/src/replication.rs:601` (`expire_if_out_of_contact`) and `:671`
+(`withdraw_unvouched_zones`).
+
+Measured with a probe test, masters A (never answered) and B (answered 60 s
+ago), zone held:
+
+- A's `expire_if_out_of_contact`, EXPIRE counted from a start older than
+  EXPIRE: zone withdrawn.
+- `withdraw_unvouched_zones(&[A, B])`: zone withdrawn, because A has no line.
+
+In a running server that is a zone out of service from each of A's RETRYs
+until B's next REFRESH reinstalls it, and withdrawn on every SIGHUP (the
+reload path calls the second check). Five production callers inherit it:
+`main.rs:2066` (startup), `:1380` (reload), `catalog.rs:429`, `:786`, and the
+refresh loop at `replication.rs:433`.
+
+RFC 1034 §4.3.5 discards a zone when "the secondary finds it impossible to
+perform a serial check for the EXPIRE interval". Here the check against B
+succeeded. Both implementations read keep one expiry per *zone*, extended
+by whichever primary answers:
+
+- BIND, `lib/dns/zone.c` `refresh_callback`: on an equal serial from any
+  primary, "Compute the new expire time based on this response … Has the
+  expire time improved?" and `zone->expiretime = expiretime`, then
+  `goto next_primary`. The expiry check (`zone_maintenance`) compares `now`
+  against that one field.
+- Knot, `src/knot/events/handlers/refresh.c`: `event_refresh` is per zone
+  and calls `zone_master_try(conf, zone, try_refresh, &trctx, "refresh")`,
+  which tries the masters in turn; a success sets
+  `zone->timers->next_expire = now + data->expire_timer` in
+  `finalize_timers_base`.
+
+What a fix must keep, and would refute a naive one: `:654` treats "an entry
+for another master" as unvouched on purpose, for a zone whose configured
+master *changed*. The distinction is between masters currently configured
+for the zone and masters that no longer are. Neither BIND nor Knot draws
+it: both key the timer by zone alone, so a changed primary list inherits
+the old one's expiry. Whether that rule is stricter than it needs to be is
+part of the remedy, not a given. No remedy named.
+
+### 132. A stale lookup serves an older "yes" over a newer "no" — **filed 2026-09-27**, **bug**, **needs-triage**
+
+Found grooming #129. `Caches::store` (`rdnsr/src/caches.rs:65`) puts a
+positive answer in `answers` and a negative one in `negatives`, and never
+retires the other cache's entry for the same question. While both are fresh
+this is harmless: `handle_query` asks `negatives` first. Once both have
+expired, `stale_answer` (`rdnsr/src/answer.rs:786-797`) asks `answers`
+first, under the comment "A 'yes' before a 'no': both may be held for one
+name, and the answer is the more specific thing known about it". That
+reasons about specificity, not age.
+
+Measured with a probe test, `--serve-stale` 3600: an A record with TTL 300
+cached at t, expired at t+301, an NXDOMAIN (negative TTL 60) stored at
+t+301, both expired at t+362. `stale_answer` and `stale_negative` both
+return `Some`, so the stale path answers with the address from t that the
+name's authority denied at t+301. The takedown of a malicious domain is the
+case where that matters.
+
+None of the three read can hold both for one question:
+
+- BIND, `lib/dns/qpcache.c` `add`: a negative entry covering all types
+  (NXDOMAIN) makes it "Delete all other data so that the only rdataset that
+  can be found at this node is the negative cache entry", unless the
+  existing data is secure and the negative is not. The reverse: "There's
+  an existing NXDOMAIN or negative covered type in the cache. If it's more
+  trusted than the new data, keep it, but if not, purge and replace it."
+  Separately, `STALE_TTL` is `NXDOMAIN(header) ? 0 : serve_stale_ttl`, so
+  BIND serves no stale NXDOMAIN at all, where `rdnsr` does
+  (`STALE_NXDOMAIN`).
+- Unbound, `services/cache/dns.c` `dns_cache_store_msg`: one message per
+  question, keyed by `query_info_hash`, stored by `slabhash_insert`, whose
+  `lruhash_insert` on an existing key does "if so: update data". The
+  comment beside it lists "NXDOMAIN", "NODATA" and "an older record" as
+  what that one slot may hold.
+- Knot Resolver, `lib/cache/entry_pkt.c` `stash_pkt`: a negative packet is
+  stored under `key_exact_type_maypkt(k, pkt_type)`, the same key
+  `key_exact_type` gives that type's RRset. Whether it displaces an
+  existing entry is `entry_h_splice`'s rank rule, which was not read.
+
+So the newest thing learned about a question is the only thing held, in
+all three. No remedy named; BIND's no-stale-NXDOMAIN is a second question
+the remedy should answer rather than copy.
 
 ---
 
