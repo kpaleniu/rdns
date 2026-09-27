@@ -6806,7 +6806,7 @@ feed and is not affected. A shared cycle would have to choose the contact
 key, so #131 goes first. **It went, and chose per zone** over the masters
 configured now (`StateFile::last_contact`).
 
-### 129. `rdnsr`'s `Caches` seals the write side and forwards the read side — **filed 2026-09-27**, **needs-triage**
+### 129. `rdnsr`'s `Caches` seals the write side and forwards the read side — **filed 2026-09-27**, **ready-for-agent**
 
 #117 made `Caches::store` the one writer, so a writer that forgets a cache
 does not compile. The read side got no equivalent. Six of `Caches`'s ten
@@ -6836,6 +6836,32 @@ cache's entry for the same question. The row's claim stands and is
 stronger: the read-side order is where #127 and #132 both lived. **Since
 #132**, `Caches::stale` replaces `stale_answer` and `stale_negative` with the
 decision between them, so four of the forwards are left.
+
+**Triaged 2026-09-27.** Read the four fresh-path arms (`answer.rs:301-335`):
+
+| arm | who owns the order | right today? |
+|---|---|---|
+| wildcard synthesis | the cache: which of it and a held answer is newer | no, served over a newer answer (below) |
+| denial synthesis | the cache | no, #134 |
+| negative before answer | the cache: `store`'s #133 comment relies on `answer.rs` asking `negatives` first | yes, but the invariant lives in two files |
+| stale | the cache | yes since #132, `Caches::stale` |
+
+What stays in `handle_query`: whether synthesis is allowed (CD), the
+metric, `build_response`, `finish_dns64`, the prefetch offer and the
+stale-first/resolve fallback. Three arms build the same reply from (rcode,
+answers, authority, secure); the answer arm adds `refresh`.
+
+Found triaging: #134's shape in the wildcard arm too. Probed: a Secure
+wildcard answer for `x.w.example.test.` (`SignedZone`), then a Secure A
+192.0.2.99 for `y.w` through `Caches::store`: `synthesize_wildcard(y)`
+returns the wildcard's 192.0.2.7, and `handle_query` asks it first. Added
+to #134.
+
+Remedy: `Caches::lookup(name, qtype, synthesize, prefetching)` returning
+one enum over the four holdings, the order moved in verbatim, and one hit
+arm in `handle_query`. Behaviour-preserving, so the existing arm tests
+(#127's hit count among them) must pass unchanged. Lands before #134, whose
+fix is then one function. Not built.
 
 ### 130. `answer_update` decides and replies in one pass, so its test surface is a TCP server — **filed 2026-09-27**, **needs-triage**
 
@@ -6888,6 +6914,10 @@ NSEC3 hashing the name with the zone's salt and iterations first
 record also takes away every other name in its gap, which the answer does
 not refute. The read-side alternative needs `learned_at` on the proofs. What
 BIND does here was not checked. No remedy named.
+
+**Two instances, not one** (found triaging #129): the wildcard arm
+(`answer.rs:301`) serves a cached wildcard synthesis over a newer answer
+held for the name itself. Same cause, same fix site. #129 goes first.
 
 ---
 
