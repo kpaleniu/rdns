@@ -84,6 +84,11 @@ impl Caches {
         if !response.answers.is_empty() {
             self.answers
                 .put_validated(name, qtype, response.answers.clone(), secure);
+            // The lookups ask `negatives` first, so an older "no" left there
+            // outranks this until it expires (`TODO.md` #133). No trust check,
+            // as BIND's has: an answer contradicting a signed denial that does
+            // not itself validate is bogus, and returned above.
+            self.negatives.forget_refuted(name, qtype);
         }
         // A "no" is an answer; re-resolving it makes a typo storm cost one
         // upstream walk per repeat. The SOA in the authority section says how

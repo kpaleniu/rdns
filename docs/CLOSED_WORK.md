@@ -11302,3 +11302,92 @@ both ways, as a control should.
 cfg-gated.
 
 ---
+
+### 133. The fresh path can serve an older "no" over a newer "yes" — **filed 2026-09-27, closed 2026-09-27**, **bug**
+
+Found closing #132, which fixed the stale path only. `handle_query` asks
+`negatives` before `answers` (`rdnsr/src/answer.rs:325`, `:335`), so with
+both fresh the "no" answers whichever is newer. The query path cannot store
+a "yes" under a fresh NXDOMAIN, because the NXDOMAIN answers first. A
+prefetch or stale refresh queued *before* the NXDOMAIN arrived can: an A
+refresh in flight while an AAAA query learns NXDOMAIN, or while the name is
+re-created. The older "no" then answers until its negative TTL runs out, at
+most `MAX_NEGATIVE_TTL` (3 600 s).
+
+~~Not probed: this is read from the code, not provoked.~~ **Probed, groomed
+2026-09-27.** An NXDOMAIN stored for AAAA at t, then a positive A stored at
+t+5 through `Caches::store` (what the refresh calls), then an A query
+through `handle_query` at t+6: NXDOMAIN, 0 answers. After the negative TTL
+(60 s here), the same query gets the address.
+
+What can store the newer "yes", read in all three writers:
+
+- The query path (`answer.rs:437`) cannot: `negatives` answers first.
+- DNS64 and its reverse mapping go through `cached_or_resolve` (`:578`,
+  `:622`), which asks `negatives` before resolving, so they cannot either.
+- `refresh` (`:713`), the prefetch and stale-refresh worker, goes straight
+  to `resolve_and_store` with no cache check. It is the only writer that
+  can, and only for a question queued before the "no" arrived.
+
+And the upstream has to say "yes" *after* saying "no". If the name is really
+gone, the refresh stores another NXDOMAIN and nothing is wrong. So the case
+is a name re-created within the window, or authoritative servers that
+disagree mid-update.
+
+Wider than one question, read from the code and not probed:
+`NegativeCache::get` walks the ancestors (RFC 8020), so an NXDOMAIN at a
+parent hides a newer answer at any name below it. NODATA has the same shape
+per (name, type).
+
+What the implementations read for #132 do: BIND's `add` has a positive
+answer purge a negative entry that is not more trusted ("If it's more
+trusted than the new data, keep it, but if not, purge and replace it").
+Unbound and Knot Resolver overwrite the one entry per question. In all
+three the newer "yes" wins for the same question. The ancestor case was not
+checked in any of them.
+
+Two candidate shapes, neither built (§19):
+
+- Read side, as #132: compare `learned_at` on the fresh path too. That
+  costs an answer-cache probe on every negative hit, and the order is
+  `handle_query`'s, which is #129's subject.
+- Store side: a positive answer retires `nodata` for its question and
+  `nxdomain` at its name and every ancestor. That is one removal per label,
+  not #132's scan of the answer cache, because it runs from the name being
+  stored and not from the name being denied.
+
+No remedy chosen.
+
+**Done, store side**: `NegativeCache::forget_refuted(name, qtype)` removes
+the NODATA for the question and the NXDOMAIN at the name and every
+ancestor, and `Caches::store` calls it whenever it stores an answer. With
+older denials retired as answers arrive, asking `negatives` first is right
+by construction: whatever is still there is newer than any answer to that
+question. That fixes all three readers (`handle_query`, `cached_or_resolve`,
+the stale path) in one place, where the read side would have needed a
+comparison at each. **The read side was not built**, against §19: the
+reason is that one-place argument, and it is not a measurement.
+
+No trust check of the kind BIND's `add` makes: with validation on, an
+answer that contradicts a signed denial and does not itself validate is
+bogus, and `store` returns before storing it.
+
+Tests: `an_answer_retires_the_denials_it_refutes` in `rdns` (the question's
+NODATA and the NXDOMAIN at an ancestor go; the NODATA for another type and a
+sibling's NXDOMAIN stay), and through `handle_query`
+`a_fresh_address_stored_after_a_denial_is_the_answer`,
+`a_fresh_address_below_a_denied_name_is_the_answer`, and the control
+`a_fresh_denial_stored_after_an_address_is_the_answer`. The first two failed
+without the call (NXDOMAIN where NOERROR was expected); the control passed
+both ways.
+
+**Counted before closing** (§18): the shape has one more instance, the RFC
+8198 denial cache, which `handle_query` asks before `negatives`. Probed: a
+validated NXDOMAIN for `a.example.test.` whose NSEC covers `b`, then a
+Secure answer for `b` stored as a refresh would, then a query for `b`:
+NXDOMAIN, 0 answers. Filed as #134.
+
+1 354 passed on Windows, 0 failed; clippy, `cargo doc` and `cargo fmt
+--check` clean. Linux not run: none of the files touched is cfg-gated.
+
+---

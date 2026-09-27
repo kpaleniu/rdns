@@ -1967,6 +1967,75 @@ mod tests {
         assert_eq!(stale_errors(&reply)[0].0, InfoCode::STALE_ANSWER);
     }
 
+    /// An address for `name`, stored the way a refresh stores it.
+    fn store_address(caches: &Caches, name: &rdns::Name) {
+        let mut found = DnsMessage::try_from_bytes(&message(OpCode::Query, true)).expect("parses");
+        found.answers = vec![a_record(name, 300)];
+        let question = QuerySection {
+            qname: name.clone(),
+            qtype: Qtype::of(record_types::A),
+            qclass: rdns::QueryClass::IN,
+        };
+        caches.store(&question, &found, &ValidationState::Insecure);
+    }
+
+    /// Fresh, a "yes" stored after a "no" answers. The query path never stores
+    /// one under a fresh "no", but a refresh queued before the "no" arrived
+    /// does (`TODO.md` #133). Watched failing without the retiring in
+    /// `Caches::store`: NXDOMAIN for the negative TTL.
+    #[tokio::test]
+    async fn a_fresh_address_stored_after_a_denial_is_the_answer() {
+        let (resolver, _upstream) = silent_resolver();
+        let (serving, clock, _queue) = stale_first(resolver);
+        let name = nm("back.example.com.");
+        let a = Qtype::of(record_types::A);
+        store_nxdomain(&serving.caches, &name, Qtype::of(record_types::AAAA));
+        clock.advance(5);
+        store_address(&serving.caches, &name);
+        clock.advance(1);
+
+        let reply = asked_at_once(&serving, &name, a).await;
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers.len(), 1);
+    }
+
+    /// And the NXDOMAIN of an ancestor, which denies every name below it
+    /// (RFC 8020) until a name below it turns out to exist. Watched failing
+    /// as above.
+    #[tokio::test]
+    async fn a_fresh_address_below_a_denied_name_is_the_answer() {
+        let (resolver, _upstream) = silent_resolver();
+        let (serving, clock, _queue) = stale_first(resolver);
+        let parent = nm("back.example.com.");
+        let name = nm("host.back.example.com.");
+        store_nxdomain(&serving.caches, &parent, Qtype::of(record_types::A));
+        clock.advance(5);
+        store_address(&serving.caches, &name);
+        clock.advance(1);
+
+        let reply = asked_at_once(&serving, &name, Qtype::of(record_types::A)).await;
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers.len(), 1);
+    }
+
+    /// The control: a "no" learned after the "yes" still answers, fresh as
+    /// stale. What the store retires is older, never newer.
+    #[tokio::test]
+    async fn a_fresh_denial_stored_after_an_address_is_the_answer() {
+        let (resolver, _upstream) = silent_resolver();
+        let (serving, clock, _queue) = stale_first(resolver);
+        let name = nm("gone.example.com.");
+        let a = Qtype::of(record_types::A);
+        store_address(&serving.caches, &name);
+        clock.advance(5);
+        store_nxdomain(&serving.caches, &name, Qtype::of(record_types::AAAA));
+        clock.advance(1);
+
+        let reply = asked_at_once(&serving, &name, a).await;
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
+        assert!(reply.answers.is_empty());
+    }
+
     /// The negative half: an expired NXDOMAIN is answered first too, with
     /// RFC 8914's code for a stale NXDOMAIN and the same text.
     #[tokio::test]

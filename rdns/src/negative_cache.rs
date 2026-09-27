@@ -288,6 +288,34 @@ impl NegativeCache {
             .map(|entry| entry.stale_answer(now, refreshing))
     }
 
+    /// Forget what an answer for this question has just proved wrong: the
+    /// NODATA for it, and an NXDOMAIN at the name or any ancestor, since a name
+    /// with data exists and so do the names above it (RFC 8020 reads the
+    /// ancestors the same way).
+    ///
+    /// For the answer's writer to call as it stores. [`NegativeCache::get`]
+    /// is asked before the answer cache, so a "no" left here would go on
+    /// answering over the newer "yes" until its TTL ran out (`TODO.md` #133).
+    /// Retired rather than compared at every reader, and cheap in this
+    /// direction: one probe per label of the name being stored.
+    pub fn forget_refuted(&self, qname: NameRef<'_>, qtype: Qtype) {
+        let mut fold_buf = Vec::new();
+        let name = qname.folded_in(&mut fold_buf);
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let key: &dyn NameType = &(name.as_wire(), qtype);
+        entries.nodata.remove(key);
+        let mut ancestor = name;
+        loop {
+            entries.nxdomain.remove(ancestor.as_wire());
+            match ancestor.parent() {
+                Some(up) => ancestor = up,
+                None => break,
+            }
+        }
+    }
+
     /// How many negative answers are held. For tests and diagnostics.
     pub fn len(&self) -> usize {
         self.entries.lock().map(|e| e.len()).unwrap_or(0)
@@ -673,6 +701,56 @@ mod tests {
         assert!(cache
             .get(nm("sub.www.example.com.").as_ref(), Qtype::of(rt::AAAA))
             .is_none());
+    }
+
+    /// An answer for a question retires what it refutes and nothing else
+    /// (`TODO.md` #133).
+    #[test]
+    fn an_answer_retires_the_denials_it_refutes() {
+        let cache = NegativeCache::new(16);
+        let (a, aaaa) = (Qtype::of(rt::A), Qtype::of(rt::AAAA));
+        let nodata = |name: &str| {
+            negative(
+                name,
+                ResponseCode::Ok,
+                vec![soa_record("example.com.", 300, Ttl::from_secs(3600))],
+            )
+        };
+        let www = nm("www.example.com.");
+        cache.insert(www.as_ref(), a, &nodata("www.example.com."), false);
+        cache.insert(www.as_ref(), aaaa, &nodata("www.example.com."), false);
+        cache.insert(
+            nm("gone.example.com.").as_ref(),
+            a,
+            &nxdomain_for("gone.example.com."),
+            false,
+        );
+        cache.insert(
+            nm("beside.example.com.").as_ref(),
+            a,
+            &nxdomain_for("beside.example.com."),
+            false,
+        );
+
+        cache.forget_refuted(www.as_ref(), a);
+        assert!(
+            cache.get(www.as_ref(), a).is_none(),
+            "the NODATA it answers"
+        );
+        assert!(
+            cache.get(www.as_ref(), aaaa).is_some(),
+            "another type is still absent"
+        );
+
+        // A name below an NXDOMAIN exists, so the NXDOMAIN above it goes.
+        let below = nm("host.gone.example.com.");
+        cache.forget_refuted(below.as_ref(), a);
+        assert!(cache.get(below.as_ref(), a).is_none());
+        assert!(cache.get(nm("gone.example.com.").as_ref(), aaaa).is_none());
+        assert!(
+            cache.get(nm("beside.example.com.").as_ref(), a).is_some(),
+            "a sibling's NXDOMAIN is not refuted"
+        );
     }
 
     /// RFC 2308 §5: the negative TTL is the lesser of the SOA's MINIMUM and the
