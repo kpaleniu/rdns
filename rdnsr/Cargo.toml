@@ -21,3 +21,8 @@ toml = "1.1.4"
 serde = { version = "1.0.229", features = ["derive"] }
 # No `tracing-subscriber`: `rdns_transport::logging::init` installs the
 # subscriber and this binary never names the crate (`TODO.md` #30n, #85).
+
+[dev-dependencies]
+# `tokio::time::pause`, so a refresh task's RETRY — minutes at the floor — can
+# be waited out in a test (`TODO.md` #135). A feature, not a package.
+tokio = { workspace = true, features = ["test-util"] }

@@ -11559,3 +11559,48 @@ written beside the assertion.
 `cargo doc` and `cargo fmt --check` clean.
 
 ---
+
+### 135. A restarted `rdnsr` whose master is gone never reaches EXPIRE — **filed 2026-09-27, closed 2026-09-27**, **bug**
+
+Found triaging #128. `refresh_task` (`rdnsr/src/rpz_transfer.rs:167`)
+starts from `RefreshTimers::default()` and assigns `timers` only in the
+`Ok` arm. The default's EXPIRE is `u64::MAX` ("a zone never reached cannot
+expire: there is nothing to withdraw"), and `has_expired` is never true
+against it (`secondary.rs` asserts `!timers.has_expired(0, u64::MAX)`).
+
+But a restarted resolver does hold something: the feed's file from the last
+run, loaded and enforced before the task is spawned. With its master gone,
+every attempt fails, EXPIRE never passes, and:
+
+- `on-expire = "lift"` never lifts: the stale rules are enforced forever.
+- `on-expire = "enforce"`, the default, never WARNs, and
+  `note_zone_transfer` is never called, so the age gauge is absent rather
+  than stale. The staleness alert #57d built `enforce` on does not fire.
+
+The comment on `last_contact` says "a resolver that has never reached its
+master expires on the same clock as one that lost contact", which holds
+only when no file is held. `rdnsd` gets this right because `zone_timers` reads the zone map,
+which holds the file.
+
+Read, not run: provoking it needs #128's `Clock`, or a minute of real time
+per RETRY.
+
+Remedy: initialise `timers` from the zone in force, as `fetch_and_write`'s
+`Refresh::Current` arm already does:
+`policy.in_force().held(zone).map(PolicyZone::zone).and_then(RefreshTimers::from_zone).unwrap_or_default()`.
+The regression test fails against the default.
+
+**Closed 2026-09-27.** The remedy as written. `refresh_task` takes a `Clock`
+(the process's, from `ServeContext`) and a `Lifecycle` in place of `Stop` and
+`Busy`, which keeps it at seven arguments. `rdnsr` gains `tokio` `test-util`
+as a dev-dependency.
+
+`a_restart_with_the_master_gone_still_expires`: a feed in force, a dead
+master, paused time, the clock moved past EXPIRE; the file is removed and a
+reload asked for. Failed against `RefreshTimers::default()` ("EXPIRE passed
+and the lifted feed was not re-read"), passes with the fix.
+
+1 358 passed on Windows and 1 379 on Linux, 0 failed; clippy clean on both,
+`cargo doc` and `cargo fmt --check` clean.
+
+---

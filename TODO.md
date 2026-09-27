@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21, #128, #130 and #135**, as of 2026-09-27. Triaging #128 found #135.
+**#21, #128 and #130**, as of 2026-09-27.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
 defect (#127, closed the same day) and three places where a module's
 interface is its callers' problem. Grooming those three found #131 and
@@ -45,7 +45,7 @@ interface is its callers' problem. Grooming those three found #131 and
 and closing #133 found #134.
 Checked and not filed: the transfer ladder (#130 says why), the `[server]`
 keys (#63h's macro), the two UDP loops (#30), the reload seam (#83, #112).
-#58, #68, #107-#127, #129 and #131-#134 are closed. #117-#119 came out of a fourth
+#58, #68, #107-#127, #129 and #131-#135 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
 #123 and #124 out of verifying #122, #125 out of closing #121, and #126 out
@@ -6833,9 +6833,10 @@ both loops:
 Remedy, in order:
 
 1. #135 first, with its own regression test, so neither shape starts from
-   a known-wrong copy.
+   a known-wrong copy. **Done**, and it did `rdnsr`'s half of step 2.
 2. Thread a `Clock` into both loops. Needed by both shapes, so not part of
-   the choice.
+   the choice. `rdnsd`'s `secondary_loop` and its `expire_if_out_of_contact`
+   are left.
 3. Build both shapes (§19): (A) one cycle in `rdns::secondary`, the
    differing rows of the table plus "timers of what is held" as the
    caller's part; (B) paused-time tests on each loop as it stands. Tests,
@@ -6881,36 +6882,6 @@ write is the open question; no remedy named.
 **Groomed 2026-09-27, nothing hidden.** The order in the code is #118's
 (zone, permission, then the rest). The replicated-zone REFUSED is a recorded
 deviation (#118 item 4: RFC 2136 §3.1.1 forwards, BIND and PowerDNS do).
-
-### 135. A restarted `rdnsr` whose master is gone never reaches EXPIRE — **filed 2026-09-27**, **bug**, **ready-for-agent**
-
-Found triaging #128. `refresh_task` (`rdnsr/src/rpz_transfer.rs:167`)
-starts from `RefreshTimers::default()` and assigns `timers` only in the
-`Ok` arm. The default's EXPIRE is `u64::MAX` ("a zone never reached cannot
-expire: there is nothing to withdraw"), and `has_expired` is never true
-against it (`secondary.rs` asserts `!timers.has_expired(0, u64::MAX)`).
-
-But a restarted resolver does hold something: the feed's file from the last
-run, loaded and enforced before the task is spawned. With its master gone,
-every attempt fails, EXPIRE never passes, and:
-
-- `on-expire = "lift"` never lifts: the stale rules are enforced forever.
-- `on-expire = "enforce"`, the default, never WARNs, and
-  `note_zone_transfer` is never called, so the age gauge is absent rather
-  than stale. The staleness alert #57d built `enforce` on does not fire.
-
-The comment on `last_contact` says "a resolver that has never reached its
-master expires on the same clock as one that lost contact", which holds
-only when no file is held. `rdnsd` gets this right because `zone_timers` reads the zone map,
-which holds the file.
-
-Read, not run: provoking it needs #128's `Clock`, or a minute of real time
-per RETRY.
-
-Remedy: initialise `timers` from the zone in force, as `fetch_and_write`'s
-`Refresh::Current` arm already does:
-`policy.in_force().held(zone).map(PolicyZone::zone).and_then(RefreshTimers::from_zone).unwrap_or_default()`.
-The regression test fails against the default.
 
 ---
 
@@ -7062,6 +7033,7 @@ the week; the record is under "How the queue kept going stale" in
 | **132** | a stale lookup served an older "yes" over a newer "no" | **filed and closed 2026-09-27.** Found grooming #129. `Caches::stale` serves the later of the two by `learned_at` (RFC 8767 §4), deciding at read time because an NXDOMAIN is keyed by name and retiring on store would scan the answer cache. Covers other types at the name. Stale NXDOMAIN kept (RFC 8914 §4.20). Both regression tests failed with the "yes" asked first. |
 | **133** | the fresh path could serve an older "no" over a newer "yes" | **filed and closed 2026-09-27.** Found closing #132. `Caches::store` has an answer retire the NODATA for its question and the NXDOMAIN at its name and every ancestor (`NegativeCache::forget_refuted`), so asking `negatives` first is right by construction; one removal per label, no scan. The read side was not built. Both regression tests failed without the call. The denial cache has the same shape: #134. |
 | **134** | a cached RFC 8198 gap or wildcard outranked a newer answer for the name | **filed and closed 2026-09-27.** Found closing #133; the wildcard instance found triaging #129. RFC 8198 Appendix A, Unbound, BIND and Knot Resolver ask the exact-match cache first and synthesize on a miss; `Caches::lookup` now does too. Neither store-side retiring nor `learned_at` on proofs was needed. Both regression tests failed against the old order; a cache hit went from 13 allocations to 12. See `docs/CLOSED_WORK.md` |
+| **135** | a restarted `rdnsr` whose master was gone never reached EXPIRE | **filed and closed 2026-09-27.** Found triaging #128. `refresh_task` started from `RefreshTimers::default()`, EXPIRE never, and held a feed file from the last run; it now starts from the timers of the zone in force. The regression test failed against the default. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 

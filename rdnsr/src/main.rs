@@ -1050,8 +1050,8 @@ async fn main() -> anyhow::Result<()> {
             reload.clone(),
             wake.clone(),
             ctx.metrics.clone(),
-            shutdown.stop_handle(),
-            shutdown.busy(),
+            ctx.clock.clone(),
+            shutdown.lifecycle(),
         )));
     }
 

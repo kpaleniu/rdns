@@ -68,11 +68,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rdns::clock::current_unix_timestamp;
+use rdns::clock::Clock;
 use rdns::metrics::DnsMetrics;
 use rdns::rpz::{PolicyStore, PolicyZone};
 use rdns::secondary::{MasterSpec, RefreshTimers};
-use rdns::shutdown::{Busy, Stop};
+use rdns::shutdown::Lifecycle;
 use rdns::tsig::TsigKey;
 use rdns::xfr::{self, Master};
 use rdns::zone_writer::{write_zone_text, zone_to_string};
@@ -160,16 +160,25 @@ pub(crate) async fn refresh_task(
     reload: PolicyReload,
     wake: FeedWake,
     metrics: Arc<DnsMetrics>,
-    stop: Stop,
-    busy: Busy,
+    clock: Clock,
+    lifecycle: Lifecycle,
 ) {
+    let Lifecycle { stop, busy } = lifecycle;
     let master = Master::plain(feed.spec.master);
-    let mut timers = RefreshTimers::default();
+    // The file from the last run is in force before the first transfer, and
+    // its SOA says when it expires. The default's EXPIRE is never, so a restart
+    // with the master gone enforced it forever (`TODO.md` #135).
+    let mut timers = policy
+        .in_force()
+        .held(feed.spec.zone.as_ref())
+        .map(PolicyZone::zone)
+        .and_then(RefreshTimers::from_zone)
+        .unwrap_or_default();
     // The age `on-expire` acts on, and the only one this process has: `rdnsd`'s
     // sidecar and its refresh gauge belong to the other daemon (`TODO.md`
     // #57d). Started at "now" rather than at zero, so a resolver that has never
     // reached its master expires on the same clock as one that lost contact.
-    let mut last_contact = current_unix_timestamp();
+    let mut last_contact = clock.now();
     let mut lifted = false;
 
     loop {
@@ -181,7 +190,7 @@ pub(crate) async fn refresh_task(
             match fetch_and_write(&master, &feed, &policy, &reload).await {
                 Ok(fetched) => {
                     timers = fetched;
-                    last_contact = current_unix_timestamp();
+                    last_contact = clock.now();
                     // The same gauge `rdnsd` sets for a replicated zone, because
                     // a policy feed is one: same name, same shape, same alert
                     // (`CLAUDE.md` §7, §14). `TODO.md` #57g.
@@ -207,6 +216,7 @@ pub(crate) async fn refresh_task(
                         &feed,
                         &timers,
                         last_contact,
+                        clock.now(),
                         &mut lifted,
                         &reload,
                         &metrics,
@@ -239,11 +249,12 @@ fn expire_if_out_of_contact(
     feed: &TransferredFeed,
     timers: &RefreshTimers,
     last_contact: u64,
+    now: u64,
     lifted: &mut bool,
     reload: &PolicyReload,
     metrics: &DnsMetrics,
 ) {
-    if *lifted || !timers.has_expired(last_contact, current_unix_timestamp()) {
+    if *lifted || !timers.has_expired(last_contact, now) {
         return;
     }
     *lifted = true;
@@ -606,6 +617,49 @@ mod tests {
             .contains("www.malware.example"));
     }
 
+    /// A restart with the master gone still reaches EXPIRE, counted by the SOA
+    /// of the file in force: the only timers there are until a transfer
+    /// succeeds.
+    ///
+    /// Fails against starting from `RefreshTimers::default()`, whose EXPIRE is
+    /// never: the file stays and no reload is asked for (`TODO.md` #135).
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_with_the_master_gone_still_expires() {
+        let dir = ScratchDir::new("rpz-restart-expire");
+        let dead = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("local addr");
+        let (store, mut feed) = feed_in_force(&dir, dead, &feed_text(1, &["www.malware.example"]));
+        feed.on_expire = OnExpire::Lift;
+        let reload = PolicyReload::default();
+        let clock = Clock::fixed(1_000_000_000);
+        let shutdown = rdns::shutdown::Shutdown::new();
+
+        let task = tokio::spawn(refresh_task(
+            feed.clone(),
+            store,
+            reload.clone(),
+            FeedWake::new(feed.spec.zone.clone()),
+            Arc::new(DnsMetrics::new()),
+            clock.clone(),
+            shutdown.lifecycle(),
+        ));
+        // Once the task has read its start off the clock. The feed's EXPIRE is
+        // 86400 and its RETRY 600.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        clock.advance(86_401);
+
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(3600), reload.requested())
+            .await
+            .is_ok();
+        assert!(asked, "EXPIRE passed and the lifted feed was not re-read");
+        assert!(!feed.file.exists(), "on-expire = lift removes the file");
+
+        shutdown.begin();
+        task.await.expect("the task ends on the stop");
+    }
+
     fn feed(on_expire: OnExpire) -> TransferredFeed {
         TransferredFeed {
             spec: MasterSpec::parse("block.example.@192.0.2.9").expect("a spec"),
@@ -654,7 +708,8 @@ mod tests {
     #[test]
     fn lifting_forgets_the_feed_and_enforcing_keeps_it_stale() {
         let expired = RefreshTimers::from_soa(3600, 600, 1);
-        let long_ago = current_unix_timestamp() - 10_000;
+        let now = rdns::clock::current_unix_timestamp();
+        let long_ago = now - 10_000;
         let reload = PolicyReload::default();
 
         for (way, expected) in [(OnExpire::Enforce, 1), (OnExpire::Lift, 0)] {
@@ -662,7 +717,15 @@ mod tests {
             let feed = feed(way);
             metrics.note_zone_transfer(feed.spec.zone.as_ref(), long_ago);
             let mut lifted = false;
-            expire_if_out_of_contact(&feed, &expired, long_ago, &mut lifted, &reload, &metrics);
+            expire_if_out_of_contact(
+                &feed,
+                &expired,
+                long_ago,
+                now,
+                &mut lifted,
+                &reload,
+                &metrics,
+            );
 
             assert!(lifted, "{way:?}: the transition happened");
             assert_eq!(
@@ -677,16 +740,33 @@ mod tests {
     #[test]
     fn the_expiry_warning_is_a_transition_and_not_a_repeat() {
         let expired = RefreshTimers::from_soa(3600, 600, 1);
-        let long_ago = current_unix_timestamp() - 10_000;
+        let now = rdns::clock::current_unix_timestamp();
+        let long_ago = now - 10_000;
         let metrics = DnsMetrics::new();
         let reload = PolicyReload::default();
         let feed = feed(OnExpire::Lift);
 
         let mut lifted = false;
-        expire_if_out_of_contact(&feed, &expired, long_ago, &mut lifted, &reload, &metrics);
+        expire_if_out_of_contact(
+            &feed,
+            &expired,
+            long_ago,
+            now,
+            &mut lifted,
+            &reload,
+            &metrics,
+        );
         assert!(lifted);
         // Called again with the same state: nothing to say and nothing to do.
-        expire_if_out_of_contact(&feed, &expired, long_ago, &mut lifted, &reload, &metrics);
+        expire_if_out_of_contact(
+            &feed,
+            &expired,
+            long_ago,
+            now,
+            &mut lifted,
+            &reload,
+            &metrics,
+        );
         assert!(lifted);
     }
 }
