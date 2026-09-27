@@ -20,7 +20,7 @@
 //! builds out of `dispatch`'s own transfer path.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -153,6 +153,20 @@ impl Secondaries {
             task.wake.notify_one();
         }
         Notified::Refreshing
+    }
+
+    /// Every master `zone` is replicated from right now.
+    fn masters(&self, zone: NameRef<'_>) -> Vec<SocketAddr> {
+        self.read()
+            .get(&*zone.folded())
+            .map(|replicated| {
+                replicated
+                    .tasks
+                    .iter()
+                    .map(|task| task.spec.master)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn register(&self, zone: NameRef<'_>, task: RefreshTask) {
@@ -357,6 +371,7 @@ pub(crate) fn spawn_secondary(
         replication.clone(),
         wake.clone(),
         lifecycle.clone(),
+        secondaries.clone(),
     ));
     let zone = registered.zone.clone();
     secondaries.register(
@@ -386,6 +401,7 @@ async fn secondary_loop(
     replication: ReplicationContext,
     wake: Arc<Notify>,
     lifecycle: Lifecycle,
+    secondaries: Arc<Secondaries>,
 ) {
     let Lifecycle { stop, busy } = lifecycle;
     // What EXPIRE counts from before the master is ever reached. Not "forever
@@ -430,7 +446,13 @@ async fn secondary_loop(
             }
             Err(e) => {
                 tracing::warn!("secondary {} from {}: {e}", spec.zone, spec.master);
-                expire_if_out_of_contact(&spec, &replication, started_at, timers).await;
+                // Every master of the zone, this one included: the spawn runs
+                // before the registration, so the first pass may not find it.
+                let mut masters = secondaries.masters(spec.zone.as_ref());
+                if !masters.contains(&spec.master) {
+                    masters.push(spec.master);
+                }
+                expire_if_out_of_contact(&spec, &masters, &replication, started_at, timers).await;
                 timers.after_failure()
             }
         };
@@ -585,11 +607,16 @@ pub(crate) async fn record_state(
 /// Withdrawn, the query gets REFUSED and the resolver tries the delegation's
 /// other nameservers.
 ///
+/// Contact is with the zone, not with `spec`'s master: `masters` is every
+/// master the zone is replicated from, and one of them answering keeps it
+/// served (`StateFile::last_contact`, `TODO.md` #131).
+///
 /// The state line stays behind: it records when contact was last made, so a
 /// restart sees the zone is still expired rather than reading "nothing known"
 /// as "fetch and serve".
 pub(crate) async fn expire_if_out_of_contact(
     spec: &MasterSpec,
+    masters: &[SocketAddr],
     replication: &ReplicationContext,
     started_at: u64,
     timers: RefreshTimers,
@@ -598,8 +625,7 @@ pub(crate) async fn expire_if_out_of_contact(
     let last_contact = state
         .lock()
         .expect("state mutex")
-        .get(&spec.zone.as_ref().to_presentation(), spec.master)
-        .map(|s| s.refreshed_at)
+        .last_contact(&spec.zone.as_ref().to_presentation(), masters)
         .unwrap_or(started_at);
 
     if !timers.has_expired(last_contact, current_unix_timestamp()) {
@@ -651,9 +677,13 @@ pub(crate) async fn withdraw(served: &ZoneContext, zone: NameRef<'_>) -> bool {
 ///
 /// - Its last successful contact is older than the SOA's EXPIRE.
 /// - There is no record of contact at all, so the zone came off disk — a
-///   missing sidecar, an unreadable one, or an entry for another master.
-///   `StateFile::load` returns empty and never fails, so unknown age has to mean
-///   "do not serve". The zone returns at the first successful transfer.
+///   missing sidecar, an unreadable one, or lines only for masters no longer
+///   configured. `StateFile::load` returns empty and never fails, so unknown
+///   age has to mean "do not serve". The zone returns at the first successful
+///   transfer.
+///
+/// Asked per zone over all of its masters in `specs`, not per spec: one master
+/// in contact vouches for the zone (`TODO.md` #131).
 ///
 /// A zone we hold but do not replicate is untouched: the loop is over the
 /// `--secondary` specs.
@@ -666,12 +696,20 @@ pub(crate) async fn withdraw_unvouched_zones(
     let state = StateFile::load(&state_file_path(zone_dir));
     let now = current_unix_timestamp();
 
+    let mut zones: Vec<(&rdns::Name, Vec<SocketAddr>)> = Vec::new();
     for spec in specs {
-        let timers = zone_timers(zone_map, spec.zone.as_ref()).await;
-        let why = match state.get(&spec.zone.as_ref().to_presentation(), spec.master) {
-            Some(entry) if timers.has_expired(entry.refreshed_at, now) => format!(
+        match zones.iter_mut().find(|(zone, _)| **zone == spec.zone) {
+            Some((_, masters)) => masters.push(spec.master),
+            None => zones.push((&spec.zone, vec![spec.master])),
+        }
+    }
+
+    for (zone, masters) in zones {
+        let timers = zone_timers(zone_map, zone.as_ref()).await;
+        let why = match state.last_contact(&zone.as_ref().to_presentation(), &masters) {
+            Some(last) if timers.has_expired(last, now) => format!(
                 "the copy on disk expired {}s ago",
-                now.saturating_sub(entry.refreshed_at + timers.expire)
+                now.saturating_sub(last.saturating_add(timers.expire))
             ),
             Some(_) => continue,
             None => "there is no record of ever having transferred it, so its age is \
@@ -679,11 +717,14 @@ pub(crate) async fn withdraw_unvouched_zones(
                 .to_string(),
         };
 
-        if withdraw(served, spec.zone.as_ref()).await {
+        if withdraw(served, zone.as_ref()).await {
             tracing::warn!(
-                "secondary {}: {why} — not serving it until {} answers",
-                spec.zone,
-                spec.master
+                "secondary {zone}: {why} — not serving it until {} answers",
+                masters
+                    .iter()
+                    .map(SocketAddr::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" or ")
             );
         }
     }
@@ -985,7 +1026,7 @@ mod tests {
             catalogs: no_catalogs(),
             xot: None,
         };
-        expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
+        expire_if_out_of_contact(&spec, &[master], &r, current_unix_timestamp(), timers).await;
         assert!(
             zone_map.read().await.is_empty(),
             "an expired zone is no longer served"
@@ -1040,8 +1081,122 @@ mod tests {
             catalogs: no_catalogs(),
             xot: None,
         };
-        expire_if_out_of_contact(&spec, &r, current_unix_timestamp(), timers).await;
+        expire_if_out_of_contact(&spec, &[master], &r, current_unix_timestamp(), timers).await;
         assert_eq!(zone_map.read().await.len(), 1, "still served");
+    }
+
+    /// A zone replicated from two masters, `dead` never having answered and
+    /// `live` having answered a minute ago, with the zone held.
+    struct TwoMasters {
+        _dir: ScratchDir,
+        dead: MasterSpec,
+        live: MasterSpec,
+        timers: RefreshTimers,
+        replication: ReplicationContext,
+    }
+
+    fn two_masters(name: &str) -> TwoMasters {
+        let dir = ScratchDir::new(name);
+        let spec = |master: &str| MasterSpec {
+            zone: nm("example.com."),
+            master: master.parse().expect("an address"),
+            key_name: None,
+            tls: None,
+        };
+        let (dead, live) = (spec("127.0.0.1:1"), spec("127.0.0.1:2"));
+
+        let zone = rdns::zone::parse_zone_file(&zone_at_serial(7), "example.com.").expect("zone");
+        let timers = RefreshTimers::from_zone(&zone).expect("timers");
+        let mut zones = HashMap::new();
+        zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
+
+        let mut state = StateFile::load(&state_file_path(dir.path()));
+        state
+            .record(TransferState {
+                zone: "example.com.".to_string(),
+                serial: Serial::new(7),
+                refreshed_at: current_unix_timestamp() - 60,
+                master: live.master,
+            })
+            .expect("record");
+
+        let replication = ReplicationContext {
+            served: ZoneContext {
+                zone_map: Arc::new(RwLock::new(Zones::new(zones))),
+                deltas: Arc::new(RwLock::new(DeltaLog::new())),
+                metrics: Arc::new(DnsMetrics::new()),
+                journal: None,
+            },
+            state: Arc::new(Mutex::new(state)),
+            zone_dir: dir.path().to_path_buf(),
+            notify: Arc::new(NotifyPolicy::default()),
+            readiness: Readiness::ready(),
+            catalogs: no_catalogs(),
+            xot: None,
+        };
+        TwoMasters {
+            _dir: dir,
+            dead,
+            live,
+            timers,
+            replication,
+        }
+    }
+
+    /// One master in contact keeps a zone served, however long the other has
+    /// been silent. RFC 1034 §4.3.5 discards a copy only when "the secondary
+    /// finds it impossible to perform a serial check for the EXPIRE interval"
+    /// (`TODO.md` #131). Watched failing with contact looked up per master:
+    /// the zone was withdrawn.
+    #[tokio::test]
+    async fn one_dead_master_of_two_does_not_expire_the_zone() {
+        let t = two_masters("two-masters-expire");
+        let masters = [t.dead.master, t.live.master];
+        let started_long_ago = current_unix_timestamp() - t.timers.expire - 1;
+
+        expire_if_out_of_contact(
+            &t.dead,
+            &masters,
+            &t.replication,
+            started_long_ago,
+            t.timers,
+        )
+        .await;
+        assert_eq!(
+            t.replication.served.zone_map.read().await.len(),
+            1,
+            "the live master vouches for the zone"
+        );
+
+        // The control: with only the dead master configured, it does expire.
+        expire_if_out_of_contact(
+            &t.dead,
+            &[t.dead.master],
+            &t.replication,
+            started_long_ago,
+            t.timers,
+        )
+        .await;
+        assert!(t.replication.served.zone_map.read().await.is_empty());
+    }
+
+    /// The same at startup and on every reload: a master with no line in the
+    /// sidecar does not unvouch a zone another master has one for
+    /// (`TODO.md` #131). Watched failing against the per-spec loop: the zone
+    /// was withdrawn.
+    #[tokio::test]
+    async fn one_unreached_master_of_two_does_not_unvouch_the_zone() {
+        let t = two_masters("two-masters-unvouched");
+        let specs = [t.dead.clone(), t.live.clone()];
+
+        withdraw_unvouched_zones(&specs, &t.replication.served, &t.replication.zone_dir).await;
+        assert_eq!(t.replication.served.zone_map.read().await.len(), 1);
+
+        withdraw_unvouched_zones(&specs[..1], &t.replication.served, &t.replication.zone_dir).await;
+        assert!(
+            t.replication.served.zone_map.read().await.is_empty(),
+            "and alone, the unreached master vouches for nothing"
+        );
     }
 
     /// A refresh against a master that remembers the change moves only the

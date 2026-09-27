@@ -3421,8 +3421,9 @@ mod tests {
             assert!(zone_map.read().await.is_empty());
         }
 
-        /// A sidecar entry for a *different* master is not evidence about this
-        /// one, and lands in the same place.
+        /// A sidecar entry for a master no longer configured for the zone is
+        /// not evidence about it, and lands in the same place. One configured
+        /// master in contact does vouch (`TODO.md` #131).
         #[tokio::test]
         async fn a_record_for_another_master_does_not_vouch_for_this_one() {
             let Replica {

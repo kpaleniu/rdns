@@ -11143,3 +11143,80 @@ touched is cfg-gated.
 
 
 ---
+
+### 131. A zone with two masters is withdrawn when one of them is down — **filed 2026-09-27, closed 2026-09-27**, **bug**
+
+Found grooming #128. `--secondary` may be repeated "for more masters of one
+zone" (How to run), and a catalog group may name several masters
+(`rdnsd/src/catalog.rs:759-761`). Each (zone, master) gets its own refresh
+task. Both decisions that withdraw a zone read the sidecar for *that task's
+master only*: `StateFile::get(zone, master)`, at
+`rdnsd/src/replication.rs:601` (`expire_if_out_of_contact`) and `:671`
+(`withdraw_unvouched_zones`).
+
+Measured with a probe test, masters A (never answered) and B (answered 60 s
+ago), zone held:
+
+- A's `expire_if_out_of_contact`, EXPIRE counted from a start older than
+  EXPIRE: zone withdrawn.
+- `withdraw_unvouched_zones(&[A, B])`: zone withdrawn, because A has no line.
+
+In a running server that is a zone out of service from each of A's RETRYs
+until B's next REFRESH reinstalls it, and withdrawn on every SIGHUP (the
+reload path calls the second check). Five production callers inherit it:
+`main.rs:2066` (startup), `:1380` (reload), `catalog.rs:429`, `:786`, and the
+refresh loop at `replication.rs:433`.
+
+RFC 1034 §4.3.5 discards a zone when "the secondary finds it impossible to
+perform a serial check for the EXPIRE interval". Here the check against B
+succeeded. Both implementations read keep one expiry per *zone*, extended
+by whichever primary answers:
+
+- BIND, `lib/dns/zone.c` `refresh_callback`: on an equal serial from any
+  primary, "Compute the new expire time based on this response … Has the
+  expire time improved?" and `zone->expiretime = expiretime`, then
+  `goto next_primary`. The expiry check (`zone_maintenance`) compares `now`
+  against that one field.
+- Knot, `src/knot/events/handlers/refresh.c`: `event_refresh` is per zone
+  and calls `zone_master_try(conf, zone, try_refresh, &trctx, "refresh")`,
+  which tries the masters in turn; a success sets
+  `zone->timers->next_expire = now + data->expire_timer` in
+  `finalize_timers_base`.
+
+What a fix must keep, and would refute a naive one: `:654` treats "an entry
+for another master" as unvouched on purpose, for a zone whose configured
+master *changed*. The distinction is between masters currently configured
+for the zone and masters that no longer are. Neither BIND nor Knot draws
+it: both key the timer by zone alone, so a changed primary list inherits
+the old one's expiry. Whether that rule is stricter than it needs to be is
+part of the remedy, not a given. No remedy named.
+
+**Done**: contact is per zone, over the masters configured for it now.
+`StateFile::last_contact(zone, masters)` is the latest `refreshed_at` among
+those masters' lines. Both checks use it: `expire_if_out_of_contact` gets
+the zone's masters from `Secondaries` (plus its own, since the spawn runs
+before the registration), and `withdraw_unvouched_zones` groups its specs by
+zone and warns once per zone.
+
+**The rule a fix had to keep is kept, not decided**: a line for a master no
+longer configured still vouches for nothing, and
+`a_record_for_another_master_does_not_vouch_for_this_one` still pins it.
+BIND and Knot do not draw that line (above). Dropping it is a separate
+question from this bug, and nobody has asked it.
+
+The module header of `replication.rs` already said "no contact in too long"
+is "a question about the *zone*, not about any one master". The code
+disagreed, which is `CLAUDE.md` §4's claim to verify.
+
+Tests: `one_dead_master_of_two_does_not_expire_the_zone` and
+`one_unreached_master_of_two_does_not_unvouch_the_zone`, each with a
+one-master control that still withdraws, and
+`test_last_contact_is_the_latest_of_the_configured_masters` in `rdns`. Both
+`rdnsd` tests failed against the per-master lookup restored (0 zones where 1
+was expected), each on its first assertion.
+
+1 347 passed on Windows and 1 368 on Linux, 0 failed; clippy clean on both;
+`cargo doc` and `cargo fmt --check` clean.
+
+
+---

@@ -233,6 +233,23 @@ impl StateFile {
             .find(|e| e.master == master && e.zone.eq_ignore_ascii_case(zone))
     }
 
+    /// When any of `masters` last answered for this zone: the instant EXPIRE
+    /// counts from.
+    ///
+    /// Per zone and not per master, because RFC 1034 §4.3.5 discards a copy
+    /// only when "the secondary finds it impossible to perform a serial check",
+    /// and one master answering is a check performed (`TODO.md` #131; BIND and
+    /// Knot keep one expiry per zone the same way). Restricted to `masters`, the
+    /// ones configured now: a line from a master no longer listed vouches for
+    /// nothing.
+    pub fn last_contact(&self, zone: &str, masters: &[SocketAddr]) -> Option<u64> {
+        self.entries
+            .iter()
+            .filter(|e| masters.contains(&e.master) && e.zone.eq_ignore_ascii_case(zone))
+            .map(|e| e.refreshed_at)
+            .max()
+    }
+
     pub fn entries(&self) -> &[TransferState] {
         &self.entries
     }
@@ -510,6 +527,32 @@ mod tests {
         // Keyed by both: the same zone from another master is another entry.
         assert!(reloaded.get("example.com.", addr("192.0.2.2:53")).is_none());
         assert!(reloaded.get("other.test.", addr("192.0.2.1:53")).is_none());
+    }
+
+    /// The latest contact from any configured master, and none from a master
+    /// that is not (`TODO.md` #131).
+    #[test]
+    fn test_last_contact_is_the_latest_of_the_configured_masters() {
+        let dir = ScratchDir::new("secondary-contact");
+        let (a, b, gone) = (
+            addr("192.0.2.1:53"),
+            addr("192.0.2.2:53"),
+            addr("192.0.2.3:53"),
+        );
+        let mut state = StateFile::load(&state_file_path(dir.path()));
+        for (master, refreshed_at) in [(a, 100), (b, 300), (gone, 900)] {
+            state.set(TransferState {
+                zone: "example.com.".to_string(),
+                serial: Serial::new(1),
+                refreshed_at,
+                master,
+            });
+        }
+
+        assert_eq!(state.last_contact("example.com.", &[a, b]), Some(300));
+        assert_eq!(state.last_contact("EXAMPLE.com.", &[a]), Some(100));
+        assert_eq!(state.last_contact("example.com.", &[]), None);
+        assert_eq!(state.last_contact("other.test.", &[a, b, gone]), None);
     }
 
     #[test]

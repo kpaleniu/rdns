@@ -37,14 +37,14 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21 and #128-#132**, as of 2026-09-27.
+**#21, #128-#130 and #132**, as of 2026-09-27.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
 defect (#127, closed the same day) and three places where a module's
 interface is its callers' problem. Grooming those three found #131 and
-#132, both bugs. Checked and not filed: the transfer ladder (#130 says why), the
-`[server]` keys (#63h's macro), the two UDP loops (#30), the reload seam
-(#83, #112).
-#58, #68 and #107-#127 are closed. #117-#119 came out of a fourth
+#132, both bugs; #131 closed the same day. Checked and not filed: the
+transfer ladder (#130 says why), the `[server]` keys (#63h's macro), the two
+UDP loops (#30), the reload seam (#83, #112).
+#58, #68, #107-#127 and #131 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
 #123 and #124 out of verifying #122, #125 out of closing #121, and #126 out
@@ -6802,7 +6802,8 @@ it stands, and compare.
 #131: `rdnsd` keys contact by (zone, master), so with two masters one dead
 master withdraws a zone the other keeps current. `rdnsr` has one master per
 feed and is not affected. A shared cycle would have to choose the contact
-key, so #131 goes first.
+key, so #131 goes first. **It went, and chose per zone** over the masters
+configured now (`StateFile::last_contact`).
 
 ### 129. `rdnsr`'s `Caches` seals the write side and forwards the read side — **filed 2026-09-27**, **needs-triage**
 
@@ -6861,53 +6862,6 @@ write is the open question; no remedy named.
 **Groomed 2026-09-27, nothing hidden.** The order in the code is #118's
 (zone, permission, then the rest). The replicated-zone REFUSED is a recorded
 deviation (#118 item 4: RFC 2136 §3.1.1 forwards, BIND and PowerDNS do).
-
-### 131. A zone with two masters is withdrawn when one of them is down — **filed 2026-09-27**, **bug**, **needs-triage**
-
-Found grooming #128. `--secondary` may be repeated "for more masters of one
-zone" (How to run), and a catalog group may name several masters
-(`rdnsd/src/catalog.rs:759-761`). Each (zone, master) gets its own refresh
-task. Both decisions that withdraw a zone read the sidecar for *that task's
-master only*: `StateFile::get(zone, master)`, at
-`rdnsd/src/replication.rs:601` (`expire_if_out_of_contact`) and `:671`
-(`withdraw_unvouched_zones`).
-
-Measured with a probe test, masters A (never answered) and B (answered 60 s
-ago), zone held:
-
-- A's `expire_if_out_of_contact`, EXPIRE counted from a start older than
-  EXPIRE: zone withdrawn.
-- `withdraw_unvouched_zones(&[A, B])`: zone withdrawn, because A has no line.
-
-In a running server that is a zone out of service from each of A's RETRYs
-until B's next REFRESH reinstalls it, and withdrawn on every SIGHUP (the
-reload path calls the second check). Five production callers inherit it:
-`main.rs:2066` (startup), `:1380` (reload), `catalog.rs:429`, `:786`, and the
-refresh loop at `replication.rs:433`.
-
-RFC 1034 §4.3.5 discards a zone when "the secondary finds it impossible to
-perform a serial check for the EXPIRE interval". Here the check against B
-succeeded. Both implementations read keep one expiry per *zone*, extended
-by whichever primary answers:
-
-- BIND, `lib/dns/zone.c` `refresh_callback`: on an equal serial from any
-  primary, "Compute the new expire time based on this response … Has the
-  expire time improved?" and `zone->expiretime = expiretime`, then
-  `goto next_primary`. The expiry check (`zone_maintenance`) compares `now`
-  against that one field.
-- Knot, `src/knot/events/handlers/refresh.c`: `event_refresh` is per zone
-  and calls `zone_master_try(conf, zone, try_refresh, &trctx, "refresh")`,
-  which tries the masters in turn; a success sets
-  `zone->timers->next_expire = now + data->expire_timer` in
-  `finalize_timers_base`.
-
-What a fix must keep, and would refute a naive one: `:654` treats "an entry
-for another master" as unvouched on purpose, for a zone whose configured
-master *changed*. The distinction is between masters currently configured
-for the zone and masters that no longer are. Neither BIND nor Knot draws
-it: both key the timer by zone alone, so a changed primary list inherits
-the old one's expiry. Whether that rule is stricter than it needs to be is
-part of the remedy, not a given. No remedy named.
 
 ### 132. A stale lookup serves an older "yes" over a newer "no" — **filed 2026-09-27**, **bug**, **needs-triage**
 
@@ -7097,6 +7051,7 @@ the week; the record is under "How the queue kept going stale" in
 | **125** | `--generate-keys` replaced a key file whose tag it collided with | **filed and closed 2026-09-26.** Checked against BIND first: `dnssec-keygen` generates again while a new key's tag, or its tag with REVOKE set, equals either tag of a key of that name and algorithm in the directory (`key_collision`, `dnssectool.c`). `SigningKey::distinct_from` does the same against the directory and the run's other key, bounded at 100 attempts; `write_to_dir` publishes by hard link and refuses an existing file. Tested over #121's stored pair, a stored REVOKE-apart pair and a same-tag pair of two algorithms; the overwrite test watched failing against the old rename, and `rdnsd`'s wiring test against dropping either list. See `docs/CLOSED_WORK.md` |
 | **126** | `--generate-keys` left a KSK with no DS when the ZSK's write failed | **filed and closed 2026-09-27.** Found reviewing #125. `write_key_pair` now removes whatever of the pair reached the directory on any write error, by `SigningKey::remove_from_dir`, which compares content rather than trusting the name: the name is the tag, and a file under it holding anything else is a colliding key. A key that cannot be removed is named in the error. |
 | **127** | a cached wildcard synthesis counted neither a hit nor a miss | **filed and closed 2026-09-27.** Found by the deepening sweep that filed #128-#130. `rdnsr`'s RFC 8198 §5.3 arm returned before `cache_hits`, where the other three arms answered from something held count one. One line; the test failed on 0 hits against the old arm. |
+| **131** | a zone with two masters was withdrawn when one of them was down | **filed and closed 2026-09-27.** Found grooming #128. EXPIRE and the startup/reload vouch read the sidecar per (zone, master); RFC 1034 §4.3.5, BIND and Knot count contact per zone. `StateFile::last_contact` over the masters configured now, so a line from a master no longer configured still vouches for nothing. Both regression tests failed against the per-master lookup. |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
@@ -7842,6 +7797,9 @@ Three details that are easy to get wrong and were:
 
 - **Expiry is measured from the last time the master answered**, not from the last
   time the zone changed. A zone that has not changed in a year is not stale.
+  With several masters, it is the last time *any configured* master answered:
+  per (zone, master) until #131, which withdrew a zone one live master was
+  keeping current.
 - **Expiry has to survive a restart**, or it lasts only as long as the process:
   the stale file is loaded from disk and served again, authoritative once more.
   So the state line is *kept* when a zone expires — it is the record of when
