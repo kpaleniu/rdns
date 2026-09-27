@@ -15,12 +15,17 @@
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::Qtype;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tokio::sync::Notify;
+
+use crate::clock::Clock;
 use crate::endpoint::XotName;
 use crate::record_types as rt;
+use crate::shutdown::Lifecycle;
 use crate::zone::Zone;
 use crate::{Name, ParsedRecord, Serial};
 
@@ -352,6 +357,100 @@ pub fn state_file_path(dir: &Path) -> PathBuf {
     dir.join("rdnsd.state")
 }
 
+/// What one refresh came to, as far as [`refresh_cycle`] is concerned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Contact {
+    /// The master answered. The timers are those of the zone held now, which
+    /// the refresh may just have installed.
+    Made(RefreshTimers),
+    /// It did not. The replica has said why in its own log line.
+    Lost,
+}
+
+/// A daemon's half of [`refresh_cycle`]: the zone and where it lives. The
+/// cycle has the timing and the shutdown.
+pub trait Replica: Send {
+    /// Ask the master, and install anything newer.
+    fn refresh(&mut self) -> impl Future<Output = Contact> + Send;
+
+    /// The timers of the zone held now, or the default if none is.
+    ///
+    /// Required rather than an initial value the caller picks: `rdnsr` began
+    /// at `RefreshTimers::default()`, EXPIRE never, while holding a feed from
+    /// its last run (`TODO.md` #135).
+    fn held_timers(&self) -> impl Future<Output = RefreshTimers> + Send;
+
+    /// When the zone last had contact by some path besides this cycle, if that
+    /// is recorded: another master, or a previous run. `None` counts from this
+    /// cycle's own start or its last success.
+    fn recorded_contact(&self) -> Option<u64> {
+        None
+    }
+
+    /// Contact was made. `after_expiry` if [`Replica::expired`] ran since the
+    /// last success.
+    fn in_contact(&mut self, after_expiry: bool) -> impl Future<Output = ()> + Send;
+
+    /// EXPIRE passed with no contact. Once per spell out of contact: this is
+    /// what an alert is built on, and a line per RETRY would bury it.
+    fn expired(&mut self, timers: RefreshTimers) -> impl Future<Output = ()> + Send;
+}
+
+/// Keep one zone in step with one master until the stop.
+///
+/// RFC 1035 §4.3.5: ask, then sleep on REFRESH, or RETRY after a failure, with
+/// a NOTIFY cutting the wait short. Out of contact past EXPIRE the replica is
+/// told once.
+///
+/// The [`Busy`](crate::shutdown::Busy) claim covers a refresh and what follows it, never the sleep,
+/// which is hours long (`CLAUDE.md` §9). Written once for both daemons: the two
+/// copies it replaced had drifted twice (`TODO.md` #128, #135).
+pub async fn refresh_cycle<R: Replica>(
+    mut replica: R,
+    wake: &Notify,
+    clock: &Clock,
+    lifecycle: Lifecycle,
+) {
+    let Lifecycle { stop, busy } = lifecycle;
+    // Not "forever ago", which expires a held zone before the first attempt,
+    // and not "never", which serves a copy of unknown age after a restart.
+    let mut contact = clock.now();
+    let mut expired = false;
+
+    loop {
+        // `select!` below picks among ready arms at random, so a NOTIFY pending
+        // beside the stop can win it.
+        if stop.is_set() {
+            return;
+        }
+        let wait = {
+            let _busy = busy.clone();
+            match replica.refresh().await {
+                Contact::Made(timers) => {
+                    contact = clock.now();
+                    replica.in_contact(std::mem::take(&mut expired)).await;
+                    timers.after_success()
+                }
+                Contact::Lost => {
+                    let timers = replica.held_timers().await;
+                    let last = replica.recorded_contact().unwrap_or(contact);
+                    if !expired && timers.has_expired(last, clock.now()) {
+                        expired = true;
+                        replica.expired(timers).await;
+                    }
+                    timers.after_failure()
+                }
+            }
+        };
+
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = wake.notified() => {}
+            () = stop.wait() => return,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -660,5 +759,217 @@ mod tests {
             "given absolute or not"
         );
         assert_eq!(state_file_path(dir), Path::new("/var/db/rdnsd.state"));
+    }
+
+    /// What a [`Scripted`] replica does and what the cycle asked of it.
+    #[derive(Default)]
+    struct Script {
+        /// Whether the master answers.
+        up: bool,
+        /// The master's zone, held once a refresh succeeds.
+        serving: Option<RefreshTimers>,
+        held: Option<RefreshTimers>,
+        recorded: Option<u64>,
+        refreshes: usize,
+        expiries: usize,
+        back_after_expiry: usize,
+    }
+
+    /// A replica with no I/O, so paused time is exact.
+    #[derive(Clone, Default)]
+    struct Scripted(std::sync::Arc<std::sync::Mutex<Script>>);
+
+    impl Scripted {
+        fn with(f: impl FnOnce(&mut Script)) -> Scripted {
+            let scripted = Scripted::default();
+            f(&mut scripted.0.lock().expect("the script"));
+            scripted
+        }
+
+        fn get<T>(&self, f: impl FnOnce(&Script) -> T) -> T {
+            f(&self.0.lock().expect("the script"))
+        }
+
+        fn set(&self, f: impl FnOnce(&mut Script)) {
+            f(&mut self.0.lock().expect("the script"));
+        }
+    }
+
+    impl Replica for Scripted {
+        async fn refresh(&mut self) -> Contact {
+            let mut s = self.0.lock().expect("the script");
+            s.refreshes += 1;
+            if !s.up {
+                return Contact::Lost;
+            }
+            s.held = s.serving;
+            Contact::Made(s.held.unwrap_or_default())
+        }
+
+        async fn held_timers(&self) -> RefreshTimers {
+            self.get(|s| s.held.unwrap_or_default())
+        }
+
+        fn recorded_contact(&self) -> Option<u64> {
+            self.get(|s| s.recorded)
+        }
+
+        async fn in_contact(&mut self, after_expiry: bool) {
+            self.set(|s| s.back_after_expiry += usize::from(after_expiry));
+        }
+
+        async fn expired(&mut self, _: RefreshTimers) {
+            self.set(|s| s.expiries += 1);
+        }
+    }
+
+    /// REFRESH 7200, so it cannot be mistaken for the default hour.
+    const SLOW: RefreshTimers = RefreshTimers {
+        refresh: 7200,
+        retry: 600,
+        expire: 86_400,
+    };
+
+    struct Cycling {
+        replica: Scripted,
+        wake: std::sync::Arc<tokio::sync::Notify>,
+        clock: Clock,
+        shutdown: Option<crate::shutdown::Shutdown>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    fn cycle(replica: Scripted) -> Cycling {
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let clock = Clock::fixed(1_000_000_000);
+        let shutdown = crate::shutdown::Shutdown::new();
+        let task = tokio::spawn({
+            let (replica, wake, clock) = (replica.clone(), wake.clone(), clock.clone());
+            let lifecycle = shutdown.lifecycle();
+            async move { refresh_cycle(replica, &wake, &clock, lifecycle).await }
+        });
+        Cycling {
+            replica,
+            wake,
+            clock,
+            shutdown: Some(shutdown),
+            task,
+        }
+    }
+
+    async fn pass(secs: u64) {
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+    }
+
+    fn refreshes(c: &Cycling) -> usize {
+        c.replica.get(|s| s.refreshes)
+    }
+
+    /// After the first transfer the zone's own REFRESH applies, not the
+    /// default hour it started with. Fails against reading the timers before
+    /// the refresh, which is the bug only a live two-process run had caught.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_transfer_is_followed_by_the_zones_refresh() {
+        let c = cycle(Scripted::with(|s| {
+            s.up = true;
+            s.serving = Some(SLOW);
+        }));
+        pass(1).await;
+        assert_eq!(refreshes(&c), 1);
+        pass(3650).await;
+        assert_eq!(
+            refreshes(&c),
+            1,
+            "the default hour is not the zone's REFRESH"
+        );
+        pass(3550).await;
+        assert_eq!(refreshes(&c), 2);
+    }
+
+    /// A failure is followed by the held zone's RETRY.
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_is_followed_by_retry() {
+        let c = cycle(Scripted::with(|s| s.held = Some(SLOW)));
+        pass(599).await;
+        assert_eq!(refreshes(&c), 1);
+        pass(2).await;
+        assert_eq!(refreshes(&c), 2);
+    }
+
+    /// A NOTIFY cuts the wait short.
+    #[tokio::test(start_paused = true)]
+    async fn a_notify_cuts_the_wait_short() {
+        let c = cycle(Scripted::with(|s| {
+            s.up = true;
+            s.serving = Some(SLOW);
+        }));
+        pass(1).await;
+        c.wake.notify_one();
+        pass(1).await;
+        assert_eq!(refreshes(&c), 2);
+    }
+
+    /// A stop during the wait ends the cycle, and the drain with it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_the_wait_ends_the_drain() {
+        let mut c = cycle(Scripted::with(|s| s.up = true));
+        pass(1).await;
+        let shutdown = c.shutdown.take().expect("the shutdown");
+        shutdown.begin();
+        assert!(shutdown.drain(Duration::from_secs(1)).await);
+        c.task.await.expect("the cycle ends");
+    }
+
+    /// EXPIRE is acted on once per spell out of contact, counted from the held
+    /// zone's timers when nothing has been fetched (`TODO.md` #135). Contact
+    /// ends the spell and says it came after one.
+    #[tokio::test(start_paused = true)]
+    async fn expire_acts_once_per_spell() {
+        let c = cycle(Scripted::with(|s| {
+            s.held = Some(SLOW);
+            s.serving = Some(SLOW);
+        }));
+        let expiries = || c.replica.get(|s| s.expiries);
+        pass(1).await;
+        c.clock.advance(86_401);
+        pass(600).await;
+        assert_eq!(expiries(), 1);
+        pass(3000).await;
+        assert_eq!(refreshes(&c), 7);
+        assert_eq!(expiries(), 1, "once, not once per RETRY");
+
+        c.replica.set(|s| s.up = true);
+        pass(600).await;
+        assert_eq!(c.replica.get(|s| s.back_after_expiry), 1);
+
+        c.replica.set(|s| s.up = false);
+        c.clock.advance(86_401);
+        pass(7200).await;
+        assert_eq!(expiries(), 2, "a new spell");
+    }
+
+    /// Contact recorded elsewhere is what EXPIRE counts from: another master,
+    /// or a run before this one.
+    #[tokio::test(start_paused = true)]
+    async fn expire_counts_from_recorded_contact() {
+        let c = cycle(Scripted::with(|s| {
+            s.held = Some(SLOW);
+            s.recorded = Some(1_000_000_000 - 86_401);
+        }));
+        pass(1).await;
+        assert_eq!(c.replica.get(|s| s.expiries), 1);
+    }
+
+    /// A stop with a NOTIFY also pending starts no refresh. `select!` picks
+    /// among ready arms at random, so this is repeated.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_beside_a_notify_starts_no_refresh() {
+        for round in 0..16 {
+            let mut c = cycle(Scripted::with(|s| s.up = true));
+            pass(1).await;
+            c.wake.notify_one();
+            c.shutdown.take().expect("the shutdown").begin();
+            (&mut c.task).await.expect("the cycle ends");
+            assert_eq!(refreshes(&c), 1, "round {round}: a refresh after the stop");
+        }
     }
 }

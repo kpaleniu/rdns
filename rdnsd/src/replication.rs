@@ -6,9 +6,9 @@
 //!
 //! The three timers are the whole protocol (RFC 1035 §3.3.13): REFRESH when to
 //! ask again, RETRY when to ask again after a failure, EXPIRE when to stop
-//! answering. `expire_if_out_of_contact` is separate from the refresh loop
-//! because "no contact in too long" is a question about the *zone*, not about
-//! any one master.
+//! answering. When each is due is `rdns::secondary::refresh_cycle`'s; what is
+//! here is the zone. `recorded_contact` asks about the *zone*, not about any
+//! one master, because "no contact in too long" is a question about the zone.
 //!
 //! Forgetting a last-contact time is not a degraded cache: it is the difference
 //! between a withdrawn zone and a stale one served with AA set. So `record_state`
@@ -32,7 +32,8 @@ use rdns::metrics::DnsMetrics;
 use rdns::name_keys::NameKeyBuf;
 use rdns::notify::NotifyPolicy;
 use rdns::secondary::{
-    state_file_path, zone_file_path, MasterSpec, RefreshTimers, StateFile, TransferState,
+    refresh_cycle, state_file_path, zone_file_path, Contact, MasterSpec, RefreshTimers, Replica,
+    StateFile, TransferState,
 };
 use rdns::shutdown::{Busy, Lifecycle};
 use rdns::tsig::{TsigKey, TsigKeyring};
@@ -387,17 +388,10 @@ pub(crate) fn spawn_secondary(
     );
 }
 
-/// Keep one zone in step with one master, forever.
+/// Keep one zone in step with one master, until the stop.
 ///
-/// RFC 1035 §4.3.5's cycle: ask for the SOA, compare serials, transfer if
-/// behind, then sleep on REFRESH — or RETRY after a failure, with a NOTIFY
-/// cutting the wait short. Out of contact past EXPIRE the zone stops being
-/// served, which is what makes this a replica and not a cache.
-///
-/// The [`Busy`] is held across a refresh and never across the sleep: the sleep
-/// is hours long and would burn the whole drain budget. Held across the refresh
-/// because `refresh_once` writes the zone file, and `persist` cleans up its
-/// `.zone.tmpNNN` sibling on error but not on being killed.
+/// The timing is [`refresh_cycle`]'s. Out of contact past EXPIRE the zone stops
+/// being served, which is what makes this a replica and not a cache.
 async fn secondary_loop(
     spec: MasterSpec,
     key: Option<TsigKey>,
@@ -406,70 +400,84 @@ async fn secondary_loop(
     lifecycle: Lifecycle,
     secondaries: Arc<Secondaries>,
 ) {
-    let Lifecycle { stop, busy } = lifecycle;
-    // What EXPIRE counts from before the master is ever reached. Not "forever
-    // ago", which withdraws a held zone before the first attempt, and not
-    // "never", which serves a copy of unknown age because we restarted.
-    let started_at = replication.clock.now();
+    let clock = replication.clock.clone();
+    let replica = ZoneReplica {
+        spec,
+        key,
+        replication,
+        secondaries,
+        lifecycle: lifecycle.clone(),
+    };
+    refresh_cycle(replica, &wake, &clock, lifecycle).await;
+}
 
-    loop {
-        if stop.is_set() {
-            return;
-        }
-        let result = {
-            let _busy = busy.clone();
-            refresh_once(&spec, key.as_ref(), &replication, &busy).await
-        };
+/// `rdnsd`'s half of [`refresh_cycle`]: a zone in the zone map, its file, and
+/// the sidecar recording contact.
+struct ZoneReplica {
+    spec: MasterSpec,
+    key: Option<TsigKey>,
+    replication: ReplicationContext,
+    secondaries: Arc<Secondaries>,
+    /// For the catalog reconcile after a refresh, which provisions members
+    /// and so spawns tasks of its own.
+    lifecycle: Lifecycle,
+}
 
-        // After the refresh, not before: the refresh may have just installed
-        // the zone that defines them. Read first, a zone's first transfer is
-        // followed by the default hour instead of its own REFRESH.
-        let timers = zone_timers(&replication.served.zone_map, spec.zone.as_ref()).await;
-
-        let wait = match result {
+impl Replica for ZoneReplica {
+    /// Held [`Busy`] by the cycle, because `refresh_once` writes the zone file
+    /// and `persist` cleans up its `.zone.tmpNNN` sibling on error but not on
+    /// being killed.
+    async fn refresh(&mut self) -> Contact {
+        let spec = &self.spec;
+        let refreshed = refresh_once(
+            spec,
+            self.key.as_ref(),
+            &self.replication,
+            &self.lifecycle.busy,
+        )
+        .await;
+        match refreshed {
             Ok(outcome) => {
                 tracing::info!("secondary {}: {outcome} (from {})", spec.zone, spec.master);
-                // If this zone is a catalog, what it now lists is what this
-                // server should hold (RFC 9432 §5.1). A no-op for every other
-                // zone, and for a catalog whose serial has not moved. Held
-                // `Busy`: provisioning writes the membership sidecar.
-                let _busy = busy.clone();
-                replication
-                    .catalogs
-                    .reconcile(
-                        spec.zone.as_ref(),
-                        &replication,
-                        &Lifecycle {
-                            stop: stop.clone(),
-                            busy: busy.clone(),
-                        },
-                    )
-                    .await;
-                timers.after_success()
+                Contact::Made(self.held_timers().await)
             }
             Err(e) => {
                 tracing::warn!("secondary {} from {}: {e}", spec.zone, spec.master);
-                // Every master of the zone, this one included: the spawn runs
-                // before the registration, so the first pass may not find it.
-                let mut masters = secondaries.masters(spec.zone.as_ref());
-                if !masters.contains(&spec.master) {
-                    masters.push(spec.master);
-                }
-                expire_if_out_of_contact(&spec, &masters, &replication, started_at, timers).await;
-                timers.after_failure()
+                Contact::Lost
             }
-        };
-
-        // No `Busy` across this: a refresh timer is hours long.
-        tokio::select! {
-            _ = tokio::time::sleep(wait) => {}
-            _ = wake.notified() => {}
-            _ = stop.wait() => return,
         }
+    }
+
+    async fn held_timers(&self) -> RefreshTimers {
+        zone_timers(&self.replication.served.zone_map, self.spec.zone.as_ref()).await
+    }
+
+    fn recorded_contact(&self) -> Option<u64> {
+        // Every master of the zone, this one included: the spawn runs before
+        // the registration, so the first pass may not find it.
+        let mut masters = self.secondaries.masters(self.spec.zone.as_ref());
+        if !masters.contains(&self.spec.master) {
+            masters.push(self.spec.master);
+        }
+        recorded_contact(&self.spec, &masters, &self.replication)
+    }
+
+    async fn in_contact(&mut self, _after_expiry: bool) {
+        // If this zone is a catalog, what it now lists is what this server
+        // should hold (RFC 9432 §5.1). A no-op for every other zone, and for a
+        // catalog whose serial has not moved.
+        self.replication
+            .catalogs
+            .reconcile(self.spec.zone.as_ref(), &self.replication, &self.lifecycle)
+            .await;
+    }
+
+    async fn expired(&mut self, timers: RefreshTimers) {
+        withdraw_expired(&self.spec, &self.replication.served, timers).await;
     }
 }
 
-/// The timers the zone we currently hold asks for, or the defaults if we hold
+// The timers the zone we currently hold asks for, or the defaults if we hold
 /// none — a zone we have never fetched has no SOA to obey.
 async fn zone_timers(zone_map: &Arc<RwLock<Zones>>, zone: NameRef<'_>) -> RefreshTimers {
     zone_map
@@ -604,43 +612,35 @@ pub(crate) async fn record_state(
         .map_err(|e| anyhow!("recording the transfer state: {e}"))
 }
 
+/// When the zone last had contact with any of `masters`, per the sidecar.
+///
+/// Contact is with the zone, not with `spec`'s master: one of them answering
+/// keeps it served (`StateFile::last_contact`, `TODO.md` #131). The line
+/// outlives the process, so a restart sees an expired zone as expired rather
+/// than reading "nothing known" as "fetch and serve".
+pub(crate) fn recorded_contact(
+    spec: &MasterSpec,
+    masters: &[SocketAddr],
+    replication: &ReplicationContext,
+) -> Option<u64> {
+    replication
+        .state
+        .lock()
+        .expect("state mutex")
+        .last_contact(&spec.zone.as_ref().to_presentation(), masters)
+}
+
 /// Stop serving a zone unreachable for longer than its EXPIRE.
 ///
 /// A zone served with AA set claims to be current, so serving one indefinitely
 /// turns a primary's outage into wrong answers nobody can see are wrong.
 /// Withdrawn, the query gets REFUSED and the resolver tries the delegation's
 /// other nameservers.
-///
-/// Contact is with the zone, not with `spec`'s master: `masters` is every
-/// master the zone is replicated from, and one of them answering keeps it
-/// served (`StateFile::last_contact`, `TODO.md` #131).
-///
-/// The state line stays behind: it records when contact was last made, so a
-/// restart sees the zone is still expired rather than reading "nothing known"
-/// as "fetch and serve".
-pub(crate) async fn expire_if_out_of_contact(
+pub(crate) async fn withdraw_expired(
     spec: &MasterSpec,
-    masters: &[SocketAddr],
-    replication: &ReplicationContext,
-    started_at: u64,
+    served: &ZoneContext,
     timers: RefreshTimers,
 ) {
-    let ReplicationContext {
-        served,
-        state,
-        clock,
-        ..
-    } = replication;
-    let last_contact = state
-        .lock()
-        .expect("state mutex")
-        .last_contact(&spec.zone.as_ref().to_presentation(), masters)
-        .unwrap_or(started_at);
-
-    if !timers.has_expired(last_contact, clock.now()) {
-        return;
-    }
-
     if withdraw(served, spec.zone.as_ref()).await {
         // WARN, not INFO: this is what the alert is built on.
         tracing::warn!(
@@ -651,7 +651,7 @@ pub(crate) async fn expire_if_out_of_contact(
     }
 }
 
-/// Stop serving a zone, and forget everything derived from holding it.
+// Stop serving a zone, and forget everything derived from holding it.
 ///
 /// Three callers — EXPIRE, an unvouched copy at startup, a catalog dropping a
 /// member — and three copies of it until `TODO.md` #44a, which is how the
@@ -1037,7 +1037,9 @@ mod tests {
             xot: None,
             clock: Clock::system(),
         };
-        expire_if_out_of_contact(&spec, &[master], &r, current_unix_timestamp(), timers).await;
+        let last = recorded_contact(&spec, &[master], &r).expect("contact was recorded");
+        assert!(timers.has_expired(last, current_unix_timestamp()));
+        withdraw_expired(&spec, &r.served, timers).await;
         assert!(
             zone_map.read().await.is_empty(),
             "an expired zone is no longer served"
@@ -1093,8 +1095,11 @@ mod tests {
             xot: None,
             clock: Clock::system(),
         };
-        expire_if_out_of_contact(&spec, &[master], &r, current_unix_timestamp(), timers).await;
-        assert_eq!(zone_map.read().await.len(), 1, "still served");
+        let last = recorded_contact(&spec, &[master], &r).expect("contact was recorded");
+        assert!(
+            !timers.has_expired(last, current_unix_timestamp()),
+            "still served"
+        );
     }
 
     /// A zone replicated from two masters, `dead` never having answered and
@@ -1165,32 +1170,19 @@ mod tests {
     async fn one_dead_master_of_two_does_not_expire_the_zone() {
         let t = two_masters("two-masters-expire");
         let masters = [t.dead.master, t.live.master];
-        let started_long_ago = current_unix_timestamp() - t.timers.expire - 1;
 
-        expire_if_out_of_contact(
-            &t.dead,
-            &masters,
-            &t.replication,
-            started_long_ago,
-            t.timers,
-        )
-        .await;
-        assert_eq!(
-            t.replication.served.zone_map.read().await.len(),
-            1,
+        let last = recorded_contact(&t.dead, &masters, &t.replication);
+        assert!(
+            last.is_some_and(|last| !t.timers.has_expired(last, current_unix_timestamp())),
             "the live master vouches for the zone"
         );
 
-        // The control: with only the dead master configured, it does expire.
-        expire_if_out_of_contact(
-            &t.dead,
-            &[t.dead.master],
-            &t.replication,
-            started_long_ago,
-            t.timers,
-        )
-        .await;
-        assert!(t.replication.served.zone_map.read().await.is_empty());
+        // The control: with only the dead master configured, nothing vouches,
+        // and the cycle counts from its own start.
+        assert_eq!(
+            recorded_contact(&t.dead, &[t.dead.master], &t.replication),
+            None
+        );
     }
 
     /// The same at startup and on every reload: a master with no line in the

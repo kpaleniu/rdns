@@ -71,7 +71,7 @@ use std::sync::Arc;
 use rdns::clock::Clock;
 use rdns::metrics::DnsMetrics;
 use rdns::rpz::{PolicyStore, PolicyZone};
-use rdns::secondary::{MasterSpec, RefreshTimers};
+use rdns::secondary::{refresh_cycle, Contact, MasterSpec, RefreshTimers, Replica};
 use rdns::shutdown::Lifecycle;
 use rdns::tsig::TsigKey;
 use rdns::xfr::{self, Master};
@@ -153,7 +153,7 @@ impl FeedWake {
 
 /// Fetch this feed's zone, write it where the feed is read from, ask for a
 /// reload, and wait for the refresh timer, a NOTIFY for this zone, or the stop
-/// signal.
+/// signal. The timing is [`refresh_cycle`]'s.
 pub(crate) async fn refresh_task(
     feed: TransferredFeed,
     policy: Arc<PolicyStore>,
@@ -163,101 +163,91 @@ pub(crate) async fn refresh_task(
     clock: Clock,
     lifecycle: Lifecycle,
 ) {
-    let Lifecycle { stop, busy } = lifecycle;
-    let master = Master::plain(feed.spec.master);
-    // The file from the last run is in force before the first transfer, and
-    // its SOA says when it expires. The default's EXPIRE is never, so a restart
-    // with the master gone enforced it forever (`TODO.md` #135).
-    let mut timers = policy
-        .in_force()
-        .held(feed.spec.zone.as_ref())
-        .map(PolicyZone::zone)
-        .and_then(RefreshTimers::from_zone)
-        .unwrap_or_default();
-    // The age `on-expire` acts on, and the only one this process has: `rdnsd`'s
-    // sidecar and its refresh gauge belong to the other daemon (`TODO.md`
-    // #57d). Started at "now" rather than at zero, so a resolver that has never
-    // reached its master expires on the same clock as one that lost contact.
-    let mut last_contact = clock.now();
-    let mut lifted = false;
+    let replica = FeedReplica {
+        master: Master::plain(feed.spec.master),
+        feed,
+        policy,
+        reload,
+        metrics,
+        clock: clock.clone(),
+    };
+    refresh_cycle(replica, &wake.notify, &clock, lifecycle).await;
+}
 
-    loop {
-        // The claim is held across the transfer and dropped before the wait: a
-        // refresh interval is hours long and holding it over one would keep the
-        // drain open for the life of the process (`CLAUDE.md` §9).
-        let wait = {
-            let _working = busy.clone();
-            match fetch_and_write(&master, &feed, &policy, &reload).await {
-                Ok(fetched) => {
-                    timers = fetched;
-                    last_contact = clock.now();
-                    // The same gauge `rdnsd` sets for a replicated zone, because
-                    // a policy feed is one: same name, same shape, same alert
-                    // (`CLAUDE.md` §7, §14). `TODO.md` #57g.
-                    metrics.note_zone_transfer(feed.spec.zone.as_ref(), last_contact);
-                    if lifted {
-                        // Back in contact: the rules go back into force, and it
-                        // is said out loud because the lifting was.
-                        lifted = false;
-                        tracing::warn!(
-                            "policy zone {}: back in contact, its rules are enforced again",
-                            feed.spec.zone
-                        );
-                    }
-                    timers.after_success()
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "policy zone {}: transfer from {master} failed, the file on disk \
-                         stays in force: {e}",
-                        feed.spec.zone
-                    );
-                    expire_if_out_of_contact(
-                        &feed,
-                        &timers,
-                        last_contact,
-                        clock.now(),
-                        &mut lifted,
-                        &reload,
-                        &metrics,
-                    );
-                    timers.after_failure()
-                }
-            }
-        };
+/// `rdnsr`'s half of [`refresh_cycle`]: a feed's file and the policy read from
+/// it.
+///
+/// The age `on-expire` acts on is the cycle's own, from this process's start or
+/// its last contact: `rdnsd`'s sidecar belongs to the other daemon
+/// (`TODO.md` #57d), so there is no `recorded_contact`.
+struct FeedReplica {
+    master: Master,
+    feed: TransferredFeed,
+    policy: Arc<PolicyStore>,
+    reload: PolicyReload,
+    metrics: Arc<DnsMetrics>,
+    clock: Clock,
+}
 
-        tokio::select! {
-            () = tokio::time::sleep(wait) => {}
-            () = wake.notify.notified() => {
-                tracing::info!("policy zone {}: a NOTIFY cut the wait short", feed.spec.zone);
+impl Replica for FeedReplica {
+    async fn refresh(&mut self) -> Contact {
+        match fetch_and_write(&self.master, &self.feed, &self.policy, &self.reload).await {
+            // The fetched zone's, not `held_timers`: what was written is in
+            // force only after the reload it asked for.
+            Ok(timers) => Contact::Made(timers),
+            Err(e) => {
+                tracing::warn!(
+                    "policy zone {}: transfer from {} failed, the file on disk stays in \
+                     force: {e}",
+                    self.feed.spec.zone,
+                    self.master
+                );
+                Contact::Lost
             }
-            () = stop.wait() => break,
         }
+    }
+
+    async fn held_timers(&self) -> RefreshTimers {
+        self.policy
+            .in_force()
+            .held(self.feed.spec.zone.as_ref())
+            .map(PolicyZone::zone)
+            .and_then(RefreshTimers::from_zone)
+            .unwrap_or_default()
+    }
+
+    async fn in_contact(&mut self, after_expiry: bool) {
+        // The same gauge `rdnsd` sets for a replicated zone, because a policy
+        // feed is one: same name, same shape, same alert (`CLAUDE.md` §7, §14).
+        // `TODO.md` #57g.
+        self.metrics
+            .note_zone_transfer(self.feed.spec.zone.as_ref(), self.clock.now());
+        if after_expiry {
+            // Said out loud because the expiry was.
+            tracing::warn!(
+                "policy zone {}: back in contact, its rules are enforced again",
+                self.feed.spec.zone
+            );
+        }
+    }
+
+    async fn expired(&mut self, timers: RefreshTimers) {
+        act_on_expiry(&self.feed, timers, &self.reload, &self.metrics);
     }
 }
 
-/// Act on EXPIRE having passed with no contact, once.
+/// Act on EXPIRE having passed with no contact.
 ///
 /// `Enforce` says so and changes nothing: the file stays and its rules stay in
 /// force, which is what the shipped two-process arrangement does by accident
 /// and this does on purpose. `Lift` removes the file and asks for a re-read,
 /// which is how one feed stops being enforced without disturbing the others.
-///
-/// WARN either way and only on the transition: this is what an alert is built
-/// on, and a line per RETRY would bury it.
-fn expire_if_out_of_contact(
+fn act_on_expiry(
     feed: &TransferredFeed,
-    timers: &RefreshTimers,
-    last_contact: u64,
-    now: u64,
-    lifted: &mut bool,
+    timers: RefreshTimers,
     reload: &PolicyReload,
     metrics: &DnsMetrics,
 ) {
-    if *lifted || !timers.has_expired(last_contact, now) {
-        return;
-    }
-    *lifted = true;
     let zone = &feed.spec.zone;
     let expire = timers.expire;
     match feed.on_expire {
@@ -708,65 +698,20 @@ mod tests {
     #[test]
     fn lifting_forgets_the_feed_and_enforcing_keeps_it_stale() {
         let expired = RefreshTimers::from_soa(3600, 600, 1);
-        let now = rdns::clock::current_unix_timestamp();
-        let long_ago = now - 10_000;
+        let long_ago = rdns::clock::current_unix_timestamp() - 10_000;
         let reload = PolicyReload::default();
 
         for (way, expected) in [(OnExpire::Enforce, 1), (OnExpire::Lift, 0)] {
             let metrics = DnsMetrics::new();
             let feed = feed(way);
             metrics.note_zone_transfer(feed.spec.zone.as_ref(), long_ago);
-            let mut lifted = false;
-            expire_if_out_of_contact(
-                &feed,
-                &expired,
-                long_ago,
-                now,
-                &mut lifted,
-                &reload,
-                &metrics,
-            );
+            act_on_expiry(&feed, expired, &reload, &metrics);
 
-            assert!(lifted, "{way:?}: the transition happened");
             assert_eq!(
                 gauge_lines(&metrics).len(),
                 expected,
                 "{way:?}: a feed still enforced keeps its age; a lifted one stops being reported"
             );
         }
-    }
-
-    /// The transition fires once, not once per RETRY.
-    #[test]
-    fn the_expiry_warning_is_a_transition_and_not_a_repeat() {
-        let expired = RefreshTimers::from_soa(3600, 600, 1);
-        let now = rdns::clock::current_unix_timestamp();
-        let long_ago = now - 10_000;
-        let metrics = DnsMetrics::new();
-        let reload = PolicyReload::default();
-        let feed = feed(OnExpire::Lift);
-
-        let mut lifted = false;
-        expire_if_out_of_contact(
-            &feed,
-            &expired,
-            long_ago,
-            now,
-            &mut lifted,
-            &reload,
-            &metrics,
-        );
-        assert!(lifted);
-        // Called again with the same state: nothing to say and nothing to do.
-        expire_if_out_of_contact(
-            &feed,
-            &expired,
-            long_ago,
-            now,
-            &mut lifted,
-            &reload,
-            &metrics,
-        );
-        assert!(lifted);
     }
 }

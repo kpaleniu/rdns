@@ -60,6 +60,9 @@ dhat = "0.3"
 # dev-dependency and the same flags `rdns-transport` uses for DoT's — so it is
 # one version in the lock rather than two, and still zero runtime packages.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+# `tokio::time::pause`, so `secondary::refresh_cycle`'s timers — hours long —
+# can be tested (`TODO.md` #128). A feature, not a package.
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "answer_path"
