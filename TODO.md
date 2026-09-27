@@ -37,7 +37,12 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21** only, as of 2026-09-27.
+**#21 and #127-#130**, as of 2026-09-27.
+#127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
+defect (#127) and three places where a module's interface is its callers'
+problem. Checked and not filed: the transfer ladder (#130 says why), the
+`[server]` keys (#63h's macro), the two UDP loops (#30), the reload seam
+(#83, #112).
 #58, #68 and #107-#126 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
@@ -6749,6 +6754,118 @@ SVCB were picked because the list already carried the argument, and the
 transports were picked because the argument the list carried turned out to be
 untested. A line that says a thing is expensive is a claim to measure
 (`CLAUDE.md` §4), and this one had sat since 2026-08-03 costing nothing to check.
+
+---
+
+### 127. A cached wildcard synthesis counts neither a hit nor a miss — **filed 2026-09-27**, **bug**, **ready-for-agent**
+
+`rdnsr/src/answer.rs:301-308` answers from `NsecCache::synthesize_wildcard`
+and returns without touching `cache_hits` or `cache_misses`. The three
+siblings answered from something held all count a hit: the denial synthesis
+(`:312`), the negative cache (`:325`), the answer cache (`:353`), and the
+stale-first answer (`:365`). The comment above the miss (`:366-368`) says
+"Everything above answered from something held … This is the line a cache
+hit rate is drawn on", which the wildcard arm makes untrue.
+
+So `dns_cache_hits_total / (hits + misses)` omits every RFC 8198 §5.3
+answer, and those are the answers `--dnssec-validate` exists to make cheap
+(`CLAUDE.md` §14: a counter's name is a claim about what it counts).
+
+Refuting check taken: no reason is recorded. `git log -S` finds the arm
+arriving in `rdnsr/src/main.rs` with `d6dc622`, uncounted then; neither `TODO.md`
+nor `docs/CLOSED_WORK.md` mentions the metric beside it. The test at
+`:1883` asserts three hits and none of them is a wildcard.
+
+A one-line fix plus a test that watches it fail. #129 is the shape that let
+it happen.
+
+### 128. RFC 1035 §4.3.5's refresh cycle is written twice, and neither copy has a test — **filed 2026-09-27**, **needs-triage**
+
+`rdnsd`'s `secondary_loop` (`rdnsd/src/replication.rs:383`, ~65 lines) and
+`rdnsr`'s `refresh_task` (`rdnsr/src/rpz_transfer.rs:157`, ~80 lines) are
+the same cycle, one per daemon: hold `Busy` across the refresh and never
+across the sleep (`CLAUDE.md` §9), `after_success` / `after_failure`,
+EXPIRE counted from last contact, and a `select!` over the timer, a
+NOTIFY wake and `Stop`. Both call `xfr::refresh_zone` and
+`RefreshTimers`. What differs, read in both:
+
+| | `rdnsd` | `rdnsr` |
+|---|---|---|
+| last contact | `StateFile` sidecar, else process start | a local, from process start |
+| timers after a success | re-read from the zone map after install | taken from the fetched zone |
+| after a success | catalog `reconcile` | gauge, "back in contact" WARN |
+| at EXPIRE | `withdraw` | `on-expire`: WARN, or remove file and reload |
+| once only | `withdraw` returns false second time | a `lifted` flag |
+
+**Neither loop is reached by any test.** `grep` for either name finds only
+the spawns (`replication.rs:354`, `rdnsr/src/main.rs:1047`). The tests stop
+one level down, at `refresh_once`, `fetch_and_write` and the two
+`expire_if_out_of_contact`. That is the level where the live two-process run
+caught the timers-read-before-the-transfer bug that "no unit test would
+have" ("Architecture: the secondary role"). The row for this is the
+cadence: a first transfer followed by the zone's REFRESH and not the
+default hour, a NOTIFY cutting the wait short, `Busy` released across the
+sleep, the EXPIRE action once. `rdnsd` already enables `tokio`'s
+`test-util` for `start_paused` (`rdnsd/Cargo.toml:36`); `rdnsr` does not.
+
+Refuting check taken: nothing decided this. `grep` for both function names
+and for `rpz_transfer` across `TODO.md` and `docs/CLOSED_WORK.md` finds only
+#20's table placing `secondary_loop`. 57d built two shapes for *where the
+zone goes*, not for the cycle. No drift found between the copies today:
+the timer difference in the table is two correct spellings of one rule.
+
+No remedy named. The candidate a build would test is one cycle in
+`rdns::secondary` with the four differing rows as the caller's part. §19
+says build it against the alternative of paused-time tests on each loop as
+it stands, and compare.
+
+### 129. `rdnsr`'s `Caches` seals the write side and forwards the read side — **filed 2026-09-27**, **needs-triage**
+
+#117 made `Caches::store` the one writer, so a writer that forgets a cache
+does not compile. The read side got no equivalent. Six of `Caches`'s ten
+methods are one-line forwards (`rdnsr/src/caches.rs:103-148`: `answer`,
+`negative`, `synthesize_wildcard`, `synthesize_denial`, `stale_answer`,
+`stale_negative`). The *order* they are asked in lives in `handle_query`
+(`rdnsr/src/answer.rs:301-334`: wildcard, denial, negative, answer) and in
+`stale_answer` (`:787-796`: "a yes before a no"). A mechanical scan of every
+crate's `pub` functions for one-line forwarding bodies puts `caches.rs`
+highest after `rdns::error`'s constructors. Everything else it flags is an
+accessor.
+
+What the forwarding cost: #127, a fourth "answered from something held" arm
+that does not count as one. Each arm spells its own metric, response build
+and `finish_dns64` call.
+
+What must stay in `handle_query`, and would refute a naive move: the CD gate
+(`:300`, `:310`) is the client's request and not the cache's knowledge; the
+DNS64 finish and the prefetch offer are answer-path. Which of the four
+orderings belong to the cache and which to the answer path has to be read
+arm by arm before anything moves. No remedy named.
+
+### 130. `answer_update` decides and replies in one pass, so its test surface is a TCP server — **filed 2026-09-27**, **needs-triage**
+
+`answer_update` (`rdnsd/src/dispatch.rs:1180-1441`) has 13 exits through
+`signed_error` (twelve refusals and the success), each with its own log
+line. The decision of which rcode and which EDE a request gets is RFC 2136
+§3.1-§3.4 plus the local policy: zone, permission, replicated, writable
+source, file, prerequisites. It is interleaved with the signing and
+logging, so the only seam in front of it is the listening server:
+`spawn_updatable` / `updatable_server` / `listen_updatable` appear 16 times
+in the file, and each exit test is a TCP round trip against a temp
+directory.
+
+Evidence that the interleaving costs something: #118 was the check *order*
+disagreeing with the doc, and #119 found four exits no test reached, one of
+which answered REFUSED for a disk error. Both were found by reading.
+
+Refuting check taken, and it narrows the row: the transfer ladder in
+`answer_transfer` has the same shape (8 exits through
+`send_transfer_error`) and #119's table shows every branch tested, so it is
+not included. And the one exit #119 left untested, the `spawn_blocking`
+`JoinError`, is not reached by any restructuring of the decision either.
+What is left is the order and the rcode/EDE mapping as a table a test can
+enumerate. Whether that earns a type between `update::parse` and the file
+write is the open question; no remedy named.
 
 ---
 
