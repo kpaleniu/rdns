@@ -746,6 +746,30 @@ impl SigningKey {
         Ok(path)
     }
 
+    /// Undo [`SigningKey::write_to_dir`]: remove this key's file from `dir` if
+    /// it holds this key, and say whether it did.
+    ///
+    /// Compared by content, not trusted by name: the name is the tag, so a
+    /// file under it holding anything else is another key's only private half
+    /// (`TODO.md` #125). The content test also covers a write that failed after
+    /// publishing, which `write_to_dir` reports as an error.
+    pub fn remove_from_dir(&self, dir: &Path) -> Result<bool> {
+        let path = dir.join(self.file_name());
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(DnssecError::key(format!("reading {}: {e}", path.display())));
+            }
+        };
+        if text != self.to_key_file() {
+            return Ok(false);
+        }
+        std::fs::remove_file(&path)
+            .map_err(|e| DnssecError::key(format!("removing {}: {e}", path.display())))?;
+        Ok(true)
+    }
+
     /// Every key file in `dir`.
     ///
     /// A file that will not parse is an error, never a skip: a dropped key means
@@ -1256,6 +1280,21 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].dnskey_public_key(), zsk.dnskey_public_key());
         assert_eq!(dir.entries(), vec![zsk.file_name()], "no temporary left");
+    }
+
+    /// Removal takes a key's own file and leaves a colliding key's, which
+    /// has the same name (`TODO.md` #126).
+    #[test]
+    fn a_key_removes_its_own_file_and_not_a_twins() {
+        let dir = ScratchDir::new("key-file-remove");
+        let [zsk, twin] = colliding_zsks("example.com.");
+        zsk.write_to_dir(dir.path()).expect("write");
+
+        assert!(!twin.remove_from_dir(dir.path()).expect("read"));
+        assert_eq!(dir.entries(), vec![zsk.file_name()]);
+        assert!(zsk.remove_from_dir(dir.path()).expect("remove"));
+        assert!(dir.entries().is_empty());
+        assert!(!zsk.remove_from_dir(dir.path()).expect("absent"));
     }
 
     /// Equal tags collide, and so do tags one REVOKE apart, which do not

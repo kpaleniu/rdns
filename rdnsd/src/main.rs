@@ -2325,14 +2325,38 @@ fn write_key_pair(
     let ksk = SigningKey::distinct_from(&others, || generate(DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP))?;
     others.push(&ksk);
     let zsk = SigningKey::distinct_from(&others, || generate(DNSKEY_FLAG_ZONE))?;
-    for key in [&ksk, &zsk] {
-        let path = key.write_to_dir(dir)?;
+    let pair = [&ksk, &zsk];
+    let written: Result<Vec<PathBuf>, _> = pair.iter().map(|key| key.write_to_dir(dir)).collect();
+    let written = match written {
+        Ok(written) => written,
+        // All or nothing: a key left behind has no timing, so the server
+        // publishes and signs with it, and a KSK the operator never saw a DS
+        // for is the result (`TODO.md` #126).
+        Err(e) => return Err(remove_key_pair(dir, pair, e.into())),
+    };
+    for path in written {
         // Also stdout on purpose, for the same reason as `--check-config`:
         // `--generate-keys` exists to print a DS record somebody pastes into a
         // registrar form, and that is output, not logging.
         println!("Wrote {}", path.display());
     }
     Ok(ksk)
+}
+
+/// `err`, after removing whatever of `pair` reached `dir`, with each key that
+/// could not be removed named in it.
+fn remove_key_pair(dir: &Path, pair: [&SigningKey; 2], mut err: anyhow::Error) -> anyhow::Error {
+    for key in pair {
+        if let Err(e) = key.remove_from_dir(dir) {
+            err = err.context(format!(
+                "{} is left in {} and must be removed by hand, or the server signs with it \
+                 ({e})",
+                key.file_name(),
+                dir.display()
+            ));
+        }
+    }
+    err
 }
 
 #[cfg(test)]
@@ -2398,6 +2422,32 @@ mod tests {
         on_disk.sort();
         expected.sort();
         assert_eq!(on_disk, expected);
+    }
+
+    /// A ZSK that cannot be written takes the KSK written before it back out,
+    /// and leaves the file that stopped it (`TODO.md` #126). The generator
+    /// takes the ZSK's name after `load_dir` has looked, as a second writer
+    /// would.
+    #[test]
+    fn a_key_pair_that_fails_halfway_leaves_nothing_behind() {
+        let dir = ScratchDir::new("key-pair-halfway");
+        let mut drawn = 0;
+        let err = write_key_pair(dir.path(), |flags| {
+            let key =
+                SigningKey::generate(SigningAlgorithm::EcdsaP256Sha256, "example.com.", flags)?;
+            drawn += 1;
+            if drawn == 2 {
+                dir.write(&key.file_name(), "another writer's\n");
+            }
+            Ok(key)
+        })
+        .expect_err("the ZSK's name is taken");
+
+        assert_eq!(drawn, 2);
+        let entries = dir.entries();
+        assert_eq!(entries.len(), 1, "the KSK is gone: {entries:?}");
+        let planted = std::fs::read_to_string(dir.join(&entries[0])).expect("read");
+        assert_eq!(planted, "another writer's\n", "{err:#}");
     }
 
     /// Reading the directory first means a directory the server would refuse

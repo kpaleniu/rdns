@@ -851,6 +851,8 @@ there, nor with it once either is revoked, and a key file is never replaced. A
 directory the server would refuse to load is refused here too. The directory
 must be on a filesystem with hard links, which rules out FAT: a key file is
 published by one, because unlike a rename it cannot replace an existing file.
+Both keys or neither: if the second cannot be written the first is removed, and
+the error names any file that could not be.
 
 ```bash
 mkdir -p /etc/rdns/keys

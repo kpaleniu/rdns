@@ -11052,3 +11052,60 @@ Linux, 0 failed; clippy clean on both; `cargo doc` and `cargo fmt --check` clean
 
 
 ---
+
+### 126. `--generate-keys` leaves a KSK without its DS when the ZSK's write fails — **filed 2026-09-27, closed 2026-09-27**
+
+Found reviewing #125. `write_key_pair` (`rdnsd/src/main.rs`) writes the KSK,
+prints `Wrote <path>`, then writes the ZSK; the DS is printed only after both.
+A ZSK write that fails returns the error with the KSK already on disk.
+Provoked with a throwaway test whose generator put a key under the ZSK's file
+name just before the write: stdout had the KSK's `Wrote` line, the error was
+`os error 183` (`AlreadyExists`), and no DS followed.
+
+Ways in: a full disk or a permission error on the second write, another
+writer taking the ZSK's name between `load_dir` and the write (#125 made that
+an error rather than a replacement), and #125's own failure to remove the
+KSK's temporary, where the KSK is written and reported as an error.
+
+What the orphan does, read and not provoked: `load_dir` takes every key file
+and a generated key has no timing, so the server publishes it and it is
+active at once. Alone in a new directory it signs everything
+(`sign_everything` uses every key when there is no non-SEP one), a zone
+signed but insecure. Beside a live pair it signs the DNSKEY RRset next to the
+key the parent's DS names, which validates, but is a KSK the operator never
+saw a DS for. Nothing else in the tree prints a DS: `KSK.ds(2)` has one
+production caller, `generate_keys`, and CDS is published only for a key file
+carrying `SyncPublish`. A rerun makes a fresh pair and leaves the orphan in
+place.
+
+No remedy is costed here (`CLAUDE.md` §18).
+
+**Done 2026-09-27.** Both keys or neither.
+
+- `SigningKey::remove_from_dir` removes a key's file only if its content is
+  that key's own key file. The name is the tag, so trusting it would delete
+  the colliding key #125 exists to protect; a fresh private key in the
+  content is proof the file is ours. The same test covers a write reported
+  as failed after publishing, #125's temporary-removal error, whose target is
+  on disk.
+- `write_key_pair` writes both, and on any error removes whatever of the pair
+  reached the directory. A key that cannot be removed is named in the error
+  with what the server will do with it. `Wrote` lines print after both, so
+  nothing is reported that was taken back.
+- A temporary left by that error stays: `load_dir` skips it, and its own
+  error names it.
+- No other implementation checked for this: BIND's `dnssec-keygen` makes one
+  key per run (#125's grooming), so it has no pair to keep whole.
+
+Verified: `a_key_pair_that_fails_halfway_leaves_nothing_behind` plants a file
+under the ZSK's name from the generator, after `load_dir` has looked. It
+failed against the old loop, both files left, and against removal by name,
+the planted file deleted. `a_key_removes_its_own_file_and_not_a_twins` over
+#121's colliding pair fails against removal by name. Untested: a removal that
+fails, and the temporary-removal case, for #125's reason. One
+`--generate-keys` run on Windows wrote two files and printed the DS.
+1 343 passed on Windows and 1 364 on Linux, 0 failed; clippy clean on both;
+`cargo doc` and `cargo fmt --check` clean.
+
+
+---
