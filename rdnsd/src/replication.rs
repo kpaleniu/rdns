@@ -773,6 +773,7 @@ mod tests {
     use rdns_transport::readiness::Readiness;
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1658,5 +1659,86 @@ mod tests {
         let msg = DnsMessage::try_from_bytes(&buf[..n]).expect("parse");
         assert_eq!(msg.opcode, OpCode::Notify, "still a NOTIFY, signed or not");
         assert_eq!(notify::notified_zone(&msg), Some(nm("example.com.")));
+    }
+
+    /// Yield without letting paused time move until `done`, or panic. An idle
+    /// runtime auto-advances paused time past loopback I/O still in flight, so
+    /// a `sleep` here would fire the transfer's own timeouts.
+    async fn settle(done: impl Fn() -> bool) {
+        // Real time, not paused: an fsync on the blocking pool is the slow part.
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done() {
+            assert!(std::time::Instant::now() < give_up, "did not settle");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Let loopback I/O happen for a moment of real time without moving paused
+    /// time: what a "nothing happened" assertion has to wait out first.
+    async fn quiet() {
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while std::time::Instant::now() < until {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A TCP front for `upstream` counting connections, one per question.
+    async fn counting_front(upstream: SocketAddr) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counting = asked.clone();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                counting.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    if let Ok(mut outbound) = TcpStream::connect(upstream).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+        (addr, asked)
+    }
+
+    /// Through the real loop and a real primary: after the first transfer the
+    /// zone's own REFRESH applies, not the default hour. The cycle's tests
+    /// cannot see this, because `ZoneReplica::refresh` is what reads the timers
+    /// after installing; read before, a zone's first transfer is followed by
+    /// the default hour. That bug was only ever caught by a live run.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_transfer_is_followed_by_the_zones_refresh() {
+        // REFRESH 7200, so it cannot be mistaken for the default hour.
+        let zone = zone_at_serial(7).replace(" 3600 1800 ", " 7200 1800 ");
+        let (master, asked) = counting_front(spawn_primary(&zone).await).await;
+        let asked = || asked.load(Ordering::Relaxed);
+        let dir = ScratchDir::new("cycle-refresh");
+        let mut r = replication(&dir, NotifyPolicy::default());
+        r.clock = Clock::fixed(1_000_000_000);
+        let zone_map = r.served.zone_map.clone();
+        let spec = MasterSpec {
+            zone: nm("example.com."),
+            master,
+            key_name: None,
+            tls: None,
+        };
+        let _task = tokio::spawn(secondary_loop(
+            spec,
+            None,
+            r,
+            Arc::new(Notify::new()),
+            test_shutdown().lifecycle(),
+            Arc::new(Secondaries::default()),
+        ));
+
+        settle(|| zone_map.try_read().is_ok_and(|zones| zones.len() == 1)).await;
+        let first = asked();
+        tokio::time::sleep(Duration::from_secs(3650)).await;
+        quiet().await;
+        assert_eq!(asked(), first, "the default hour is not the zone's REFRESH");
+        tokio::time::sleep(Duration::from_secs(3551)).await;
+        settle(|| asked() > first).await;
     }
 }
