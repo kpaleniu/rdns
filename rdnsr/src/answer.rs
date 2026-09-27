@@ -2015,6 +2015,74 @@ mod tests {
         assert!(reply.answers.is_empty());
     }
 
+    /// A Secure "yes" stored as a refresh would, for a name the zone has
+    /// since added: what `SignedZone` would answer after the change.
+    fn store_secure_address(caches: &Caches, name: &str) {
+        let mut found = DnsMessage::try_from_bytes(&message(OpCode::Query, true)).expect("parses");
+        found.answers = vec![a_record(&nm(name), 300)];
+        caches.store(&a_question(name), &found, &ValidationState::Secure);
+    }
+
+    /// What `SignedZone` answers for `name`, stored as validated.
+    fn store_signed(caches: &Caches, zone: &SignedZone, name: &str) {
+        let mut asked = DnsMessage::try_from_bytes(&message(OpCode::Query, false)).expect("ok");
+        asked.queries = vec![a_question(name)];
+        caches.store(
+            &a_question(name),
+            &zone.reply(&asked),
+            &ValidationState::Secure,
+        );
+    }
+
+    /// A name added inside a cached NSEC gap, once an answer for it is held,
+    /// is that answer: the exact match is asked before the gap (RFC 8198
+    /// Appendix A, `TODO.md` #134). Watched failing with synthesis first:
+    /// NXDOMAIN, 0 answers.
+    #[tokio::test]
+    async fn an_answer_held_inside_a_cached_gap_is_the_answer() {
+        let (resolver, _upstream) = silent_resolver();
+        let (serving, _clock) =
+            timed_with(StalePolicy::OFF, resolver, None, PolicyZones::default());
+        let zone = SignedZone::new();
+        let b = nm("b.example.test.");
+        let a = Qtype::of(record_types::A);
+        // The apex NSEC it carries covers `b` too.
+        store_signed(&serving.caches, &zone, "a.example.test.");
+        let reply = asked_at_once(&serving, &b, a).await;
+        assert_eq!(reply.rcode, ResponseCode::NoSuchDomain, "synthesized");
+
+        store_secure_address(&serving.caches, "b.example.test.");
+        let reply = asked_at_once(&serving, &b, a).await;
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers, vec![a_record(&b, 300)]);
+    }
+
+    /// The wildcard half (RFC 8198 §5.3): a name the zone has since given its
+    /// own record, once that is held, is not answered with the wildcard's.
+    /// Watched failing with synthesis first: the wildcard's 192.0.2.7.
+    #[tokio::test]
+    async fn an_answer_held_under_a_cached_wildcard_is_the_answer() {
+        let (resolver, _upstream) = silent_resolver();
+        let (serving, _clock) =
+            timed_with(StalePolicy::OFF, resolver, None, PolicyZones::default());
+        let zone = SignedZone::new();
+        let y = nm("y.w.example.test.");
+        let a = Qtype::of(record_types::A);
+        store_signed(&serving.caches, &zone, "x.w.example.test.");
+        let reply = asked_at_once(&serving, &y, a).await;
+        let wildcard = rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+            std::net::Ipv4Addr::new(192, 0, 2, 7),
+        ))
+        .expect("encodes");
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(reply.answers[0].rdata, wildcard, "synthesized");
+
+        store_secure_address(&serving.caches, "y.w.example.test.");
+        let reply = asked_at_once(&serving, &y, a).await;
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers, vec![a_record(&y, 300)]);
+    }
+
     /// The negative half: an expired NXDOMAIN is answered first too, with
     /// RFC 8914's code for a stale NXDOMAIN and the same text.
     #[tokio::test]

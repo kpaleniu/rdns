@@ -68,13 +68,17 @@ fn query_bytes(name: &rdns::Name) -> Vec<u8> {
 ///
 /// Exact, and attributed rather than merely recorded: an exact count that is
 /// not understood is worse than a timing, because it looks trustworthy
-/// (`CLAUDE.md` §10). Two of the thirteen are the parse and three are the
+/// (`CLAUDE.md` §10). Two of the twelve are the parse and three are the
 /// serialization, which are the same two numbers `rdns/tests/allocations.rs`
-/// asserts for the authoritative path, so **eight** are what the resolver does
+/// asserts for the authoritative path, so **seven** are what the resolver does
 /// in between: the cache lookup, the records copied out of it, and the reply
 /// message they are assembled into.
 ///
-/// That eight is #88's real answer, and it says **decline**. `rdnsd` writes its
+/// Thirteen and eight until #134, which moved RFC 8198 synthesis behind the
+/// answer cache: a hit no longer builds the `*.<parent>` name
+/// `NsecCache::synthesize_wildcard` looks up.
+///
+/// That seven is #88's real answer, and it says **decline**. `rdnsd` writes its
 /// answer straight into a held buffer with `ResponseWriter` — `rdns`'s
 /// "write a one-record response" is **0**, and **3** with neither buffer nor
 /// compressor in hand, which is what it pays per message on TCP. `rdnsr` clones
@@ -122,7 +126,7 @@ fn a_cached_answer_costs_what_it_costs() {
     let (answered, count) =
         allocations(|| rt.block_on(handle_query(wire, TEST_PEER, now, &serving, Transport::Udp)));
     assert!(answered.is_some(), "still a cache hit");
-    within("answer one query from the cache", count, 13..=13);
+    within("answer one query from the cache", count, 12..=12);
 
     // The two ends of it, priced separately so the total is attributed. Both
     // are `rdns`'s own numbers for the authoritative path, measured here
@@ -142,7 +146,7 @@ fn a_cached_answer_costs_what_it_costs() {
 
     assert_eq!(
         count - parse_count - serialize_count,
-        8,
+        7,
         "the cache lookup, the records copied out of it, and the message they go into"
     );
 }

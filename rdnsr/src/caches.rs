@@ -138,38 +138,10 @@ impl Caches {
         synthesize: bool,
         prefetching: bool,
     ) -> Option<Held> {
-        // Before the answer cache: a cached NSEC answers every question in its
-        // gap, so a flood of random names under one zone costs one upstream
-        // query, not one per name (RFC 8198). The positive half (§5.3) first:
-        // a cached NXDOMAIN needs the wildcard *denied*, so the two are
-        // mutually exclusive and trying the more specific one first costs
-        // nothing.
-        if synthesize {
-            // A wildcard signature verifies at this name unchanged, so the
-            // client can check this for itself.
-            if let Some(wildcard) = self.denials.synthesize_wildcard(name, qtype) {
-                return Some(Held::Reply {
-                    rcode: ResponseCode::Ok,
-                    answers: wildcard.answers,
-                    authority: wildcard.authority,
-                    secure: true,
-                });
-            }
-            // The proofs were validated before storage, so what is derived
-            // from them is authentic on the same terms.
-            if let Some(denial) = self.denials.synthesize(name, qtype) {
-                return Some(Held::Reply {
-                    rcode: denial.rcode,
-                    answers: Vec::new(),
-                    authority: denial.authority,
-                    secure: true,
-                });
-            }
-        }
-        // Before `answers`, so a newer "no" outranks an older "yes" with no
-        // retiring on store; `store` retires only the "no" an answer refutes
-        // (`TODO.md` #133). Nothing is synthesized — this is the answer this
-        // question got — so a CD client may have it too.
+        // A newer "no" outranks an older "yes" with no retiring on store;
+        // `store` retires only the "no" an answer refutes (`TODO.md` #133).
+        // Nothing is synthesized — this is the answer this question got — so a
+        // CD client may have it too.
         if let Some(negative) = self.negatives.get(name, qtype) {
             return Some(Held::Reply {
                 rcode: negative.rcode,
@@ -178,9 +150,42 @@ impl Caches {
                 secure: negative.secure,
             });
         }
-        self.answers
-            .lookup(name, qtype, prefetching)
-            .map(Held::Answer)
+        if let Some(hit) = self.answers.lookup(name, qtype, prefetching) {
+            return Some(Held::Answer(hit));
+        }
+        // Synthesis only once the question itself missed: a gap or a wildcard
+        // stored before an answer for this name would otherwise outrank it
+        // (`TODO.md` #134). RFC 8198 Appendix A checks "if the answer is in
+        // its cache" first, and so do Unbound, BIND and Knot Resolver. A random
+        // name misses both caches above, so a flood still costs no upstream
+        // query.
+        if !synthesize {
+            return None;
+        }
+        // The positive half (RFC 8198 §5.3) first: a cached NXDOMAIN needs the
+        // wildcard *denied*, so the two are mutually exclusive and trying the
+        // more specific one first costs nothing.
+        //
+        // A wildcard signature verifies at this name unchanged, so the client
+        // can check this for itself.
+        if let Some(wildcard) = self.denials.synthesize_wildcard(name, qtype) {
+            return Some(Held::Reply {
+                rcode: ResponseCode::Ok,
+                answers: wildcard.answers,
+                authority: wildcard.authority,
+                secure: true,
+            });
+        }
+        // The proofs were validated before storage, so what is derived from
+        // them is authentic on the same terms.
+        self.denials
+            .synthesize(name, qtype)
+            .map(|denial| Held::Reply {
+                rcode: denial.rcode,
+                answers: Vec::new(),
+                authority: denial.authority,
+                secure: true,
+            })
     }
 
     /// One cache at a time, for tests about which caches `store` reached.

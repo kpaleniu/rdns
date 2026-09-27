@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21, #128, #130 and #134**, as of 2026-09-27.
+**#21, #128 and #130**, as of 2026-09-27.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
 defect (#127, closed the same day) and three places where a module's
 interface is its callers' problem. Grooming those three found #131 and
@@ -45,7 +45,7 @@ interface is its callers' problem. Grooming those three found #131 and
 and closing #133 found #134.
 Checked and not filed: the transfer ladder (#130 says why), the `[server]`
 keys (#63h's macro), the two UDP loops (#30), the reload seam (#83, #112).
-#58, #68, #107-#127, #129 and #131-#133 are closed. #117-#119 came out of a fourth
+#58, #68, #107-#127, #129 and #131-#134 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
 #123 and #124 out of verifying #122, #125 out of closing #121, and #126 out
@@ -6835,69 +6835,6 @@ write is the open question; no remedy named.
 (zone, permission, then the rest). The replicated-zone REFUSED is a recorded
 deviation (#118 item 4: RFC 2136 §3.1.1 forwards, BIND and PowerDNS do).
 
-### 134. The denial cache can serve an older "no" over a newer "yes" — **filed 2026-09-27**, **bug**, **ready-for-agent**
-
-#133's shape in the RFC 8198 denial cache, found counting instances before
-closing #133. `handle_query` asks `synthesize_denial`
-(`rdnsr/src/answer.rs:312`) before either the negative or the answer cache,
-under a clear CD bit. A refresh queued before the denial arrived can store
-a validated answer for a name inside a cached NSEC gap, and the gap goes on
-synthesizing NXDOMAIN over it.
-
-Probed: a validated NXDOMAIN for `a.example.test.` (`SignedZone`) whose NSEC
-covers `b.example.test.`, then a Secure A for `b` stored through
-`Caches::store`, then a query for `b` through `handle_query`: NXDOMAIN, 0
-answers.
-
-What #133's remedy would cost here, read and not built: retiring on store
-means finding the NSEC covering the stored name, a range query in
-`ZoneProofs::nsecs` (`covering_nsec`, `rdns/src/nsec_cache.rs:558`), or for
-NSEC3 hashing the name with the zone's salt and iterations first
-(`covering_nsec3`, `:615`), bounded by `MAX_NSEC3_ITERATIONS`. Removing the
-record also takes away every other name in its gap, which the answer does
-not refute. The read-side alternative needs `learned_at` on the proofs. What
-BIND does here was not checked. No remedy named.
-
-**Two instances, not one** (found triaging #129): the wildcard arm
-(`answer.rs:301`) serves a cached wildcard synthesis over a newer answer
-held for the name itself. Same cause, same fix site. #129 goes first.
-**#129 is done**: both arms are now in `Caches::lookup`
-(`rdnsr/src/caches.rs`), and the line numbers above are from before it.
-
-**Triaged 2026-09-27.** A third shape, neither of the two above: ask the
-exact-match caches first and synthesize only on a miss. It is what RFC 8198
-describes and what all three implementations do, read in their source:
-
-- RFC 8198 Appendix A: the validator, "in addition to checking to see if
-  the answer is in its cache before sending a query, checks to see whether
-  any cached and validated NSEC record denies the existence".
-- Unbound, `iterator.c` `processInitRequest`: `dns_cache_lookup`, then
-  `if(!msg && qstate->env->neg_cache && ...)` `val_neg_getmsg`.
-- BIND, `qpcache.c` `find`: `find_coveringnsec` only under
-  `if (result == DNS_R_PARTIALMATCH)`, i.e. the name has no node in the cache.
-- Knot Resolver, `lib/cache/peek.c` `peek_nosync`: "1a. exact name+type
-  match (can be negative ...)" returns `KR_STATE_DONE` before any NSEC or
-  wildcard lookup.
-
-The reason the code gives for the current order is wrong: "so it goes
-before the answer cache: a flood of random names under one zone costs one
-upstream query". A random name is not in the answer cache, so asking that
-cache first costs one hash lookup and still no upstream query. Going
-before *resolution* is what saves the upstream query.
-
-Remedy: in `Caches::lookup`, `negatives` then `answers` then the two
-synthesis arms, in that order. No store-side retiring and no `learned_at`
-on the proofs. Built as a probe and not kept: both instances answer from
-the answer cache, and 99 of `rdnsr`'s 100 tests pass unchanged. The one
-that fails is `a_cached_answer_costs_what_it_costs`, which reads 12 instead
-of 13 because a hit no longer asks the denial cache first. Move the bound
-to 12 and say so beside it.
-
-Not covered, and BIND does it: BIND does not synthesize for a name with any
-cached node, so data held for another type also blocks synthesis. Our
-caches key on (name, type), so a held AAAA does not stop a denial for A.
-That is RFC 8198 §4's accepted staleness, not this bug. Not filed.
-
 ---
 
 ## Closed work
@@ -7047,6 +6984,7 @@ the week; the record is under "How the queue kept going stale" in
 | **131** | a zone with two masters was withdrawn when one of them was down | **filed and closed 2026-09-27.** Found grooming #128. EXPIRE and the startup/reload vouch read the sidecar per (zone, master); RFC 1034 §4.3.5, BIND and Knot count contact per zone. `StateFile::last_contact` over the masters configured now, so a line from a master no longer configured still vouches for nothing. Both regression tests failed against the per-master lookup. |
 | **132** | a stale lookup served an older "yes" over a newer "no" | **filed and closed 2026-09-27.** Found grooming #129. `Caches::stale` serves the later of the two by `learned_at` (RFC 8767 §4), deciding at read time because an NXDOMAIN is keyed by name and retiring on store would scan the answer cache. Covers other types at the name. Stale NXDOMAIN kept (RFC 8914 §4.20). Both regression tests failed with the "yes" asked first. |
 | **133** | the fresh path could serve an older "no" over a newer "yes" | **filed and closed 2026-09-27.** Found closing #132. `Caches::store` has an answer retire the NODATA for its question and the NXDOMAIN at its name and every ancestor (`NegativeCache::forget_refuted`), so asking `negatives` first is right by construction; one removal per label, no scan. The read side was not built. Both regression tests failed without the call. The denial cache has the same shape: #134. |
+| **134** | a cached RFC 8198 gap or wildcard outranked a newer answer for the name | **filed and closed 2026-09-27.** Found closing #133; the wildcard instance found triaging #129. RFC 8198 Appendix A, Unbound, BIND and Knot Resolver ask the exact-match cache first and synthesize on a miss; `Caches::lookup` now does too. Neither store-side retiring nor `learned_at` on proofs was needed. Both regression tests failed against the old order; a cache hit went from 13 allocations to 12. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
@@ -7385,8 +7323,8 @@ Two rules, and the second is where this would go wrong:
 The two halves cannot both fire: a cached NXDOMAIN requires the wildcard to have
 been *denied*, so it never applies to a name a wildcard governs.
 
-`rdnsr` checks the denial cache *before* the answer cache, and skips it entirely
-for a client with CD set — that client asked us not to filter on its behalf, and
+`rdnsr` checks the denial cache only after the negative and answer caches
+missed (#134), and skips it entirely for a client with CD set — that client asked us not to filter on its behalf, and
 an answer we invented from cached proofs is exactly that. The cache is sized to
 zero unless `--dnssec-validate` is on, the same zero-capacity idiom `--no-cache`
 uses, so there is no configuration in which unvalidated proofs can enter it.

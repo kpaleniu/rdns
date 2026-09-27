@@ -157,12 +157,16 @@ process down. Binds 127.0.0.1 by default.
 6. DNS64 reverse mapping, when `--dns64` is on and the question is a PTR under
    `ip6.arpa` for an address inside the NAT64 prefix: the question is rewritten
    rather than answered. See §5.7.
-7. RFC 8198 synthesis from validated denials, skipped when the client set CD.
-   Checked before the answer cache, so a flood of random names under one zone
-   costs one upstream query rather than one per name. The positive half (a
-   validated wildcard) is tried first; the two are mutually exclusive by
+7. Negative cache, then answer cache. A "no" is asked first because an answer
+   retires the "no" it refutes when stored (`TODO.md` #133), so whatever "no"
+   is left is the newer.
+8. RFC 8198 synthesis from validated denials, skipped when the client set CD.
+   Only after both exact-match caches missed, as RFC 8198 Appendix A, Unbound,
+   BIND and Knot Resolver do: a gap or wildcard cached before an answer for
+   the name must not outrank it (`TODO.md` #134). A random name misses both,
+   so a flood under one zone still costs one upstream query. The positive half
+   (a validated wildcard) is tried first; the two are mutually exclusive by
    construction.
-8. Answer cache, then negative cache.
 9. With `--serve-stale-first`, an expired answer or "no" inside the window,
    answered at once with its refresh queued. See §5.5.
 10. Miss → `Resolver::resolve`.

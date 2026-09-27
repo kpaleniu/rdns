@@ -11473,3 +11473,89 @@ NXDOMAIN, 0 answers. Filed as #134.
 --check` clean. Linux not run: none of the files touched is cfg-gated.
 
 ---
+
+### 134. The denial cache can serve an older "no" over a newer "yes" — **filed 2026-09-27, closed 2026-09-27**, **bug**
+
+#133's shape in the RFC 8198 denial cache, found counting instances before
+closing #133. `handle_query` asks `synthesize_denial`
+(`rdnsr/src/answer.rs:312`) before either the negative or the answer cache,
+under a clear CD bit. A refresh queued before the denial arrived can store
+a validated answer for a name inside a cached NSEC gap, and the gap goes on
+synthesizing NXDOMAIN over it.
+
+Probed: a validated NXDOMAIN for `a.example.test.` (`SignedZone`) whose NSEC
+covers `b.example.test.`, then a Secure A for `b` stored through
+`Caches::store`, then a query for `b` through `handle_query`: NXDOMAIN, 0
+answers.
+
+What #133's remedy would cost here, read and not built: retiring on store
+means finding the NSEC covering the stored name, a range query in
+`ZoneProofs::nsecs` (`covering_nsec`, `rdns/src/nsec_cache.rs:558`), or for
+NSEC3 hashing the name with the zone's salt and iterations first
+(`covering_nsec3`, `:615`), bounded by `MAX_NSEC3_ITERATIONS`. Removing the
+record also takes away every other name in its gap, which the answer does
+not refute. The read-side alternative needs `learned_at` on the proofs. What
+BIND does here was not checked. No remedy named.
+
+**Two instances, not one** (found triaging #129): the wildcard arm
+(`answer.rs:301`) serves a cached wildcard synthesis over a newer answer
+held for the name itself. Same cause, same fix site. #129 goes first.
+**#129 is done**: both arms are now in `Caches::lookup`
+(`rdnsr/src/caches.rs`), and the line numbers above are from before it.
+
+**Triaged 2026-09-27.** A third shape, neither of the two above: ask the
+exact-match caches first and synthesize only on a miss. It is what RFC 8198
+describes and what all three implementations do, read in their source:
+
+- RFC 8198 Appendix A: the validator, "in addition to checking to see if
+  the answer is in its cache before sending a query, checks to see whether
+  any cached and validated NSEC record denies the existence".
+- Unbound, `iterator.c` `processInitRequest`: `dns_cache_lookup`, then
+  `if(!msg && qstate->env->neg_cache && ...)` `val_neg_getmsg`.
+- BIND, `qpcache.c` `find`: `find_coveringnsec` only under
+  `if (result == DNS_R_PARTIALMATCH)`, i.e. the name has no node in the cache.
+- Knot Resolver, `lib/cache/peek.c` `peek_nosync`: "1a. exact name+type
+  match (can be negative ...)" returns `KR_STATE_DONE` before any NSEC or
+  wildcard lookup.
+
+The reason the code gives for the current order is wrong: "so it goes
+before the answer cache: a flood of random names under one zone costs one
+upstream query". A random name is not in the answer cache, so asking that
+cache first costs one hash lookup and still no upstream query. Going
+before *resolution* is what saves the upstream query.
+
+Remedy: in `Caches::lookup`, `negatives` then `answers` then the two
+synthesis arms, in that order. No store-side retiring and no `learned_at`
+on the proofs. Built as a probe and not kept: both instances answer from
+the answer cache, and 99 of `rdnsr`'s 100 tests pass unchanged. The one
+that fails is `a_cached_answer_costs_what_it_costs`, which reads 12 instead
+of 13 because a hit no longer asks the denial cache first. Move the bound
+to 12 and say so beside it.
+
+Not covered, and BIND does it: BIND does not synthesize for a name with any
+cached node, so data held for another type also blocks synthesis. Our
+caches key on (name, type), so a held AAAA does not stop a denial for A.
+That is RFC 8198 §4's accepted staleness, not this bug. Not filed.
+
+**Done, as triaged.** `Caches::lookup` asks `negatives`, then `answers`,
+then the two synthesis arms. Tests through `handle_query`:
+`an_answer_held_inside_a_cached_gap_is_the_answer` and
+`an_answer_held_under_a_cached_wildcard_is_the_answer`. Each first checks
+that synthesis answers before the answer is stored, then stores it. Both
+failed against the old order (NXDOMAIN; the wildcard's 192.0.2.7 where the
+held 192.0.2.10 was expected).
+
+One count changed, downwards: `a_cached_answer_costs_what_it_costs` is 12,
+not 13, and the resolver's share 7, not 8. The allocation that went is the
+`*.<parent>` name `synthesize_wildcard` built before finding the cache
+empty; a hit no longer gets that far. Stable over three runs. The reason is
+written beside the assertion.
+
+`docs/spec/05-resolver.md`'s cache-order list is updated. It also said
+"answer cache, then negative cache", which had been wrong since before
+#133.
+
+1 357 passed on Windows and 1 378 on Linux, 0 failed; clippy clean on both,
+`cargo doc` and `cargo fmt --check` clean.
+
+---
