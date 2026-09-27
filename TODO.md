@@ -37,11 +37,12 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21** only, as of 2026-09-26.
+**#126**, plus **#21**, as of 2026-09-27.
 #58, #68 and #107-#125 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
-#123 and #124 out of verifying #122, and #125 out of closing #121.
+#123 and #124 out of verifying #122, #125 out of closing #121, and #126 out
+of reviewing #125.
 
 **#107 through #115 came out of a third architecture review on 2026-09-21**,
 this one asking where a module's interface is nearly as large as what is behind
@@ -6686,6 +6687,35 @@ refused however small the zone, and was watched failing against the unfixed
 predicate — where it transferred the whole fixture. 1 302 tests on Windows
 (1 300 before) and 1 323 on Linux, clippy clean on both, `cargo doc` and
 `cargo fmt --check` clean.
+
+---
+
+### 126. `--generate-keys` leaves a KSK without its DS when the ZSK's write fails — **filed 2026-09-27**
+
+Found reviewing #125. `write_key_pair` (`rdnsd/src/main.rs`) writes the KSK,
+prints `Wrote <path>`, then writes the ZSK; the DS is printed only after both.
+A ZSK write that fails returns the error with the KSK already on disk.
+Provoked with a throwaway test whose generator put a key under the ZSK's file
+name just before the write: stdout had the KSK's `Wrote` line, the error was
+`os error 183` (`AlreadyExists`), and no DS followed.
+
+Ways in: a full disk or a permission error on the second write, another
+writer taking the ZSK's name between `load_dir` and the write (#125 made that
+an error rather than a replacement), and #125's own failure to remove the
+KSK's temporary, where the KSK is written and reported as an error.
+
+What the orphan does, read and not provoked: `load_dir` takes every key file
+and a generated key has no timing, so the server publishes it and it is
+active at once. Alone in a new directory it signs everything
+(`sign_everything` uses every key when there is no non-SEP one), a zone
+signed but insecure. Beside a live pair it signs the DNSKEY RRset next to the
+key the parent's DS names, which validates, but is a KSK the operator never
+saw a DS for. Nothing else in the tree prints a DS: `KSK.ds(2)` has one
+production caller, `generate_keys`, and CDS is published only for a key file
+carrying `SyncPublish`. A rerun makes a fresh pair and leaves the orphan in
+place.
+
+No remedy is costed here (`CLAUDE.md` §18).
 
 ---
 
