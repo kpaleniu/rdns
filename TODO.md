@@ -6835,8 +6835,7 @@ Remedy, in order:
 1. #135 first, with its own regression test, so neither shape starts from
    a known-wrong copy. **Done**, and it did `rdnsr`'s half of step 2.
 2. Thread a `Clock` into both loops. Needed by both shapes, so not part of
-   the choice. `rdnsd`'s `secondary_loop` and its `expire_if_out_of_contact`
-   are left.
+   the choice. **Done**: `rdnsd`'s is a field of `ReplicationContext`.
 3. Build both shapes (§19): (A) one cycle in `rdns::secondary`, the
    differing rows of the table plus "timers of what is held" as the
    caller's part; (B) paused-time tests on each loop as it stands. Tests,

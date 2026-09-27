@@ -2110,6 +2110,7 @@ async fn main() -> Result<()> {
             readiness: readiness.clone(),
             catalogs: catalogs.clone(),
             xot: xot.clone(),
+            clock: Clock::system(),
         };
         // Before the tasks start and before anything is served: the members a
         // previous run provisioned are on disk too, and their refresh tasks do

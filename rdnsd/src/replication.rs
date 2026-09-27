@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use tokio::sync::{Notify, RwLock};
 
-use rdns::clock::current_unix_timestamp;
+use rdns::clock::{current_unix_timestamp, Clock};
 use rdns::metrics::DnsMetrics;
 use rdns::name_keys::NameKeyBuf;
 use rdns::notify::NotifyPolicy;
@@ -273,6 +273,9 @@ pub(crate) struct ReplicationContext {
     /// not a decision an operator takes per peer, and the name that *is* per
     /// peer is in [`MasterSpec::tls`].
     pub(crate) xot: Option<XotTrust>,
+    /// What contact and EXPIRE are measured on, so a test can move past an
+    /// EXPIRE without waiting it out (`TODO.md` #128).
+    pub(crate) clock: Clock,
 }
 
 impl ReplicationContext {
@@ -407,7 +410,7 @@ async fn secondary_loop(
     // What EXPIRE counts from before the master is ever reached. Not "forever
     // ago", which withdraws a held zone before the first attempt, and not
     // "never", which serves a copy of unknown age because we restarted.
-    let started_at = current_unix_timestamp();
+    let started_at = replication.clock.now();
 
     loop {
         if stop.is_set() {
@@ -492,6 +495,7 @@ pub(crate) async fn refresh_once(
         readiness,
         catalogs: _,
         xot: _,
+        clock: _,
     } = replication;
     let ZoneContext {
         zone_map, metrics, ..
@@ -503,7 +507,7 @@ pub(crate) async fn refresh_once(
 
     let master = replication.master(spec)?;
     let refreshed = xfr::refresh_zone(&master, spec.zone.as_ref(), key, base.as_ref()).await?;
-    let now = current_unix_timestamp();
+    let now = replication.clock.now();
 
     // EXPIRE resets on contact, not on a transfer: a zone confirmed current is
     // exactly what "not stale" means.
@@ -621,14 +625,19 @@ pub(crate) async fn expire_if_out_of_contact(
     started_at: u64,
     timers: RefreshTimers,
 ) {
-    let ReplicationContext { served, state, .. } = replication;
+    let ReplicationContext {
+        served,
+        state,
+        clock,
+        ..
+    } = replication;
     let last_contact = state
         .lock()
         .expect("state mutex")
         .last_contact(&spec.zone.as_ref().to_presentation(), masters)
         .unwrap_or(started_at);
 
-    if !timers.has_expired(last_contact, current_unix_timestamp()) {
+    if !timers.has_expired(last_contact, clock.now()) {
         return;
     }
 
@@ -821,6 +830,7 @@ mod tests {
             readiness: Readiness::ready(),
             catalogs: no_catalogs(),
             xot: None,
+            clock: Clock::system(),
         }
     }
 
@@ -1025,6 +1035,7 @@ mod tests {
             readiness: Readiness::ready(),
             catalogs: no_catalogs(),
             xot: None,
+            clock: Clock::system(),
         };
         expire_if_out_of_contact(&spec, &[master], &r, current_unix_timestamp(), timers).await;
         assert!(
@@ -1080,6 +1091,7 @@ mod tests {
             readiness: Readiness::ready(),
             catalogs: no_catalogs(),
             xot: None,
+            clock: Clock::system(),
         };
         expire_if_out_of_contact(&spec, &[master], &r, current_unix_timestamp(), timers).await;
         assert_eq!(zone_map.read().await.len(), 1, "still served");
@@ -1133,6 +1145,7 @@ mod tests {
             readiness: Readiness::ready(),
             catalogs: no_catalogs(),
             xot: None,
+            clock: Clock::system(),
         };
         TwoMasters {
             _dir: dir,

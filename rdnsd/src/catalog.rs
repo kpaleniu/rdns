@@ -1274,6 +1274,7 @@ mod tests {
                     readiness: Readiness::ready(),
                     catalogs: catalogs.clone(),
                     xot: None,
+                    clock: rdns::clock::Clock::system(),
                 },
                 dir,
                 catalogs,
