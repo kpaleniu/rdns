@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21, #128 and #130**, as of 2026-09-27.
+**#21, #128, #130 and #135**, as of 2026-09-27. Triaging #128 found #135.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
 defect (#127, closed the same day) and three places where a module's
 interface is its callers' problem. Grooming those three found #131 and
@@ -6759,7 +6759,7 @@ untested. A line that says a thing is expensive is a claim to measure
 
 ---
 
-### 128. RFC 1035 §4.3.5's refresh cycle is written twice, and neither copy has a test — **filed 2026-09-27**, **needs-triage**
+### 128. RFC 1035 §4.3.5's refresh cycle is written twice, and neither copy has a test — **filed 2026-09-27**, **ready-for-agent**
 
 `rdnsd`'s `secondary_loop` (`rdnsd/src/replication.rs:383`, ~65 lines) and
 `rdnsr`'s `refresh_task` (`rdnsr/src/rpz_transfer.rs:157`, ~80 lines) are
@@ -6791,8 +6791,13 @@ sleep, the EXPIRE action once. `rdnsd` already enables `tokio`'s
 Refuting check taken: nothing decided this. `grep` for both function names
 and for `rpz_transfer` across `TODO.md` and `docs/CLOSED_WORK.md` finds only
 #20's table placing `secondary_loop`. 57d built two shapes for *where the
-zone goes*, not for the cycle. No drift found between the copies today:
-the timer difference in the table is two correct spellings of one rule.
+zone goes*, not for the cycle. ~~No drift found between the copies today:
+the timer difference in the table is two correct spellings of one rule.~~
+**Wrong, found triaging (#135):** the table compared the timers *after a
+success* and nothing before one. `rdnsd` reads them from the zone it holds,
+fetched or not; `rdnsr` starts from `RefreshTimers::default()`, whose EXPIRE
+is `u64::MAX`, and sets them only on a success. A resolver restarted with
+its master gone never reaches EXPIRE.
 
 No remedy named. The candidate a build would test is one cycle in
 `rdns::secondary` with the four differing rows as the caller's part. §19
@@ -6805,6 +6810,48 @@ master withdraws a zone the other keeps current. `rdnsr` has one master per
 feed and is not affected. A shared cycle would have to choose the contact
 key, so #131 goes first. **It went, and chose per zone** over the masters
 configured now (`StateFile::last_contact`).
+
+**Triaged 2026-09-27.** Three things the row did not have, each read in
+both loops:
+
+- **The copies have drifted twice.** #135, above. And `rdnsd` checks
+  `stop.is_set()` before each refresh while `rdnsr` does not: with a NOTIFY
+  and the stop both pending, `select!` picks at random, so `rdnsr` can
+  start a transfer after shutdown began and the drain waits for it. Minor,
+  not filed separately; a shared cycle carries the guard once.
+- **Paused time cannot reach EXPIRE in either loop.** Both read
+  `current_unix_timestamp` directly (`started_at` and
+  `expire_if_out_of_contact` in `rdnsd`, `last_contact` and
+  `expire_if_out_of_contact` in `rdnsr`), and `start_paused` moves tokio's
+  clock, not `SystemTime`. RETRY is floored at 60 s, so a real-time test
+  waits a minute per attempt. Either shape needs `rdns_core::clock::Clock`
+  passed in; `Clock::fixed` exists for this (#52).
+- **The harnesses exist.** `rdnsr`'s tests have `spawn_master`, which
+  records what it was asked; `rdnsd`'s have `two_masters`. `rdnsr` needs
+  `tokio` `test-util` as a dev-dependency, as `rdnsd` has.
+
+Remedy, in order:
+
+1. #135 first, with its own regression test, so neither shape starts from
+   a known-wrong copy.
+2. Thread a `Clock` into both loops. Needed by both shapes, so not part of
+   the choice.
+3. Build both shapes (§19): (A) one cycle in `rdns::secondary`, the
+   differing rows of the table plus "timers of what is held" as the
+   caller's part; (B) paused-time tests on each loop as it stands. Tests,
+   the same list for both: first transfer then the zone's REFRESH, not the
+   default hour; a failure then RETRY; a NOTIFY cutting the wait short;
+   `Busy` released across the sleep (`Shutdown::drain` returns during it);
+   the EXPIRE action once over several failures; a stop during a pending
+   NOTIFY starts no transfer.
+4. Choose on: whether (A) makes #135's question a required hook rather
+   than an initial value somebody picks, the diff each needs, and whether
+   (B)'s tests are two copies of one list. Keep both patches and put the
+   numbers here.
+
+What (A) does not buy, so it is not credited with it: the hook for the held
+zone's timers is still written per caller, and `rdnsr` could still answer
+it wrongly. It makes the question impossible to skip, not the answer right.
 
 ### 130. `answer_update` decides and replies in one pass, so its test surface is a TCP server — **filed 2026-09-27**, **needs-triage**
 
@@ -6834,6 +6881,36 @@ write is the open question; no remedy named.
 **Groomed 2026-09-27, nothing hidden.** The order in the code is #118's
 (zone, permission, then the rest). The replicated-zone REFUSED is a recorded
 deviation (#118 item 4: RFC 2136 §3.1.1 forwards, BIND and PowerDNS do).
+
+### 135. A restarted `rdnsr` whose master is gone never reaches EXPIRE — **filed 2026-09-27**, **bug**, **ready-for-agent**
+
+Found triaging #128. `refresh_task` (`rdnsr/src/rpz_transfer.rs:167`)
+starts from `RefreshTimers::default()` and assigns `timers` only in the
+`Ok` arm. The default's EXPIRE is `u64::MAX` ("a zone never reached cannot
+expire: there is nothing to withdraw"), and `has_expired` is never true
+against it (`secondary.rs` asserts `!timers.has_expired(0, u64::MAX)`).
+
+But a restarted resolver does hold something: the feed's file from the last
+run, loaded and enforced before the task is spawned. With its master gone,
+every attempt fails, EXPIRE never passes, and:
+
+- `on-expire = "lift"` never lifts: the stale rules are enforced forever.
+- `on-expire = "enforce"`, the default, never WARNs, and
+  `note_zone_transfer` is never called, so the age gauge is absent rather
+  than stale. The staleness alert #57d built `enforce` on does not fire.
+
+The comment on `last_contact` says "a resolver that has never reached its
+master expires on the same clock as one that lost contact", which holds
+only when no file is held. `rdnsd` gets this right because `zone_timers` reads the zone map,
+which holds the file.
+
+Read, not run: provoking it needs #128's `Clock`, or a minute of real time
+per RETRY.
+
+Remedy: initialise `timers` from the zone in force, as `fetch_and_write`'s
+`Refresh::Current` arm already does:
+`policy.in_force().held(zone).map(PolicyZone::zone).and_then(RefreshTimers::from_zone).unwrap_or_default()`.
+The regression test fails against the default.
 
 ---
 
