@@ -6835,7 +6835,7 @@ write is the open question; no remedy named.
 (zone, permission, then the rest). The replicated-zone REFUSED is a recorded
 deviation (#118 item 4: RFC 2136 §3.1.1 forwards, BIND and PowerDNS do).
 
-### 134. The denial cache can serve an older "no" over a newer "yes" — **filed 2026-09-27**, **bug**, **needs-triage**
+### 134. The denial cache can serve an older "no" over a newer "yes" — **filed 2026-09-27**, **bug**, **ready-for-agent**
 
 #133's shape in the RFC 8198 denial cache, found counting instances before
 closing #133. `handle_query` asks `synthesize_denial`
@@ -6863,6 +6863,40 @@ BIND does here was not checked. No remedy named.
 held for the name itself. Same cause, same fix site. #129 goes first.
 **#129 is done**: both arms are now in `Caches::lookup`
 (`rdnsr/src/caches.rs`), and the line numbers above are from before it.
+
+**Triaged 2026-09-27.** A third shape, neither of the two above: ask the
+exact-match caches first and synthesize only on a miss. It is what RFC 8198
+describes and what all three implementations do, read in their source:
+
+- RFC 8198 Appendix A: the validator, "in addition to checking to see if
+  the answer is in its cache before sending a query, checks to see whether
+  any cached and validated NSEC record denies the existence".
+- Unbound, `iterator.c` `processInitRequest`: `dns_cache_lookup`, then
+  `if(!msg && qstate->env->neg_cache && ...)` `val_neg_getmsg`.
+- BIND, `qpcache.c` `find`: `find_coveringnsec` only under
+  `if (result == DNS_R_PARTIALMATCH)`, i.e. the name has no node in the cache.
+- Knot Resolver, `lib/cache/peek.c` `peek_nosync`: "1a. exact name+type
+  match (can be negative ...)" returns `KR_STATE_DONE` before any NSEC or
+  wildcard lookup.
+
+The reason the code gives for the current order is wrong: "so it goes
+before the answer cache: a flood of random names under one zone costs one
+upstream query". A random name is not in the answer cache, so asking that
+cache first costs one hash lookup and still no upstream query. Going
+before *resolution* is what saves the upstream query.
+
+Remedy: in `Caches::lookup`, `negatives` then `answers` then the two
+synthesis arms, in that order. No store-side retiring and no `learned_at`
+on the proofs. Built as a probe and not kept: both instances answer from
+the answer cache, and 99 of `rdnsr`'s 100 tests pass unchanged. The one
+that fails is `a_cached_answer_costs_what_it_costs`, which reads 12 instead
+of 13 because a hit no longer asks the denial cache first. Move the bound
+to 12 and say so beside it.
+
+Not covered, and BIND does it: BIND does not synthesize for a name with any
+cached node, so data held for another type also blocks synthesis. Our
+caches key on (name, type), so a held AAAA does not stop a denial for A.
+That is RFC 8198 §4's accepted staleness, not this bug. Not filed.
 
 ---
 
