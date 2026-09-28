@@ -11750,3 +11750,83 @@ Not changed: `withdraw_unvouched_zones` reads the wall clock. It runs from
 `cargo doc` and `cargo fmt --check` clean.
 
 ---
+
+### 130. `answer_update` decides and replies in one pass, so its test surface is a TCP server — **filed 2026-09-27, closed 2026-09-28**
+
+`answer_update` (`rdnsd/src/dispatch.rs:1180-1441`) has 13 exits through
+`signed_error` (twelve refusals and the success), each with its own log
+line. The decision of which rcode and which EDE a request gets is RFC 2136
+§3.1-§3.4 plus the local policy: zone, permission, replicated, writable
+source, file, prerequisites. It is interleaved with the signing and
+logging, ~~so the only seam in front of it is the listening server:~~
+**wrong, see the triage: `testutil::answered` is a socketless seam**, and
+`spawn_updatable` / `updatable_server` / `listen_updatable` appear 16 times
+in the file, and each exit test is a TCP round trip against a temp
+directory.
+
+Evidence that the interleaving costs something: #118 was the check *order*
+disagreeing with the doc, and #119 found four exits no test reached, one of
+which answered REFUSED for a disk error. Both were found by reading.
+
+Refuting check taken, and it narrows the row: the transfer ladder in
+`answer_transfer` has the same shape (8 exits through
+`send_transfer_error`) and #119's table shows every branch tested, so it is
+not included. And the one exit #119 left untested, the `spawn_blocking`
+`JoinError`, is not reached by any restructuring of the decision either.
+What is left is the order and the rcode/EDE mapping as a table a test can
+enumerate. Whether that earns a type between `update::parse` and the file
+write is the open question; no remedy named.
+
+**Groomed 2026-09-27, nothing hidden.** The order in the code is #118's
+(zone, permission, then the rest). The replicated-zone REFUSED is a recorded
+deviation (#118 item 4: RFC 2136 §3.1.1 forwards, BIND and PowerDNS do).
+
+**Triaged 2026-09-28: no type.** Both halves of the row's case fail when
+measured.
+
+- **The seam exists.** `testutil::answered` calls `Server::answer` with no
+  socket. A signed UPDATE through it, built on `updatable_server`, came back
+  REFUSED with EDE 18 in 0.34 ms (probe, not kept). The TCP listener is what
+  the tests chose. It costs little either way: the eight UPDATE tests timed
+  through it each run in 27-30 ms, process start included.
+- **The evidence is not about interleaving.** #118 was a doc comment stating
+  an order the code did not follow; a type states an order no better than a
+  comment does. #119's disk error answered as REFUSED was
+  `file_for`'s `read_dir(dir).ok()?`, one call below this function, and a
+  table of rcodes would have mapped the wrong answer faithfully.
+- **Order is asserted already.** `an_unauthorized_update_is_refused_and_an_unknown_zone_is_notauth`
+  sends the NOTAUTH case unsigned and with a key scoped elsewhere, and
+  expects NOTAUTH for both.
+
+What is real is narrower: of the 13 exits, four have an EDE or an rcode that
+no test asserts at the answer.
+
+| exit | rcode asserted | EDE asserted |
+|---|---|---|
+| zone not served: NOTAUTH, `NOT_OUR_ZONE` | yes | **no** |
+| key scoped elsewhere: REFUSED, `NOT_YOURS` | yes | **no** (the EDE test sends it unsigned, the exit before) |
+| no writable source: REFUSED, `NOT_WRITABLE` | yes | **no** |
+| file not writable (`$INCLUDE`): REFUSED, the variant's EDE | **no** | **no** (`apply_update_to_file` returns the variant; nothing checks the reply) |
+
+The other exits: parse rejections pass `rejected.rcode` through and are
+covered by `rdns::update`'s 24 tests; unsigned, replicated, file gone,
+directory unreadable, unparsable file, prerequisite and success are asserted;
+`JoinError` is unreachable.
+
+Remedy: assert the four, through the existing harness or through `answered`
+if a new test needs no listener. `update_with_edns` already returns
+`(rcode, texts)`. No type between `update::parse` and the write.
+
+**Closed 2026-09-28** (`c0c4041`), by the remedy as written. The scoped
+key's, NOTAUTH's and no-source's rcode asserts now compare
+`(rcode, EDE texts)` through `update_with_edns`, which grew
+`update_of_with_edns` for the NOTAUTH zone.
+`an_update_to_a_zone_file_that_includes_another_says_so` sends the
+`$INCLUDE` case through the listener. Mutated one at a time — each of the
+four EDEs to `None`, the `$INCLUDE` rcode to SERVFAIL — each failed exactly
+one test.
+
+1 366 passed on Windows and 1 387 on Linux, 0 failed; clippy clean on both,
+`cargo doc` and `cargo fmt --check` clean.
+
+---

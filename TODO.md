@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21 and #130**, as of 2026-09-28.
+**#21**, as of 2026-09-28.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
 defect (#127, closed the same day) and three places where a module's
 interface is its callers' problem. Grooming those three found #131 and
@@ -45,7 +45,7 @@ interface is its callers' problem. Grooming those three found #131 and
 and closing #133 found #134.
 Checked and not filed: the transfer ladder (#130 says why), the `[server]`
 keys (#63h's macro), the two UDP loops (#30), the reload seam (#83, #112).
-#58, #68, #107-#129 and #131-#135 are closed. #117-#119 came out of a fourth
+#58, #68 and #107-#135 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
 #123 and #124 out of verifying #122, #125 out of closing #121, and #126 out
@@ -6759,75 +6759,6 @@ untested. A line that says a thing is expensive is a claim to measure
 
 ---
 
-
-### 130. `answer_update` decides and replies in one pass, so its test surface is a TCP server — **filed 2026-09-27**, **ready-for-agent**
-
-`answer_update` (`rdnsd/src/dispatch.rs:1180-1441`) has 13 exits through
-`signed_error` (twelve refusals and the success), each with its own log
-line. The decision of which rcode and which EDE a request gets is RFC 2136
-§3.1-§3.4 plus the local policy: zone, permission, replicated, writable
-source, file, prerequisites. It is interleaved with the signing and
-logging, ~~so the only seam in front of it is the listening server:~~
-**wrong, see the triage: `testutil::answered` is a socketless seam**, and
-`spawn_updatable` / `updatable_server` / `listen_updatable` appear 16 times
-in the file, and each exit test is a TCP round trip against a temp
-directory.
-
-Evidence that the interleaving costs something: #118 was the check *order*
-disagreeing with the doc, and #119 found four exits no test reached, one of
-which answered REFUSED for a disk error. Both were found by reading.
-
-Refuting check taken, and it narrows the row: the transfer ladder in
-`answer_transfer` has the same shape (8 exits through
-`send_transfer_error`) and #119's table shows every branch tested, so it is
-not included. And the one exit #119 left untested, the `spawn_blocking`
-`JoinError`, is not reached by any restructuring of the decision either.
-What is left is the order and the rcode/EDE mapping as a table a test can
-enumerate. Whether that earns a type between `update::parse` and the file
-write is the open question; no remedy named.
-
-**Groomed 2026-09-27, nothing hidden.** The order in the code is #118's
-(zone, permission, then the rest). The replicated-zone REFUSED is a recorded
-deviation (#118 item 4: RFC 2136 §3.1.1 forwards, BIND and PowerDNS do).
-
-**Triaged 2026-09-28: no type.** Both halves of the row's case fail when
-measured.
-
-- **The seam exists.** `testutil::answered` calls `Server::answer` with no
-  socket. A signed UPDATE through it, built on `updatable_server`, came back
-  REFUSED with EDE 18 in 0.34 ms (probe, not kept). The TCP listener is what
-  the tests chose. It costs little either way: the eight UPDATE tests timed
-  through it each run in 27-30 ms, process start included.
-- **The evidence is not about interleaving.** #118 was a doc comment stating
-  an order the code did not follow; a type states an order no better than a
-  comment does. #119's disk error answered as REFUSED was
-  `file_for`'s `read_dir(dir).ok()?`, one call below this function, and a
-  table of rcodes would have mapped the wrong answer faithfully.
-- **Order is asserted already.** `an_unauthorized_update_is_refused_and_an_unknown_zone_is_notauth`
-  sends the NOTAUTH case unsigned and with a key scoped elsewhere, and
-  expects NOTAUTH for both.
-
-What is real is narrower: of the 13 exits, four have an EDE or an rcode that
-no test asserts at the answer.
-
-| exit | rcode asserted | EDE asserted |
-|---|---|---|
-| zone not served: NOTAUTH, `NOT_OUR_ZONE` | yes | **no** |
-| key scoped elsewhere: REFUSED, `NOT_YOURS` | yes | **no** (the EDE test sends it unsigned, the exit before) |
-| no writable source: REFUSED, `NOT_WRITABLE` | yes | **no** |
-| file not writable (`$INCLUDE`): REFUSED, the variant's EDE | **no** | **no** (`apply_update_to_file` returns the variant; nothing checks the reply) |
-
-The other exits: parse rejections pass `rejected.rcode` through and are
-covered by `rdns::update`'s 24 tests; unsigned, replicated, file gone,
-directory unreadable, unparsable file, prerequisite and success are asserted;
-`JoinError` is unreachable.
-
-Remedy: assert the four, through the existing harness or through `answered`
-if a new test needs no listener. `update_with_edns` already returns
-`(rcode, texts)`. No type between `update::parse` and the write.
-
----
-
 ## Closed work
 
 One line each. The reasoning, the RFC citations and the verification are in the
@@ -6973,6 +6904,7 @@ the week; the record is under "How the queue kept going stale" in
 | **127** | a cached wildcard synthesis counted neither a hit nor a miss | **filed and closed 2026-09-27.** Found by the deepening sweep that filed #128-#130. `rdnsr`'s RFC 8198 §5.3 arm returned before `cache_hits`, where the other three arms answered from something held count one. One line; the test failed on 0 hits against the old arm. |
 | **128** | RFC 1035 §4.3.5's refresh cycle was written twice and neither copy was tested | **filed 2026-09-27, closed 2026-09-28.** Both shapes built: one cycle in `rdns::secondary` (A) against paused-time tests on each loop (B). A taken: B's tests need real loopback I/O under paused time and a 200 ms real-time quiet period, without which the REFRESH test passed the bug it was for, and they are the same six tests twice. The copies had drifted three times: #135, `rdnsr`'s missing stop guard, and the timers after an expiry. Branches `128-shape-a` and `128-shape-b` kept. See `docs/CLOSED_WORK.md` |
 | **129** | `Caches` sealed its write side and left the read order to its callers | **filed and closed 2026-09-27.** `Caches::lookup` holds the order; `handle_query` has one hit arm. Found doing it: `cached_or_resolve` asked `answers` before `negatives`, so DNS64 synthesized from an A a newer "no" had replaced. Regression test failed against the old order. See `docs/CLOSED_WORK.md` |
+| **130** | four UPDATE refusals had an EDE or rcode no test asserted | **filed 2026-09-27, closed 2026-09-28.** Filed as "decides and replies in one pass"; triage found the socketless seam existed and the evidence was not about interleaving, so no type. NOTAUTH's, the scoped key's and no-source's EDE and the `$INCLUDE` rcode and EDE are asserted at the reply; each mutated exit failed one test. See `docs/CLOSED_WORK.md` |
 | **131** | a zone with two masters was withdrawn when one of them was down | **filed and closed 2026-09-27.** Found grooming #128. EXPIRE and the startup/reload vouch read the sidecar per (zone, master); RFC 1034 §4.3.5, BIND and Knot count contact per zone. `StateFile::last_contact` over the masters configured now, so a line from a master no longer configured still vouches for nothing. Both regression tests failed against the per-master lookup. |
 | **132** | a stale lookup served an older "yes" over a newer "no" | **filed and closed 2026-09-27.** Found grooming #129. `Caches::stale` serves the later of the two by `learned_at` (RFC 8767 §4), deciding at read time because an NXDOMAIN is keyed by name and retiring on store would scan the answer cache. Covers other types at the name. Stale NXDOMAIN kept (RFC 8914 §4.20). Both regression tests failed with the "yes" asked first. |
 | **133** | the fresh path could serve an older "no" over a newer "yes" | **filed and closed 2026-09-27.** Found closing #132. `Caches::store` has an answer retire the NODATA for its question and the NXDOMAIN at its name and every ancestor (`NegativeCache::forget_refuted`), so asking `negatives` first is right by construction; one removal per label, no scan. The read side was not built. Both regression tests failed without the call. The denial cache has the same shape: #134. |
