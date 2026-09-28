@@ -217,7 +217,9 @@ static PROFILER: Mutex<()> = Mutex::new(());
 /// The first profiled block in a process picks up a one-off from dhat's own lazy
 /// state, so without the warm-up the first measurement reads one high.
 fn exclusive() -> std::sync::MutexGuard<'static, ()> {
-    let guard = PROFILER.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = PROFILER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     static WARMED: std::sync::Once = std::sync::Once::new();
     WARMED.call_once(|| {
         let profiler = dhat::Profiler::builder().testing().build();

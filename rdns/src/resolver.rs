@@ -27,6 +27,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -294,18 +295,15 @@ impl SharedAnchors {
     /// propagated: an anchor swap is a whole-value assignment, so the caller
     /// sees one of the two versions either way.
     pub fn get(&self) -> TrustAnchors {
-        match self.0.read() {
-            Ok(anchors) => anchors.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Put a new set in place.
     pub fn replace(&self, anchors: TrustAnchors) {
-        match self.0.write() {
-            Ok(mut held) => *held = anchors,
-            Err(poisoned) => *poisoned.into_inner() = anchors,
-        }
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = anchors;
     }
 }
 

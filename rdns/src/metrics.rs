@@ -11,7 +11,7 @@ use crate::Serial;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 
 use crate::ResponseCode;
@@ -729,7 +729,7 @@ impl DnsMetrics {
         // alert exists to catch (`CLAUDE.md` §14). A writer that panicked left a
         // valid, possibly out-of-date map — these hold `Copy` values, so nothing
         // is half-written.
-        let zones = self.zones.read().unwrap_or_else(|e| e.into_inner());
+        let zones = self.zones.read().unwrap_or_else(PoisonError::into_inner);
         declare(
             &mut out,
             "dns_zone_serial",
@@ -770,7 +770,7 @@ impl DnsMetrics {
         drop(zones);
 
         // As above.
-        let catalogs = self.catalogs.read().unwrap_or_else(|e| e.into_inner());
+        let catalogs = self.catalogs.read().unwrap_or_else(PoisonError::into_inner);
         if !catalogs.is_empty() {
             declare(
                 &mut out,

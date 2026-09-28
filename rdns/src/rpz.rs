@@ -51,7 +51,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 /// What a policy zone says to do with a query.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1138,10 +1138,7 @@ impl PolicyStore {
             )));
         };
         let indexed = Arc::new(PolicyZone::from_written(zone, feed.policy, written)?);
-        let mut offered = match self.offered.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut offered = self.offered.lock().unwrap_or_else(PoisonError::into_inner);
         // One per path and policy: an older offer for the same feed is a zone
         // the file no longer holds.
         offered.retain(|zone| !zone.was_read_from(path) || zone.policy != feed.policy);
@@ -1151,10 +1148,7 @@ impl PolicyStore {
 
     /// Everything offered since the last reload, leaving none behind.
     fn take_offered(&self) -> PolicyZones {
-        let mut offered = match self.offered.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut offered = self.offered.lock().unwrap_or_else(PoisonError::into_inner);
         PolicyZones {
             zones: std::mem::take(&mut offered),
         }
@@ -1172,10 +1166,10 @@ impl PolicyStore {
         // value behind. Recovering keeps the policy in force, where `unwrap`
         // would take the resolver off the air and a default would silently lift
         // every block (`CLAUDE.md` §4, §6).
-        match self.current.read() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Re-read every file and install the result.
@@ -1206,10 +1200,7 @@ impl PolicyStore {
             .filter(|zone| offered.zones().iter().any(|was| Arc::ptr_eq(zone, was)))
             .count();
         let reread = new.len() - installed;
-        let mut guard = match self.current.write() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut guard = self.current.write().unwrap_or_else(PoisonError::into_inner);
         let delegation_rules_changed = zones.delegation_versions() != guard.delegation_versions();
         *guard = zones.clone();
         Ok(Reloaded {

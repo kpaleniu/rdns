@@ -32,7 +32,7 @@ use crate::zone_scope::ZoneScope;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// Configuration for rate limiting
 #[derive(Debug, Clone)]
@@ -381,10 +381,10 @@ impl ResponseLimiter {
     /// decision path in this file states its failure policy in a comment; this
     /// one was the exception, and it is `TODO.md` #67g.
     pub fn tracked(&self) -> usize {
-        match self.clients.lock() {
-            Ok(clients) => clients.len(),
-            Err(poisoned) => poisoned.into_inner().len(),
-        }
+        self.clients
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     /// Drop clients that have been quiet long enough to have refilled anyway —

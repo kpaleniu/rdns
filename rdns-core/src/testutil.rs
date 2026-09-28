@@ -144,7 +144,9 @@ static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// next may run, and the alternative is every later one failing for a reason
 /// that is not theirs.
 pub fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
-    ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
+    ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// An allocator that tallies calls per thread, wrapping whichever one the test
