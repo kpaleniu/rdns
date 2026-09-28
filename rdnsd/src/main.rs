@@ -18,6 +18,9 @@
 
 // `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
 #![warn(unreachable_pub)]
+// `TODO.md` #143: `push_str(&format!(..))` allocates a `String` to copy it;
+// `write!` into the target does not. Off by default (restriction group).
+#![warn(clippy::format_push_string)]
 
 mod answer;
 /// Consuming catalog zones: what `--catalog` provisions (RFC 9432).
@@ -2622,6 +2625,7 @@ mod tests {
         /// A round-robin pool of `count` addresses, which is how both size
         /// tests below put an answer at a chosen weight.
         fn pool_zone(count: u32) -> Zone {
+            use std::fmt::Write as _;
             let mut text = String::from(
                 "$ORIGIN example.com.\n\
                  $TTL 3600\n\
@@ -2630,7 +2634,7 @@ mod tests {
                  ns1 IN A   192.0.2.1\n",
             );
             for i in 0..count {
-                text.push_str(&format!("pool IN A 198.51.100.{}\n", i % 254 + 1));
+                let _ = writeln!(text, "pool IN A 198.51.100.{}", i % 254 + 1);
             }
             rdns::zone::parse_zone_file(&text, "example.com.").expect("the zone parses")
         }
@@ -3488,11 +3492,12 @@ mod tests {
         /// the observer.
         #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
         async fn a_reload_does_not_block_the_runtime_it_was_called_from() {
+            use std::fmt::Write as _;
             // Enough parsing to take real time — the point is that whatever it
             // costs, it is not charged to the runtime.
             let mut records = String::new();
             for i in 0..4000 {
-                records.push_str(&format!("h{i} IN A 10.{}.{}.1\n", i / 256, i % 256));
+                let _ = writeln!(records, "h{i} IN A 10.{}.{}.1", i / 256, i % 256);
             }
             let dir = ScratchDir::new("reload-blocking");
             for zone in ["a", "b", "c", "d"] {

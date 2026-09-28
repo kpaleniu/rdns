@@ -138,13 +138,14 @@ mod tests {
     /// ~170 ms on the development machine, against the microseconds a test
     /// would otherwise measure.
     fn big_feed(dir: &ScratchDir, rules: usize) -> std::path::PathBuf {
+        use std::fmt::Write as _;
         let mut text = String::from(
             "$TTL 60\n\
              @ IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. 1 3600 600 86400 60\n\
              @ IN NS localhost.\n",
         );
         for i in 0..rules {
-            text.push_str(&format!("www.malware{i:07}.example IN CNAME .\n"));
+            let _ = writeln!(text, "www.malware{i:07}.example IN CNAME .");
         }
         dir.write("feed.rpz.invalid.zone", &text)
     }

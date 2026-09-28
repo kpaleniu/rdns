@@ -155,12 +155,13 @@ fn writing_a_record_as_text_borrows_it() {
 /// every machine (`CLAUDE.md` §10), and because the defect was allocation for
 /// allocation what it was in time: the scan built the two vectors it scanned.
 fn checking_one_rrset_does_not_read_the_whole_zone() {
+    use std::fmt::Write as _;
     let validator = DnssecValidator::new(true);
 
     let count_for = |hosts: usize| -> u64 {
         let mut text = String::from(ZONE);
         for i in 0..hosts {
-            text.push_str(&format!("host{i} IN A 192.0.2.9\n"));
+            let _ = writeln!(text, "host{i} IN A 192.0.2.9");
         }
         let zone = parse_zone_file(&text, "example.com.").expect("parse");
         let keys = vec![SigningKey::generate(
@@ -939,6 +940,7 @@ fn the_first_envelope_costs_the_same_however_big_the_zone_is(request: &DnsMessag
 
 /// A zone of `records` A records, all sharing one suffix, plus its apex SOA.
 fn big_zone(records: usize) -> rdns::zone::Zone {
+    use std::fmt::Write as _;
     let mut text = String::from(
         "$ORIGIN example.com.\n\
          $TTL 3600\n\
@@ -946,7 +948,7 @@ fn big_zone(records: usize) -> rdns::zone::Zone {
          @ IN NS  ns1.example.com.\n",
     );
     for i in 0..records {
-        text.push_str(&format!("h{i} IN A 192.0.2.{}\n", i % 254 + 1));
+        let _ = writeln!(text, "h{i} IN A 192.0.2.{}", i % 254 + 1);
     }
     parse_zone_file(&text, "example.com.").expect("parse")
 }

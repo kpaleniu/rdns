@@ -183,6 +183,7 @@ fn small_zone_text(origin: &str, serial: u32) -> String {
 
 /// One zone of `hosts` A records, in presentation form.
 fn big_zone_text(hosts: usize) -> String {
+    use std::fmt::Write as _;
     // Built outside every `measure`, and with its capacity up front, so none of
     // this is in a number below.
     let mut text = String::with_capacity(hosts * 48 + 256);
@@ -195,7 +196,7 @@ fn big_zone_text(hosts: usize) -> String {
     );
     for i in 0..hosts {
         let a = Ipv4Addr::new(192, 0, 2, (i % 254) as u8 + 1);
-        text.push_str(&format!("host{i} IN A {a}\n"));
+        let _ = writeln!(text, "host{i} IN A {a}");
     }
     text
 }

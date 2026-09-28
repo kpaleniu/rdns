@@ -2904,9 +2904,10 @@ deep.a.b IN TXT \"down here\"
     #[test]
     fn applying_deltas_forever_does_not_grow_the_index() {
         fn churn(rounds: u32) -> (usize, usize, usize, usize, usize, usize) {
+            use std::fmt::Write as _;
             let mut text = String::from("$TTL 3600\n@ IN SOA ns admin 1 3600 600 86400 300\n");
             for i in 0..1000 {
-                text.push_str(&format!("host{i:06} IN A 192.0.2.1\n"));
+                let _ = writeln!(text, "host{i:06} IN A 192.0.2.1");
             }
             // One name with an RRset, which is what leaves a list behind.
             text.push_str("many IN A 192.0.2.7\nmany IN A 192.0.2.8\n");
@@ -3078,9 +3079,10 @@ deep.a.b IN TXT \"down here\"
     #[test]
     fn parsing_does_not_cost_more_per_record_when_every_record_moves_the_origin() {
         fn parse(records: usize) -> std::time::Duration {
+            use std::fmt::Write as _;
             let mut text = String::from("$TTL 3600\n");
             for i in 0..records {
-                text.push_str(&format!("$ORIGIN s{i}.example.com.\nhost IN A 192.0.2.1\n"));
+                let _ = writeln!(text, "$ORIGIN s{i}.example.com.\nhost IN A 192.0.2.1");
             }
             let start = std::time::Instant::now();
             let zone = parse_zone_file(&text, "example.com.").expect("parses");

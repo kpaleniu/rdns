@@ -615,6 +615,7 @@ impl<'a> NameRef<'a> {
 /// two functions — `CLAUDE.md` §7 is about one rule written twice, not about
 /// two rules that resemble each other.
 fn escape_label(label: &[u8], out: &mut String) {
+    use std::fmt::Write as _;
     for &byte in label {
         match byte {
             b'.' | b'\\' | b';' | b'"' | b'(' | b')' | b'@' | b'$' => {
@@ -622,7 +623,9 @@ fn escape_label(label: &[u8], out: &mut String) {
                 out.push(byte as char);
             }
             0x21..=0x7e => out.push(byte as char),
-            other => out.push_str(&format!("\\{other:03}")),
+            other => {
+                let _ = write!(out, "\\{other:03}");
+            }
         }
     }
 }

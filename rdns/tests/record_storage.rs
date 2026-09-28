@@ -213,6 +213,7 @@ fn what_a_copy_is_made_of() {
 #[test]
 #[ignore = "minutes and a gigabyte"]
 fn what_a_feed_load_is_made_of() {
+    use std::fmt::Write as _;
     let _turn = rdns::testutil::one_at_a_time();
     refuse_debug();
     let rules = knob("RDNS_RECORDS", 1_000_000);
@@ -225,7 +226,7 @@ fn what_a_feed_load_is_made_of() {
          @ IN NS localhost.\n",
     );
     for i in 0..rules {
-        text.push_str(&format!("www.malware{i:07}.example IN CNAME .\n"));
+        let _ = writeln!(text, "www.malware{i:07}.example IN CNAME .");
     }
     let path = dir.join("feed.zone");
     std::fs::write(&path, &text).expect("the feed is written");

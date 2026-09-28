@@ -15,6 +15,9 @@
 // on two private assemblers. It does not answer #38's question; that sweep has
 // to be re-run by hand.
 #![warn(unreachable_pub)]
+// `TODO.md` #143: `push_str(&format!(..))` allocates a `String` to copy it;
+// `write!` into the target does not. Off by default (restriction group).
+#![warn(clippy::format_push_string)]
 
 pub use rdns_core::*;
 

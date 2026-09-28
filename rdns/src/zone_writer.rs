@@ -27,6 +27,7 @@ use crate::ParsedRecord;
 /// Fails only on a record this format cannot express — see the module docs; in
 /// practice that is an owner name needing escapes.
 pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
+    use std::fmt::Write as _;
     // A zone file runs to tens of megabytes and this grew from empty, so a
     // million-record zone was ~25 reallocations copying up to the whole file
     // each time. The estimate need not be right — being wrong costs one
@@ -37,8 +38,8 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
     out.push_str(&zone.origin().to_presentation());
     out.push_str(" — written by rdns. Owner names are absolute and every record\n");
     out.push_str("; states its own TTL, so no line here depends on any other.\n");
-    out.push_str(&format!("$ORIGIN {}\n", zone.origin().to_presentation()));
-    out.push_str(&format!("$TTL {}\n\n", default_ttl(zone)));
+    let _ = writeln!(out, "$ORIGIN {}", zone.origin().to_presentation());
+    let _ = writeln!(out, "$TTL {}\n", default_ttl(zone));
 
     // The SOA first, as a transfer sends it. The rest in the order the zone
     // holds them, so rewriting an unchanged zone produces an unchanged file —

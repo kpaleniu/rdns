@@ -348,16 +348,17 @@ mod tests {
     /// The "first message only" half of §2.2.5, which needs a zone that splits.
     #[test]
     fn only_the_first_envelope_of_a_split_transfer_carries_the_opt() {
+        use std::fmt::Write as _;
         let mut text = String::from(
             "$TTL 3600
 @ IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400
 ",
         );
         for i in 0..2_000 {
-            text.push_str(&format!(
-                "host-with-a-fairly-long-name-{i} IN TXT \"padding padding padding\"
-"
-            ));
+            let _ = writeln!(
+                text,
+                "host-with-a-fairly-long-name-{i} IN TXT \"padding padding padding\""
+            );
         }
         let zone = parse_zone_file(&text, "example.com.").unwrap();
 
@@ -379,14 +380,16 @@ mod tests {
     /// with the SOA at each end of the series.
     #[test]
     fn test_a_large_zone_is_split_across_messages() {
+        use std::fmt::Write as _;
         let mut text = String::from(
             "$TTL 3600\n@ IN SOA ns1.example.com. admin.example.com. 1 3600 1800 604800 86400\n",
         );
         // Long names, so the estimate crosses the target without a slow test.
         for i in 0..2_000 {
-            text.push_str(&format!(
-                "host-with-a-fairly-long-name-{i} IN TXT \"padding padding padding\"\n"
-            ));
+            let _ = writeln!(
+                text,
+                "host-with-a-fairly-long-name-{i} IN TXT \"padding padding padding\""
+            );
         }
         let zone = parse_zone_file(&text, "example.com.").unwrap();
 

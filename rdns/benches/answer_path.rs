@@ -379,9 +379,10 @@ fn dnssec(c: &mut Criterion) {
     // One RRset of 1 A record and one of 20, each signed once: everything but
     // the canonicalization is identical between them.
     for count in [1usize, 20] {
+        use std::fmt::Write as _;
         let mut text = String::from(ZONE);
         for i in 0..count {
-            text.push_str(&format!("many IN A 192.0.2.{}\n", i + 1));
+            let _ = writeln!(text, "many IN A 192.0.2.{}", i + 1);
         }
         let zone = parse_zone_file(&text, "example.com.").expect("parse the zone");
         let signed = sign_zone(&zone, &keys, &SigningPolicy::valid_for(now, 30 * 86_400))

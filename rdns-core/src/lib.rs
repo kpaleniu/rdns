@@ -9,6 +9,9 @@
 
 // `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
 #![warn(unreachable_pub)]
+// `TODO.md` #143: `push_str(&format!(..))` allocates a `String` to copy it;
+// `write!` into the target does not. Off by default (restriction group).
+#![warn(clippy::format_push_string)]
 
 /// This build, as `<package version> (<git describe>)`. Stamped by `build.rs`
 /// and passed to clap's `version` by every binary, so `--version` names a

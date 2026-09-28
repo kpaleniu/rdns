@@ -145,6 +145,7 @@ fn scratch(name: &str) -> PathBuf {
 /// A QNAME feed: the shape a blocklist actually has, which is what #61 and #62b
 /// measured against.
 fn feed_text(rules: usize) -> String {
+    use std::fmt::Write as _;
     let mut text = String::from(
         "$ORIGIN rpz.example.\n\
          $TTL 60\n\
@@ -152,7 +153,7 @@ fn feed_text(rules: usize) -> String {
          @ IN NS localhost.\n",
     );
     for i in 0..rules {
-        text.push_str(&format!("www.malware{i:07}.example IN CNAME .\n"));
+        let _ = writeln!(text, "www.malware{i:07}.example IN CNAME .");
     }
     text
 }

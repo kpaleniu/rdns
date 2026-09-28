@@ -1033,6 +1033,7 @@ impl Membership {
     }
 
     fn snapshot(&self) -> (PathBuf, String) {
+        use std::fmt::Write as _;
         let mut text = String::from(
             "# rdnsd catalog membership: member-zone member-node group\n\
              # Written by the server. Deleting this makes every member look like\n\
@@ -1042,12 +1043,13 @@ impl Membership {
              # that has it.\n",
         );
         for row in &self.rows {
-            text.push_str(&format!(
-                "{} {} {}\n",
+            let _ = writeln!(
+                text,
+                "{} {} {}",
                 row.zone,
                 row.node,
                 write_group(row.group.as_deref())
-            ));
+            );
         }
         (self.path.clone(), text)
     }
@@ -1149,13 +1151,14 @@ mod tests {
     /// A catalog zone at `origin`, at `serial`, listing `<id>.zones` -> zone
     /// pairs. `extra` is appended verbatim, which is how a test adds a property.
     fn catalog_zone(origin: &str, serial: u32, members: &[(&str, &str)], extra: &str) -> Zone {
+        use std::fmt::Write as _;
         let mut text = format!(
             "{origin} 0 SOA invalid. invalid. {serial} 3600 600 2147483646 0\n\
              {origin} 0 NS invalid.\n\
              version.{origin} 0 TXT \"2\"\n"
         );
         for (id, zone) in members {
-            text.push_str(&format!("{id}.zones.{origin} 0 PTR {zone}\n"));
+            let _ = writeln!(text, "{id}.zones.{origin} 0 PTR {zone}");
         }
         text.push_str(extra);
         parse_zone_file(&text, origin).expect("the catalog parses as a zone")

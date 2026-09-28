@@ -426,6 +426,7 @@ impl ManagedAnchors {
 
     /// The file's contents, ready to be written.
     pub fn format(&self) -> String {
+        use std::fmt::Write as _;
         // ASCII only: an editor reading UTF-8 as the ANSI codepage turns a
         // stray em-dash into mojibake.
         let mut out = String::from(
@@ -434,18 +435,20 @@ impl ManagedAnchors {
              ; annotation is read back as a key you have decided to trust.\n",
         );
         for ds in &self.ds {
-            out.push_str(&format!(
-                "{} IN DS {} {} {} {}\n",
+            let _ = writeln!(
+                out,
+                "{} IN DS {} {} {} {}",
                 ds.owner,
                 ds.key_tag,
                 ds.algorithm,
                 ds.digest_type,
                 hex_encode(&ds.digest)
-            ));
+            );
         }
         for tracked in &self.keys {
-            out.push_str(&format!(
-                "{} IN DNSKEY {} {} {} {} ;;state={} ;;since={} ;;tag={}\n",
+            let _ = writeln!(
+                out,
+                "{} IN DNSKEY {} {} {} {} ;;state={} ;;since={} ;;tag={}",
                 tracked.key.owner,
                 tracked.key.flags,
                 tracked.key.protocol,
@@ -453,8 +456,8 @@ impl ManagedAnchors {
                 base64_encode(&tracked.key.public_key),
                 tracked.state.as_str(),
                 tracked.since,
-                tracked.key.key_tag(),
-            ));
+                tracked.key.key_tag()
+            );
         }
         out
     }

@@ -339,6 +339,7 @@ fn comma_list(text: &str, name: &str, ln: usize) -> Result<Vec<String>, ZoneErro
 /// parameters that were fine, and returning `None` would put a "cannot write
 /// this" case into every caller for a record we can always write.
 pub(crate) fn present_params(params: &[(u16, Vec<u8>)]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     for (code, value) in params {
         if !out.is_empty() {
@@ -356,7 +357,7 @@ pub(crate) fn present_params(params: &[(u16, Vec<u8>)]) -> String {
             // parser reads it back as octets instead of trying the shape that
             // did not fit.
             None => {
-                out.push_str(&format!("key{code}"));
+                let _ = write!(out, "key{code}");
                 out.push_str("=\"");
                 out.push_str(&char_string_escaped(value));
                 out.push('"');

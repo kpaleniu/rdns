@@ -5,6 +5,7 @@
 //! `std` nor `tokio` exposes AF_UNIX on Windows, where `--control-socket` is
 //! refused at startup rather than accepted and ignored.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -278,8 +279,9 @@ async fn status(control: &Control) -> String {
         "zone                            serial  records  denial  role       catalog                   last contact\n",
     );
     for row in &rows {
-        out.push_str(&format!(
-            "{:<30}  {:>6}  {:>7}  {:<6}  {:<9}  {:<24}  {}\n",
+        let _ = writeln!(
+            out,
+            "{:<30}  {:>6}  {:>7}  {:<6}  {:<9}  {:<24}  {}",
             row.zone,
             row.serial,
             row.records,
@@ -299,7 +301,7 @@ async fn status(control: &Control) -> String {
                 // Not zero: a primary has no master to have heard from.
                 None => "-".to_string(),
             }
-        ));
+        );
     }
     if rows.is_empty() {
         out.push_str("(none — every query will be REFUSED)\n");
@@ -343,18 +345,20 @@ async fn catalog(args: &[String], control: &Control) -> String {
                 continue;
             }
         }
-        out.push_str(&format!(
-            "catalog {} from {}: {} member(s)\n",
+        let _ = writeln!(
+            out,
+            "catalog {} from {}: {} member(s)",
             report.catalog,
             report.master,
             report.members.len()
-        ));
+        );
         if report.members.is_empty() {
             out.push_str("  (none — the catalog has not been transferred, or lists nothing)\n");
         }
         for (zone, node, group) in &report.members {
-            out.push_str(&format!(
-                "  {:<30}  node {:<20}  group {}\n",
+            let _ = writeln!(
+                out,
+                "  {:<30}  node {:<20}  group {}",
                 zone.to_string(),
                 // The `<unique-N>` label alone: the rest of the node is the
                 // catalog, which the heading already said.
@@ -366,21 +370,23 @@ async fn catalog(args: &[String], control: &Control) -> String {
                     Some(value) => format!("{:?}", String::from_utf8_lossy(value)),
                     None => "-".to_string(),
                 }
-            ));
+            );
         }
         if report.refused.total > 0 {
-            out.push_str(&format!(
-                "  refused {} member(s) at the last reconcile:\n",
+            let _ = writeln!(
+                out,
+                "  refused {} member(s) at the last reconcile:",
                 report.refused.total
-            ));
+            );
             for (zone, why) in &report.refused.shown {
-                out.push_str(&format!("  ! {zone}: {why}\n"));
+                let _ = writeln!(out, "  ! {zone}: {why}");
             }
             if report.refused.total > report.refused.shown.len() {
-                out.push_str(&format!(
-                    "  ! ... and {} more, in the log\n",
+                let _ = writeln!(
+                    out,
+                    "  ! ... and {} more, in the log",
                     report.refused.total - report.refused.shown.len()
-                ));
+                );
             }
         }
     }

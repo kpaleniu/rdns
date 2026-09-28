@@ -2031,6 +2031,7 @@ mod tests {
     fn signed_zone_of(hosts: usize) -> (ZoneMap, usize) {
         use rdns::dnssec::DNSKEY_FLAG_ZONE;
         use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
+        use std::fmt::Write as _;
 
         let mut text = String::from(
             "$ORIGIN example.com.\n\
@@ -2040,7 +2041,7 @@ mod tests {
              ns1 IN A 192.0.2.1\n",
         );
         for i in 0..hosts {
-            text.push_str(&format!("host{i} IN A 192.0.2.2\n"));
+            let _ = writeln!(text, "host{i} IN A 192.0.2.2");
         }
         let zone = rdns::zone::parse_zone_file(&text, "example.com.").expect("parse");
         let key = SigningKey::generate(
@@ -2698,13 +2699,14 @@ ns1 IN A 192.0.2.1
         // to happen with every query waiting on it.
         const RECORDS: u32 = 6000;
         let version = |serial: u32, tail: u8| {
+            use std::fmt::Write as _;
             let mut text = format!(
                 "$TTL 3600\n\
                  @    IN SOA ns1.example.com. admin.example.com. {serial} 3600 1800 604800 86400\n\
                  @    IN NS  ns1.example.com.\n"
             );
             for i in 0..RECORDS {
-                text.push_str(&format!("h{i} IN A 10.{}.{}.{tail}\n", i / 256, i % 256));
+                let _ = writeln!(text, "h{i} IN A 10.{}.{}.{tail}", i / 256, i % 256);
             }
             rdns::zone::parse_zone_file(&text, "example.com.").expect("zone should parse")
         };

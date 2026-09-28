@@ -302,15 +302,17 @@ impl StateFile {
     /// The path and the exact contents [`StateFile::record`] would write, owned
     /// so they outlive the guard they were taken under.
     pub fn snapshot(&self) -> (PathBuf, String) {
+        use std::fmt::Write as _;
         let mut text = String::from(
             "# rdnsd transfer state: zone serial refreshed-at master\n\
              # Written by the server. Deleting this only costs a refresh.\n",
         );
         for entry in &self.entries {
-            text.push_str(&format!(
-                "{} {} {} {}\n",
+            let _ = writeln!(
+                text,
+                "{} {} {} {}",
                 entry.zone, entry.serial, entry.refreshed_at, entry.master
-            ));
+            );
         }
         (self.path.clone(), text)
     }

@@ -381,6 +381,7 @@ mod tests {
 
     /// A feed of two rules at `serial`, as a file's text.
     fn feed_text(serial: u32, rules: &[&str]) -> String {
+        use std::fmt::Write as _;
         let mut text = format!(
             "$ORIGIN block.example.\n\
              $TTL 60\n\
@@ -388,7 +389,7 @@ mod tests {
              @ IN NS localhost.\n"
         );
         for rule in rules {
-            text.push_str(&format!("{rule} IN CNAME .\n"));
+            let _ = writeln!(text, "{rule} IN CNAME .");
         }
         text
     }

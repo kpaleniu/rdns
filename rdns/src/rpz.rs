@@ -1351,6 +1351,7 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
     #[test]
     fn indexing_address_triggers_does_not_grow_quadratically() {
         fn feed(rules: usize) -> String {
+            use std::fmt::Write as _;
             let mut text = String::from(
                 "$TTL 60\n\
                  @ IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. 1 3600 600 86400 60\n\
@@ -1358,7 +1359,7 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
             );
             for i in 0..rules {
                 let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
-                text.push_str(&format!("32.{c}.{b}.{a}.10.rpz-ip IN CNAME .\n"));
+                let _ = writeln!(text, "32.{c}.{b}.{a}.10.rpz-ip IN CNAME .");
             }
             text
         }
@@ -1399,6 +1400,7 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
     #[test]
     fn a_query_costs_the_same_however_many_address_rules_the_feed_holds() {
         fn feed(rules: usize) -> String {
+            use std::fmt::Write as _;
             let mut text = String::from(
                 "$TTL 60\n\
                  @ IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. 1 3600 600 86400 60\n\
@@ -1406,7 +1408,7 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
             );
             for i in 0..rules {
                 let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
-                text.push_str(&format!("32.{c}.{b}.{a}.10.rpz-client-ip IN CNAME .\n"));
+                let _ = writeln!(text, "32.{c}.{b}.{a}.10.rpz-client-ip IN CNAME .");
             }
             text
         }
@@ -2004,6 +2006,7 @@ evil.example.com IN CNAME .
     /// the zone claims to be at, and whether it has anything to say about a
     /// delegation.
     fn feed(serial: u32, blocked: &str, nsdname: Option<&str>) -> String {
+        use std::fmt::Write as _;
         let mut text = format!(
             "$TTL 60\n\
              @ IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. {serial} 3600 600 86400 60\n\
@@ -2011,7 +2014,7 @@ evil.example.com IN CNAME .
              {blocked} IN CNAME .\n"
         );
         if let Some(ns) = nsdname {
-            text.push_str(&format!("{ns}.rpz-nsdname IN CNAME .\n"));
+            let _ = writeln!(text, "{ns}.rpz-nsdname IN CNAME .");
         }
         text
     }

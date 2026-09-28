@@ -700,15 +700,17 @@ pub struct Fetched {
 impl Fetched {
     /// How the version arrived, for the line an operator reads.
     pub fn how(&self) -> String {
+        use std::fmt::Write as _;
         match self.steps {
             None => ", sent in full".to_string(),
             Some(steps) => {
                 let mut how = format!(", {steps} incremental step(s)");
                 if self.missing_deletions > 0 {
-                    how.push_str(&format!(
+                    let _ = write!(
+                        how,
                         ", {} deletion(s) we did not hold",
                         self.missing_deletions
-                    ));
+                    );
                 }
                 how
             }
@@ -1953,6 +1955,7 @@ mod tests {
     /// silently — an unverified stream still parses into a good-looking zone.
     #[tokio::test]
     async fn test_a_signed_transfer_chains_macs_across_envelopes() {
+        use std::fmt::Write as _;
         let mut text = String::from(
             "$TTL 3600\n\
              @    IN SOA ns1.example.com. admin.example.com. 42 3600 1800 604800 86400\n\
@@ -1960,7 +1963,7 @@ mod tests {
         );
         // Past AXFR_TARGET_MESSAGE_SIZE several times over.
         for i in 0..1500 {
-            text.push_str(&format!("host{i:04}  IN A 192.0.2.1\n"));
+            let _ = writeln!(text, "host{i:04}  IN A 192.0.2.1");
         }
         let source = parse_zone_file(&text, "example.com.").expect("zone parses");
         let envelopes =

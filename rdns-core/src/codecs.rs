@@ -134,6 +134,7 @@ pub fn char_string_decode(text: &str) -> WireResult<Vec<u8>> {
 /// The quotes are the caller's to add: a value inside a comma-separated list
 /// is escaped the same way but not quoted individually.
 pub fn char_string_escaped(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len());
     for &byte in bytes {
         match byte {
@@ -142,7 +143,9 @@ pub fn char_string_escaped(bytes: &[u8]) -> String {
                 out.push(byte as char);
             }
             0x20..=0x7e => out.push(byte as char),
-            other => out.push_str(&format!("\\{other:03}")),
+            other => {
+                let _ = write!(out, "\\{other:03}");
+            }
         }
     }
     out

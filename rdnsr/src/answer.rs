@@ -3605,6 +3605,7 @@ mod tests {
 
     /// A policy feed with one QNAME rule, and optionally a nameserver rule.
     fn feed(serial: u32, blocked: &str, nsdname: Option<&str>) -> String {
+        use std::fmt::Write as _;
         let mut text = format!(
             "$TTL 60\n\
              @ IN SOA ns.rpz.invalid. hostmaster.rpz.invalid. {serial} 3600 600 86400 60\n\
@@ -3612,7 +3613,7 @@ mod tests {
              {blocked} IN CNAME .\n"
         );
         if let Some(ns) = nsdname {
-            text.push_str(&format!("{ns}.rpz-nsdname IN CNAME .\n"));
+            let _ = writeln!(text, "{ns}.rpz-nsdname IN CNAME .");
         }
         text
     }

@@ -3451,13 +3451,14 @@ www IN A   192.0.2.10
     /// A zone of `records` `A` records under `example.com.`, the fixture both
     /// cost measurements below build.
     fn cost_fixture(records: usize) -> Zone {
+        use std::fmt::Write as _;
         let mut text = String::from("$ORIGIN example.com.\n$TTL 3600\n");
         text.push_str("@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n");
         text.push_str("@ IN NS ns.example.com.\n");
         text.push_str("ns IN A 192.0.2.1\n");
         for i in 0..records {
             let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
-            text.push_str(&format!("h{i} IN A 10.{a}.{b}.{c}\n"));
+            let _ = writeln!(text, "h{i} IN A 10.{a}.{b}.{c}");
         }
         parse_zone_file(&text, ORIGIN).expect("the fixture parses")
     }

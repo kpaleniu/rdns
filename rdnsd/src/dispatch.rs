@@ -1879,6 +1879,7 @@ pub(crate) mod tests {
 
     /// A zone of `records` A records under one apex, for the benchmarks.
     pub(crate) fn zone_text(records: usize) -> String {
+        use std::fmt::Write as _;
         let mut text = String::new();
         text.push_str("$TTL 3600\n");
         text.push_str("@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n");
@@ -1886,7 +1887,7 @@ pub(crate) mod tests {
         text.push_str("ns IN A 192.0.2.1\n");
         for i in 0..records {
             let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
-            text.push_str(&format!("h{i} IN A 10.{a}.{b}.{c}\n"));
+            let _ = writeln!(text, "h{i} IN A 10.{a}.{b}.{c}");
         }
         text
     }
@@ -2233,6 +2234,7 @@ pub(crate) mod tests {
             "records", "unsigned", "signed", "incr-sign", "verify", "full-sign", "carried"
         );
         for records in [10_000usize, 100_000, 1_000_000] {
+            use std::fmt::Write as _;
             let mut text = String::from("$TTL 3600\n");
             text.push_str(
                 "@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n",
@@ -2241,7 +2243,7 @@ pub(crate) mod tests {
             text.push_str("ns IN A 192.0.2.1\n");
             for i in 0..records {
                 let (a, b, c) = ((i >> 16) & 0xff, (i >> 8) & 0xff, i & 0xff);
-                text.push_str(&format!("h{i} IN A 10.{a}.{b}.{c}\n"));
+                let _ = writeln!(text, "h{i} IN A 10.{a}.{b}.{c}");
             }
             let path = dir.join("example.com.zone");
             std::fs::write(&path, &text).expect("write the fixture");
@@ -2906,6 +2908,7 @@ pub(crate) mod tests {
         /// reliably still in flight when the stop arrives. One message would make
         /// this test pass for the wrong reason.
         fn big_zone() -> Zone {
+            use std::fmt::Write as _;
             let mut text = String::from(
                 "$ORIGIN example.com.\n\
                  $TTL 3600\n\
@@ -2914,12 +2917,13 @@ pub(crate) mod tests {
                  ns1 IN A   192.0.2.1\n",
             );
             for i in 0..4000 {
-                text.push_str(&format!(
-                    "host{i} IN A 10.{}.{}.{}\n",
+                let _ = writeln!(
+                    text,
+                    "host{i} IN A 10.{}.{}.{}",
                     (i >> 16) & 255,
                     (i >> 8) & 255,
                     i & 255
-                ));
+                );
             }
             rdns::zone::parse_zone_file(&text, "example.com.").expect("the big zone parses")
         }
