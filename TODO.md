@@ -37,7 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21**, as of 2026-09-28.
+**#21** and **#136**, as of 2026-09-28.
+#136 came out of a review asking where injecting a dependency would deepen a
+module: the resolver's outbound exchange is the one left that is not
+injected. Grooming it took three of the review's six claimed gains away.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
 defect (#127, closed the same day) and three places where a module's
 interface is its callers' problem. Grooming those three found #131 and
@@ -6694,6 +6697,76 @@ refused however small the zone, and was watched failing against the unfixed
 predicate — where it transferred the whole fixture. 1 302 tests on Windows
 (1 300 before) and 1 323 on Linux, clippy clean on both, `cargo doc` and
 `cargo fmt --check` clean.
+
+---
+
+### 136. The resolver's tests reach it only through a loopback hierarchy — **filed and groomed 2026-09-28**, **needs-triage**
+
+From a review asking where injecting a dependency would deepen a module. The
+one dependency still constructed inside the module that decides what to send is
+outbound I/O: `query_server` and `query_upstream_tcp`
+(`rdns/src/resolver/recurse.rs:538-632`) bind and connect for themselves, and
+`ask_any` is their only caller. Every test of the walk — referral, glueless,
+CNAME, DNSSEC chain, QNAME minimisation — stands up real servers on loopback.
+
+What that costs, measured:
+
+- **`ResolverConfig::server_port` is a `pub` field that exists for tests.**
+  Its doc says so ("configurable only so tests can run an unprivileged
+  hierarchy"). No production path sets it (`rdnsr/src/main.rs:578` takes the
+  default); `recursing_config` and one `rdnsr` test do.
+- **Eleven hand-written fake-server loops in two crates, in three styles**:
+  `spawn_server` (a task, #123's fix), seven one-shot blocking threads in
+  `resolver.rs` (`:2379-2711`), and three in `rdnsr` (`answer.rs:2956`,
+  `:3044`, `testutil.rs:299`). Two port-scanning binders sit under them:
+  `bind_fake_upstream` (7 callers, UDP and TCP on one port) and
+  `bind_hierarchy` (21 callers, one port across `127.0.0.1`-`.8`), both
+  because of `server_port` and Windows' per-protocol exclusion ranges
+  (the ephemeral-port trap under "Running the Linux half by hand").
+- **One behaviour has no end-to-end test**: `ask_any` orders servers
+  fastest-first. `RttStore` is tested alone (`caches.rs:317-457`), and
+  through the resolver only a *failing* server's demotion is
+  (`test_rtt_selection_skips_a_failing_server_after_the_first_try`). Latency
+  on loopback is a sleep, which §10 rules out.
+
+Refuting checks taken, and three of the review's six claimed gains did not
+survive them:
+
+- **Speed is not a cost.** `rdns`'s 72 resolver tests run in 0.49 s and
+  `rdnsr`'s 101 in 2.01 s (Windows). `silent_resolver`'s ten callers do not
+  wait out its 10 s timeout.
+- **Query counts are asserted already**: 11 `AtomicUsize` counters in
+  `resolver.rs`'s fakes and `rdnsr`'s `SignedZone::upstream`. A recorded
+  exchange log would be a second way to do what is done.
+- **The eight-alias ceiling does not bind.** No hierarchy test uses more than
+  three servers.
+- **Flakes**: #123 was the last, and its fix is in `spawn_server`. The seven
+  one-shot threads block without `SO_RCVTIMEO`, which is not #123's shape.
+
+What a port could not replace, so the loopback tests of it stay whatever is
+chosen: family-matched bind (`test_forwarding_reaches_an_ipv6_upstream`), the
+connected socket's source filter, the receive buffer, and a real TC→TCP
+retry with its framing (`test_tcp_fallback_on_truncated_udp_response`).
+
+And one thing a port does not buy by itself: `ask_any` times with
+`std::time::Instant`, which `tokio`'s paused clock does not move. An
+end-to-end RTT test through an in-memory adapter needs `tokio::time::Instant`
+there as well.
+
+No remedy named. What is left is `server_port` and the eleven fakes, and they
+have separate candidate answers, which is why §19 says build them rather
+than argue:
+
+- a port under `ask_any` (address, transport, bytes in; bytes out) with a
+  socket adapter and an in-memory table, which removes `server_port` and the
+  binders;
+- one shared fake in `rdns_core::testutil`, which removes the drift across
+  eleven loops and leaves `server_port` where it is;
+- neither: #130 closed the same way, a seam asked for and the tests' cost
+  measured as small.
+
+The measurement that decides between them is what the first two cost in
+interface and in test lines, against the one `pub` field and the eleven loops.
 
 ---
 
