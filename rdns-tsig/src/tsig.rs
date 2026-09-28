@@ -1065,6 +1065,15 @@ fn read_name(data: &[u8]) -> Option<(String, &[u8])> {
     Some((name.as_ref().to_presentation(), rest))
 }
 
+/// Whether two spellings name one key, as [`TsigKeyring::by_name`] decides it.
+///
+/// For a config check that runs before there is a keyring to ask. Its own
+/// comparison, `eq_ignore_ascii_case` on the text, refused `#partner.key` for
+/// `[keys."partner.key."]`, which the flags accept (`TODO.md` #141).
+pub fn same_key_name(a: &str, b: &str) -> bool {
+    canonical_key_name(a) == canonical_key_name(b)
+}
+
 /// A key name as compared and hashed: absolute and down-cased, because it is a
 /// domain name (RFC 4343).
 fn canonical_key_name(name: &str) -> String {

@@ -424,9 +424,7 @@ impl Config {
                 let spec = rdns::secondary::MasterSpec::parse(&format!("{zone}@{master}"))
                     .map_err(|e| anyhow::anyhow!("zone {zone:?}: {e}"))?;
                 if let Some(key) = &spec.key_name {
-                    if !self.keys.contains_key(key)
-                        && !self.keys.keys().any(|k| k.eq_ignore_ascii_case(key))
-                    {
+                    if !self.keys.keys().any(|k| rdns::tsig::same_key_name(k, key)) {
                         bail!(
                             "zone {zone:?} replicates from {master:?}, but no [keys.{key:?}] \
                              defines that key"
@@ -469,9 +467,7 @@ impl Config {
                     let spec = rdns::secondary::MasterSpec::parse(&format!("{zone}@{master}"))
                         .map_err(|e| anyhow::anyhow!("zone {zone:?}, group {group:?}: {e}"))?;
                     if let Some(key) = &spec.key_name {
-                        if !self.keys.contains_key(key)
-                            && !self.keys.keys().any(|k| k.eq_ignore_ascii_case(key))
-                        {
+                        if !self.keys.keys().any(|k| rdns::tsig::same_key_name(k, key)) {
                             bail!(
                                 "zone {zone:?}, group {group:?}: no [keys.{key:?}] defines \
                                  the key {master:?} names"
@@ -1133,6 +1129,36 @@ masters = ["192.0.2.1#missing.key."]
         )
         .expect_err("an undefined key must not load");
         assert!(err.to_string().contains("missing.key."), "got: {err}");
+    }
+
+    /// A master's `#key` matches a `[keys.*]` entry as the keyring matches it:
+    /// as a domain name, so the trailing dot and the case are not the key. The
+    /// check compared text, refusing `#partner.key` for `partner.key.`, which
+    /// the flags accept (`TODO.md` #141).
+    #[test]
+    fn a_key_reference_matches_as_the_keyring_does() {
+        for (defined, named) in [
+            ("partner.key.", "partner.key"),
+            ("partner.key", "partner.key."),
+            ("Partner.Key.", "partner.KEY"),
+        ] {
+            parse(&format!(
+                r#"
+[server]
+zone-dir = "./zones"
+[keys."{defined}"]
+secret = "AAECAwQFBgcICQoLDA0ODw=="
+[zones."example.com."]
+masters = ["192.0.2.1#{named}"]
+[zones."catalog.invalid."]
+masters = ["192.0.2.1"]
+catalog = true
+[zones."catalog.invalid.".groups."operator-x"]
+masters = ["192.0.2.9#{named}"]
+"#
+            ))
+            .unwrap_or_else(|e| panic!("{defined} / #{named}: {e}"));
+        }
     }
 
     #[test]

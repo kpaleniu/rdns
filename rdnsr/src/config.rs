@@ -336,22 +336,19 @@ impl Config {
         // Named by its file rather than by its index: an operator reading this
         // has the file open at the feed, not at the third table.
         for feed in &self.rpz.feeds {
-            if let Some(master) = &feed.master {
-                MasterSpec::parse(master)
-                    .map_err(|e| anyhow::anyhow!("rpz.feeds master {master:?}: {e}"))?;
-            }
-            if let Some(key) = feed
+            let spec = feed
                 .master
                 .as_deref()
-                .and_then(|m| MasterSpec::parse(m).ok())
-                .and_then(|spec| spec.key_name)
-            {
+                .map(|master| {
+                    MasterSpec::parse(master)
+                        .map_err(|e| anyhow::anyhow!("rpz.feeds master {master:?}: {e}"))
+                })
+                .transpose()?;
+            if let Some(key) = spec.and_then(|spec| spec.key_name) {
                 // A key name that names nothing is a transfer the operator
                 // believes is signed and is not (§15) — `rdnsd` refuses the
                 // same way for `[zones.*].masters`.
-                if !self.keys.contains_key(&key)
-                    && !self.keys.keys().any(|k| k.eq_ignore_ascii_case(&key))
-                {
+                if !self.keys.keys().any(|k| rdns::tsig::same_key_name(k, &key)) {
                     bail!(
                         "rpz.feeds {} transfers with key {key:?}, and no [keys.{key:?}] \
                          defines it",
@@ -980,6 +977,27 @@ master = \"a.example.@192.0.2.9\"
         )
         .expect_err("an unknown value");
         assert!(err.to_string().contains("unknown on-expire"), "got: {err}");
+    }
+
+    /// Matched as the keyring matches, not as text: `#partner.key` for
+    /// `partner.key.` was refused here and resolves through the flags
+    /// (`TODO.md` #141).
+    #[test]
+    fn a_feed_key_reference_matches_as_the_keyring_does() {
+        for (defined, named) in [
+            ("partner.key.", "partner.key"),
+            ("Partner.Key", "partner.KEY."),
+        ] {
+            parse(&format!(
+                "[keys.\"{defined}\"]
+                 secret = \"c2VjcmV0\"
+                 [[rpz.feeds]]
+                 file = \"block.zone\"
+                 master = \"block.example.@192.0.2.9#{named}\"
+"
+            ))
+            .unwrap_or_else(|e| panic!("{defined} / #{named}: {e}"));
+        }
     }
 
     /// #57f: a feed's master may name a key, and a name that defines nothing is
