@@ -19,7 +19,7 @@ use crate::codecs::hex_decode;
 use crate::denial_wire::base32hex_decode;
 use crate::error::ZoneError;
 use crate::record_types as rt;
-use crate::{NameRef, ParsedRecord, RecordData, Serial};
+use crate::{Name, NameRef, ParsedRecord, RecordData, Serial};
 use rdns_present::dnssec_time::parse_dnssec_time;
 use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -101,6 +101,27 @@ fn split_svcb_head<'a>(
     Ok((priority, target.to_string(), rest))
 }
 
+/// RDATA that is one `<domain-name>` (RFC 1035 §3.3), which is one field.
+/// Reading the joined text instead folded a stray field into the name as a
+/// label with a space in it (`TODO.md` #147).
+fn one_name(
+    record_type: &str,
+    fields: &[Cow<'_, str>],
+    origin: NameRef<'_>,
+    ln: usize,
+) -> Result<Name, ZoneError> {
+    match fields {
+        [name] => name_at(name, origin, ln),
+        _ => Err(ZoneError::syntax(
+            ln,
+            format!(
+                "{record_type} record needs one name, got {} fields",
+                fields.len()
+            ),
+        )),
+    }
+}
+
 /// The RDATA half of a zone-file line: everything after the owner name, TTL,
 /// class and type have been read off it. Pure, unlike `super::parse`'s
 /// `parse_into`, which
@@ -133,22 +154,24 @@ pub(super) fn rdata_from_fields(
             })?;
             ParsedRecord::AAAA(addr)
         }
-        "NS" => ParsedRecord::NS(name_at(&rdata, origin, ln)?),
-        "CNAME" => ParsedRecord::CNAME(name_at(&rdata, origin, ln)?),
+        "NS" => ParsedRecord::NS(one_name(record_type, fields, origin, ln)?),
+        "CNAME" => ParsedRecord::CNAME(one_name(record_type, fields, origin, ln)?),
         "MX" => {
-            let mx_parts: Vec<&str> = rdata.split_whitespace().collect();
-            if mx_parts.len() < 2 {
+            let [preference, exchange] = fields else {
                 return Err(ZoneError::syntax(
                     ln,
-                    format!("MX record needs preference and exchange, got {:?}", rdata),
+                    format!(
+                        "MX record needs preference and exchange, got {} fields",
+                        fields.len()
+                    ),
                 ));
-            }
-            let preference = mx_parts[0].parse::<u16>().map_err(|e| {
-                ZoneError::syntax(ln, format!("invalid MX preference {:?}: {e}", mx_parts[0]))
+            };
+            let preference = preference.parse::<u16>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid MX preference {preference:?}: {e}"))
             })?;
             ParsedRecord::MX {
                 preference,
-                exchange: name_at(&mx_parts[1..].join(" "), origin, ln)?,
+                exchange: name_at(exchange, origin, ln)?,
             }
         }
         "TXT" => {
@@ -165,8 +188,8 @@ pub(super) fn rdata_from_fields(
             }
             ParsedRecord::TXT(strings)
         }
-        "PTR" => ParsedRecord::PTR(name_at(&rdata, origin, ln)?),
-        "DNAME" => ParsedRecord::DNAME(name_at(&rdata, origin, ln)?),
+        "PTR" => ParsedRecord::PTR(one_name(record_type, fields, origin, ln)?),
+        "DNAME" => ParsedRecord::DNAME(one_name(record_type, fields, origin, ln)?),
         // One arm for two type codes: "the same encoding, format, and
         // high-level semantics" (RFC 9460 §6). Only the owner name differs
         // between them, and that is the caller's (§9.1).
@@ -201,31 +224,30 @@ pub(super) fn rdata_from_fields(
             }
         }
         "SOA" => {
-            let soa_parts: Vec<&str> = rdata.split_whitespace().collect();
-            if soa_parts.len() < 7 {
+            let [mname, rname, serial, refresh, retry, expire, minimum] = fields else {
                 return Err(ZoneError::syntax(
                     ln,
-                    format!("SOA record needs 7 fields, got {}", soa_parts.len()),
+                    format!("SOA record needs 7 fields, got {}", fields.len()),
                 ));
-            }
-            let serial = soa_parts[2].parse::<Serial>().map_err(|e| {
-                ZoneError::syntax(ln, format!("invalid SOA serial {:?}: {e}", soa_parts[2]))
+            };
+            let serial = serial.parse::<Serial>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid SOA serial {serial:?}: {e}"))
             })?;
-            let refresh = soa_parts[3].parse::<i32>().map_err(|e| {
-                ZoneError::syntax(ln, format!("invalid SOA refresh {:?}: {e}", soa_parts[3]))
+            let refresh = refresh.parse::<i32>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid SOA refresh {refresh:?}: {e}"))
             })?;
-            let retry = soa_parts[4].parse::<i32>().map_err(|e| {
-                ZoneError::syntax(ln, format!("invalid SOA retry {:?}: {e}", soa_parts[4]))
+            let retry = retry
+                .parse::<i32>()
+                .map_err(|e| ZoneError::syntax(ln, format!("invalid SOA retry {retry:?}: {e}")))?;
+            let expire = expire.parse::<i32>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid SOA expire {expire:?}: {e}"))
             })?;
-            let expire = soa_parts[5].parse::<i32>().map_err(|e| {
-                ZoneError::syntax(ln, format!("invalid SOA expire {:?}: {e}", soa_parts[5]))
-            })?;
-            let minimum = soa_parts[6].parse::<u32>().map_err(|e| {
-                ZoneError::syntax(ln, format!("invalid SOA minimum {:?}: {e}", soa_parts[6]))
+            let minimum = minimum.parse::<u32>().map_err(|e| {
+                ZoneError::syntax(ln, format!("invalid SOA minimum {minimum:?}: {e}"))
             })?;
             ParsedRecord::SOA {
-                mname: name_at(soa_parts[0], origin, ln)?,
-                rname: name_at(soa_parts[1], origin, ln)?,
+                mname: name_at(mname, origin, ln)?,
+                rname: name_at(rname, origin, ln)?,
                 serial,
                 refresh,
                 retry,

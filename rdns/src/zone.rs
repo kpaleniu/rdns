@@ -3538,6 +3538,58 @@ $TTL 3600
         assert!(parse_dnssec_time("99991231235959").is_err(), "far past");
     }
 
+    /// A `<domain-name>` in RDATA is one field (RFC 1035 §3.3). NS, CNAME,
+    /// PTR, DNAME and MX joined what followed into it, so `NS ns1.example.com.
+    /// junk` served `ns1.example.com.\032junk.example.com.`, and SOA dropped
+    /// an eighth field unread (`TODO.md` #147).
+    #[test]
+    fn a_field_past_the_rdata_is_refused_rather_than_joined_into_a_name() {
+        let soa = "@ 3600 IN SOA ns. h. 1 2 3 4 5\n";
+        for (line, record) in [
+            ("@ IN NS ns1.example.com. junk", "NS"),
+            ("x IN CNAME a.example.com. junk", "CNAME"),
+            ("x IN PTR a.example.com. junk", "PTR"),
+            ("x IN DNAME a.example.com. junk", "DNAME"),
+            ("@ IN MX 10 mail.example.com. junk", "MX"),
+        ] {
+            let err = parse_zone_file(&format!("{soa}{line}\n"), "example.com.").expect_err(record);
+            assert!(
+                matches!(err, ZoneError::Syntax { line: 2, .. }),
+                "{record}: {err}"
+            );
+        }
+        let err =
+            parse_zone_file("@ 3600 IN SOA ns. h. 1 2 3 4 5 6\n", "example.com.").expect_err("SOA");
+        assert!(
+            matches!(err, ZoneError::Syntax { line: 1, .. }),
+            "SOA: {err}"
+        );
+    }
+
+    /// An escaped or quoted space is inside a field, so MX and SOA read it as
+    /// the one label CNAME always did. SOA split the joined text on
+    /// whitespace and refused it.
+    #[test]
+    fn an_escaped_space_in_an_mx_or_soa_name_is_one_label() {
+        let zone = parse_zone_file(
+            "@ 3600 IN SOA \"ns one.example.com.\" h. 1 2 3 4 5\n\
+             @ IN MX 10 mail\\ x.example.com.\n",
+            "example.com.",
+        )
+        .expect("both parse");
+        let origin = nm("example.com.");
+        let soa = zone.query(origin.as_ref(), Qtype::of(rt::SOA));
+        let Ok(ParsedRecord::SOA { mname, .. }) = soa[0].rdata.parse() else {
+            panic!("an SOA");
+        };
+        assert_eq!(mname, nm("ns\\032one.example.com."));
+        let mx = zone.query(origin.as_ref(), Qtype::of(rt::MX));
+        let Ok(ParsedRecord::MX { exchange, .. }) = mx[0].rdata.parse() else {
+            panic!("an MX");
+        };
+        assert_eq!(exchange, nm("mail\\032x.example.com."));
+    }
+
     /// The RDATA half is a pure function: a type's field handling is testable
     /// without a zone file, an origin, a TTL and an owner name around it. Not a
     /// regression test.
