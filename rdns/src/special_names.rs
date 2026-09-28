@@ -126,8 +126,7 @@ struct Table {
 }
 
 fn table() -> &'static Table {
-    static TABLE: std::sync::OnceLock<Table> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| {
+    static TABLE: std::sync::LazyLock<Table> = std::sync::LazyLock::new(|| {
         let parse = |text: &str| {
             Name::from_presentation(text).expect("a name written out in this file parses")
         };
@@ -139,7 +138,8 @@ fn table() -> &'static Table {
             invalid: parse("invalid."),
             private_reverse: PRIVATE_REVERSE_ZONES.iter().copied().map(parse).collect(),
         }
-    })
+    });
+    &TABLE
 }
 
 /// Reverse zones for address space that is not globally unique, so a name in one
@@ -197,7 +197,7 @@ fn positive(qname: NameRef<'_>, rdata: RecordData, why: &'static str) -> LocalAn
         rcode: ResponseCode::Ok,
         answers: vec![ResourceRecord {
             name: qname.to_owned(),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: LOCAL_TTL,
             rdata,
         }],
@@ -251,7 +251,7 @@ fn synthetic_soa(zone: NameRef<'_>) -> Option<ResourceRecord> {
     .ok()?;
     Some(ResourceRecord {
         name: zone.to_owned(),
-        class: Class::new(1),
+        class: Class::IN,
         ttl: LOCAL_TTL,
         rdata,
     })

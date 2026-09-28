@@ -260,7 +260,7 @@ impl DelegationEvidence {
             .filter(|rr| rr.name.as_ref() == zone)
             .collect();
         DelegationEvidence {
-            class: relevant.first().map(|rr| rr.class).unwrap_or(Class::new(1)),
+            class: relevant.first().map_or(Class::IN, |rr| rr.class),
             ds: relevant
                 .iter()
                 .filter_map(|rr| Ds::from_record(rr))
@@ -401,7 +401,7 @@ impl<'a> ChainValidator<'a> {
             .filter(|rr| rr.rdata.rtype() == rt::DNSKEY && rr.name.as_ref() == zone)
             .map(|rr| rr.rdata.clone())
             .collect();
-        let class = records.first().map(|rr| rr.class).unwrap_or(Class::new(1));
+        let class = records.first().map_or(Class::IN, |rr| rr.class);
         let rrsigs: Vec<Rrsig> = records.iter().filter_map(Rrsig::from_record).collect();
 
         match verify_rrset(
@@ -1035,7 +1035,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
             0,
             ResourceRecord {
                 name: nm("example.test."),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(3600),
                 rdata: crate::dnssec_test_util::dnskey_rdata(&attacker.zsk.dnskey("example.test.")),
             },
@@ -1126,7 +1126,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
 
         let nsec = ResourceRecord {
             name: nm("example.test."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: nm("zz.test."),
@@ -1170,7 +1170,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
 
         let nsec = ResourceRecord {
             name: nm("example.test."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: nm("zz.test."),
@@ -1456,7 +1456,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
     fn cname(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
             name: nm(owner),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm(target))).unwrap(),
         }
@@ -1465,7 +1465,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
     fn a(owner: &str, addr: &str) -> ResourceRecord {
         ResourceRecord {
             name: nm(owner),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::A(addr.parse().unwrap())).unwrap(),
         }
@@ -1474,7 +1474,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
     fn rrsig_over(owner: &str, covered: Rtype) -> ResourceRecord {
         ResourceRecord {
             name: nm(owner),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
                 type_covered: covered,

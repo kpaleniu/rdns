@@ -530,8 +530,7 @@ pub fn self_signers(zone: NameRef<'_>, records: &[ResourceRecord], now: u64) -> 
     let class = records
         .iter()
         .find(|rr| rr.rdata.rtype() == rt::DNSKEY)
-        .map(|rr| rr.class)
-        .unwrap_or(Class::new(1));
+        .map_or(Class::IN, |rr| rr.class);
     let rrset = Rrset::new(zone, rt::DNSKEY, class, &rdatas);
 
     keys.into_iter()
@@ -694,7 +693,7 @@ fn key_record(key: &Dnskey, ttl: Ttl) -> Option<ResourceRecord> {
     .ok()?;
     Some(ResourceRecord {
         name: key.owner.clone(),
-        class: Class::new(1),
+        class: Class::IN,
         ttl,
         rdata,
     })
@@ -1311,7 +1310,7 @@ mod tests {
             })
             .collect();
         let sig = signer.sign_rrset_as(
-            &Rrset::new(zone, rt::DNSKEY, Class::new(1), &rdatas),
+            &Rrset::new(zone, rt::DNSKEY, Class::IN, &rdatas),
             3600,
             &zone.to_presentation(),
             signer_flags,

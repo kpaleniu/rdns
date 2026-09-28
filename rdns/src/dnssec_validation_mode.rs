@@ -269,7 +269,7 @@ mod tests {
         zone.add_record(ZoneRecord {
             name: nm(&nm("example.com.").to_string()),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         });
         assert!(!ZoneKeys::of(&zone).is_signed());
@@ -277,7 +277,7 @@ mod tests {
         zone.add_record(ZoneRecord {
             name: nm(&nm("example.com.").to_string()),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::DNSKEY {
                 rtype: rdns_core::record_types::DNSKEY,
                 flags: 256,
@@ -302,7 +302,7 @@ mod tests {
         zone.add_record(ZoneRecord {
             name: nm(&nm("example.com.").to_string()),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::DNSKEY {
                 rtype: rdns_core::record_types::DNSKEY,
                 flags: 256,
@@ -315,7 +315,7 @@ mod tests {
         zone.add_record(ZoneRecord {
             name: nm(&nm("www.example.com.").to_string()),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         });
         let keys = ZoneKeys::of(&zone);

@@ -99,7 +99,7 @@ fn filled(iterations: u16) -> DnsMessage {
     let salt = vec![0xaa, 0xbb];
     let mut authorities = vec![ResourceRecord {
         name: nm("example.com."),
-        class: Class::new(1),
+        class: Class::IN,
         ttl: Ttl::from_secs(3600),
         rdata: RecordData::from_parsed(&ParsedRecord::SOA {
             mname: nm("ns1.example.com."),
@@ -128,7 +128,7 @@ fn filled(iterations: u16) -> DnsMessage {
                 "{}.example.com.",
                 base32hex_encode(hash.as_bytes()).to_lowercase()
             )),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
                 hash_algorithm: 1,

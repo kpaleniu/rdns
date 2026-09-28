@@ -1716,7 +1716,7 @@ mod tests {
             zone.add_record(ZoneRecord {
                 name: name.clone(),
                 ttl: Ttl::from_secs(3600),
-                class: Class::new(1),
+                class: Class::IN,
                 rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1)))
                     .expect("an A record"),
             });
@@ -1755,7 +1755,7 @@ mod tests {
         zone.add_record(ZoneRecord {
             name: nm("ExAmPlE.CoM."),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: nm("ns1.example.com."),
                 rname: nm("admin.example.com."),
@@ -1831,7 +1831,7 @@ mod tests {
         zone.add_record(ZoneRecord {
             name: nm("sub.example.com."),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::NS(nm("ns1.sub.example.com."))).unwrap(),
         });
         assert_eq!(
@@ -3108,7 +3108,7 @@ deep.a.b IN TXT \"down here\"
         zone.add_record(ZoneRecord {
             name: nm("www.example.com."),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         });
         assert_eq!(
@@ -3138,7 +3138,7 @@ deep.a.b IN TXT \"down here\"
         zone.add_record(ZoneRecord {
             name: nm("www.example.com."),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         });
         assert_eq!(

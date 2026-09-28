@@ -1034,7 +1034,7 @@ mod tests {
             let key = SigningKey::generate(algorithm, "example.com.", DNSKEY_FLAG_ZONE).unwrap();
             let rdatas = vec![a_rdata([192, 0, 2, 1])];
             let owner = nm("www.example.com.");
-            let rrset = Rrset::new(owner.as_ref(), rt::A, Class::new(1), &rdatas);
+            let rrset = Rrset::new(owner.as_ref(), rt::A, Class::IN, &rdatas);
             let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
 
             let proof = verify_rrset(
@@ -1068,7 +1068,7 @@ mod tests {
         .unwrap();
         let rdatas = vec![a_rdata([192, 0, 2, 1])];
         let owner = nm("www.example.com.");
-        let rrset = Rrset::new(owner.as_ref(), rt::A, Class::new(1), &rdatas);
+        let rrset = Rrset::new(owner.as_ref(), rt::A, Class::IN, &rdatas);
         let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
 
         let data = signed_data(&sig, rrset.owner, rrset.class, rrset.rdatas).unwrap();
@@ -1093,7 +1093,7 @@ mod tests {
         .unwrap();
         let rdatas = vec![a_rdata([192, 0, 2, 1])];
         let owner = nm("*.example.com.");
-        let rrset = Rrset::new(owner.as_ref(), rt::A, Class::new(1), &rdatas);
+        let rrset = Rrset::new(owner.as_ref(), rt::A, Class::IN, &rdatas);
         let sig = key.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
         assert_eq!(sig.labels, 2);
 
@@ -1101,7 +1101,7 @@ mod tests {
         let mut expanded = sig.clone();
         expanded.owner = nm("anything.example.com.");
         let expanded_owner = nm("anything.example.com.");
-        let expanded_rrset = Rrset::new(expanded_owner.as_ref(), rt::A, Class::new(1), &rdatas);
+        let expanded_rrset = Rrset::new(expanded_owner.as_ref(), rt::A, Class::IN, &rdatas);
         assert!(matches!(
             verify_rrset(
                 &expanded_rrset,
@@ -1139,7 +1139,7 @@ mod tests {
         // same: a signature from the loaded copy verifies under the original.
         let rdatas = vec![a_rdata([192, 0, 2, 1])];
         let owner = nm("example.com.");
-        let rrset = Rrset::new(owner.as_ref(), rt::A, Class::new(1), &rdatas);
+        let rrset = Rrset::new(owner.as_ref(), rt::A, Class::IN, &rdatas);
         let sig = back.sign_rrset(&rrset, 3600, 1_000, 2_000_000_000).unwrap();
         assert!(matches!(
             verify_rrset(

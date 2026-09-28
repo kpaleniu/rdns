@@ -360,7 +360,7 @@ mod tests {
     fn a(name: &str, addr: &str, ttl: u32) -> ResourceRecord {
         ResourceRecord {
             name: nm(name),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(ttl),
             rdata: RecordData::from_parsed(&ParsedRecord::A(addr.parse().unwrap())).unwrap(),
         }
@@ -369,7 +369,7 @@ mod tests {
     fn aaaa(name: &str, addr: &str) -> ResourceRecord {
         ResourceRecord {
             name: nm(name),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::AAAA(addr.parse().unwrap())).unwrap(),
         }
@@ -422,7 +422,7 @@ mod tests {
         let chain = vec![
             ResourceRecord {
                 name: nm("www.example.com."),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(300),
                 rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm("host.example.net.")))
                     .unwrap(),

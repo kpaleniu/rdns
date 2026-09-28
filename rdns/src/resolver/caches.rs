@@ -204,13 +204,11 @@ impl RttStore {
     /// `servers` reordered fastest-known-first, ties keeping their input order
     /// (so a freshly learned, all-unmeasured set is tried as given).
     pub(super) fn order(&self, servers: &[SocketAddr]) -> Vec<SocketAddr> {
-        let mut ranked: Vec<(usize, SocketAddr, f64)> = servers
-            .iter()
-            .enumerate()
-            .map(|(i, s)| (i, *s, self.get(s)))
-            .collect();
-        ranked.sort_by(|a, b| a.2.total_cmp(&b.2).then(a.0.cmp(&b.0)));
-        ranked.into_iter().map(|(_, s, _)| s).collect()
+        let mut ranked: Vec<(SocketAddr, f64)> =
+            servers.iter().map(|s| (*s, self.get(s))).collect();
+        // `sort_by` is stable, which is the tie rule above.
+        ranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+        ranked.into_iter().map(|(s, _)| s).collect()
     }
 }
 

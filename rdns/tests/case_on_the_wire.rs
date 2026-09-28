@@ -33,7 +33,7 @@ use rdns::{
 fn a_record(owner: &str, last: u8) -> ResourceRecord {
     ResourceRecord {
         name: owner.parse().expect("a name"),
-        class: Class::new(1),
+        class: Class::IN,
         ttl: Ttl::from_secs(300),
         rdata: RecordData::new(rt::A, vec![10, 0, 0, last]).expect("an A"),
     }

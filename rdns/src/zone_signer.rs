@@ -386,7 +386,7 @@ fn sign_zone_inner(
         signed.add_record(ZoneRecord {
             name: origin.clone(),
             ttl: dnskey_ttl,
-            class: Class::new(1),
+            class: Class::IN,
             rdata: nsec3param_rdata(salt, *iterations),
         });
     }
@@ -668,7 +668,7 @@ fn carry_over_records(
         {
             continue;
         }
-        if record.class != Class::new(1) {
+        if record.class != Class::IN {
             return Err(DnssecError::signing(format!(
                 "{} carries class {}, and DNSSEC is defined per class — a zone mixing them has \
                  no single chain to sign",
@@ -850,7 +850,7 @@ fn publish_dnskeys(
         signed.add_record(ZoneRecord {
             name: origin.to_owned(),
             ttl,
-            class: Class::new(1),
+            class: Class::IN,
             rdata,
         });
     }
@@ -948,7 +948,7 @@ fn publish_sync_records(
             signed.add_record(ZoneRecord {
                 name: origin.to_owned(),
                 ttl,
-                class: Class::new(1),
+                class: Class::IN,
                 rdata,
             });
         }
@@ -1161,7 +1161,7 @@ fn build_nsec_chain(layout: &Layout, ttl: Ttl, signed: &mut Zone) -> Result<()> 
         signed.add_record(ZoneRecord {
             name: name.clone(),
             ttl,
-            class: Class::new(1),
+            class: Class::IN,
             rdata,
         });
     }
@@ -1218,7 +1218,7 @@ fn build_nsec3_chain(
             name: nsec3_owner_name_at(*hash, layout.origin.as_ref())
                 .map_err(|e| DnssecError::key(format!("an NSEC3 owner name: {e}")))?,
             ttl,
-            class: Class::new(1),
+            class: Class::IN,
             rdata,
         });
     }
@@ -1341,7 +1341,7 @@ fn signatures_for(
                     signatures.push(ZoneRecord {
                         name: name.to_owned(),
                         ttl,
-                        class: Class::new(1),
+                        class: Class::IN,
                         rdata: signature.rdata.to_owned(),
                     });
                 }
@@ -1353,7 +1353,7 @@ fn signatures_for(
             fresh.push((name.to_owned(), rtype));
         }
         let original_ttl = ttl.as_secs();
-        let rrset = Rrset::new(name, rtype, Class::new(1), &rdatas);
+        let rrset = Rrset::new(name, rtype, Class::IN, &rdatas);
         // Spread back from the window's end so the zone degrades over a slope
         // rather than one cliff — see `SigningPolicy::expiry_for`.
         let expiration = policy.expiry_for(name, rtype);
@@ -1366,7 +1366,7 @@ fn signatures_for(
             signatures.push(ZoneRecord {
                 name: name.to_owned(),
                 ttl,
-                class: Class::new(1),
+                class: Class::IN,
                 rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
                     type_covered: sig.type_covered,
                     algorithm: sig.algorithm,
@@ -2033,7 +2033,7 @@ a\.b    IN A   192.0.2.50
         zone.add_record(ZoneRecord {
             name: nm(ORIGIN),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: dnskey_rdata(&theirs.dnskey()),
         });
         let signed = sign_zone(&zone, &ours, &policy(DenialChain::Nsec)).expect("signs");
@@ -2087,7 +2087,7 @@ a\.b    IN A   192.0.2.50
         zone.add_record(ZoneRecord {
             name: nm(ORIGIN),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: dnskey_rdata(&theirs.dnskey()),
         });
         let signed = sign_zone(&zone, &ours, &policy(DenialChain::Nsec)).expect("signs");
@@ -2124,7 +2124,7 @@ a\.b    IN A   192.0.2.50
         zone.add_record(ZoneRecord {
             name: nm(ORIGIN),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: dnskey_rdata(&dnskey),
         });
         let signed = sign_zone(&zone, &ours, &policy(DenialChain::Nsec)).expect("signs");
@@ -2162,7 +2162,7 @@ a\.b    IN A   192.0.2.50
             zone.add_record(ZoneRecord {
                 name: nm(ORIGIN),
                 ttl: Ttl::from_secs(3600),
-                class: Class::new(1),
+                class: Class::IN,
                 rdata,
             });
         }
@@ -2170,7 +2170,7 @@ a\.b    IN A   192.0.2.50
         let apex = nm(ORIGIN);
         let sig = owner_ksk
             .sign_rrset(
-                &Rrset::new(apex.as_ref(), rt::DNSKEY, Class::new(1), &rdatas),
+                &Rrset::new(apex.as_ref(), rt::DNSKEY, Class::IN, &rdatas),
                 3600,
                 run.inception,
                 run.expiration,
@@ -2179,7 +2179,7 @@ a\.b    IN A   192.0.2.50
         zone.add_record(ZoneRecord {
             name: apex.clone(),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
                 type_covered: sig.type_covered,
                 algorithm: sig.algorithm,
@@ -2473,7 +2473,7 @@ a\.b    IN A   192.0.2.50
             .filter(|s| s.owner == nm(name))
             .collect();
         verify_rrset(
-            &Rrset::new(nm(name).as_ref(), rtype, Class::new(1), &rdatas),
+            &Rrset::new(nm(name).as_ref(), rtype, Class::IN, &rdatas),
             &sigs,
             &published_keys(zone),
             nm(ORIGIN).as_ref(),
@@ -2499,7 +2499,7 @@ a\.b    IN A   192.0.2.50
                 .cloned()
                 .collect();
             let proof = verify_rrset(
-                &Rrset::new(nm(&name).as_ref(), rtype, Class::new(1), &rdatas),
+                &Rrset::new(nm(&name).as_ref(), rtype, Class::IN, &rdatas),
                 &at_name,
                 &keys,
                 nm(ORIGIN).as_ref(),
@@ -2565,7 +2565,7 @@ a\.b    IN A   192.0.2.50
         zone.add_record(ZoneRecord {
             name: nm("occluded.redir.example.com."),
             ttl: Ttl::from_secs(3600),
-            class: crate::Class::new(1),
+            class: crate::Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.66".parse().unwrap()))
                 .unwrap(),
         });
@@ -2903,7 +2903,7 @@ www IN A   192.0.2.10
             &Rrset::new(
                 nm("anything.example.com.").as_ref(),
                 rt::A,
-                Class::new(1),
+                Class::IN,
                 &rdatas,
             ),
             &[expanded],
@@ -3069,7 +3069,7 @@ www IN A   192.0.2.10
             &zone,
             &[crate::update::Change::Add(ResourceRecord {
                 name: nm("new.example.com."),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.77".parse().unwrap()))
                     .unwrap(),
@@ -3157,7 +3157,7 @@ www IN A   192.0.2.10
             &zone,
             &[crate::update::Change::Add(ResourceRecord {
                 name: nm("new.example.com."),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.77".parse().unwrap()))
                     .unwrap(),
@@ -3218,7 +3218,7 @@ www IN A   192.0.2.10
         grown.add_record(ZoneRecord {
             name: nm("www.example.com."),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.88".parse().unwrap()))
                 .unwrap(),
         });
@@ -3238,7 +3238,7 @@ www IN A   192.0.2.10
             &zone,
             &[crate::update::Change::Add(ResourceRecord {
                 name: nm("www.example.com."),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(60),
                 rdata: zone.query(nm("www.example.com.").as_ref(), Qtype::of(rt::A))[0]
                     .rdata
@@ -3364,7 +3364,7 @@ www IN A   192.0.2.10
         zone.add_record(ZoneRecord {
             name: nm("www.example.com."),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.1".parse().unwrap())).unwrap(),
         });
         let err = sign_zone(&zone, &signing_keys(ORIGIN), &policy(DenialChain::Nsec)).unwrap_err();
@@ -3552,7 +3552,7 @@ www IN A   192.0.2.10
             signed.add_record(ZoneRecord {
                 name: origin.clone(),
                 ttl: dnskey_ttl,
-                class: Class::new(1),
+                class: Class::IN,
                 rdata: nsec3param_rdata(salt, *iterations),
             });
         }
@@ -3871,7 +3871,7 @@ deep.b IN A 192.0.2.4
             let previous = sign_zone(&source, &keys, &policy).expect("the fixture signs");
             let change = update::Change::Add(ResourceRecord {
                 name: nm("added.example.com."),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::A(std::net::Ipv4Addr::new(
                     198, 51, 100, 1,
@@ -4041,7 +4041,7 @@ deep.b IN A 192.0.2.4
                         edited.add_record(ZoneRecord {
                             name: nm(&format!("new{i}.example.com.")),
                             ttl: Ttl::from_secs(3600),
-                            class: Class::new(1),
+                            class: Class::IN,
                             rdata: RecordData::from_parsed(&ParsedRecord::A(
                                 std::net::Ipv4Addr::new(198, 51, 100, 3),
                             ))

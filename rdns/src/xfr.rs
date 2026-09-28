@@ -466,7 +466,7 @@ fn belongs_here(rr: &ResourceRecord, zone: NameRef<'_>) -> TransferResult<Name> 
              the zone it is a transfer of"
         )));
     }
-    if rr.class != Class::new(1) {
+    if rr.class != Class::IN {
         return Err(TransferError::malformed(format!(
             "master sent {name} in class {}, and this server holds only IN zones",
             rr.class
@@ -1046,7 +1046,7 @@ mod tests {
             1,
             ResourceRecord {
                 name: nm("www.other-zone.test."),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(300),
                 rdata: crate::RecordData::from_parsed(&ParsedRecord::A(
                     "192.0.2.66".parse().unwrap(),
@@ -1387,7 +1387,7 @@ mod tests {
             2,
             ResourceRecord {
                 name: nm("www.elsewhere.test."),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(300),
                 rdata: crate::RecordData::from_parsed(&ParsedRecord::A(
                     "192.0.2.66".parse().unwrap(),
@@ -1415,7 +1415,7 @@ mod tests {
             .unwrap();
         headless[0].answers[0] = ResourceRecord {
             name: nm("www.example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(300),
             rdata: crate::RecordData::from_parsed(&ParsedRecord::A("192.0.2.77".parse().unwrap()))
                 .unwrap(),

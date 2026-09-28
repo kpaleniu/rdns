@@ -44,7 +44,7 @@ fn within(what: &str, count: u64, range: std::ops::RangeInclusive<u64>) {
 fn a_record(name: &rdns::Name) -> ResourceRecord {
     ResourceRecord {
         name: name.clone(),
-        class: rdns::Class::new(1),
+        class: rdns::Class::IN,
         ttl: rdns::Ttl::from_secs(300),
         rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(std::net::Ipv4Addr::new(
             192, 0, 2, 10,

@@ -1366,7 +1366,7 @@ fn what_the_resolvers_caches_cost() {
     let rrset: Vec<ResourceRecord> = (0..3)
         .map(|_| ResourceRecord {
             name: held.clone(),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: rdns::Ttl::from_wire(3600),
             rdata: rdns::RecordData::new(record_types::A, vec![192u8, 0, 2, 1]).expect("A"),
         })
@@ -1440,7 +1440,7 @@ fn verifying_an_rrset_against_two_candidate_signatures() {
         .map(|r| r.rdata)
         .collect();
     let apex = nm("example.com.");
-    let rrset = Rrset::new(apex.as_ref(), record_types::DNSKEY, Class::new(1), &rdatas);
+    let rrset = Rrset::new(apex.as_ref(), record_types::DNSKEY, Class::IN, &rdatas);
     let now = current_unix_timestamp();
 
     let (proof, count) =

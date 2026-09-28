@@ -346,10 +346,9 @@ impl DnsMessage {
     /// Readable even when the option list is malformed: the size lives in the
     /// OPT CLASS field.
     pub fn udp_payload_size(&self) -> u16 {
-        self.edns
-            .as_ref()
-            .map(|e| e.udp_payload_size.max(CLASSIC_UDP_SIZE))
-            .unwrap_or(CLASSIC_UDP_SIZE)
+        self.edns.as_ref().map_or(CLASSIC_UDP_SIZE, |e| {
+            e.udp_payload_size.max(CLASSIC_UDP_SIZE)
+        })
     }
 
     /// Set the message's OPT record, replacing any it already had. Infallible:

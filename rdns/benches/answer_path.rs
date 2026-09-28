@@ -118,7 +118,7 @@ fn answer(c: &mut Criterion) {
     for i in 0..60 {
         big.answers.push(ResourceRecord {
             name: nm(&format!("host{i}.example.com.")),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
                 192,
@@ -149,7 +149,7 @@ fn answer(c: &mut Criterion) {
     for i in 0..400 {
         envelope.answers.push(ResourceRecord {
             name: nm(&format!("h{i}.e.com.")),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
                 192,
@@ -203,7 +203,7 @@ fn zone_index(c: &mut Criterion) {
         zone.add_record(ZoneRecord {
             name: nm(&format!("host{i}.example.com.")),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
                 192,
                 0,
@@ -257,7 +257,7 @@ fn shared_state(c: &mut Criterion) {
     let cache = DnsCache::new(20_000);
     let record = |name: &str| ResourceRecord {
         name: nm(name),
-        class: Class::new(1),
+        class: Class::IN,
         ttl: Ttl::from_secs(300),
         rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1)))
             .expect("build the rdata"),
@@ -360,7 +360,7 @@ fn dnssec(c: &mut Criterion) {
         .map(|r| r.rdata)
         .collect();
     let apex = nm("example.com.");
-    let rrset = Rrset::new(apex.as_ref(), record_types::DNSKEY, Class::new(1), &rdatas);
+    let rrset = Rrset::new(apex.as_ref(), record_types::DNSKEY, Class::IN, &rdatas);
     let now = current_unix_timestamp();
 
     let mut group = c.benchmark_group("dnssec");
@@ -397,7 +397,7 @@ fn dnssec(c: &mut Criterion) {
         ));
         let rdatas: Vec<_> = records.into_iter().map(|r| r.rdata).collect();
         let owner = nm("many.example.com.");
-        let rrset = Rrset::new(owner.as_ref(), record_types::A, Class::new(1), &rdatas);
+        let rrset = Rrset::new(owner.as_ref(), record_types::A, Class::IN, &rdatas);
 
         let plural = if count == 1 { "record" } else { "records" };
         group.bench_function(format!("verify an RRset of {count} {plural}"), |b| {

@@ -319,7 +319,7 @@ fn building_without_parsing(hosts: usize) {
                 .parse()
                 .expect("a host name parses"),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
                 192,
                 0,

@@ -876,7 +876,7 @@ mail IN MX  10 mx.example.com.
             (
                 rr(
                     "www.example.com.",
-                    Class::new(1),
+                    Class::IN,
                     Ttl::from_secs(0),
                     a("192.0.2.10"),
                 ),
@@ -939,13 +939,13 @@ mail IN MX  10 mx.example.com.
             (
                 rr(
                     "new.example.com.",
-                    Class::new(1),
+                    Class::IN,
                     Ttl::from_secs(3600),
                     a("192.0.2.50"),
                 ),
                 Change::Add(rr(
                     "new.example.com.",
-                    Class::new(1),
+                    Class::IN,
                     Ttl::from_secs(3600),
                     a("192.0.2.50"),
                 )),
@@ -1034,7 +1034,7 @@ mail IN MX  10 mx.example.com.
     fn a_record_outside_the_named_zone_is_notzone() {
         let outside = rr(
             "www.elsewhere.test.",
-            Class::new(1),
+            Class::IN,
             Ttl::from_secs(3600),
             a("192.0.2.50"),
         );
@@ -1064,7 +1064,7 @@ mail IN MX  10 mx.example.com.
         // the boundary has to land on a label separator.
         let lookalike = rr(
             "notexample.com.",
-            Class::new(1),
+            Class::IN,
             Ttl::from_secs(3600),
             a("192.0.2.50"),
         );
@@ -1096,7 +1096,7 @@ mail IN MX  10 mx.example.com.
             rr("old.example.com.", Class::new(255), Ttl::ZERO, bare(rt::A)),
             rr(
                 "add.example.com.",
-                Class::new(1),
+                Class::IN,
                 Ttl::from_secs(3600),
                 a("192.0.2.7"),
             ),
@@ -1141,7 +1141,7 @@ mail IN MX  10 mx.example.com.
         // meta-type, so §3.4.1's prescan must refuse it.
         let add_any = rr(
             "www.example.com.",
-            Class::new(1),
+            Class::IN,
             Ttl::from_secs(3600),
             RecordData::new(rt::ANY, vec![192, 0, 2, 50]).expect("opaque rdata"),
         );
@@ -1291,13 +1291,13 @@ mail IN MX  10 mx.example.com.
             vec![
                 rr(
                     "www.example.com.",
-                    Class::new(1),
+                    Class::IN,
                     Ttl::from_secs(0),
                     a("192.0.2.10"),
                 ),
                 rr(
                     "www.example.com.",
-                    Class::new(1),
+                    Class::IN,
                     Ttl::from_secs(0),
                     a("192.0.2.11"),
                 ),
@@ -1415,7 +1415,7 @@ mail IN MX  10 mx.example.com.
     }
 
     fn add(name: &str, ttl: u32, rdata: RecordData) -> Change {
-        Change::Add(rr(name, Class::new(1), Ttl::from_secs(ttl), rdata))
+        Change::Add(rr(name, Class::IN, Ttl::from_secs(ttl), rdata))
     }
 
     /// All four update forms of §2.5, applied rather than merely read.
@@ -1685,7 +1685,7 @@ mail IN MX  10 mx.example.com.
         signed.add_record(ZoneRecord {
             name: nm("alias.example.com."),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::new(rt::RRSIG, vec![0u8; 20]).expect("opaque rdata"),
         });
         let applied = apply(

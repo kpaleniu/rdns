@@ -53,7 +53,7 @@ fn name(text: &str) -> Name {
 fn rr(owner: &str, ttl: u32, parsed: ParsedRecord) -> ResourceRecord {
     ResourceRecord {
         name: name(owner),
-        class: Class::new(1),
+        class: Class::IN,
         ttl: Ttl::from_secs(ttl),
         rdata: RecordData::from_parsed(&parsed).expect("encodes"),
     }

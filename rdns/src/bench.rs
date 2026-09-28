@@ -65,7 +65,7 @@ mod benches {
             zone.add_record(ZoneRecord {
                 name: nm(&format!("host{i}.example.com.")),
                 ttl: Ttl::from_secs(3600),
-                class: Class::new(1),
+                class: Class::IN,
                 rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(
                     192,
                     0,

@@ -65,7 +65,7 @@ pub(crate) struct Control {
 ///   target: the mode is in place before the published path exists, and the
 ///   rename leaves no unlink-then-bind gap for a racing process.
 pub(crate) fn bind(path: &Path) -> Result<UnixListener> {
-    if let Ok(dir) = path.parent().ok_or(()) {
+    if let Some(dir) = path.parent() {
         if !dir.as_os_str().is_empty() && !dir.is_dir() {
             return Err(anyhow!(
                 "--control-socket {}: {} is not a directory",

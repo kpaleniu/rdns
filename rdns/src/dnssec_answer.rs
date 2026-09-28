@@ -676,7 +676,7 @@ deep.a.b IN TXT "down here"
             &Rrset::new(
                 nm(qname).as_ref(),
                 Rtype::new(qtype.to_u16()),
-                Class::new(1),
+                Class::IN,
                 &rdatas,
             ),
             &rrsigs,
@@ -961,7 +961,7 @@ www     IN A   192.0.2.10\n";
                     &Rrset::new(
                         record.name.as_ref(),
                         record.rdata.rtype(),
-                        Class::new(1),
+                        Class::IN,
                         &rdatas,
                     ),
                     &sigs,

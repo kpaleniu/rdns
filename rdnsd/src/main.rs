@@ -3168,7 +3168,7 @@ mod tests {
         let dkim = format!("v=DKIM1; k=rsa; p={}", "A".repeat(392));
         let txt = ResourceRecord {
             name: nm("s2026._domainkey.example.com."),
-            class: rdns::Class::new(1),
+            class: rdns::Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::TXT(
                 dkim.as_bytes().chunks(255).map(<[u8]>::to_vec).collect(),

@@ -1959,7 +1959,7 @@ pub(crate) mod tests {
             let previous = parse_zone_file_at(&path, "example.com.").expect("the fixture parses");
             let change = update::Change::Add(rdns::ResourceRecord {
                 name: nm("added.example.com."),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(3600),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                     std::net::Ipv4Addr::new(198, 51, 100, 1),
@@ -2096,7 +2096,7 @@ pub(crate) mod tests {
                 // and read as a win (`CLAUDE.md` §1).
                 let change = update::Change::Add(rdns::ResourceRecord {
                     name: nm(&format!("added-{round}.example.com.")),
-                    class: rdns::Class::new(1),
+                    class: rdns::Class::IN,
                     ttl: rdns::Ttl::from_secs(3600),
                     rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                         std::net::Ipv4Addr::new(198, 51, 100, round + 1),
@@ -2258,7 +2258,7 @@ pub(crate) mod tests {
 
             let change = update::Change::Add(rdns::ResourceRecord {
                 name: nm("added.example.com."),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(3600),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                     std::net::Ipv4Addr::new(198, 51, 100, 1),
@@ -2413,7 +2413,7 @@ pub(crate) mod tests {
 
         let change = update::Change::Add(rdns::ResourceRecord {
             name: nm("added.example.com."),
-            class: rdns::Class::new(1),
+            class: rdns::Class::IN,
             ttl: rdns::Ttl::from_secs(3600),
             rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(std::net::Ipv4Addr::new(
                 198, 51, 100, 4,
@@ -2494,7 +2494,7 @@ pub(crate) mod tests {
         let add = |name: &str, last: u8| {
             update::Change::Add(rdns::ResourceRecord {
                 name: nm(name),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(3600),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                     std::net::Ipv4Addr::new(198, 51, 100, last),
@@ -2623,7 +2623,7 @@ pub(crate) mod tests {
 
         let change = update::Change::Add(rdns::ResourceRecord {
             name: nm("added.example.com."),
-            class: rdns::Class::new(1),
+            class: rdns::Class::IN,
             ttl: rdns::Ttl::from_secs(3600),
             rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(std::net::Ipv4Addr::new(
                 198, 51, 100, 4,
@@ -3530,7 +3530,7 @@ pub(crate) mod tests {
     fn a_record(name: &str, addr: &str) -> ResourceRecord {
         ResourceRecord {
             name: nm(name),
-            class: rdns::Class::new(1),
+            class: rdns::Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                 addr.parse().expect("an address"),

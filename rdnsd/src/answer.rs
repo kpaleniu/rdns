@@ -408,11 +408,10 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome
         if let Some(dname) = redirect {
             match redirect_through(dname, name.into_owned(), &mut chain) {
                 Ok(next) => {
-                    visited.push(next.clone());
-                    if !in_zone(zone, next.as_ref()) || visited[..visited.len() - 1].contains(&next)
-                    {
+                    if !in_zone(zone, next.as_ref()) || visited.contains(&next) {
                         return Outcome::ChainLeftZone { chain };
                     }
+                    visited.push(next.clone());
                     name = Cow::Owned(next);
                     continue;
                 }
@@ -459,10 +458,10 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome
         chain.push(Hop::Cname(name.into_owned()));
         // `visited` compares as names, which fold as they go — so there is no
         // folded copy of each hop to keep any more.
-        visited.push(target.clone());
-        if !in_zone(zone, target.as_ref()) || visited[..visited.len() - 1].contains(&target) {
+        if !in_zone(zone, target.as_ref()) || visited.contains(&target) {
             return Outcome::ChainLeftZone { chain };
         }
+        visited.push(target.clone());
         name = Cow::Owned(target);
     }
     Outcome::ChainLeftZone { chain }
@@ -952,7 +951,7 @@ x.sub2   IN A   192.0.2.30
         zone.add_record(rdns::zone::ZoneRecord {
             name: nm("occluded.redir.example.com."),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.66".parse().unwrap()))
                 .unwrap(),
         });
@@ -1756,7 +1755,7 @@ ns.plain  IN A   192.0.2.30
                 assert_eq!(rdatas.len(), 1, "nsec3={nsec3}: no wildcard answer");
 
                 let proof = verify_rrset(
-                    &Rrset::new(nm(qname).as_ref(), record_types::A, Class::new(1), &rdatas),
+                    &Rrset::new(nm(qname).as_ref(), record_types::A, Class::IN, &rdatas),
                     &rrsigs_in(&response.answers),
                     &keys_of(&zones),
                     nm("example.com.").as_ref(),
@@ -1841,7 +1840,7 @@ ns.plain  IN A   192.0.2.30
                         .map(|r| r.rdata.clone())
                         .collect();
                     let proof = verify_rrset(
-                        &Rrset::new(nm("example.com.").as_ref(), rtype, Class::new(1), &rdatas),
+                        &Rrset::new(nm("example.com.").as_ref(), rtype, Class::IN, &rdatas),
                         &signatures,
                         &keys,
                         nm("example.com.").as_ref(),
@@ -1916,7 +1915,7 @@ ns.plain  IN A   192.0.2.30
                     &Rrset::new(
                         nm("secure.example.com.").as_ref(),
                         record_types::DS,
-                        Class::new(1),
+                        Class::IN,
                         &ds,
                     ),
                     &sigs,
@@ -1991,7 +1990,7 @@ ns.plain  IN A   192.0.2.30
                 &Rrset::new(
                     nm("www.example.com.").as_ref(),
                     record_types::A,
-                    Class::new(1),
+                    Class::IN,
                     &rdatas,
                 ),
                 &rrsigs_in(&response.answers),

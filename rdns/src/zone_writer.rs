@@ -287,7 +287,7 @@ mod tests {
         zone.add_record(ZoneRecord {
             name: nm("bin.example.com."),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: rdata.clone(),
         });
 
@@ -314,7 +314,7 @@ mod tests {
         zone.add_record(ZoneRecord {
             name: nm("odd.example.com."),
             ttl: Ttl::from_secs(300),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: rdata.clone(),
         });
 
@@ -335,7 +335,7 @@ mod tests {
         zone.add_record(ZoneRecord {
             name: nm("empty.example.com."),
             ttl: Ttl::from_secs(300),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: RecordData::new(Rtype::new(4321), Vec::new()).expect("zero-length rdata"),
         });
 
@@ -454,7 +454,7 @@ mod tests {
         zone.add_record(ZoneRecord {
             name: nm("example.com."),
             ttl: Ttl::from_secs(3600),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: padded.clone(),
         });
 
@@ -479,7 +479,7 @@ mod tests {
             zone.add_record(ZoneRecord {
                 name: name.clone(),
                 ttl: Ttl::from_secs(300),
-                class: Class::new(1),
+                class: Class::IN,
                 rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.1".parse().unwrap()))
                     .expect("encode"),
             });
@@ -508,7 +508,7 @@ mod tests {
         zone.add_record(ZoneRecord {
             name: nm("example.com."),
             ttl: Ttl::from_secs(300),
-            class: Class::new(1),
+            class: Class::IN,
             rdata: ns.clone(),
         });
 

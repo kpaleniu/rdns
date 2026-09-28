@@ -621,16 +621,15 @@ impl Zones {
     pub(crate) fn for_query(&self, qname: NameRef<'_>) -> Option<&Zone> {
         // Every ancestor from `deepest` labels down, which is where the
         // deepest zone this server holds could start.
-        for candidate in qname.ancestors().skip(
-            qname
-                .label_count()
-                .saturating_sub(self.deepest.min(qname.label_count())),
-        ) {
-            if let Some(zone) = self.by_name.get(candidate.folded().as_ref()) {
-                return Some(zone);
-            }
-        }
-        None
+        qname
+            .ancestors()
+            .skip(
+                qname
+                    .label_count()
+                    .saturating_sub(self.deepest.min(qname.label_count())),
+            )
+            .find_map(|candidate| self.by_name.get(candidate.folded().as_ref()))
+            .map(|zone| &**zone)
     }
 }
 
@@ -857,10 +856,7 @@ impl ZoneSigning {
             // would re-sign without the change and then sleep the full interval
             // with it pending.
             .map(|at| at.saturating_sub(now).saturating_add(1).max(60));
-        Duration::from_secs(match next_key_change {
-            Some(next) => ordinary.min(next),
-            None => ordinary,
-        })
+        Duration::from_secs(next_key_change.map_or(ordinary, |next| ordinary.min(next)))
     }
 
     /// How many of `zones` this would actually sign, for `--check-config`.

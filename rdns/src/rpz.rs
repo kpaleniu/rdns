@@ -1693,7 +1693,7 @@ $TTL 60
         let zones = zones();
         let answer = vec![ResourceRecord {
             name: nm("www.example.com."),
-            class: crate::Class::new(1),
+            class: crate::Class::IN,
             ttl: crate::Ttl::from_secs(60),
             rdata: crate::RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(198, 0, 2, 7)))
                 .unwrap(),
@@ -1710,7 +1710,7 @@ $TTL 60
         let zones = zones();
         let answer = vec![ResourceRecord {
             name: nm("www.example.com."),
-            class: crate::Class::new(1),
+            class: crate::Class::IN,
             ttl: crate::Ttl::from_secs(60),
             rdata: crate::RecordData::from_parsed(&ParsedRecord::AAAA(Ipv6Addr::new(
                 0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,

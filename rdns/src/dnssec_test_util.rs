@@ -177,7 +177,7 @@ impl TestZone {
     pub(crate) fn signed_dnskey_rrset(&self) -> (Vec<RecordData>, Rrsig) {
         let rdatas: Vec<RecordData> = self.dnskeys().iter().map(dnskey_rdata).collect();
         let sig = self.ksk.sign_rrset_as(
-            &Rrset::new(nm(&self.name).as_ref(), rt::DNSKEY, Class::new(1), &rdatas),
+            &Rrset::new(nm(&self.name).as_ref(), rt::DNSKEY, Class::IN, &rdatas),
             3600,
             &self.name,
             KSK_FLAGS,
@@ -205,7 +205,7 @@ impl TestZone {
             .into_iter()
             .map(|rdata| ResourceRecord {
                 name: nm(&self.name.clone()),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(3600),
                 rdata,
             })
@@ -272,7 +272,7 @@ pub(crate) fn dnskey_rdata(key: &Dnskey) -> RecordData {
 pub(crate) fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
         name: sig.owner.clone(),
-        class: Class::new(1),
+        class: Class::IN,
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
             type_covered: sig.type_covered,
@@ -293,7 +293,7 @@ pub(crate) fn rrsig_record(sig: &Rrsig, ttl: Ttl) -> ResourceRecord {
 pub(crate) fn ds_record(ds: &Ds, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
         name: ds.owner.clone(),
-        class: Class::new(1),
+        class: Class::IN,
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::DS {
             rtype: crate::record_types::DS,
@@ -433,7 +433,7 @@ pub(crate) fn nsec3_span(
             nm(zone).as_ref(),
         )
         .expect("an NSEC3 owner name"),
-        class: Class::new(1),
+        class: Class::IN,
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
             hash_algorithm: 1,
@@ -450,7 +450,7 @@ pub(crate) fn nsec3_span(
 fn nsec3_as_record(n: &Nsec3, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
         name: n.owner.clone(),
-        class: Class::new(1),
+        class: Class::IN,
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
             hash_algorithm: n.hash_algorithm,

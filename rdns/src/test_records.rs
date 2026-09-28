@@ -29,7 +29,7 @@ pub(crate) fn nm(text: &str) -> Name {
 pub(crate) fn a_record(name: &str, addr: impl Into<Ipv4Addr>) -> ResourceRecord {
     ResourceRecord {
         name: nm(name),
-        class: Class::new(1),
+        class: Class::IN,
         ttl: Ttl::from_secs(300),
         rdata: a_rdata(addr),
     }
@@ -44,7 +44,7 @@ pub(crate) fn a_rdata(addr: impl Into<Ipv4Addr>) -> RecordData {
 pub(crate) fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
         name: nm(zone),
-        class: Class::new(1),
+        class: Class::IN,
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::SOA {
             mname: nm(&format!("ns1.{zone}")),
@@ -62,7 +62,7 @@ pub(crate) fn soa_record(zone: &str, minimum: u32, ttl: Ttl) -> ResourceRecord {
 pub(crate) fn nsec_record(owner: &str, next: &str, types: &[Rtype], ttl: Ttl) -> ResourceRecord {
     ResourceRecord {
         name: nm(owner),
-        class: Class::new(1),
+        class: Class::IN,
         ttl,
         rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
             next_domain_name: nm(next),

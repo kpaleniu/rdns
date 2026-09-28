@@ -441,7 +441,7 @@ mod tests {
 
         let answer = ResourceRecord {
             name: nm("www.example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         };
@@ -478,7 +478,7 @@ mod tests {
         );
         let a = &parsed.answers[0];
         assert_eq!(a.name, nm("www.example.com."));
-        assert_eq!(a.class, Class::new(1));
+        assert_eq!(a.class, Class::IN);
         assert_eq!(a.ttl, Ttl::from_secs(3600));
         assert_eq!(a.rdata.rtype(), rt::A);
         assert_eq!(a.rdata.bytes(), [192, 0, 2, 1]); // A record: 4 address octets
@@ -493,7 +493,7 @@ mod tests {
         let answers: Vec<ResourceRecord> = (1..=10)
             .map(|i| ResourceRecord {
                 name: nm("www.example.com."),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, i)))
                     .unwrap(),
@@ -528,13 +528,13 @@ mod tests {
     fn test_output_compresses_names_inside_rdata() {
         let ns = ResourceRecord {
             name: nm("example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NS(nm("ns1.example.com."))).unwrap(),
         };
         let mx = ResourceRecord {
             name: nm("example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::MX {
                 preference: 10,
@@ -544,7 +544,7 @@ mod tests {
         };
         let cname = ResourceRecord {
             name: nm("alias.example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm("www.example.com."))).unwrap(),
         };
@@ -681,7 +681,7 @@ mod tests {
     fn a_dname_target_goes_out_uncompressed() {
         let dname = |owner: &str| ResourceRecord {
             name: nm(owner),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::DNAME(nm("to.example.net."))).unwrap(),
         };
@@ -719,7 +719,7 @@ mod tests {
         srv_rdata.extend_from_slice(nm("www.example.com.").as_ref().as_wire());
         let srv = ResourceRecord {
             name: nm("_sip._tcp.example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::new(Rtype::new(33), srv_rdata.clone())
                 .expect("SRV has no decoder here, so its bytes are opaque"),
@@ -1073,7 +1073,7 @@ mod tests {
         let mut msg = query_msg(7);
         msg.additionals.push(ResourceRecord {
             name: nm("ns1.example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1)))
                 .expect("encode"),
@@ -1432,7 +1432,7 @@ mod tests {
         for i in 0..60u8 {
             msg.answers.push(ResourceRecord {
                 name: nm(&format!("host{i}.example.com.")),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(10, 0, 0, i)))
                     .unwrap(),
@@ -1468,7 +1468,7 @@ mod tests {
         msg.response = true;
         msg.answers.push(ResourceRecord {
             name: nm("example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
         });
@@ -1507,7 +1507,7 @@ mod tests {
         msg.response = true;
         msg.answers.push(ResourceRecord {
             name: nm("example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
         });
@@ -1537,7 +1537,7 @@ mod tests {
         msg.response = true;
         msg.answers.push(ResourceRecord {
             name: nm("example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
         });
@@ -1563,7 +1563,7 @@ mod tests {
         msg.response = true;
         msg.answers.push(ResourceRecord {
             name: nm("example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(1, 2, 3, 4))).unwrap(),
         });

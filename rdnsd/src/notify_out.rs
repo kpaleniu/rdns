@@ -27,19 +27,16 @@ use crate::zones::Zones;
 /// lookup is `NotifyTarget::resolve` — so a `#key` naming nothing is a startup
 /// error here for the same reason and in the same words as there.
 fn parse_notify_peers(specs: &[String], keys: &TsigKeyring) -> Result<Vec<NotifyPeer>> {
-    let mut peers = Vec::new();
-    for spec in specs {
-        let spec = spec.trim();
-        if spec.is_empty() {
-            continue;
-        }
-        peers.push(
-            notify::NotifyTarget::parse(spec)
+    specs
+        .iter()
+        .map(|spec| spec.trim())
+        .filter(|spec| !spec.is_empty())
+        .map(|spec| {
+            Ok(notify::NotifyTarget::parse(spec)
                 .map_err(|e| anyhow!("--also-notify {e}"))?
-                .resolve(keys)?,
-        );
-    }
-    Ok(peers)
+                .resolve(keys)?)
+        })
+        .collect()
 }
 
 /// The global list plus whatever `[zones."x"].also-notify` adds per zone.

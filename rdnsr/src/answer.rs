@@ -543,7 +543,7 @@ async fn reverse_dns64(
 ) -> DnsMessage {
     let cname = ResourceRecord {
         name: query.qname.clone(),
-        class: rdns::Class::new(1),
+        class: rdns::Class::IN,
         ttl: rdns::Ttl::from_secs(REVERSE_CNAME_TTL),
         rdata: match rdns::RecordData::from_parsed(&rdns::ParsedRecord::CNAME(target.clone())) {
             Ok(rdata) => rdata,
@@ -1270,7 +1270,7 @@ mod tests {
             &request,
             vec![ResourceRecord {
                 name: nm("www.example.com."),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(60),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                     "192.0.2.1".parse().unwrap(),
@@ -1656,7 +1656,7 @@ mod tests {
     fn a_record(name: &rdns::Name, ttl: u32) -> ResourceRecord {
         ResourceRecord {
             name: name.clone(),
-            class: rdns::Class::new(1),
+            class: rdns::Class::IN,
             ttl: rdns::Ttl::from_secs(ttl),
             rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(std::net::Ipv4Addr::new(
                 192, 0, 2, 10,
@@ -2497,7 +2497,7 @@ mod tests {
             Qtype::of(record_types::A),
             vec![ResourceRecord {
                 name: name.clone(),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(100),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                     std::net::Ipv4Addr::new(198, 0, 2, 10),
@@ -2552,7 +2552,7 @@ mod tests {
             Qtype::of(record_types::A),
             vec![ResourceRecord {
                 name: name.clone(),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(100),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                     std::net::Ipv4Addr::new(198, 0, 2, 10),
@@ -2620,7 +2620,7 @@ mod tests {
     fn soa(zone: &str) -> ResourceRecord {
         ResourceRecord {
             name: nm(zone),
-            class: rdns::Class::new(1),
+            class: rdns::Class::IN,
             ttl: rdns::Ttl::from_secs(60),
             rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::SOA {
                 mname: nm("ns.example.com."),
@@ -2656,7 +2656,7 @@ mod tests {
             Qtype::of(record_types::A),
             vec![ResourceRecord {
                 name: name.clone(),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(300),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                     "192.0.2.33".parse().unwrap(),
@@ -2763,7 +2763,7 @@ mod tests {
             Qtype::of(record_types::AAAA),
             vec![ResourceRecord {
                 name: name.clone(),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(300),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::AAAA(
                     "::ffff:192.0.2.33".parse().unwrap(),
@@ -2776,7 +2776,7 @@ mod tests {
             Qtype::of(record_types::A),
             vec![ResourceRecord {
                 name: name.clone(),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(300),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                     "192.0.2.33".parse().unwrap(),
@@ -2803,7 +2803,7 @@ mod tests {
             Qtype::of(record_types::AAAA),
             vec![ResourceRecord {
                 name: name.clone(),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(300),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::AAAA(
                     "2001:db8::1".parse().unwrap(),
@@ -2956,7 +2956,7 @@ mod tests {
             resp.response = true;
             resp.authorities = vec![ResourceRecord {
                 name: nm("example.test."),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(3600),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::NS(nm(
                     "ns.evil.example.com.",
@@ -2965,7 +2965,7 @@ mod tests {
             }];
             resp.additionals = vec![ResourceRecord {
                 name: nm("ns.evil.example.com."),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(3600),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                     std::net::Ipv4Addr::new(192, 0, 2, 13),
@@ -3328,7 +3328,7 @@ mod tests {
             Qtype::of(record_types::A),
             vec![ResourceRecord {
                 name: name.clone(),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(300),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                     std::net::Ipv4Addr::new(198, 0, 2, 7),
@@ -3388,7 +3388,7 @@ mod tests {
             (0..128u32)
                 .map(|i| ResourceRecord {
                     name: pool.clone(),
-                    class: rdns::Class::new(1),
+                    class: rdns::Class::IN,
                     ttl: rdns::Ttl::from_secs(300),
                     rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                         std::net::Ipv4Addr::new(198, 51, 100, (i % 254 + 1) as u8),

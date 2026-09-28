@@ -1788,13 +1788,13 @@ mod tests {
     fn wildcard_answer(qname: &str, wildcard_labels: u8, nsec: ResourceRecord) -> DnsMessage {
         let a = ResourceRecord {
             name: nm(qname),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::A("192.0.2.7".parse().unwrap())).unwrap(),
         };
         let sig = ResourceRecord {
             name: nm(qname),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
                 type_covered: rt::A,
@@ -1811,7 +1811,7 @@ mod tests {
         };
         let nsec_sig = ResourceRecord {
             name: nsec.name.clone(),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::RRSIG {
                 type_covered: rt::NSEC,

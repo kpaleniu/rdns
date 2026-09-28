@@ -1420,7 +1420,7 @@ mod tests {
 
         let good = |owner_hash: &[u8], next: Vec<u8>| crate::ResourceRecord {
             name: nm(&format!("{}.example.com.", base32hex_encode(owner_hash))),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
                 hash_algorithm: 1,
@@ -1458,7 +1458,7 @@ mod tests {
                 "{}.example.com.",
                 base32hex_encode(hash.as_bytes())
             )),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
                 hash_algorithm: 1,

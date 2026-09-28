@@ -1157,7 +1157,7 @@ this line has no record and is skipped
     fn ns_record(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
             name: nm(owner),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NS(nm(target))).unwrap(),
         }
@@ -1166,7 +1166,7 @@ this line has no record and is skipped
     fn cname_record(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
             name: nm(owner),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm(target))).unwrap(),
         }
@@ -1175,7 +1175,7 @@ this line has no record and is skipped
     fn dname_record(owner: &str, target: &str) -> ResourceRecord {
         ResourceRecord {
             name: nm(owner),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(1800),
             rdata: RecordData::from_parsed(&ParsedRecord::DNAME(nm(target))).unwrap(),
         }
@@ -2665,7 +2665,7 @@ this line has no record and is skipped
     fn signed_no_ds_proof(parent: &TestZone, name: &str) -> Vec<ResourceRecord> {
         let nsec = ResourceRecord {
             name: nm(name),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: nm("zz.test."),
@@ -2863,7 +2863,7 @@ this line has no record and is skipped
     fn cname_records(auth: &TestZone, owner: &str, target: &str) -> Vec<ResourceRecord> {
         let cname = ResourceRecord {
             name: nm(owner),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm(target))).unwrap(),
         };
@@ -2877,7 +2877,7 @@ this line has no record and is skipped
     fn signed_nodata_authority(auth: &TestZone, name: &str) -> Vec<ResourceRecord> {
         let soa = ResourceRecord {
             name: nm("example.test."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: nm("ns.example.test."),
@@ -2892,7 +2892,7 @@ this line has no record and is skipped
         };
         let nsec = ResourceRecord {
             name: nm(name),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: nm("zz.example.test."),
@@ -2912,7 +2912,7 @@ this line has no record and is skipped
     fn signed_nxdomain_authority(auth: &TestZone) -> Vec<ResourceRecord> {
         let soa = ResourceRecord {
             name: nm("example.test."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: nm("ns.example.test."),
@@ -2927,7 +2927,7 @@ this line has no record and is skipped
         };
         let nsec = ResourceRecord {
             name: nm("example.test."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: nm("www.example.test."),
@@ -2970,7 +2970,7 @@ this line has no record and is skipped
 
         let soa = ResourceRecord {
             name: nm(zone),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: nm("ns.example.test."),
@@ -2989,7 +2989,7 @@ this line has no record and is skipped
             // — which is why nothing about this shape can be checked without
             // hashing for real.
             name: nm(&format!("{}.{zone}", base32hex_encode(owner_hash))),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC3 {
                 hash_algorithm: 1,
@@ -3028,7 +3028,7 @@ this line has no record and is skipped
     fn signed_wildcard_nodata_authority(auth: &TestZone, at_wildcard: bool) -> Vec<ResourceRecord> {
         let soa = ResourceRecord {
             name: nm("example.test."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::SOA {
                 mname: nm("ns.example.test."),
@@ -3047,7 +3047,7 @@ this line has no record and is skipped
             } else {
                 nm(&nm("m.example.test.").to_string())
             },
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(3600),
             rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                 next_domain_name: nm("zzz.example.test."),
@@ -3572,7 +3572,7 @@ this line has no record and is skipped
         if with_proof {
             let nsec = ResourceRecord {
                 name: nm("*.example.test."),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
                     next_domain_name: nm("zzz.example.test."),
@@ -3670,7 +3670,7 @@ this line has no record and is skipped
         let h = signed_hierarchy_with(signed_ds, |auth| {
             let cname = ResourceRecord {
                 name: nm("www.example.test."),
-                class: Class::new(1),
+                class: Class::IN,
                 ttl: Ttl::from_secs(3600),
                 rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm(&nm(
                     "alias.example.test.",

@@ -251,7 +251,7 @@ mod tests {
         msg.additionals = vec![
             ResourceRecord {
                 name: nm("example.com."),
-                class: rdns::Class::new(1),
+                class: rdns::Class::IN,
                 ttl: rdns::Ttl::from_secs(60),
                 rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
                     "192.0.2.1".parse().unwrap(),

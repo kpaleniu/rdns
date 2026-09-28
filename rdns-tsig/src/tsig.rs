@@ -1175,7 +1175,7 @@ mod tests {
             strings.push(vec![b'y'; pad]);
             msg.answers.push(rdns_core::ResourceRecord {
                 name: nm(&nm("big.example.com.").to_string()),
-                class: rdns_core::Class::new(1),
+                class: rdns_core::Class::IN,
                 ttl: rdns_core::Ttl::from_secs(60),
                 rdata: rdns_core::RecordData::from_parsed(&rdns_core::ParsedRecord::TXT(strings))
                     .expect("a TXT encodes"),

@@ -420,21 +420,11 @@ impl DnsCache {
         };
         let now = self.clock.now();
 
-        let mut expired_count = 0;
-        let mut valid_count = 0;
-
-        for entry in cache.values() {
-            if entry.is_expired(now) {
-                expired_count += 1;
-            } else {
-                valid_count += 1;
-            }
-        }
-
+        let expired = cache.values().filter(|e| e.is_expired(now)).count();
         CacheStats {
             total_entries: cache.len(),
-            valid_entries: valid_count,
-            expired_entries: expired_count,
+            valid_entries: cache.len() - expired,
+            expired_entries: expired,
         }
     }
 
@@ -470,7 +460,7 @@ mod tests {
     fn create_test_record(name: &str, ttl: Ttl) -> ResourceRecord {
         ResourceRecord {
             name: nm(name),
-            class: Class::new(1),
+            class: Class::IN,
             ttl,
             rdata: RecordData::from_parsed(&ParsedRecord::A(Ipv4Addr::new(192, 0, 2, 1))).unwrap(),
         }

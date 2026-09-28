@@ -900,7 +900,7 @@ mod tests {
         );
         response.answers.push(ResourceRecord {
             name: nm("www.example.com."),
-            class: Class::new(1),
+            class: Class::IN,
             ttl: Ttl::from_secs(300),
             rdata: RecordData::from_parsed(&ParsedRecord::CNAME(nm("elsewhere.test."))).unwrap(),
         });
