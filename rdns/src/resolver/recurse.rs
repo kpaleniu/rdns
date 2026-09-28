@@ -16,28 +16,6 @@
 // of one `impl Resolver`, and a second import list is a second thing to drift.
 use super::*;
 
-/// What one upstream answer is read into, whatever this resolver advertised.
-///
-/// Not [`ResolverConfig::udp_payload_size`], which is what we told the server we
-/// could reassemble: the two were one number until `TODO.md` #41c, so lowering
-/// the advertisement to DNS Flag Day's 1232 would also have narrowed the
-/// doorway a server that ignores the advertisement has to fit through — and a
-/// datagram larger than the buffer is not truncated into a parse error, it is
-/// lost, since the receive itself fails on Windows (WSAEMSGSIZE) and silently
-/// drops the tail elsewhere.
-///
-/// Why not 65,535, which is Unbound's `msg-buffer-size` ("Default is 65552
-/// bytes, enough for 64 Kb packets, the maximum DNS message size") and the size
-/// a peer could in principle send: one of these exists per query in flight, and
-/// `rdnsr`'s `--max-inflight-udp` allows 1024 of those. At 64 KiB that ceiling
-/// costs 64 MB rather than the ~1.5 MB its own documentation claims — the
-/// multiplier is the point (`CLAUDE.md` §5), and Unbound reuses one buffer per
-/// thread where this allocates per query. 4,096 is what the coupled number was
-/// before #41 lowered the advertisement, so nothing this resolver could read
-/// yesterday is unreadable today; it is three times the advertisement, which is
-/// the slack a non-conforming server gets.
-const UPSTREAM_RECEIVE_BUFFER: usize = 4096;
-
 /// What a referral told us.
 struct Referral {
     zone: Name,
@@ -459,14 +437,13 @@ impl Resolver {
             if !owner.is_at_or_under(zone) {
                 continue;
             }
-            let port = self.config.server_port;
             match rr.rdata.parse() {
                 Ok(ParsedRecord::A(addr)) => {
-                    glue.push(SocketAddr::new(IpAddr::V4(addr), port));
+                    glue.push(SocketAddr::new(IpAddr::V4(addr), DNS_PORT));
                     ttl = ttl.min(rr.ttl.as_u64());
                 }
                 Ok(ParsedRecord::AAAA(addr)) => {
-                    glue.push(SocketAddr::new(IpAddr::V6(addr), port));
+                    glue.push(SocketAddr::new(IpAddr::V6(addr), DNS_PORT));
                     ttl = ttl.min(rr.ttl.as_u64());
                 }
                 _ => {}
@@ -516,10 +493,10 @@ impl Resolver {
                         .iter()
                         .filter_map(|rr| match rr.rdata.parse() {
                             Ok(ParsedRecord::A(addr)) => {
-                                Some(SocketAddr::new(IpAddr::V4(addr), self.config.server_port))
+                                Some(SocketAddr::new(IpAddr::V4(addr), DNS_PORT))
                             }
                             Ok(ParsedRecord::AAAA(addr)) => {
-                                Some(SocketAddr::new(IpAddr::V6(addr), self.config.server_port))
+                                Some(SocketAddr::new(IpAddr::V6(addr), DNS_PORT))
                             }
                             _ => None,
                         }),
@@ -540,18 +517,11 @@ impl Resolver {
         upstream: &SocketAddr,
         out: &OutgoingQuery,
     ) -> ResolveResult<DnsMessage> {
-        // tokio's UdpSocket has no read timeout of its own.
-        let read_timeout = Duration::from_millis(self.config.timeout_ms / 2);
-        let socket = UdpSocket::bind(bind_addr_for(*upstream)).await?;
-        socket.connect(upstream).await?;
-
-        socket.send(&out.buf).await?;
-
-        let mut response_buf = vec![0; UPSTREAM_RECEIVE_BUFFER];
-        let n = tokio::time::timeout(read_timeout, socket.recv(&mut response_buf)).await??;
-
-        response_buf.truncate(n);
-        let response = DnsMessage::try_from_bytes(&response_buf)?;
+        let bytes = self
+            .upstream
+            .exchange(*upstream, Transport::Udp, &out.buf, self.exchange_timeout())
+            .await?;
+        let response = DnsMessage::try_from_bytes(&bytes)?;
 
         // The connected socket filters by source address; the id and the echoed
         // (0x20-cased) name are the entropy an off-path spoofer must also match.
@@ -570,7 +540,7 @@ impl Resolver {
         Ok(response)
     }
 
-    /// Re-issue a query over TCP, length-prefixed (RFC 1035 §4.2.2).
+    /// Re-issue a query over TCP.
     ///
     /// A still-truncated response is returned as-is: TCP is the last resort, so
     /// the partial answer plus TC beats a hard failure.
@@ -579,35 +549,11 @@ impl Resolver {
         upstream: &SocketAddr,
         out: &OutgoingQuery,
     ) -> ResolveResult<DnsMessage> {
-        if out.buf.len() > TCP_MAX_MESSAGE {
-            return Err(ResolveError::no_response(format!(
-                "query of {} bytes exceeds the 2-byte TCP length prefix",
-                out.buf.len()
-            )));
-        }
-
-        // Applied to each of connect, write and read.
-        let timeout = Duration::from_millis(self.config.timeout_ms / 2);
-        let mut stream = tokio::time::timeout(timeout, TcpStream::connect(upstream)).await??;
-
-        // One write so prefix and message share a segment. The length is checked
-        // rather than cast: a wrapped prefix reads as a broken stream.
-        let framed = crate::framed(&out.buf)?;
-        tokio::time::timeout(timeout, stream.write_all(&framed)).await??;
-
-        let mut len_buf = [0u8; 2];
-        tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await??;
-        let len = u16::from_be_bytes(len_buf) as usize;
-        if len == 0 {
-            return Err(ResolveError::no_response(format!(
-                "upstream {} sent a zero-length TCP message",
-                upstream
-            )));
-        }
-
-        let mut response_buf = vec![0; len];
-        tokio::time::timeout(timeout, stream.read_exact(&mut response_buf)).await??;
-        let response = DnsMessage::try_from_bytes(&response_buf)?;
+        let bytes = self
+            .upstream
+            .exchange(*upstream, Transport::Tcp, &out.buf, self.exchange_timeout())
+            .await?;
+        let response = DnsMessage::try_from_bytes(&bytes)?;
 
         // TCP is not off-path spoofable, but a mismatched id or question still
         // means a confused peer, not an answer to trust.
@@ -617,6 +563,12 @@ impl Resolver {
             )));
         }
         Ok(response)
+    }
+
+    /// Each wait on one server. Half the per-query timeout, so a second server
+    /// still gets a turn.
+    fn exchange_timeout(&self) -> Duration {
+        Duration::from_millis(self.config.timeout_ms / 2)
     }
 }
 

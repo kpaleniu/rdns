@@ -20,11 +20,10 @@ Everything is async `tokio::net`. Each hop is an `await` on a socket.
 | `max_delegations` | 16 | referrals followed before giving up |
 | `max_cname_hops` | 8 | |
 | `query_budget` | 64 | total upstream queries one `resolve` may spend |
-| `udp_payload_size` | 1232 | advertised upstream (RFC 6891 §6.2.3). `rdnsr` sets it from `--udp-payload-size`, the same number it advertises to its own clients: one host, one reassembly claim. Not the size an upstream answer is read into, which is `recurse::UPSTREAM_RECEIVE_BUFFER` = 4096 — the two were one number until #41c |
+| `udp_payload_size` | 1232 | advertised upstream (RFC 6891 §6.2.3). `rdnsr` sets it from `--udp-payload-size`, the same number it advertises to its own clients: one host, one reassembly claim. Not the size an upstream answer is read into, which is `upstream::UPSTREAM_RECEIVE_BUFFER` = 4096 — the two were one number until #41c |
 | `delegation_cache_size` | 10 000 | 0 disables, which restarts every query at the root |
 | `qname_minimization` | on | RFC 9156 |
 | `zero_x20` | on | draft-vixie-dnsext-dns0x20 |
-| `server_port` | 53 | configurable so tests can stand up a fake hierarchy |
 | `dnssec` | `None` | off by default |
 
 `--root-hints <file>` reads named.root format. A stray line is skipped rather

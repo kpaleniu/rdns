@@ -7076,10 +7076,10 @@ any `--upstream` selects forwarding.
 
 **Recursion** walks root hints → TLD → authoritative, following referrals. The
 built-in hints carry both an A and an AAAA for each of the 13 roots, interleaved
-so whichever family the host has is reached early; `query_server` binds its send
-socket to the target's family (a v4-wildcard socket cannot reach a v6 address),
-which is what makes AAAA glue usable at all. `parse_root_hints` loads the
-`named.root` format for `rdnsr --root-hints`. Three controls are load-bearing:
+so whichever family the host has is reached early; `Upstream::Network` binds its
+send socket to the target's family (a v4-wildcard socket cannot reach a v6
+address), which is what makes AAAA glue usable at all. `parse_root_hints` loads
+the `named.root` format for `rdnsr --root-hints`. Three controls are load-bearing:
 
 - **Bailiwick on referrals.** A referral must be below the zone we asked and at
   or above the name being chased, or `com.` could hand us the servers for

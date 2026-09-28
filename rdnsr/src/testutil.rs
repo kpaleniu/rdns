@@ -13,7 +13,7 @@ use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
 use rdns::logging::QueryLogger;
 use rdns::metrics::DnsMetrics;
 use rdns::record_types;
-use rdns::resolver::{Resolver, ResolverConfig, ResolverMode};
+use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, Upstream};
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
 use rdns::validation::AdmissionCheck;
 use rdns::zone_signer::{sign_zone, SigningPolicy};
@@ -281,33 +281,24 @@ impl SignedZone {
     /// A forwarder anchored on this zone's KSK, pointed at an upstream that
     /// answers with [`SignedZone::reply`], and the count of what it was asked
     /// other than the DNSKEY RRset.
-    pub(crate) async fn upstream(self) -> (Arc<Resolver>, Arc<AtomicUsize>) {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("a loopback port");
-        let addr = socket.local_addr().expect("bound");
+    pub(crate) fn upstream(self) -> (Arc<Resolver>, Arc<AtomicUsize>) {
         let asked = Arc::new(AtomicUsize::new(0));
         let config = ResolverConfig {
             mode: ResolverMode::Forward,
-            upstream_servers: vec![addr],
+            upstream_servers: vec!["198.51.100.1:53".parse().expect("an address")],
             dnssec: Some(TrustAnchors::new(vec![self.anchor.clone()]).into()),
             ..Default::default()
         };
         let counter = asked.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            while let Ok((n, peer)) = socket.recv_from(&mut buf).await {
-                let Ok(query) = DnsMessage::try_from_bytes(&buf[..n]) else {
-                    continue;
-                };
-                if !query.queries[0].qtype.is(record_types::DNSKEY) {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                }
-                let reply = self.reply(&query).to_bytes_within(4096).expect("serialize");
-                let _ = socket.send_to(&reply, peer).await;
+        let upstream = Upstream::answering(move |_, _, query| {
+            let query = DnsMessage::try_from_bytes(query).ok()?;
+            if !query.queries[0].qtype.is(record_types::DNSKEY) {
+                counter.fetch_add(1, Ordering::SeqCst);
             }
+            self.reply(&query).to_bytes_within(4096).ok()
         });
-        (Arc::new(Resolver::new(config)), asked)
+        let resolver = Resolver::new(config).with_upstream(upstream);
+        (Arc::new(resolver), asked)
     }
 }
 

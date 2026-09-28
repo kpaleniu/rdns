@@ -2125,7 +2125,7 @@ mod tests {
     /// fresh answer, the next client gets that and not the stale one.
     #[tokio::test]
     async fn a_refresh_behind_a_stale_answer_ends_the_stale_answers() {
-        let (resolver, asked) = SignedZone::new().upstream().await;
+        let (resolver, asked) = SignedZone::new().upstream();
         let (serving, clock, mut queue) = stale_first(resolver);
         let name = nm("x.w.example.test.");
         let a = Qtype::of(record_types::A);
@@ -2347,7 +2347,7 @@ mod tests {
     /// answers and negatives only — as a second upstream query for `b`.
     #[tokio::test]
     async fn a_refreshed_denial_answers_the_rest_of_its_gap() {
-        let (resolver, asked) = SignedZone::new().upstream().await;
+        let (resolver, asked) = SignedZone::new().upstream();
         let serving = serving(resolver, test_shell(), PolicyZones::default());
 
         refresh(
@@ -2947,51 +2947,43 @@ mod tests {
     /// `passthru_resolves_the_query_as_if_no_rule_matched` shows.
     #[tokio::test]
     async fn a_nameserver_trigger_blocks_a_name_the_feed_never_names() {
-        let root = tokio::net::UdpSocket::bind("127.0.0.1:0")
-            .await
-            .expect("bind a fake root");
-        let root_addr = root.local_addr().expect("addr");
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1500];
-            while let Ok((n, peer)) = root.recv_from(&mut buf).await {
-                let Ok(query) = DnsMessage::try_from_bytes(&buf[..n]) else {
-                    continue;
-                };
-                let mut resp = DnsMessage::try_from_bytes(&buf[..n]).expect("parses twice");
-                resp.response = true;
-                resp.queries = query.queries.clone();
-                resp.authorities = vec![ResourceRecord {
-                    name: nm("example.test."),
-                    class: rdns::Class::new(1),
-                    ttl: rdns::Ttl::from_secs(3600),
-                    rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::NS(nm(
-                        "ns.evil.example.com.",
-                    )))
-                    .expect("encodes"),
-                }];
-                resp.additionals = vec![ResourceRecord {
-                    name: nm("ns.evil.example.com."),
-                    class: rdns::Class::new(1),
-                    ttl: rdns::Ttl::from_secs(3600),
-                    rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
-                        std::net::Ipv4Addr::new(192, 0, 2, 13),
-                    ))
-                    .expect("encodes"),
-                }];
-                let mut out = vec![0u8; 1500];
-                if let Ok(len) = resp.to_bytes(&mut out) {
-                    let _ = root.send_to(&out[..len], peer).await;
-                }
+        let root_addr: std::net::SocketAddr = "198.51.100.1:53".parse().expect("an address");
+        let root = rdns::resolver::Upstream::answering(move |server, _, query| {
+            if server != root_addr {
+                return None;
             }
+            let mut resp = DnsMessage::try_from_bytes(query).ok()?;
+            resp.response = true;
+            resp.authorities = vec![ResourceRecord {
+                name: nm("example.test."),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(3600),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::NS(nm(
+                    "ns.evil.example.com.",
+                )))
+                .expect("encodes"),
+            }];
+            resp.additionals = vec![ResourceRecord {
+                name: nm("ns.evil.example.com."),
+                class: rdns::Class::new(1),
+                ttl: rdns::Ttl::from_secs(3600),
+                rdata: rdns::RecordData::from_parsed(&rdns::ParsedRecord::A(
+                    std::net::Ipv4Addr::new(192, 0, 2, 13),
+                ))
+                .expect("encodes"),
+            }];
+            resp.to_bytes_within(1500).ok()
         });
 
-        let resolver = Arc::new(Resolver::new(rdns::resolver::ResolverConfig {
-            mode: rdns::resolver::ResolverMode::Recurse,
-            root_hints: vec![root_addr],
-            server_port: root_addr.port(),
-            timeout_ms: 2000,
-            ..Default::default()
-        }));
+        let resolver = Arc::new(
+            Resolver::new(rdns::resolver::ResolverConfig {
+                mode: rdns::resolver::ResolverMode::Recurse,
+                root_hints: vec![root_addr],
+                timeout_ms: 2000,
+                ..Default::default()
+            })
+            .with_upstream(root),
+        );
         let serving = serving(
             resolver,
             test_shell(),
@@ -3096,7 +3088,7 @@ mod tests {
     /// demand for #58: this resolution would have been served stale anyway.
     ///
     /// A black hole plus a 4 s per-query timeout, so the elapsed time is the
-    /// timeout and not a sleep. **4 s, not 2**: `recurse::query_server` waits
+    /// timeout and not a sleep. **4 s, not 2**: `recurse::exchange_timeout` is
     /// `timeout_ms / 2` on the read, so a 2 s config gives up at 1 s and this
     /// test passed with the counter at zero until that was opened
     /// (`CLAUDE.md` §4).

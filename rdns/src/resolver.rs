@@ -137,13 +137,19 @@ impl From<tokio::time::error::Elapsed> for ResolveError {
 
 mod caches;
 mod recurse;
+mod upstream;
 mod validate;
+
+pub use upstream::{Answering, Transport, Upstream};
 
 use caches::{DelegationCache, KeyCache, RttStore, Start};
 
 /// A DNS message sent over TCP is prefixed with a 2-byte big-endian length
 /// (RFC 1035 §4.2.2), so no message can exceed what that field can express.
 const TCP_MAX_MESSAGE: usize = u16::MAX as usize;
+
+/// Where a nameserver named by a referral is asked: glue carries no port.
+const DNS_PORT: u16 = 53;
 
 /// The record type an intermediate QNAME-minimized probe asks for: A, the QTYPE
 /// least likely to trip middleboxes (RFC 9156 §2.3), not RFC 7816's NS.
@@ -250,7 +256,7 @@ pub struct ResolverConfig {
     ///
     /// Not the size of the buffer an answer is read into — those were one
     /// number until `TODO.md` #41c, which is why lowering this was not free.
-    /// See `recurse::UPSTREAM_RECEIVE_BUFFER`.
+    /// See `upstream::UPSTREAM_RECEIVE_BUFFER`.
     pub udp_payload_size: u16,
     /// How many zone delegations to remember. 0 disables the cache, which makes
     /// every query restart at the root — correct, but only acceptable in tests.
@@ -263,9 +269,6 @@ pub struct ResolverConfig {
     /// top of the transaction id and source port. Off for peers that do not
     /// preserve case.
     pub zero_x20: bool,
-    /// Port to contact a nameserver on. Always 53 in practice — glue carries no
-    /// port; configurable only so tests can run an unprivileged hierarchy.
-    pub server_port: u16,
     /// Trust anchors to validate against, or `None` for no DNSSEC validation.
     ///
     /// On, every query carries DO and CD: an upstream that validates for us and
@@ -344,7 +347,6 @@ impl Default for ResolverConfig {
             delegation_cache_size: 10_000,
             qname_minimization: true,
             zero_x20: true,
-            server_port: 53,
             // Off by default: validation costs round trips and turns a
             // misconfigured zone into a failure, so it is the operator's call.
             dnssec: None,
@@ -507,6 +509,7 @@ pub struct Resolver {
     /// (`TODO.md` #107b). `validate` reads it directly; the two caches hold
     /// their own clone.
     clock: Clock,
+    upstream: Upstream,
 }
 
 impl Resolver {
@@ -529,7 +532,14 @@ impl Resolver {
             rtt,
             keys,
             clock,
+            upstream: Upstream::Network,
         }
+    }
+
+    /// Send this resolver's queries through `upstream` instead of the network.
+    pub fn with_upstream(mut self, upstream: Upstream) -> Self {
+        self.upstream = upstream;
+        self
     }
 
     /// A recursing resolver with the built-in root hints.
@@ -802,16 +812,64 @@ mod tests {
         }
     }
 
-    /// Recursing from a fake root. The whole fake hierarchy shares
-    /// `root.port()` — see [`bind_hierarchy`].
+    /// Recursing from a fake root.
     fn recursing_config(root: SocketAddr) -> ResolverConfig {
         ResolverConfig {
             mode: ResolverMode::Recurse,
             root_hints: vec![root],
             timeout_ms: 4000,
-            server_port: root.port(),
             ..ResolverConfig::default()
         }
+    }
+
+    /// Fake servers by address, answering in place of the network. An address
+    /// with no server is silence.
+    #[derive(Clone, Default)]
+    struct Net(Arc<Mutex<HashMap<SocketAddr, Arc<Serve>>>>);
+
+    type Serve = dyn Fn(&DnsMessage) -> DnsMessage + Send + Sync;
+
+    impl Net {
+        fn serve(
+            &self,
+            addr: SocketAddr,
+            answer: impl Fn(&DnsMessage) -> DnsMessage + Send + Sync + 'static,
+        ) {
+            self.0.lock().unwrap().insert(addr, Arc::new(answer));
+        }
+
+        /// Both transports get the same answer; a test about which one was
+        /// used writes its own [`Upstream::answering`].
+        fn upstream(&self) -> Upstream {
+            let net = self.clone();
+            Upstream::answering(move |server, _, query| {
+                let answer = net.0.lock().unwrap().get(&server)?.clone();
+                let query = DnsMessage::try_from_bytes(query).ok()?;
+                answer(&query).to_bytes_within(u16::MAX as usize).ok()
+            })
+        }
+
+        fn resolver(&self, config: ResolverConfig) -> Resolver {
+            Resolver::new(config).with_upstream(self.upstream())
+        }
+    }
+
+    /// The `n`th fake server's address. TEST-NET-2 (RFC 5737), so it cannot
+    /// be mistaken for the 192.0.2.0/24 data the servers hand out.
+    fn fake(n: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, n)), DNS_PORT)
+    }
+
+    /// Every server, on both transports, answers with `answer`.
+    fn answering(
+        answer: impl Fn(Transport, &DnsMessage) -> DnsMessage + Send + Sync + 'static,
+    ) -> Upstream {
+        Upstream::answering(move |_, transport, query| {
+            let query = DnsMessage::try_from_bytes(query).ok()?;
+            answer(transport, &query)
+                .to_bytes_within(u16::MAX as usize)
+                .ok()
+        })
     }
 
     /// A minimal NOERROR response echoing `query`'s id and question.
@@ -995,9 +1053,8 @@ this line has no record and is skipped
     /// taken as the answer to an A query, address record and all.
     #[tokio::test]
     async fn a_reply_that_echoes_another_type_is_not_this_answer() {
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind a fake upstream");
-        let addr = socket.local_addr().unwrap();
-        let _server = spawn_server(socket, |query| {
+        let net = Net::default();
+        net.serve(fake(1), |query| {
             let mut resp = response_to(query);
             if let Some(q) = resp.queries.first_mut() {
                 q.qtype = Qtype::of(rt::MX);
@@ -1005,11 +1062,7 @@ this line has no record and is skipped
             resp.answers.push(a_record("example.com.", [192, 0, 2, 1]));
             resp
         });
-
-        let mut config = test_config(addr);
-        // The upstream answers at once; this only bounds the retries.
-        config.timeout_ms = 500;
-        let resolver = Resolver::new(config);
+        let resolver = net.resolver(test_config(fake(1)));
 
         let err = resolver
             .resolve(&test_query())
@@ -1062,7 +1115,6 @@ this line has no record and is skipped
     /// A UDP server that answers with whatever the closure builds. Stops when
     /// the returned guard is dropped.
     struct FakeServer {
-        addr: SocketAddr,
         task: tokio::task::JoinHandle<()>,
     }
 
@@ -1070,35 +1122,6 @@ this line has no record and is skipped
         fn drop(&mut self) {
             self.task.abort();
         }
-    }
-
-    /// Bind `count` sockets on distinct loopback addresses that all share one
-    /// port.
-    ///
-    /// One port because glue carries no port: the resolver always dials
-    /// `server_port`, so the fake servers differ only by address.
-    fn bind_hierarchy(count: usize) -> Vec<UdpSocket> {
-        assert!(count <= 8, "loopback aliases used here stop at 127.0.0.8");
-        let start = 20_000 + (rand::random::<u16>() % 20_000);
-
-        for offset in 0..500u16 {
-            let port = 20_000 + (start - 20_000 + offset) % 20_000;
-            let mut socks = Vec::with_capacity(count);
-            let bound =
-                (0..count).all(
-                    |i| match UdpSocket::bind(format!("127.0.0.{}:{}", i + 1, port)) {
-                        Ok(s) => {
-                            socks.push(s);
-                            true
-                        }
-                        Err(_) => false,
-                    },
-                );
-            if bound {
-                return socks;
-            }
-        }
-        panic!("could not bind a shared port across loopback addresses");
     }
 
     /// A task on the test's runtime, not a thread polling a timed receive: on
@@ -1111,8 +1134,6 @@ this line has no record and is skipped
     {
         socket.set_nonblocking(true).unwrap();
         let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
-        let addr = socket.local_addr().unwrap();
-
         let task = tokio::spawn(async move {
             let mut buf = [0u8; 4096];
             loop {
@@ -1132,7 +1153,7 @@ this line has no record and is skipped
             }
         });
 
-        FakeServer { addr, task }
+        FakeServer { task }
     }
 
     fn ns_record(owner: &str, target: &str) -> ResourceRecord {
@@ -1238,19 +1259,13 @@ this line has no record and is skipped
     /// Root → TLD → authoritative, following glue at each step.
     #[tokio::test]
     async fn test_recursion_follows_the_delegation_chain() {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, auth_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr, auth_addr) = (fake(1), fake(2), fake(3));
 
-        let _auth = spawn_server(auth_sock, |q| {
+        net.serve(auth_addr, |q| {
             authoritative(q, vec![a_record("www.example.test.", [192, 0, 2, 1])])
         });
-        let _tld = spawn_server(tld_sock, move |q| {
+        net.serve(tld_addr, move |q| {
             referral(
                 q,
                 "example.test.",
@@ -1258,11 +1273,11 @@ this line has no record and is skipped
                 Some(("ns.example.test.", auth_addr)),
             )
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let answer = resolver
             .resolve(&QuerySection {
                 qname: nm("www.example.test."),
@@ -1285,22 +1300,16 @@ this line has no record and is skipped
     /// it exists to keep the resolver away from.
     #[tokio::test]
     async fn a_refused_delegation_stops_the_walk_before_the_server_is_asked() {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, auth_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr, auth_addr) = (fake(1), fake(2), fake(3));
 
         let asked = Arc::new(AtomicUsize::new(0));
         let counter = asked.clone();
-        let _auth = spawn_server(auth_sock, move |q| {
+        net.serve(auth_addr, move |q| {
             counter.fetch_add(1, Ordering::Relaxed);
             authoritative(q, vec![a_record("www.example.test.", [192, 0, 2, 1])])
         });
-        let _tld = spawn_server(tld_sock, move |q| {
+        net.serve(tld_addr, move |q| {
             referral(
                 q,
                 "example.test.",
@@ -1308,11 +1317,11 @@ this line has no record and is skipped
                 Some(("ns.example.test.", auth_addr)),
             )
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let policy = RefuseNs::by_name("ns.example.test.");
         let err = resolver
             .resolve_validated(
@@ -1341,21 +1350,15 @@ this line has no record and is skipped
     /// rather than what they are called.
     #[tokio::test]
     async fn a_refused_address_stops_a_glueless_delegation() {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, auth_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr, auth_addr) = (fake(1), fake(2), fake(3));
 
-        let _auth = spawn_server(auth_sock, |q| {
+        net.serve(auth_addr, |q| {
             authoritative(q, vec![a_record("www.example.test.", [192, 0, 2, 1])])
         });
         // No glue for `example.test.`: its nameserver lives elsewhere under
         // `test.`, so the address comes back from a nested resolution.
-        let _tld = spawn_server(tld_sock, move |q| {
+        net.serve(tld_addr, move |q| {
             if qname_of(q).starts_with("ns.hoster.test.") {
                 let IpAddr::V4(v4) = auth_addr.ip() else {
                     panic!("test glue must be IPv4")
@@ -1364,11 +1367,11 @@ this line has no record and is skipped
             }
             referral(q, "example.test.", "ns.hoster.test.", None)
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let policy = RefuseNs::by_address(auth_addr.ip());
         let err = resolver
             .resolve_validated(
@@ -1393,20 +1396,14 @@ this line has no record and is skipped
     /// at `example.test.`, sees no referral, and resolves.
     #[tokio::test]
     async fn a_cached_delegation_is_still_offered_to_the_policy() {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, auth_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr, auth_addr) = (fake(1), fake(2), fake(3));
 
-        let _auth = spawn_server(auth_sock, |q| {
+        net.serve(auth_addr, |q| {
             let owner = qname_of(q);
             authoritative(q, vec![a_record(&owner, [192, 0, 2, 1])])
         });
-        let _tld = spawn_server(tld_sock, move |q| {
+        net.serve(tld_addr, move |q| {
             referral(
                 q,
                 "example.test.",
@@ -1414,11 +1411,11 @@ this line has no record and is skipped
                 Some(("ns.example.test.", auth_addr)),
             )
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         // The first client has no policy, and caches the delegation.
         resolver
             .resolve(&QuerySection {
@@ -1454,19 +1451,13 @@ this line has no record and is skipped
     /// that falls back from a stale one would be starting from a refusal.
     #[tokio::test]
     async fn a_refused_delegation_is_not_cached() {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, auth_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr, auth_addr) = (fake(1), fake(2), fake(3));
 
-        let _auth = spawn_server(auth_sock, |q| {
+        net.serve(auth_addr, |q| {
             authoritative(q, vec![a_record("www.example.test.", [192, 0, 2, 1])])
         });
-        let _tld = spawn_server(tld_sock, move |q| {
+        net.serve(tld_addr, move |q| {
             referral(
                 q,
                 "example.test.",
@@ -1474,11 +1465,11 @@ this line has no record and is skipped
                 Some(("ns.example.test.", auth_addr)),
             )
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let policy = RefuseNs::by_name("ns.example.test.");
         let query = QuerySection {
             qname: nm("www.example.test."),
@@ -1506,11 +1497,10 @@ this line has no record and is skipped
     /// path and proves nothing about DNAME.
     #[tokio::test]
     async fn a_dname_alone_is_followed_and_its_cname_synthesized() {
-        let mut socks = bind_hierarchy(2).into_iter();
-        let (root_sock, tld_sock) = (socks.next().unwrap(), socks.next().unwrap());
-        let tld_addr = tld_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr) = (fake(1), fake(2));
 
-        let _tld = spawn_server(tld_sock, |q| {
+        net.serve(tld_addr, |q| {
             let name = qname_of(q);
             if name == "www.example2.test." {
                 return authoritative(q, vec![a_record(&name, [192, 0, 2, 7])]);
@@ -1524,11 +1514,11 @@ this line has no record and is skipped
             }
             authoritative(q, vec![])
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let answer = resolver
             .resolve(&QuerySection {
                 qname: nm("www.example.test."),
@@ -1593,23 +1583,17 @@ this line has no record and is skipped
     /// reason and the test passed with the guard deleted (`CLAUDE.md` §1).
     #[tokio::test]
     async fn an_out_of_bailiwick_dname_is_neither_kept_nor_followed() {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, evil_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let evil_addr = evil_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr, evil_addr) = (fake(1), fake(2), fake(3));
 
-        let _evil = spawn_server(evil_sock, |q| {
+        net.serve(evil_addr, |q| {
             authoritative(q, vec![a_record(&qname_of(q), [6, 6, 6, 6])])
         });
         // Authoritative for `test.` and redirecting the root from there.
-        let _tld = spawn_server(tld_sock, |q| {
+        net.serve(tld_addr, |q| {
             authoritative(q, vec![dname_record(".", "evil.")])
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             if nm(&qname_of(q))
                 .as_ref()
                 .is_at_or_under(nm("evil.").as_ref())
@@ -1620,7 +1604,7 @@ this line has no record and is skipped
             }
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let answers = resolver
             .resolve(&QuerySection {
                 qname: nm("www.example.test."),
@@ -1642,14 +1626,13 @@ this line has no record and is skipped
     /// hand off `evil.test.` while we are asking for `www.example.test.`.
     #[tokio::test]
     async fn test_out_of_bailiwick_referral_is_not_followed() {
-        let mut socks = bind_hierarchy(2).into_iter();
-        let (root_sock, evil_sock) = (socks.next().unwrap(), socks.next().unwrap());
-        let evil_addr = evil_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, evil_addr) = (fake(1), fake(2));
 
-        let _evil = spawn_server(evil_sock, |q| {
+        net.serve(evil_addr, |q| {
             authoritative(q, vec![a_record(&qname_of(q), [6, 6, 6, 6])])
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(
                 q,
                 "evil.test.",
@@ -1658,7 +1641,7 @@ this line has no record and is skipped
             )
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let result = resolver
             .resolve(&QuerySection {
                 qname: nm("www.example.test."),
@@ -1681,22 +1664,16 @@ this line has no record and is skipped
     /// everything in bailiwick.
     #[tokio::test]
     async fn test_out_of_bailiwick_glue_is_ignored() {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, attacker_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let attacker_addr = attacker_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr, attacker_addr) = (fake(1), fake(2), fake(3));
 
-        let _attacker = spawn_server(attacker_sock, |q| {
+        net.serve(attacker_addr, |q| {
             authoritative(q, vec![a_record(&qname_of(q), [6, 6, 6, 6])])
         });
 
         // The `test.` server delegates example.test. but supplies glue for a
         // name outside `test.` entirely, pointing at the attacker.
-        let _tld = spawn_server(tld_sock, move |q| {
+        net.serve(tld_addr, move |q| {
             referral(
                 q,
                 "example.test.",
@@ -1704,11 +1681,11 @@ this line has no record and is skipped
                 Some(("ns.elsewhere.invalid.", attacker_addr)),
             )
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let result = resolver
             .resolve(&QuerySection {
                 qname: nm("www.example.test."),
@@ -1732,11 +1709,10 @@ this line has no record and is skipped
     /// A CNAME is followed, and every record along the chain is returned.
     #[tokio::test]
     async fn test_cname_chain_is_followed() {
-        let mut socks = bind_hierarchy(2).into_iter();
-        let (root_sock, auth_sock) = (socks.next().unwrap(), socks.next().unwrap());
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, auth_addr) = (fake(1), fake(2));
 
-        let _auth = spawn_server(auth_sock, |q| {
+        net.serve(auth_addr, |q| {
             let name = qname_of(q);
             if name == "www.example.test." {
                 authoritative(
@@ -1747,7 +1723,7 @@ this line has no record and is skipped
                 authoritative(q, vec![a_record("real.example.test.", [192, 0, 2, 9])])
             }
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(
                 q,
                 "example.test.",
@@ -1756,7 +1732,7 @@ this line has no record and is skipped
             )
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let answer = resolver
             .resolve(&QuerySection {
                 qname: nm("www.example.test."),
@@ -1777,11 +1753,10 @@ this line has no record and is skipped
     /// A CNAME pointing back at itself must terminate, not spin.
     #[tokio::test]
     async fn test_cname_loop_is_detected() {
-        let mut socks = bind_hierarchy(2).into_iter();
-        let (root_sock, auth_sock) = (socks.next().unwrap(), socks.next().unwrap());
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, auth_addr) = (fake(1), fake(2));
 
-        let _auth = spawn_server(auth_sock, |q| {
+        net.serve(auth_addr, |q| {
             let name = qname_of(q);
             let next = if name == "a.example.test." {
                 "b.example.test."
@@ -1790,7 +1765,7 @@ this line has no record and is skipped
             };
             authoritative(q, vec![cname_record(&name, next)])
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(
                 q,
                 "example.test.",
@@ -1799,7 +1774,7 @@ this line has no record and is skipped
             )
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let result = resolver
             .resolve(&QuerySection {
                 qname: nm("a.example.test."),
@@ -1823,14 +1798,8 @@ this line has no record and is skipped
     /// own name — which must work, and must be charged to the same budget.
     #[tokio::test]
     async fn test_glueless_delegation_is_resolved() {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, auth_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr, auth_addr) = (fake(1), fake(2), fake(3));
 
         // Authoritative for example.test., and also holds the A for
         // ns.hoster.test. — which must be this server's real address, since the
@@ -1838,7 +1807,7 @@ this line has no record and is skipped
         let IpAddr::V4(auth_ip) = auth_addr.ip() else {
             unreachable!("bound on IPv4 loopback")
         };
-        let _auth = spawn_server(auth_sock, move |q| {
+        net.serve(auth_addr, move |q| {
             let name = qname_of(q);
             if name == "ns.hoster.test." {
                 authoritative(q, vec![a_record(&name, auth_ip.octets())])
@@ -1848,7 +1817,7 @@ this line has no record and is skipped
         });
         // `example.test.` glueless (its nameserver is outside that zone) and
         // `hoster.test.` with glue, so the nameserver lookup can succeed.
-        let _tld = spawn_server(tld_sock, move |q| {
+        net.serve(tld_addr, move |q| {
             let name = qname_of(q);
             if name.ends_with("hoster.test.") {
                 referral(
@@ -1861,11 +1830,11 @@ this line has no record and is skipped
                 referral(q, "example.test.", "ns.hoster.test.", None)
             }
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let answer = resolver
             .resolve(&QuerySection {
                 qname: nm("www.example.test."),
@@ -1885,12 +1854,13 @@ this line has no record and is skipped
     /// rather than looping until the client times out.
     #[tokio::test]
     async fn test_referral_loop_is_bounded() {
-        let root_sock = bind_hierarchy(1).into_iter().next().unwrap();
-        let self_addr = root_sock.local_addr().unwrap();
+        let net = Net::default();
+        let root_addr = fake(1);
+        let self_addr = root_addr;
 
         // Refers `example.test.` to a nameserver whose glue points back at this
         // same server, so the walk never makes progress.
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(
                 q,
                 "example.test.",
@@ -1899,9 +1869,9 @@ this line has no record and is skipped
             )
         });
 
-        let resolver = Resolver::new(ResolverConfig {
+        let resolver = net.resolver(ResolverConfig {
             query_budget: 12,
-            ..recursing_config(root.addr)
+            ..recursing_config(root_addr)
         });
         let result = resolver
             .resolve(&QuerySection {
@@ -1923,22 +1893,9 @@ this line has no record and is skipped
     /// A root/TLD/auth hierarchy where each server records the QNAME it was
     /// asked. All three ignore the QTYPE, so the minimized probes and the final
     /// query share one server.
-    fn recording_hierarchy() -> (
-        FakeServer,
-        FakeServer,
-        FakeServer,
-        SeenLog,
-        SeenLog,
-        SeenLog,
-    ) {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, auth_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let auth_addr = auth_sock.local_addr().unwrap();
+    fn recording_hierarchy() -> (Net, SocketAddr, SeenLog, SeenLog, SeenLog) {
+        let net = Net::default();
+        let (root_addr, tld_addr, auth_addr) = (fake(1), fake(2), fake(3));
 
         let (root_seen, tld_seen, auth_seen) = (
             Arc::new(Mutex::new(Vec::new())),
@@ -1947,12 +1904,12 @@ this line has no record and is skipped
         );
 
         let a = auth_seen.clone();
-        let auth = spawn_server(auth_sock, move |q| {
+        net.serve(auth_addr, move |q| {
             a.lock().unwrap().push(qname_of(q));
             authoritative(q, vec![a_record("www.example.test.", [192, 0, 2, 1])])
         });
         let t = tld_seen.clone();
-        let tld = spawn_server(tld_sock, move |q| {
+        net.serve(tld_addr, move |q| {
             t.lock().unwrap().push(qname_of(q));
             referral(
                 q,
@@ -1962,12 +1919,12 @@ this line has no record and is skipped
             )
         });
         let r = root_seen.clone();
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             r.lock().unwrap().push(qname_of(q));
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
-        (root, tld, auth, root_seen, tld_seen, auth_seen)
+        (net, root_addr, root_seen, tld_seen, auth_seen)
     }
 
     /// With minimization on (the default), the root is asked only for the TLD
@@ -1975,9 +1932,9 @@ this line has no record and is skipped
     /// server authoritative for it.
     #[tokio::test]
     async fn test_qname_minimization_reveals_only_the_delegated_label() {
-        let (root, _tld, _auth, root_seen, tld_seen, auth_seen) = recording_hierarchy();
+        let (net, root_addr, root_seen, tld_seen, auth_seen) = recording_hierarchy();
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let answer = resolver
             .resolve(&QuerySection {
                 qname: nm("www.example.test."),
@@ -2005,11 +1962,11 @@ this line has no record and is skipped
     /// With minimization off, the full name goes to every server up the chain.
     #[tokio::test]
     async fn test_minimization_disabled_sends_the_full_name() {
-        let (root, _tld, _auth, root_seen, tld_seen, _auth_seen) = recording_hierarchy();
+        let (net, root_addr, root_seen, tld_seen, _auth_seen) = recording_hierarchy();
 
-        let resolver = Resolver::new(ResolverConfig {
+        let resolver = net.resolver(ResolverConfig {
             qname_minimization: false,
-            ..recursing_config(root.addr)
+            ..recursing_config(root_addr)
         });
         resolver
             .resolve(&QuerySection {
@@ -2036,20 +1993,14 @@ this line has no record and is skipped
     /// same server again, rather than mistaking NODATA for a final answer.
     #[tokio::test]
     async fn test_qname_minimization_probes_an_empty_non_terminal() {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, auth_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr, auth_addr) = (fake(1), fake(2), fake(3));
 
         // The leaf www.sub.example.test. has an A; its parent is an empty
         // non-terminal, so everything else gets an authoritative NODATA.
         let auth_seen = Arc::new(Mutex::new(Vec::new()));
         let a = auth_seen.clone();
-        let _auth = spawn_server(auth_sock, move |q| {
+        net.serve(auth_addr, move |q| {
             let name = qname_of(q);
             a.lock().unwrap().push(name.clone());
             if name == "www.sub.example.test." {
@@ -2058,7 +2009,7 @@ this line has no record and is skipped
                 authoritative(q, vec![])
             }
         });
-        let _tld = spawn_server(tld_sock, move |q| {
+        net.serve(tld_addr, move |q| {
             referral(
                 q,
                 "example.test.",
@@ -2066,11 +2017,11 @@ this line has no record and is skipped
                 Some(("ns.example.test.", auth_addr)),
             )
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let answer = resolver
             .resolve(&QuerySection {
                 qname: nm("www.sub.example.test."),
@@ -2099,14 +2050,8 @@ this line has no record and is skipped
     /// time. Also pins the probe QTYPE at A, not RFC 7816's superseded NS.
     #[tokio::test]
     async fn deep_names_stop_minimizing_at_the_rfc_9156_ceiling() {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, auth_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr, auth_addr) = (fake(1), fake(2), fake(3));
 
         // Twelve empty non-terminals below the apex, then the leaf: deeper than
         // the ceiling, so the fallback has to happen for this to resolve.
@@ -2117,7 +2062,7 @@ this line has no record and is skipped
         let seen: Arc<Mutex<Vec<(String, Qtype)>>> = Arc::new(Mutex::new(Vec::new()));
 
         let a = seen.clone();
-        let _auth = spawn_server(auth_sock, move |q| {
+        net.serve(auth_addr, move |q| {
             let name = qname_of(q);
             let qtype = q
                 .queries
@@ -2132,7 +2077,7 @@ this line has no record and is skipped
             }
         });
         let t = seen.clone();
-        let _tld = spawn_server(tld_sock, move |q| {
+        net.serve(tld_addr, move |q| {
             t.lock().unwrap().push((
                 qname_of(q),
                 q.queries
@@ -2148,7 +2093,7 @@ this line has no record and is skipped
             )
         });
         let r = seen.clone();
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             r.lock().unwrap().push((
                 qname_of(q),
                 q.queries
@@ -2159,7 +2104,7 @@ this line has no record and is skipped
             referral(q, "test.", "ns.test.", Some(("ns.test.", tld_addr)))
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         let answer = resolver
             .resolve(&QuerySection {
                 qname: nm(leaf),
@@ -2200,14 +2145,8 @@ this line has no record and is skipped
     /// server that answered.
     #[tokio::test]
     async fn test_rtt_selection_skips_a_failing_server_after_the_first_try() {
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, bad_sock, good_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let bad_addr = bad_sock.local_addr().unwrap();
-        let good_addr = good_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, bad_addr, good_addr) = (fake(1), fake(2), fake(3));
         let IpAddr::V4(bad_ip) = bad_addr.ip() else {
             unreachable!("bound on IPv4 loopback")
         };
@@ -2219,18 +2158,18 @@ this line has no record and is skipped
         // rejected without costing a timeout. Counts how often it is asked.
         let bad_hits = Arc::new(AtomicUsize::new(0));
         let bh = bad_hits.clone();
-        let _bad = spawn_server(bad_sock, move |q| {
+        net.serve(bad_addr, move |q| {
             bh.fetch_add(1, Ordering::Relaxed);
             let mut r = response_to(q);
             r.id = q.id.wrapping_add(1);
             r
         });
-        let _good = spawn_server(good_sock, move |q| {
+        net.serve(good_addr, move |q| {
             authoritative(q, vec![a_record(&qname_of(q), [192, 0, 2, 1])])
         });
         // Bad server listed first, so it is the one tried before any RTT is
         // known.
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             let mut resp = response_to(q);
             resp.authorities = vec![
                 ns_record("example.test.", "ns1.example.test."),
@@ -2243,7 +2182,7 @@ this line has no record and is skipped
             resp
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         for name in [
             "one.example.test.",
             "two.example.test.",
@@ -2273,17 +2212,16 @@ this line has no record and is skipped
     /// A second query for the same zone must not go back to the root.
     #[tokio::test]
     async fn test_second_query_does_not_revisit_the_root() {
-        let mut socks = bind_hierarchy(2).into_iter();
-        let (root_sock, auth_sock) = (socks.next().unwrap(), socks.next().unwrap());
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, auth_addr) = (fake(1), fake(2));
 
-        let _auth = spawn_server(auth_sock, |q| {
+        net.serve(auth_addr, |q| {
             authoritative(q, vec![a_record(&qname_of(q), [192, 0, 2, 5])])
         });
 
         let root_hits = Arc::new(AtomicUsize::new(0));
         let counter = root_hits.clone();
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             counter.fetch_add(1, Ordering::Relaxed);
             referral(
                 q,
@@ -2293,7 +2231,7 @@ this line has no record and is skipped
             )
         });
 
-        let resolver = Resolver::new(recursing_config(root.addr));
+        let resolver = net.resolver(recursing_config(root_addr));
         for name in [
             "one.example.test.",
             "two.example.test.",
@@ -2324,14 +2262,13 @@ this line has no record and is skipped
     /// resolver drops it and starts again from the root.
     #[tokio::test]
     async fn test_stale_delegation_falls_back_to_the_root() {
-        let mut socks = bind_hierarchy(2).into_iter();
-        let (root_sock, auth_sock) = (socks.next().unwrap(), socks.next().unwrap());
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, auth_addr) = (fake(1), fake(2));
 
-        let _auth = spawn_server(auth_sock, |q| {
+        net.serve(auth_addr, |q| {
             authoritative(q, vec![a_record(&qname_of(q), [192, 0, 2, 6])])
         });
-        let root = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             referral(
                 q,
                 "example.test.",
@@ -2341,13 +2278,13 @@ this line has no record and is skipped
         });
 
         // Short timeout: this deliberately talks to a black hole.
-        let resolver = Resolver::new(ResolverConfig {
+        let resolver = net.resolver(ResolverConfig {
             timeout_ms: 300,
-            ..recursing_config(root.addr)
+            ..recursing_config(root_addr)
         });
 
         // Poison the cache with a server that will never answer.
-        let dead: SocketAddr = format!("192.0.2.99:{}", root.addr.port()).parse().unwrap();
+        let dead: SocketAddr = format!("192.0.2.99:{}", root_addr.port()).parse().unwrap();
         resolver
             .delegations
             .insert(nm("example.test.").as_ref(), vec![dead], Vec::new(), 3600);
@@ -2437,25 +2374,19 @@ this line has no record and is skipped
     /// the TCP side here, so a stray fallback would fail the connect.
     #[tokio::test]
     async fn test_no_tcp_fallback_when_response_fits() {
-        let (udp, tcp, addr) = bind_fake_upstream();
-        drop(tcp);
-
-        let udp_thread = thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let (n, peer) = udp.recv_from(&mut buf).unwrap();
-            let query = DnsMessage::try_from_bytes(&buf[..n]).unwrap();
-
-            let mut resp = response_to(&query);
+        let used = Arc::new(Mutex::new(Vec::new()));
+        let log = used.clone();
+        let upstream = answering(move |transport, query| {
+            log.lock().unwrap().push(transport);
+            let mut resp = response_to(query);
             resp.answers.push(a_record("example.com.", [10, 0, 0, 1]));
-            let mut out = vec![0u8; 512];
-            let len = resp.to_bytes(&mut out).unwrap();
-            udp.send_to(&out[..len], peer).unwrap();
+            resp
         });
 
-        let resolver = Resolver::new(test_config(addr));
+        let resolver = Resolver::new(test_config(fake(1))).with_upstream(upstream);
         let answer = resolver.resolve(&test_query()).await.unwrap();
-        udp_thread.join().unwrap();
 
+        assert_eq!(*used.lock().unwrap(), [Transport::Udp]);
         assert_eq!(answer.answers.len(), 1);
         assert_eq!(
             answer.answers[0].rdata.parse().unwrap(),
@@ -2466,43 +2397,17 @@ this line has no record and is skipped
     /// A TCP answer that is *itself* truncated is passed through, not rejected.
     #[tokio::test]
     async fn test_still_truncated_tcp_response_is_returned() {
-        let (udp, tcp, addr) = bind_fake_upstream();
-
-        let udp_thread = thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let (n, peer) = udp.recv_from(&mut buf).unwrap();
-            let query = DnsMessage::try_from_bytes(&buf[..n]).unwrap();
-            let mut resp = response_to(&query);
+        let upstream = answering(|transport, query| {
+            let mut resp = response_to(query);
             resp.truncation = true;
-            let mut out = vec![0u8; 512];
-            let len = resp.to_bytes(&mut out).unwrap();
-            udp.send_to(&out[..len], peer).unwrap();
+            if transport == Transport::Tcp {
+                resp.answers.push(a_record("example.com.", [10, 0, 0, 2]));
+            }
+            resp
         });
 
-        let tcp_thread = thread::spawn(move || {
-            let (mut stream, _) = tcp.accept().unwrap();
-            let mut len_buf = [0u8; 2];
-            stream.read_exact(&mut len_buf).unwrap();
-            let mut buf = vec![0u8; u16::from_be_bytes(len_buf) as usize];
-            stream.read_exact(&mut buf).unwrap();
-            let query = DnsMessage::try_from_bytes(&buf).unwrap();
-
-            let mut resp = response_to(&query);
-            resp.truncation = true;
-            resp.answers.push(a_record("example.com.", [10, 0, 0, 2]));
-            let mut out = vec![0u8; 4096];
-            let n = resp.to_bytes(&mut out).unwrap();
-            let mut framed = Vec::with_capacity(2 + n);
-            framed.extend_from_slice(&(n as u16).to_be_bytes());
-            framed.extend_from_slice(&out[..n]);
-            stream.write_all(&framed).unwrap();
-        });
-
-        let resolver = Resolver::new(test_config(addr));
+        let resolver = Resolver::new(test_config(fake(1))).with_upstream(upstream);
         let answer = resolver.resolve(&test_query()).await.unwrap();
-
-        udp_thread.join().unwrap();
-        tcp_thread.join().unwrap();
 
         assert!(answer.truncation);
         assert_eq!(answer.answers.len(), 1);
@@ -2567,12 +2472,9 @@ this line has no record and is skipped
         mangle: fn(&str) -> String,
         break_id: bool,
     ) -> ResolveResult<DnsMessage> {
-        let (udp, _tcp, addr) = bind_fake_upstream();
-        let udp_thread = thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let (n, peer) = udp.recv_from(&mut buf).unwrap();
-            let query = DnsMessage::try_from_bytes(&buf[..n]).unwrap();
-            let mut resp = response_to(&query);
+        let net = Net::default();
+        net.serve(fake(1), move |query| {
+            let mut resp = response_to(query);
             if break_id {
                 resp.id = query.id.wrapping_add(1);
             }
@@ -2580,15 +2482,9 @@ this line has no record and is skipped
                 q.qname = nm(&mangle(&q.qname.to_string()));
             }
             resp.answers.push(a_record("example.com.", [10, 0, 0, 5]));
-            let mut out = vec![0u8; 512];
-            let len = resp.to_bytes(&mut out).unwrap();
-            udp.send_to(&out[..len], peer).unwrap();
+            resp
         });
-
-        let resolver = Resolver::new(config(addr));
-        let result = resolver.resolve(&test_query()).await;
-        udp_thread.join().unwrap();
-        result
+        net.resolver(config(fake(1))).resolve(&test_query()).await
     }
 
     /// With 0x20 on, a reply that does not echo the exact casing sent is
@@ -2636,27 +2532,24 @@ this line has no record and is skipped
     /// does — and with 0x20 on, what arrived is the case this resolver
     /// scrambled. Gives back the answer and the name the upstream saw.
     async fn resolve_against_an_authoritative_upstream() -> (DnsMessage, String) {
-        let (udp, _tcp, addr) = bind_fake_upstream();
-        let udp_thread = thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            let (n, peer) = udp.recv_from(&mut buf).unwrap();
-            let query = DnsMessage::try_from_bytes(&buf[..n]).unwrap();
-            let asked = query.queries[0].qname.to_string();
-            let mut resp = response_to(&query);
+        let asked = Arc::new(Mutex::new(String::new()));
+        let seen = asked.clone();
+        let net = Net::default();
+        net.serve(fake(1), move |query| {
+            let name = query.queries[0].qname.to_string();
+            let mut resp = response_to(query);
             resp.authoritive = true;
-            resp.answers.push(a_record(&asked, [10, 0, 0, 5]));
-            let mut out = vec![0u8; 512];
-            let len = resp.to_bytes(&mut out).unwrap();
-            udp.send_to(&out[..len], peer).unwrap();
-            asked
+            resp.answers.push(a_record(&name, [10, 0, 0, 5]));
+            *seen.lock().unwrap() = name;
+            resp
         });
 
-        let resolver = Resolver::new(test_config(addr));
-        let answer = resolver
+        let answer = net
+            .resolver(test_config(fake(1)))
             .resolve(&test_query())
             .await
             .expect("the upstream answered");
-        let asked = udp_thread.join().unwrap();
+        let asked = asked.lock().unwrap().clone();
         (answer, asked)
     }
 
@@ -2698,9 +2591,9 @@ this line has no record and is skipped
         );
     }
 
-    /// Reaching a server over IPv6 works only because `query_server` binds a
-    /// socket of the target's family — the same thing that makes AAAA glue and
-    /// the v6 root hints usable.
+    /// Reaching a server over IPv6 works only because `Upstream::Network`
+    /// binds a socket of the target's family — the same thing that makes AAAA
+    /// glue and the v6 root hints usable.
     #[tokio::test]
     async fn test_forwarding_reaches_an_ipv6_upstream() {
         let udp = UdpSocket::bind("[::1]:0").expect("IPv6 loopback should be available");
@@ -2744,8 +2637,7 @@ this line has no record and is skipped
     struct SignedHierarchy {
         root_addr: SocketAddr,
         anchors: TrustAnchors,
-        // Held so the servers stay alive for the test's lifetime.
-        _servers: Vec<FakeServer>,
+        net: Net,
     }
 
     /// A referral that also carries the parent's DNSSEC statement about the
@@ -2808,14 +2700,8 @@ this line has no record and is skipped
         let tld = TestZone::new("test.");
         let auth = TestZone::new("example.test.");
 
-        let mut socks = bind_hierarchy(3).into_iter();
-        let (root_sock, tld_sock, auth_sock) = (
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-            socks.next().unwrap(),
-        );
-        let tld_addr = tld_sock.local_addr().unwrap();
-        let auth_addr = auth_sock.local_addr().unwrap();
+        let net = Net::default();
+        let (root_addr, tld_addr, auth_addr) = (fake(1), fake(2), fake(3));
 
         let anchors = TrustAnchors::new(vec![root.ds(2)]);
 
@@ -2853,7 +2739,7 @@ this line has no record and is skipped
             "unproved.example.test.",
         );
 
-        let auth_server = spawn_server(auth_sock, move |q| {
+        net.serve(auth_addr, move |q| {
             let name = qname_of(q);
             let qtype = q
                 .queries
@@ -2934,7 +2820,7 @@ this line has no record and is skipped
             }
         });
 
-        let tld_server = spawn_server(tld_sock, move |q| {
+        net.serve(tld_addr, move |q| {
             let name = qname_of(q);
             let qtype = q
                 .queries
@@ -2954,7 +2840,7 @@ this line has no record and is skipped
             }
         });
 
-        let root_server = spawn_server(root_sock, move |q| {
+        net.serve(root_addr, move |q| {
             let name = qname_of(q);
             let qtype = q
                 .queries
@@ -2969,9 +2855,9 @@ this line has no record and is skipped
         });
 
         SignedHierarchy {
-            root_addr: root_server.addr,
+            root_addr,
             anchors,
-            _servers: vec![root_server, tld_server, auth_server],
+            net,
         }
     }
 
@@ -3190,15 +3076,20 @@ this line has no record and is skipped
         }
     }
 
-    async fn resolve_www(config: ResolverConfig) -> (DnsMessage, ValidationState) {
-        resolve_www_qtype(config, Qtype::of(rt::A)).await
+    async fn resolve_www(
+        h: &SignedHierarchy,
+        config: ResolverConfig,
+    ) -> (DnsMessage, ValidationState) {
+        resolve_www_qtype(h, config, Qtype::of(rt::A)).await
     }
 
     async fn resolve_www_qtype(
+        h: &SignedHierarchy,
         config: ResolverConfig,
         qtype: Qtype,
     ) -> (DnsMessage, ValidationState) {
-        Resolver::new(config)
+        h.net
+            .resolver(config)
             .resolve_validated(
                 &QuerySection {
                     qname: nm("www.example.test."),
@@ -3226,7 +3117,8 @@ this line has no record and is skipped
     #[tokio::test]
     async fn an_any_query_is_a_positive_answer_and_must_not_be_read_as_a_denial() {
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let (answer, state) = resolve_www_qtype(validating_config(&h), Qtype::of(rt::ANY)).await;
+        let (answer, state) =
+            resolve_www_qtype(&h, validating_config(&h), Qtype::of(rt::ANY)).await;
 
         assert!(
             answer.answers.iter().any(|rr| matches!(
@@ -3248,7 +3140,7 @@ this line has no record and is skipped
     #[tokio::test]
     async fn test_signed_hierarchy_validates_as_secure() {
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let (answer, state) = resolve_www(validating_config(&h)).await;
+        let (answer, state) = resolve_www(&h, validating_config(&h)).await;
 
         assert_eq!(state, ValidationState::Secure, "{state}");
         assert!(
@@ -3279,7 +3171,7 @@ this line has no record and is skipped
             vec![a_record("www.example.test.", [6, 6, 6, 6]), sig]
         });
 
-        let (_, state) = resolve_www(validating_config(&h)).await;
+        let (_, state) = resolve_www(&h, validating_config(&h)).await;
         assert!(state.is_bogus(), "expected bogus, got {state}");
     }
 
@@ -3295,7 +3187,7 @@ this line has no record and is skipped
             vec![a, sig]
         });
 
-        let (_, state) = resolve_www(validating_config(&h)).await;
+        let (_, state) = resolve_www(&h, validating_config(&h)).await;
         assert!(state.is_bogus(), "expected bogus, got {state}");
     }
 
@@ -3309,7 +3201,7 @@ this line has no record and is skipped
             |_auth| vec![a_record("www.example.test.", [6, 6, 6, 6])],
         );
 
-        let (_, state) = resolve_www(validating_config(&h)).await;
+        let (_, state) = resolve_www(&h, validating_config(&h)).await;
         assert!(
             state.is_bogus(),
             "a missing DS with nothing to back it must not read as unsigned: {state}"
@@ -3326,7 +3218,7 @@ this line has no record and is skipped
             |_auth| vec![a_record("www.example.test.", [192, 0, 2, 4])],
         );
 
-        let (answer, state) = resolve_www(validating_config(&h)).await;
+        let (answer, state) = resolve_www(&h, validating_config(&h)).await;
         assert_eq!(state, ValidationState::Insecure, "{state}");
         assert!(
             answer.answers.iter().any(|rr| matches!(
@@ -3345,7 +3237,7 @@ this line has no record and is skipped
             vec![a_record("www.example.test.", [192, 0, 2, 1])]
         });
 
-        let (_, state) = resolve_www(validating_config(&h)).await;
+        let (_, state) = resolve_www(&h, validating_config(&h)).await;
         assert!(state.is_bogus(), "expected bogus, got {state}");
     }
 
@@ -3378,7 +3270,7 @@ this line has no record and is skipped
                 "a signature that fails",
             ),
         ] {
-            let (_, state) = resolve_www(validating_config(h)).await;
+            let (_, state) = resolve_www(h, validating_config(h)).await;
             match state {
                 ValidationState::Bogus(bogus) => assert_eq!(bogus.code, expected, "{what}"),
                 other => panic!("{what}: expected bogus, got {other}"),
@@ -3392,7 +3284,7 @@ this line has no record and is skipped
     #[tokio::test]
     async fn test_validation_disabled_is_indeterminate() {
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let (_, state) = resolve_www(recursing_config(h.root_addr)).await;
+        let (_, state) = resolve_www(&h, recursing_config(h.root_addr)).await;
         assert!(
             matches!(state, ValidationState::Indeterminate(_)),
             "got {state}"
@@ -3412,7 +3304,7 @@ this line has no record and is skipped
             ),
             ..recursing_config(h.root_addr)
         };
-        let (_, state) = resolve_www(config).await;
+        let (_, state) = resolve_www(&h, config).await;
         assert!(
             matches!(state, ValidationState::Indeterminate(_)),
             "got {state}"
@@ -3426,7 +3318,9 @@ this line has no record and is skipped
     #[tokio::test]
     async fn test_signed_nxdomain_validates_as_secure() {
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let (answer, state) = Resolver::new(validating_config(&h))
+        let (answer, state) = h
+            .net
+            .resolver(validating_config(&h))
             .resolve_validated(
                 &QuerySection {
                     qname: nm("gone.example.test."),
@@ -3454,7 +3348,9 @@ this line has no record and is skipped
     #[tokio::test]
     async fn test_signed_nsec3_nxdomain_validates_as_secure() {
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let (answer, state) = Resolver::new(validating_config(&h))
+        let (answer, state) = h
+            .net
+            .resolver(validating_config(&h))
             .resolve_validated(
                 &QuerySection {
                     qname: nm("nsec3-gone.example.test."),
@@ -3495,7 +3391,9 @@ this line has no record and is skipped
     #[tokio::test]
     async fn test_an_nsec3_denial_missing_its_closest_encloser_is_not_secure() {
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let (_, state) = Resolver::new(validating_config(&h))
+        let (_, state) = h
+            .net
+            .resolver(validating_config(&h))
             .resolve_validated(
                 &QuerySection {
                     qname: nm("nsec3-incomplete.example.test."),
@@ -3525,7 +3423,9 @@ this line has no record and is skipped
         use crate::nsec_cache::NsecCache;
 
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let (denial, state) = Resolver::new(validating_config(&h))
+        let (denial, state) = h
+            .net
+            .resolver(validating_config(&h))
             .resolve_validated(
                 &QuerySection {
                     qname: nm("gone.example.test."),
@@ -3572,7 +3472,9 @@ this line has no record and is skipped
     #[tokio::test]
     async fn test_wildcard_nodata_validates_as_secure() {
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let (answer, state) = Resolver::new(validating_config(&h))
+        let (answer, state) = h
+            .net
+            .resolver(validating_config(&h))
             .resolve_validated(
                 &QuerySection {
                     qname: nm("wild-nodata.example.test."),
@@ -3600,7 +3502,9 @@ this line has no record and is skipped
     #[tokio::test]
     async fn test_wildcard_nodata_without_the_wildcards_own_nsec_is_bogus() {
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let (_, state) = Resolver::new(validating_config(&h))
+        let (_, state) = h
+            .net
+            .resolver(validating_config(&h))
             .resolve_validated(
                 &QuerySection {
                     qname: nm("stripped-wildcard.example.test."),
@@ -3627,7 +3531,7 @@ this line has no record and is skipped
     #[tokio::test]
     async fn test_wildcard_answer_with_its_nsec_is_secure() {
         let h = signed_hierarchy_with(signed_ds, |auth| wildcard_answer(auth, true));
-        let (answer, state) = resolve_www(validating_config(&h)).await;
+        let (answer, state) = resolve_www(&h, validating_config(&h)).await;
 
         assert_eq!(state, ValidationState::Secure, "{state}");
         assert!(
@@ -3645,7 +3549,7 @@ this line has no record and is skipped
     #[tokio::test]
     async fn test_wildcard_answer_without_its_nsec_is_bogus() {
         let h = signed_hierarchy_with(signed_ds, |auth| wildcard_answer(auth, false));
-        let (_, state) = resolve_www(validating_config(&h)).await;
+        let (_, state) = resolve_www(&h, validating_config(&h)).await;
         assert!(
             state.is_bogus(),
             "a wildcard answer with no denial of the queried name must not be served \
@@ -3692,7 +3596,9 @@ this line has no record and is skipped
     #[tokio::test]
     async fn a_negative_answer_after_a_cname_is_validated() {
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let (answer, state) = Resolver::new(validating_config(&h))
+        let (answer, state) = h
+            .net
+            .resolver(validating_config(&h))
             .resolve_validated(
                 &QuerySection {
                     qname: nm("chase.example.test."),
@@ -3734,7 +3640,9 @@ this line has no record and is skipped
     #[tokio::test]
     async fn a_stripped_denial_after_a_cname_is_bogus() {
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let (_, state) = Resolver::new(validating_config(&h))
+        let (_, state) = h
+            .net
+            .resolver(validating_config(&h))
             .resolve_validated(
                 &QuerySection {
                     qname: nm("stripped-chase.example.test."),
@@ -3778,7 +3686,7 @@ this line has no record and is skipped
             (vec![cname, cname_sig, target, target_sig], Vec::new())
         });
 
-        let (answer, state) = resolve_www(validating_config(&h)).await;
+        let (answer, state) = resolve_www(&h, validating_config(&h)).await;
         assert_eq!(state, ValidationState::Secure, "{state}");
         assert!(
             answer
@@ -3810,7 +3718,7 @@ this line has no record and is skipped
         use crate::nsec_cache::NsecCache;
 
         let h = signed_hierarchy_with(signed_ds, |auth| wildcard_answer(auth, true));
-        let (answer, state) = resolve_www(validating_config(&h)).await;
+        let (answer, state) = resolve_www(&h, validating_config(&h)).await;
         assert_eq!(state, ValidationState::Secure, "{state}");
 
         // Exactly what rdnsr does with a Secure positive answer.
@@ -3863,7 +3771,7 @@ this line has no record and is skipped
     #[tokio::test]
     async fn test_validated_keys_are_cached_across_queries() {
         let h = signed_hierarchy(signed_ds, signed_answer);
-        let resolver = Resolver::new(validating_config(&h));
+        let resolver = h.net.resolver(validating_config(&h));
         let query = QuerySection {
             qname: nm("www.example.test."),
             qtype: Qtype::of(rt::A),
