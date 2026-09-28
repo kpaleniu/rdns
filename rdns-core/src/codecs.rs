@@ -13,13 +13,19 @@ use crate::error::{WireError, WireResult};
 /// is **a heap allocation per output byte** — `rdnsctl dump` of a signed zone
 /// runs it over every DS digest and NSEC3 salt (`TODO.md` #26a).
 pub fn hex_encode(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(bytes.len() * 2);
+    hex_encode_into(bytes, &mut out);
+    out
+}
+
+/// The same, appended to `out`: for a caller already building a `String`.
+pub fn hex_encode_into(bytes: &[u8], out: &mut String) {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    out.reserve(bytes.len() * 2);
     for b in bytes {
         out.push(DIGITS[(b >> 4) as usize] as char);
         out.push(DIGITS[(b & 0x0f) as usize] as char);
     }
-    out
 }
 
 /// The inverse, tolerating whitespace anywhere.

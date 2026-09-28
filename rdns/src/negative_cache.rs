@@ -222,18 +222,13 @@ impl NegativeCache {
         // A cached NXDOMAIN denies every name beneath it too (RFC 8020), so the
         // walk up the ancestors *is* the lookup, deepest first. Every suffix of
         // a wire name at a label boundary is a name, so each ancestor borrows.
-        let mut ancestor = name;
-        loop {
+        for ancestor in name.ancestors() {
             if let Some(entry) = entries
                 .nxdomain
                 .get(ancestor.as_wire())
                 .filter(|e| e.live(now))
             {
                 return Some(entry.answer(now));
-            }
-            match ancestor.parent() {
-                Some(up) => ancestor = up,
-                None => break,
             }
         }
 
@@ -265,18 +260,13 @@ impl NegativeCache {
         let name = qname.folded_in(&mut fold_buf);
         let mut entries = self.entries.lock().ok()?;
 
-        let mut ancestor = name;
-        loop {
+        for ancestor in name.ancestors() {
             if let Some(entry) = entries
                 .nxdomain
                 .get_mut(ancestor.as_wire())
                 .filter(|e| e.stale(now, self.stale))
             {
                 return Some(entry.stale_answer(now, refreshing));
-            }
-            match ancestor.parent() {
-                Some(up) => ancestor = up,
-                None => break,
             }
         }
 
@@ -306,13 +296,8 @@ impl NegativeCache {
         };
         let key: &dyn NameType = &(name.as_wire(), qtype);
         entries.nodata.remove(key);
-        let mut ancestor = name;
-        loop {
+        for ancestor in name.ancestors() {
             entries.nxdomain.remove(ancestor.as_wire());
-            match ancestor.parent() {
-                Some(up) => ancestor = up,
-                None => break,
-            }
         }
     }
 

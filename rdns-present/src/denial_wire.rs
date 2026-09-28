@@ -261,7 +261,7 @@ pub(crate) fn base32hex_len(len: usize) -> usize {
 /// Encode bytes as unpadded base32hex.
 pub fn base32hex_encode(data: &[u8]) -> String {
     let mut out = String::with_capacity(base32hex_len(data.len()));
-    encode_base32hex(data, BASE32HEX, &mut out);
+    out.extend(base32hex_chars(data, BASE32HEX).map(char::from));
     out
 }
 
@@ -273,33 +273,24 @@ pub fn base32hex_encode(data: &[u8]) -> String {
 /// so the bytes are what is wanted and a `String` is the conversion.
 pub fn encode_base32hex_in(data: &[u8], alphabet: &[u8; 32], out: &mut [u8]) -> usize {
     let mut at = 0;
-    for chunk in data.chunks(5) {
-        let mut buf = [0u8; 5];
-        buf[..chunk.len()].copy_from_slice(chunk);
-        let bits = u64::from_be_bytes([0, 0, 0, buf[0], buf[1], buf[2], buf[3], buf[4]]);
-        let chars = (chunk.len() * 8).div_ceil(5);
-        for i in 0..chars {
-            let shift = 35 - i * 5;
-            out[at] = alphabet[((bits >> shift) & 0x1f) as usize];
-            at += 1;
-        }
+    for c in base32hex_chars(data, alphabet) {
+        out[at] = c;
+        at += 1;
     }
     at
 }
 
-pub(crate) fn encode_base32hex(data: &[u8], alphabet: &[u8; 32], out: &mut String) {
-    for chunk in data.chunks(5) {
+/// The characters of `data` in `alphabet`: one computation for both encoders.
+fn base32hex_chars<'a>(data: &'a [u8], alphabet: &'a [u8; 32]) -> impl Iterator<Item = u8> + 'a {
+    data.chunks(5).flat_map(move |chunk| {
         let mut buf = [0u8; 5];
         buf[..chunk.len()].copy_from_slice(chunk);
         let bits = u64::from_be_bytes([0, 0, 0, buf[0], buf[1], buf[2], buf[3], buf[4]]);
         // 5 input bytes make 8 output characters; a short final chunk makes
         // ceil(len * 8 / 5) of them.
-        let chars = (chunk.len() * 8).div_ceil(5);
-        for i in 0..chars {
-            let shift = 35 - i * 5;
-            out.push(alphabet[((bits >> shift) & 0x1f) as usize] as char);
-        }
-    }
+        (0..base32hex_len(chunk.len()))
+            .map(move |i| alphabet[((bits >> (35 - i * 5)) & 0x1f) as usize])
+    })
 }
 
 /// Decode unpadded base32hex. Case-insensitive, as DNS labels are.

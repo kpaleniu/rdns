@@ -241,6 +241,14 @@ struct Node {
     coo: Vec<Name>,
 }
 
+/// The one record of a singleton RRset, or how many there were instead.
+fn at_most_one<T>(mut set: Vec<T>) -> Result<Option<T>, usize> {
+    match set.len() {
+        0 | 1 => Ok(set.pop()),
+        records => Err(records),
+    }
+}
+
 impl Node {
     fn new(name: NameRef<'_>) -> Node {
         Node {
@@ -261,26 +269,23 @@ impl Node {
         // §4.1: "This PTR record MUST be the only record in the PTR RRset with
         // the same name. The presence of more than one record in the RRset
         // indicates a broken catalog zone."
-        let mut ptr = ptr.into_iter();
-        let zone = match (ptr.next(), ptr.len()) {
-            (None, _) => return Ok(None),
-            (Some(zone), 0) => zone,
-            (Some(_), rest) => {
+        let zone = match at_most_one(ptr) {
+            Ok(Some(zone)) => zone,
+            Ok(None) => return Ok(None),
+            Err(records) => {
                 return Err(BrokenCatalog::MemberRrset {
                     node: name,
-                    records: rest + 1,
+                    records,
                 })
             }
         };
         // §4.3.1: "The PTR RRset MUST consist of a single PTR record."
-        let mut coo = coo.into_iter();
-        let coo = match (coo.next(), coo.len()) {
-            (None, _) => None,
-            (Some(catalog), 0) => Some(catalog),
-            (Some(_), rest) => {
+        let coo = match at_most_one(coo) {
+            Ok(coo) => coo,
+            Err(records) => {
                 return Err(BrokenCatalog::CooRrset {
                     node: name,
-                    records: rest + 1,
+                    records,
                 })
             }
         };

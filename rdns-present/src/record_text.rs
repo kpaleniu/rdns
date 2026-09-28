@@ -17,7 +17,7 @@
 
 use std::borrow::Cow;
 
-use rdns_core::codecs::{base64_encode, hex_encode};
+use rdns_core::codecs::{base64_encode, hex_encode, hex_encode_into};
 use rdns_core::error::ZoneError;
 use rdns_core::record_types::record_type_name;
 use rdns_core::{Class, NameRef, ParsedRecord, RecordData, RecordDataRef, ResourceRecord, Ttl};
@@ -125,11 +125,7 @@ fn generic_rdata(stored: RecordDataRef<'_>) -> String {
     let _ = write!(out, "\\# {}", bytes.len());
     if !bytes.is_empty() {
         out.push(' ');
-        for byte in bytes {
-            // `write!` rather than `push_str(&format!(..))`, which allocated a
-            // `String` per octet.
-            let _ = write!(out, "{byte:02X}");
-        }
+        hex_encode_into(bytes, &mut out);
     }
     out
 }

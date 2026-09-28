@@ -609,8 +609,7 @@ impl PolicyZone {
         // `something.rpz-ip.` as a query name would otherwise land on an
         // address rule. `None` at the root, whose trigger name is the apex —
         // where the SOA is, not a rule.
-        let last = qname.labels().last()?;
-        if SPECIAL_LABELS.iter().any(|l| last.eq_ignore_ascii_case(l)) {
+        if special_label(qname.labels().last()?).is_some() {
             return None;
         }
         let trigger = Name::concat(qname, self.zone.origin()).ok()?;
@@ -634,8 +633,7 @@ impl PolicyZone {
         }
         // As in `qname_action`: a nameserver called `something.rpz-ip.` would
         // otherwise build a trigger name inside an address subtree.
-        let last = ns.labels().last()?;
-        if SPECIAL_LABELS.iter().any(|l| last.eq_ignore_ascii_case(l)) {
+        if special_label(ns.labels().last()?).is_some() {
             return None;
         }
         let trigger = Name::concat(ns, self.nsdname_root.as_ref()).ok()?;
@@ -684,7 +682,11 @@ fn trigger_subtree<'a>(owner: NameRef<'a>, origin: NameRef<'_>) -> Option<&'a [u
     if depth == 0 {
         return None;
     }
-    let label = owner.labels().nth(depth)?;
+    special_label(owner.labels().nth(depth)?)
+}
+
+/// The trigger-subtree label `label` spells, in any case.
+fn special_label(label: &[u8]) -> Option<&'static [u8]> {
     SPECIAL_LABELS
         .iter()
         .find(|special| label.eq_ignore_ascii_case(special))

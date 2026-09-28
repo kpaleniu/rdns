@@ -202,11 +202,7 @@ async fn pump<W>(
             _ = stop.wait() => break,
         };
         let Some(frame) = frame else { break };
-        if !cap.admits(frame.len(), &metrics) {
-            continue;
-        }
-        if let Err(e) = writer.write_all(&frame).await {
-            tracing::error!("dnstap write failed, closing the stream: {e}");
+        if put(&mut writer, &mut cap, &metrics, &frame).await.is_err() {
             return;
         }
     }
@@ -215,11 +211,7 @@ async fn pump<W>(
     // is the last requests a capture holds (`TODO.md` #68a). A payload sent
     // after this is counted as dropped by `send`, once the receiver is gone.
     while let Ok(frame) = queue.try_recv() {
-        if !cap.admits(frame.len(), &metrics) {
-            continue;
-        }
-        if let Err(e) = writer.write_all(&frame).await {
-            tracing::error!("dnstap write failed, closing the stream: {e}");
+        if put(&mut writer, &mut cap, &metrics, &frame).await.is_err() {
             return;
         }
     }
@@ -231,6 +223,25 @@ async fn pump<W>(
         let _ = writer.write_all(&dnstap::finish_frame()).await;
     }
     let _ = writer.flush().await;
+}
+
+/// Write one frame if the cap admits it. `Err` means the stream is closed,
+/// and has been logged.
+async fn put<W>(
+    writer: &mut W,
+    cap: &mut Cap,
+    metrics: &DnsMetrics,
+    frame: &[u8],
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    if !cap.admits(frame.len(), metrics) {
+        return Ok(());
+    }
+    writer.write_all(frame).await.inspect_err(|e| {
+        tracing::error!("dnstap write failed, closing the stream: {e}");
+    })
 }
 
 /// `--dnstap-max-bytes`: octets written so far, against the limit.
