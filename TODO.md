@@ -37,10 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21** and **#136**, as of 2026-09-28.
+**#21** and **#137**, as of 2026-09-28.
 #136 came out of a review asking where injecting a dependency would deepen a
-module: the resolver's outbound exchange is the one left that is not
-injected. Grooming it took three of the review's six claimed gains away.
+module, and closed the same day with the resolver's exchange behind a seam;
+closing it filed #137.
 #127-#130 came out of a deepening sweep of the workspace on 2026-09-27: one
 defect (#127, closed the same day) and three places where a module's
 interface is its callers' problem. Grooming those three found #131 and
@@ -48,7 +48,7 @@ interface is its callers' problem. Grooming those three found #131 and
 and closing #133 found #134.
 Checked and not filed: the transfer ladder (#130 says why), the `[server]`
 keys (#63h's macro), the two UDP loops (#30), the reload seam (#83, #112).
-#58, #68 and #107-#135 are closed. #117-#119 came out of a fourth
+#58, #68 and #107-#136 are closed. #117-#119 came out of a fourth
 architecture review on 2026-09-25 and were groomed against the code before
 filing; #120 came out of verifying #68, #121 and #122 out of verifying #120,
 #123 and #124 out of verifying #122, #125 out of closing #121, and #126 out
@@ -6700,137 +6700,19 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 136. The resolver's tests reach it only through a loopback hierarchy — **filed, groomed and triaged 2026-09-28**, **enhancement**, **ready-for-agent**
+### 137. Nothing tests fastest-first server order end to end — **filed 2026-09-28**, **needs-triage**
 
-From a review asking where injecting a dependency would deepen a module. The
-one dependency still constructed inside the module that decides what to send is
-outbound I/O: `query_server` and `query_upstream_tcp`
-(`rdns/src/resolver/recurse.rs:538-632`) bind and connect for themselves, and
-`ask_any` is their only caller. Every test of the walk — referral, glueless,
-CNAME, DNSSEC chain, QNAME minimisation — stands up real servers on loopback.
+Found closing #136. `ask_any` orders a server list by `RttStore` and records
+each exchange's elapsed time. `RttStore` is tested alone
+(`caches.rs`, `test_rtt_store_orders_fastest_first` and four more); through
+the resolver, only a failing server's demotion is
+(`test_rtt_selection_skips_a_failing_server_after_the_first_try`). No test
+shows the faster of two answering servers being asked first.
 
-What that costs, measured:
-
-- **`ResolverConfig::server_port` is a `pub` field that exists for tests.**
-  Its doc says so ("configurable only so tests can run an unprivileged
-  hierarchy"). No production path sets it (`rdnsr/src/main.rs:578` takes the
-  default); `recursing_config` and one `rdnsr` test do.
-- **Eleven hand-written fake-server loops in two crates, in three styles**:
-  `spawn_server` (a task, #123's fix), seven one-shot blocking threads in
-  `resolver.rs` (`:2379-2711`), and three in `rdnsr` (`answer.rs:2956`,
-  `:3044`, `testutil.rs:299`). Two port-scanning binders sit under them:
-  `bind_fake_upstream` (7 callers, UDP and TCP on one port) and
-  `bind_hierarchy` (21 callers, one port across `127.0.0.1`-`.8`), both
-  because of `server_port` and Windows' per-protocol exclusion ranges
-  (the ephemeral-port trap under "Running the Linux half by hand").
-- **One behaviour has no end-to-end test**: `ask_any` orders servers
-  fastest-first. `RttStore` is tested alone (`caches.rs:317-457`), and
-  through the resolver only a *failing* server's demotion is
-  (`test_rtt_selection_skips_a_failing_server_after_the_first_try`). Latency
-  on loopback is a sleep, which §10 rules out.
-
-Refuting checks taken, and three of the review's six claimed gains did not
-survive them:
-
-- **Speed is not a cost.** `rdns`'s 72 resolver tests run in 0.49 s and
-  `rdnsr`'s 101 in 2.01 s (Windows). `silent_resolver`'s ten callers do not
-  wait out its 10 s timeout.
-- **Query counts are asserted already**: 11 `AtomicUsize` counters in
-  `resolver.rs`'s fakes and `rdnsr`'s `SignedZone::upstream`. A recorded
-  exchange log would be a second way to do what is done.
-- **The eight-alias ceiling does not bind.** No hierarchy test uses more than
-  three servers.
-- **Flakes**: #123 was the last, and its fix is in `spawn_server`. The seven
-  one-shot threads block without `SO_RCVTIMEO`, which is not #123's shape.
-
-What a port could not replace, so the loopback tests of it stay whatever is
-chosen: family-matched bind (`test_forwarding_reaches_an_ipv6_upstream`), the
-connected socket's source filter, the receive buffer, and a real TC→TCP
-retry with its framing (`test_tcp_fallback_on_truncated_udp_response`).
-
-And one thing a port does not buy by itself: `ask_any` times with
-`std::time::Instant`, which `tokio`'s paused clock does not move. An
-end-to-end RTT test through an in-memory adapter needs `tokio::time::Instant`
-there as well.
-
-No remedy named. What is left is `server_port` and the eleven fakes, and they
-have separate candidate answers, which is why §19 says build them rather
-than argue:
-
-- a port under `ask_any` (address, transport, bytes in; bytes out) with a
-  socket adapter and an in-memory table, which removes `server_port` and the
-  binders;
-- one shared fake ~~in `rdns_core::testutil`~~ **in `rdns`, behind a
-  feature** (corrected in triage: `rdns-core` has no `tokio`, and `rdnsr`'s
-  tests cannot see a `#[cfg(test)]` module in another crate), which removes
-  the drift across eleven loops and leaves `server_port` where it is;
-- neither: #130 closed the same way, a seam asked for and the tests' cost
-  measured as small.
-
-The measurement that decides between them is what the first two cost in
-interface and in test lines, against the one `pub` field and the eleven loops.
-
-**Triaged 2026-09-28: enhancement, ready-for-agent.** Not a bug: nothing is
-served wrong and no test flakes. No existing shared fake anywhere (the three
-`testutil` modules checked; `rdnsd`'s `spawn_primary*` run a real `Server`,
-and `answered` is the listening side). Option 2 is not free: either way it
-puts test code on `rdns`'s public surface, the same cost as `server_port`.
-
-> *This was generated by AI during triage.*
-
-**Agent brief**
-
-**Category:** enhancement
-**Summary:** Build two ways of taking the resolver's tests off the loopback
-hierarchy, measure both, and keep one or neither.
-
-**Current behaviour.** `Resolver` sends every upstream query through its own
-UDP socket, with a TCP retry on TC, from the one place that tries a server
-list fastest-first. Tests reach the walk only by binding real servers on
-loopback. Glue carries no port, so `ResolverConfig::server_port` — `pub`,
-set by no production path — lets the fake hierarchy share one unprivileged
-port across `127.0.0.x`, and two port-scanning binders exist for that. Eleven
-fake-server loops in `rdns` and `rdnsr`, in three styles, answer the queries.
-
-**Desired behaviour.** One of these, chosen on the numbers:
-
-- **Shape A, a port.** The exchange of one query with one server (address,
-  UDP or TCP, bytes in, bytes out, or a failure) is a seam `Resolver` is
-  given. Production passes a socket adapter; tests pass an in-memory table
-  from `SocketAddr` to an answering function. Everything the resolver
-  decides stays in the resolver: reply matching (RFC 5452 §9.1), 0x20, the
-  TC→TCP retry (RFC 1035 §4.2.1), budget, RTT. `server_port` and both binders
-  go.
-- **Shape B, a shared fake.** One fake upstream in `rdns` behind a
-  `test-util`-style feature, used by every resolver test in both crates.
-  `server_port` stays.
-- **Neither**, if both cost more than one `pub` field and eleven loops.
-
-**Key interfaces.** `Resolver::new` / `with_clock` and `ResolverConfig`
-(what the port or the feature adds, what `server_port` leaving removes);
-the failure the port returns has to keep `ask_any`'s rule that a failure is
-charged the full timeout.
-
-**Acceptance criteria.**
-- [ ] Both shapes built to compile, clippy-clean and passing, and kept as
-      patches whether or not taken (§19).
-- [ ] This row records, for each: `pub` items added and removed, test lines
-      added and removed, tests changed, and non-test lines in `rdns`.
-- [ ] If A is taken: family-matched bind, the connected socket's source
-      filter, the receive buffer and a real TC→TCP retry with its framing
-      are still tested against real sockets.
-- [ ] If A is taken: `dhat` counts in `rdns/tests/allocations.rs` unchanged
-      or moved with the reason beside the assertion (§17).
-- [ ] Suite, clippy and `cargo doc` clean on Windows and Linux, both counts
-      in the commit.
-
-**Out of scope.**
-- The end-to-end fastest-first test. `ask_any` times with
-  `std::time::Instant`, which paused time does not move; say whether A makes
-  it reachable, do not build it.
-- NOTIFY's and the transfer client's sockets (`notify_out`, `xfr::connect`),
-  which the same review raised and did not file.
-- The resolver's decisions: nothing in what it sends or accepts changes.
+Two things stand between it and a deterministic test: `Upstream::Answering`
+answers synchronously, so it cannot be slow, and `ask_any` reads
+`std::time::Instant`, which `tokio::time::pause` does not move. Loopback with
+a sleep is a timing test (§10). No remedy named.
 
 ---
 
@@ -7047,6 +6929,7 @@ the week; the record is under "How the queue kept going stale" in
 | **133** | the fresh path could serve an older "no" over a newer "yes" | **filed and closed 2026-09-27.** Found closing #132. `Caches::store` has an answer retire the NODATA for its question and the NXDOMAIN at its name and every ancestor (`NegativeCache::forget_refuted`), so asking `negatives` first is right by construction; one removal per label, no scan. The read side was not built. Both regression tests failed without the call. The denial cache has the same shape: #134. |
 | **134** | a cached RFC 8198 gap or wildcard outranked a newer answer for the name | **filed and closed 2026-09-27.** Found closing #133; the wildcard instance found triaging #129. RFC 8198 Appendix A, Unbound, BIND and Knot Resolver ask the exact-match cache first and synthesize on a miss; `Caches::lookup` now does too. Neither store-side retiring nor `learned_at` on proofs was needed. Both regression tests failed against the old order; a cache hit went from 13 allocations to 12. See `docs/CLOSED_WORK.md` |
 | **135** | a restarted `rdnsr` whose master was gone never reached EXPIRE | **filed and closed 2026-09-27.** Found triaging #128. `refresh_task` started from `RefreshTimers::default()`, EXPIRE never, and held a feed file from the last run; it now starts from the timers of the zone in force. The regression test failed against the default. See `docs/CLOSED_WORK.md` |
+| **136** | the resolver's tests reached it only through a loopback hierarchy | **filed and closed 2026-09-28.** Both shapes built: an `Upstream` seam under `ask_any` (A) against one shared fake behind a `test-util` feature (B). A taken: it removed `ResolverConfig::server_port`, a `pub` field that existed for tests, and B kept it and added test code to `rdns`'s public surface. 46 resolver tests and 3 `rdnsr` tests answer from a table; socket behaviour stays on sockets, plus a source-filter test that did not exist. Filed **#137**. See `docs/CLOSED_WORK.md` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
