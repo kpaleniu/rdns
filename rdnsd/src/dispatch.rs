@@ -3886,7 +3886,7 @@ pub(crate) mod tests {
         let changes = vec![a_record("new.example.com.", "192.0.2.50")];
 
         // Unsigned: an UPDATE has no address-based path in, by design.
-        let unsigned = update_message("example.com.", changes.clone())
+        let unsigned = update_message("example.com.", changes)
             .to_bytes_within(4096)
             .expect("serialize");
         assert_eq!(
@@ -3895,29 +3895,25 @@ pub(crate) mod tests {
             "§3.3: an unsigned UPDATE has no credential"
         );
 
-        // Signed with a key scoped to another zone.
-        let bytes = update_message("example.com.", changes)
-            .to_bytes_within(4096)
-            .expect("serialize");
-        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
+        // Signed with a key scoped to another zone. The EDE is the unsigned
+        // case's: which of the two it was is not the client's business.
         assert_eq!(
-            round_trip(addr, signed).await.rcode,
-            ResponseCode::Refused,
+            update_of_with_edns(addr, &key, "example.com.").await,
+            (
+                ResponseCode::Refused,
+                vec![NOT_YOURS.extra_text().to_string()]
+            ),
             "§3.3: the key may not rewrite this zone"
         );
 
         // A zone this server is not authoritative for is NOTAUTH, not REFUSED —
         // the opposite of the query path's rule (`CLAUDE.md` §8).
-        let elsewhere = update_message(
-            "elsewhere.test.",
-            vec![a_record("new.elsewhere.test.", "192.0.2.50")],
-        )
-        .to_bytes_within(4096)
-        .expect("serialize");
-        let signed = rdns::tsig::sign_request(elsewhere, &key, tsig::now()).expect("sign");
         assert_eq!(
-            round_trip(addr, signed).await.rcode,
-            ResponseCode::NotAuthorized,
+            update_of_with_edns(addr, &key, "elsewhere.test.").await,
+            (
+                ResponseCode::NotAuthorized,
+                vec![NOT_OUR_ZONE.extra_text().to_string()]
+            ),
             "§3.1.1: not one of this server's authority zones"
         );
 
@@ -3968,16 +3964,12 @@ pub(crate) mod tests {
         )
         .await;
 
-        let bytes = update_message(
-            "example.com.",
-            vec![a_record("new.example.com.", "192.0.2.50")],
-        )
-        .to_bytes_within(4096)
-        .expect("serialize");
-        let signed = rdns::tsig::sign_request(bytes, &key, tsig::now()).expect("sign");
         assert_eq!(
-            round_trip(addr, signed).await.rcode,
-            ResponseCode::Refused,
+            update_with_edns(addr, &key).await,
+            (
+                ResponseCode::Refused,
+                vec![NOT_WRITABLE.extra_text().to_string()]
+            ),
             "a key that grants everything still cannot write a zone we cannot persist"
         );
     }
@@ -3985,10 +3977,16 @@ pub(crate) mod tests {
     /// A signed UPDATE of `example.com.` adding `new.example.com.`, asking for
     /// EDE, and the reply's rcode and extended errors.
     async fn update_with_edns(addr: SocketAddr, key: &TsigKey) -> (ResponseCode, Vec<String>) {
-        let mut asked = update_message(
-            "example.com.",
-            vec![a_record("new.example.com.", "192.0.2.50")],
-        );
+        update_of_with_edns(addr, key, "example.com.").await
+    }
+
+    /// [`update_with_edns`] for another zone, adding `new.` under it.
+    async fn update_of_with_edns(
+        addr: SocketAddr,
+        key: &TsigKey,
+        zone: &str,
+    ) -> (ResponseCode, Vec<String>) {
+        let mut asked = update_message(zone, vec![a_record(&format!("new.{zone}"), "192.0.2.50")]);
         asked.set_edns(rdns::Edns::with_payload_size(4096));
         let bytes = asked.to_bytes_within(4096).expect("serialize");
         let signed = rdns::tsig::sign_request(bytes, key, tsig::now()).expect("sign");
@@ -4048,6 +4046,29 @@ pub(crate) mod tests {
                 vec![NOT_WRITABLE.extra_text().to_string()]
             )
         );
+    }
+
+    /// The `$INCLUDE` refusal as the client sees it. The unit test on
+    /// `apply_update_to_file` stops at the `UpdateFailure`; this is the rcode
+    /// and EDE the handler turns it into (`TODO.md` #130).
+    #[tokio::test]
+    async fn an_update_to_a_zone_file_that_includes_another_says_so() {
+        let dir = ScratchDir::new("update-include-answer");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let addr = spawn_updatable(dir.path(), key.clone()).await;
+        std::fs::write(dir.join("hosts.inc"), "extra IN A 192.0.2.9\n").expect("write the include");
+        let with_include = format!("{UPDATE_ZONE}$INCLUDE hosts.inc\n");
+        std::fs::write(dir.join("example.com.zone"), &with_include).expect("add the $INCLUDE");
+
+        assert_eq!(
+            update_with_edns(addr, &key).await,
+            (
+                ResponseCode::Refused,
+                vec![INCLUDES_ANOTHER_FILE.extra_text().to_string()]
+            )
+        );
+        let written = std::fs::read_to_string(dir.join("example.com.zone")).expect("read back");
+        assert_eq!(written, with_include, "a refused update writes nothing");
     }
 
     /// A zone directory that cannot be read is a server failure, not a refusal
