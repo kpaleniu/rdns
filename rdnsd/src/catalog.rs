@@ -343,7 +343,7 @@ impl Catalogs {
                     .into_iter()
                     .map(|row| (row.zone, row.node, row.group))
                     .collect();
-                members.sort_by_key(|(zone, _, _)| zone.to_string());
+                members.sort_by_cached_key(|(zone, _, _)| zone.to_string());
                 CatalogReport {
                     catalog: spec.spec.zone.clone(),
                     master: spec.spec.master.to_string(),
@@ -356,7 +356,7 @@ impl Catalogs {
                 }
             })
             .collect();
-        reports.sort_by_key(|report| report.catalog.to_string());
+        reports.sort_by_cached_key(|report| report.catalog.to_string());
         reports
     }
 

@@ -714,10 +714,7 @@ fn carry_over_records(
         ttls.entry(key)
             .and_modify(|t| *t = (*t).min(record.ttl))
             .or_insert(record.ttl);
-        carried.push(ZoneRecord {
-            name: name.to_owned(),
-            ..record
-        });
+        carried.push(record);
     }
 
     for mut record in carried {
@@ -833,18 +830,11 @@ fn publish_dnskeys(
     now: u64,
     signed: &mut Zone,
 ) -> Ttl {
-    let existing: Vec<RecordData> = signed
-        .query(origin, Qtype::of(rt::DNSKEY))
-        .iter()
-        .map(|r| r.rdata.to_owned())
-        .collect();
+    let published = signed.query(origin, Qtype::of(rt::DNSKEY));
+    let existing: Vec<RecordData> = published.iter().map(|r| r.rdata.to_owned()).collect();
     // An RRset has one TTL: keys already published set it, since changing it
     // would be changing records the operator put there.
-    let ttl = signed
-        .query(origin, Qtype::of(rt::DNSKEY))
-        .first()
-        .map(|r| r.ttl)
-        .unwrap_or(soa_ttl);
+    let ttl = published.first().map_or(soa_ttl, |r| r.ttl);
 
     for key in keys {
         // A key before its `Publish` or past its `Delete` is loaded and not

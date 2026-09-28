@@ -815,11 +815,11 @@ async fn send_request<S: AsyncWrite + Unpin + ?Sized>(
     request: &DnsMessage,
     key: Option<&TsigKey>,
 ) -> TransferResult<Vec<u8>> {
-    let mut buf = vec![0u8; 512];
+    let mut packet = vec![0u8; 512];
     let n = request
-        .to_bytes(&mut buf)
+        .to_bytes(&mut packet)
         .map_err(|e| TransferError::malformed(format!("serializing the request: {e}")))?;
-    let mut packet = buf[..n].to_vec();
+    packet.truncate(n);
 
     let mut mac = Vec::new();
     if let Some(key) = key {
