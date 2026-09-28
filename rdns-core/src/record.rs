@@ -607,9 +607,21 @@ impl ParsedRecord {
                 out.push(*hash_algorithm);
                 out.push(*flags);
                 out.extend_from_slice(&iterations.to_be_bytes());
-                out.push(salt.len() as u8);
+                // One length octet each (RFC 5155 §3.2), and a zone file's hex
+                // or base32hex can be any length (`TODO.md` #138).
+                let length_octet = |what, field: &[u8]| {
+                    u8::try_from(field.len()).map_err(|_| WireError::TooLong {
+                        what,
+                        limit: 255,
+                        actual: field.len(),
+                    })
+                };
+                out.push(length_octet("an NSEC3 salt", salt)?);
                 out.extend_from_slice(salt);
-                out.push(next_hashed_owner.len() as u8);
+                out.push(length_octet(
+                    "an NSEC3 next hashed owner",
+                    next_hashed_owner,
+                )?);
                 out.extend_from_slice(next_hashed_owner);
                 out.extend_from_slice(type_bitmap);
                 record_types::NSEC3
@@ -777,5 +789,37 @@ mod tests {
                 have: 3,
             }
         );
+    }
+
+    /// Each has one length octet (RFC 5155 §3.2). Cast rather than checked, 256
+    /// octets wrote a length of 0 and the RDATA read back as a different NSEC3
+    /// (`TODO.md` #138).
+    #[test]
+    fn an_nsec3_field_past_255_octets_is_refused_not_wrapped() {
+        let nsec3 = |salt: Vec<u8>, next_hashed_owner: Vec<u8>| ParsedRecord::NSEC3 {
+            hash_algorithm: 1,
+            flags: 0,
+            iterations: 0,
+            salt,
+            next_hashed_owner,
+            type_bitmap: Vec::new(),
+        };
+        assert!(matches!(
+            nsec3(vec![0xab; 256], vec![0; 20]).encode(),
+            Err(WireError::TooLong {
+                what: "an NSEC3 salt",
+                limit: 255,
+                actual: 256
+            })
+        ));
+        assert!(matches!(
+            nsec3(Vec::new(), vec![0; 256]).encode(),
+            Err(WireError::TooLong {
+                what: "an NSEC3 next hashed owner",
+                limit: 255,
+                actual: 256
+            })
+        ));
+        assert!(nsec3(vec![0xab; 255], vec![0; 255]).encode().is_ok());
     }
 }

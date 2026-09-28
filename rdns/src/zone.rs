@@ -2752,6 +2752,21 @@ deep.a.b IN TXT \"down here\"
         );
     }
 
+    /// Loaded, a 256-octet salt had a length octet of 0 and was served as a
+    /// different NSEC3 (`TODO.md` #138). The line is what the operator needs.
+    #[test]
+    fn an_nsec3_salt_past_255_octets_refuses_the_zone() {
+        let text = format!(
+            "@ 3600 IN SOA ns hm 1 2 3 4 5\n\
+             @ 3600 IN NS ns\n\
+             ns 3600 IN A 192.0.2.1\n\
+             h 3600 IN NSEC3 1 0 0 {} 2T7B4G4VSA5SMI47K61MV5BV1A22BOJR A\n",
+            "AB".repeat(256)
+        );
+        let err = parse_zone_file(&text, "example.com.").expect_err("a salt has one length octet");
+        assert!(matches!(err, ZoneError::Syntax { line: 4, .. }), "{err}");
+    }
+
     /// The chains hold positions too, so a removal owes them both halves: the
     /// entry of the record that went, and the entry of the record that moved
     /// into its place.
