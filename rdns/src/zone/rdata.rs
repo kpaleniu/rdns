@@ -14,7 +14,7 @@
 //! The generic `\#` form (RFC 3597) is here too: it is still a record's RDATA,
 //! just spelled as a length and hex rather than as fields.
 
-use super::parse::name_at;
+use super::parse::{name_at, upper_into};
 use crate::codecs::hex_decode;
 use crate::denial_wire::base32hex_decode;
 use crate::error::ZoneError;
@@ -30,10 +30,14 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 /// An unrecognized name is an error, not a silent omission: dropping one turns
 /// an NSEC denying six types into one denying five. `TYPEnnn` (RFC 3597 §5)
 /// gives every type a spelling, so there is no case where dropping is better.
-fn construct_type_bitmap(types: &[String]) -> Result<Vec<u8>, String> {
+fn construct_type_bitmap(types: &[Cow<'_, str>]) -> Result<Vec<u8>, String> {
     let mut codes = Vec::with_capacity(types.len());
+    let mut buf = [0u8; 32];
     for name in types {
-        let code = crate::record_types::record_type_name_to_code(&name.to_uppercase())
+        // ASCII only (RFC 4343): `to_uppercase` read `Nſ` as NS (`TODO.md`
+        // #140). A token `upper_into` declines is no type name either.
+        let upper = upper_into(name, &mut buf).unwrap_or(name);
+        let code = crate::record_types::record_type_name_to_code(upper)
             .ok_or_else(|| format!("unknown record type {name:?} in type bitmap"))?;
         codes.push(code);
     }
@@ -384,8 +388,7 @@ pub(super) fn rdata_from_fields(
                 ));
             }
             let next_domain_name = name_at(nsec_parts[0].as_ref(), origin, ln)?;
-            let type_names: Vec<String> = nsec_parts[1..].iter().map(|s| s.to_string()).collect();
-            let type_bitmap = construct_type_bitmap(&type_names)
+            let type_bitmap = construct_type_bitmap(&nsec_parts[1..])
                 .map_err(|e| ZoneError::syntax(ln, format!("NSEC record: {e}")))?;
             ParsedRecord::NSEC {
                 next_domain_name,
@@ -435,8 +438,7 @@ pub(super) fn rdata_from_fields(
                     format!("invalid NSEC3 next hashed owner {:?}: {e}", nsec3_parts[4]),
                 )
             })?;
-            let type_names: Vec<String> = nsec3_parts[5..].iter().map(|s| s.to_string()).collect();
-            let type_bitmap = construct_type_bitmap(&type_names)
+            let type_bitmap = construct_type_bitmap(&nsec3_parts[5..])
                 .map_err(|e| ZoneError::syntax(ln, format!("NSEC3 record: {e}")))?;
             ParsedRecord::NSEC3 {
                 hash_algorithm,

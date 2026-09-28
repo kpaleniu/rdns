@@ -230,7 +230,7 @@ fn tokenize_into<'a>(text: &'a str, out: &mut Vec<Cow<'a, str>>) {
 }
 
 /// `text` upper-cased into `buf`, or `None` if it does not fit or is not ASCII.
-fn upper_into<'b>(text: &str, buf: &'b mut [u8; 32]) -> Option<&'b str> {
+pub(super) fn upper_into<'b>(text: &str, buf: &'b mut [u8; 32]) -> Option<&'b str> {
     if !text.is_ascii() || text.len() > buf.len() {
         return None;
     }

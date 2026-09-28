@@ -2767,6 +2767,27 @@ deep.a.b IN TXT \"down here\"
         assert!(matches!(err, ZoneError::Syntax { line: 4, .. }), "{err}");
     }
 
+    /// U+017F upper-cases to `S` under the Unicode fold, which read `Nſ` as NS
+    /// (`TODO.md` #140). RFC 4343's fold is ASCII only; the lower-case spelling
+    /// still has to work.
+    #[test]
+    fn a_type_bitmap_folds_type_names_as_ascii() {
+        let zone = |types: &str| {
+            parse_zone_file(
+                &format!(
+                    "@ 3600 IN SOA ns hm 1 2 3 4 5\n\
+                     @ 3600 IN NS ns\n\
+                     ns 3600 IN A 192.0.2.1\n\
+                     ns 3600 IN NSEC @ {types}\n"
+                ),
+                "example.com.",
+            )
+        };
+        let err = zone("A N\u{17f}").expect_err("the long s is not an s");
+        assert!(matches!(err, ZoneError::Syntax { line: 4, .. }), "{err}");
+        assert!(zone("a ns type65").is_ok());
+    }
+
     /// The chains hold positions too, so a removal owes them both halves: the
     /// entry of the record that went, and the entry of the record that moved
     /// into its place.
