@@ -927,10 +927,10 @@ fn find_tsig(packet: &[u8]) -> Option<(usize, &[u8], String)> {
     if rtype != TSIG_TYPE {
         return None;
     }
-    // After the TYPE check, not before it. `read_name_at` allocates a `String`
-    // per label plus a `join`, so reading first charged every EDNS query for the
-    // OPT record's owner name and then threw it away — and the label count is
-    // the sender's, on a path reached before anything is authenticated.
+    // After the TYPE check, not before it. `read_name_at` allocates the name
+    // and its text, so reading first charged every EDNS query for the OPT
+    // record's owner name and then threw it away, on a path reached before
+    // anything is authenticated.
     let owner = read_name_at(packet, pos)?;
     let rdlen = u16::from_be_bytes([packet[after_name + 8], packet[after_name + 9]]) as usize;
     let rdata_start = after_name + 10;
@@ -1047,61 +1047,22 @@ fn skip_record(packet: &[u8], pos: usize) -> Option<usize> {
 
 /// A name read from `packet` at `pos`, following pointers. Used for the TSIG
 /// owner name only, which is the key name.
+///
+/// `Name`'s parser and presentation form rather than labels joined as text: a
+/// `.` inside a label read as a separator, and a non-UTF-8 octet as U+FFFD, so
+/// `name_wire` rebuilt different octets and the MAC did not verify
+/// (`TODO.md` #139).
 fn read_name_at(packet: &[u8], pos: usize) -> Option<String> {
-    let mut labels = Vec::new();
-    let mut pos = pos;
-    let mut jumps = 0;
-    loop {
-        let len = *packet.get(pos)?;
-        if len & 0xc0 == 0xc0 {
-            let target = u16::from_be_bytes([packet[pos] & 0x3f, *packet.get(pos + 1)?]) as usize;
-            jumps += 1;
-            if jumps > 4 {
-                return None;
-            }
-            pos = target;
-            continue;
-        }
-        if len == 0 {
-            break;
-        }
-        let start = pos + 1;
-        let end = start + len as usize;
-        labels.push(String::from_utf8_lossy(packet.get(start..end)?).to_string());
-        pos = end;
-    }
-    Some(if labels.is_empty() {
-        ".".to_string()
-    } else {
-        format!("{}.", labels.join("."))
-    })
+    let unpacker = rdns_core::dname::DNameUnpacker::new(packet);
+    let (name, _) = rdns_core::Name::from_wire_in(packet.get(pos..)?, &unpacker).ok()?;
+    Some(name.as_ref().to_presentation())
 }
 
 /// A name at the start of `data`, and what follows. No compression: this reads
 /// the algorithm name out of TSIG RDATA, where RFC 3597 §4 forbids pointers.
 fn read_name(data: &[u8]) -> Option<(String, &[u8])> {
-    let mut labels = Vec::new();
-    let mut pos = 0;
-    loop {
-        let len = *data.get(pos)? as usize;
-        if len & 0xc0 != 0 {
-            return None; // a pointer has no business in here
-        }
-        if len == 0 {
-            pos += 1;
-            break;
-        }
-        let start = pos + 1;
-        let end = start + len;
-        labels.push(String::from_utf8_lossy(data.get(start..end)?).to_string());
-        pos = end;
-    }
-    let name = if labels.is_empty() {
-        ".".to_string()
-    } else {
-        format!("{}.", labels.join("."))
-    };
-    Some((name, &data[pos..]))
+    let (name, rest) = rdns_core::Name::from_wire(data).ok()?;
+    Some((name.as_ref().to_presentation(), rest))
 }
 
 /// A key name as compared and hashed: absolute and down-cased, because it is a
@@ -1600,6 +1561,31 @@ mod tests {
             TsigCheck::Verified(session) => assert_eq!(session.key_name(), "transfer.key."),
             TsigCheck::Unsigned => panic!("the request is signed"),
             TsigCheck::Rejected(r) => panic!("should verify: {}", r.error.reason()),
+        }
+    }
+
+    /// Read as lossy, joined text, a `.` inside a label became a separator and
+    /// a non-UTF-8 octet became U+FFFD, so our own signature failed our own
+    /// check (`TODO.md` #139). RFC 1035 §5.1's escapes are how the name
+    /// survives the round trip through presentation form.
+    #[test]
+    fn a_key_name_needing_escapes_verifies() {
+        let now = 1_800_000_000;
+        for name in [r"a\.b.", r"k\200ey.", r"sp\032ace.key."] {
+            let key = TsigKey::new(name, TsigAlgorithm::HmacSha256, vec![0x0b; 32]);
+            let ring = TsigKeyring::new(vec![key.clone()]);
+            let signed = sign_request(query_bytes("example.com.", Qtype::AXFR), &key, now).unwrap();
+            match check_request(&signed, &ring, now) {
+                TsigCheck::Verified(session) => assert_eq!(session.key_name(), name),
+                TsigCheck::Unsigned => panic!("{name}: the request is signed"),
+                TsigCheck::Rejected(r) => {
+                    panic!(
+                        "{name}: rejected as {:?}: {}",
+                        r.key_name(),
+                        r.error.reason()
+                    )
+                }
+            }
         }
     }
 
