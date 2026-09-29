@@ -19,7 +19,7 @@ the log of what landed, verbatim, strike-throughs and wrong claims included.
 written here: the struck one was already wrong when it was written on 2026-09-05
 (there were twenty-nine sections, not twenty-eight), and what the "thirty-one
 numbers" counted is not recoverable — #5, #8 and #9 are closed with no section
-of their own, and #21 has a section in *this* file. That is the ninth time a
+of their own, and #21 had a section in *this* file until it closed on 2026-09-29. That is the ninth time a
 count in a preamble here has gone stale, and the first fixed by deleting the
 count.
 This page had reached 7,989 lines of which about six thousand described work
@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21**, as of 2026-09-29.
+Nothing, as of 2026-09-29.
 #138-#146 came out of an idiom and std-reuse review of the whole workspace on
 2026-09-28, and all nine closed the same day. The four bugs, #138-#141, were
 each provoked before filing; #147, a fifth, came out of probing 145e.
@@ -471,9 +471,10 @@ state" are all of that kind and are untouched. A status line that merely stopped
 being current is not that, and deleting it loses nothing the table does not
 hold.
 
-- **#21** — the four deliberate RFC deviations and the not-implemented list.
-  **Not a queue.** It exists so the next person to notice one finds the decision
-  instead of re-deriving it. If one is ever taken up it gets its own number.
+- **#21** — the four deliberate RFC deviations and the not-implemented list,
+  closed 2026-09-29 into `docs/CLOSED_WORK.md`. **Not a queue.** It exists so
+  the next person to notice one finds the decision instead of re-deriving it.
+  If one is ever taken up it gets its own number.
 
 **#33 closed on 2026-09-06**, its last two items a day after the rest; the
 section is in `docs/CLOSED_WORK.md` under its own number, where the five
@@ -6708,68 +6709,6 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 21. The deviations and the not-implemented list — decisions, not open work
-
-**Filed 2026-08-03**, after the architecture review's findings were closed and
-`docs/spec/` was committed. Every *gap* that review found (G-1 to G-5) is fixed;
-what is left in the spec are four **deviations** — places the code and an RFC
-disagree on purpose — and a list of things simply not implemented. None of them
-was in this file, which meant the only record that they had been *decided* rather
-than overlooked lived in a document nobody reads before starting work.
-
-**This section is not a queue.** It exists so the next person to notice one of
-these finds the decision instead of re-deriving it, which is the same job
-`CLAUDE.md` §16's "what the pass checked and found nothing wrong with" does. If
-one of these is ever taken up it gets its own number.
-
-#### The four live deviations
-
-| | what | decided |
-|---|---|---|
-| ~~**D-1**~~ | ~~a label that is not valid UTF-8 is refused, where RFC 2181 §11 allows any binary string~~ | **Fixed 2026-09-07 by #36**, which took the argument in the last clause below. The reasoning that produced the deviation is left standing, because it is why the deviation existed: ~~**Deliberate, and the one with a real cost.** Names are `String`s in presentation form throughout; the alternative is a different representation (labels, or wire bytes), which is what **#13e** scopes — its map-key half is done and its `Name` half is *deferred*, not declined, and #11 owns the storage question. The consequence is easy to under-read: a zone containing such a name cannot be served, *and* a response containing one is unparseable, so `rdnsr` cannot relay someone else's zone that has one. **That last clause is the strongest argument anywhere on this page for taking #13e's `Name` half**, and it is not among the reasons #13e was deferred — those were about allocation counts and churn.~~ (Not #15, which is a different question: that was the `DName`/`UnpackedDName` typestate collapse, withdrawn on its own merits, and it would not have changed what a label may contain.) |
-| **D-5** | RFC 1035 §2.3.1's LDH "preferred name syntax" is not enforced | **Deliberate, and enforcing it would be a bug.** RFC 2181 §11 settles it; enforcing LDH would refuse `_dmarc`, every `_tcp` SRV owner, DNS-SD instance names and the wildcard `*`. #15 records that a `TODO` asking for this was deleted rather than done, because doing it was the defect |
-| **D-6** | the first compression pointer in a chain may point forward | **Deliberate.** Every *subsequent* pointer must strictly decrease, which is what makes cycles unreachable without a visited-set; the first is unconstrained because a name is parsed from a suffix slice that does not know its own offset. Termination is unaffected, and the reasoning and the cost of the alternative are written at `dname.rs` |
-| **D-7** | class CH and HS are refused rather than served | **Deliberate.** RFC 1034 §4.3.2 step 1 searches the zones *of the question's class*, and holding none in a class is the same situation as holding no zone. The visible cost is that `version.bind CH TXT` — which BIND, NSD and Knot all answer — is not answered here. Serving it would mean a second class in the zone index, which #13d's class-blind index deliberately made unrepresentable |
-| **D-8** | `rdnsr --serve-stale-first` answers from the stale window before any refresh, where RFC 8767 §4 allows stale data only when it "is unable to be authoritatively refreshed" | **Deliberate and opt-in**, as BIND's `stale-answer-client-timeout 0` is. It is what a slow authoritative server costs nobody, where §5's 1.8 s client response timer — the conforming shape — was declined: BIND removed its non-zero form after two CVEs, and it needs a resolution that outlives its query. Refreshes are one per name per 30 s, §5's failure recheck timer. Off by default and refused without a window (#58) |
-
-#### Not implemented
-
-Scope, not defects. Listed so "is this missing on purpose?" has an answer.
-
-| | note |
-|---|---|
-| ~~DoT / DoH / DoQ (7858 / 8484 / 9250)~~ | ~~each is a transport, and each drags in a TLS stack — the dependency argument §14 makes about the OTLP exporter applies with more force here~~ **Taken 2026-09-11 as #42**, and the reasoning is left standing because the *measurement* is what moved it rather than a change of mind: the TLS stack costs 7 packages, not a tree, because `rustls` can be told to use the `ring` this repo already links. "Applies with more force here" was a guess where §14's own argument was a count |
-| SIG(0) (RFC 2931) | TSIG covers the transaction-authentication case this server actually has. SIG(0) matters for a client that cannot share a secret in advance, which is not a deployment this serves |
-| DNS Cookies (RFC 7873) | round-trips as an opaque EDNS option. Implementing it properly is a second anti-spoofing mechanism beside the response budget, and the budget is the one that is there |
-| `$GENERATE` | a BIND zone-file extension, not an RFC. Absent because nothing here needed it |
-| white lies / minimally-covering NSEC (RFC 4470) | the denial chain is precomputed at signing time, so a lie would have to be signed online. That is a different signing model, not a feature |
-| ~~key-rollover *automation* (RFC 6781)~~ | ~~rollover is manual and the signer will not delete a published DNSKEY, which is the half that matters: a key published without its private half is how every rollover starts, and deleting it would undo the operator's preparation~~ **Taken 2026-09-11 as #44f**, and the reasoning is left standing because it is still why the item is not urgent: the dangerous half is already safe. What moved it is scale, not risk |
-
-~~**One of these is a stronger candidate than the rest**, and saying which is the
-point of writing the list down: **DNAME**, because it is the only entry that
-makes this server give a *wrong* answer rather than an incomplete one — a name
-under a DNAME gets NXDOMAIN or NODATA where an implementation that followed it
-would synthesize a CNAME.~~ **Taken 2026-09-06 and done — #34.** The paragraph is
-kept because it is why the work happened, and because it is the only time this
-list has been used for what it was written for: a session with no queue read it,
-found the argument already made, and did that.
-
-Everything else on the list is something absent that announces its own absence,
-which is why none of the rest is marked. ~~The next strongest, on the same
-reasoning, is **SVCB/HTTPS**: an operator who writes one in a zone file has to
-hand-encode it in `\#` form, and a mistake there is silent.~~ **Taken 2026-09-07
-and done — #35.** ~~Twice now this list has been read by a session with no queue
-and used to pick the work, which is what it is for; nothing on it is marked any
-more.~~ **Three times, as of 2026-09-11**: the transports went as #42, and key-rollover
-automation went the same day as #44f, which makes it four. That one
-went differently from the first two, and the difference is the lesson — DNAME and
-SVCB were picked because the list already carried the argument, and the
-transports were picked because the argument the list carried turned out to be
-untested. A line that says a thing is expensive is a claim to measure
-(`CLAUDE.md` §4), and this one had sat since 2026-08-03 costing nothing to check.
-
----
-
 ## Closed work
 
 One line each. The reasoning, the RFC citations and the verification are in the
@@ -6814,6 +6753,7 @@ the week; the record is under "How the queue kept going stale" in
 | **18** | `rdnsr` has none of the operational shell | **fixed 2026-08-03.** Seven library facilities wired into one daemon and not the other, the more amplifying one |
 | **19** | the 2026-08-03 review's smaller items, 19a-19h | **closed 2026-08-03.** Five stragglers of consolidations that caught most copies and missed one |
 | **20** | `rdnsd/src/main.rs` is one file and eleven subsystems | **done 2026-08-03**, one commit per seam. 8,328 → 5,956 lines, every move diffed against `HEAD` to prove it changed nothing |
+| **21** | the deliberate RFC deviations and the not-implemented list | **filed 2026-08-03, closed 2026-09-29, wontfix.** Decisions, not a queue; every row re-checked against the code the day it closed. A row taken up gets its own number, as #34, #35, #36, #42 and #44f did. See `docs/CLOSED_WORK.md` |
 | **22** | the zone lookup is hash-bound | **closed 2026-09-05.** One map instead of two takes a miss from 1,875 to 1,402 instructions. The second direction is a decision and the answer is **no** — the threat model is in the section |
 | **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`9715c3c`), the day after filing. 1 124 ms → 1.28 ms on the same probe |
 | **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection 55 µs → 32 ns and flat at ten thousand zones; name compression O(n²) → linear in one message's records; an AXFR at 10.5× less peak memory |

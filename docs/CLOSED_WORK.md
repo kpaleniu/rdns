@@ -2537,6 +2537,82 @@ orphaned `///`.
 
 ---
 
+### 21. The deviations and the not-implemented list — decisions, not open work — **filed 2026-08-03, closed 2026-09-29**, **wontfix**
+
+**Filed 2026-08-03**, after the architecture review's findings were closed and
+`docs/spec/` was committed. Every *gap* that review found (G-1 to G-5) is fixed;
+what is left in the spec are four **deviations** — places the code and an RFC
+disagree on purpose — and a list of things simply not implemented. None of them
+was in this file, which meant the only record that they had been *decided* rather
+than overlooked lived in a document nobody reads before starting work.
+
+**This section is not a queue.** It exists so the next person to notice one of
+these finds the decision instead of re-deriving it, which is the same job
+`CLAUDE.md` §16's "what the pass checked and found nothing wrong with" does. If
+one of these is ever taken up it gets its own number.
+
+**Triaged 2026-09-29: wontfix**, which is what every row already says: each
+is a decision not to act, and one that is taken up gets its own number. Every
+row re-checked against the code and still true: LDH not enforced
+(`dname.rs:238`), the first compression hop unconstrained (`dname.rs`,
+`unpack_internal`), CH refused (`rdnsd/src/answer.rs:143` cites D-7),
+`--serve-stale-first` opt-in; no SIG(0), cookie, `$GENERATE` or RFC 4470 code
+in the tree. `big.test.db` is `$GENERATE`, but BIND expands it and `rdnsd`
+receives it by transfer, so "nothing here needed it" still holds.
+
+#### The four live deviations
+
+| | what | decided |
+|---|---|---|
+| ~~**D-1**~~ | ~~a label that is not valid UTF-8 is refused, where RFC 2181 §11 allows any binary string~~ | **Fixed 2026-09-07 by #36**, which took the argument in the last clause below. The reasoning that produced the deviation is left standing, because it is why the deviation existed: ~~**Deliberate, and the one with a real cost.** Names are `String`s in presentation form throughout; the alternative is a different representation (labels, or wire bytes), which is what **#13e** scopes — its map-key half is done and its `Name` half is *deferred*, not declined, and #11 owns the storage question. The consequence is easy to under-read: a zone containing such a name cannot be served, *and* a response containing one is unparseable, so `rdnsr` cannot relay someone else's zone that has one. **That last clause is the strongest argument anywhere on this page for taking #13e's `Name` half**, and it is not among the reasons #13e was deferred — those were about allocation counts and churn.~~ (Not #15, which is a different question: that was the `DName`/`UnpackedDName` typestate collapse, withdrawn on its own merits, and it would not have changed what a label may contain.) |
+| **D-5** | RFC 1035 §2.3.1's LDH "preferred name syntax" is not enforced | **Deliberate, and enforcing it would be a bug.** RFC 2181 §11 settles it; enforcing LDH would refuse `_dmarc`, every `_tcp` SRV owner, DNS-SD instance names and the wildcard `*`. #15 records that a `TODO` asking for this was deleted rather than done, because doing it was the defect |
+| **D-6** | the first compression pointer in a chain may point forward | **Deliberate.** Every *subsequent* pointer must strictly decrease, which is what makes cycles unreachable without a visited-set; the first is unconstrained because a name is parsed from a suffix slice that does not know its own offset. Termination is unaffected, and the reasoning and the cost of the alternative are written at `dname.rs` |
+| **D-7** | class CH and HS are refused rather than served | **Deliberate.** RFC 1034 §4.3.2 step 1 searches the zones *of the question's class*, and holding none in a class is the same situation as holding no zone. The visible cost is that `version.bind CH TXT` — which BIND, NSD and Knot all answer — is not answered here. Serving it would mean a second class in the zone index, which #13d's class-blind index deliberately made unrepresentable |
+| **D-8** | `rdnsr --serve-stale-first` answers from the stale window before any refresh, where RFC 8767 §4 allows stale data only when it "is unable to be authoritatively refreshed" | **Deliberate and opt-in**, as BIND's `stale-answer-client-timeout 0` is. It is what a slow authoritative server costs nobody, where §5's 1.8 s client response timer — the conforming shape — was declined: BIND removed its non-zero form after two CVEs, and it needs a resolution that outlives its query. Refreshes are one per name per 30 s, §5's failure recheck timer. Off by default and refused without a window (#58) |
+
+#### Not implemented
+
+Scope, not defects. Listed so "is this missing on purpose?" has an answer.
+
+| | note |
+|---|---|
+| ~~DoT / DoH / DoQ (7858 / 8484 / 9250)~~ | ~~each is a transport, and each drags in a TLS stack — the dependency argument §14 makes about the OTLP exporter applies with more force here~~ **Taken 2026-09-11 as #42**, and the reasoning is left standing because the *measurement* is what moved it rather than a change of mind: the TLS stack costs 7 packages, not a tree, because `rustls` can be told to use the `ring` this repo already links. "Applies with more force here" was a guess where §14's own argument was a count |
+| SIG(0) (RFC 2931) | TSIG covers the transaction-authentication case this server actually has. SIG(0) matters for a client that cannot share a secret in advance, which is not a deployment this serves |
+| DNS Cookies (RFC 7873) | round-trips as an opaque EDNS option. Implementing it properly is a second anti-spoofing mechanism beside the response budget, and the budget is the one that is there |
+| `$GENERATE` | a BIND zone-file extension, not an RFC. Absent because nothing here needed it |
+| white lies / minimally-covering NSEC (RFC 4470) | the denial chain is precomputed at signing time, so a lie would have to be signed online. That is a different signing model, not a feature |
+| ~~key-rollover *automation* (RFC 6781)~~ | ~~rollover is manual and the signer will not delete a published DNSKEY, which is the half that matters: a key published without its private half is how every rollover starts, and deleting it would undo the operator's preparation~~ **Taken 2026-09-11 as #44f**, and the reasoning is left standing because it is still why the item is not urgent: the dangerous half is already safe. What moved it is scale, not risk |
+
+~~**One of these is a stronger candidate than the rest**, and saying which is the
+point of writing the list down: **DNAME**, because it is the only entry that
+makes this server give a *wrong* answer rather than an incomplete one — a name
+under a DNAME gets NXDOMAIN or NODATA where an implementation that followed it
+would synthesize a CNAME.~~ **Taken 2026-09-06 and done — #34.** The paragraph is
+kept because it is why the work happened, and because it is the only time this
+list has been used for what it was written for: a session with no queue read it,
+found the argument already made, and did that.
+
+Everything else on the list is something absent that announces its own absence,
+which is why none of the rest is marked. ~~The next strongest, on the same
+reasoning, is **SVCB/HTTPS**: an operator who writes one in a zone file has to
+hand-encode it in `\#` form, and a mistake there is silent.~~ **Taken 2026-09-07
+and done — #35.** ~~Twice now this list has been read by a session with no queue
+and used to pick the work, which is what it is for; nothing on it is marked any
+more.~~ **Three times, as of 2026-09-11**: the transports went as #42, and key-rollover
+automation went the same day as #44f, which makes it four. That one
+went differently from the first two, and the difference is the lesson — DNAME and
+SVCB were picked because the list already carried the argument, and the
+transports were picked because the argument the list carried turned out to be
+untested. A line that says a thing is expensive is a claim to measure
+(`CLAUDE.md` §4), and this one had sat since 2026-08-03 costing nothing to check.
+
+**Closed 2026-09-29**, the day it was triaged wontfix. It was the last entry
+under "What is open" and never a queue, so the page could not say "nothing is
+open". The decisions stand and this is where to find them; a row taken up
+still gets its own number.
+
+---
+
 ### 22. The zone lookup is hash-bound — ~~filed 2026-08-04 from #11~~ **closed 2026-09-05**
 
 **Filed as a redirect rather than found as a defect.** #11 went looking for cache
@@ -12005,6 +12081,50 @@ synchronous function, so it cannot answer late, and `ask_any` times with
 
 ---
 
+### 137. Nothing tests fastest-first server order end to end — **filed 2026-09-28, closed 2026-09-29**, **enhancement**
+
+Found closing #136. `ask_any` orders a server list by `RttStore` and records
+each exchange's elapsed time. `RttStore` is tested alone
+(`caches.rs`, `test_rtt_store_orders_fastest_first` and four more); through
+the resolver, only a failing server's demotion is
+(`test_rtt_selection_skips_a_failing_server_after_the_first_try`). No test
+shows the faster of two answering servers being asked first.
+
+Two things stand between it and a deterministic test: `Upstream::Answering`
+answers synchronously, so it cannot be slow, and `ask_any` reads
+`std::time::Instant`, which `tokio::time::pause` does not move. Loopback with
+a sleep is a timing test (§10). No remedy named.
+
+**Triaged 2026-09-29.** Both obstacles hold and both are small:
+
+- The clock is one line. `tokio` is already a dev-dependency of `rdns` with
+  `test-util` (`rdns/Cargo.toml:65`), and `tokio::time::Instant` is
+  `std::time::Instant` unless the runtime is paused. `recurse.rs:364` is the
+  only `Instant` on the resolver's query path. `Clock` is not the seam: it is
+  whole wall-clock seconds, and an interval wants `Instant` (§6).
+- The slowness needs `Upstream::Answering` to be able to wait. Four
+  constructors call `Upstream::answering` (`resolver.rs:843`, `:865`,
+  `rdnsr/src/answer.rs:2951`, `rdnsr/src/testutil.rs:293`), so the churn is
+  bounded either way. Two shapes, not yet built (§19): the closure returns a
+  future, or `Answering` keeps its signature and gains a per-server latency the
+  exchange sleeps for.
+
+Checked and not enough on its own: a test in `resolver::tests` can seed
+`resolver.rtt` directly and assert the ask order, since the field is visible to
+descendants. That covers `order` feeding `ask_any` and not `ask_any` recording
+the elapsed time, which is the half no test reaches.
+
+**Closed 2026-09-29**, `15d9add`. Both shapes built. The future taken:
+`Upstream::answering_later`, with `answering` keeping its sync signature, so
+none of the four constructors changed. The latency table declined: its
+`with_latency` has nothing to mean on `Network`, and it says only "this server
+is this slow". `ask_any` reads `tokio::time::Instant`. The new test fails
+against `std::time::Instant`, where the slow server times at ~0 ms and is
+asked all three times. Windows 1376 and Linux 1397 passing, one more each;
+clippy clean on both.
+
+---
+
 ### 138. An NSEC3 salt over 255 octets is encoded with the wrong length — **filed and closed 2026-09-28**, **bug**
 
 Found by the idiom review of 2026-09-28. `ParsedRecord::encode`'s NSEC3 arm
@@ -12331,49 +12451,5 @@ the four name types; MX takes exactly two and SOA exactly seven, both through
 `fields`. Two tests, both failing against the old parser. Every tracked
 interop zone still parses except `big.test.db`, which is `$GENERATE` (#21).
 Windows 1375 and Linux 1396 passing across #142-#147, clippy clean on both.
-
----
-
-### 137. Nothing tests fastest-first server order end to end — **filed 2026-09-28, closed 2026-09-29**, **enhancement**
-
-Found closing #136. `ask_any` orders a server list by `RttStore` and records
-each exchange's elapsed time. `RttStore` is tested alone
-(`caches.rs`, `test_rtt_store_orders_fastest_first` and four more); through
-the resolver, only a failing server's demotion is
-(`test_rtt_selection_skips_a_failing_server_after_the_first_try`). No test
-shows the faster of two answering servers being asked first.
-
-Two things stand between it and a deterministic test: `Upstream::Answering`
-answers synchronously, so it cannot be slow, and `ask_any` reads
-`std::time::Instant`, which `tokio::time::pause` does not move. Loopback with
-a sleep is a timing test (§10). No remedy named.
-
-**Triaged 2026-09-29.** Both obstacles hold and both are small:
-
-- The clock is one line. `tokio` is already a dev-dependency of `rdns` with
-  `test-util` (`rdns/Cargo.toml:65`), and `tokio::time::Instant` is
-  `std::time::Instant` unless the runtime is paused. `recurse.rs:364` is the
-  only `Instant` on the resolver's query path. `Clock` is not the seam: it is
-  whole wall-clock seconds, and an interval wants `Instant` (§6).
-- The slowness needs `Upstream::Answering` to be able to wait. Four
-  constructors call `Upstream::answering` (`resolver.rs:843`, `:865`,
-  `rdnsr/src/answer.rs:2951`, `rdnsr/src/testutil.rs:293`), so the churn is
-  bounded either way. Two shapes, not yet built (§19): the closure returns a
-  future, or `Answering` keeps its signature and gains a per-server latency the
-  exchange sleeps for.
-
-Checked and not enough on its own: a test in `resolver::tests` can seed
-`resolver.rtt` directly and assert the ask order, since the field is visible to
-descendants. That covers `order` feeding `ask_any` and not `ask_any` recording
-the elapsed time, which is the half no test reaches.
-
-**Closed 2026-09-29**, `15d9add`. Both shapes built. The future taken:
-`Upstream::answering_later`, with `answering` keeping its sync signature, so
-none of the four constructors changed. The latency table declined: its
-`with_latency` has nothing to mean on `Network`, and it says only "this server
-is this slow". `ask_any` reads `tokio::time::Instant`. The new test fails
-against `std::time::Instant`, where the slow server times at ~0 ms and is
-asked all three times. Windows 1376 and Linux 1397 passing, one more each;
-clippy clean on both.
 
 ---

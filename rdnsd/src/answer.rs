@@ -140,7 +140,7 @@ const UNIMPLEMENTED_OPCODE: ExtendedError =
 
 /// NOT_SUPPORTED rather than [`NOT_OUR_ZONE`], though the two arrive at the
 /// same REFUSED: what is absent is the class, not the zone, and the operator's
-/// fix differs. Serving CH at all is `TODO.md` #21's deviation D-7.
+/// fix differs. Serving CH at all is deviation D-7, #21 in `docs/CLOSED_WORK.md`.
 const UNSERVED_CLASS: ExtendedError =
     ExtendedError::new(InfoCode::NOT_SUPPORTED, "this class is not served");
 

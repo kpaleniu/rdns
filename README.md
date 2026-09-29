@@ -437,9 +437,8 @@ The gap between the columns is the `#[cfg(unix)]` tests, which a Windows build
 never compiles — which is why a green suite on one platform is not a green
 suite (`CLAUDE.md` §1).
 
-Open work is `TODO.md`: #58, #68, #78-#84, #87-#90, and one inventory of
-deliberate RFC deviations (#21). Everything else numbered is closed, and
-`docs/CLOSED_WORK.md` holds it.
+Open work is `TODO.md`. Every closed number is in `docs/CLOSED_WORK.md`,
+including the inventory of deliberate RFC deviations (#21).
 
 Not implemented: SIG(0), multi-signer DNSSEC (RFC 8901), EDNS Client Subnet
 (declined on purpose, RFC 7871 §11), DNS Cookies as anything but opaque bytes,
