@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#21** and **#137**, as of 2026-09-28.
+**#21**, as of 2026-09-29.
 #138-#146 came out of an idiom and std-reuse review of the whole workspace on
 2026-09-28, and all nine closed the same day. The four bugs, #138-#141, were
 each provoked before filing; #147, a fifth, came out of probing 145e.
@@ -6708,41 +6708,6 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 137. Nothing tests fastest-first server order end to end — **filed 2026-09-28**, **ready-for-agent**
-
-Found closing #136. `ask_any` orders a server list by `RttStore` and records
-each exchange's elapsed time. `RttStore` is tested alone
-(`caches.rs`, `test_rtt_store_orders_fastest_first` and four more); through
-the resolver, only a failing server's demotion is
-(`test_rtt_selection_skips_a_failing_server_after_the_first_try`). No test
-shows the faster of two answering servers being asked first.
-
-Two things stand between it and a deterministic test: `Upstream::Answering`
-answers synchronously, so it cannot be slow, and `ask_any` reads
-`std::time::Instant`, which `tokio::time::pause` does not move. Loopback with
-a sleep is a timing test (§10). No remedy named.
-
-**Triaged 2026-09-29.** Both obstacles hold and both are small:
-
-- The clock is one line. `tokio` is already a dev-dependency of `rdns` with
-  `test-util` (`rdns/Cargo.toml:65`), and `tokio::time::Instant` is
-  `std::time::Instant` unless the runtime is paused. `recurse.rs:364` is the
-  only `Instant` on the resolver's query path. `Clock` is not the seam: it is
-  whole wall-clock seconds, and an interval wants `Instant` (§6).
-- The slowness needs `Upstream::Answering` to be able to wait. Four
-  constructors call `Upstream::answering` (`resolver.rs:843`, `:865`,
-  `rdnsr/src/answer.rs:2951`, `rdnsr/src/testutil.rs:293`), so the churn is
-  bounded either way. Two shapes, not yet built (§19): the closure returns a
-  future, or `Answering` keeps its signature and gains a per-server latency the
-  exchange sleeps for.
-
-Checked and not enough on its own: a test in `resolver::tests` can seed
-`resolver.rtt` directly and assert the ask order, since the field is visible to
-descendants. That covers `order` feeding `ask_any` and not `ask_any` recording
-the elapsed time, which is the half no test reaches.
-
----
-
 ### 21. The deviations and the not-implemented list — decisions, not open work
 
 **Filed 2026-08-03**, after the architecture review's findings were closed and
@@ -6957,6 +6922,7 @@ the week; the record is under "How the queue kept going stale" in
 | **134** | a cached RFC 8198 gap or wildcard outranked a newer answer for the name | **filed and closed 2026-09-27.** Found closing #133; the wildcard instance found triaging #129. RFC 8198 Appendix A, Unbound, BIND and Knot Resolver ask the exact-match cache first and synthesize on a miss; `Caches::lookup` now does too. Neither store-side retiring nor `learned_at` on proofs was needed. Both regression tests failed against the old order; a cache hit went from 13 allocations to 12. See `docs/CLOSED_WORK.md` |
 | **135** | a restarted `rdnsr` whose master was gone never reached EXPIRE | **filed and closed 2026-09-27.** Found triaging #128. `refresh_task` started from `RefreshTimers::default()`, EXPIRE never, and held a feed file from the last run; it now starts from the timers of the zone in force. The regression test failed against the default. See `docs/CLOSED_WORK.md` |
 | **136** | the resolver's tests reached it only through a loopback hierarchy | **filed and closed 2026-09-28.** Both shapes built: an `Upstream` seam under `ask_any` (A) against one shared fake behind a `test-util` feature (B). A taken: it removed `ResolverConfig::server_port`, a `pub` field that existed for tests, and B kept it and added test code to `rdns`'s public surface. 46 resolver tests and 3 `rdnsr` tests answer from a table; socket behaviour stays on sockets, plus a source-filter test that did not exist. Filed **#137**. See `docs/CLOSED_WORK.md` |
+| **137** | nothing tested fastest-first server order end to end | **filed 2026-09-28, closed 2026-09-29.** Found closing #136. `Upstream::Answering` returns a future and `ask_any` reads `tokio::time::Instant`, so a paused test makes one server slower than another. A per-server latency table built and declined. `15d9add` |
 | **138** | an NSEC3 salt over 255 octets was encoded with the wrong length | **filed and closed 2026-09-28.** Found by the idiom review. `u8::try_from` at both lengths: a 256-octet salt loaded with length 0 and reparsed as another NSEC3, and now fails the zone at its line. `9431916` |
 | **139** | TSIG read a key name off the wire as lossy, unescaped text | **filed and closed 2026-09-28.** Found by the idiom review. Read with `rdns_core::Name` and carried in presentation form, so escapes survive; our own request was BADKEY for `a\.b.`. Not a bypass. `248bdc0` |
 | **140** | an NSEC type bitmap folded its type names with the Unicode fold | **filed and closed 2026-09-28.** Found by the idiom review. `N\u{17f}` loaded as NS; `upper_into`'s ASCII fold now, #26b's fix one file over. `a40c305` |
