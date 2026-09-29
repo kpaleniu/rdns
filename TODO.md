@@ -6708,7 +6708,7 @@ predicate — where it transferred the whole fixture. 1 302 tests on Windows
 
 ---
 
-### 137. Nothing tests fastest-first server order end to end — **filed 2026-09-28**, **needs-triage**
+### 137. Nothing tests fastest-first server order end to end — **filed 2026-09-28**, **ready-for-agent**
 
 Found closing #136. `ask_any` orders a server list by `RttStore` and records
 each exchange's elapsed time. `RttStore` is tested alone
@@ -6721,6 +6721,25 @@ Two things stand between it and a deterministic test: `Upstream::Answering`
 answers synchronously, so it cannot be slow, and `ask_any` reads
 `std::time::Instant`, which `tokio::time::pause` does not move. Loopback with
 a sleep is a timing test (§10). No remedy named.
+
+**Triaged 2026-09-29.** Both obstacles hold and both are small:
+
+- The clock is one line. `tokio` is already a dev-dependency of `rdns` with
+  `test-util` (`rdns/Cargo.toml:65`), and `tokio::time::Instant` is
+  `std::time::Instant` unless the runtime is paused. `recurse.rs:364` is the
+  only `Instant` on the resolver's query path. `Clock` is not the seam: it is
+  whole wall-clock seconds, and an interval wants `Instant` (§6).
+- The slowness needs `Upstream::Answering` to be able to wait. Four
+  constructors call `Upstream::answering` (`resolver.rs:843`, `:865`,
+  `rdnsr/src/answer.rs:2951`, `rdnsr/src/testutil.rs:293`), so the churn is
+  bounded either way. Two shapes, not yet built (§19): the closure returns a
+  future, or `Answering` keeps its signature and gains a per-server latency the
+  exchange sleeps for.
+
+Checked and not enough on its own: a test in `resolver::tests` can seed
+`resolver.rtt` directly and assert the ask order, since the field is visible to
+descendants. That covers `order` feeding `ask_any` and not `ask_any` recording
+the elapsed time, which is the half no test reaches.
 
 ---
 
