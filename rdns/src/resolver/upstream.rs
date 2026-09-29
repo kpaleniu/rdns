@@ -6,6 +6,8 @@
 //! that (`TODO.md` #136).
 
 use super::*;
+use std::future::Future;
+use std::pin::Pin;
 
 /// What one upstream answer is read into, whatever this resolver advertised.
 ///
@@ -38,7 +40,13 @@ pub enum Transport {
 
 /// Answers in place of the network: the server asked, the transport and the
 /// query's wire bytes in; the reply's bytes out, or `None` for silence.
-pub type Answering = dyn Fn(SocketAddr, Transport, &[u8]) -> Option<Vec<u8>> + Send + Sync;
+///
+/// A future so that an answer can take time — a sleep under a paused tokio
+/// clock is how a test makes one server slower than another (`TODO.md` #137).
+pub type Answering = dyn Fn(SocketAddr, Transport, &[u8]) -> Reply + Send + Sync;
+
+/// What an [`Answering`] upstream hands back.
+pub type Reply = Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send>>;
 
 /// Where a [`Resolver`]'s queries go.
 ///
@@ -66,10 +74,25 @@ impl std::fmt::Debug for Upstream {
 }
 
 impl Upstream {
+    /// Answers at once.
     pub fn answering(
         answer: impl Fn(SocketAddr, Transport, &[u8]) -> Option<Vec<u8>> + Send + Sync + 'static,
     ) -> Upstream {
-        Upstream::Answering(Arc::new(answer))
+        Upstream::Answering(Arc::new(move |server, transport, query| {
+            Box::pin(std::future::ready(answer(server, transport, query)))
+        }))
+    }
+
+    /// Answers when the returned future does, or is silent past the timeout.
+    pub fn answering_later<F>(
+        answer: impl Fn(SocketAddr, Transport, &[u8]) -> F + Send + Sync + 'static,
+    ) -> Upstream
+    where
+        F: Future<Output = Option<Vec<u8>>> + Send + 'static,
+    {
+        Upstream::Answering(Arc::new(move |server, transport, query| {
+            Box::pin(answer(server, transport, query))
+        }))
     }
 
     /// Send `query` to `server` and return the reply's bytes. `timeout` bounds
@@ -86,8 +109,13 @@ impl Upstream {
                 Transport::Udp => udp(server, query, timeout).await,
                 Transport::Tcp => tcp(server, query, timeout).await,
             },
-            Upstream::Answering(answer) => answer(server, transport, query)
-                .ok_or_else(|| ResolveError::no_response(format!("{server} did not answer"))),
+            Upstream::Answering(answer) => {
+                tokio::time::timeout(timeout, answer(server, transport, query))
+                    .await
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| ResolveError::no_response(format!("{server} did not answer")))
+            }
         }
     }
 }

@@ -141,7 +141,7 @@ mod recurse;
 mod upstream;
 mod validate;
 
-pub use upstream::{Answering, Transport, Upstream};
+pub use upstream::{Answering, Reply, Transport, Upstream};
 
 use caches::{DelegationCache, KeyCache, RttStore, Start};
 
@@ -2205,6 +2205,51 @@ this line has no record and is skipped
             1,
             "the failing server should be tried once, then skipped on later queries"
         );
+    }
+
+    /// Two servers that both answer, the slower listed first: it is asked
+    /// once, timed, and the faster one is asked from then on. The failing-server
+    /// test above shows a timeout's charge; this one shows a measured round
+    /// trip's, which only `ask_any` records.
+    ///
+    /// 150 ms is past `UNKNOWN_RTT_MS`, so an untimed server outranks it. The
+    /// clock is paused, so the sleeps take no time and the order is exact.
+    #[tokio::test(start_paused = true)]
+    async fn test_rtt_selection_prefers_the_faster_of_two_answering_servers() {
+        let (slow, fast) = (fake(2), fake(3));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let log = asked.clone();
+        let upstream = Upstream::answering_later(move |server, _, query| {
+            log.lock().unwrap().push(server);
+            let delay = if server == slow { 150 } else { 20 };
+            let reply = DnsMessage::try_from_bytes(query).ok().and_then(|q| {
+                authoritative(&q, vec![a_record(&qname_of(&q), [192, 0, 2, 1])])
+                    .to_bytes_within(u16::MAX as usize)
+                    .ok()
+            });
+            async move {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                reply
+            }
+        });
+        let config = ResolverConfig {
+            upstream_servers: vec![slow, fast],
+            ..test_config(slow)
+        };
+        let resolver = Resolver::new(config).with_upstream(upstream);
+
+        for name in ["one.test.", "two.test.", "three.test."] {
+            resolver
+                .resolve(&QuerySection {
+                    qname: nm(name),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("resolving {name}: {e}"));
+        }
+
+        assert_eq!(*asked.lock().unwrap(), [slow, fast, fast]);
     }
 
     /// A second query for the same zone must not go back to the root.

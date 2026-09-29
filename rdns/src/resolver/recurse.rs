@@ -361,7 +361,9 @@ impl Resolver {
             if budget.spend().is_err() {
                 return None;
             }
-            let started = std::time::Instant::now();
+            // tokio's, not std's: the same clock in production, and one a
+            // paused test runtime moves (`TODO.md` #137).
+            let started = tokio::time::Instant::now();
             if let Ok(response) = self.query_server(&server, out).await {
                 self.rtt
                     .record(&server, started.elapsed().as_secs_f64() * 1000.0);
