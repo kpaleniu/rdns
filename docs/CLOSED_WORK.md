@@ -2560,6 +2560,11 @@ row re-checked against the code and still true: LDH not enforced
 in the tree. `big.test.db` is `$GENERATE`, but BIND expands it and `rdnsd`
 receives it by transfer, so "nothing here needed it" still holds.
 
+**Moved to ADRs 2026-09-29 (#148)**, and kept here verbatim as the record:
+D-5 is `docs/adr/0001`, D-6 `0002`, D-7 `0003`, and this table's D-8 is `0005`
+and `docs/spec/07`'s D-9. That file's own D-8, RPZ and DNS64 answers no zone
+holds, was never in this table; it is `0004`.
+
 #### The four live deviations
 
 | | what | decided |
@@ -13866,6 +13871,10 @@ copy is where the drift goes. What the file gained in place of the pointer is a
 sentence saying the absence is a decision and naming this number, so the next
 session does not file it again (§18).
 
+**Reversed 2026-09-29 by #148**, the owner's decision: this layout was a guess
+made before the mattpocock skills were in use, and the skills are what read it.
+The §7 argument above is not refuted; #148 carries it.
+
 ---
 
 ### 99. Both daemons' dry run is a `return` at a line number, not the rule §15 states — **filed and closed 2026-09-21**
@@ -17765,5 +17774,51 @@ the four name types; MX takes exactly two and SOA exactly seven, both through
 `fields`. Two tests, both failing against the old parser. Every tracked
 interop zone still parses except `big.test.db`, which is `$GENERATE` (#21).
 Windows 1375 and Linux 1396 passing across #142-#147, clippy clean on both.
+
+---
+
+### 148. Domain docs move to the mattpocock layout: `CONTEXT.md` and `docs/adr/` — **filed 2026-09-29, closed 2026-09-30**, **enhancement**
+
+Reverses #98, by the owner's decision: the layout here was a best guess made
+before the skills existed, and the skills are what reads it.
+`docs/agents/domain.md` now takes the skills' shape; `CONTEXT.md` and
+`docs/adr/` are created lazily by `/domain-modeling`, as the skills expect.
+
+What was declined in #98 still needs an answer, not a reversal: a glossary is a
+second copy of a doc comment (§7). `domain.md` answers it by splitting the
+job — `CONTEXT.md` says what a concept is, the doc comment says what the type
+does, neither restates the other.
+
+What there is to migrate, measured 2026-09-29:
+
+- 19 `## Architecture:` sections in `TODO.md`, each holding several decisions.
+- #21's four live deviations (D-5 to D-8), now in `docs/CLOSED_WORK.md`: the
+  closest fit to an ADR, "a deliberate deviation from the obvious path".
+- `docs/ARCHITECTURE_REVIEW.md`: two review reports, findings rather than
+  decisions; only its "checked and found nothing wrong with" lists are
+  decision-shaped.
+- Coined names #98 counted: `ServeContext`, `Reloading`, the denial cache (75
+  uses in 20 `.rs` files), plus "the library" and "the daemons" in
+  `docs/spec/README.md`'s Conventions.
+
+Open: whether existing decisions move now or as each area is touched, and
+whether a moved one leaves its source or a pointer. No remedy named.
+
+**Closed on the owner's two answers.** #21's deviations moved now and the rest
+move lazily: a decision in an `## Architecture:` section becomes an ADR when
+work touches its area, which `docs/agents/domain.md` states as the rule. A moved
+decision leaves a one-line pointer, so there is one copy (§7).
+`docs/CLOSED_WORK.md` is the exception, being a verbatim archive by its own
+preamble: #21 kept its text and gained a line saying where each row went.
+
+- `docs/adr/0001`-`0005`: LDH, the first compression hop, CH/HS, RPZ and DNS64
+  answers no zone holds, `--serve-stale-first`. Each claim checked against the
+  code first. Where the code states the full argument (`rpz.rs`'s header, the
+  flag's doc, `dname.rs`), the ADR records the decision and names the place.
+- **Two lists had one D-8.** `docs/spec/07`'s was RPZ/DNS64 and #21's was
+  `--serve-stale-first`, each missing the other. The spec now has D-9 for the
+  second, and its D-5 to D-9 are pointers to the ADRs.
+- `CONTEXT.md` is not written: the skill creates it when a term is resolved,
+  and none has been yet.
 
 ---

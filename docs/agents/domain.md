@@ -3,40 +3,50 @@
 How the engineering skills should consume this repo's domain documentation when
 exploring the codebase.
 
-**There is no `CONTEXT.md` and no `docs/adr/`, on purpose.** The vocabulary is
-mostly the RFCs', which are cited in place rather than paraphrased into a
-glossary (`CLAUDE.md` §1, §7), and the decisions are recorded where they were
-made. `TODO.md` #98 is the reasoning and the two shapes that were declined; do
-not file the absence again.
-
 ## Before exploring, read these
 
-- **`docs/spec/`** — seven files saying what the code actually does, derived by
-  reading it rather than by reading intent, with every known RFC deviation and
-  gap in one table. `README.md` there defines the few terms that are this
-  project's rather than the protocol's.
-- **`docs/ARCHITECTURE_REVIEW.md`** and `TODO.md`'s `## Architecture:` sections
-  — the decisions an ADR directory would otherwise hold, each stating what was
-  rejected and why.
-- The **doc comment on the type**, for a name this project coined
-  (`ServeContext`, `Reloading`, the denial cache). That is where a definition
-  lives; a second copy is where the drift goes (§7).
+- **`CONTEXT.md`** at the repo root: the glossary. Single context; there is no
+  `CONTEXT-MAP.md`.
+- **`docs/adr/`**: read ADRs that touch the area you are about to work in.
 
-## Use the project's vocabulary
+If either does not exist, **proceed silently**. `/domain-modeling` creates them
+lazily, when a term or a decision is actually resolved.
 
-When your output names a domain concept (in an issue title, a refactor proposal,
-a hypothesis, a test name), use the RFC's term and cite the section that says
-it, not the one nearby that sounds relevant (§1). For a coined name, use it as
-its doc comment defines it.
+Older decisions are still where they were made: `TODO.md`'s `## Architecture:`
+sections and `docs/ARCHITECTURE_REVIEW.md`. When work touches one, move it into
+an ADR and leave a one-line pointer in its place (#148).
 
-If there is no term for what you mean, that is a signal: either you are
-inventing language the project does not use (reconsider), or there is a real gap
-— which is a numbered item in `TODO.md`, not a sentence in a doc comment (§18).
+`docs/spec/` says what the code does. It is not a glossary and not a decision
+record.
 
-## Flag conflicts with a recorded decision
+## File structure
 
-If your output contradicts a decision in `TODO.md`'s architecture sections, a
-deviation in `docs/spec/07-rfc-conformance.md`, or a rule in `CLAUDE.md`,
-surface it explicitly rather than silently overriding:
+```
+/
+├── CONTEXT.md
+├── docs/adr/
+│   └── 0001-<slug>.md
+├── rdns-core/  rdns/  rdnsd/  rdnsr/  rdnsc/ ...
+```
 
-> _Contradicts #30's "What must not be unified", but worth reopening because…_
+## Use the glossary's vocabulary
+
+When your output names a domain concept (an issue title, a refactor proposal, a
+hypothesis, a test name), use the term as `CONTEXT.md` defines it, and not a
+synonym it lists under _Avoid_.
+
+A protocol term is the RFC's: cite the section that says it (`CLAUDE.md` §1).
+`CONTEXT.md` holds the terms this project coined or narrowed. It says what the
+concept *is*; the doc comment on the type says what the type does. Neither
+restates the other, because the second copy is where drift goes (§7).
+
+If the concept you need is not in the glossary, either you are inventing
+language the project does not use (reconsider), or there is a real gap: resolve
+it with `/domain-modeling`.
+
+## Flag ADR conflicts
+
+If your output contradicts an ADR, a decision in `TODO.md`'s architecture
+sections, or a rule in `CLAUDE.md`, surface it rather than silently overriding:
+
+> _Contradicts ADR-0007, but worth reopening because…_

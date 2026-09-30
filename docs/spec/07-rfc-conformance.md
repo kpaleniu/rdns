@@ -58,7 +58,7 @@ each row exists (`CLAUDE.md` §11).
 | 9432 | catalog zones | **the consumer side** (2026-09-12): §4's whole schema incl. `coo` and `group`, §5.1's broken-catalog rule, §5.2's clash rule, §5.3's removal, §5.4's state reset, §4.3.1's migration, and §4.3.2's group values mapped onto a per-catalog `groups` table (2026-09-13, `TODO.md` #48). §6's out-of-band tool is `rdnsctl catalog`, which also reports the members a reconcile refused (`TODO.md` #49). The producer side needs no code — a catalog is an ordinary zone | `rdns/src/catalog.rs`, `rdnsd/src/catalog.rs` |
 | 9103 | zone transfer over TLS | **yes**, both directions (2026-09-12, `TODO.md` #44d). As a secondary: `--secondary zone@addr[:port][#key]+tls=name`, TLS 1.3 only (§7.2), ALPN `dot` (§7.1), port 853 by default (§7.3), the master authenticated by name against `--transfer-tls-ca` (§7.5) with no opportunistic mode. As a primary: `--transfer-tls-only` refuses a transfer that did not arrive over TLS 1.3 (§11). As a client it also presents a certificate when a master asks for one (§7.5's mTLS, `--transfer-tls-cert`/`--transfer-tls-key`, `TODO.md` #51). As a *server* the client is authorized by the address ACL and TSIG, which is §7.5's second method; **demanding a client certificate is not implemented** and is `TODO.md` #59 | `rdns/src/xot.rs`, `rdns/src/tls_identity.rs`, `rdns/src/xfr.rs`, `rdnsd`'s `answer_transfer` |
 | 8901 | multi-signer DNSSEC | no — filed as `TODO.md` #44e | — |
-| 8767 | serve-stale | **yes**, `rdnsr` only (2026-09-13, `TODO.md` #45b). §5's query resolution timer — an expired answer or an expired "no" when the resolution fails — with §4's 30-second TTL and RFC 8914's codes 3 and 19. Off at `--serve-stale 0`, which is the default, for §6's reason. **Not** §5's client response timer, which answers stale at 1.8 s while the resolution continues — declined, as BIND removed it. **Deviation**, opt-in: `--serve-stale-first` answers from the window before any refresh, where §4 allows stale data only once one has failed; refreshes are limited to one per name per 30 s, §5's failure recheck timer (`TODO.md` #58) | `cache::StalePolicy`, `negative_cache`, `rdnsr`'s `stale_answer` |
+| 8767 | serve-stale | **yes**, `rdnsr` only (2026-09-13, `TODO.md` #45b). §5's query resolution timer — an expired answer or an expired "no" when the resolution fails — with §4's 30-second TTL and RFC 8914's codes 3 and 19. Off at `--serve-stale 0`, which is the default, for §6's reason. **Not** §5's client response timer, which answers stale at 1.8 s while the resolution continues — declined, as BIND removed it. `--serve-stale-first` is a deviation — see D-9 | `cache::StalePolicy`, `negative_cache`, `rdnsr`'s `stale_answer` |
 | 6147 | DNS64 | **yes**, `rdnsr` only (2026-09-13, `TODO.md` #45c). §5.1.1, §5.1.2, §5.1.4's exclusion set, §5.1.5's CNAME chain, §5.1.7's synthesis and TTL, §5.2's RFC 6052 arithmetic, §5.3's untouched additional section, §5.3.1's reverse CNAME, §5.4's assembly and §5.5's CD+DO exemption. §5.1.8's parallel query is a MAY and is declined. Off unless `--dns64` | `dns64.rs`, `rdnsr`'s `finish_dns64` |
 | 6052 | IPv4-embedded IPv6 addresses | **yes** — §2.1's Well-Known Prefix and §2.2's six prefix lengths, both directions. §2.4's example table is a test | `dns64::Nat64Prefix` |
 | 7871 | EDNS Client Subnet | **no, on purpose** (2026-09-13, `TODO.md` #45e). No option is sent upstream and none is echoed back; §11's privacy cost and the RFC's own "SHOULD be disabled in all default configurations" are the reasons, and both directions are pinned by tests | `edns.rs`, `response::ClientEdns::mirror`, `Resolver::build_query` |
@@ -169,50 +169,25 @@ having been written to match.
 
 ### D-5 — LDH label syntax is not enforced
 
-RFC 1035 §2.3.1's "preferred name syntax" is advice to whoever *chooses* a
-hostname, not a rule about what the protocol carries; RFC 2181 §11 settles it.
-Enforcing it would refuse `_dmarc`, every `_tcp` SRV owner, DNS-SD instance names
-and the wildcard `*` itself. Deliberate, and documented in place.
+[ADR-0001](../adr/0001-ldh-label-syntax-is-not-enforced.md).
 
 ### D-6 — the first compression pointer in a chain may point forward
 
-`dname.rs:384`. Every *subsequent* pointer must strictly decrease, which is what
-makes cycles unreachable; the first is unconstrained because a name is parsed
-from a suffix slice that does not know its own offset. Deliberate, with the
-reasoning and the cost of the alternative written in place. Termination is
-unaffected.
+[ADR-0002](../adr/0002-first-compression-pointer-is-unconstrained.md).
 
 ### D-7 — class CH and HS are refused rather than served
 
-`Class::CH` and `Class::HS` exist as types, the zone parser refuses a non-IN
-record, and a non-IN question is REFUSED. So `version.bind CH TXT` — which BIND,
-NSD and Knot all answer — is not answered. Deliberate: RFC 1034 §4.3.2 step 1
-searches the zones of the question's class, and holding none is the same as
-holding no zone.
+[ADR-0003](../adr/0003-class-ch-and-hs-are-refused.md).
 
 ### D-8 — with `--rpz` or `--dns64`, an answer may be one no zone holds
 
-Both are off unless the operator turns them on, and both are the point of the
-feature rather than a side effect. Recorded here because a reader of RFC 1034
-would not predict either, and because an operator debugging one needs to know
-which.
+[ADR-0004](../adr/0004-rpz-and-dns64-answer-what-no-zone-holds.md).
 
-- **A policy rewrite** (`05-resolver.md` §5.6) replaces the answer with what a
-  policy zone says — NXDOMAIN, NODATA, a redirect, silence, or TC=1. AD is
-  clear and the reply carries RFC 8914's code 15 (Blocked) or 4 (Forged
-  Answer). Two departures from BIND, both deliberate and both in `rpz.rs`'s
-  header: a rewrite applies to a client that set DO (BIND's `break-dnssec no`
-  does not, which makes a block bypassable by one bit), and zone precedence is
-  per pass rather than per zone, because a response-IP match costs the
-  resolution a QNAME block exists to avoid.
-- **A DNS64 synthesis** (§5.7) answers with an address that exists in no zone
-  and is reachable only through a translator this resolver does not operate.
-  RFC 6147 §5.5 is why a client that set both CD and DO gets the denial
-  instead. AD is clear and there is no Extended DNS Error, because the registry
-  has no code for it.
+### D-9 — `--serve-stale-first` answers stale before any refresh is tried
 
-In both cases a validating client will find the signatures missing, which is the
-honest outcome: neither answer is authentic and neither claims to be.
+[ADR-0005](../adr/0005-serve-stale-first-answers-before-a-refresh.md). Recorded
+as D-8 in `TODO.md` #21 while this file's D-8 was the one above: two lists, one
+number.
 
 ## 7.4 Gaps
 
