@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Nothing, as of 2026-09-30.
+**#149**, as of 2026-09-30.
 #138-#146 came out of an idiom and std-reuse review of the whole workspace on
 2026-09-28, and all nine closed the same day. The four bugs, #138-#141, were
 each provoked before filing; #147, a fifth, came out of probing 145e.
@@ -1394,6 +1394,31 @@ wrong trade when the symptom is already a counter.
 whole answer is 522 ns and one `sendto`+`recvfrom` pair is 3.6-4.1 µs, so the
 entire benchmark suite covers about 6% of what a query costs — the context that
 stops a 20% win in it being reported as a 20% win.
+
+---
+
+### 149. Eleven em dashes in comments are double-encoded — **filed 2026-09-30**, **ready-for-agent**
+
+Found reading `rdnsd/src/answer.rs:149` for #148. The bytes are
+`c3 a2 c2 80 c2 94`: U+2014's UTF-8 read as Latin-1 and encoded again, so an
+editor shows `â€”`. Every tracked file was scanned for that shape — a run of
+`0xc2`/`0xc3`-led byte pairs that decodes through Latin-1 to valid UTF-8:
+
+| file | lines | from |
+|---|---|---|
+| `rdnsd/src/answer.rs` | 149, 151, 1353 (twice) | `fc120bc` |
+| `rdnsd/src/dispatch.rs` | 1456, 1484, 1495, 1496 | `fc120bc` |
+| `rdnsd/src/dispatch.rs` | 3843 | `c1e3236`, which moved a line `fc120bc` wrote |
+| `rdns-core/src/ede.rs` | 221 | `fc120bc` |
+| `rdns/src/dnssec.rs` | 670 | `4e1adcf` |
+
+All eleven are U+2014 and all are in comments: nothing reaches an operator or
+the wire. Against 2 090 correct em dashes in the `.rs` files, and none in any
+`.md`. Both source commits are #44b, 2026-09-12, so this is one bad edit
+rather than a habit.
+
+The fix is the byte replacement at those eleven sites, then the scan again to
+show zero. Whether a test should hold that zero is not decided.
 
 ---
 
