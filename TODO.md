@@ -37,7 +37,18 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Nothing, as of 2026-10-01.
+**#150-#154**, as of 2026-10-01.
+#150-#154 came out of a review on 2026-10-01 asking where a missing
+abstraction makes a caller carry state between calls into a module, or
+re-derive what the module already knew. Five rows, none a defect on the wire.
+Checked and not filed: `answer_transfer`'s refusal ladder (#130 already says
+why), `rdnsr`'s `(resp, authenticated, why)` triple through `finish` and
+`finish_dns64` (inside `handle_query`, which #88 left alone),
+`rdnsd/src/zones.rs`'s eight `zone_signer` imports (`ZoneSigning` *is* the
+abstraction over them), and `replication.rs`'s nine `secondary` imports
+(the `Replica` trait, two implementations). A crate split of `rdns` along
+its four clusters was re-checked and stays declined: it would make every
+cross-cluster item `pub` that could be `pub(crate)` today.
 #138-#146 came out of an idiom and std-reuse review of the whole workspace on
 2026-09-28, and all nine closed the same day. The four bugs, #138-#141, were
 each provoked before filing; #147, a fifth, came out of probing 145e.
@@ -1394,6 +1405,153 @@ wrong trade when the symptom is already a counter.
 whole answer is 522 ns and one `sendto`+`recvfrom` pair is 3.6-4.1 µs, so the
 entire benchmark suite covers about 6% of what a query costs — the context that
 stops a 20% win in it being reported as a 20% win.
+
+---
+
+### 150. The authoritative answer is split across the `rdns`/`rdnsd` seam — **filed 2026-10-01**, **needs-triage**
+
+`rdns::dnssec_answer` has one production caller, `rdnsd/src/answer.rs`, and
+its interface hands that caller the RFC 4035 §3.1 table to apply:
+
+- five `pub fn` (`is_signed` and four `push_*`), and the caller picks which
+  proof each outcome owes — `add_answer`, `add_negative`, `refer_to_child`;
+- an obligation returned as a `bool`: `push_answer_signatures` is true when
+  the answer "still owes `push_proof_of_absence`", which `rdnsd` discharges
+  through `target_owed` (`answer.rs:238`), a `u32` bitmask (`:568`) and
+  `add_chain_denials` (`:606`);
+- an invariant whose guarantor is on the other side: #79e found
+  `dnssec_answer.rs:200`'s claim holds because `resolve_in_zone` asks
+  `delegation_for` first.
+
+Because the algorithm cannot be reached from `rdns`, three places there
+re-enact it by hand. `tests/allocations.rs`:
+`answering_a_signed_query` ("As `answer.rs` does it: locate once…") and
+`the_lookups_behind_one_answer_allocate_only_the_answer` ("the three zone
+lookups `rdnsd` makes per query"). `tests/no_input_panics.rs` calls the four
+`push_*` one by one. `benches/answer_path.rs`'s `answer` group serializes a
+built `DnsMessage`, which `rdnsd` stopped doing at #27b. None of the three
+follows `rdnsd` if its sequence changes.
+
+Refuting check taken: the zone half of `answer.rs` — `Hop`, `Outcome`,
+`resolve_in_zone`, `redirect_through`, `in_zone`, the `add_*` helpers,
+`negative_ttl`, `refer_to_child` (`:270`-`:741`) — names only `rdns` types.
+`Zones` and `Scratch` are used above `:270` only, and the only item any
+other `rdnsd` module imports from `answer.rs` is `write_response`.
+
+What it does not buy: `answer.rs`'s 44 tests go through `make_response`,
+which needs `Zones`, `Cli` and `generate_keys`, so they stay in `rdnsd`.
+What moves is what `rdns`'s counts, panic sweep and bench measure: the real
+sequence rather than a copy. A move would have to hold every count in
+`rdns/tests/allocations.rs` (§17). No remedy costed.
+
+---
+
+### 151. The chain-of-trust walk has no type, so its RFC rules live in the async loop — **filed 2026-10-01**, **needs-triage**
+
+`dnssec_chain` publishes 26 items (`pub (fn|struct|enum|const|type|trait)`
+above its tests). Outside `rdns` two are named, `ValidationState` and
+`TrustAnchors`; inside, `rfc5011` names `TrustAnchors` and every other
+driver of the validator is `rdns/src/resolver/validate.rs`. `ChainValidator`,
+`KeyStore`, `DelegationEvidence`, `DelegationVerdict`, `RecordsVerdict`,
+`WildcardExpansion`, `ChainShape` and `cname_chain_shape` appear in no `pub`
+signature of `Resolver`.
+
+The module's header gives the reason for the shape: "Synchronous: the records
+are arguments, because fetching them is the resolver's job. The resolver
+drives the loop and calls in at each step." That keeps the I/O out, and also
+keeps the loop out. `establish_chain` (`validate.rs:142`) holds both: the
+fetch, the key cache and `next_cut_below` are I/O; the anchor start, the
+resume depth, the `label_count() + 2` step cap and the `DelegationVerdict`
+transitions are RFC 4035 §5 and reach a test only through the resolver.
+
+A rule written twice, with the comment saying so (`validate.rs:155`):
+"Resume as deep as already trusted, by the same rule `best_start` used…
+Disagreeing makes the walk skip a zone cut". They are different predicates.
+`best_start` (`recurse.rs:209`) takes the deepest ancestor with a live
+delegation entry *and* held keys; `establish_chain` takes the deepest under
+the anchor with held keys alone. The weaker test resumes at least as deep,
+which is the safe direction while both read the same cache state. Not
+checked: a key entry (`MAX_KEY_TTL` 86 400, `resolver/caches.rs:237`)
+expiring between `best_start` and `establish_chain`, which resumes the walk
+*above* where the resolution started, with no referral evidence for the cut
+in between.
+
+A shape with no I/O in it would be a walker the resolver feeds — asks for a
+zone's DNSKEYs or the cut below a zone, is handed them, ends in a
+`ValidationState`. Not built; §19 says to build it before choosing it, and it
+has one caller, so what it would buy is the test surface and one home for the
+resume rule, not substitution.
+
+---
+
+### 152. `resign_interval` returns which rule won as a bare `Duration` — **filed 2026-10-01**, **needs-triage**
+
+`ZoneSigning::resign_interval_at` (`rdnsd/src/zones.rs:847`) computes two
+intervals — a third of the shortest validity, and the time to the next key
+transition (#44f) — and returns the smaller. `spawn_zone_maintenance`'s
+startup line needs to say which, so `main.rs:1551` recomputes the first,
+`resign_after(signing.shortest_validity()).max(60)`, and compares. Two
+copies of the formula, the `.max(60)` floor included; a change to either
+makes the log line name the wrong reason. One site. No remedy costed.
+
+---
+
+### 153. The encrypted listeners are configured, bound and spawned in both daemons — **filed 2026-10-01**, **needs-triage**
+
+Three stages, written out in each `main.rs`:
+
+| stage | `rdnsd/src/main.rs` | `rdnsr/src/main.rs` |
+|---|---|---|
+| cert pair required, store loaded | `:1721`-`:1735` | `:760`-`:771` |
+| DoT, DoH, DoQ bound | `:946`-`:980` | `:848`-`:876` |
+| TCP, DoT, DoQ, DoH spawned | `:1103`-`:1145` | `:1105`-`:1146` |
+
+What differs is two parameters: `rdnsd` passes `--transfer-client-ca`'s
+anchors where `rdnsr` passes `None`, and `RateLimit::PerMessage` against
+`PerConnection` (#30e). Spawn order differs and does not matter in a
+`JoinSet`. **It has drifted once already**: the missing-pair error is
+"tls-listen, quic-listen and https-listen need both tls-cert and tls-key"
+in one (`:1731`) and the `--` spelling in the other (`:766`).
+
+Refuting check taken against #30's "What must not be unified": it covers the
+UDP loops, the clock read and the handler's shape, and none of these three
+stages. The §15 dry-run rule is the one constraint a merged form must keep:
+the store is loaded above `--check-config`'s exit and the binds are below it,
+in both.
+
+Seen beside it and not about the shape: all 10 production `TransportLimits`
+sites are `TransportLimits::default()` — 128 connections per loop, 16 in
+flight, 10 s idle, 5 s read — with no flag. #30b consolidated the constants;
+§14 says a limit with no flag is a limit nobody has reviewed.
+
+---
+
+### 154. A cache entry's expiry has no type, and five caches write it by hand — **filed 2026-10-01**, **needs-triage**
+
+Every cache stores `expires_at: u64` and computes it, tests it and counts
+down from it itself. Constructions: `cache.rs:364` saturates; the other seven
+are plain `+` — `negative_cache.rs:185`, `nsec_cache.rs:219`, `:252`,
+`:280`, `:381`, `:408`, `resolver/caches.rs:134`, `:280`. §2 and §6 say
+`saturating_add` onto timestamps. Not a live overflow: `now` is
+`SystemTime` seconds and every TTL is capped first, so it needs a clock near
+`u64::MAX`, which only a `Clock::Fixed` can be. It is §17's shape — a rule
+applied per call site, missed at seven of eight.
+
+The reads are per site too: eleven `expires_at > now` liveness tests in
+`negative_cache`, `nsec_cache` and `resolver/caches` against `cache.rs`'s
+`now >= self.expires_at`, the same predicate spelled the other way; and
+`expires_at.saturating_sub(now).min(u32::MAX as u64) as u32` four times
+(`negative_cache.rs:86`, `nsec_cache.rs:100`, `:455`, `:507`).
+
+**154a**, the same family: RFC 8767's stale-refresh claim —
+`refreshing && now >= stale_refresh_after`, then push it one
+`STALE_REFRESH_INTERVAL` on — is written in `cache.rs:311` and
+`negative_cache.rs:332`, the second citing the first ("as the answer cache's
+`get_stale` does").
+
+Command for the constructions:
+`grep -nE "expires_at: |expires_at = " rdns/src -r`, production code only.
+No remedy costed.
 
 ---
 
