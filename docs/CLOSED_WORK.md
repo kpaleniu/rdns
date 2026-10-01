@@ -17822,3 +17822,32 @@ preamble: #21 kept its text and gained a line saying where each row went.
   and none has been yet.
 
 ---
+
+### 149. Eleven em dashes in comments are double-encoded — **filed 2026-09-30, closed 2026-10-01**, **bug**
+
+Found reading `rdnsd/src/answer.rs:149` for #148. The bytes are
+`c3 a2 c2 80 c2 94`: U+2014's UTF-8 read as Latin-1 and encoded again, so an
+editor shows `â€”`. Every tracked file was scanned for that shape — a run of
+`0xc2`/`0xc3`-led byte pairs that decodes through Latin-1 to valid UTF-8:
+
+| file | lines | from |
+|---|---|---|
+| `rdnsd/src/answer.rs` | 149, 151, 1353 (twice) | `fc120bc` |
+| `rdnsd/src/dispatch.rs` | 1456, 1484, 1495, 1496 | `fc120bc` |
+| `rdnsd/src/dispatch.rs` | 3843 | `c1e3236`, which moved a line `fc120bc` wrote |
+| `rdns-core/src/ede.rs` | 221 | `fc120bc` |
+| `rdns/src/dnssec.rs` | 670 | `4e1adcf` |
+
+All eleven are U+2014 and all are in comments: nothing reaches an operator or
+the wire. Against 2 090 correct em dashes in the `.rs` files, and none in any
+`.md`. Both source commits are #44b, 2026-09-12, so this is one bad edit
+rather than a habit.
+
+The fix is the byte replacement at those eleven sites, then the scan again to
+show zero. Whether a test should hold that zero is not decided.
+
+**Closed 2026-10-01**, `96f26dd`. The eleven sites replaced byte for byte;
+the scan read 11 before, all U+2014, and 0 after, over every tracked file. No
+test holds the zero: that was left undecided and still is.
+
+---

@@ -37,7 +37,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#149**, as of 2026-09-30.
+Nothing, as of 2026-10-01.
 #138-#146 came out of an idiom and std-reuse review of the whole workspace on
 2026-09-28, and all nine closed the same day. The four bugs, #138-#141, were
 each provoked before filing; #147, a fifth, came out of probing 145e.
@@ -1397,31 +1397,6 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 149. Eleven em dashes in comments are double-encoded — **filed 2026-09-30**, **ready-for-agent**
-
-Found reading `rdnsd/src/answer.rs:149` for #148. The bytes are
-`c3 a2 c2 80 c2 94`: U+2014's UTF-8 read as Latin-1 and encoded again, so an
-editor shows `â€”`. Every tracked file was scanned for that shape — a run of
-`0xc2`/`0xc3`-led byte pairs that decodes through Latin-1 to valid UTF-8:
-
-| file | lines | from |
-|---|---|---|
-| `rdnsd/src/answer.rs` | 149, 151, 1353 (twice) | `fc120bc` |
-| `rdnsd/src/dispatch.rs` | 1456, 1484, 1495, 1496 | `fc120bc` |
-| `rdnsd/src/dispatch.rs` | 3843 | `c1e3236`, which moved a line `fc120bc` wrote |
-| `rdns-core/src/ede.rs` | 221 | `fc120bc` |
-| `rdns/src/dnssec.rs` | 670 | `4e1adcf` |
-
-All eleven are U+2014 and all are in comments: nothing reaches an operator or
-the wire. Against 2 090 correct em dashes in the `.rs` files, and none in any
-`.md`. Both source commits are #44b, 2026-09-12, so this is one bad edit
-rather than a habit.
-
-The fix is the byte replacement at those eleven sites, then the scan again to
-show zero. Whether a test should hold that zero is not decided.
-
----
-
 ## Closed work
 
 One line each. The reasoning, the RFC citations and the verification are in the
@@ -1592,6 +1567,7 @@ the week; the record is under "How the queue kept going stale" in
 | **146** | small idioms, one sweep | **filed and closed 2026-09-28.** Found by the idiom review. `Class::IN` at all 203 sites, and eight smaller rewrites. `1e6e39e` |
 | **147** | a zone-file field past a name's RDATA was joined into the name | **filed and closed 2026-09-28.** Found probing 145e. `NS ns1.example.com. junk` served `ns1.example.com.\032junk.example.com.`; a name is one field now, MX two, SOA seven. `a5ea7e8` |
 | **148** | domain docs moved to the mattpocock layout | **filed 2026-09-29, closed 2026-09-30.** Reverses #98 on the owner's decision. `docs/agents/domain.md` in the skills' shape; #21's deviations are `docs/adr/0001`-`0005`, the rest move when touched; `docs/spec/07`'s two D-8s split into D-8 and D-9. See `docs/CLOSED_WORK.md` |
+| **149** | eleven em dashes in comments were double-encoded | **filed 2026-09-30, closed 2026-10-01.** Found reading `answer.rs` for #148; all U+2014, all from #44b. The scan reads 0 over every tracked file. `96f26dd` |
 | **111** | the signing cost harness was a copy of `sign_zone_inner` and had drifted | **filed 2026-09-21, closed 2026-09-22**, five sub-items. 111a fixed the two drifts named, both latent — the fixture is `$TTL 3600` over MINIMUM 3600, and one SEP plus one ZSK never empties a half. 111b fixed the one not named: no `policy.chain` branch at all, so an NSEC3 zone was unmeasurable. 111c is the guard that runs — record for record under Ed25519, whose signatures are deterministic, with all three drifts watched failing it. 111d found the ratio assertion failing 2 runs in 3 on Linux at 10 000 records and always having done: the whole was timed on its first run at a size while the parts inherited a warm allocator, 39.2 ms against 31.1. **111e is 111d's own remedy going wrong** — warming one side made the whole 33.2 s against 28.2 at a million on Windows, where Linux read 1.015 on the same code, so both sides are warmed now |
 | **115** | two pieces of `rdnsd` prose that were wrong in the tree | **filed 2026-09-21, closed 2026-09-22**, and re-measuring the row before fixing it corrected the row. The duplicated RFC 8945 §5.2 comment above `tsig::check_request` came in with `955504d` (#101) and is byte-identical to the `dc9d64ab` pair under it; the shape is 1 tree-wide before and 0 after. The config module doc's 46/40 were stale — **and so was the correction**: 51 `#[arg]` over **51** fields, not 49, because `nsec3` and `nsec3_opt_out` fall outside a `[a-z_]+` scan. A row filed to fix a stale number wrote one it had not read, which is the reported defect committed a second time, so it is struck in place (§11). **Fixed by deleting the counts rather than refreshing them**: the rule already has a guarantor in `a_setting_the_file_can_write_is_refused_beside_config`, which walks `Cli::command()` and requires a flag not refused beside `--config` to have no key in the file — clap owns one half and serde the other — so the doc cites the test and carries no number that can drift (§17). No code changed and no test was added: a count assertion would be a second authority to keep in step, which is the defect. 1 302 passed on Windows, 1 323 on Linux, 0 failed |
 
