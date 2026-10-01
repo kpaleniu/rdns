@@ -496,6 +496,20 @@ Configure git once per clone:
 git config blame.ignoreRevsFile .git-blame-ignore-revs
 ```
 
+Encoding is the other thing nothing checks. A file read as Latin-1 and written
+back as UTF-8 double-encodes every non-ASCII character, and the result
+compiles, formats and lints clean: #149 was eleven em dashes stored as
+`c3 a2 c2 80 c2 94`, shown as `â€”`. Before committing an edit made by a script
+rather than an editor, this must print nothing:
+
+```sh
+git ls-files -z | LC_ALL=C xargs -0 grep -na $'\xc3[\xa2-\xaf]\xc2[\x80-\xbf]\xc2[\x80-\xbf]'
+```
+
+It matches a double-encoded three-byte character (`—`, `→`, `’`). A looser
+pattern matches `§§`. Not a test: one shelling out to `git` was written and
+removed (#149), and no lint sees `//` comments or `.md`.
+
 ---
 
 ## 13. Size a buffer for what you will send, not for what the protocol allows

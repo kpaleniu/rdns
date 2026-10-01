@@ -17847,7 +17847,15 @@ The fix is the byte replacement at those eleven sites, then the scan again to
 show zero. Whether a test should hold that zero is not decided.
 
 **Closed 2026-10-01**, `96f26dd`. The eleven sites replaced byte for byte;
-the scan read 11 before, all U+2014, and 0 after, over every tracked file. No
-test holds the zero: that was left undecided and still is.
+the scan read 11 before, all U+2014, and 0 after, over every tracked file.
+
+**No test holds the zero**, on the owner's decision (2026-10-01). One was
+written, scanning `git ls-files`, and dropped before commit: a unit test that
+shells out to `git` is the wrong tool. No lint can hold it either — rustc and
+clippy are fixed sets, `//` comments never reach a lint, and `.md` never
+reaches the compiler. The check is a `grep` in `CLAUDE.md` §12. Its pattern is
+narrower than the scan's: a double-encoded *three-byte* character only,
+because the looser shape matches `§§`, nine times in the tree. Against
+`c762158` it finds the eleven sites and nothing else.
 
 ---
