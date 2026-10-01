@@ -1453,7 +1453,7 @@ impl Server {
 
 /// Why a transfer or an UPDATE was refused: RFC 8914 §4.19's "a query from an
 /// 'unauthorized' client", which covers all four ways permission is missing
-/// here â no key, a key scoped elsewhere, an unsigned UPDATE, a key that may
+/// here — no key, a key scoped elsewhere, an unsigned UPDATE, a key that may
 /// not rewrite this zone. One reason for all four on purpose: telling a
 /// stranger *which* of them it was is telling it about the keyring.
 const NOT_YOURS: ExtendedError =
@@ -1481,7 +1481,7 @@ const ONE_MESSAGE_TRANSPORT: ExtendedError = ExtendedError::new(
     "a zone transfer is a sequence of messages and DoH carries one (RFC 8484 §4.2)",
 );
 
-/// An UPDATE for a zone this server replicates. Not PROHIBITED â the
+/// An UPDATE for a zone this server replicates. Not PROHIBITED — the
 /// credential was good and the refusal is about where the zone is written, so
 /// OTHER carries what the text says (§4.1: "does not match known extended
 /// error codes").
@@ -1492,8 +1492,8 @@ const REPLICATED_ZONE: ExtendedError = ExtendedError::new(
 
 /// An UPDATE this server could apply and could not persist. Same reasoning as
 /// [`REPLICATED_ZONE`]: an operator's configuration, not the client's
-/// credential. Both spellings of it â no writable source at all, and no file
-/// for this zone â answer the one question the client can act on.
+/// credential. Both spellings of it — no writable source at all, and no file
+/// for this zone — answer the one question the client can act on.
 const NOT_WRITABLE: ExtendedError = ExtendedError::new(
     InfoCode::OTHER,
     "this server has nowhere to write this zone back to",
@@ -3840,7 +3840,7 @@ pub(crate) mod tests {
     /// PROHIBITED for all four ways permission can be missing, and no finer:
     /// telling a stranger *which* of them it was is telling it about the
     /// keyring. The text is what an operator reads, and the RCODE is still
-    /// REFUSED whatever §3 says about EDE â "applications MUST continue to
+    /// REFUSED whatever §3 says about EDE — "applications MUST continue to
     /// follow requirements ... on how to process RCODEs".
     #[tokio::test]
     async fn a_refused_update_says_why_when_the_client_used_edns() {

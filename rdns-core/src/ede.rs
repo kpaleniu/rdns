@@ -218,7 +218,7 @@ impl ExtendedError {
     ///
     /// `Err` is a malformed *option list*, which is FORMERR for the message as
     /// a whole. An individual EDE too short to hold its INFO-CODE is skipped
-    /// instead â §3 is explicit that an EDE changes nothing about how the
+    /// instead — §3 is explicit that an EDE changes nothing about how the
     /// RCODE beside it is processed, so discarding an unreadable annotation
     /// discards no answer.
     pub fn all_in(edns: &Edns) -> Result<Vec<(InfoCode, String)>, WireError> {

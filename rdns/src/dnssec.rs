@@ -667,7 +667,7 @@ pub enum RrsetProof {
 /// [`ValidationState::Bogus`](crate::dnssec_chain::ValidationState::Bogus), so a
 /// reason keeps its code as it is carried up the chain. Deriving the code from
 /// the text at the top instead is `CLAUDE.md` §3's "assert on the variant, not
-/// the message" seen from the other end â a SERVFAIL that says *expired* has
+/// the message" seen from the other end — a SERVFAIL that says *expired* has
 /// to be told so by the check that found the expiry.
 ///
 /// The text stays here and never reaches the wire: [`crate::ExtendedError`]

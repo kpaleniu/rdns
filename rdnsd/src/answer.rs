@@ -146,9 +146,9 @@ const UNSERVED_CLASS: ExtendedError =
 
 /// Why a REFUSED for a name we hold no zone for is REFUSED (RFC 8914 §4.21).
 ///
-/// One constant because the two sites are one decision seen twice â the ordinary
+/// One constant because the two sites are one decision seen twice — the ordinary
 /// lookup and the IXFR-over-UDP shortcut both fall through to `for_query`
-/// finding nothing â and a second spelling is where the two would drift
+/// finding nothing — and a second spelling is where the two would drift
 /// (`CLAUDE.md` §7).
 pub(crate) const NOT_OUR_ZONE: ExtendedError = ExtendedError::new(
     InfoCode::NOT_AUTHORITATIVE,
@@ -1350,7 +1350,7 @@ ns1 IN A   192.0.2.1
     /// A bare REFUSED is a support ticket: an operator cannot tell "you asked
     /// the wrong server" from "your key is scoped elsewhere" from "that class
     /// is not served" without one. The three sites share two INFO-CODEs on
-    /// purpose â the registry is coarser than the reasons â so the text is
+    /// purpose — the registry is coarser than the reasons — so the text is
     /// what separates them.
     #[test]
     fn a_refusal_says_why_when_the_client_can_hear_it() {
