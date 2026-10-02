@@ -26,6 +26,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 
 use crate::clock::current_unix_timestamp;
 use crate::error::{ConfigError, ConfigResult};
+use crate::peer::{ResponseTarget, Source};
 use crate::text_names::absolute_lowered;
 use crate::validation::PeerCertificate;
 use crate::zone_scope::ZoneScope;
@@ -96,11 +97,14 @@ struct TokenBucket {
     last_refill: u64,
 }
 
-/// Rate limiter using token bucket algorithm.
+/// Rate limiter using token bucket algorithm, one bucket per [`Source`].
 ///
 /// The table is attacker-keyed: a bucket is created before anything validates the
 /// packet. Above `max_tracked` no new bucket is created and the packet is
-/// *allowed*, because failing closed lets one flood deny service to everybody.
+/// *allowed*, because failing closed lets one flood deny service to everybody —
+/// and [`Judged`]'s `untracked` says so, since an admission with no bucket is one
+/// nothing limits. Keyed on the source rather than the peer, so filling the
+/// table costs a /56 per entry and not an address of a /64 (`TODO.md` #157).
 ///
 /// `current_unix_timestamp` is wall-clock, so all time arithmetic here saturates:
 /// a backwards NTP step would otherwise underflow and refill every bucket.
@@ -113,7 +117,7 @@ struct TokenBucket {
 /// be rediscovered under load (`TODO.md` #25f).
 pub struct RateLimiter {
     config: RateLimitConfig,
-    buckets: Arc<Mutex<HashMap<IpAddr, TokenBucket>>>,
+    buckets: Arc<Mutex<HashMap<Source, TokenBucket>>>,
     /// When the sweep last ran. An `AtomicU64` and not a `Mutex`: this is read
     /// on every datagram to decide *not* to sweep, and a lock for that made the
     /// common path two mutexes deep for one comparison.
@@ -141,10 +145,18 @@ impl RateLimiter {
     /// #28a. The value is seconds old at worst and every bucket here is
     /// second-granularity.
     pub fn should_allow(&self, ip: IpAddr, now: u64) -> bool {
+        self.judge(ip, now).verdict
+    }
+
+    /// [`RateLimiter::should_allow`], and whether the table had room for it.
+    ///
+    /// The exemption list is matched against the peer: exempting a host is
+    /// about that host, not its /56.
+    pub fn judge(&self, ip: IpAddr, now: u64) -> Judged<bool> {
         // Before the lock and before a bucket is created: a disabled limiter must
         // not be a mutex on every query.
         if self.config.tokens_per_window == 0 || self.config.exempt.allows(ip) {
-            return true;
+            return Judged::tracked(true);
         }
 
         // Cleanup old entries periodically
@@ -153,12 +165,13 @@ impl RateLimiter {
         let Ok(mut buckets) = self.buckets.lock() else {
             // Poisoned: state unknown. Allow, rather than answer nothing until
             // restarted.
-            return true;
+            return Judged::tracked(true);
         };
-        if !buckets.contains_key(&ip) && buckets.len() >= self.config.max_tracked {
-            return true;
+        let source = Source::of(ip);
+        if !buckets.contains_key(&source) && buckets.len() >= self.config.max_tracked {
+            return Judged::untracked(true);
         }
-        let bucket = buckets.entry(ip).or_insert_with(|| TokenBucket {
+        let bucket = buckets.entry(source).or_insert_with(|| TokenBucket {
             tokens: self.config.burst_size as f64,
             last_refill: now,
         });
@@ -171,12 +184,11 @@ impl RateLimiter {
         bucket.tokens = (bucket.tokens + tokens_to_add).min(self.config.burst_size as f64);
         bucket.last_refill = now;
 
-        // Check if we have tokens
         if bucket.tokens >= 1.0 {
             bucket.tokens -= 1.0;
-            true
+            Judged::tracked(true)
         } else {
-            false
+            Judged::tracked(false)
         }
     }
 
@@ -190,7 +202,7 @@ impl RateLimiter {
             return self.config.burst_size as f64;
         };
         buckets
-            .get(&ip)
+            .get(&Source::of(ip))
             .map(|b| b.tokens)
             .unwrap_or(self.config.burst_size as f64)
     }
@@ -242,6 +254,35 @@ impl RateLimiter {
     }
 }
 
+/// A limiter's verdict, and whether it was reached without a table entry.
+///
+/// `untracked` is the visible shortfall §5 asks of every bounded per-peer
+/// table: at `max_tracked` the query limiter admits and the response limiter
+/// truncates, and neither had counted that (`TODO.md` #157). The caller that
+/// owns the metrics counts it — `rdns_transport::ServeContext`, which both
+/// daemons answer through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Judged<V> {
+    pub verdict: V,
+    pub untracked: bool,
+}
+
+impl<V> Judged<V> {
+    fn tracked(verdict: V) -> Self {
+        Judged {
+            verdict,
+            untracked: false,
+        }
+    }
+
+    fn untracked(verdict: V) -> Self {
+        Judged {
+            verdict,
+            untracked: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RateLimiterStats {
     pub tracked_ips: usize,
@@ -263,6 +304,11 @@ pub enum ResponseVerdict {
 /// A per-client budget on response *bytes*, not queries — the reflected traffic
 /// is what amplification is measured in (RFC 5358; Response Rate Limiting).
 ///
+/// A client is a [`ResponseTarget`], an IPv4 /24 or IPv6 /56, because the
+/// address a reply goes to is the victim's for a spoofed query, and a spoofer
+/// spreading over a victim's network would otherwise get one budget per
+/// address (`TODO.md` #157).
+///
 /// Above `max_tracked` the table stops growing and every response is truncated:
 /// a spoofed flood arrives from every address there is, so the table would
 /// otherwise be the next amplification vector.
@@ -276,7 +322,7 @@ pub struct ResponseLimiter {
     /// One in every `slip` over-budget responses is truncated rather than
     /// dropped. 1 truncates all of them; 0 drops all of them.
     slip: u32,
-    clients: Mutex<HashMap<IpAddr, ByteBucket>>,
+    clients: Mutex<HashMap<ResponseTarget, ByteBucket>>,
     max_tracked: usize,
 }
 
@@ -328,26 +374,38 @@ impl ResponseLimiter {
         self.bytes_per_sec > 0
     }
 
+    /// A smaller table, for a test that has to reach the bound.
+    pub fn tracking_at_most(mut self, max_tracked: usize) -> Self {
+        self.max_tracked = max_tracked;
+        self
+    }
+
     /// Charge `response_bytes` to `ip` and say what to do with the response.
     ///
     /// `now` is the caller's; see [`RateLimiter::should_allow`].
     pub fn admit(&self, ip: IpAddr, response_bytes: usize, now: u64) -> ResponseVerdict {
+        self.judge(ip, response_bytes, now).verdict
+    }
+
+    /// [`ResponseLimiter::admit`], and whether the table had room for it.
+    pub fn judge(&self, ip: IpAddr, response_bytes: usize, now: u64) -> Judged<ResponseVerdict> {
         if !self.is_enabled() {
-            return ResponseVerdict::Send;
+            return Judged::tracked(ResponseVerdict::Send);
         }
         let Ok(mut clients) = self.clients.lock() else {
             // A poisoned lock is a bug elsewhere, not a licence to amplify.
-            return ResponseVerdict::Truncate;
+            return Judged::tracked(ResponseVerdict::Truncate);
         };
 
-        if !clients.contains_key(&ip) && clients.len() >= self.max_tracked {
+        let target = ResponseTarget::of(ip);
+        if !clients.contains_key(&target) && clients.len() >= self.max_tracked {
             self.forget_idle(&mut clients, now);
             if clients.len() >= self.max_tracked {
-                return ResponseVerdict::Truncate;
+                return Judged::untracked(ResponseVerdict::Truncate);
             }
         }
 
-        let bucket = clients.entry(ip).or_insert_with(|| ByteBucket {
+        let bucket = clients.entry(target).or_insert_with(|| ByteBucket {
             bytes: self.burst_bytes as f64,
             last_refill: now,
             over_budget: 0,
@@ -361,15 +419,15 @@ impl ResponseLimiter {
         if bucket.bytes >= response_bytes as f64 {
             bucket.bytes -= response_bytes as f64;
             bucket.over_budget = 0;
-            return ResponseVerdict::Send;
+            return Judged::tracked(ResponseVerdict::Send);
         }
 
         bucket.over_budget = bucket.over_budget.saturating_add(1);
-        if self.slip > 0 && bucket.over_budget % self.slip == 0 {
+        Judged::tracked(if self.slip > 0 && bucket.over_budget % self.slip == 0 {
             ResponseVerdict::Truncate
         } else {
             ResponseVerdict::Drop
-        }
+        })
     }
 
     /// How many clients are being tracked. For tests and diagnostics.
@@ -389,7 +447,7 @@ impl ResponseLimiter {
 
     /// Drop clients that have been quiet long enough to have refilled anyway —
     /// their bucket is full, so forgetting them changes nothing.
-    fn forget_idle(&self, clients: &mut HashMap<IpAddr, ByteBucket>, now: u64) {
+    fn forget_idle(&self, clients: &mut HashMap<ResponseTarget, ByteBucket>, now: u64) {
         let full_after = self
             .burst_bytes
             .checked_div(self.bytes_per_sec)
@@ -1223,8 +1281,9 @@ mod tests {
     #[test]
     fn test_budgets_are_per_client() {
         let now = current_unix_timestamp();
+        // Different /24s: one /24 is one response target (`TODO.md` #157).
         let noisy: IpAddr = "192.0.2.4".parse().unwrap();
-        let quiet: IpAddr = "192.0.2.5".parse().unwrap();
+        let quiet: IpAddr = "198.51.100.5".parse().unwrap();
         let limiter = ResponseLimiter::new(1, 512, 2);
 
         assert_eq!(limiter.admit(noisy, 512, now), ResponseVerdict::Send);
@@ -1244,22 +1303,22 @@ mod tests {
         let mut limiter = ResponseLimiter::new(8192, 32768, 2);
         limiter.max_tracked = 16;
 
-        let mut truncated = 0;
-        for i in 0..200u32 {
-            let ip: IpAddr = format!("198.51.100.{}", i % 256).parse().unwrap();
-            let ip = if i < 256 {
-                ip
-            } else {
-                format!("203.0.113.{}", i % 256).parse().unwrap()
-            };
-            if limiter.admit(ip, 100, now) == ResponseVerdict::Truncate {
-                truncated += 1;
+        // One address per /24, since a /24 is one response target
+        // (`TODO.md` #157); the addresses of one /24 never reached the bound.
+        let mut untracked = 0;
+        for i in 0..200u8 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(10, i, 0, 1));
+            let judged = limiter.judge(ip, 100, now);
+            if judged.untracked {
+                assert_eq!(judged.verdict, ResponseVerdict::Truncate);
+                untracked += 1;
             }
         }
         assert!(limiter.tracked() <= 16, "tracked {}", limiter.tracked());
-        assert!(
-            truncated > 0,
-            "past the bound, responses are truncated rather than tracked"
+        assert_eq!(
+            untracked,
+            200 - 16,
+            "past the bound, responses are truncated rather than tracked, and say so"
         );
     }
 
@@ -1302,5 +1361,73 @@ mod tests {
                 "answer {i} of an ordinary burst"
             );
         }
+    }
+
+    /// `n` peers inside one IPv6 /64, which an ordinary host holds.
+    fn rotating(n: u16) -> impl Iterator<Item = IpAddr> {
+        (1..=n).map(|i| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, i)))
+    }
+
+    /// `TODO.md` #157's probe, kept: a host rotating within its /64 is one
+    /// source, so the burst binds it as it binds one address.
+    #[test]
+    fn peers_rotating_within_a_slash_64_share_one_query_bucket() {
+        let limiter = RateLimiter::new(RateLimitConfig::per_second(10, 20));
+        let now = 1_000_000;
+        let allowed = rotating(1000)
+            .filter(|&peer| limiter.should_allow(peer, now))
+            .count();
+        assert_eq!(allowed, 20, "the burst, not one per address");
+    }
+
+    #[test]
+    fn two_ipv4_peers_in_one_slash_24_have_two_query_buckets_and_one_budget() {
+        let (a, b): (IpAddr, IpAddr) = ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap());
+        let now = 1_000_000;
+        let queries = RateLimiter::new(RateLimitConfig::per_second(1, 1));
+        assert!(queries.should_allow(a, now));
+        assert!(queries.should_allow(b, now), "a neighbour is not silenced");
+
+        let responses = ResponseLimiter::new(1000, 1000, 0);
+        assert_eq!(responses.admit(a, 1000, now), ResponseVerdict::Send);
+        assert_eq!(
+            responses.admit(b, 1000, now),
+            ResponseVerdict::Drop,
+            "but the /24 has one budget"
+        );
+    }
+
+    /// 1000-byte replies spread over a /64, and over a /24, are charged to one
+    /// response target: four fit a burst of 4000, not one per address.
+    #[test]
+    fn responses_spread_over_a_block_are_charged_to_one_target() {
+        let now = 1_000_000;
+        let v6 = ResponseLimiter::new(1000, 4000, 0);
+        let sent = rotating(1000)
+            .filter(|&peer| v6.admit(peer, 1000, now) == ResponseVerdict::Send)
+            .count();
+        assert_eq!(sent, 4);
+
+        let v4 = ResponseLimiter::new(1000, 4000, 0);
+        let sent = (1..=254u8)
+            .map(|i| IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, i)))
+            .filter(|&peer| v4.admit(peer, 1000, now) == ResponseVerdict::Send)
+            .count();
+        assert_eq!(sent, 4);
+    }
+
+    #[test]
+    fn a_mapped_peer_is_limited_as_the_ipv4_address_it_maps() {
+        let now = 1_000_000;
+        let limiter = RateLimiter::new(RateLimitConfig::per_second(1, 1));
+        assert!(limiter.should_allow("192.0.2.1".parse().unwrap(), now));
+        assert!(
+            !limiter.should_allow("::ffff:192.0.2.1".parse().unwrap(), now),
+            "one source"
+        );
+        assert!(
+            limiter.should_allow("::ffff:198.51.100.1".parse().unwrap(), now),
+            "and a different IPv4 address is another"
+        );
     }
 }

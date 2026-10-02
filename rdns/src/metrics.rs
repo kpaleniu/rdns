@@ -221,6 +221,11 @@ pub struct Counters {
     pub rate_limited: AtomicU64,
     pub validation_errors: AtomicU64,
     pub queries_dropped: AtomicU64,
+    /// Queries the query limiter admitted with no bucket, and responses the
+    /// response limiter truncated with none, because each table was at its
+    /// `max_tracked` (`TODO.md` #157). The first is traffic nothing limits.
+    pub rate_limiter_untracked: AtomicU64,
+    pub response_limiter_untracked: AtomicU64,
 
     /// DoT connections whose handshake completed, and those that did not.
     ///
@@ -370,6 +375,8 @@ impl DnsMetrics {
             rate_limited: AtomicU64::new(0),
             validation_errors: AtomicU64::new(0),
             queries_dropped: AtomicU64::new(0),
+            rate_limiter_untracked: AtomicU64::new(0),
+            response_limiter_untracked: AtomicU64::new(0),
             tls_handshakes: AtomicU64::new(0),
             tls_handshake_failures: AtomicU64::new(0),
             quic_handshakes: AtomicU64::new(0),
@@ -709,6 +716,16 @@ impl DnsMetrics {
                 "dns_queries_dropped_total",
                 "Dropped queries",
                 &self.queries_dropped,
+            ),
+            (
+                "dns_rate_limiter_untracked_total",
+                "Queries admitted because the query limiter's table was full",
+                &self.rate_limiter_untracked,
+            ),
+            (
+                "dns_response_limiter_untracked_total",
+                "Responses truncated because the response limiter's table was full",
+                &self.response_limiter_untracked,
             ),
             (
                 "dns_tls_handshakes_total",
@@ -1123,6 +1140,8 @@ mod tests {
             &m.rate_limited,
             &m.validation_errors,
             &m.queries_dropped,
+            &m.rate_limiter_untracked,
+            &m.response_limiter_untracked,
             &m.tls_handshakes,
             &m.tls_handshake_failures,
             &m.quic_handshakes,

@@ -172,7 +172,7 @@ pub const UDP_RECEIVE_BUFFER: usize = 65_535;
 pub struct ServeContext {
     /// Queries per second per source. The first refusal, and the cheapest.
     pub limiter: Arc<RateLimiter>,
-    /// Response *bytes* per second per source, for UDP only — a TCP peer
+    /// Response *bytes* per second per response target, for UDP only — a TCP peer
     /// completed a handshake, so there is nobody to reflect at.
     pub responses: Arc<ResponseLimiter>,
     /// Size and section caps, applied before a packet is parsed.
@@ -208,7 +208,11 @@ impl ServeContext {
     /// bucket the refill the wait earned it. A pipeline that read the clock
     /// itself would silently pick the first of those (`TODO.md` #28a, #30e).
     pub fn allow_source(&self, peer: IpAddr, now: u64) -> bool {
-        if self.limiter.should_allow(peer, now) {
+        let judged = self.limiter.judge(peer, now);
+        if judged.untracked {
+            self.metrics.count(&self.metrics.rate_limiter_untracked);
+        }
+        if judged.verdict {
             return true;
         }
         self.logger.log_rate_limited(peer);
@@ -260,7 +264,11 @@ impl ServeContext {
     /// gives: `rdnsr` reads the clock again here because a recursion sat
     /// between the two reads.
     pub fn admit_response(&self, peer: IpAddr, len: usize, now: u64) -> ResponseVerdict {
-        let verdict = self.responses.admit(peer, len, now);
+        let judged = self.responses.judge(peer, len, now);
+        if judged.untracked {
+            self.metrics.count(&self.metrics.response_limiter_untracked);
+        }
+        let verdict = judged.verdict;
         match verdict {
             ResponseVerdict::Send => {}
             ResponseVerdict::Truncate => {
@@ -416,6 +424,7 @@ mod tests {
     use super::*;
     use crate::testutil::{context, query};
     use rdns::clock::current_unix_timestamp;
+    use rdns::security::RateLimitConfig;
 
     /// The oversized-datagram case, tested through the raw code because
     /// WSAEMSGSIZE's `ErrorKind` is `Uncategorized` and carries no information.
@@ -520,6 +529,40 @@ mod tests {
             ResponseVerdict::Truncate
         );
         assert_eq!(counter(&ctx.metrics.rate_limited), 1);
+    }
+
+    /// Past `max_tracked` the query limiter admits and the response limiter
+    /// truncates, and each says so in the scrape (`TODO.md` #157).
+    #[test]
+    fn a_full_limiter_table_is_counted_in_the_scrape() {
+        let ctx = ServeContext {
+            limiter: Arc::new(RateLimiter::new(RateLimitConfig {
+                max_tracked: 1,
+                ..RateLimitConfig::per_second(1, 1)
+            })),
+            responses: Arc::new(ResponseLimiter::per_second(1000).tracking_at_most(1)),
+            ..context(1)
+        };
+        let now = current_unix_timestamp();
+        let (a, b): (IpAddr, IpAddr) = (
+            "192.0.2.1".parse().unwrap(),
+            "198.51.100.1".parse().unwrap(),
+        );
+
+        assert!(ctx.allow_source(a, now));
+        assert!(ctx.allow_source(b, now), "admitted with no bucket");
+        assert_eq!(ctx.admit_response(a, 100, now), ResponseVerdict::Send);
+        assert_eq!(ctx.admit_response(b, 100, now), ResponseVerdict::Truncate);
+
+        let scrape = ctx.metrics.to_prometheus_format();
+        assert!(
+            scrape.contains("dns_rate_limiter_untracked_total 1"),
+            "{scrape}"
+        );
+        assert!(
+            scrape.contains("dns_response_limiter_untracked_total 1"),
+            "{scrape}"
+        );
     }
 
     /// The size cap is the transport's, which is the reason [`Transport`] is

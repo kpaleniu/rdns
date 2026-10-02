@@ -249,7 +249,8 @@ struct Cli {
     /// sends.
     #[arg(long, value_name = "QUERIES", default_value_t = default_max_inflight_udp(), conflicts_with = "config")]
     max_inflight_udp: usize,
-    /// Queries per second, per client address. 0 turns the limit off.
+    /// Queries per second, per source: an IPv4 address or an IPv6 /56.
+    /// 0 turns the limit off.
     ///
     /// 200 where `rdnsd`'s is 1000: an authoritative server's clients are
     /// resolvers, and one resolver behind one address legitimately asks orders
@@ -356,7 +357,8 @@ struct Cli {
     /// in one interval. 0 is off.
     #[arg(long, value_name = "REFUSALS", default_value_t = default_anomaly_source_refusals(), conflicts_with = "config")]
     anomaly_source_refusals: u64,
-    /// Response bytes per second, per client address. 0 turns the budget off.
+    /// Response bytes per second, per IPv4 /24 or IPv6 /56 a reply goes to.
+    /// 0 turns the budget off.
     ///
     /// A resolver needs this more than an authoritative server does: a 30-byte
     /// query can produce a 4 KB validated answer, which `--dnssec-validate`

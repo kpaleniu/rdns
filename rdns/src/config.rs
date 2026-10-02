@@ -81,10 +81,10 @@ macro_rules! server_table {
             host: String,
             #[serde(default = "crate::default_port")]
             port: u16,
-            /// Response bytes per second, per client address; 0 is off.
+            /// Response bytes per second, per IPv4 /24 or IPv6 /56; 0 is off.
             #[serde(default = "crate::default_response_rate")]
             response_rate: u32,
-            /// Queries per second, per client address; 0 is off.
+            /// Queries per second, per IPv4 address or IPv6 /56; 0 is off.
             #[serde(default = "crate::default_query_rate")]
             query_rate: u32,
             #[serde(default = "crate::default_query_burst")]

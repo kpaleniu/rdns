@@ -328,7 +328,8 @@ struct Cli {
     /// holding 40 zones would rather serve 39 than none — but as a decision.
     #[arg(long, conflicts_with = "config")]
     allow_partial_load: bool,
-    /// Response bytes per second, per client address. 0 turns the budget off.
+    /// Response bytes per second, per IPv4 /24 or IPv6 /56 a reply goes to.
+    /// 0 turns the budget off.
     ///
     /// Meters what leaves, which is what an amplification attack is made of.
     /// UDP only: a TCP query completed a handshake, so there is nobody to
@@ -422,7 +423,8 @@ struct Cli {
         conflicts_with = "config"
     )]
     connection_idle_timeout: std::num::NonZeroU64,
-    /// Queries per second, per client address. 0 turns the limit off.
+    /// Queries per second, per source: an IPv4 address or an IPv6 /56.
+    /// 0 turns the limit off.
     ///
     /// Over the limit is dropped silently, so the number has to be generous:
     /// `rdnsd`'s clients are resolvers, not end users. A backstop against a

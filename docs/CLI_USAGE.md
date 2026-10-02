@@ -98,7 +98,8 @@ because their output is the point of running them.
 
 ### `--response-rate <BYTES_PER_SEC>` (UDP)
 
-Response bytes per second, per client address. Default `8192`; `0` disables.
+Response bytes per second, per IPv4 /24 or IPv6 /56 a reply goes to (a
+**response target**). Default `8192`; `0` disables.
 
 The query limiter counts requests, which says nothing about amplification — a
 query is a query whether the answer is 60 bytes or 4000. An attacker forging a
@@ -127,7 +128,8 @@ rdnsd --zone-file example.com.zone --response-rate 0      # closed network only
 
 ### `--query-rate <QUERIES_PER_SEC>`, `--query-burst`, `--query-rate-exempt`
 
-Queries per second per client address, with a burst allowance and an exemption
+Queries per second per **source** — an IPv4 address or an IPv6 /56 — with a
+burst allowance and an exemption
 list. Defaults 1000/s, burst 200, no exemptions. `--query-rate 0` disables it.
 
 Over the limit a query is dropped in silence — no REFUSED, no SERVFAIL, nothing

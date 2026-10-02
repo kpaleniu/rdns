@@ -18,19 +18,24 @@
 //! The per-source maps are keyed on an address the sender chose, so both are
 //! bounded (`MAX_TRACKED_SOURCES`) and the shortfall is itself a counter —
 //! `untracked_sources`, because a bound that lies by omission is worse than a
-//! bound that says so (`CLAUDE.md` §5).
+//! bound that says so (`CLAUDE.md` §5). The key is a [`Source`], not the
+//! peer: keyed on the exact address, a host rotating within its /64 was a
+//! thousand light sources and never the heavy hitter the warning is for
+//! (`TODO.md` #157).
 
 use crate::clock::current_unix_timestamp;
+use crate::peer::Source;
 use crate::shutdown::Stop;
 use crate::Qtype;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// How many source addresses are counted individually at once.
 ///
-/// The per-IP maps are keyed on a forgeable address, so without a bound one
+/// The per-source maps are keyed on a forgeable address, so without a bound one
 /// spoofed 12-byte datagram per entry makes the monitoring the memory-exhaustion
 /// vector. Same shape as [`crate::security::ResponseLimiter`]'s `max_tracked`.
 const MAX_TRACKED_SOURCES: usize = 10_000;
@@ -44,16 +49,16 @@ pub struct QueryStats {
     pub total_errors: u64,
     /// Queries per second (last measurement)
     pub qps: f64,
-    /// Per-IP query counts, bounded by `MAX_TRACKED_SOURCES` — see
+    /// Per-source query counts, bounded by `MAX_TRACKED_SOURCES` — see
     /// `note_source` for what happens at the bound.
-    pub queries_by_ip: HashMap<IpAddr, u64>,
+    pub queries_by_source: HashMap<Source, u64>,
     /// Per-record-type query counts. Bounded by the key space: there are only
     /// 65536 possible types, and no map of them is a DoS.
     pub queries_by_type: HashMap<Qtype, u64>,
-    /// IPs with rate limiting triggered, bounded the same way.
-    pub rate_limited_ips: HashMap<IpAddr, u64>,
+    /// Sources the rate limiter refused, bounded the same way.
+    pub rate_limited_sources: HashMap<Source, u64>,
     /// Queries from sources there was no room to count individually. Nonzero
-    /// means the per-IP numbers are a sample, not a census.
+    /// means the per-source numbers are a sample, not a census.
     pub untracked_sources: u64,
 }
 
@@ -63,9 +68,9 @@ impl QueryStats {
             total_queries: 0,
             total_errors: 0,
             qps: 0.0,
-            queries_by_ip: HashMap::new(),
+            queries_by_source: HashMap::new(),
             queries_by_type: HashMap::new(),
-            rate_limited_ips: HashMap::new(),
+            rate_limited_sources: HashMap::new(),
             untracked_sources: 0,
         }
     }
@@ -119,11 +124,11 @@ pub enum Anomaly {
         percent: f64,
     },
     HeavySource {
-        peer: IpAddr,
+        source: Source,
         queries: u64,
     },
     RepeatedlyLimited {
-        peer: IpAddr,
+        source: Source,
         refusals: u64,
     },
     /// The per-source figures are a sample, not a census: the map was full.
@@ -149,20 +154,20 @@ pub fn anomalies(stats: &QueryStats, limits: &AnomalyThresholds) -> Vec<Anomaly>
         }
     }
     if limits.queries_per_source > 0 {
-        for (peer, queries) in &stats.queries_by_ip {
+        for (source, queries) in &stats.queries_by_source {
             if *queries > limits.queries_per_source {
                 found.push(Anomaly::HeavySource {
-                    peer: *peer,
+                    source: *source,
                     queries: *queries,
                 });
             }
         }
     }
     if limits.refusals_per_source > 0 {
-        for (peer, refusals) in &stats.rate_limited_ips {
+        for (source, refusals) in &stats.rate_limited_sources {
             if *refusals > limits.refusals_per_source {
                 found.push(Anomaly::RepeatedlyLimited {
-                    peer: *peer,
+                    source: *source,
                     refusals: *refusals,
                 });
             }
@@ -206,14 +211,14 @@ pub async fn watch_anomalies(
     }
 }
 
-/// Count one hit against `ip`, keeping the map bounded.
+/// Count one hit against `key`, keeping the map bounded.
 ///
 /// At the bound every count is halved and the zeroes forgotten, which keeps the
 /// heavy talkers these counters exist to find and drops the single-datagram
 /// sources a spoofed flood is made of. Halving is O(n) per ~n admissions, so
 /// amortized constant; a scan for the smallest count per insertion is not.
-fn note_source(map: &mut HashMap<IpAddr, u64>, ip: IpAddr, untracked: &mut u64, max: usize) {
-    if let Some(count) = map.get_mut(&ip) {
+fn note_source<K: Hash + Eq>(map: &mut HashMap<K, u64>, key: K, untracked: &mut u64, max: usize) {
+    if let Some(count) = map.get_mut(&key) {
         *count = count.saturating_add(1);
         return;
     }
@@ -229,7 +234,7 @@ fn note_source(map: &mut HashMap<IpAddr, u64>, ip: IpAddr, untracked: &mut u64, 
             return;
         }
     }
-    map.insert(ip, 1);
+    map.insert(key, 1);
 }
 
 /// How long a QPS measurement runs before it is rolled over and published.
@@ -289,11 +294,16 @@ impl QueryLogger {
         stats.total_queries += 1;
 
         let QueryStats {
-            queries_by_ip,
+            queries_by_source,
             untracked_sources,
             ..
         } = stats;
-        note_source(queries_by_ip, ip, untracked_sources, MAX_TRACKED_SOURCES);
+        note_source(
+            queries_by_source,
+            Source::of(ip),
+            untracked_sources,
+            MAX_TRACKED_SOURCES,
+        );
 
         if let Some(qtype) = query_type {
             *stats.queries_by_type.entry(qtype).or_insert(0) += 1;
@@ -330,13 +340,18 @@ impl QueryLogger {
             return;
         };
         let QueryStats {
-            rate_limited_ips,
+            rate_limited_sources,
             untracked_sources,
             ..
         } = &mut inner.stats;
         // The map that most needs a bound: an entry here comes from a *refused*
         // source, which is what a spoofed flood is made of.
-        note_source(rate_limited_ips, ip, untracked_sources, MAX_TRACKED_SOURCES);
+        note_source(
+            rate_limited_sources,
+            Source::of(ip),
+            untracked_sources,
+            MAX_TRACKED_SOURCES,
+        );
     }
 
     /// The one place this lock is taken, and the one failure decision: a
@@ -384,16 +399,16 @@ impl QueryLogger {
                 Anomaly::HighErrorRate { percent } => {
                     tracing::warn!(percent, "high error rate")
                 }
-                Anomaly::HeavySource { peer, queries } => {
-                    tracing::warn!(%peer, queries, "high query count from one source")
+                Anomaly::HeavySource { source, queries } => {
+                    tracing::warn!(%source, queries, "high query count from one source")
                 }
-                Anomaly::RepeatedlyLimited { peer, refusals } => {
-                    tracing::warn!(%peer, refusals, "repeatedly rate limited")
+                Anomaly::RepeatedlyLimited { source, refusals } => {
+                    tracing::warn!(%source, refusals, "repeatedly rate limited")
                 }
                 Anomaly::UntrackedSources { queries } => tracing::warn!(
                     untracked = queries,
                     "queries from sources there was no room to count individually — the \
-                     per-IP figures are a sample, not a census"
+                     per-source figures are a sample, not a census"
                 ),
             }
         }
@@ -450,7 +465,7 @@ mod tests {
 
         let stats = logger.get_stats();
         assert_eq!(stats.total_queries, 3);
-        assert_eq!(*stats.queries_by_ip.get(&ip).unwrap(), 3);
+        assert_eq!(*stats.queries_by_source.get(&Source::of(ip)).unwrap(), 3);
         assert_eq!(*stats.queries_by_type.get(&Qtype::of(rt::A)).unwrap(), 2);
         assert_eq!(*stats.queries_by_type.get(&Qtype::of(rt::AAAA)).unwrap(), 1);
     }
@@ -477,7 +492,7 @@ mod tests {
         logger.log_rate_limited(ip);
 
         let stats = logger.get_stats();
-        assert_eq!(*stats.rate_limited_ips.get(&ip).unwrap(), 3);
+        assert_eq!(*stats.rate_limited_sources.get(&Source::of(ip)).unwrap(), 3);
     }
 
     #[test]
@@ -493,7 +508,7 @@ mod tests {
         let stats = logger.get_stats();
         assert_eq!(stats.total_queries, 0);
         assert_eq!(stats.total_errors, 0);
-        assert!(stats.queries_by_ip.is_empty());
+        assert!(stats.queries_by_source.is_empty());
     }
 
     /// The per-IP counters are keyed on a forgeable address and nothing used to
@@ -514,8 +529,8 @@ mod tests {
         }
 
         let stats = logger.get_stats();
-        assert!(stats.queries_by_ip.len() <= MAX_TRACKED_SOURCES);
-        assert!(stats.rate_limited_ips.len() <= MAX_TRACKED_SOURCES);
+        assert!(stats.queries_by_source.len() <= MAX_TRACKED_SOURCES);
+        assert!(stats.rate_limited_sources.len() <= MAX_TRACKED_SOURCES);
         // Every query is still counted in total, and the shortfall is visible
         // rather than silent — an operator reading "top talkers" has to know the
         // list is a sample.
@@ -549,7 +564,7 @@ mod tests {
 
         let stats = logger.get_stats();
         assert!(
-            stats.queries_by_ip.contains_key(&heavy),
+            stats.queries_by_source.contains_key(&Source::of(heavy)),
             "the source with a thousand queries is the one worth keeping"
         );
     }
@@ -661,8 +676,8 @@ mod tests {
         logger.log_query(ip2, Some(Qtype::of(rt::A)), current_unix_timestamp());
 
         let stats = logger.get_stats();
-        assert_eq!(*stats.queries_by_ip.get(&ip1).unwrap(), 1);
-        assert_eq!(*stats.queries_by_ip.get(&ip2).unwrap(), 2);
+        assert_eq!(*stats.queries_by_source.get(&Source::of(ip1)).unwrap(), 1);
+        assert_eq!(*stats.queries_by_source.get(&Source::of(ip2)).unwrap(), 2);
     }
 
     /// The counts a warning is judged on are per interval, and taking them
@@ -688,7 +703,7 @@ mod tests {
         assert_eq!(
             anomalies(&first, &limits),
             vec![Anomaly::HeavySource {
-                peer: heavy,
+                source: Source::of(heavy),
                 queries: 3
             }]
         );
@@ -700,6 +715,28 @@ mod tests {
             anomalies(&second, &limits).is_empty(),
             "a quiet interval is quiet, whatever the one before it did"
         );
+    }
+
+    /// A host rotating within its /64 is one heavy source, named as its /56
+    /// (`TODO.md` #157). Keyed on the peer it was a thousand sources of one
+    /// query each, and the warning named nobody.
+    #[test]
+    fn a_rotating_slash_64_is_named_as_one_slash_56() {
+        let logger = QueryLogger::new();
+        let now = current_unix_timestamp();
+        for i in 1..=1000u16 {
+            let peer = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, i));
+            logger.log_query(peer, Some(Qtype::of(rt::A)), now);
+        }
+        let found = anomalies(&logger.take_stats(now + 60), &AnomalyThresholds::default());
+        let named: Vec<String> = found
+            .iter()
+            .filter_map(|a| match a {
+                Anomaly::HeavySource { source, .. } => Some(source.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named, ["2001:db8::/56"]);
     }
 
     /// The rate is over the interval that was taken, not over the last window

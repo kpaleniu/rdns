@@ -229,8 +229,8 @@ because a dry run would leave it owned by whoever ran the check.
 | `--max-connections` (per stream listener: TCP, DoT, DoH, DoQ each) | 128 | the next connection waits in the kernel's backlog; one WARN per episode, `dns_connection_accept_waits_total{transport}` | none: `0` is refused, the ceiling is what bounds descriptors |
 | `--connection-idle-timeout` (seconds) | 10 | connection closed; not applied to DoH (`TODO.md` #161) | none: `0` is refused |
 | `MAX_INFLIGHT_PER_CONNECTION` | 16 | read loop back-pressures | — |
-| `RateLimiter::max_tracked` | 10 000 | an untracked source is allowed | — |
-| `ResponseLimiter::max_tracked` | 10 000 | an untracked source is truncated (TC=1), not dropped and not sent in full | — |
+| `RateLimiter::max_tracked` (sources: IPv4 address, IPv6 /56) | 10 000 | an untracked source is allowed, counted in `dns_rate_limiter_untracked_total` | — |
+| `ResponseLimiter::max_tracked` (response targets: IPv4 /24, IPv6 /56) | 10 000 | an untracked target is truncated (TC=1), not dropped and not sent in full; counted in `dns_response_limiter_untracked_total` | — |
 
 Rates are stated per second (`RateLimitConfig::per_second(rate, burst)`). Every
 per-peer table has a `max_tracked` and a documented direction of failure: the
@@ -295,7 +295,8 @@ no header.
 
 `queries_received`, `queries_authoritative`, `responses_sent`,
 `responses_noerror`, `responses_nxdomain`, `responses_servfail`,
-`responses_refused`, `rate_limited`, `validation_errors`, `queries_dropped`, and
+`responses_refused`, `rate_limited`, `validation_errors`, `queries_dropped`,
+`rate_limiter_untracked`, `response_limiter_untracked`, and
 `dns_queries_type{type=...}` for A/AAAA/MX/NS/CNAME/TXT/SOA/PTR/OTHER.
 
 `dns_tls_handshakes_total` and `dns_tls_handshake_failures_total`, and the same

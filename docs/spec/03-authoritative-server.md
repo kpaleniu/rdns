@@ -21,7 +21,8 @@ In order. Every step that drops a packet does so silently unless noted.
    `rdns_transport::recv_error_is_transient` recognises (ICMP reports, WSAEMSGSIZE, which
    arrives as `ErrorKind::Uncategorized`) continues the loop; anything else ends
    it and takes the process down.
-2. Rate limit (`security::RateLimiter`, per source address). Over the limit:
+2. Rate limit (`security::RateLimiter`, per source: an IPv4 address or an
+   IPv6 /56, `TODO.md` #157). Over the limit:
    dropped, counted in `dns_rate_limited_total`. Dropped rather than REFUSED — a
    reply to a spoofed source amplifies.
 3. `AdmissionCheck::validate_packet(packet, is_tcp=false)`. Fails: dropped,

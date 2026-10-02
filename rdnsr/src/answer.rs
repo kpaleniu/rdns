@@ -3595,7 +3595,12 @@ mod tests {
 
         let stats = serving.ctx.logger.take_stats(now + 60);
         assert_eq!(stats.total_queries, 3);
-        assert_eq!(stats.queries_by_ip.get(&TEST_PEER), Some(&3));
+        assert_eq!(
+            stats
+                .queries_by_source
+                .get(&rdns::peer::Source::of(TEST_PEER)),
+            Some(&3)
+        );
         assert_eq!(stats.total_errors, 1);
         assert_eq!(
             stats.queries_by_type.get(&Qtype::of(record_types::A)),
