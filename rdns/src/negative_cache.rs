@@ -21,8 +21,9 @@
 //!   an answer and stays usable for [`crate::cache::StalePolicy`]'s window, so
 //!   an outage does not turn a cached NXDOMAIN into a SERVFAIL.
 
-use crate::cache::{StalePolicy, STALE_ANSWER_TTL, STALE_REFRESH_INTERVAL};
+use crate::cache::{StalePolicy, STALE_ANSWER_TTL};
 use crate::clock::Clock;
+use crate::deadline::Deadline;
 use crate::eviction::Halving;
 use crate::name_keys::{NameKeyBuf, NameType, NameTypeKey};
 use crate::record_types as rt;
@@ -64,16 +65,16 @@ struct Entry {
     rcode: ResponseCode,
     authority: Vec<ResourceRecord>,
     secure: bool,
-    expires_at: u64,
+    expires_at: Deadline,
     /// When a stale answer may next hand out a refresh
-    /// ([`crate::cache::STALE_REFRESH_INTERVAL`]). 0 on a new entry.
-    stale_refresh_after: u64,
+    /// ([`crate::cache::STALE_REFRESH_INTERVAL`]). The epoch on a new entry.
+    stale_refresh_after: Deadline,
     learned_at: u64,
 }
 
 impl Entry {
     fn live(&self, now: u64) -> bool {
-        self.expires_at > now
+        self.expires_at.is_live(now)
     }
 
     /// Expired, but inside the stale window: an answer only for a caller that
@@ -83,7 +84,7 @@ impl Entry {
     }
 
     fn remaining(&self, now: u64) -> u32 {
-        self.expires_at.saturating_sub(now).min(u32::MAX as u64) as u32
+        self.expires_at.remaining_ttl(now)
     }
 }
 
@@ -182,8 +183,8 @@ impl NegativeCache {
             rcode: response.rcode,
             authority: response.authorities.clone(),
             secure,
-            expires_at: now + ttl as u64,
-            stale_refresh_after: 0,
+            expires_at: Deadline::after(now, u64::from(ttl)),
+            stale_refresh_after: Deadline::default(),
             learned_at: now,
         };
         let Ok(mut entries) = self.entries.lock() else {
@@ -327,12 +328,11 @@ impl Entry {
 
     /// The same, with the TTL a stale answer carries: there is none left to
     /// count down (RFC 8767 §4). Claims the refresh if `refreshing` and one is
-    /// due, as the answer cache's `get_stale` does.
+    /// due.
     fn stale_answer(&mut self, now: u64, refreshing: bool) -> NegativeAnswer {
-        let refresh = refreshing && now >= self.stale_refresh_after;
-        if refresh {
-            self.stale_refresh_after = now.saturating_add(STALE_REFRESH_INTERVAL);
-        }
+        let refresh = self
+            .stale_refresh_after
+            .claim_stale_refresh(refreshing, now);
         NegativeAnswer {
             refresh,
             ..self.with_ttl(STALE_ANSWER_TTL)
@@ -383,19 +383,24 @@ fn make_room(entries: &mut Entries, max_entries: usize, now: u64, stale: StalePo
         .nxdomain
         .values()
         .chain(entries.nodata.values())
-        .map(|e| e.expires_at)
+        .map(|e| e.expires_at.unix_secs())
         .collect();
     let Some(mut plan) = Halving::plan(expiries, max_entries / 2) else {
         return;
     };
-    entries.nxdomain.retain(|_, e| plan.keep(e.expires_at));
-    entries.nodata.retain(|_, e| plan.keep(e.expires_at));
+    entries
+        .nxdomain
+        .retain(|_, e| plan.keep(e.expires_at.unix_secs()));
+    entries
+        .nodata
+        .retain(|_, e| plan.keep(e.expires_at.unix_secs()));
 }
 
 #[cfg(test)]
 mod tests {
 
     use super::*;
+    use crate::cache::STALE_REFRESH_INTERVAL;
     use crate::clock::Clock;
     use crate::test_records::nm;
     use crate::test_records::soa_record;
@@ -1039,5 +1044,27 @@ mod tests {
              ({with_room:?} -> {at_the_bound:?}); eviction is scanning for one \
              victim per insert again"
         );
+    }
+
+    /// An expiry is `now` plus a TTL, saturating (`TODO.md` #154): a clock
+    /// near the end of `u64` keeps the entry until the end of time rather than
+    /// overflowing.
+    #[test]
+    fn an_entry_cached_at_the_end_of_time_is_kept() {
+        let clock = Clock::fixed(u64::MAX - 10);
+        let cache = NegativeCache::with_stale(16, StalePolicy::OFF, clock);
+        cache.insert(
+            nm("gone.example.com.").as_ref(),
+            Qtype::of(rt::A),
+            &negative(
+                "gone.example.com.",
+                ResponseCode::NoSuchDomain,
+                vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
+            ),
+            false,
+        );
+        assert!(cache
+            .get(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))
+            .is_some());
     }
 }

@@ -29,6 +29,7 @@
 //! insert is a scan per query once a bounded cache is full.
 
 use crate::clock::Clock;
+use crate::deadline::Deadline;
 use crate::eviction::Halving;
 use crate::name_keys::{NameType, NameTypeKey};
 use crate::NameRef;
@@ -114,8 +115,8 @@ impl StalePolicy {
     /// The one place the window is arithmetic, so no call site re-derives it.
     /// With the policy off this is exactly "has not expired", which is what
     /// makes one predicate serve both caches in both modes.
-    pub(crate) fn keeps(self, expires_at: u64, now: u64) -> bool {
-        expires_at.saturating_add(self.max_stale) > now
+    pub(crate) fn keeps(self, expires_at: Deadline, now: u64) -> bool {
+        expires_at.extended_by(self.max_stale).is_live(now)
     }
 }
 
@@ -131,7 +132,7 @@ const PREFETCH_AT: u64 = 10;
 #[derive(Debug, Clone)]
 struct CacheEntry {
     records: Vec<ResourceRecord>,
-    expires_at: u64, // Unix timestamp
+    expires_at: Deadline,
     /// What the TTL was, so "nearly expired" is a fraction of it rather than a
     /// fixed number of seconds — a minute left is nothing on a day's TTL and
     /// everything on two minutes'.
@@ -148,19 +149,19 @@ struct CacheEntry {
     /// entry then expires and the next query resolves the ordinary way.
     refreshing: bool,
     /// When a stale answer may next hand out a refresh
-    /// ([`STALE_REFRESH_INTERVAL`]). 0 on a new entry: due at once.
-    stale_refresh_after: u64,
+    /// ([`STALE_REFRESH_INTERVAL`]). The epoch on a new entry: due at once.
+    stale_refresh_after: Deadline,
     learned_at: u64,
 }
 
 impl CacheEntry {
     fn is_expired(&self, now: u64) -> bool {
-        now >= self.expires_at
+        !self.expires_at.is_live(now)
     }
 
     /// Whether less than [`PREFETCH_AT`]'s share of the TTL is left.
     fn nearly_expired(&self, now: u64) -> bool {
-        self.expires_at.saturating_sub(now) <= self.ttl / PREFETCH_AT
+        self.expires_at.remaining(now) <= self.ttl / PREFETCH_AT
     }
 }
 
@@ -308,10 +309,9 @@ impl DnsCache {
             .get_mut(key)
             .filter(|entry| entry.is_expired(now) && self.stale.keeps(entry.expires_at, now))?;
         // Under the lock the lookup already holds, as `lookup`'s flag is.
-        let refresh = refreshing && now >= entry.stale_refresh_after;
-        if refresh {
-            entry.stale_refresh_after = now.saturating_add(STALE_REFRESH_INTERVAL);
-        }
+        let refresh = entry
+            .stale_refresh_after
+            .claim_stale_refresh(refreshing, now);
         let records = entry
             .records
             .iter()
@@ -361,7 +361,7 @@ impl DnsCache {
 
         // Saturating: a wrapped expiry is an entry that already expired, or one
         // that never does.
-        let expires_at = now.saturating_add(min_ttl);
+        let expires_at = Deadline::after(now, min_ttl);
 
         // Poisoned lock: store nothing, as [`DnsCache::get_validated`].
         let Ok(mut cache) = self.cache.lock() else {
@@ -380,7 +380,7 @@ impl DnsCache {
                 ttl: min_ttl,
                 secure,
                 refreshing: false,
-                stale_refresh_after: 0,
+                stale_refresh_after: Deadline::default(),
                 learned_at: now,
             },
         );
@@ -399,11 +399,14 @@ impl DnsCache {
         // under any load that fills the cache.
         cache.retain(|_, entry| self.stale.keeps(entry.expires_at, now));
 
-        let expiries = cache.values().map(|entry| entry.expires_at).collect();
+        let expiries = cache
+            .values()
+            .map(|entry| entry.expires_at.unix_secs())
+            .collect();
         let Some(mut plan) = Halving::plan(expiries, self.max_entries / 2) else {
             return;
         };
-        cache.retain(|_, entry| plan.keep(entry.expires_at));
+        cache.retain(|_, entry| plan.keep(entry.expires_at.unix_secs()));
     }
 
     /// Get cache statistics.
@@ -607,7 +610,7 @@ mod tests {
             [&NameTypeKey::new(nm("example.com.").as_ref(), Qtype::of(rt::A))]
             .expires_at;
         assert!(
-            expires_at <= current_unix_timestamp() + MAX_CACHE_TTL,
+            expires_at.unix_secs() <= current_unix_timestamp() + MAX_CACHE_TTL,
             "an entry may not outlive the ceiling"
         );
     }
@@ -680,21 +683,22 @@ mod tests {
     #[test]
     fn the_stale_window_ends_exactly_where_it_says() {
         let policy = StalePolicy::seconds(3600);
+        let expired = Deadline::after(1_000, 0);
         assert!(
-            policy.keeps(1_000, 1_000),
+            policy.keeps(expired, 1_000),
             "expired this second, still usable"
         );
-        assert!(policy.keeps(1_000, 1_000 + 3599));
+        assert!(policy.keeps(expired, 1_000 + 3599));
         assert!(
-            !policy.keeps(1_000, 1_000 + 3600),
+            !policy.keeps(expired, 1_000 + 3600),
             "a window of an hour ends an hour after the TTL did"
         );
         assert!(
-            !StalePolicy::OFF.keeps(1_000, 1_000),
+            !StalePolicy::OFF.keeps(expired, 1_000),
             "with the policy off, usable and unexpired are the same thing"
         );
         // A window past the end of time must not wrap into the past.
-        assert!(StalePolicy::seconds(u64::MAX).keeps(1_000, u64::MAX - 1));
+        assert!(StalePolicy::seconds(u64::MAX).keeps(expired, u64::MAX - 1));
     }
 
     /// RFC 8767 §4: an expired answer is not an answer — the resolver tries the
@@ -1001,5 +1005,18 @@ mod tests {
             "filling a 20k cache twice over took {elapsed:?}; eviction is \
              scaling with the cache size again"
         );
+    }
+
+    /// An expiry is `now` plus a TTL, saturating (`TODO.md` #154): a clock
+    /// near the end of `u64` keeps the entry until the end of time rather than
+    /// overflowing.
+    #[test]
+    fn an_entry_cached_at_the_end_of_time_is_kept() {
+        let clock = Clock::fixed(u64::MAX - 10);
+        let cache = DnsCache::with_stale(16, StalePolicy::OFF, clock);
+        put_a(&cache, "www.example.com.", 3600);
+        assert!(cache
+            .get(nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+            .is_some());
     }
 }

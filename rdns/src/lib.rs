@@ -38,6 +38,8 @@ mod bench;
 pub mod cache;
 pub mod catalog;
 pub mod config;
+/// Cache expiry arithmetic, `pub(crate)` for the reason [`eviction`] is.
+mod deadline;
 pub mod dns64;
 pub mod dnssec;
 pub mod dnssec_answer;

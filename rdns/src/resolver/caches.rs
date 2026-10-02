@@ -16,6 +16,7 @@
 // The parent's `use` block, not a copy per file: these three are continuations
 // of one `impl Resolver`, and a second import list is a second thing to drift.
 use super::*;
+use crate::deadline::Deadline;
 use crate::eviction::Halving;
 
 /// Servers already learned for a zone, so a resolution can start partway down
@@ -38,7 +39,7 @@ struct CachedDelegation {
     /// the delegations a query happened to walk is a rule in force for the
     /// first client and not the next (`TODO.md` #56).
     ns_names: Vec<Name>,
-    expires_at: u64,
+    expires_at: Deadline,
 }
 
 /// Where a walk starts: a zone, its servers, and what the referral called them.
@@ -85,7 +86,7 @@ impl DelegationCache {
         let folded = qname.folded_in(&mut buf);
         for (candidate, key) in qname.ancestors().zip(folded.ancestors()) {
             match entries.get(key.as_wire()) {
-                Some(entry) if entry.expires_at > now && accept(candidate) => {
+                Some(entry) if entry.expires_at.is_live(now) && accept(candidate) => {
                     return Some(Start {
                         zone: candidate.to_owned(),
                         servers: entry.servers.clone(),
@@ -93,7 +94,7 @@ impl DelegationCache {
                     });
                 }
                 // Live, but the caller does not want to start here.
-                Some(entry) if entry.expires_at > now => {}
+                Some(entry) if entry.expires_at.is_live(now) => {}
                 Some(_) => {
                     entries.remove(key.as_wire());
                 }
@@ -121,9 +122,9 @@ impl DelegationCache {
 
         if entries.len() >= self.capacity {
             let now = self.clock.now();
-            entries.retain(|_, e| e.expires_at > now);
+            entries.retain(|_, e| e.expires_at.is_live(now));
             // Soonest to expire first: the least lost by re-learning.
-            halve(&mut entries, self.capacity, |e| e.expires_at);
+            halve(&mut entries, self.capacity, |e| e.expires_at.unix_secs());
         }
 
         entries.insert(
@@ -131,7 +132,7 @@ impl DelegationCache {
             CachedDelegation {
                 servers,
                 ns_names,
-                expires_at: self.clock.now() + ttl.min(MAX_DELEGATION_TTL),
+                expires_at: Deadline::after(self.clock.now(), ttl.min(MAX_DELEGATION_TTL)),
             },
         );
     }
@@ -229,7 +230,7 @@ pub(super) struct KeyCache {
 #[derive(Debug, Clone)]
 struct CachedKeys {
     keys: Vec<Dnskey>,
-    expires_at: u64,
+    expires_at: Deadline,
 }
 
 /// Never hold a validated key set longer than this, whatever the TTL says: a
@@ -252,7 +253,7 @@ impl KeyCache {
         // are one entry, and looking one up unfolded would miss its own write.
         let key = zone.folded();
         match entries.get(key.as_ref()) {
-            Some(entry) if entry.expires_at > now => Some(entry.keys.clone()),
+            Some(entry) if entry.expires_at.is_live(now) => Some(entry.keys.clone()),
             Some(_) => {
                 entries.remove(key.as_ref());
                 None
@@ -270,14 +271,14 @@ impl KeyCache {
         };
         if entries.len() >= self.capacity {
             let now = self.clock.now();
-            entries.retain(|_, e| e.expires_at > now);
-            halve(&mut entries, self.capacity, |e| e.expires_at);
+            entries.retain(|_, e| e.expires_at.is_live(now));
+            halve(&mut entries, self.capacity, |e| e.expires_at.unix_secs());
         }
         entries.insert(
             zone.folded().into_owned().into_boxed_slice(),
             CachedKeys {
                 keys,
-                expires_at: self.clock.now() + ttl.min(MAX_KEY_TTL),
+                expires_at: Deadline::after(self.clock.now(), ttl.min(MAX_KEY_TTL)),
             },
         );
     }
@@ -535,5 +536,33 @@ mod tests {
         assert!(entries.len() <= 2, "cache must stay within capacity");
         // The soonest-to-expire entry is the one dropped.
         assert!(!entries.contains_key(&key_of("a.test.")));
+    }
+
+    /// An expiry is `now` plus a TTL, saturating (`TODO.md` #154): a clock
+    /// near the end of `u64` keeps the entry until the end of time rather than
+    /// overflowing.
+    #[test]
+    fn an_entry_cached_at_the_end_of_time_is_kept() {
+        let server: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let delegations = DelegationCache::new(16, Clock::fixed(u64::MAX - 10));
+        delegations.insert(nm("example.com.").as_ref(), vec![server], Vec::new(), 3600);
+        assert!(delegations
+            .best_match(nm("www.example.com.").as_ref())
+            .is_some());
+    }
+
+    /// As above, for the key cache.
+    #[test]
+    fn a_key_set_cached_at_the_end_of_time_is_kept() {
+        let keys = KeyCache::new(16, Clock::fixed(u64::MAX - 10));
+        let key = Dnskey {
+            owner: nm("example.com."),
+            flags: 257,
+            protocol: 3,
+            algorithm: 13,
+            public_key: vec![0; 64],
+        };
+        keys.insert(nm("example.com.").as_ref(), vec![key], 3600);
+        assert!(keys.get(nm("example.com.").as_ref()).is_some());
     }
 }

@@ -16,6 +16,7 @@
 //! - TTL is bounded by the proof, not by the question.
 
 use crate::clock::Clock;
+use crate::deadline::Deadline;
 use crate::denial_wire::{canonical_sort_key, CanonicalKey};
 use crate::dnssec::{signed_owner_name, Rrsig};
 use crate::dnssec_denial::{
@@ -69,7 +70,7 @@ struct CachedProof<T> {
     /// The record and its RRSIGs, kept whole so a DO client gets the proof it
     /// would have got from the zone.
     records: Vec<ResourceRecord>,
-    expires_at: u64,
+    expires_at: Deadline,
 }
 
 /// An RRset that a wildcard answered with, ready to answer with again.
@@ -80,7 +81,7 @@ struct CachedWildcard {
     /// unchanged, which is also why the answer needs its own denial proof
     /// (RFC 4035 §5.3.4).
     records: Vec<ResourceRecord>,
-    expires_at: u64,
+    expires_at: Deadline,
 }
 
 #[derive(Debug, Clone)]
@@ -88,16 +89,16 @@ struct CachedSoa {
     records: Vec<ResourceRecord>,
     /// The negative-caching TTL: `min(SOA TTL, SOA MINIMUM)` (RFC 2308 §5).
     negative_ttl: u32,
-    expires_at: u64,
+    expires_at: Deadline,
 }
 
 impl<T> CachedProof<T> {
     fn live(&self, now: u64) -> bool {
-        self.expires_at > now
+        self.expires_at.is_live(now)
     }
 
     fn remaining(&self, now: u64) -> u32 {
-        self.expires_at.saturating_sub(now).min(u32::MAX as u64) as u32
+        self.expires_at.remaining_ttl(now)
     }
 }
 
@@ -216,7 +217,7 @@ impl NsecCache {
         let soa = CachedSoa {
             records: records_at(&response.authorities, zone.as_ref(), rt::SOA),
             negative_ttl,
-            expires_at: now + (negative_ttl as u64).min(MAX_PROOF_TTL),
+            expires_at: Deadline::after(now, u64::from(negative_ttl).min(MAX_PROOF_TTL)),
         };
 
         let Ok(mut zones) = self.zones.lock() else {
@@ -249,7 +250,7 @@ impl NsecCache {
                         CachedProof {
                             proof: nsec,
                             records,
-                            expires_at: now + ttl,
+                            expires_at: Deadline::after(now, ttl),
                         },
                         now,
                     );
@@ -277,7 +278,7 @@ impl NsecCache {
                         CachedProof {
                             proof: nsec3,
                             records,
-                            expires_at: now + ttl,
+                            expires_at: Deadline::after(now, ttl),
                         },
                         now,
                     );
@@ -378,7 +379,7 @@ impl NsecCache {
                 (wildcard, Qtype::of(rtype)),
                 CachedWildcard {
                     records,
-                    expires_at: now + ttl,
+                    expires_at: Deadline::after(now, ttl),
                 },
                 now,
             );
@@ -405,7 +406,7 @@ impl NsecCache {
                     CachedProof {
                         proof: nsec,
                         records,
-                        expires_at: now + ttl,
+                        expires_at: Deadline::after(now, ttl),
                     },
                     now,
                 );
@@ -444,16 +445,12 @@ impl NsecCache {
         let cached = zone
             .wildcards
             .get(&(wildcard, qtype))
-            .filter(|w| w.expires_at > now)?;
+            .filter(|w| w.expires_at.is_live(now))?;
         // The queried name must not exist. `covering_nsec` also refuses a gap
         // below a delegation, whose names sort inside it.
         let denial = zone.covering_nsec(qname, now)?;
 
-        let ttl = cached
-            .expires_at
-            .saturating_sub(now)
-            .min(denial.expires_at.saturating_sub(now))
-            .min(u32::MAX as u64) as u32;
+        let ttl = cached.expires_at.min(denial.expires_at).remaining_ttl(now);
         if ttl == 0 {
             return None;
         }
@@ -497,14 +494,12 @@ impl NsecCache {
                 .filter(|(z, _)| qname.is_at_or_under(z.as_ref()))
                 .max_by_key(|(z, _)| z.as_ref().label_count())?;
 
-            let soa = zone.soa.as_ref().filter(|s| s.expires_at > now)?;
+            let soa = zone.soa.as_ref().filter(|s| s.expires_at.is_live(now))?;
             let gathered = zone
                 .gather_nodata(qname, qtype, now)
                 .or_else(|| zone.gather_nxdomain(qname, zone_name.as_ref(), now))?;
 
-            let soa_ttl = soa
-                .negative_ttl
-                .min(soa.expires_at.saturating_sub(now).min(u32::MAX as u64) as u32);
+            let soa_ttl = soa.negative_ttl.min(soa.expires_at.remaining_ttl(now));
             (zone_name.clone(), soa.records.clone(), soa_ttl, gathered)
         };
 
@@ -923,7 +918,7 @@ fn insert_bounded_map(
     now: u64,
 ) {
     if !map.contains_key(&key) && map.len() >= MAX_WILDCARDS_PER_ZONE {
-        map.retain(|_, v| v.expires_at > now);
+        map.retain(|_, v| v.expires_at.is_live(now));
         if map.len() >= MAX_WILDCARDS_PER_ZONE {
             if let Some(soonest) = map
                 .iter()
@@ -970,7 +965,7 @@ fn insert_bounded<K: Ord + Clone, T>(
 fn evict_zone(zones: &mut HashMap<Name, ZoneProofs>, max_zones: usize, now: u64) {
     let before = zones.len();
     // A zone whose SOA has gone proves nothing: the negative TTL comes from it.
-    zones.retain(|_, z| z.soa.as_ref().is_some_and(|s| s.expires_at > now));
+    zones.retain(|_, z| z.soa.as_ref().is_some_and(|s| s.expires_at.is_live(now)));
     if zones.len() < before {
         return;
     }
@@ -985,7 +980,7 @@ fn evict_zone(zones: &mut HashMap<Name, ZoneProofs>, max_zones: usize, now: u64)
 /// A zone with no SOA is not held by [`evict_zone`], so 0 is the value that
 /// sorts such a zone out first rather than a claim about its lifetime.
 fn zone_expiry(zone: &ZoneProofs) -> u64 {
-    zone.soa.as_ref().map(|s| s.expires_at).unwrap_or(0)
+    zone.soa.as_ref().map_or(0, |s| s.expires_at.unix_secs())
 }
 
 #[cfg(test)]
@@ -2060,5 +2055,29 @@ mod tests {
             .synthesize_wildcard(nm("b.example.com.").as_ref(), Qtype::of(rt::A))
             .is_none());
         assert!(cache.is_empty());
+    }
+
+    /// An expiry is `now` plus a TTL, saturating (`TODO.md` #154): a clock
+    /// near the end of `u64` keeps the entry until the end of time rather than
+    /// overflowing.
+    #[test]
+    fn an_entry_cached_at_the_end_of_time_is_kept() {
+        let cache = NsecCache::with_clock(16, Clock::fixed(u64::MAX - 10));
+        cache.insert_validated(&negative(
+            "nope.example.com.",
+            ResponseCode::NoSuchDomain,
+            vec![
+                soa_record("example.com.", 3600, Ttl::from_secs(3600)),
+                nsec_record(
+                    "example.com.",
+                    "www.example.com.",
+                    &[rt::SOA, rt::NS, rt::RRSIG, rt::NSEC],
+                    Ttl::from_secs(3600),
+                ),
+            ],
+        ));
+        assert!(cache
+            .synthesize(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
+            .is_some());
     }
 }
