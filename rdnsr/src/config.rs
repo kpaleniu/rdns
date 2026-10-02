@@ -297,19 +297,6 @@ impl Config {
                 _ => {}
             }
         }
-        // clap's `requires` for the three listeners, which the file has no
-        // equivalent of: a listener with no certificate binds 853 and presents
-        // nothing.
-        let encrypted = self.server.tls_listen.is_some()
-            || self.server.quic_listen.is_some()
-            || self.server.https_listen.is_some();
-        if encrypted && (self.server.tls_cert.is_none() || self.server.tls_key.is_none()) {
-            bail!(
-                "server.tls-listen, quic-listen and https-listen need server.tls-cert \
-                 and server.tls-key: a listener with no certificate cannot complete a \
-                 handshake"
-            );
-        }
         for (name, key) in &self.keys {
             match (&key.secret, &key.secret_file) {
                 (Some(_), Some(_)) => bail!(
@@ -731,9 +718,18 @@ hsot = \"127.0.0.1\"
         );
     }
 
+    /// The pair rule is checked once, over the merged view, by
+    /// `Encrypted::configure` (`TODO.md` #153): a file naming a listener and no
+    /// certificate parses, and is refused there.
     #[test]
     fn a_tls_listener_needs_a_certificate() {
-        let err = parse("[server]\ntls-listen = \"0.0.0.0:853\"\n").expect_err("no certificate");
+        let mut cli = Cli::parse_from(["rdnsr"]);
+        parse("[server]\ntls-listen = \"0.0.0.0:853\"\n")
+            .expect("the file parses")
+            .apply(&mut cli);
+        let err = rdns_transport::encrypted::Encrypted::configure(cli.encrypted_flags(), None)
+            .err()
+            .expect("no certificate");
         assert!(err.to_string().contains("tls-cert"), "got: {err}");
     }
 

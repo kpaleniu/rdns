@@ -26,3 +26,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 # `tokio::time::pause`, so a refresh task's RETRY — minutes at the floor — can
 # be waited out in a test (`TODO.md` #135). A feature, not a package.
 tokio = { workspace = true, features = ["test-util"] }
+# A certificate per run for the DoH dry-run test (`TODO.md` #153): the
+# dev-dependency and flags `rdnsd` uses, so one version in the lock and no
+# runtime package.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }

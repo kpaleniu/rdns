@@ -122,6 +122,41 @@ secret = \"not!base64!\"
     );
 }
 
+/// The dry run names each encrypted listener, a DoH-only one included: the
+/// case `rdnsd`'s copy of this line once reported as disabled, and which this
+/// daemon reported only as "certificate loads" (`TODO.md` #153).
+#[test]
+fn the_dry_run_names_a_doh_only_listener() {
+    let dir = ScratchDir::new("rdnsr-doh-only");
+    let issued =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a certificate");
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    std::fs::write(&cert, issued.cert.pem()).expect("write the certificate");
+    std::fs::write(&key, issued.signing_key.serialize_pem()).expect("write the key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+    }
+
+    let out = rdnsr(&[
+        "--check-config",
+        "--https-listen",
+        "127.0.0.1:8443",
+        "--tls-cert",
+        &cert.to_string_lossy(),
+        "--tls-key",
+        &key.to_string_lossy(),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let line = stdout(&out);
+    assert!(
+        line.contains("encrypted transports on 127.0.0.1:8443/dns-query DoH, certificate loads"),
+        "got: {line:?}"
+    );
+}
+
 /// §15 again, and #63i's row: `--dnstap-max-bytes` was the one flag of 35 not
 /// refused beside `--config`, so the file overwrote it in silence. This asks
 /// whether the refusal reaches the operator.

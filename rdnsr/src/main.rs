@@ -56,12 +56,10 @@ use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl}
 use rdns::shutdown::Shutdown;
 use rdns::validation::{AdmissionCheck, AdmissionLimits};
 use rdns::UdpSizes;
-use rdns_transport::https;
+use rdns_transport::encrypted::{Encrypted, EncryptedFlags, EncryptedListeners};
 use rdns_transport::logging::LogLevel;
 use rdns_transport::metrics_server;
-use rdns_transport::quic;
 use rdns_transport::readiness::Readiness;
-use rdns_transport::tls::{self, CertificateStore};
 use rdns_transport::{tcp, ServeContext, TransportLimits};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
@@ -544,6 +542,17 @@ impl Cli {
             self.rpz_feeds.clone()
         }
     }
+
+    fn encrypted_flags(&self) -> EncryptedFlags<'_> {
+        EncryptedFlags {
+            tls_listen: self.tls_listen.as_deref(),
+            quic_listen: self.quic_listen.as_deref(),
+            https_listen: self.https_listen.as_deref(),
+            https_path: &self.https_path,
+            tls_cert: self.tls_cert.as_deref(),
+            tls_key: self.tls_key.as_deref(),
+        }
+    }
 }
 
 #[tokio::main]
@@ -755,20 +764,9 @@ async fn main() -> anyhow::Result<()> {
     // Read before anything binds, which is what this comment claimed while
     // sitting below three of them: a certificate that will not load is a DoT
     // listener that answers nothing, and `--check-config` has to reach it.
-    // Either encrypted listener needs the pair, which clap's `requires` cannot
-    // express as an "or", so the check is here.
-    let encrypted =
-        cli.tls_listen.is_some() || cli.quic_listen.is_some() || cli.https_listen.is_some();
-    let tls_store = match (encrypted, &cli.tls_cert, &cli.tls_key) {
-        (true, Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
-        (true, _, _) => {
-            return Err(anyhow!(
-                "--tls-listen, --quic-listen and --https-listen need both --tls-cert \
-                 and --tls-key"
-            ))
-        }
-        _ => None,
-    };
+    // Over the merged view, once: the file and the flags each had their own
+    // check of the pair rule (`TODO.md` #153).
+    let encrypted = Encrypted::configure(cli.encrypted_flags(), None)?;
 
     // Here for the same reason, and it was below the binds too: a typo in the
     // list is a client paying the rate limit its operator exempted it from.
@@ -821,9 +819,9 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 format!("{capacity} entries")
             },
-            match (encrypted, &tls_store) {
-                (false, _) | (_, None) => "disabled".to_string(),
-                (true, Some(_)) => "certificate loads".to_string(),
+            match &encrypted {
+                None => "disabled".to_string(),
+                Some(encrypted) => format!("on {}, certificate loads", encrypted.listeners()),
             },
         );
         return Ok(());
@@ -845,35 +843,8 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    let tls_listener = match (&cli.tls_listen, &tls_store) {
-        (Some(spec), Some(store)) => Some((
-            TcpListener::bind(spec)
-                .await
-                .with_context(|| format!("--tls-listen {spec}"))?,
-            tls::server_config(store.clone(), None)?,
-        )),
-        _ => None,
-    };
-    let https_listener = match (&cli.https_listen, &tls_store) {
-        (Some(spec), Some(store)) => Some((
-            TcpListener::bind(spec)
-                .await
-                .with_context(|| format!("--https-listen {spec}"))?,
-            https::endpoint(store.clone(), &cli.https_path, None)?,
-        )),
-        _ => None,
-    };
-    let quic_endpoint = match (&cli.quic_listen, &tls_store) {
-        (Some(spec), Some(store)) => Some(
-            quinn::Endpoint::server(
-                quic::server_config(store.clone(), TransportLimits::default(), None)?,
-                spec.parse()
-                    .with_context(|| format!("--quic-listen {spec} is not an address:port"))?,
-            )
-            .with_context(|| format!("--quic-listen {spec}"))?,
-        ),
-        _ => None,
-    };
+    let stream_listeners =
+        EncryptedListeners::bind(encrypted.as_ref(), TransportLimits::default()).await?;
 
     let query_limit =
         RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(query_rate_exempt);
@@ -894,7 +865,7 @@ async fn main() -> anyhow::Result<()> {
     });
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, \
-         UDP reply cap: {}B (advertising {}B), UDP in flight: {}",
+         UDP reply cap: {}B (advertising {}B), UDP in flight: {}, encrypted: {}",
         addr,
         source,
         if capacity == 0 {
@@ -919,6 +890,10 @@ async fn main() -> anyhow::Result<()> {
         udp.advertised(),
         // Printed because the drops it causes are silent.
         cli.max_inflight_udp.max(1),
+        match &encrypted {
+            Some(encrypted) => encrypted.describe(),
+            None => "off (--tls-listen, --quic-listen, --https-listen)".to_string(),
+        },
     );
     // And the two limits, for the same reason: both drop in silence, so an
     // operator who cannot see the policy blames the network.
@@ -1102,48 +1077,13 @@ async fn main() -> anyhow::Result<()> {
     }
     // Per connection, not per message: a resolver's clients open a connection
     // and ask a few things (`TODO.md` #30e).
-    loops.spawn(tcp::serve(
+    stream_listeners.spawn(
         listener,
         serving.clone(),
-        TransportLimits::default(),
         tcp::RateLimit::PerConnection,
-        shutdown.stop_handle(),
-        shutdown.busy(),
-    ));
-    if let Some((https_listener, endpoint)) = https_listener {
-        loops.spawn(https::serve(
-            https_listener,
-            endpoint,
-            serving.clone(),
-            TransportLimits::default(),
-            tcp::RateLimit::PerConnection,
-            shutdown.stop_handle(),
-            shutdown.busy(),
-        ));
-    }
-    if let Some(endpoint) = quic_endpoint {
-        loops.spawn(quic::serve(
-            endpoint,
-            serving.clone(),
-            TransportLimits::default(),
-            tcp::RateLimit::PerConnection,
-            shutdown.stop_handle(),
-            shutdown.busy(),
-        ));
-    }
-    // Same admission, same per-connection rate rule as the plain TCP loop: what
-    // TLS changes is who can read the connection, not what is answered on it.
-    if let Some((tls_listener, config)) = tls_listener {
-        loops.spawn(tls::serve(
-            tls_listener,
-            config,
-            serving.clone(),
-            TransportLimits::default(),
-            tcp::RateLimit::PerConnection,
-            shutdown.stop_handle(),
-            shutdown.busy(),
-        ));
-    }
+        &shutdown,
+        &mut loops,
+    );
     // Two things pass through the one reload this daemon has: the certificate a
     // renewal rewrote, and every `--rpz` file. `rdnsd` folds the same
     // certificate call into the reload every trigger passes through; here there
@@ -1153,9 +1093,9 @@ async fn main() -> anyhow::Result<()> {
     //
     // Not in the `JoinSet` below: that set's rule is "the first task to end ends
     // the process", and this one ends on the stop signal by design.
-    if tls_store.is_some() || serving.policy.is_configured() {
+    if encrypted.is_some() || serving.policy.is_configured() {
         tokio::spawn(reload::reload_task(
-            tls_store.clone(),
+            encrypted.as_ref().map(Encrypted::store),
             serving.clone(),
             reload,
             shutdown.stop_handle(),

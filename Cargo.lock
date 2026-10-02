@@ -1179,6 +1179,7 @@ dependencies = [
  "anyhow",
  "clap",
  "quinn",
+ "rcgen",
  "rdns",
  "rdns-transport",
  "serde",
