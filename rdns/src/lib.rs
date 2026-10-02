@@ -78,6 +78,7 @@ pub mod update;
 pub mod xfr;
 pub mod xot;
 pub mod zone;
+pub mod zone_answer;
 pub mod zone_signer;
 pub mod zone_writer;
 
