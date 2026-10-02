@@ -3202,6 +3202,69 @@ this line has no record and is skipped
         );
     }
 
+    /// `TODO.md` #151a, the first window: a resolution starts below the
+    /// anchor because a delegation and its zone's keys are cached
+    /// (`best_start`), and the keys expire before validation resumes from
+    /// them (`establish_chain`). The second resolution here starts at
+    /// `example.test.`; the authoritative server moves the clock past every
+    /// cached key set while it answers.
+    ///
+    /// Asserts `Secure`, which is what the answer is. Against the code that
+    /// filed it this reads `Bogus`: the resume falls back to the anchor, the
+    /// walk has no referral evidence for the cuts below it, and the answer's
+    /// signer has no keys.
+    #[tokio::test]
+    #[ignore = "TODO.md #151a: Bogus until #151c records trusted starts"]
+    async fn a_key_set_expiring_mid_resolution_still_validates() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let clock = Clock::fixed(crate::clock::current_unix_timestamp());
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let asked: Arc<Mutex<Vec<(SocketAddr, String)>>> = Arc::default();
+
+        let net = h.net.clone();
+        let (moved, arm, log) = (clock.clone(), armed.clone(), asked.clone());
+        let upstream = Upstream::answering(move |server, _, query| {
+            let query = DnsMessage::try_from_bytes(query).ok()?;
+            let name = qname_of(&query);
+            log.lock().unwrap().push((server, name.clone()));
+            if server == fake(3)
+                && name == "www.example.test."
+                && arm.swap(false, Ordering::Relaxed)
+            {
+                // Past the 3 600 s every DNSKEY RRset here carries.
+                moved.advance(3_601);
+            }
+            let answer = net.0.lock().unwrap().get(&server)?.clone();
+            answer(&query).to_bytes_within(u16::MAX as usize).ok()
+        });
+        let resolver = Resolver::with_clock(validating_config(&h), clock).with_upstream(upstream);
+        let question = QuerySection {
+            qname: nm("www.example.test."),
+            qtype: Qtype::of(rt::A),
+            qclass: QueryClass::IN,
+        };
+
+        let (_, first) = resolver
+            .resolve_validated(&question, None)
+            .await
+            .expect("the first resolution succeeds");
+        assert_eq!(first, ValidationState::Secure, "{first}");
+
+        asked.lock().unwrap().clear();
+        armed.store(true, Ordering::Relaxed);
+        let (_, second) = resolver
+            .resolve_validated(&question, None)
+            .await
+            .expect("the second resolution succeeds");
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(
+            asked.first(),
+            Some(&(fake(3), "www.example.test.".to_string())),
+            "the second resolution started at example.test. from the cache: {asked:?}"
+        );
+        assert_eq!(second, ValidationState::Secure, "{second}; asked {asked:?}");
+    }
+
     /// The attack the whole apparatus exists to stop: the authoritative server
     /// hands over a different address alongside a perfectly genuine signature
     /// for the original one.

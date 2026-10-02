@@ -1417,7 +1417,7 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 151. The chain-of-trust walk has no type, so its RFC rules live in the async loop — **filed 2026-10-01**, **enhancement**, **ready-for-agent** (to a stop; see 151 below)
+### 151. The chain-of-trust walk has no type, so its RFC rules live in the async loop — **filed 2026-10-01**, **bug** since 151a, **ready-for-agent** (to a stop; see 151 below)
 
 `dnssec_chain` publishes 26 items (`pub (fn|struct|enum|const|type|trait)`
 above its tests). Outside `rdns` two are named, `ValidationState` and
@@ -1479,9 +1479,9 @@ Order and states:
 
 | item | what | state |
 |---|---|---|
-| **151a** | provoke both windows | ready-for-agent |
-| **151b** | narrow `dnssec_chain`'s resolver-only items to `pub(crate)` | ready-for-agent |
-| **151c** | record trusted starts; resume from them | ready-for-agent, after 151a |
+| **151a** | provoke both windows | **done 2026-10-02**: the first reproduces, the second cannot be provoked; below |
+| **151b** | narrow `dnssec_chain`'s resolver-only items to `pub(crate)` | **done 2026-10-02**, `2508d1b` |
+| **151c** | record trusted starts; resume from them | ready-for-agent, **bug** |
 | **151** | build the walker and the baseline, then stop | ready-for-agent to the stop |
 
 #### Agent brief — 151a
@@ -1514,6 +1514,30 @@ can be made to fail, the row says so and why.
 - [ ] A test that fails is not fixed here.
 
 **Out of scope:** the fix (151c); any change to cache TTLs or capacities.
+
+**Result, 2026-10-02.**
+
+- **The first window reproduces.**
+  `resolver::tests::a_key_set_expiring_mid_resolution_still_validates`
+  resolves `www.example.test.` twice through the signed fixture with a
+  `Clock::Fixed`. The second resolution starts at `example.test.` from the
+  cache (the first query of the second resolution goes to that zone's
+  server), and the server moves the clock 3 601 s, past every cached DNSKEY
+  set, while it answers. `establish_chain` then holds nothing below the
+  anchor, fetches the root's DNSKEYs, finds no referral evidence for `test.`
+  or `example.test.` in this resolution, and returns `Bogus(DNSSEC_BOGUS,
+  "www.example.test. is signed by example.test., whose keys were never
+  established")`. That is SERVFAIL for a secure answer. It fails closed, as
+  the row reasoned, and it is a failure. The test is committed
+  `#[ignore]`d with the reason; 151c removes the attribute.
+- **The second window cannot be provoked.** `holds` and the `get` after it
+  are two synchronous reads with no `await` between them. A `Clock::Fixed`
+  moves only when the test moves it, and nothing a test controls runs
+  between the two. It is reachable in production by two routes: the system
+  clock crossing the expiry second between the reads, or a concurrent
+  resolution's `insert` halving the map. Neither is deterministic, so no
+  test is written for it. 151c removes the second read rather than closing
+  the gap, which is the fix that needs no test to be right.
 
 #### Agent brief — 151b
 
