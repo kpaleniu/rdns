@@ -20,12 +20,9 @@ use rdns::clock::current_unix_timestamp;
 use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
 use rdns::record_types;
 use rdns::validation::{AdmissionCheck, Transport};
-use rdns::zone::{parse_zone_file, NameKind, Zone};
+use rdns::zone::{parse_zone_file, Zone};
 use rdns::zone_signer::{sign_zone, DenialChain, SigningPolicy};
-use rdns::{
-    dnssec_answer, tsig, DnsMessage, DnsMessageBuilder, Edns, EdnsOption, Name, Qtype,
-    ResourceRecord,
-};
+use rdns::{tsig, DnsMessage, DnsMessageBuilder, Edns, EdnsOption, Name, Qtype, ResourceRecord};
 
 /// A name from a literal, for tests only: `Name` is fallible to build and a test
 /// that writes a bad one should fail loudly at that line.
@@ -307,54 +304,26 @@ fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring
     for query in &msg.queries {
         for z in [zone, signed] {
             let _ = z.query(query.qname.as_ref(), query.qtype);
-            let kind = z.name_kind(query.qname.as_ref());
+            let _ = z.name_kind(query.qname.as_ref());
             let _ = z.name_exists(query.qname.as_ref());
             let _ = z.holds_name(query.qname.as_ref());
             let _ = z.delegation_for(query.qname.as_ref());
             let _ = z.matches_query(nm("www.example.com.").as_ref(), query.qname.as_ref());
 
-            // The DO-bit path: signatures, and the three denials. Each into
-            // its own reply, because the writer takes sections in order.
+            // The zone's answer, DO set, as `rdnsd` writes it (#150). It
+            // called the four proof writers one by one, each into its own
+            // reply, including on names the answer path never sends them.
             let mut out = Vec::new();
             let mut compressor = rdns::compression::NameCompressor::new();
-            let mut into = |f: &mut dyn FnMut(&mut rdns::response::ResponseWriter)| {
-                let Ok(mut w) = rdns::response::ResponseWriter::start(
-                    &mut out,
-                    &mut compressor,
-                    u16::MAX as usize,
-                    &msg,
-                ) else {
-                    return;
-                };
-                f(&mut w);
+            if let Ok(mut w) = rdns::response::ResponseWriter::start(
+                &mut out,
+                &mut compressor,
+                u16::MAX as usize,
+                &msg,
+            ) {
+                let _ = rdns::zone_answer::write(z, &query.qname, query.qtype, true, &mut w);
                 let _ = w.finish();
-            };
-            into(&mut |w| {
-                let canonical = query.qname.as_ref().to_folded();
-                let _ = dnssec_answer::push_answer_signatures(
-                    &z.locate(canonical.as_ref()),
-                    canonical.as_ref(),
-                    query.qtype,
-                    w,
-                );
-            });
-            into(&mut |w| {
-                let _ = dnssec_answer::push_negative_proof(z, query.qname.as_ref(), &kind, w);
-            });
-            into(&mut |w| {
-                let _ = dnssec_answer::push_negative_proof(
-                    z,
-                    query.qname.as_ref(),
-                    &NameKind::NotFound,
-                    w,
-                );
-            });
-            into(&mut |w| {
-                let _ = dnssec_answer::push_proof_of_absence(z, query.qname.as_ref(), w);
-            });
-            into(&mut |w| {
-                let _ = dnssec_answer::push_delegation_proof(z, query.qname.as_ref(), w);
-            });
+            }
         }
     }
 

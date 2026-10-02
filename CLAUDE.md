@@ -281,7 +281,7 @@ Cheap to re-check, expensive to rediscover.
 - RFC 1034 §4.3.2 is four cases, tried in order: authority ends here (referral),
   the name has the data, the name is an alias (follow, restart), the name has no
   such data. Getting the first one last is how a parent answers NXDOMAIN for a
-  child's names. See `rdnsd`'s `resolve_in_zone`.
+  child's names. See `rdns::zone_answer`'s `resolve_in_zone`.
 - AA is clear on a referral (RFC 1035 §4.1.1). With AA set, per RFC 8020 every
   resolver caches "the whole subtree does not exist".
 - A name with descendants exists (RFC 4592 §2.2.2) — NODATA, not NXDOMAIN. An

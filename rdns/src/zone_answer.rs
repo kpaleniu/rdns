@@ -14,9 +14,10 @@
 //! order, and a helper that owes both an answer and an authority record hands
 //! the second back to its caller instead of writing it.
 
+mod dnssec_answer;
+
 use std::borrow::Cow;
 
-use crate::dnssec_answer;
 use crate::error::WireError;
 use crate::name::{dname_redirect, Redirect};
 use crate::record_types;
@@ -157,7 +158,7 @@ enum Outcome<'a> {
 /// and "resolvers and servers should be cautious in devoting resources to a
 /// query". One ceiling for both kinds, because they chain together — "DNAMEs
 /// and CNAMEs can chain together to form loops".
-pub const MAX_REDIRECTS: usize = 16;
+const MAX_REDIRECTS: usize = 16;
 
 /// Walk RFC 1034 §4.3.2 for one question.
 ///
@@ -539,4 +540,105 @@ fn refer_to_child(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compression::NameCompressor;
+    use crate::test_records::nm;
+    use crate::zone::parse_zone_file;
+    use crate::{DnsMessage, DnsMessageBuilder, ResourceRecord, Rtype};
+
+    const ZONE: &str = "$ORIGIN example.com.
+$TTL 3600
+@        IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )
+@        IN NS  ns1.example.com.
+ns1      IN A   192.0.2.1
+loop1    IN CNAME loop2.example.com.
+loop2    IN CNAME loop1.example.com.
+sub      IN NS  ns.sub.example.com.
+ns.sub   IN A   192.0.2.20
+*.sub    IN A   192.0.2.77
+";
+
+    /// What `zone` says to the question, read back off the wire.
+    fn answer(zone: &Zone, qname: &str, qtype: Qtype) -> DnsMessage {
+        let request = DnsMessageBuilder::new()
+            .with_query(nm(qname), qtype)
+            .with_id(1)
+            .build();
+        let mut out = Vec::new();
+        let mut compressor = NameCompressor::new();
+        let mut w = ResponseWriter::start(&mut out, &mut compressor, u16::MAX as usize, &request)
+            .expect("start a reply");
+        w.set_authoritative(true);
+        write(zone, &nm(qname), qtype, false, &mut w).expect("the answer writes");
+        w.finish().expect("the reply serializes");
+        DnsMessage::try_from_bytes(&out).expect("and parses back")
+    }
+
+    fn of_type(records: &[ResourceRecord], rtype: Rtype) -> usize {
+        records.iter().filter(|r| r.rdata.rtype() == rtype).count()
+    }
+
+    /// A broken zone must not hang the server. Two aliases pointing at each
+    /// other terminate on the visited set, not on the hop limit.
+    ///
+    /// Moved from `rdnsd` with [`MAX_REDIRECTS`], which it names (#150).
+    #[test]
+    fn a_cname_loop_terminates() {
+        let zone = parse_zone_file(ZONE, "example.com.").expect("the test zone parses");
+        let reply = answer(&zone, "loop1.example.com.", Qtype::of(record_types::A));
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert!(
+            of_type(&reply.answers, record_types::CNAME) <= MAX_REDIRECTS,
+            "the chain is bounded"
+        );
+    }
+
+    /// A DNAME pointing at its own owner's ancestor maps a name to itself —
+    /// RFC 6672 Table 1's `cyc` row. The visited set ends it, as it ends a
+    /// CNAME loop. Moved from `rdnsd` with the test above.
+    #[test]
+    fn a_dname_loop_terminates() {
+        let zone_text = "$ORIGIN example.com.\n$TTL 3600\n\
+                         @ IN SOA ns1.example.com. admin.example.com. \
+                         ( 1 3600 600 604800 300 )\n\
+                         @ IN NS ns1.example.com.\n\
+                         @ IN DNAME example.com.\n";
+        let zone = parse_zone_file(zone_text, "example.com.").expect("the apex DNAME parses");
+        let reply = answer(&zone, "cyc.example.com.", Qtype::of(record_types::A));
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert!(
+            of_type(&reply.answers, record_types::CNAME) <= MAX_REDIRECTS,
+            "the chain is bounded: {:?}",
+            reply.answers
+        );
+    }
+
+    /// `dnssec_answer::deny_the_name_and_its_wildcard` needs
+    /// `*.<closest encloser>` absent, and the guarantor is the order here:
+    /// `delegation_for` is asked first (RFC 1034 §4.3.2's first case), so a
+    /// name under a cut is a referral even with a wildcard below the cut, and
+    /// never reaches a negative proof (`TODO.md` #79e).
+    #[test]
+    fn a_wildcard_below_a_cut_is_still_a_referral() {
+        let zone = parse_zone_file(ZONE, "example.com.").expect("the test zone parses");
+        let qname = nm("nothing.sub.example.com.");
+        assert!(matches!(
+            resolve_in_zone(&zone, &qname, Qtype::of(record_types::A)),
+            Outcome::Referral { .. }
+        ));
+
+        let reply = answer(
+            &zone,
+            "nothing.sub.example.com.",
+            Qtype::of(record_types::A),
+        );
+        assert_eq!(reply.rcode, ResponseCode::Ok, "a referral, not NXDOMAIN");
+        assert!(!reply.authoritive, "AA is clear on a referral");
+        assert!(reply.answers.is_empty(), "RFC 4592 §2.2.1");
+        assert_eq!(of_type(&reply.authorities, record_types::NS), 1);
+    }
 }

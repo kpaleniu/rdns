@@ -172,20 +172,22 @@ fn answer(c: &mut Criterion) {
         })
     });
 
-    // Parse, look up, build, serialize: the library's share of one query.
-    group.bench_function("one whole answer", |b| {
+    // Parse, answer from the zone, write: the library's share of one query as
+    // `rdnsd` runs it, through `zone_answer::write` into a held buffer and
+    // compressor (#150). It cloned a parsed `DnsMessage`, filled `answers` and
+    // serialized it, which is neither daemon's path.
+    let mut compressor = rdns::compression::NameCompressor::new();
+    group.bench_function("parse and write one zone answer", |b| {
         b.iter(|| {
             let parsed = DnsMessage::try_from_bytes(black_box(&wire)).expect("parse");
-            let answers = owned(
-                &zone,
-                &parsed.queries[0].qname.to_string(),
-                Qtype::of(record_types::A),
-            );
-            let mut out = parsed.clone();
-            out.response = true;
-            out.authoritive = true;
-            out.answers = answers;
-            out.to_bytes_within_buf(4096, &mut scratch).expect("write");
+            let query = &parsed.queries[0];
+            let mut w =
+                rdns::response::ResponseWriter::start(&mut scratch, &mut compressor, 4096, &parsed)
+                    .expect("start");
+            w.set_authoritative(true);
+            rdns::zone_answer::write(&zone, &query.qname, query.qtype, false, &mut w)
+                .expect("write");
+            w.finish().expect("finish");
             scratch.len()
         })
     });

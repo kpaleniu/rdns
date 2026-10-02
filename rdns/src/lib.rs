@@ -42,7 +42,6 @@ pub mod config;
 mod deadline;
 pub mod dns64;
 pub mod dnssec;
-pub mod dnssec_answer;
 pub mod dnssec_chain;
 pub mod dnssec_denial;
 pub mod dnssec_key;

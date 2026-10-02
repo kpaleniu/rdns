@@ -247,7 +247,7 @@ impl Qtype {
     ///
     /// ANY means every type at the name (RFC 1035 §3.2.3) *except* RRSIG, NSEC
     /// and NSEC3, which are not answer-section data unless DO asked for them
-    /// (RFC 4035 §3.1.1); `dnssec_answer::answer_signatures` attaches those.
+    /// (RFC 4035 §3.1.1); `rdns::zone_answer` attaches those.
     /// Including them would also make an empty non-terminal in an NSEC-signed
     /// zone look like a name with data.
     pub fn matches(self, rtype: Rtype) -> bool {

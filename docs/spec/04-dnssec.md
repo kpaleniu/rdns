@@ -3,7 +3,8 @@
 `rdns/src/dnssec.rs` (crypto and RRset verification), `dnssec_denial.rs`
 (NSEC/NSEC3 proofs, both directions), `dnssec_chain.rs` (chain of trust, trust
 anchors), `dnssec_key.rs` (private keys), `zone_signer.rs` (signing),
-`dnssec_answer.rs` (what a signed answer carries), `nsec_cache.rs` (RFC 8198),
+`zone_answer/dnssec_answer.rs` (what a signed answer carries, private to
+`zone_answer.rs`), `nsec_cache.rs` (RFC 8198),
 `rfc5011.rs` (managed anchors).
 
 ---
@@ -309,7 +310,8 @@ of the rule with no caller, deleted in `77f0e7b`.)
 
 ## 4.3 What a signed answer owes
 
-`dnssec_answer.rs`. Three of the four shapes owe a proof rather than a signature.
+`zone_answer/dnssec_answer.rs`. Three of the four shapes owe a proof rather
+than a signature.
 
 | answer | owes |
 |---|---|

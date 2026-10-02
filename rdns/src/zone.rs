@@ -9,8 +9,8 @@
 //! What is deliberately not here:
 //!
 //! - **The reply.** Which section a record goes in, what the AA bit says, what a
-//!   negative answer owes as proof: `rdnsd`'s `answer` and
-//!   [`crate::dnssec_answer`]. A zone has no opinion about a client.
+//!   negative answer owes as proof: [`crate::zone_answer`]. A zone has no
+//!   opinion about a client.
 //! - **Anything across zones.** Which zone a question belongs to is the
 //!   daemon's `ZoneMap`, and a referral to a child is a record in *this* zone.
 //! - **Signing.** [`crate::zone_signer`] builds the chains; this module stores
@@ -687,7 +687,7 @@ impl<'a> Located<'a> {
 ///
 /// Not a bool: three of the four are "the name exists", and an empty
 /// non-terminal and a wildcard match each owe a *different* DNSSEC proof (see
-/// [`crate::dnssec_answer::push_negative_proof`]).
+/// [`crate::zone_answer`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameKind {
     /// The zone holds records at this exact name.

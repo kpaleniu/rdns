@@ -214,4 +214,4 @@ transferred zone) and by `rdnsctl dump`.
 | `$GENERATE` | unsupported | |
 | escaped labels | unsupported | see `01-wire-format.md` §1.1 |
 | zone size | memory-bound | the whole zone is resident; there is no on-disk format |
-| redirections within a zone | 16 | CNAME and DNAME share the ceiling, because RFC 6672 §2.2 says they chain together: `MAX_REDIRECTS`, `rdnsd/src/answer.rs` |
+| redirections within a zone | 16 | CNAME and DNAME share the ceiling, because RFC 6672 §2.2 says they chain together: `MAX_REDIRECTS`, `rdns/src/zone_answer.rs` |

@@ -451,32 +451,24 @@ fn writing_a_response_costs_nothing_per_record() {
     within("write it with a fresh buffer and compressor", cold, 3..=3);
 }
 
-/// The three zone lookups `rdnsd` makes per query (RFC 1034 §4.3.2) cost one
-/// allocation between them, and it is the answer: the `Vec` `Zone::query`
-/// returns.
+/// One zone answer to a lower-case question costs nothing: the lookups borrow
+/// the name and the records go straight to the writer.
 ///
-/// A guard against the lookup key going back to an owned copy per lookup — four
-/// per query, ~14% of everything an answer allocated. Against that code this
-/// reads 5. A `Name` is absolute, so only the case fold is left to avoid.
+/// Through [`rdns::zone_answer::write`] since #150. It measured three `Zone`
+/// calls by hand — `delegation_for`, `name_kind`, `query` — and read 1, the
+/// `Vec` `query` returns, which `rdnsd` stopped asking for at #27c. A guard
+/// against the lookup key going back to an owned copy per lookup: four per
+/// query, ~14% of everything an answer allocated.
 fn the_lookups_behind_one_answer_allocate_only_the_answer() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
-
-    // Warm first: the first run of any path pays for state unrelated to the
-    // count, and a target this small cannot absorb it.
-    let qname = nm("www.example.com.");
-    let warm = |zone: &rdns::zone::Zone| {
-        let cut = zone.delegation_for(qname.as_ref());
-        let kind = zone.name_kind(qname.as_ref());
-        let records = zone.query(qname.as_ref(), Qtype::of(record_types::A)).len();
-        (cut, kind, records)
-    };
-    let _ = warm(&zone);
-
-    let ((cut, kind, records), count) = allocations(|| warm(&zone));
-    assert_eq!(cut, None, "www is not below a delegation in this zone");
-    assert_eq!(kind, NameKind::Exact, "www.example.com. is in the zone");
-    assert_eq!(records, 1, "and holds exactly one A record");
-    within("the three lookups behind one answer", count, 1..=1);
+    let (reply, count) =
+        zone_answer_count(&zone, "www.example.com.", Qtype::of(record_types::A), false);
+    assert_eq!(
+        reply.answers.len(),
+        1,
+        "www.example.com. holds exactly one A"
+    );
+    within("one zone answer", count, 0..=0);
 }
 
 /// The same three lookups against the name a DNS-0x20 resolver actually sends.
@@ -515,10 +507,18 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
     // (`TODO.md` #28c); it read 4 while every zone paid for that walk.
     within("the same three lookups, case randomized", count, 3..=3);
 
-    // What the answer path asks now, in the order it asks: fold once at the
-    // door (`TODO.md` #27a), then the delegation walk and one `locate` that
-    // serves both the existence test and the records (#28b, #27c). Nothing is
-    // collected — `query` built a `Vec` for a question that was `is_empty()`.
+    // The answer path itself (#150): the fold at the door, then the
+    // delegation walk and one `locate` that serves both the existence test and
+    // the records (#28b, #27c). The fold is the one allocation, and it needs
+    // somewhere to put the bytes that outlives the question (#27d). It read 4
+    // before #28b, #28c, #27a and #27c.
+    let (reply, count) =
+        zone_answer_count(&zone, "WwW.eXaMpLe.CoM.", Qtype::of(record_types::A), false);
+    assert_eq!(reply.answers.len(), 1);
+    within("the answer path's lookups, case randomized", count, 1..=1);
+
+    // The `Zone` primitives the answer path calls, in its order, for the two
+    // measurements below.
     let answer_path = |zone: &rdns::zone::Zone, name: NameRef<'_>| {
         let mut buf = Vec::new();
         let key = name.folded_in(&mut buf);
@@ -528,18 +528,10 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
         let records = located.of_type(Qtype::of(record_types::A)).count();
         (cut, located.kind().clone(), has, records)
     };
-    let _ = answer_path(&zone, mixed);
-
-    let ((cut, kind, has, records), count) = allocations(|| answer_path(&zone, mixed));
-    assert_eq!((cut, kind, has, records), (None, NameKind::Exact, true, 1));
-    // The fold at the door and nothing else. It read 4 before #28b, #28c, #27a
-    // and #27c; the one left is the fold itself, and it needs somewhere to put
-    // the bytes that outlives the question (#27d).
-    within("the answer path's lookups, case randomized", count, 1..=1);
-
-    // And with somewhere to put them — which is what `rdnsd`'s UDP worker now
-    // holds beside its scratch buffer and its compressor — the same sequence
-    // costs nothing at all. The buffer is warmed first: the interesting number
+    // And with somewhere to put them, the same sequence costs nothing at all.
+    // `rdnsd`'s UDP worker holds such a buffer beside its scratch and its
+    // compressor, and since #38 does not pass it down: `zone_answer::write`
+    // folds into its own, which is the one allocation above (`TODO.md` #160). The buffer is warmed first: the interesting number
     // is the *steady state* of a worker answering datagram after datagram, not
     // its first one.
     let buffered = |zone: &rdns::zone::Zone, name: NameRef<'_>, buf: &mut Vec<u8>| {
@@ -1150,64 +1142,31 @@ fn proving_a_signed_nxdomain() {
     let (reply, count) = nxdomain_proof(&signed_zone());
     assert_eq!(
         reply.authorities.len(),
-        5,
-        "the SOA's RRSIG and two NSECs with theirs"
+        6,
+        "the SOA, its RRSIG, and two NSECs with theirs"
     );
+    // 5 until #150, when this wrote the proof alone. The whole answer adds the
+    // SOA, which costs 3 measured by itself — `Zone::query`'s `Vec`, and 2 to
+    // write an SOA, whose MNAME and RNAME are re-encoded — and the total rose
+    // by 2, so the proof's share is one lower beside it. Not investigated.
     within("prove a signed NXDOMAIN", count, 5..=15);
 }
 
 /// A positive answer from a signed zone: the records and the RRSIGs over them,
-/// written the way `rdnsd`'s answer path writes them.
+/// through [`rdns::zone_answer::write`], which is `rdnsd`'s answer path.
 ///
-/// The gate is on the *sequence*, not on `push_answer_signatures` alone, because
-/// what #25a removed is a repetition between the two halves:
-/// `push_answer_signatures` located the name a second time and canonicalized a
-/// name the caller had already folded. The lookup is time rather than
-/// allocations, so what this holds is the fold — one per signed answer.
+/// The gate is on the *sequence*, because what #25a removed is a repetition
+/// between the two halves: the signatures located the name a second time and
+/// canonicalized a name the caller had already folded. The lookup is time
+/// rather than allocations, so what this holds is the fold — one per signed
+/// answer, and none for a name that arrives lower-case.
+///
+/// Until #150 this re-enacted `rdnsd`'s sequence by hand — locate, push, push
+/// the signatures — and would not have followed a change to it.
 fn answering_a_signed_query() {
     let zone = signed_zone();
-    let request = rdns::DnsMessageBuilder::new()
-        .with_query(nm("www.example.com."), Qtype::of(record_types::A))
-        .with_id(1)
-        .with_dnssec(true)
-        .build();
-    let qtype = Qtype::of(record_types::A);
-    let mut out = Vec::new();
-    let mut compressor = rdns::compression::NameCompressor::new();
-    let qname = nm("www.example.com.");
-    let qname = qname.as_ref();
-
-    let answer = |w: &mut rdns::response::ResponseWriter| {
-        // As `answer.rs` does it: locate once, and hand that lookup to the
-        // signatures.
-        let at = zone.locate(qname);
-        for record in at.of_type(qtype) {
-            w.push(
-                rdns::response::Section::Answer,
-                qname,
-                record.class,
-                record.ttl,
-                record.rdata,
-            )
-            .expect("the record writes");
-        }
-        rdns::dnssec_answer::push_answer_signatures(&at, qname, qtype, w)
-            .expect("the signatures write")
-    };
-
-    // The first call in a process picks up a one-off; measure the second.
-    let mut w = rdns::response::ResponseWriter::start(&mut out, &mut compressor, 4096, &request)
-        .expect("start a reply");
-    let _ = answer(&mut w);
-    w.finish().expect("the reply serializes");
-
-    let mut w = rdns::response::ResponseWriter::start(&mut out, &mut compressor, 4096, &request)
-        .expect("start a reply");
-    let (wildcard, count) = allocations(|| answer(&mut w));
-    w.finish().expect("the reply serializes");
-    assert!(!wildcard, "an exact name, not a wildcard");
-
-    let reply = rdns::DnsMessage::try_from_bytes(&out).expect("and parses back");
+    let (reply, count) =
+        zone_answer_count(&zone, "www.example.com.", Qtype::of(record_types::A), true);
     assert_eq!(reply.answers.len(), 2, "the A record and its RRSIG");
     within("answer a signed query", count, 0..=0);
 }
@@ -1230,60 +1189,70 @@ fn answering_a_signed_query() {
 /// the QNAME to the same closest encloser.
 fn proving_a_signed_nxdomain_under_nsec3() {
     let (reply, count) = nxdomain_proof(&signed_zone_nsec3());
-    // Five, not seven: one NSEC3 covers the next closer name *and* the
+    // Six, not eight: one NSEC3 covers the next closer name *and* the
     // wildcard, and the writer is told the identical second copy has gone out
     // already — which it could not be while the two halves each built a `Vec`.
     assert_eq!(
         reply.authorities.len(),
-        5,
-        "the SOA's RRSIG and two NSEC3s with theirs"
+        6,
+        "the SOA, its RRSIG, and two NSEC3s with theirs"
     );
+    // 6 until #150; the same SOA as above.
     within("prove a signed NXDOMAIN under NSEC3", count, 5..=15);
 }
 
-/// The authority records `push_negative_proof` writes for an NXDOMAIN, and what
-/// writing them costs.
+/// An NXDOMAIN through [`rdns::zone_answer::write`], and what writing it costs.
 ///
-/// The buffer and the reply are started outside the measurement: what is being
-/// counted is the proof, not the 64 KB scratch every response path already owns.
+/// The whole answer since #150, not the proof alone: the SOA and the walk that
+/// decided NXDOMAIN are counted too, because `rdnsd` pays for them on the same
+/// query and the proof was never reached any other way.
 fn nxdomain_proof(signed: &rdns::zone::Zone) -> (rdns::DnsMessage, u64) {
+    let (reply, count) = zone_answer_count(
+        signed,
+        "nope.example.com.",
+        Qtype::of(record_types::A),
+        true,
+    );
+    assert_eq!(reply.rcode, rdns::ResponseCode::NoSuchDomain);
+    (reply, count)
+}
+
+/// What one [`rdns::zone_answer::write`] costs, in a reply started outside the
+/// measurement: the 64 KB scratch every response path already owns is not the
+/// answer's cost. Run once first, because the first call in a process picks up
+/// a one-off.
+fn zone_answer_count(
+    zone: &rdns::zone::Zone,
+    qname: &str,
+    qtype: Qtype,
+    dnssec_ok: bool,
+) -> (rdns::DnsMessage, u64) {
     let request = rdns::DnsMessageBuilder::new()
-        .with_query(nm("nope.example.com."), Qtype::of(record_types::A))
+        .with_query(nm(qname), qtype)
         .with_id(1)
-        .with_dnssec(true)
+        .with_dnssec(dnssec_ok)
         .build();
+    // Built outside: off the wire a name arrives already built.
+    let qname = nm(qname);
     let mut out = Vec::new();
     let mut compressor = rdns::compression::NameCompressor::new();
-    let prove = |w: &mut rdns::response::ResponseWriter| {
-        rdns::dnssec_answer::push_negative_proof(
-            signed,
-            nm("nope.example.com.").as_ref(),
-            &NameKind::NotFound,
-            w,
+    let mut answer = || {
+        let mut w = rdns::response::ResponseWriter::start(
+            &mut out,
+            &mut compressor,
+            u16::MAX as usize,
+            &request,
         )
-        .expect("the proof writes")
+        .expect("start a reply");
+        let ((), count) = allocations(|| {
+            rdns::zone_answer::write(zone, &qname, qtype, dnssec_ok, &mut w)
+                .expect("the answer writes")
+        });
+        w.finish().expect("the reply serializes");
+        count
     };
-
-    let mut w = rdns::response::ResponseWriter::start(
-        &mut out,
-        &mut compressor,
-        u16::MAX as usize,
-        &request,
-    )
-    .expect("start a reply");
-    prove(&mut w);
-    w.finish().expect("the reply serializes");
-
-    let mut w = rdns::response::ResponseWriter::start(
-        &mut out,
-        &mut compressor,
-        u16::MAX as usize,
-        &request,
-    )
-    .expect("start a reply");
-    let ((), count) = allocations(|| prove(&mut w));
-    w.finish().expect("the reply serializes");
-
+    let _ = answer();
+    let count = answer();
     let reply = rdns::DnsMessage::try_from_bytes(&out).expect("and parses back");
     (reply, count)
 }

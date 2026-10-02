@@ -1,8 +1,9 @@
 # 3. The authoritative server (`rdnsd`)
 
 `rdnsd/src/main.rs`, `config.rs`, `control.rs`, `notify_out.rs`, the library
-modules `transfer`, `xfr`, `ixfr`, `notify`, `secondary`, `security`,
-`validation`, and `rdns-transport`'s `readiness`.
+modules `zone_answer` (§3.2.6 onwards, one zone's answer to one question),
+`transfer`, `xfr`, `ixfr`, `notify`, `secondary`, `security`, `validation`,
+and `rdns-transport`'s `readiness`.
 
 One process serves UDP and TCP on the same host and port. Whichever loop fails
 first takes the process down.

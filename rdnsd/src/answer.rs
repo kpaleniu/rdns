@@ -19,8 +19,6 @@ use rdns::error::WireError;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::record_types;
 use rdns::response::{ResponseWriter, Section};
-#[cfg(test)]
-use rdns::zone_answer::MAX_REDIRECTS;
 use rdns::Qtype;
 use rdns::{DnsMessage, Edns, ExtendedError, OpCode, QueryClass, ResponseCode};
 #[cfg(test)]
@@ -214,10 +212,12 @@ fn answer_question(
     // when there is nothing left to fold, so folding once here makes all of
     // them free — a case-randomized query paid for three (`TODO.md` #27a).
     //
-    // Into the caller's buffer, because a `Cow` here was the last allocation on
-    // this path for a DNS-0x20 query: the folded name has to outlive the
-    // question and a UDP worker can hold the bytes for the life of the process
-    // (#27d's remainder).
+    // ~~Into the caller's buffer~~, because a `Cow` here was the last
+    // allocation on this path for a DNS-0x20 query: the folded name has to
+    // outlive the question and a UDP worker can hold the bytes for the life of
+    // the process (#27d's remainder). **Not since #38**: the fold is
+    // `zone_answer`'s, into a buffer of its own, and `_key_buf` is passed to
+    // nothing (`TODO.md` #160).
     let Some(zone) = zones.for_query(query.qname.as_ref()) else {
         // A zone we do not serve is REFUSED, not NXDOMAIN. NXDOMAIN asserts
         // the name exists nowhere, which we have no standing to say, and a
@@ -476,33 +476,6 @@ x.sub2   IN A   192.0.2.30
         assert_eq!(rdatas(&response.answers, record_types::CNAME).len(), 1);
     }
 
-    /// A DNAME pointing at its own owner's ancestor maps a name to itself —
-    /// RFC 6672 Table 1's `cyc` row. The visited set ends it, as it ends a
-    /// CNAME loop.
-    #[test]
-    fn a_dname_loop_terminates() {
-        let zone_text = "$ORIGIN example.com.\n$TTL 3600\n\
-                         @ IN SOA ns1.example.com. admin.example.com. \
-                         ( 1 3600 600 604800 300 )\n\
-                         @ IN NS ns1.example.com.\n\
-                         @ IN DNAME example.com.\n";
-        let zone = parse_zone_file(zone_text, "example.com.").expect("the apex DNAME parses");
-        let mut zones = Zones::default();
-        drop(zones.insert(zone));
-
-        let response = make_response(
-            &query("cyc.example.com.", Qtype::of(record_types::A), false),
-            &zones,
-            &DnsMetrics::new(),
-        );
-        assert_eq!(response.rcode, ResponseCode::Ok);
-        assert!(
-            rdatas(&response.answers, record_types::CNAME).len() <= MAX_REDIRECTS,
-            "the chain is bounded: {:?}",
-            response.answers
-        );
-    }
-
     /// A resolver randomizes the case of the QNAME and compares the echo byte
     /// for byte; a mismatch is a spoofed answer as far as it is concerned
     /// (DNS-0x20). The answer therefore echoes the name *as asked*, not as the
@@ -583,18 +556,6 @@ x.sub2   IN A   192.0.2.30
         assert_eq!(response.answers[0].rdata.rtype(), record_types::CNAME);
     }
 
-    /// A broken zone must not hang the server. Two aliases pointing at each
-    /// other terminate on the visited set, not on the hop limit.
-    #[test]
-    fn a_cname_loop_terminates() {
-        let response = ask("loop1.example.com.", Qtype::of(record_types::A));
-        assert_eq!(response.rcode, ResponseCode::Ok);
-        assert!(
-            rdatas(&response.answers, record_types::CNAME).len() <= MAX_REDIRECTS,
-            "the chain is bounded"
-        );
-    }
-
     /// The referral, and the header bit that makes it one. This used to be an
     /// NXDOMAIN with AA=1, so per RFC 8020 every resolver cached "the
     /// whole subtree does not exist" and the child zone was off the internet
@@ -643,10 +604,10 @@ x.sub2   IN A   192.0.2.30
     /// nothing. It said `Zone::name_kind` guaranteed that; of that function's
     /// six `NotFound` returns the delegation one does not — it returns
     /// `NotFound` because RFC 4592 §2.2.1 forbids synthesis below a cut, which
-    /// says nothing about the index (`TODO.md` #79e). The guarantor is here:
-    /// `resolve_in_zone` asks `delegation_for` before anything else, which is
-    /// RFC 1034 §4.3.2's first case, so a name under a cut never reaches a
-    /// negative proof at all.
+    /// says nothing about the index (`TODO.md` #79e). The guarantor is
+    /// `rdns::zone_answer`'s `resolve_in_zone`, which asks `delegation_for`
+    /// before anything else (RFC 1034 §4.3.2's first case), so a name under a
+    /// cut never reaches a negative proof at all. This holds it end to end.
     #[test]
     fn a_wildcard_below_a_cut_is_still_a_referral() {
         let mut text = ZONE.to_string();

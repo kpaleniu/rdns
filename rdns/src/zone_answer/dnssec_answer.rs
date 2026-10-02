@@ -28,7 +28,7 @@ use crate::{Name, NameRef, Qtype};
 ///
 /// The apex DNSKEY RRset, not "are there any RRSIGs": signatures with no
 /// published key make an insecure answer bogus rather than validatable.
-pub fn is_signed(zone: &Zone) -> bool {
+pub(super) fn is_signed(zone: &Zone) -> bool {
     zone.locate(zone.origin()).has_type(Qtype::of(rt::DNSKEY))
 }
 
@@ -44,7 +44,7 @@ pub fn is_signed(zone: &Zone) -> bool {
 /// `at` is the answer's own lookup, handed in rather than repeated: the caller
 /// has just read the records out of it (`TODO.md` #25a). `qname` is the name it
 /// was located with, canonical, and is what the signatures are echoed under.
-pub fn push_answer_signatures(
+pub(super) fn push_answer_signatures(
     at: &Located,
     qname: NameRef<'_>,
     qtype: Qtype,
@@ -83,7 +83,7 @@ pub fn push_answer_signatures(
 /// Half of an NXDOMAIN, and the whole of what a wildcard answer owes. One record
 /// under NSEC; under NSEC3 a hash chain cannot point at a name, so it is the
 /// closest encloser and the next closer name (RFC 5155 §7.2.1).
-pub fn push_proof_of_absence(
+pub(super) fn push_proof_of_absence(
     zone: &Zone,
     qname: NameRef<'_>,
     w: &mut ResponseWriter,
@@ -102,7 +102,7 @@ pub fn push_proof_of_absence(
 /// A [`NameKind`] rather than a bool because the wildcard has to come from the
 /// zone: "the first label replaced by `*`" is wrong for anything a wildcard
 /// reaches more than one label down, and denies a name that does not exist.
-pub fn push_negative_proof(
+pub(super) fn push_negative_proof(
     zone: &Zone,
     qname: NameRef<'_>,
     kind: &NameKind,
@@ -142,7 +142,7 @@ pub fn push_negative_proof(
 /// stripped the DS out of.
 ///
 /// The NS RRset gets no signature: it is the child's data (RFC 4035 §2.2).
-pub fn push_delegation_proof(
+pub(super) fn push_delegation_proof(
     zone: &Zone,
     cut: NameRef<'_>,
     w: &mut ResponseWriter,
@@ -206,10 +206,12 @@ fn absence<'z>(
 /// the delegation one does not** (`TODO.md` #79e): it returns `NotFound`
 /// because RFC 4592 §2.2.1 forbids synthesis below a cut, which says nothing
 /// about whether `*.sub` is in the index. The guarantor is the *caller*:
-/// `rdnsd`'s `resolve_in_zone` asks `delegation_for` before anything else —
-/// RFC 1034 §4.3.2's first case — so a name under a cut is a referral and
-/// never reaches a negative proof. `a_wildcard_below_a_cut_is_still_a_referral`
-/// holds it, in that crate, because that is where the ordering lives.
+/// ~~`rdnsd`'s `resolve_in_zone`~~ [`super::resolve_in_zone`] (since #150)
+/// asks `delegation_for` before anything else — RFC 1034 §4.3.2's first case
+/// — so a name under a cut is a referral and never reaches a negative proof.
+/// `rdnsd`'s `a_wildcard_below_a_cut_is_still_a_referral` holds it end to end,
+/// and `zone_answer`'s own test of the same name holds it here, where the
+/// ordering now lives.
 fn deny_the_name_and_its_wildcard<'z>(
     zone: &'z Zone,
     qname: NameRef<'_>,
