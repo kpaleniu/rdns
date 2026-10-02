@@ -3812,6 +3812,8 @@ dnssec_denial::proves_wildcard_expansion(owner, wildcard, &nsecs, &nsec3s)
 // -> WildcardVerdict::{ Proved, Unjudgeable(why) /* insecure */, NotProved(why) }
 
 // The chain, one step at a time. Fetching is the resolver's job, not this API's.
+// pub(crate) since #151b: the resolver is the one driver, so outside `rdns`
+// this is reached through `resolve_validated` below.
 let v = ChainValidator::new(&anchors, now);
 v.start(name)                                  // -> Option<(anchor zone, its DS)>
 v.validate_dnskeys(zone, &records, &ds_set)?   // -> Vec<Dnskey>, or a ValidationState
@@ -3866,6 +3868,7 @@ zone.holds_name(name)         // exact — NOT name_exists, which honours wildca
 ```rust
 // Is this answer the CNAME chain the question asked for? Independent of the
 // signatures — each RRset verifying says nothing about the collection.
+// pub(crate) since #151b, with the rest of the resolver-only chain API.
 match dnssec_chain::cname_chain_shape(&qname, qtype, &answers) {
     ChainShape::Intact { final_name } => {}
     ChainShape::Broken(why) => {}   // -> Bogus

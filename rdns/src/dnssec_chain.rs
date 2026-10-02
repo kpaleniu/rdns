@@ -236,25 +236,25 @@ fn parse_ds_line(line: &str) -> Result<Ds, DnssecError> {
 /// parent's side of the cut is in front of us, and asking the child for its own
 /// DS lets the child answer a question about itself.
 #[derive(Debug, Clone, Default)]
-pub struct DelegationEvidence {
+pub(crate) struct DelegationEvidence {
     /// The child zone being delegated to.
-    pub zone: Name,
+    pub(crate) zone: Name,
     /// The DS RRset from the parent's authority section, if any.
-    pub ds: Vec<Ds>,
+    pub(crate) ds: Vec<Ds>,
     /// The signatures over that DS RRset.
-    pub rrsigs: Vec<Rrsig>,
+    pub(crate) rrsigs: Vec<Rrsig>,
     /// NSEC records offered instead, when there is no DS.
-    pub nsecs: Vec<Nsec>,
+    pub(crate) nsecs: Vec<Nsec>,
     /// NSEC3 records offered instead, when there is no DS.
     pub nsec3s: Vec<Nsec3>,
     /// The class the records came in.
-    pub class: Class,
+    pub(crate) class: Class,
 }
 
 impl DelegationEvidence {
     /// Read a referral's authority section for everything bearing on the
     /// child's security.
-    pub fn from_authority(zone: NameRef<'_>, authorities: &[ResourceRecord]) -> Self {
+    pub(crate) fn from_authority(zone: NameRef<'_>, authorities: &[ResourceRecord]) -> Self {
         let relevant: Vec<&ResourceRecord> = authorities
             .iter()
             .filter(|rr| rr.name.as_ref() == zone)
@@ -275,7 +275,7 @@ impl DelegationEvidence {
 
 /// What checking a delegation established about the child.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DelegationVerdict {
+pub(crate) enum DelegationVerdict {
     /// The parent published a DS we verified: the child must be signed, and
     /// these are the keys it has to match.
     Secure(Vec<Ds>),
@@ -288,21 +288,21 @@ pub enum DelegationVerdict {
 }
 
 /// The keys established for each zone so far, keyed by canonical zone name.
-pub type KeyStore = HashMap<Name, Vec<Dnskey>>;
+pub(crate) type KeyStore = HashMap<Name, Vec<Dnskey>>;
 
 /// An RRset that turned out to have been synthesized from a wildcard.
 ///
 /// Verifying the signature is only half of RFC 4035 §5.3.4; the denial that is
 /// the other half lives in another section of the response.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WildcardExpansion {
+pub(crate) struct WildcardExpansion {
     /// The name the records were served at.
-    pub owner: Name,
+    pub(crate) owner: Name,
     /// The wildcard they were really signed at — `*.example.com.`.
-    pub wildcard: Name,
+    pub(crate) wildcard: Name,
     /// The zone that signed them, and therefore the only zone whose denial of
     /// `owner` counts.
-    pub signer: Name,
+    pub(crate) signer: Name,
 }
 
 /// What validating a set of records established.
@@ -311,9 +311,9 @@ pub struct WildcardExpansion {
 /// still owe a denial of the name they were served at (RFC 4035 §5.3.4), which
 /// [`ChainValidator::validate_wildcard_proofs`] settles.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RecordsVerdict {
-    pub state: ValidationState,
-    pub wildcards: Vec<WildcardExpansion>,
+pub(crate) struct RecordsVerdict {
+    pub(crate) state: ValidationState,
+    pub(crate) wildcards: Vec<WildcardExpansion>,
 }
 
 impl RecordsVerdict {
@@ -325,18 +325,18 @@ impl RecordsVerdict {
     }
 }
 
-pub struct ChainValidator<'a> {
+pub(crate) struct ChainValidator<'a> {
     anchors: &'a TrustAnchors,
     now: u64,
 }
 
 impl<'a> ChainValidator<'a> {
-    pub fn new(anchors: &'a TrustAnchors, now: u64) -> Self {
+    pub(crate) fn new(anchors: &'a TrustAnchors, now: u64) -> Self {
         ChainValidator { anchors, now }
     }
 
     /// Where a walk for `name` starts, and with what DS records.
-    pub fn start(&self, name: NameRef<'_>) -> Option<(Name, Vec<Ds>)> {
+    pub(crate) fn start(&self, name: NameRef<'_>) -> Option<(Name, Vec<Ds>)> {
         let zone = self.anchors.deepest_enclosing(name)?;
         let ds = self.anchors.for_zone(zone.as_ref());
         Some((zone, ds))
@@ -348,7 +348,7 @@ impl<'a> ChainValidator<'a> {
     /// extends trust to *every* key in the set, so a zone can use a separate ZSK
     /// without a DS for it. Trusting the DS-named keys directly instead would
     /// also trust an injected ZSK.
-    pub fn validate_dnskeys(
+    pub(crate) fn validate_dnskeys(
         &self,
         zone: NameRef<'_>,
         records: &[ResourceRecord],
@@ -432,7 +432,7 @@ impl<'a> ChainValidator<'a> {
     }
 
     /// Check what a referral said about its child, using the parent's keys.
-    pub fn validate_delegation(
+    pub(crate) fn validate_delegation(
         &self,
         evidence: &DelegationEvidence,
         parent_zone: NameRef<'_>,
@@ -563,7 +563,11 @@ impl<'a> ChainValidator<'a> {
     /// An RRset whose RRSIG names a zone we have no keys for is bogus, not
     /// unsigned: we walked to that zone precisely because it was signed.
     /// `Secure` here is about signatures only — see [`RecordsVerdict`].
-    pub fn validate_records(&self, records: &[ResourceRecord], keys: &KeyStore) -> RecordsVerdict {
+    pub(crate) fn validate_records(
+        &self,
+        records: &[ResourceRecord],
+        keys: &KeyStore,
+    ) -> RecordsVerdict {
         let rrsigs: Vec<Rrsig> = records.iter().filter_map(Rrsig::from_record).collect();
         let mut validated_any = false;
         let mut wildcards: Vec<WildcardExpansion> = Vec::new();
@@ -643,7 +647,7 @@ impl<'a> ChainValidator<'a> {
     /// `proofs` is the authority section plus whatever earlier hops of a CNAME
     /// chase carried. They are re-verified here: only the zone that signed the
     /// answer can deny a name in it.
-    pub fn validate_wildcard_proofs(
+    pub(crate) fn validate_wildcard_proofs(
         &self,
         expansions: &[WildcardExpansion],
         proofs: &[ResourceRecord],
@@ -795,7 +799,7 @@ const MAX_CNAME_CHAIN: usize = 16;
 
 /// What the shape of an answer's CNAME chain turned out to be.
 #[derive(Debug, PartialEq, Eq)]
-pub enum ChainShape {
+pub(crate) enum ChainShape {
     /// The records form the chain the question asked for, ending at `final_name`.
     Intact { final_name: Name },
     /// They do not, and this says how.
@@ -815,7 +819,7 @@ pub enum ChainShape {
 /// Not the resolver's hop-by-hop `chain` filter, which decides what to *accept*
 /// while fetching. This decides whether what arrived is coherent, wherever it
 /// came from.
-pub fn cname_chain_shape(
+pub(crate) fn cname_chain_shape(
     qname: NameRef<'_>,
     qtype: Qtype,
     answers: &[ResourceRecord],
