@@ -1482,7 +1482,7 @@ Order and states:
 | **151a** | provoke both windows | **done 2026-10-02**: the first reproduces, the second cannot be provoked; below |
 | **151b** | narrow `dnssec_chain`'s resolver-only items to `pub(crate)` | **done 2026-10-02**, `2508d1b` |
 | **151c** | record trusted starts; resume from them | **done 2026-10-02**, **bug**; 151a's test passes |
-| **151** | build the walker and the baseline, then stop | ready-for-agent to the stop |
+| **151** | build the walker and the baseline, then stop | **at the stop 2026-10-02**: both built, measured below; the owner picks |
 
 #### Agent brief — 151a
 
@@ -1609,6 +1609,46 @@ stop for the owner's choice.
 
 **Out of scope:** `validate`'s top half; an async trait-based walk unless
 the walker stalls, in which case say where.
+
+**Result, 2026-10-02: both shapes built; nothing past 151c is on `main`.**
+
+- **Baseline** is `main` from `3935df9` (151c): `establish_chain`'s loop
+  with the resume rule in `Resolution::trusted_start_for`.
+- **Walker** is branch `151-walker`, one commit (`a590735`) on `3935df9`:
+  `dnssec_chain::ChainWalk`, which says what it needs (`ChainNeed::Keys`,
+  `CutBelow`), is fed held keys, a fetched DNSKEY RRset, a fetch failure or
+  the cut evidence, and ends in `ChainNeed::Done(ValidationState)`.
+  `establish_chain` is the loop that fetches and feeds it.
+
+| | baseline | walker |
+|---|---|---|
+| `resolver/validate.rs` lines | 300 | 259 |
+| `establish_chain` lines | 78 | 37 |
+| walk rules a synchronous test reaches | 0 of 9 | 9 of 9 |
+| tests, Windows / Linux | 1391 / 1412 | 1400 / 1421 |
+| allocation counts | as below | identical |
+
+The nine rules: no anchor is Indeterminate; the walk starts at the anchor's
+zone; it resumes from the deepest trusted start at or above the target;
+it ignores a trusted start above the anchor; the target's own zone ends
+Secure; no cut below ends Secure; a delegation verdict ends Insecure or
+Bogus, or moves on with the DS set; keys the DS does not vouch for end Bogus
+and are not handed back; a failed fetch is DNSKEY_MISSING; the step cap
+ends Bogus. In the baseline every one of these is reachable only through
+the async resolver, and 151a's case needed a fake network and a moving
+clock. In the walker it is `a_walk_resumes_from_the_deepest_trusted_start`,
+eleven lines.
+
+Allocation counts are identical in `rdns/tests/allocations.rs` and
+`rdnsr`'s module (12, 2, 3), but neither file counts `establish_chain`. So
+this says the walker added nothing to the paths that are counted, and
+nothing about what a walk costs. The walker allocates its own `KeyStore`,
+which `establish_chain` extends into the caller's at `Done`. That is one
+map per validation, not measured.
+
+What it did not stall on: the trusted start's keys are copied in at
+`start`, so the walker borrows nothing from the resolution and the loop
+can hand `state` to `fetch_dnskeys` mutably.
 
 ---
 
