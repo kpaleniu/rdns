@@ -228,6 +228,7 @@ because a dry run would leave it owned by whoever ran the check.
 | `--udp-workers` | parallelism, clamped 2–32 | datagrams queue in the socket buffer; the kernel drops the overflow and counts it (`netstat -su`) | — |
 | `--max-connections` (per stream listener: TCP, DoT, DoH, DoQ each) | 128 | the next connection waits in the kernel's backlog; one WARN per episode, `dns_connection_accept_waits_total{transport}` | none: `0` is refused, the ceiling is what bounds descriptors |
 | `--connection-idle-timeout` (seconds) | 10 | connection closed; not applied to DoH (`TODO.md` #161) | none: `0` is refused |
+| `--max-connections-per-source` (per stream listener; a source is an IPv4 address or IPv6 /56) | 32 | connection closed with no reply; `dns_connections_refused_per_source_total{transport}`, the source logged at most once a minute | `0`; `--max-connections-per-source-exempt` |
 | `MAX_INFLIGHT_PER_CONNECTION` | 16 | read loop back-pressures | — |
 | `RateLimiter::max_tracked` (sources: IPv4 address, IPv6 /56) | 10 000 | an untracked source is allowed, counted in `dns_rate_limiter_untracked_total` | — |
 | `ResponseLimiter::max_tracked` (response targets: IPv4 /24, IPv6 /56) | 10 000 | an untracked target is truncated (TC=1), not dropped and not sent in full; counted in `dns_response_limiter_untracked_total` | — |
@@ -350,13 +351,17 @@ resolutions a client waited on past it (`TODO.md` #58).
 
 ### Per-listener connection slots
 
-`dns_connections_open{transport=...}` and
-`dns_connection_accept_waits_total{transport=...}`, `transport` one of `tcp`,
+`dns_connections_open{transport=...}`,
+`dns_connection_accept_waits_total{transport=...}` and
+`dns_connections_refused_per_source_total{transport=...}`, `transport` one of `tcp`,
 `dot`, `doh`, `doq` — only for listeners that were bound, so a DoT series at
 zero means a DoT listener with nothing open. The gauge moves where a slot is
 taken and released; the counter counts the times an accept loop found every
 slot taken (`--max-connections`, `TODO.md` #155). A listener also logs one WARN
-when it becomes full and one INFO when it has room again.
+when it becomes full and one INFO when it has room again. The third counts
+connections closed because their source held `--max-connections-per-source`
+(#156); it has no per-address label, which would be an attacker-sized table in
+the scrape.
 
 ### Per-catalog gauge
 

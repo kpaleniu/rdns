@@ -85,7 +85,9 @@ use rdns_transport::metrics_server;
 use rdns_transport::readiness::Readiness;
 use rdns_transport::tcp;
 use rdns_transport::tls::CertificateStore;
-use rdns_transport::{recv_error_is_transient, ServeContext, TransportLimits, UDP_RECEIVE_BUFFER};
+use rdns_transport::{
+    recv_error_is_transient, ServeContext, SourceConnections, TransportLimits, UDP_RECEIVE_BUFFER,
+};
 
 /// The request caps `--max-udp-request` and `--max-tcp-request` ask for, with the
 /// one floor this daemon adds to [`AdmissionLimits::new`]'s.
@@ -141,6 +143,9 @@ fn default_max_connections() -> std::num::NonZeroUsize {
 }
 fn default_connection_idle_timeout() -> std::num::NonZeroU64 {
     rdns_transport::DEFAULT_IDLE_TIMEOUT_SECS
+}
+fn default_max_connections_per_source() -> usize {
+    rdns_transport::DEFAULT_MAX_CONNECTIONS_PER_SOURCE
 }
 fn default_anomaly_interval() -> u64 {
     60
@@ -428,6 +433,25 @@ struct Cli {
         conflicts_with = "config"
     )]
     connection_idle_timeout: std::num::NonZeroU64,
+    /// Connections one source may hold on each stream listener; 0 turns the
+    /// limit off.
+    ///
+    /// A source is an IPv4 address or an IPv6 /56. Over the limit the
+    /// connection is closed with no reply, counted in
+    /// `dns_connections_refused_per_source_total`, and the source named in the
+    /// log at most once a minute. Without it one peer can hold every slot of a
+    /// listener.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = default_max_connections_per_source(),
+        conflicts_with = "config"
+    )]
+    max_connections_per_source: usize,
+    /// An address or CIDR prefix `--max-connections-per-source` does not apply
+    /// to, repeatable. Matched against the connecting address.
+    #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
+    max_connections_per_source_exempt: Vec<String>,
     /// Queries per second, per source: an IPv4 address or an IPv6 /56.
     /// 0 turns the limit off.
     ///
@@ -761,6 +785,8 @@ struct ServePolicy {
     udp_workers: usize,
     /// What one connection may cost on each stream listener.
     connections: TransportLimits,
+    /// And how many of them one source may hold.
+    per_source: SourceConnections,
     /// Where to serve Prometheus metrics, if anywhere.
     metrics_listen: Option<String>,
     /// Where to answer DNS over TLS, QUIC and HTTPS, and with what. `None` is
@@ -835,6 +861,7 @@ async fn serve(
         anomalies: (anomaly_interval, anomaly_thresholds),
         udp_workers,
         connections,
+        per_source,
         metrics_listen,
         tls,
         readiness,
@@ -967,6 +994,7 @@ async fn serve(
                 logger: Arc::new(QueryLogger::new()),
                 metrics,
                 udp,
+                per_source: per_source.clone(),
                 clock: Clock::system(),
             },
         )
@@ -985,9 +1013,10 @@ async fn serve(
          request cap: {udp_cap}B UDP / {tcp_cap}B TCP, \
          UDP reply cap: {reply_cap}B (advertising {advertised}B), \
          UDP workers: {udp_workers}, anomaly warnings: {anomaly_note}, \
-         connections: {} per listener, idle {}s, \
+         connections: {} per listener, {}, idle {}s, \
          TSIG keys: {}, encrypted: {}, metrics: {}, control: {}",
         connections.max_connections,
+        per_source.describe(),
         connections.idle_timeout.as_secs(),
         server.tsig_keys().len(),
         match &tls {
@@ -1666,6 +1695,13 @@ async fn main() -> Result<()> {
     let query_limit = RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(
         TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?,
     );
+    let per_source = SourceConnections::new(
+        cli.max_connections_per_source,
+        TransferAcl::parse_named(
+            &cli.max_connections_per_source_exempt,
+            "--max-connections-per-source-exempt",
+        )?,
+    );
 
     let mut secondary_specs = parse_secondary_specs(&cli.secondary)?;
     // A catalog is replicated by the same machinery as any other zone
@@ -2097,6 +2133,7 @@ async fn main() -> Result<()> {
                 cli.max_connections,
                 cli.connection_idle_timeout,
             ),
+            per_source,
             metrics_listen: cli.metrics_listen,
             tls: encrypted,
             readiness,

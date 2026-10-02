@@ -148,6 +148,7 @@ fn context_at(clock: Clock) -> ServeContext {
         logger: Arc::new(QueryLogger::new()),
         metrics: Arc::new(DnsMetrics::new()),
         udp: UdpSizes::default(),
+        per_source: Default::default(),
         clock,
     }
 }

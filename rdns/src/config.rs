@@ -1,7 +1,7 @@
 //! The `[server]` keys both daemons have, written once.
 //!
-//! `rdnsd`'s `[server]` table holds 38 keys and 24 of them name a setting
-//! `rdnsr` has as a flag under the same name (`TODO.md` #63b, #155). Two parsers for
+//! `rdnsd`'s `[server]` table holds 40 keys and 26 of them name a setting
+//! `rdnsr` has as a flag under the same name (`TODO.md` #63b, #155, #156). Two parsers for
 //! one setting is how `[zones."x"].also-notify` came to be parsed into a field
 //! nothing read (#46c), so the shared half is written here.
 //!
@@ -37,7 +37,7 @@ pub fn taken<T: Clone>(value: &T) -> T {
     value.clone()
 }
 
-/// Declare a `[server]` table: the 24 shared keys, then this daemon's own.
+/// Declare a `[server]` table: the 26 shared keys, then this daemon's own.
 ///
 /// ```ignore
 /// rdns::server_table! {
@@ -111,6 +111,13 @@ macro_rules! server_table {
             max_connections: std::num::NonZeroUsize,
             #[serde(default = "crate::default_connection_idle_timeout")]
             connection_idle_timeout: std::num::NonZeroU64,
+            /// Connections one source may hold per stream listener; 0 is off.
+            /// The exemptions are addresses and CIDR prefixes, matched
+            /// against the peer (`TODO.md` #156).
+            #[serde(default = "crate::default_max_connections_per_source")]
+            max_connections_per_source: usize,
+            #[serde(default)]
+            max_connections_per_source_exempt: Vec<String>,
             /// How often the anomaly warnings run, in seconds; 0 is off. The
             /// four thresholds below are per interval.
             #[serde(default = "crate::default_anomaly_interval")]
@@ -179,6 +186,10 @@ macro_rules! server_table {
                 cli.max_connections = $crate::config::taken(&self.max_connections);
                 cli.connection_idle_timeout =
                     $crate::config::taken(&self.connection_idle_timeout);
+                cli.max_connections_per_source =
+                    $crate::config::taken(&self.max_connections_per_source);
+                cli.max_connections_per_source_exempt =
+                    $crate::config::taken(&self.max_connections_per_source_exempt);
                 cli.anomaly_interval = $crate::config::taken(&self.anomaly_interval);
                 cli.anomaly_query_rate = $crate::config::taken(&self.anomaly_query_rate);
                 cli.anomaly_error_percent = $crate::config::taken(&self.anomaly_error_percent);
@@ -218,6 +229,8 @@ macro_rules! server_table {
                     max_udp_response: crate::default_max_udp_response(),
                     max_connections: crate::default_max_connections(),
                     connection_idle_timeout: crate::default_connection_idle_timeout(),
+                    max_connections_per_source: crate::default_max_connections_per_source(),
+                    max_connections_per_source_exempt: Vec::new(),
                     anomaly_interval: crate::default_anomaly_interval(),
                     anomaly_query_rate: crate::default_anomaly_query_rate(),
                     anomaly_error_percent: crate::default_anomaly_error_percent(),

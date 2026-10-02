@@ -103,6 +103,7 @@ pub async fn serve<H: Handler>(
         limits.max_connections,
         &handler.context().metrics,
         StreamListener::Doq,
+        handler.context().per_source.clone(),
     );
     loop {
         // Before `accept`, as `tcp::serve` does: a full listener leaves the
@@ -138,7 +139,11 @@ pub async fn serve<H: Handler>(
             incoming.refuse();
             continue;
         }
-        slot.open();
+        if !slot.open(Peer::from(peer)) {
+            // Before the handshake, like the rate refusal above.
+            incoming.refuse();
+            continue;
+        }
         let handler = handler.clone();
         let stop = stop.clone();
         let busy = busy.clone();

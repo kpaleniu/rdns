@@ -131,6 +131,30 @@ rdnsd --zone-file example.com.zone --response-rate 4096   # facing the internet
 rdnsd --zone-file example.com.zone --response-rate 0      # closed network only
 ```
 
+### `--max-connections`, `--connection-idle-timeout`, `--max-connections-per-source`, `--max-connections-per-source-exempt`
+
+What a connection may cost on each stream listener — TCP, DoT, DoH and DoQ
+count separately. Both daemons, same defaults.
+
+- `--max-connections` (128): connections a listener holds open. At the
+  ceiling the next connection waits in the kernel's backlog until one closes;
+  the listener logs one WARN when it fills and one INFO when it has room, and
+  `dns_connection_accept_waits_total{transport}` counts the waits. `0` is
+  refused: the ceiling is what stands between a connection flood and the
+  descriptor limit.
+- `--connection-idle-timeout` (10 s): how long a TCP, DoT or DoQ connection
+  may sit idle between messages. Not applied to DoH (`TODO.md` #161). `0` is
+  refused.
+- `--max-connections-per-source` (32): connections one source — an IPv4
+  address or an IPv6 /56 — may hold on a listener. Over it the connection is
+  closed with no reply, counted in
+  `dns_connections_refused_per_source_total{transport}`, and the source named
+  in the log at most once a minute. `0` turns it off. 32 is about ten times
+  what RFC 7766 §6.2.2 asks of a client, which is one connection per purpose.
+- `--max-connections-per-source-exempt`: addresses and CIDR prefixes the
+  per-source limit does not apply to, repeatable, matched against the
+  connecting address. Its own list rather than `--query-rate-exempt`'s.
+
 ### `--query-rate <QUERIES_PER_SEC>`, `--query-burst`, `--query-rate-exempt`
 
 Queries per second per **source** — an IPv4 address or an IPv6 /56 — with a

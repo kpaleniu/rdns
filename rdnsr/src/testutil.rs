@@ -51,6 +51,7 @@ pub(crate) fn test_shell() -> Arc<ServeContext> {
         logger: Arc::new(QueryLogger::new()),
         validator: Arc::new(AdmissionCheck::with_defaults()),
         udp: rdns::UdpSizes::default(),
+        per_source: Default::default(),
         clock: rdns::clock::Clock::system(),
     })
 }

@@ -353,3 +353,37 @@ fn an_idle_connection_is_closed_after_the_configured_timeout() {
         "held {held:?} for a 1 s idle timeout"
     );
 }
+
+/// A typo in the per-source exemption list stops the dry run, named, on the
+/// flag and in the file (`TODO.md` #156).
+#[test]
+fn a_malformed_per_source_exemption_is_refused_by_name() {
+    let dir = ScratchDir::new("per-source-exempt");
+    let zone = zone_in(&dir, ZONE);
+    let out = rdnsd(&[
+        "--check-config",
+        "--zone-file",
+        &zone,
+        "--max-connections-per-source-exempt",
+        "not-an-address",
+    ]);
+    assert!(!out.status.success(), "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("--max-connections-per-source-exempt"),
+        "got: {}",
+        stderr(&out)
+    );
+
+    let config = dir.join("rdnsd.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nzone-dir = {:?}\nmax-connections-per-source = 4\n\
+             max-connections-per-source-exempt = [\"192.0.2.0/24\"]\n",
+            dir.path()
+        ),
+    )
+    .expect("write the config");
+    let out = rdnsd(&["--config", &config.to_string_lossy(), "--check-config"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+}

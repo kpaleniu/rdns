@@ -120,6 +120,7 @@ pub async fn serve<H: Handler>(
         limits.max_connections,
         &handler.context().metrics,
         StreamListener::Doh,
+        handler.context().per_source.clone(),
     );
     loop {
         // Before `accept`, as `tcp::serve` does and for its reason.
@@ -144,7 +145,11 @@ pub async fn serve<H: Handler>(
         if !rate.admits_connection(handler.context(), Peer::from(peer)) {
             continue;
         }
-        slot.open();
+        // Closed unserved: dropping the stream closes it and dropping the
+        // slot releases it.
+        if !slot.open(Peer::from(peer)) {
+            continue;
+        }
         let acceptor = acceptor.clone();
         let handler = handler.clone();
         let path = path.clone();

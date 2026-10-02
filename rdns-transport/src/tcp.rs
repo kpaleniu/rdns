@@ -175,6 +175,7 @@ pub async fn serve<H: Handler>(
         limits.max_connections,
         &handler.context().metrics,
         StreamListener::Tcp,
+        handler.context().per_source.clone(),
     );
     loop {
         // Before `accept`, so a full listener leaves the next connection in
@@ -204,7 +205,11 @@ pub async fn serve<H: Handler>(
         if !rate.admits_connection(handler.context(), Peer::from(peer)) {
             continue;
         }
-        slot.open();
+        // Closed unserved: dropping the stream closes it and dropping the
+        // slot releases it.
+        if !slot.open(Peer::from(peer)) {
+            continue;
+        }
         let handler = handler.clone();
         let stop = stop.clone();
         // Claim the drain for the connection's life: a client cannot tell a
@@ -739,6 +744,77 @@ mod tests {
         let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf-8");
         assert_eq!(text.matches("listener full").count(), 1, "{text}");
         assert_eq!(text.matches("listener has room again").count(), 1, "{text}");
+    }
+
+    /// With two per source, a third connection from one peer is closed without
+    /// a reply while two are open, and a connection after one closes is
+    /// served (`TODO.md` #156).
+    #[tokio::test]
+    async fn a_source_at_its_limit_has_the_next_connection_closed() {
+        let shutdown = Shutdown::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let echo = Arc::new(Echo {
+            ctx: ServeContext {
+                per_source: crate::SourceConnections::new(
+                    2,
+                    rdns::security::TransferAcl::default(),
+                ),
+                ..context(0)
+            },
+            answer: Answer::AfterIdMillis,
+            started: Arc::new(tokio::sync::Notify::new()),
+        });
+        let metrics = echo.ctx.metrics.clone();
+        let server = tokio::spawn(serve(
+            listener,
+            echo,
+            TransportLimits::default(),
+            RateLimit::PerMessage,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        let mut open = Vec::new();
+        for id in [0x0100u16, 0x0200] {
+            let mut client = TcpStream::connect(addr).await.expect("connect");
+            send(&mut client, &query(id)).await;
+            assert_eq!(next_reply(&mut client).await.map(|r| id_of(&r)), Some(id));
+            open.push(client);
+        }
+        let mut third = TcpStream::connect(addr).await.expect("connect");
+        send(&mut third, &query(0x0300)).await;
+        assert!(
+            next_reply(&mut third).await.is_none(),
+            "closed with no reply"
+        );
+        assert_eq!(
+            metrics.listener(StreamListener::Tcp).refused_per_source(),
+            1
+        );
+
+        drop(open.remove(0));
+        // The server notices the close on its next read; until then the
+        // source still holds two.
+        let served = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut next = TcpStream::connect(addr).await.expect("connect");
+                send(&mut next, &query(0x0400)).await;
+                if let Some(reply) = next_reply(&mut next).await {
+                    return id_of(&reply);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("served once one closed");
+        assert_eq!(served, 0x0400);
+
+        shutdown.begin();
+        drop(open);
+        let _ = server.await;
     }
 
     /// A reply too long to frame is dropped rather than sent with a wrapped

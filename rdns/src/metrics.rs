@@ -127,6 +127,10 @@ pub struct ListenerSlots {
     configured: AtomicBool,
     open: AtomicU64,
     accept_waits: AtomicU64,
+    /// Connections closed unserved because their source held the most it may
+    /// (`TODO.md` #156). No per-address label: that would be §5's unbounded
+    /// table in the scrape.
+    refused_per_source: AtomicU64,
 }
 
 impl ListenerSlots {
@@ -148,8 +152,16 @@ impl ListenerSlots {
         self.accept_waits.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn refused_for_source(&self) {
+        self.refused_per_source.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn open(&self) -> u64 {
         self.open.load(Ordering::Relaxed)
+    }
+
+    pub fn refused_per_source(&self) -> u64 {
+        self.refused_per_source.load(Ordering::Relaxed)
     }
 
     pub fn accept_waits(&self) -> u64 {
@@ -854,6 +866,21 @@ impl DnsMetrics {
                     self.listener(l).accept_waits(),
                 );
             }
+            declare(
+                &mut out,
+                "dns_connections_refused_per_source_total",
+                "counter",
+                "Connections closed because their source held the most it may",
+            );
+            for &l in &bound {
+                labelled(
+                    &mut out,
+                    "dns_connections_refused_per_source_total",
+                    "transport",
+                    l.label(),
+                    self.listener(l).refused_per_source(),
+                );
+            }
         }
 
         // Read *through* a poisoned lock rather than past it. Every writer here
@@ -1271,6 +1298,7 @@ mod tests {
         assert!(scrape.contains("dns_connections_open{transport=\"doq\"} 0"));
         assert!(scrape.contains("dns_connection_accept_waits_total{transport=\"tcp\"} 0"));
         assert!(scrape.contains("dns_connection_accept_waits_total{transport=\"doq\"} 1"));
+        assert!(scrape.contains("dns_connections_refused_per_source_total{transport=\"tcp\"} 0"));
         assert!(!scrape.contains("transport=\"dot\""));
         assert!(!scrape.contains("transport=\"doh\""));
         assert!(!DnsMetrics::new()

@@ -47,7 +47,7 @@ pub(crate) struct Config {
     zones: BTreeMap<String, ZoneConfig>,
 }
 
-// `[server]`: the 24 keys both daemons have, from `rdns::server_table!`, then
+// `[server]`: the 26 keys both daemons have, from `rdns::server_table!`, then
 // this daemon's fourteen. The macro also writes `Default`, so the shared half is
 // spelled once there rather than once per daemon (`TODO.md` #63).
 rdns::server_table! {

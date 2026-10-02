@@ -44,7 +44,7 @@ use rdns::clock::Clock;
 use rdns::logging::QueryLogger;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::peer::Peer;
-use rdns::security::{RateLimiter, ResponseLimiter, ResponseVerdict};
+use rdns::security::{RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl};
 use rdns::shutdown::{stop_signal, Shutdown};
 use rdns::validation::{AdmissionCheck, Transport};
 use rdns::{ResponseCode, UdpSizes};
@@ -185,6 +185,8 @@ pub struct ServeContext {
     /// What this host advertises it can reassemble, and the largest datagram it
     /// will send. Not an `Arc`: two `u16`s fixed at startup.
     pub udp: UdpSizes,
+    /// How many connections one source may hold on each stream listener.
+    pub per_source: SourceConnections,
     /// Where the accept loops read the wall clock.
     ///
     /// The four of them had `rdns::clock::current_unix_timestamp()` written out
@@ -293,6 +295,48 @@ impl ServeContext {
         self.metrics.observe_latency_us(timer.elapsed_us());
     }
 }
+
+/// How many connections one source may hold open on each stream listener
+/// (`TODO.md` #156): `--max-connections-per-source`, and who is exempt.
+///
+/// Without it one peer could hold every slot of a listener, keeping each
+/// connection alive with a query inside the idle timeout — #155 made that
+/// visible, this makes it a limit. A source is a [`rdns::peer::Source`], so
+/// rotating within an IPv6 /56 gains nothing; exemption is matched against
+/// the peer, as `--query-rate-exempt` is. Its own list rather than that one,
+/// so the two policies do not move together.
+///
+/// The default is off, which is what a test context wants; both daemons set
+/// it from their flag, whose default is 32.
+#[derive(Clone, Default)]
+pub struct SourceConnections {
+    /// 0 is off.
+    limit: usize,
+    exempt: Arc<TransferAcl>,
+}
+
+impl SourceConnections {
+    pub fn new(limit: usize, exempt: TransferAcl) -> Self {
+        SourceConnections {
+            limit,
+            exempt: Arc::new(exempt),
+        }
+    }
+
+    /// For the startup line.
+    pub fn describe(&self) -> String {
+        match (self.limit, self.exempt.len()) {
+            (0, _) => "no per-source limit".to_string(),
+            (n, 0) => format!("{n} per source"),
+            (n, rules) => format!("{n} per source, {rules} exempt rule(s)"),
+        }
+    }
+}
+
+/// `--max-connections-per-source`' default: about ten times what RFC 7766
+/// §6.2.2 asks of a conforming client — one connection per purpose — and a
+/// quarter of a listener's default ceiling.
+pub const DEFAULT_MAX_CONNECTIONS_PER_SOURCE: usize = 32;
 
 /// `--max-connections`' default, per listener (`TODO.md` #155).
 pub const DEFAULT_MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::new(128).unwrap();

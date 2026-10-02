@@ -61,7 +61,7 @@ use rdns_transport::encrypted::{Encrypted, EncryptedFlags, EncryptedListeners};
 use rdns_transport::logging::LogLevel;
 use rdns_transport::metrics_server;
 use rdns_transport::readiness::Readiness;
-use rdns_transport::{tcp, ServeContext, TransportLimits};
+use rdns_transport::{tcp, ServeContext, SourceConnections, TransportLimits};
 use tokio::task::JoinSet;
 
 use crate::anchors::spawn_anchor_manager;
@@ -144,6 +144,9 @@ fn default_max_connections() -> std::num::NonZeroUsize {
 }
 fn default_connection_idle_timeout() -> std::num::NonZeroU64 {
     rdns_transport::DEFAULT_IDLE_TIMEOUT_SECS
+}
+fn default_max_connections_per_source() -> usize {
+    rdns_transport::DEFAULT_MAX_CONNECTIONS_PER_SOURCE
 }
 fn default_anomaly_interval() -> u64 {
     60
@@ -310,6 +313,25 @@ struct Cli {
         conflicts_with = "config"
     )]
     connection_idle_timeout: std::num::NonZeroU64,
+    /// Connections one source may hold on each stream listener; 0 turns the
+    /// limit off.
+    ///
+    /// A source is an IPv4 address or an IPv6 /56. Over the limit the
+    /// connection is closed with no reply, counted in
+    /// `dns_connections_refused_per_source_total`, and the source named in the
+    /// log at most once a minute. Without it one peer can hold every slot of a
+    /// listener.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = default_max_connections_per_source(),
+        conflicts_with = "config"
+    )]
+    max_connections_per_source: usize,
+    /// An address or CIDR prefix `--max-connections-per-source` does not apply
+    /// to, repeatable. Matched against the connecting address.
+    #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
+    max_connections_per_source_exempt: Vec<String>,
     /// UDP payload size advertised to clients in every reply's OPT, in octets.
     ///
     /// What this resolver says it can reassemble (RFC 6891 §6.2.3), in both
@@ -806,6 +828,13 @@ async fn main() -> anyhow::Result<()> {
     // list is a client paying the rate limit its operator exempted it from.
     let query_rate_exempt =
         TransferAcl::parse_named(&cli.query_rate_exempt, "--query-rate-exempt")?;
+    let per_source = SourceConnections::new(
+        cli.max_connections_per_source,
+        TransferAcl::parse_named(
+            &cli.max_connections_per_source_exempt,
+            "--max-connections-per-source-exempt",
+        )?,
+    );
 
     // The keys a transferred policy feed may be signed with. Parsed through
     // `TsigKey::parse`, so this daemon and `rdnsd` cannot disagree about what a
@@ -907,12 +936,13 @@ async fn main() -> anyhow::Result<()> {
         metrics: Arc::new(DnsMetrics::new()),
         logger: Arc::new(QueryLogger::new()),
         validator: Arc::new(AdmissionCheck::new(admission.clone())),
+        per_source: per_source.clone(),
         clock,
     });
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, \
          UDP reply cap: {}B (advertising {}B), UDP in flight: {}, \
-         connections: {} per listener, idle {}s, encrypted: {}",
+         connections: {} per listener, {}, idle {}s, encrypted: {}",
         listening,
         source,
         if capacity == 0 {
@@ -938,6 +968,7 @@ async fn main() -> anyhow::Result<()> {
         // Printed because the drops it causes are silent.
         cli.max_inflight_udp.max(1),
         cli.max_connections,
+        per_source.describe(),
         cli.connection_idle_timeout,
         match &encrypted {
             Some(encrypted) => stream_listeners.describe(encrypted),

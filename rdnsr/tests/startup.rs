@@ -259,3 +259,30 @@ fn a_zero_connection_limit_or_idle_timeout_is_refused_by_name() {
         assert!(stderr(&out).contains(key), "got: {}", stderr(&out));
     }
 }
+
+/// `rdnsd`'s test of the same name, for the other daemon (`TODO.md` #156).
+#[test]
+fn a_malformed_per_source_exemption_is_refused_by_name() {
+    let out = rdnsr(&[
+        "--check-config",
+        "--max-connections-per-source-exempt",
+        "not-an-address",
+    ]);
+    assert!(!out.status.success(), "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("--max-connections-per-source-exempt"),
+        "got: {}",
+        stderr(&out)
+    );
+
+    let dir = ScratchDir::new("per-source-exempt");
+    let config = dir.join("rdnsr.toml");
+    std::fs::write(
+        &config,
+        "[server]\nmax-connections-per-source = 0\n\
+         max-connections-per-source-exempt = [\"192.0.2.0/24\"]\n",
+    )
+    .expect("write the config");
+    let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+}
