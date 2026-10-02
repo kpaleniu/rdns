@@ -271,8 +271,9 @@ Reading, in all five read loops: read exactly 2 bytes, then exactly that many. A
 zero length is treated as a broken peer and closes the connection.
 
 Timeouts (`rdnsd`, `rdnsr`): the connection may sit idle between messages for
-`TCP_IDLE_TIMEOUT` (10 s); once a length prefix has arrived the peer gets
-`TCP_READ_TIMEOUT` (5 s) for the body.
+`--connection-idle-timeout` (10 s; TCP, DoT and DoQ, not DoH — `TODO.md`
+#161); once a length prefix has arrived the peer gets `read_timeout` (5 s,
+not configurable) for the body.
 
 Writing: the prefix and the message go into one buffer.
 

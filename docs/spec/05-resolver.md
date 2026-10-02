@@ -222,7 +222,7 @@ line beside the counter instead.
 | bound | value | note |
 |---|---|---|
 | `--max-inflight-udp` | 1024 | a task per datagram; a recursion is seconds of waiting. Floored at 1, no off switch |
-| `MAX_TCP_CONNECTIONS` | 128 | |
+| `--max-connections` | 128 | per stream listener; see `06-operations.md` §6.2 |
 | `MAX_INFLIGHT_PER_CONNECTION` | 16 | also the reply channel's depth, so a client pipelining faster than it reads pushes back on the read loop |
 
 Over the UDP ceiling the datagram is dropped before it is copied and before any

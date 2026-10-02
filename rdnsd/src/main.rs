@@ -135,6 +135,12 @@ fn default_udp_payload_size() -> u16 {
 fn default_max_udp_response() -> u16 {
     rdns::FLAG_DAY_UDP_SIZE
 }
+fn default_max_connections() -> std::num::NonZeroUsize {
+    rdns_transport::DEFAULT_MAX_CONNECTIONS
+}
+fn default_connection_idle_timeout() -> std::num::NonZeroU64 {
+    rdns_transport::DEFAULT_IDLE_TIMEOUT_SECS
+}
 fn default_anomaly_interval() -> u64 {
     60
 }
@@ -393,6 +399,29 @@ struct Cli {
         conflicts_with = "config"
     )]
     max_tcp_request: u16,
+    /// Concurrent connections each stream listener holds — TCP, DoT, DoH and
+    /// DoQ count separately.
+    ///
+    /// A full listener leaves the next connection in the kernel's backlog until
+    /// one closes, and says so once in the log and in
+    /// `dns_connection_accept_waits_total`. No `0` for "no limit": the ceiling
+    /// is what stands between a connection flood and the descriptor limit.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = default_max_connections(),
+        conflicts_with = "config"
+    )]
+    max_connections: std::num::NonZeroUsize,
+    /// Seconds a TCP, DoT or DoQ connection may sit idle between messages
+    /// before it is closed. Not applied to DoH (`TODO.md` #161).
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = default_connection_idle_timeout(),
+        conflicts_with = "config"
+    )]
+    connection_idle_timeout: std::num::NonZeroU64,
     /// Queries per second, per client address. 0 turns the limit off.
     ///
     /// Over the limit is dropped silently, so the number has to be generous:
@@ -723,6 +752,8 @@ struct ServePolicy {
     anomalies: (Duration, AnomalyThresholds),
     /// How many UDP datagrams may be answered at once. Floored at 1 in `serve`.
     udp_workers: usize,
+    /// What one connection may cost on each stream listener.
+    connections: TransportLimits,
     /// Where to serve Prometheus metrics, if anywhere.
     metrics_listen: Option<String>,
     /// Where to answer DNS over TLS, QUIC and HTTPS, and with what. `None` is
@@ -796,6 +827,7 @@ async fn serve(
         udp,
         anomalies: (anomaly_interval, anomaly_thresholds),
         udp_workers,
+        connections,
         metrics_listen,
         tls,
         readiness,
@@ -888,8 +920,7 @@ async fn serve(
         None => None,
     };
     // And the encrypted listeners, for the same reason.
-    let stream_listeners =
-        EncryptedListeners::bind(tls.as_ref(), TransportLimits::default()).await?;
+    let stream_listeners = EncryptedListeners::bind(tls.as_ref(), connections).await?;
     // Same rule for the control socket: a path that cannot be bound stops the
     // start.
     #[cfg(unix)]
@@ -945,7 +976,10 @@ async fn serve(
          request cap: {udp_cap}B UDP / {tcp_cap}B TCP, \
          UDP reply cap: {reply_cap}B (advertising {advertised}B), \
          UDP workers: {udp_workers}, anomaly warnings: {anomaly_note}, \
+         connections: {} per listener, idle {}s, \
          TSIG keys: {}, encrypted: {}, metrics: {}, control: {}",
+        connections.max_connections,
+        connections.idle_timeout.as_secs(),
         server.tsig_keys().len(),
         match &tls {
             Some(encrypted) => encrypted.describe(),
@@ -2039,6 +2073,10 @@ async fn main() -> Result<()> {
                 },
             ),
             udp_workers: cli.udp_workers,
+            connections: TransportLimits::configured(
+                cli.max_connections,
+                cli.connection_idle_timeout,
+            ),
             metrics_listen: cli.metrics_listen,
             tls: encrypted,
             readiness,

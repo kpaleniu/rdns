@@ -237,3 +237,23 @@ fn the_binary_reports_a_version() {
         stdout(&out)
     );
 }
+
+/// `rdnsd`'s test of the same name, for the other daemon (`TODO.md` #155).
+#[test]
+fn a_zero_connection_limit_or_idle_timeout_is_refused_by_name() {
+    let dir = ScratchDir::new("zero-connections");
+    for (flag, key) in [
+        ("--max-connections", "max-connections"),
+        ("--connection-idle-timeout", "connection-idle-timeout"),
+    ] {
+        let out = rdnsr(&["--check-config", flag, "0"]);
+        assert!(!out.status.success(), "stdout: {}", stdout(&out));
+        assert!(stderr(&out).contains(flag), "got: {}", stderr(&out));
+
+        let config = dir.join("rdnsr.toml");
+        std::fs::write(&config, format!("[server]\n{key} = 0\n")).expect("write the config");
+        let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
+        assert!(!out.status.success(), "stdout: {}", stdout(&out));
+        assert!(stderr(&out).contains(key), "got: {}", stderr(&out));
+    }
+}

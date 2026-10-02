@@ -10,7 +10,7 @@ use crate::Qtype;
 use crate::Serial;
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Instant;
 
@@ -86,6 +86,75 @@ fn counter(out: &mut String, name: &str, help: &str, value: u64) {
 /// operator's zone file or from a `match` arm in this crate.
 fn labelled(out: &mut String, name: &str, label: &str, value: &str, n: impl std::fmt::Display) {
     let _ = writeln!(out, "{name}{{{label}=\"{value}\"}} {n}");
+}
+
+/// A listener that holds connections, as the scrape labels it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamListener {
+    Tcp,
+    Dot,
+    Doh,
+    Doq,
+}
+
+impl StreamListener {
+    const ALL: [StreamListener; 4] = [
+        StreamListener::Tcp,
+        StreamListener::Dot,
+        StreamListener::Doh,
+        StreamListener::Doq,
+    ];
+
+    /// The `transport` label, and the name a log line gives the listener.
+    pub fn label(self) -> &'static str {
+        match self {
+            StreamListener::Tcp => "tcp",
+            StreamListener::Dot => "dot",
+            StreamListener::Doh => "doh",
+            StreamListener::Doq => "doq",
+        }
+    }
+}
+
+/// One stream listener's connection slots (`TODO.md` #155).
+///
+/// Written where a slot is taken and released, never sampled at scrape
+/// (`CLAUDE.md` §14). `configured` is what keeps a listener nobody bound out
+/// of the scrape: a DoT gauge reading zero on a server with no DoT listener
+/// says something false.
+#[derive(Default)]
+pub struct ListenerSlots {
+    configured: AtomicBool,
+    open: AtomicU64,
+    accept_waits: AtomicU64,
+}
+
+impl ListenerSlots {
+    /// This listener is bound and serving, so its series belong in the scrape.
+    pub fn configure(&self) {
+        self.configured.store(true, Ordering::Relaxed);
+    }
+
+    pub fn opened(&self) {
+        self.open.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn closed(&self) {
+        self.open.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// The accept loop found every slot taken and had to wait for one.
+    pub fn waited(&self) {
+        self.accept_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn open(&self) -> u64 {
+        self.open.load(Ordering::Relaxed)
+    }
+
+    pub fn accept_waits(&self) -> u64 {
+        self.accept_waits.load(Ordering::Relaxed)
+    }
 }
 
 /// One zone's gauges, named, as [`DnsMetrics::zone_facts`] hands them out.
@@ -247,6 +316,9 @@ pub struct Counters {
     pub dnstap_frames: AtomicU64,
     pub dnstap_dropped: AtomicU64,
 
+    /// Indexed by [`StreamListener`]; reached through [`DnsMetrics::listener`].
+    listeners: [ListenerSlots; StreamListener::ALL.len()],
+
     // Cumulative buckets plus count and sum: what `histogram_quantile()` needs.
     //
     // Length from the bounds, not repeated: the two were `8` twice, and a bound
@@ -314,6 +386,7 @@ impl DnsMetrics {
             policy_drops: AtomicU64::new(0),
             dnstap_frames: AtomicU64::new(0),
             dnstap_dropped: AtomicU64::new(0),
+            listeners: Default::default(),
             zones: RwLock::new(BTreeMap::new()),
             catalogs: RwLock::new(BTreeMap::new()),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -334,6 +407,11 @@ impl DnsMetrics {
     /// Add one to a counter: `metrics.count(&metrics.rate_limited)`.
     pub fn count(&self, counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One stream listener's connection slots.
+    pub fn listener(&self, which: StreamListener) -> &ListenerSlots {
+        &self.listeners[which as usize]
     }
 
     /// Record one answer by the code it carries.
@@ -722,6 +800,45 @@ impl DnsMetrics {
         );
         let _ = writeln!(out, "dns_answer_latency_seconds_count {count}");
 
+        // Only listeners that were bound: a DoT gauge at zero on a server with
+        // no DoT listener would be a claim, where its absence is the fact.
+        let bound: Vec<_> = StreamListener::ALL
+            .into_iter()
+            .filter(|&l| self.listener(l).configured.load(Ordering::Relaxed))
+            .collect();
+        if !bound.is_empty() {
+            declare(
+                &mut out,
+                "dns_connections_open",
+                "gauge",
+                "Connections a stream listener holds open",
+            );
+            for &l in &bound {
+                labelled(
+                    &mut out,
+                    "dns_connections_open",
+                    "transport",
+                    l.label(),
+                    self.listener(l).open(),
+                );
+            }
+            declare(
+                &mut out,
+                "dns_connection_accept_waits_total",
+                "counter",
+                "Times a stream listener was full and waited for a slot",
+            );
+            for &l in &bound {
+                labelled(
+                    &mut out,
+                    "dns_connection_accept_waits_total",
+                    "transport",
+                    l.label(),
+                    self.listener(l).accept_waits(),
+                );
+            }
+        }
+
         // Read *through* a poisoned lock rather than past it. Every writer here
         // already decided that a poisoned lock costs a stale gauge and keeps the
         // server answering; dropping the series instead makes every zone on the
@@ -1047,6 +1164,10 @@ mod tests {
         m.set_zone_serial(nm("ex\"ample.net.").as_ref(), Serial::new(8));
         m.note_zone_transfer(nm("example.net.").as_ref(), 1_700_000_000);
         m.set_catalog_members(nm("catalog.example.").as_ref(), 3);
+        m.listener(StreamListener::Tcp).configure();
+        m.listener(StreamListener::Tcp).opened();
+        m.listener(StreamListener::Doq).configure();
+        m.listener(StreamListener::Doq).waited();
         m.to_prometheus_format()
     }
 
@@ -1120,6 +1241,22 @@ mod tests {
             1,
             "a zone with no transfer must be absent, not zero"
         );
+    }
+
+    /// A listener nobody bound has no series; one that was has both, even at
+    /// zero (`TODO.md` #155).
+    #[test]
+    fn only_bound_listeners_reach_the_scrape() {
+        let scrape = a_fully_populated_scrape();
+        assert!(scrape.contains("dns_connections_open{transport=\"tcp\"} 1"));
+        assert!(scrape.contains("dns_connections_open{transport=\"doq\"} 0"));
+        assert!(scrape.contains("dns_connection_accept_waits_total{transport=\"tcp\"} 0"));
+        assert!(scrape.contains("dns_connection_accept_waits_total{transport=\"doq\"} 1"));
+        assert!(!scrape.contains("transport=\"dot\""));
+        assert!(!scrape.contains("transport=\"doh\""));
+        assert!(!DnsMetrics::new()
+            .to_prometheus_format()
+            .contains("dns_connections_open"));
     }
 
     #[test]

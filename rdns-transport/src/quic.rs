@@ -33,9 +33,11 @@ use quinn::{Endpoint, ServerConfig};
 use rdns::shutdown::{Busy, Stop};
 use rdns::validation::{Arrival, PeerCertificate, Transport};
 
+use crate::slots::Slots;
 use crate::tcp::{Handler, RateLimit, Reply};
 use crate::tls::CertificateStore;
 use crate::TransportLimits;
+use rdns::metrics::StreamListener;
 
 /// The port RFC 9250 assigns, which is DoT's.
 ///
@@ -96,8 +98,22 @@ pub async fn serve<H: Handler>(
     stop: Stop,
     busy: Busy,
 ) -> Result<(), std::io::Error> {
-    let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let slots = Slots::new(
+        limits.max_connections,
+        &handler.context().metrics,
+        StreamListener::Doq,
+    );
     loop {
+        // Before `accept`, as `tcp::serve` does: a full listener leaves the
+        // next attempt with quinn rather than taking it on here.
+        let mut slot = tokio::select! {
+            slot = slots.take() => slot,
+            _ = stop.wait() => {
+                endpoint.close(DOQ_NO_ERROR.into(), b"shutting down");
+                endpoint.wait_idle().await;
+                return Ok(());
+            }
+        };
         let incoming = tokio::select! {
             incoming = endpoint.accept() => match incoming {
                 Some(incoming) => incoming,
@@ -119,9 +135,7 @@ pub async fn serve<H: Handler>(
             incoming.refuse();
             continue;
         }
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            continue;
-        };
+        slot.open();
         let handler = handler.clone();
         let stop = stop.clone();
         let busy = busy.clone();
@@ -144,7 +158,7 @@ pub async fn serve<H: Handler>(
                     tracing::debug!(peer = %peer.ip(), "QUIC handshake failed: {e}");
                 }
             }
-            drop(permit);
+            drop(slot);
             drop(busy);
         });
     }

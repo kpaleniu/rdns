@@ -22,7 +22,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 
+use crate::slots::Slots;
 use crate::{ServeContext, TransportLimits};
+use rdns::metrics::StreamListener;
 use rdns::validation::{Arrival, Transport};
 
 /// What a connection's writer task can be handed.
@@ -168,8 +170,18 @@ pub async fn serve<H: Handler>(
     stop: Stop,
     busy: Busy,
 ) -> Result<(), std::io::Error> {
-    let permits = Arc::new(Semaphore::new(limits.max_connections));
+    let slots = Slots::new(
+        limits.max_connections,
+        &handler.context().metrics,
+        StreamListener::Tcp,
+    );
     loop {
+        // Before `accept`, so a full listener leaves the next connection in
+        // the kernel's backlog rather than holding it unserved.
+        let mut slot = tokio::select! {
+            slot = slots.take() => slot,
+            _ = stop.wait() => return Ok(()),
+        };
         // Stop accepting on shutdown; open connections drain in their own tasks.
         // `accept` is cancel-safe, so a connection lost to this race stays in
         // the kernel's backlog.
@@ -188,11 +200,7 @@ pub async fn serve<H: Handler>(
         if !rate.admits_connection(handler.context(), peer.ip()) {
             continue;
         }
-        // Back-pressure on accept rather than unbounded spawning. The semaphore
-        // is never closed, so this only fails if we drop it.
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            continue;
-        };
+        slot.open();
         let handler = handler.clone();
         let stop = stop.clone();
         // Claim the drain for the connection's life: a client cannot tell a
@@ -200,7 +208,7 @@ pub async fn serve<H: Handler>(
         let busy = busy.clone();
         tokio::spawn(async move {
             serve_one(stream, peer, handler, limits, rate, Arrival::Tcp, stop).await;
-            drop(permit);
+            drop(slot);
             drop(busy);
         });
     }
@@ -656,6 +664,77 @@ mod tests {
             "nothing was asked, so the timeout ends it like EOF"
         );
         let _ = task.await;
+    }
+
+    /// A full listener leaves the next connection unserved until one closes,
+    /// and says so once: one warning and one info line for the episode,
+    /// however many times the loop waited in it (`TODO.md` #155).
+    #[tokio::test]
+    async fn a_full_listener_waits_for_a_slot_and_says_so_once() {
+        let (logs, _guard) = crate::testutil::capture_logs();
+        let shutdown = Shutdown::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let echo = Echo::new(Answer::AfterIdMillis, 0);
+        let metrics = echo.ctx.metrics.clone();
+        let tcp = || metrics.listener(StreamListener::Tcp);
+        let limits = TransportLimits {
+            max_connections: 2,
+            ..TransportLimits::default()
+        };
+        let server = tokio::spawn(serve(
+            listener,
+            echo,
+            limits,
+            RateLimit::PerMessage,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        let mut open = Vec::new();
+        for id in [0x0100u16, 0x0200] {
+            let mut client = TcpStream::connect(addr).await.expect("connect");
+            send(&mut client, &query(id)).await;
+            assert_eq!(next_reply(&mut client).await.map(|r| id_of(&r)), Some(id));
+            open.push(client);
+        }
+        assert_eq!(tcp().open(), 2);
+
+        // The kernel completes the handshake from its backlog; nothing reads.
+        let mut third = TcpStream::connect(addr).await.expect("connect");
+        send(&mut third, &query(0x0300)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), next_reply(&mut third))
+                .await
+                .is_err(),
+            "a third connection was served with two open"
+        );
+        assert!(tcp().accept_waits() >= 1);
+        assert_eq!(tcp().open(), 2);
+
+        drop(open.remove(0));
+        assert_eq!(
+            next_reply(&mut third).await.map(|r| id_of(&r)),
+            Some(0x0300),
+            "served once a slot freed"
+        );
+        drop(open);
+        drop(third);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tcp().open() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every connection closed");
+
+        shutdown.begin();
+        let _ = server.await;
+        let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf-8");
+        assert_eq!(text.matches("listener full").count(), 1, "{text}");
+        assert_eq!(text.matches("listener has room again").count(), 1, "{text}");
     }
 
     /// A reply too long to frame is dropped rather than sent with a wrapped

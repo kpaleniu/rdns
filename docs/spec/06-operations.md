@@ -226,7 +226,8 @@ because a dry run would leave it owned by whoever ran the check.
 | `--udp-payload-size` (advertised in every reply's OPT) | 1232 | floors `--max-udp-request`; nothing else | floored at 512 |
 | `--max-udp-response` | 1232 | over it, an empty TC=1 reply and the client retries over TCP, which is not capped | `65535` |
 | `--udp-workers` | parallelism, clamped 2–32 | datagrams queue in the socket buffer; the kernel drops the overflow and counts it (`netstat -su`) | — |
-| `MAX_TCP_CONNECTIONS` | 128 | connection waits | — |
+| `--max-connections` (per stream listener: TCP, DoT, DoH, DoQ each) | 128 | the next connection waits in the kernel's backlog; one WARN per episode, `dns_connection_accept_waits_total{transport}` | none: `0` is refused, the ceiling is what bounds descriptors |
+| `--connection-idle-timeout` (seconds) | 10 | connection closed; not applied to DoH (`TODO.md` #161) | none: `0` is refused |
 | `MAX_INFLIGHT_PER_CONNECTION` | 16 | read loop back-pressures | — |
 | `RateLimiter::max_tracked` | 10 000 | an untracked source is allowed | — |
 | `ResponseLimiter::max_tracked` | 10 000 | an untracked source is truncated (TC=1), not dropped and not sent in full | — |
@@ -344,6 +345,16 @@ resolutions a client waited on past it (`TODO.md` #58).
   `forget_zone`.
 - Gauges are written where the fact changes, not sampled at scrape time.
 - Label values are escaped: RFC 1035 §5.1 allows escapes in a zone name.
+
+### Per-listener connection slots
+
+`dns_connections_open{transport=...}` and
+`dns_connection_accept_waits_total{transport=...}`, `transport` one of `tcp`,
+`dot`, `doh`, `doq` — only for listeners that were bound, so a DoT series at
+zero means a DoT listener with nothing open. The gauge moves where a slot is
+taken and released; the counter counts the times an accept loop found every
+slot taken (`--max-connections`, `TODO.md` #155). A listener also logs one WARN
+when it becomes full and one INFO when it has room again.
 
 ### Per-catalog gauge
 

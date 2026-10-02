@@ -49,8 +49,10 @@ use tokio_rustls::TlsAcceptor;
 use rdns::shutdown::{Busy, Stop};
 use rdns::tls_identity::TlsIdentity;
 
+use crate::slots::Slots;
 use crate::tcp::{Handler, RateLimit, SplitStream};
 use crate::TransportLimits;
+use rdns::metrics::StreamListener;
 use rdns::validation::{Arrival, PeerCertificate, TlsVersion};
 
 /// The port RFC 7858 §3.1 assigns.
@@ -246,8 +248,17 @@ pub async fn serve<H: Handler>(
     busy: Busy,
 ) -> Result<(), io::Error> {
     let acceptor = TlsAcceptor::from(config);
-    let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let slots = Slots::new(
+        limits.max_connections,
+        &handler.context().metrics,
+        StreamListener::Dot,
+    );
     loop {
+        // Before `accept`, as `tcp::serve` does and for its reason.
+        let mut slot = tokio::select! {
+            slot = slots.take() => slot,
+            _ = stop.wait() => return Ok(()),
+        };
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
@@ -263,9 +274,7 @@ pub async fn serve<H: Handler>(
         if !rate.admits_connection(handler.context(), peer.ip()) {
             continue;
         }
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            continue;
-        };
+        slot.open();
         let acceptor = acceptor.clone();
         let handler = handler.clone();
         let stop = stop.clone();
@@ -282,7 +291,7 @@ pub async fn serve<H: Handler>(
                 // A handshake that has not finished by shutdown is a client that
                 // has been told nothing yet, so there is nothing to drain.
                 _ = stop.wait() => {
-                    drop(permit);
+                    drop(slot);
                     drop(busy);
                     return;
                 }
@@ -304,7 +313,7 @@ pub async fn serve<H: Handler>(
                     tracing::debug!(peer = %peer.ip(), "TLS handshake failed: {e}");
                 }
             }
-            drop(permit);
+            drop(slot);
             drop(busy);
         });
     }

@@ -51,9 +51,11 @@ use tokio_rustls::TlsAcceptor;
 use rdns::shutdown::{Busy, Stop};
 use rdns::validation::{Arrival, TlsVersion, Transport};
 
+use crate::slots::Slots;
 use crate::tcp::{Handler, RateLimit, Reply};
 use crate::tls::CertificateStore;
 use crate::TransportLimits;
+use rdns::metrics::StreamListener;
 
 /// The port RFC 8484 uses, which is HTTPS's: DoH is meant to be
 /// indistinguishable from other HTTPS traffic, and a port of its own would
@@ -113,8 +115,17 @@ pub async fn serve<H: Handler>(
 ) -> Result<(), io::Error> {
     let Endpoint { tls, path } = endpoint;
     let acceptor = TlsAcceptor::from(tls);
-    let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let slots = Slots::new(
+        limits.max_connections,
+        &handler.context().metrics,
+        StreamListener::Doh,
+    );
     loop {
+        // Before `accept`, as `tcp::serve` does and for its reason.
+        let mut slot = tokio::select! {
+            slot = slots.take() => slot,
+            _ = stop.wait() => return Ok(()),
+        };
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
@@ -130,9 +141,7 @@ pub async fn serve<H: Handler>(
         if !rate.admits_connection(handler.context(), peer.ip()) {
             continue;
         }
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            continue;
-        };
+        slot.open();
         let acceptor = acceptor.clone();
         let handler = handler.clone();
         let path = path.clone();
@@ -145,7 +154,7 @@ pub async fn serve<H: Handler>(
             let stream = tokio::select! {
                 accepted = acceptor.accept(stream) => accepted,
                 _ = stop.wait() => {
-                    drop(permit);
+                    drop(slot);
                     drop(busy);
                     return;
                 }
@@ -158,7 +167,7 @@ pub async fn serve<H: Handler>(
                         .metrics
                         .count(&handler.context().metrics.tls_handshake_failures);
                     tracing::debug!(peer = %peer.ip(), "HTTPS handshake failed: {e}");
-                    drop(permit);
+                    drop(slot);
                     drop(busy);
                     return;
                 }
@@ -204,7 +213,7 @@ pub async fn serve<H: Handler>(
             if let Err(e) = served {
                 tracing::debug!(peer = %peer.ip(), "HTTPS connection ended: {e}");
             }
-            drop(permit);
+            drop(slot);
             drop(busy);
         });
     }

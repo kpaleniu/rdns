@@ -139,6 +139,12 @@ fn default_udp_payload_size() -> u16 {
 fn default_max_udp_response() -> u16 {
     rdns::FLAG_DAY_UDP_SIZE
 }
+fn default_max_connections() -> std::num::NonZeroUsize {
+    rdns_transport::DEFAULT_MAX_CONNECTIONS
+}
+fn default_connection_idle_timeout() -> std::num::NonZeroU64 {
+    rdns_transport::DEFAULT_IDLE_TIMEOUT_SECS
+}
 fn default_anomaly_interval() -> u64 {
     60
 }
@@ -277,6 +283,29 @@ struct Cli {
     /// length prefix allows 65,535 — but a query has no reason to be large.
     #[arg(long, value_name = "OCTETS", default_value_t = default_max_tcp_request(), conflicts_with = "config")]
     max_tcp_request: u16,
+    /// Concurrent connections each stream listener holds — TCP, DoT, DoH and
+    /// DoQ count separately.
+    ///
+    /// A full listener leaves the next connection in the kernel's backlog until
+    /// one closes, and says so once in the log and in
+    /// `dns_connection_accept_waits_total`. No `0` for "no limit": the ceiling
+    /// is what stands between a connection flood and the descriptor limit.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = default_max_connections(),
+        conflicts_with = "config"
+    )]
+    max_connections: std::num::NonZeroUsize,
+    /// Seconds a TCP, DoT or DoQ connection may sit idle between messages
+    /// before it is closed. Not applied to DoH (`TODO.md` #161).
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = default_connection_idle_timeout(),
+        conflicts_with = "config"
+    )]
+    connection_idle_timeout: std::num::NonZeroU64,
     /// UDP payload size advertised to clients in every reply's OPT, in octets.
     ///
     /// What this resolver says it can reassemble (RFC 6891 §6.2.3), in both
@@ -843,8 +872,11 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    let stream_listeners =
-        EncryptedListeners::bind(encrypted.as_ref(), TransportLimits::default()).await?;
+    let stream_listeners = EncryptedListeners::bind(
+        encrypted.as_ref(),
+        TransportLimits::configured(cli.max_connections, cli.connection_idle_timeout),
+    )
+    .await?;
 
     let query_limit =
         RateLimitConfig::per_second(cli.query_rate, cli.query_burst).exempting(query_rate_exempt);
@@ -865,7 +897,8 @@ async fn main() -> anyhow::Result<()> {
     });
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, \
-         UDP reply cap: {}B (advertising {}B), UDP in flight: {}, encrypted: {}",
+         UDP reply cap: {}B (advertising {}B), UDP in flight: {}, \
+         connections: {} per listener, idle {}s, encrypted: {}",
         addr,
         source,
         if capacity == 0 {
@@ -890,6 +923,8 @@ async fn main() -> anyhow::Result<()> {
         udp.advertised(),
         // Printed because the drops it causes are silent.
         cli.max_inflight_udp.max(1),
+        cli.max_connections,
+        cli.connection_idle_timeout,
         match &encrypted {
             Some(encrypted) => encrypted.describe(),
             None => "off (--tls-listen, --quic-listen, --https-listen)".to_string(),

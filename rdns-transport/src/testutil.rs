@@ -76,3 +76,34 @@ pub(crate) fn answer_with_ttl(id: u16, ttl: u32) -> Vec<u8> {
     packet.extend_from_slice(&[192, 0, 2, 10]);
     packet
 }
+
+/// What this thread logs from here until the guard drops, as text.
+///
+/// Thread-local, so a `#[tokio::test]` — current-thread by default — sees its
+/// spawned tasks' lines and no other test's.
+pub(crate) fn capture_logs() -> (
+    Arc<std::sync::Mutex<Vec<u8>>>,
+    tracing::subscriber::DefaultGuard,
+) {
+    #[derive(Clone)]
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("a test thread panicked")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = Sink(lines.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer(move || sink.clone())
+        .finish();
+    (lines, tracing::subscriber::set_default(subscriber))
+}

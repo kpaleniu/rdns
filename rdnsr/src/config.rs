@@ -68,7 +68,7 @@ fn default_tsig_algorithm() -> String {
     rdns::tsig::TsigAlgorithm::DEFAULT.config_name().to_string()
 }
 
-// `[server]`: the 22 keys both daemons have, from `rdns::server_table!`, then
+// `[server]`: the 24 keys both daemons have, from `rdns::server_table!`, then
 // `max-inflight-udp`, which is a resolver's shape of `rdnsd`'s `udp-workers`.
 // The macro writes `Default` too, so the shared half is spelled once.
 rdns::server_table! {

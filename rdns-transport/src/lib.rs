@@ -29,12 +29,14 @@ pub mod logging;
 pub mod metrics_server;
 pub mod quic;
 pub mod readiness;
+mod slots;
 pub mod tcp;
 #[cfg(test)]
 mod testutil;
 pub mod tls;
 
 use std::net::IpAddr;
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -283,6 +285,12 @@ impl ServeContext {
     }
 }
 
+/// `--max-connections`' default, per listener (`TODO.md` #155).
+pub const DEFAULT_MAX_CONNECTIONS: NonZeroUsize = NonZeroUsize::new(128).unwrap();
+
+/// `--connection-idle-timeout`'s default, in seconds.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(10).unwrap();
+
 /// What a connection may cost, per listener.
 ///
 /// A struct rather than shared `const`s: one constant would force an
@@ -290,6 +298,10 @@ impl ServeContext {
 /// ceiling forever, and they have no reason to (`TODO.md` #30b). The defaults
 /// are what both daemons ran with, and each may take the field it disagrees
 /// about without either editing the other's.
+///
+/// The connection ceiling and the idle timeout are settings since #155, the two
+/// BIND, NSD, Unbound and Knot all expose. The other two stay constants: of
+/// those four only Knot offers either (`tcp-io-timeout`).
 #[derive(Debug, Clone, Copy)]
 pub struct TransportLimits {
     /// How long a connection may sit idle between messages. RFC 7766 §6.2.3
@@ -309,12 +321,29 @@ pub struct TransportLimits {
     pub max_inflight_per_connection: usize,
 }
 
+impl TransportLimits {
+    /// The two settings an operator has, over the defaults of the rest.
+    ///
+    /// Non-zero by type: zero connections blocks every accept and a zero idle
+    /// timeout fails the first length read, so clap and serde refuse `0` by
+    /// name before anything binds (`CLAUDE.md` §15). "Zero is no limit" was
+    /// declined because it reopens the descriptor exhaustion the ceiling is
+    /// for — so, against §14, neither knob has an off switch.
+    pub fn configured(max_connections: NonZeroUsize, idle_timeout_secs: NonZeroU64) -> Self {
+        TransportLimits {
+            max_connections: max_connections.get(),
+            idle_timeout: Duration::from_secs(idle_timeout_secs.get()),
+            ..TransportLimits::default()
+        }
+    }
+}
+
 impl Default for TransportLimits {
     fn default() -> Self {
         TransportLimits {
-            idle_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS.get()),
             read_timeout: Duration::from_secs(5),
-            max_connections: 128,
+            max_connections: DEFAULT_MAX_CONNECTIONS.get(),
             max_inflight_per_connection: 16,
         }
     }

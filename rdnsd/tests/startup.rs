@@ -17,8 +17,8 @@
 //! on it. `CARGO_BIN_EXE_rdnsd` needs no container, works on both platforms,
 //! and tests the artefact an operator runs.
 //!
-//! What this does *not* cover, said rather than implied (§18): binding sockets,
-//! the drain, and signals. CI's `image` job covers those for `rdnsd` and is the
+//! What this does *not* cover, said rather than implied (§18): binding sockets
+//! (one test since #155, to time an idle close), the drain, and signals. CI's `image` job covers those for `rdnsd` and is the
 //! one job no local `cargo` invocation stands in for.
 
 use std::path::Path;
@@ -261,4 +261,95 @@ fn the_harness_points_at_the_binary_and_a_writable_directory() {
     assert!(exe.exists(), "{exe:?} was not built");
     let dir = ScratchDir::new("harness");
     std::fs::write(dir.join("probe"), b"x").expect("the scratch dir is writable");
+}
+
+/// Zero connections blocks every accept and a zero idle timeout fails the
+/// first read, so both are refused before anything binds, with the setting
+/// named on the flag and in the file (`TODO.md` #155).
+#[test]
+fn a_zero_connection_limit_or_idle_timeout_is_refused_by_name() {
+    let dir = ScratchDir::new("zero-connections");
+    let zone = zone_in(&dir, ZONE);
+    for (flag, key) in [
+        ("--max-connections", "max-connections"),
+        ("--connection-idle-timeout", "connection-idle-timeout"),
+    ] {
+        let out = rdnsd(&["--check-config", "--zone-file", &zone, flag, "0"]);
+        assert!(!out.status.success(), "stdout: {}", stdout(&out));
+        assert!(stderr(&out).contains(flag), "got: {}", stderr(&out));
+
+        let config = dir.join("rdnsd.toml");
+        std::fs::write(
+            &config,
+            format!("[server]\nzone-dir = {:?}\n{key} = 0\n", dir.path()),
+        )
+        .expect("write the config");
+        let out = rdnsd(&["--config", &config.to_string_lossy(), "--check-config"]);
+        assert!(!out.status.success(), "stdout: {}", stdout(&out));
+        assert!(stderr(&out).contains(key), "got: {}", stderr(&out));
+    }
+}
+
+/// The flag reaches the listener: a connection that sends nothing is closed
+/// after `--connection-idle-timeout`, not the default ten seconds
+/// (`TODO.md` #155). The one test here that binds a socket.
+#[test]
+fn an_idle_connection_is_closed_after_the_configured_timeout() {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let dir = ScratchDir::new("idle-timeout");
+    let zone = zone_in(&dir, ZONE);
+    // A port the OS just handed out, released for rdnsd to take. A collision
+    // in between fails the connect loop below rather than passing.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("a free port")
+        .port()
+        .to_string();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rdnsd"))
+        .args([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--zone-file",
+            &zone,
+            "--connection-idle-timeout",
+            "1",
+            "--quiet",
+        ])
+        .spawn()
+        .expect("rdnsd starts");
+    let addr = format!("127.0.0.1:{port}");
+    let started = Instant::now();
+    let mut stream = loop {
+        match std::net::TcpStream::connect(&addr) {
+            Ok(stream) => break stream,
+            Err(_) if started.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                panic!("rdnsd did not listen on {addr}: {e}");
+            }
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .expect("a read timeout");
+    let connected = Instant::now();
+    let read = stream.read(&mut [0u8; 2]);
+    let held = connected.elapsed();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        matches!(read, Ok(0)),
+        "closed by the server, not by the 8 s guard: {read:?}"
+    );
+    assert!(
+        held >= Duration::from_millis(500) && held < Duration::from_secs(5),
+        "held {held:?} for a 1 s idle timeout"
+    );
 }
