@@ -246,7 +246,7 @@ pub(crate) struct DelegationEvidence {
     /// NSEC records offered instead, when there is no DS.
     pub(crate) nsecs: Vec<Nsec>,
     /// NSEC3 records offered instead, when there is no DS.
-    pub nsec3s: Vec<Nsec3>,
+    pub(crate) nsec3s: Vec<Nsec3>,
     /// The class the records came in.
     pub(crate) class: Class,
 }
