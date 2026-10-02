@@ -147,75 +147,34 @@ impl Resolver {
         now: u64,
         keys: &mut KeyStore,
     ) -> ValidationState {
-        let validator = ChainValidator::new(anchors, now);
-        let Some((anchor_zone, anchor_ds)) = validator.start(target) else {
-            return ValidationState::Indeterminate(format!("no trust anchor covers {target}"));
-        };
-
-        // Resume from where this resolution started, with the keys it started
-        // on: they were validated to the anchor already, so the DS that got
-        // there is not needed again. Not from the cache: the walk skipped the
-        // referrals above the start, and an entry that expired since would
-        // resume above it with no evidence for the cuts in between
-        // (`TODO.md` #151a).
-        let (mut zone, mut ds_set, mut started_on) =
-            match state.trusted_start_for(target, anchor_zone.as_ref()) {
-                Some(start) => (start.zone.clone(), Vec::new(), Some(start.keys.clone())),
-                None => (anchor_zone.clone(), anchor_ds, None),
-            };
-
-        // A chain is at most one zone cut per label, plus the anchor.
-        let max_steps = target.label_count() + 2;
-        for _ in 0..max_steps {
-            let zone_keys = match started_on.take().or_else(|| self.keys.get(zone.as_ref())) {
-                Some(cached) => cached,
-                None => {
-                    let (records, ttl) = match self.fetch_dnskeys(zone.as_ref(), state).await {
-                        Ok(found) => found,
-                        Err(e) => {
-                            return ValidationState::Bogus(Bogus::new(
-                                // The DNSKEY RRset is what a DS committed to,
-                                // and we could not get it (RFC 8914 §4.10).
-                                InfoCode::DNSKEY_MISSING,
-                                format!("could not fetch the DNSKEY RRset for {zone}: {e:#}"),
-                            ));
-                        }
-                    };
-                    match validator.validate_dnskeys(zone.as_ref(), &records, &ds_set) {
-                        Ok(validated) => {
-                            self.keys.insert(zone.as_ref(), validated.clone(), ttl);
-                            validated
-                        }
-                        Err(other) => return other,
-                    }
+        // The walk holds the rules; this loop fetches and feeds it.
+        let trusted = state
+            .trusted
+            .iter()
+            .map(|start| (start.zone.as_ref(), start.keys.as_slice()));
+        let (mut walk, mut need) = ChainWalk::start(anchors, now, target, trusted);
+        loop {
+            need = match need {
+                ChainNeed::Done(result) => {
+                    keys.extend(walk.into_keys());
+                    return result;
                 }
+                ChainNeed::Keys(zone) => match self.keys.get(zone.as_ref()) {
+                    Some(cached) => walk.held_keys(cached),
+                    None => match self.fetch_dnskeys(zone.as_ref(), state).await {
+                        Ok((records, ttl)) => {
+                            let (validated, next) = walk.fetched_keys(&records);
+                            if let Some(validated) = validated {
+                                self.keys.insert(zone.as_ref(), validated, ttl);
+                            }
+                            next
+                        }
+                        Err(e) => walk.fetch_failed(format_args!("{e:#}")),
+                    },
+                },
+                ChainNeed::CutBelow(zone) => walk.cut(state.next_cut_below(zone.as_ref(), target)),
             };
-            keys.insert(zone.as_ref().to_folded(), zone_keys.clone());
-
-            if zone.as_ref() == target {
-                return ValidationState::Secure;
-            }
-
-            let Some(evidence) = state.next_cut_below(zone.as_ref(), target).cloned() else {
-                // No cut below: the target is served out of this zone, so these
-                // keys are the ones that signed it.
-                return ValidationState::Secure;
-            };
-
-            match validator.validate_delegation(&evidence, zone.as_ref(), &zone_keys) {
-                DelegationVerdict::Secure(ds) => {
-                    ds_set = ds;
-                    zone = evidence.zone.clone();
-                }
-                DelegationVerdict::Insecure(_) => return ValidationState::Insecure,
-                DelegationVerdict::Bogus(bogus) => return ValidationState::Bogus(bogus),
-            }
         }
-
-        ValidationState::Bogus(Bogus::new(
-            InfoCode::DNSSEC_BOGUS,
-            format!("the chain of trust to {target} does not terminate"),
-        ))
     }
 
     /// Fetch a zone's DNSKEY RRset, returning the records and the TTL to cache

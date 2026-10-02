@@ -5,8 +5,8 @@
 use crate::clock::Clock;
 use crate::dnssec::{Dnskey, Rrsig};
 use crate::dnssec_chain::{
-    cname_chain_shape, ChainShape, ChainValidator, DelegationEvidence, DelegationVerdict, KeyStore,
-    TrustAnchors, ValidationState,
+    cname_chain_shape, ChainNeed, ChainShape, ChainValidator, ChainWalk, DelegationEvidence,
+    KeyStore, TrustAnchors, ValidationState,
 };
 use crate::dnssec_denial::{nsec3s_in, nsecs_in, proves_nodata, proves_nxdomain, Denial};
 use crate::error::{DnssecError, WireError};
@@ -460,18 +460,6 @@ impl<'a> Resolution<'a> {
 
     fn record_trusted_start(&mut self, zone: Name, keys: Vec<Dnskey>) {
         self.trusted.push(TrustedStart { zone, keys });
-    }
-
-    /// The deepest trusted start at or above `target` and at or below
-    /// `anchor`, which is where validating `target` resumes.
-    fn trusted_start_for(&self, target: NameRef<'_>, anchor: NameRef<'_>) -> Option<&TrustedStart> {
-        self.trusted
-            .iter()
-            .filter(|start| {
-                target.is_at_or_under(start.zone.as_ref())
-                    && start.zone.as_ref().is_at_or_under(anchor)
-            })
-            .max_by_key(|start| start.zone.as_ref().label_count())
     }
 
     /// Ask the policy about a delegation, if there is one.

@@ -735,6 +735,183 @@ impl<'a> ChainValidator<'a> {
 
 /// Split records into RRsets by (owner, type, class), skipping RRSIGs — a
 /// signature is not an RRset to validate, it is what validates one.
+/// What a [`ChainWalk`] needs next.
+#[derive(Debug)]
+pub(crate) enum ChainNeed {
+    /// This zone's DNSKEY set: keys already validated, through
+    /// [`ChainWalk::held_keys`], or a fetched RRset, through
+    /// [`ChainWalk::fetched_keys`].
+    Keys(Name),
+    /// What the referral to the next zone cut below this one, on the way to the
+    /// target, said about the child, through [`ChainWalk::cut`].
+    CutBelow(Name),
+    /// The walk is over.
+    Done(ValidationState),
+}
+
+/// The chain of trust from an anchor down to one target zone (RFC 4035 §5),
+/// with no I/O in it: it says what it needs, the resolver fetches it, and it
+/// ends in a [`ValidationState`].
+///
+/// The start, the resume from a trusted start, the step cap and the
+/// delegation verdicts are here, so a synchronous test reaches them; the
+/// resolver keeps the fetch, the key cache and the referral evidence it
+/// gathered (`TODO.md` #151).
+pub(crate) struct ChainWalk<'a> {
+    validator: ChainValidator<'a>,
+    target: Name,
+    zone: Name,
+    ds_set: Vec<Ds>,
+    steps_left: usize,
+    established: KeyStore,
+}
+
+impl<'a> ChainWalk<'a> {
+    /// Begin a walk to `target` from the deepest of `trusted` at or above it
+    /// and at or below its anchor, or from the anchor when there is none.
+    ///
+    /// A trusted start's keys are used as given: they were validated to the
+    /// anchor when they were read, and the resolution that started there
+    /// skipped the referrals above it, so the walk has to resume exactly there
+    /// (`TODO.md` #151a).
+    pub(crate) fn start<'t>(
+        anchors: &'a TrustAnchors,
+        now: u64,
+        target: NameRef<'_>,
+        trusted: impl IntoIterator<Item = (NameRef<'t>, &'t [Dnskey])>,
+    ) -> (ChainWalk<'a>, ChainNeed) {
+        let validator = ChainValidator::new(anchors, now);
+        let anchored = validator.start(target);
+        let mut walk = ChainWalk {
+            validator,
+            target: target.to_owned(),
+            zone: Name::root(),
+            ds_set: Vec::new(),
+            // A chain is at most one zone cut per label, plus the anchor.
+            steps_left: target.label_count() + 2,
+            established: KeyStore::new(),
+        };
+        let Some((anchor_zone, anchor_ds)) = anchored else {
+            return (
+                walk,
+                ChainNeed::Done(ValidationState::Indeterminate(format!(
+                    "no trust anchor covers {target}"
+                ))),
+            );
+        };
+        let resume = trusted
+            .into_iter()
+            .filter(|(zone, _)| {
+                target.is_at_or_under(*zone) && zone.is_at_or_under(anchor_zone.as_ref())
+            })
+            .max_by_key(|(zone, _)| zone.label_count());
+        let need = match resume {
+            Some((zone, keys)) => {
+                walk.zone = zone.to_owned();
+                match walk.take_step() {
+                    Some(done) => done,
+                    None => walk.established(keys.to_vec()),
+                }
+            }
+            None => {
+                walk.zone = anchor_zone;
+                walk.ds_set = anchor_ds;
+                walk.need_keys()
+            }
+        };
+        (walk, need)
+    }
+
+    /// Keys for the zone [`ChainNeed::Keys`] named that were validated before.
+    pub(crate) fn held_keys(&mut self, keys: Vec<Dnskey>) -> ChainNeed {
+        self.established(keys)
+    }
+
+    /// A DNSKEY RRset fetched for the zone [`ChainNeed::Keys`] named. Returns
+    /// the keys it validated, for the resolver to cache, and what is next.
+    pub(crate) fn fetched_keys(
+        &mut self,
+        records: &[ResourceRecord],
+    ) -> (Option<Vec<Dnskey>>, ChainNeed) {
+        match self
+            .validator
+            .validate_dnskeys(self.zone.as_ref(), records, &self.ds_set)
+        {
+            Ok(validated) => (Some(validated.clone()), self.established(validated)),
+            Err(state) => (None, ChainNeed::Done(state)),
+        }
+    }
+
+    /// The DNSKEY RRset the DS committed to could not be fetched
+    /// (RFC 8914 §4.10).
+    pub(crate) fn fetch_failed(&self, why: impl std::fmt::Display) -> ChainNeed {
+        ChainNeed::Done(ValidationState::Bogus(Bogus::new(
+            InfoCode::DNSKEY_MISSING,
+            format!("could not fetch the DNSKEY RRset for {}: {why}", self.zone),
+        )))
+    }
+
+    /// The evidence for the cut [`ChainNeed::CutBelow`] asked about, or `None`
+    /// when the resolution crossed no cut below that zone.
+    pub(crate) fn cut(&mut self, evidence: Option<&DelegationEvidence>) -> ChainNeed {
+        // No cut below: the target is served out of this zone, so its keys
+        // are the ones that signed it.
+        let Some(evidence) = evidence else {
+            return ChainNeed::Done(ValidationState::Secure);
+        };
+        let verdict = {
+            let keys = self
+                .established
+                .get(&self.zone.as_ref().to_folded())
+                .map_or(&[][..], Vec::as_slice);
+            self.validator
+                .validate_delegation(evidence, self.zone.as_ref(), keys)
+        };
+        match verdict {
+            DelegationVerdict::Secure(ds) => {
+                self.ds_set = ds;
+                self.zone = evidence.zone.clone();
+                self.need_keys()
+            }
+            DelegationVerdict::Insecure(_) => ChainNeed::Done(ValidationState::Insecure),
+            DelegationVerdict::Bogus(bogus) => ChainNeed::Done(ValidationState::Bogus(bogus)),
+        }
+    }
+
+    /// Every zone's keys this walk established, for the caller's key store.
+    pub(crate) fn into_keys(self) -> KeyStore {
+        self.established
+    }
+
+    fn need_keys(&mut self) -> ChainNeed {
+        match self.take_step() {
+            Some(done) => done,
+            None => ChainNeed::Keys(self.zone.clone()),
+        }
+    }
+
+    /// Spend a step, or end the walk when none is left.
+    fn take_step(&mut self) -> Option<ChainNeed> {
+        if self.steps_left == 0 {
+            return Some(ChainNeed::Done(ValidationState::Bogus(Bogus::new(
+                InfoCode::DNSSEC_BOGUS,
+                format!("the chain of trust to {} does not terminate", self.target),
+            ))));
+        }
+        self.steps_left -= 1;
+        None
+    }
+
+    fn established(&mut self, keys: Vec<Dnskey>) -> ChainNeed {
+        self.established
+            .insert(self.zone.as_ref().to_folded(), keys);
+        if self.zone == self.target {
+            return ChainNeed::Done(ValidationState::Secure);
+        }
+        ChainNeed::CutBelow(self.zone.clone())
+    }
+}
+
 fn group_rrsets(records: &[ResourceRecord]) -> Vec<(Name, Rtype, Class, Vec<RecordData>)> {
     let mut sets: Vec<(Name, Rtype, Class, Vec<RecordData>)> = Vec::new();
     for rr in records {
@@ -1642,6 +1819,271 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         assert!(
             matches!(&shape, ChainShape::Broken(why) if why.contains("longer than")),
             "got {shape:?}"
+        );
+    }
+
+    // `ChainWalk`, synchronously (`TODO.md` #151). Each test names the rule.
+
+    /// Root, `test.` and `example.test.`, each signed, with the root as the
+    /// one anchor.
+    struct Chain {
+        root: TestZone,
+        tld: TestZone,
+        auth: TestZone,
+        anchors: TrustAnchors,
+    }
+
+    fn chain() -> Chain {
+        let root = TestZone::new(".");
+        let anchors = TrustAnchors::new(vec![root.ds(2)]);
+        Chain {
+            root,
+            tld: TestZone::new("test."),
+            auth: TestZone::new("example.test."),
+            anchors,
+        }
+    }
+
+    /// A referral's evidence for `child`: its DS, signed by `parent`.
+    fn signed_cut(parent: &TestZone, child: &TestZone, at: &str) -> DelegationEvidence {
+        let ds = ds_record(&child.ds(2), Ttl::from_secs(3600));
+        let sig = parent.sign_records(std::slice::from_ref(&ds));
+        DelegationEvidence::from_authority(nm(at).as_ref(), &[ds, sig])
+    }
+
+    fn no_trusted<'t>() -> std::iter::Empty<(NameRef<'t>, &'t [Dnskey])> {
+        std::iter::empty()
+    }
+
+    fn is_keys(need: &ChainNeed, zone: &str) -> bool {
+        matches!(need, ChainNeed::Keys(z) if *z == nm(zone))
+    }
+
+    fn is_cut_below(need: &ChainNeed, zone: &str) -> bool {
+        matches!(need, ChainNeed::CutBelow(z) if *z == nm(zone))
+    }
+
+    /// No anchor covers the target: we never looked (RFC 4033 §5).
+    #[test]
+    fn a_walk_no_anchor_covers_is_indeterminate() {
+        let anchors = TrustAnchors::default();
+        let (_, need) = ChainWalk::start(
+            &anchors,
+            current_unix_timestamp(),
+            nm("example.test.").as_ref(),
+            no_trusted(),
+        );
+        assert!(
+            matches!(need, ChainNeed::Done(ValidationState::Indeterminate(_))),
+            "{need:?}"
+        );
+    }
+
+    /// From the anchor down: each zone's keys authenticate the DS of the next
+    /// (RFC 4035 §5), and the walk ends Secure at the target's own zone.
+    #[test]
+    fn a_walk_from_the_anchor_establishes_every_zone_on_the_way() {
+        let c = chain();
+        let target = nm("example.test.");
+        let (mut walk, need) = ChainWalk::start(
+            &c.anchors,
+            current_unix_timestamp(),
+            target.as_ref(),
+            no_trusted(),
+        );
+        assert!(is_keys(&need, "."), "the anchor's zone first: {need:?}");
+
+        let (validated, need) = walk.fetched_keys(&c.root.dnskey_records());
+        assert!(validated.is_some(), "the root's keys match the anchor DS");
+        assert!(is_cut_below(&need, "."), "{need:?}");
+
+        let need = walk.cut(Some(&signed_cut(&c.root, &c.tld, "test.")));
+        assert!(is_keys(&need, "test."), "{need:?}");
+        let (_, need) = walk.fetched_keys(&c.tld.dnskey_records());
+        assert!(is_cut_below(&need, "test."), "{need:?}");
+
+        let need = walk.cut(Some(&signed_cut(&c.tld, &c.auth, "example.test.")));
+        assert!(is_keys(&need, "example.test."), "{need:?}");
+        let (_, need) = walk.fetched_keys(&c.auth.dnskey_records());
+        assert!(
+            matches!(need, ChainNeed::Done(ValidationState::Secure)),
+            "{need:?}"
+        );
+        assert_eq!(walk.into_keys().len(), 3, "a key set per zone");
+    }
+
+    /// The resume rule: the deepest trusted start at or above the target and
+    /// under the anchor, with its keys as given — no cache read, no fetch.
+    /// This is #151a's case, reached without a resolver.
+    #[test]
+    fn a_walk_resumes_from_the_deepest_trusted_start() {
+        let c = chain();
+        let (root_keys, auth_keys) = (c.root.dnskeys(), c.auth.dnskeys());
+        let below = nm("sub.example.test.");
+        let (example, root) = (nm("example.test."), Name::root());
+        let trusted = [
+            (root.as_ref(), root_keys.as_slice()),
+            (example.as_ref(), auth_keys.as_slice()),
+            // Below the target: not a start for it.
+            (below.as_ref(), auth_keys.as_slice()),
+        ];
+        let (walk, need) = ChainWalk::start(
+            &c.anchors,
+            current_unix_timestamp(),
+            example.as_ref(),
+            trusted,
+        );
+        assert!(
+            matches!(need, ChainNeed::Done(ValidationState::Secure)),
+            "the target's own zone was the start: {need:?}"
+        );
+        assert_eq!(walk.into_keys().len(), 1);
+    }
+
+    /// A trusted start above the anchor is not one: trust flows down from the
+    /// anchor, not around it.
+    #[test]
+    fn a_trusted_start_above_the_anchor_is_ignored() {
+        let c = chain();
+        let anchors = TrustAnchors::new(vec![c.tld.ds(2)]);
+        let root_keys = c.root.dnskeys();
+        let (_, need) = ChainWalk::start(
+            &anchors,
+            current_unix_timestamp(),
+            nm("example.test.").as_ref(),
+            [(Name::root().as_ref(), root_keys.as_slice())],
+        );
+        assert!(is_keys(&need, "test."), "from the anchor: {need:?}");
+    }
+
+    /// No cut below a zone on the way: the target is served out of it, so its
+    /// keys signed the answer.
+    #[test]
+    fn no_cut_below_ends_secure() {
+        let c = chain();
+        let tld_keys = c.tld.dnskeys();
+        let (mut walk, need) = ChainWalk::start(
+            &c.anchors,
+            current_unix_timestamp(),
+            nm("example.test.").as_ref(),
+            [(nm("test.").as_ref(), tld_keys.as_slice())],
+        );
+        assert!(is_cut_below(&need, "test."), "{need:?}");
+        assert!(matches!(
+            walk.cut(None),
+            ChainNeed::Done(ValidationState::Secure)
+        ));
+    }
+
+    /// The delegation verdicts end the walk: a proved absence of DS is
+    /// Insecure (RFC 4035 §5.2), an unsigned DS is Bogus.
+    #[test]
+    fn a_delegation_verdict_ends_the_walk() {
+        let c = chain();
+        let tld_keys = c.tld.dnskeys();
+        let start = || {
+            ChainWalk::start(
+                &c.anchors,
+                current_unix_timestamp(),
+                nm("example.test.").as_ref(),
+                [(nm("test.").as_ref(), tld_keys.as_slice())],
+            )
+        };
+
+        let nsec = ResourceRecord {
+            name: nm("example.test."),
+            class: Class::IN,
+            ttl: Ttl::from_secs(3600),
+            rdata: RecordData::from_parsed(&ParsedRecord::NSEC {
+                next_domain_name: nm("zz.test."),
+                type_bitmap: build_type_bitmap(&[rt::NS, rt::RRSIG, rt::NSEC]),
+            })
+            .unwrap(),
+        };
+        let sig = c.tld.sign_records(std::slice::from_ref(&nsec));
+        let proved = DelegationEvidence::from_authority(nm("example.test.").as_ref(), &[nsec, sig]);
+        let (mut walk, _) = start();
+        assert!(matches!(
+            walk.cut(Some(&proved)),
+            ChainNeed::Done(ValidationState::Insecure)
+        ));
+
+        let unsigned = DelegationEvidence::from_authority(
+            nm("example.test.").as_ref(),
+            &[ds_record(&c.auth.ds(2), Ttl::from_secs(3600))],
+        );
+        let (mut walk, _) = start();
+        assert!(matches!(
+            walk.cut(Some(&unsigned)),
+            ChainNeed::Done(ValidationState::Bogus(_))
+        ));
+    }
+
+    /// Keys the DS does not vouch for end the walk Bogus, and are not handed
+    /// back for caching.
+    #[test]
+    fn keys_the_ds_does_not_vouch_for_end_the_walk() {
+        let c = chain();
+        let impostor = TestZone::new(".");
+        let (mut walk, _) = ChainWalk::start(
+            &c.anchors,
+            current_unix_timestamp(),
+            nm("example.test.").as_ref(),
+            no_trusted(),
+        );
+        let (validated, need) = walk.fetched_keys(&impostor.dnskey_records());
+        assert!(validated.is_none());
+        assert!(
+            matches!(need, ChainNeed::Done(ValidationState::Bogus(_))),
+            "{need:?}"
+        );
+    }
+
+    /// A DNSKEY RRset that could not be fetched is DNSKEY_MISSING
+    /// (RFC 8914 §4.10).
+    #[test]
+    fn a_failed_fetch_is_dnskey_missing() {
+        let c = chain();
+        let (walk, _) = ChainWalk::start(
+            &c.anchors,
+            current_unix_timestamp(),
+            nm("example.test.").as_ref(),
+            no_trusted(),
+        );
+        assert!(matches!(
+            walk.fetch_failed("timed out"),
+            ChainNeed::Done(ValidationState::Bogus(b)) if b.code == InfoCode::DNSKEY_MISSING
+        ));
+    }
+
+    /// One zone cut per label plus the anchor, and no more: evidence that
+    /// keeps delegating to the same zone ends Bogus rather than spinning.
+    #[test]
+    fn the_walk_stops_at_its_step_cap() {
+        let c = chain();
+        let auth_keys = c.auth.dnskeys();
+        let target = nm("www.example.test.");
+        let (mut walk, mut need) = ChainWalk::start(
+            &c.anchors,
+            current_unix_timestamp(),
+            target.as_ref(),
+            [(nm("example.test.").as_ref(), auth_keys.as_slice())],
+        );
+        let again = signed_cut(&c.auth, &c.auth, "example.test.");
+        // Two needs per step, so twice the cap and one over is enough to hit it.
+        for _ in 0..=2 * (target.as_ref().label_count() + 2) + 1 {
+            need = match need {
+                ChainNeed::CutBelow(_) => walk.cut(Some(&again)),
+                ChainNeed::Keys(_) => walk.held_keys(auth_keys.clone()),
+                done @ ChainNeed::Done(_) => {
+                    need = done;
+                    break;
+                }
+            };
+        }
+        assert!(
+            matches!(&need, ChainNeed::Done(ValidationState::Bogus(b)) if b.why.contains("does not terminate")),
+            "{need:?}"
         );
     }
 }
