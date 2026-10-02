@@ -1547,23 +1547,7 @@ fn spawn_zone_maintenance(
     // re-sign, and a timer that fired anyway would reload the zones on a
     // schedule nobody asked for.
     if let Some(signing) = ctx.reloading.signing.as_ref() {
-        let every = signing.resign_interval();
-        let ordinary = rdns::zone_signer::resign_after(signing.shortest_validity()).max(60);
-        tracing::info!(
-            "re-signing every {}h, {}",
-            every.as_secs() / 3600,
-            if every.as_secs() < ordinary {
-                // The number and the reason for it, because the two differ and
-                // an operator reading "a third of the validity" against a
-                // four-hour interval would go looking for the wrong bug.
-                "the next key rollover step (RFC 6781)".to_string()
-            } else {
-                format!(
-                    "a third of the {}-day signature validity",
-                    signing.validity_days()
-                )
-            },
-        );
+        tracing::info!("{}", signing.resign_interval());
     }
 
     // Depth 1: a reload is the whole zone set, so a queue of them is a queue of
@@ -1605,7 +1589,7 @@ fn spawn_zone_maintenance(
                 // interval follows the nearest key rollover step when one is
                 // closer than the ordinary tick, and that moment moves as the
                 // steps are taken (`TODO.md` #44f).
-                _ = sleep_for(ctx.reloading.signing.as_ref().map(|s| s.resign_interval()))
+                _ = sleep_for(ctx.reloading.signing.as_ref().map(|s| s.resign_interval().every))
                     => ReloadTrigger::Timer,
                 _ = stop.wait() => break,
             };
@@ -3801,7 +3785,7 @@ mod tests {
         let signing = ZoneSigning::load(&cli, &BTreeMap::new())
             .expect("the keys load")
             .expect("a key directory means signing");
-        let interval = signing.resign_interval();
+        let interval = signing.resign_interval().every;
 
         let zone_map = Arc::new(RwLock::new(Zones::default()));
         let _reloads = spawn_zone_maintenance(

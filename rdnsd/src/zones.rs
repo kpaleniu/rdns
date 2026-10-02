@@ -709,6 +709,44 @@ pub(crate) fn validate_zone_source(
     }
 }
 
+/// When the zones are next re-signed, and which rule chose it.
+///
+/// The startup line names the rule, so the rule travels with the interval
+/// rather than being recomputed beside it: two copies of the formula is a log
+/// line that names the wrong reason after either changes (`TODO.md` #152).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Resign {
+    pub(crate) every: Duration,
+    pub(crate) why: ResignReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResignReason {
+    /// [`resign_after`] of the shortest validity, in seconds.
+    Validity(u64),
+    /// A key timing step (#44f) is nearer than that.
+    KeyTransition,
+}
+
+impl std::fmt::Display for Resign {
+    /// Does not name the fraction: [`resign_after`] owns it, and a sentence
+    /// spelling it out is a copy that a change to the constant leaves wrong.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "re-signing every {}h, ", self.every.as_secs() / 3600)?;
+        match self.why {
+            ResignReason::Validity(validity) => write!(
+                f,
+                "ahead of the {}-day signature validity",
+                validity / 86_400
+            ),
+            // The reason as well as the number: an operator reading the
+            // validity against a four-hour interval would go looking for the
+            // wrong bug.
+            ResignReason::KeyTransition => f.write_str("for the next key rollover step (RFC 6781)"),
+        }
+    }
+}
+
 /// Zone signing as configured: which keys, for how long, and which chain.
 ///
 /// Only zones loaded from disk are signed. A transferred zone is the master's,
@@ -819,7 +857,7 @@ impl ZoneSigning {
 
     /// How often the zones should be re-signed.
     ///
-    /// A third of the validity, which is [`resign_after`]'s to decide.
+    /// [`resign_after`] of the shortest validity, floored; see [`Resign`].
     ///
     /// The timer re-signs by *reloading*, which is the only correct shape: the
     /// served serial is the file's serial plus a time term
@@ -837,14 +875,15 @@ impl ZoneSigning {
     /// interval is a third of the validity, ten days by default, for a step
     /// whose entire purpose is to land at a TTL boundary. The timer has to know
     /// what the keys are waiting for.
-    pub(crate) fn resign_interval(&self) -> Duration {
+    pub(crate) fn resign_interval(&self) -> Resign {
         self.resign_interval_at(current_unix_timestamp())
     }
 
     /// [`ZoneSigning::resign_interval`] against a given instant, which is what
     /// makes it testable without waiting ten days.
-    pub(crate) fn resign_interval_at(&self, now: u64) -> Duration {
-        let ordinary = resign_after(self.shortest_validity()).max(60);
+    pub(crate) fn resign_interval_at(&self, now: u64) -> Resign {
+        let validity = self.shortest_validity();
+        let ordinary = resign_after(validity).max(60);
         let next_key_change = self
             .keys
             .values()
@@ -856,7 +895,16 @@ impl ZoneSigning {
             // would re-sign without the change and then sleep the full interval
             // with it pending.
             .map(|at| at.saturating_sub(now).saturating_add(1).max(60));
-        Duration::from_secs(next_key_change.map_or(ordinary, |next| ordinary.min(next)))
+        match next_key_change {
+            Some(next) if next < ordinary => Resign {
+                every: Duration::from_secs(next),
+                why: ResignReason::KeyTransition,
+            },
+            _ => Resign {
+                every: Duration::from_secs(ordinary),
+                why: ResignReason::Validity(validity),
+            },
+        }
     }
 
     /// How many of `zones` this would actually sign, for `--check-config`.
@@ -873,11 +921,6 @@ impl ZoneSigning {
             .keys()
             .filter(|origin| self.keys.contains_key(&origin.as_name().to_owned()))
             .count()
-    }
-
-    /// The shortest configured validity in days, for the startup line.
-    pub(crate) fn validity_days(&self) -> u64 {
-        self.shortest_validity() / 86_400
     }
 
     /// The keys that sign `origin`, or `None` for a zone this server does not
@@ -1680,7 +1723,14 @@ mod tests {
     #[test]
     fn the_resigning_timer_wakes_for_the_next_rollover_step() {
         const NOW: u64 = 1_700_000_000;
-        let ordinary = Duration::from_secs(resign_after(30 * 86_400));
+        let ordinary = Resign {
+            every: Duration::from_secs(resign_after(30 * 86_400)),
+            why: ResignReason::Validity(30 * 86_400),
+        };
+        let step = |secs| Resign {
+            every: Duration::from_secs(secs),
+            why: ResignReason::KeyTransition,
+        };
 
         let with = |timing: KeyTiming| {
             let key = rdns::dnssec_key::SigningKey::generate(
@@ -1714,7 +1764,7 @@ mod tests {
         });
         assert_eq!(
             soon.resign_interval_at(NOW),
-            Duration::from_secs(3601),
+            step(3601),
             "the step, not the tick"
         );
 
@@ -1738,7 +1788,39 @@ mod tests {
             activate: Some(NOW + 1),
             ..KeyTiming::default()
         });
-        assert_eq!(immediate.resign_interval_at(NOW), Duration::from_secs(60));
+        assert_eq!(immediate.resign_interval_at(NOW), step(60));
+    }
+
+    /// The startup line follows the validity it is a fraction of, and its
+    /// hours follow `resign_after` rather than a fraction written here.
+    #[test]
+    fn the_resigning_line_names_the_rule_that_chose_the_interval() {
+        let ordinary = |days: u64| Resign {
+            every: Duration::from_secs(resign_after(days * 86_400)),
+            why: ResignReason::Validity(days * 86_400),
+        };
+        assert_eq!(
+            ordinary(30).to_string(),
+            format!(
+                "re-signing every {}h, ahead of the 30-day signature validity",
+                resign_after(30 * 86_400) / 3600
+            )
+        );
+        assert_eq!(
+            ordinary(7).to_string(),
+            format!(
+                "re-signing every {}h, ahead of the 7-day signature validity",
+                resign_after(7 * 86_400) / 3600
+            )
+        );
+        assert_eq!(
+            Resign {
+                every: Duration::from_secs(4 * 3600),
+                why: ResignReason::KeyTransition,
+            }
+            .to_string(),
+            "re-signing every 4h, for the next key rollover step (RFC 6781)"
+        );
     }
 
     #[test]
