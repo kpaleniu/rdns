@@ -14,8 +14,13 @@ RFC 1035 §4.1.1)
 
 **Source**:
 The address block a per-client limit counts as one client: an IPv4 address,
-or an IPv6 /56.
+or an IPv6 /56. An IPv4-mapped IPv6 peer is its IPv4 address.
 _Avoid_: client IP, address (when the block is meant)
+
+**Response target**:
+The address block a response budget is charged to: an IPv4 /24, or an IPv6
+/56. An IPv4-mapped IPv6 peer is its IPv4 address.
+_Avoid_: source, victim
 
 **Peer**:
 The exact address a message or connection came from. Many peers can be one
