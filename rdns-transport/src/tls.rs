@@ -53,6 +53,7 @@ use crate::slots::Slots;
 use crate::tcp::{Handler, RateLimit, SplitStream};
 use crate::TransportLimits;
 use rdns::metrics::StreamListener;
+use rdns::peer::Peer;
 use rdns::validation::{Arrival, PeerCertificate, TlsVersion};
 
 /// The port RFC 7858 §3.1 assigns.
@@ -271,7 +272,9 @@ pub async fn serve<H: Handler>(
             },
             _ = stop.wait() => return Ok(()),
         };
-        if !rate.admits_connection(handler.context(), peer.ip()) {
+        // Canonical before anything sees it, as in `tcp::serve`.
+        let peer = rdns::peer::canonical(peer);
+        if !rate.admits_connection(handler.context(), Peer::from(peer)) {
             continue;
         }
         slot.open();

@@ -38,6 +38,7 @@ use crate::tcp::{Handler, RateLimit, Reply};
 use crate::tls::CertificateStore;
 use crate::TransportLimits;
 use rdns::metrics::StreamListener;
+use rdns::peer::Peer;
 
 /// The port RFC 9250 assigns, which is DoT's.
 ///
@@ -128,8 +129,10 @@ pub async fn serve<H: Handler>(
                 return Ok(());
             }
         };
-        let peer = incoming.remote_address();
-        if !rate.admits_connection(handler.context(), peer.ip()) {
+        // Canonical before anything sees it, as in `tcp::serve`; quinn keeps
+        // the address it replies to itself.
+        let peer = rdns::peer::canonical(incoming.remote_address());
+        if !rate.admits_connection(handler.context(), Peer::from(peer)) {
             // Refuse before the handshake: a retry-able refusal costs the
             // source a round trip and costs us no crypto at all.
             incoming.refuse();
@@ -208,7 +211,7 @@ async fn serve_connection<H: Handler>(
         };
 
         let now = handler.context().clock.now();
-        if !rate.admits_message(handler.context(), peer.ip(), now) {
+        if !rate.admits_message(handler.context(), Peer::from(peer), now) {
             continue;
         }
         let handler = handler.clone();
@@ -242,21 +245,21 @@ async fn serve_stream<H: Handler>(
     let raw = match recv.read_to_end(u16::MAX as usize + 2).await {
         Ok(raw) => raw,
         Err(e) => {
-            handler.context().logger.count_error(peer.ip());
+            handler.context().logger.count_error(Peer::from(peer));
             tracing::debug!(peer = %peer.ip(), "QUIC stream read error: {e}");
             let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
             return;
         }
     };
     if raw.len() < 2 {
-        handler.context().logger.count_error(peer.ip());
+        handler.context().logger.count_error(Peer::from(peer));
         tracing::debug!(peer = %peer.ip(), "QUIC stream too short to hold a length prefix");
         let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
         return;
     }
     let len = u16::from_be_bytes([raw[0], raw[1]]) as usize;
     if len == 0 || raw.len() < 2 + len {
-        handler.context().logger.count_error(peer.ip());
+        handler.context().logger.count_error(Peer::from(peer));
         tracing::debug!(
             peer = %peer.ip(),
             "QUIC stream says {len} octets and carries {}",
@@ -269,7 +272,7 @@ async fn serve_stream<H: Handler>(
 
     if !handler
         .context()
-        .accept_packet(peer.ip(), &packet, Transport::Tcp)
+        .accept_packet(Peer::from(peer), &packet, Transport::Tcp)
     {
         // Same cap as TCP and for the same reason: a stream is not a datagram,
         // so the UDP ceiling is the wrong one to judge it by.

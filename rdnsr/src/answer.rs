@@ -6,7 +6,7 @@
 //! [`crate::serve`] be two callers of one function. It is `async` because a
 //! recursion is, not because anything here waits on a socket itself.
 
-use std::net::IpAddr;
+use rdns::peer::Peer;
 use std::sync::Arc;
 
 use rdns::dns64::Dns64;
@@ -104,7 +104,7 @@ struct Client {
 /// (in which case we simply drop it, as a resolver should).
 pub(crate) async fn handle_query(
     data: Vec<u8>,
-    peer: IpAddr,
+    peer: Peer,
     now: u64,
     serving: &Resolving,
     transport: Transport,
@@ -1090,7 +1090,7 @@ fn unsupported_opcode(msg: &DnsMessage, advertised: u16, max_len: usize) -> Opti
 /// the re-read settles it.
 fn policy_notify(
     msg: &DnsMessage,
-    peer: IpAddr,
+    peer: Peer,
     acl: &NotifyAcl,
     policy: &PolicyZones,
     feed_wakes: &[crate::rpz_transfer::FeedWake],
@@ -1331,7 +1331,7 @@ mod tests {
         let serving = context();
         let reply = handle_query(
             message(OpCode::Query, true),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -1351,7 +1351,7 @@ mod tests {
         for opcode in [OpCode::Notify, OpCode::Update, OpCode::Status] {
             let bytes = handle_query(
                 message(opcode, false),
-                TEST_PEER,
+                test_peer(),
                 current_unix_timestamp(),
                 &serving,
                 Transport::Udp,
@@ -1383,7 +1383,7 @@ mod tests {
 
         let bytes = handle_query(
             msg.to_bytes_within(4096).expect("serialize"),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -1410,7 +1410,7 @@ mod tests {
         )
     }
 
-    async fn notify_reply(serving: &Resolving, peer: IpAddr, zone: &str) -> DnsMessage {
+    async fn notify_reply(serving: &Resolving, peer: Peer, zone: &str) -> DnsMessage {
         let bytes = handle_query(
             notify_message(zone),
             peer,
@@ -1443,7 +1443,7 @@ mod tests {
     #[tokio::test]
     async fn a_notify_from_a_listed_address_queues_a_re_read() {
         let (serving, reload) = notified_by(&["198.51.100.0/24"]);
-        let reply = notify_reply(&serving, TEST_PEER, "rpz.invalid.").await;
+        let reply = notify_reply(&serving, test_peer(), "rpz.invalid.").await;
 
         assert_eq!(reply.rcode, ResponseCode::Ok);
         assert_eq!(
@@ -1466,7 +1466,7 @@ mod tests {
     #[tokio::test]
     async fn a_notify_from_an_unlisted_address_is_refused_and_costs_nothing() {
         let (serving, reload) = notified_by(&["192.0.2.1"]);
-        let reply = notify_reply(&serving, TEST_PEER, "rpz.invalid.").await;
+        let reply = notify_reply(&serving, test_peer(), "rpz.invalid.").await;
 
         assert_eq!(reply.rcode, ResponseCode::Refused);
         assert!(
@@ -1492,7 +1492,7 @@ mod tests {
 
             let bytes = handle_query(
                 msg.to_bytes_within(4096).expect("serialize"),
-                TEST_PEER,
+                test_peer(),
                 current_unix_timestamp(),
                 &serving,
                 Transport::Udp,
@@ -1517,7 +1517,7 @@ mod tests {
     #[tokio::test]
     async fn a_notify_for_a_zone_no_feed_carries_is_notauth() {
         let (serving, reload) = notified_by(&["198.51.100.0/24"]);
-        let reply = notify_reply(&serving, TEST_PEER, "elsewhere.invalid.").await;
+        let reply = notify_reply(&serving, test_peer(), "elsewhere.invalid.").await;
 
         assert_eq!(reply.rcode, ResponseCode::NotAuthorized);
         assert!(
@@ -1538,7 +1538,7 @@ mod tests {
 
         let bytes = handle_query(
             msg.to_bytes_within(4096).expect("serialize"),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -1560,7 +1560,7 @@ mod tests {
             test_shell(),
             policy("evil.example.com IN CNAME .\n"),
         );
-        let reply = notify_reply(&serving, TEST_PEER, "rpz.invalid.").await;
+        let reply = notify_reply(&serving, test_peer(), "rpz.invalid.").await;
 
         assert_eq!(reply.rcode, ResponseCode::NotImplemented);
         assert_eq!(reply.opcode, OpCode::Notify);
@@ -1692,7 +1692,7 @@ mod tests {
             .expect("serialize");
         let bytes = handle_query(
             query,
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -1733,7 +1733,7 @@ mod tests {
         clock.advance(301);
         let bytes = handle_query(
             query_for("example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -1759,7 +1759,7 @@ mod tests {
         );
         let bytes = handle_query(
             query_for("example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -1795,7 +1795,7 @@ mod tests {
             std::time::Duration::from_secs(2),
             handle_query(
                 query,
-                TEST_PEER,
+                test_peer(),
                 current_unix_timestamp(),
                 serving,
                 Transport::Udp,
@@ -2193,7 +2193,7 @@ mod tests {
             std::time::Duration::from_millis(500),
             handle_query(
                 query,
-                TEST_PEER,
+                test_peer(),
                 current_unix_timestamp(),
                 &serving,
                 Transport::Udp,
@@ -2246,7 +2246,7 @@ mod tests {
 
         let answered = handle_query(
             query_for("hot.example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -2368,7 +2368,7 @@ mod tests {
 
         let answered = handle_query(
             query_for("b.example.test.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -2403,7 +2403,7 @@ mod tests {
 
         let answered = handle_query(
             query_for("y.w.example.test.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -2449,7 +2449,7 @@ mod tests {
                 serving
                     .handle(
                         query_for("hot.example.com.", 1, false),
-                        std::net::SocketAddr::new(TEST_PEER, 5353),
+                        std::net::SocketAddr::new(test_peer().ip(), 5353),
                         current_unix_timestamp(),
                         rdns::validation::Arrival::Tcp,
                         out,
@@ -2509,7 +2509,7 @@ mod tests {
 
         let answered = handle_query(
             query_for("hot.example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -2564,7 +2564,7 @@ mod tests {
 
         let answered = handle_query(
             query_for("hot.example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -2588,7 +2588,7 @@ mod tests {
         clock.advance(95);
         let answered = handle_query(
             query_for("hot.example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -2677,7 +2677,7 @@ mod tests {
         query.cd = cd;
         let bytes = handle_query(
             query.to_bytes_within(4096).expect("serialize"),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             serving,
             Transport::Udp,
@@ -2894,7 +2894,7 @@ mod tests {
             .collect();
         let bytes = handle_query(
             query_for(&format!("{nibbles}ip6.arpa."), 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -2922,7 +2922,7 @@ mod tests {
             .expect("serialize");
         let bytes = handle_query(
             ptr,
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -2992,7 +2992,7 @@ mod tests {
 
         let bytes = handle_query(
             query_for("www.example.test.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3059,7 +3059,7 @@ mod tests {
 
         let bytes = handle_query(
             query_for("slow.example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3108,7 +3108,7 @@ mod tests {
 
         let bytes = handle_query(
             query_for("dead.example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3151,7 +3151,7 @@ mod tests {
         let serving = serving(test_resolver(), test_shell(), policy(rules));
         let bytes = handle_query(
             query_for(name, 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             transport,
@@ -3202,7 +3202,7 @@ mod tests {
             .expect("serialize");
         let bytes = handle_query(
             query,
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3229,7 +3229,7 @@ mod tests {
         );
         let bytes = handle_query(
             query_for("evil.example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3261,7 +3261,7 @@ mod tests {
         );
         let reply = handle_query(
             query_for("evil.example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3338,7 +3338,7 @@ mod tests {
         );
         let bytes = handle_query(
             query_for("www.example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3410,7 +3410,7 @@ mod tests {
         let cap = serving.ctx.udp.max_response() as usize;
         let bytes = handle_query(
             greedy,
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3447,7 +3447,7 @@ mod tests {
         for cd in [false, true] {
             let bytes = handle_query(
                 query_for("localhost.", 1, cd),
-                TEST_PEER,
+                test_peer(),
                 current_unix_timestamp(),
                 &serving,
                 Transport::Udp,
@@ -3472,7 +3472,7 @@ mod tests {
         let serving = context();
         let bytes = handle_query(
             query_for("localhost.", 2, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3510,7 +3510,7 @@ mod tests {
         let serving = context();
         let bytes = handle_query(
             query_for("localhost.", 0, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3542,7 +3542,7 @@ mod tests {
 
         let bytes = handle_query(
             buf,
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3573,7 +3573,7 @@ mod tests {
         for _ in 0..3 {
             handle_query(
                 query_for("localhost.", 1, false),
-                TEST_PEER,
+                test_peer(),
                 now,
                 &serving,
                 Transport::Udp,
@@ -3585,7 +3585,7 @@ mod tests {
         // as nothing.
         assert!(handle_query(
             vec![0x00, 0x01, 0x00],
-            TEST_PEER,
+            test_peer(),
             now,
             &serving,
             Transport::Udp,
@@ -3598,7 +3598,7 @@ mod tests {
         assert_eq!(
             stats
                 .queries_by_source
-                .get(&rdns::peer::Source::of(TEST_PEER)),
+                .get(&rdns::peer::Source::of(test_peer())),
             Some(&3)
         );
         assert_eq!(stats.total_errors, 1);
@@ -3641,7 +3641,7 @@ mod tests {
                 .policy
                 .in_force()
                 .before_query(
-                    TEST_PEER,
+                    test_peer(),
                     nm("second.example.com.").as_ref(),
                     Qtype::of(record_types::A)
                 )
@@ -3654,7 +3654,7 @@ mod tests {
 
         let reply = handle_query(
             query_for("second.example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,
@@ -3715,7 +3715,7 @@ mod tests {
 
         let reply = handle_query(
             query_for("first.example.com.", 1, false),
-            TEST_PEER,
+            test_peer(),
             current_unix_timestamp(),
             &serving,
             Transport::Udp,

@@ -42,7 +42,9 @@ fn main() {
         for t in 0..threads {
             let limiter = limiter.clone();
             handles.push(std::thread::spawn(move || {
-                let ip: IpAddr = format!("198.51.100.{}", t + 1).parse().unwrap();
+                let ip = rdns::peer::Peer::from(
+                    format!("198.51.100.{}", t + 1).parse::<IpAddr>().unwrap(),
+                );
                 for _ in 0..rounds {
                     black_box(limiter.should_allow(black_box(ip), black_box(now)));
                 }

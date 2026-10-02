@@ -15,7 +15,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
+
+use rdns::peer::Peer;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -123,7 +125,7 @@ impl Wire<'_> {
     ///
     /// Callers hand over unframed bytes whichever transport they are on, which
     /// is what removes the `&framed[2..]` the UDP UPDATE path did by hand.
-    async fn send(&self, bytes: &[u8], logger: &QueryLogger, ip: IpAddr) {
+    async fn send(&self, bytes: &[u8], logger: &QueryLogger, ip: Peer) {
         match self {
             Wire::Framed(out, _) => {
                 send_framed(out, bytes).await;
@@ -364,7 +366,7 @@ impl tcp::Handler for Server {
 #[derive(Clone, Copy)]
 struct Refused<'a> {
     msg: &'a DnsMessage,
-    ip: IpAddr,
+    ip: Peer,
     now: u64,
     max_len: usize,
 }
@@ -372,7 +374,7 @@ struct Refused<'a> {
 impl<'a> Refused<'a> {
     /// A transfer's, whose reply is framed and so has the whole 16-bit length
     /// to spend rather than a datagram's ceiling.
-    fn transfer(msg: &'a DnsMessage, ip: IpAddr, now: u64) -> Self {
+    fn transfer(msg: &'a DnsMessage, ip: Peer, now: u64) -> Self {
         Refused {
             msg,
             ip,
@@ -417,7 +419,7 @@ impl Server {
         wire: &Wire<'_>,
         scratch: &mut Scratch,
     ) {
-        let ip = peer.ip();
+        let ip = Peer::from(peer);
         // `Request` is the door: it parses and it refuses QR=1. `AdmissionCheck`
         // accepts QR=1 on purpose — it runs on both directions of the wire — so
         // the check belongs here, where we know the packet reached a listener.
@@ -552,7 +554,7 @@ impl Server {
             ceiling,
             advertised,
         } = *admitted;
-        let ip = peer.ip();
+        let ip = Peer::from(peer);
         // The record the signer appends comes out of the ceiling, not on top of
         // it: RFC 8945 §5.3 says a TSIG that would not fit means altering the
         // response, not sending it oversized (`TODO.md` #41d). Signing is the
@@ -647,7 +649,7 @@ impl Server {
         now: u64,
         scratch: &'s Scratch,
     ) -> Option<Cow<'s, [u8]>> {
-        let ip = peer.ip();
+        let ip = Peer::from(peer);
         let advertised = self.ctx.udp.advertised();
         // The ceiling `answer` wrote the body against, signature reserved and
         // all: a truncated reply is signed too, so it is bounded by the same
@@ -778,7 +780,7 @@ impl Server {
         out: &mpsc::Sender<Reply>,
     ) {
         let privacy = arrival.privacy();
-        let ip = peer.ip();
+        let ip = Peer::from(peer);
         // One for all nine ways out of this function, so none of them can pick
         // a different instant than the one that verified the request.
         let refused = Refused::transfer(msg, ip, now);
@@ -1185,7 +1187,7 @@ impl Server {
         now: u64,
         max_len: usize,
     ) -> Option<Vec<u8>> {
-        let ip = peer.ip();
+        let ip = Peer::from(peer);
         // One for all thirteen ways out of this function, for the reason
         // `answer_transfer` builds its own.
         let refused = Refused {
@@ -1789,7 +1791,7 @@ fn notify_reply(
 ) -> DnsMessage {
     let zone = notify::notified_zone(msg).unwrap_or_default();
 
-    match secondaries.notified(zone.as_ref(), peer.ip()) {
+    match secondaries.notified(zone.as_ref(), Peer::from(peer)) {
         Notified::Refreshing => {
             tracing::info!(%peer, "NOTIFY for {zone}: refreshing now");
             return notify::notify_response(msg, ResponseCode::Ok, advertised, None);

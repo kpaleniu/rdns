@@ -26,7 +26,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 
 use crate::clock::current_unix_timestamp;
 use crate::error::{ConfigError, ConfigResult};
-use crate::peer::{ResponseTarget, Source};
+use crate::peer::{Peer, ResponseTarget, Source};
 use crate::text_names::absolute_lowered;
 use crate::validation::PeerCertificate;
 use crate::zone_scope::ZoneScope;
@@ -144,7 +144,7 @@ impl RateLimiter {
     /// `SystemTime::now` calls for one instant, 24-26 ns each. See `TODO.md`
     /// #28a. The value is seconds old at worst and every bucket here is
     /// second-granularity.
-    pub fn should_allow(&self, ip: IpAddr, now: u64) -> bool {
+    pub fn should_allow(&self, ip: Peer, now: u64) -> bool {
         self.judge(ip, now).verdict
     }
 
@@ -152,7 +152,7 @@ impl RateLimiter {
     ///
     /// The exemption list is matched against the peer: exempting a host is
     /// about that host, not its /56.
-    pub fn judge(&self, ip: IpAddr, now: u64) -> Judged<bool> {
+    pub fn judge(&self, ip: Peer, now: u64) -> Judged<bool> {
         // Before the lock and before a bucket is created: a disabled limiter must
         // not be a mutex on every query.
         if self.config.tokens_per_window == 0 || self.config.exempt.allows(ip) {
@@ -197,7 +197,7 @@ impl RateLimiter {
     /// A poisoned lock reads as a full bucket, matching the direction
     /// [`RateLimiter::should_allow`] fails in.
     #[cfg(test)]
-    fn get_tokens(&self, ip: IpAddr) -> f64 {
+    fn get_tokens(&self, ip: Peer) -> f64 {
         let Ok(buckets) = self.buckets.lock() else {
             return self.config.burst_size as f64;
         };
@@ -383,12 +383,12 @@ impl ResponseLimiter {
     /// Charge `response_bytes` to `ip` and say what to do with the response.
     ///
     /// `now` is the caller's; see [`RateLimiter::should_allow`].
-    pub fn admit(&self, ip: IpAddr, response_bytes: usize, now: u64) -> ResponseVerdict {
+    pub fn admit(&self, ip: Peer, response_bytes: usize, now: u64) -> ResponseVerdict {
         self.judge(ip, response_bytes, now).verdict
     }
 
     /// [`ResponseLimiter::admit`], and whether the table had room for it.
-    pub fn judge(&self, ip: IpAddr, response_bytes: usize, now: u64) -> Judged<ResponseVerdict> {
+    pub fn judge(&self, ip: Peer, response_bytes: usize, now: u64) -> Judged<ResponseVerdict> {
         if !self.is_enabled() {
             return Judged::tracked(ResponseVerdict::Send);
         }
@@ -600,8 +600,15 @@ impl TransferCertificates {
 /// Who may ask for a zone transfer. Empty means nobody, and empty is the
 /// default — an AXFR is the whole database, so it is allowed by list only.
 ///
-/// A rule is a bare address or a CIDR prefix. Address families do not mix: a v4
-/// rule never matches a v4-mapped v6 peer, which would be a way around the list.
+/// A rule is a bare address or a CIDR prefix. Address families do not mix, and
+/// a peer is matched as a [`Peer`], so an IPv4-mapped IPv6 address is the IPv4
+/// address it maps before any rule sees it.
+///
+/// It used to refuse a mapped peer outright, as "a way around the list". That
+/// reason holds for half the traffic and refused every IPv4 client of a
+/// dual-stack socket (`TODO.md` #158): a stream peer completed a handshake and
+/// is the IPv4 host it names, and what a spoofed UDP datagram gains is in
+/// [`Peer`]'s doc comment.
 #[derive(Debug, Clone, Default)]
 pub struct TransferAcl {
     rules: Vec<AclRule>,
@@ -658,9 +665,9 @@ impl TransferAcl {
         Ok(TransferAcl { rules })
     }
 
-    /// Whether `ip` is on the list. An empty list allows nothing.
-    pub fn allows(&self, ip: IpAddr) -> bool {
-        self.contains(ip)
+    /// Whether `peer` is on the list. An empty list allows nothing.
+    pub fn allows(&self, peer: Peer) -> bool {
+        self.contains(peer.ip())
     }
 
     /// The same predicate under the name a caller that is not an ACL wants:
@@ -719,6 +726,10 @@ fn prefix_matches(rule: &[u8], peer: &[u8], prefix: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn peer(s: &str) -> Peer {
+        Peer::from(s.parse::<IpAddr>().expect("an address"))
+    }
     use std::net::{IpAddr, Ipv4Addr};
 
     /// A certificate carrying `name` as a subject alternative name, generated
@@ -803,7 +814,7 @@ mod tests {
     fn test_rate_limiter_allows_under_limit() {
         let now = current_unix_timestamp();
         let limiter = RateLimiter::with_defaults();
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         // Should allow up to burst size
         for _ in 0..20 {
@@ -818,7 +829,7 @@ mod tests {
     fn test_rate_limiter_denies_over_limit() {
         let now = current_unix_timestamp();
         let limiter = RateLimiter::with_defaults();
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         // Use up burst
         for _ in 0..20 {
@@ -836,8 +847,8 @@ mod tests {
     fn test_rate_limiter_different_ips() {
         let now = current_unix_timestamp();
         let limiter = RateLimiter::with_defaults();
-        let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let ip1 = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        let ip2 = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
 
         // Use up burst for ip1
         for _ in 0..20 {
@@ -865,7 +876,7 @@ mod tests {
         for i in 0..5_000u32 {
             // Spread across the whole v4 space, as a spoofing source would.
             limiter.should_allow(
-                IpAddr::V4(Ipv4Addr::from(i.wrapping_mul(2_654_435_761))),
+                Peer::from(IpAddr::V4(Ipv4Addr::from(i.wrapping_mul(2_654_435_761)))),
                 now,
             );
         }
@@ -887,8 +898,8 @@ mod tests {
             ..RateLimitConfig::default()
         };
         let limiter = RateLimiter::new(config);
-        let tracked = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
-        let untracked = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let tracked = Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
+        let untracked = Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)));
 
         assert!(limiter.should_allow(tracked, now));
         for _ in 0..100 {
@@ -916,7 +927,7 @@ mod tests {
     #[test]
     fn a_clock_step_backwards_neither_panics_nor_refills_the_bucket() {
         let limiter = RateLimiter::with_defaults();
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
         let now = current_unix_timestamp();
 
         assert!(limiter.should_allow(ip, now));
@@ -939,8 +950,8 @@ mod tests {
     fn test_rate_limiter_get_stats() {
         let now = current_unix_timestamp();
         let limiter = RateLimiter::with_defaults();
-        let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let ip1 = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        let ip2 = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
 
         limiter.should_allow(ip1, now);
         limiter.should_allow(ip2, now);
@@ -953,7 +964,7 @@ mod tests {
     fn test_rate_limiter_get_tokens() {
         let now = current_unix_timestamp();
         let limiter = RateLimiter::with_defaults();
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         // Initial tokens should be burst_size
         let initial = limiter.get_tokens(ip);
@@ -974,8 +985,8 @@ mod tests {
             cleanup_interval_secs: 60,
             ..RateLimitConfig::per_second(10, 10)
         });
-        let idle = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
-        let busy = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
+        let idle = Peer::from(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
+        let busy = Peer::from(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
         // The real clock, because `last_cleanup` is seeded from it at
         // construction: a synthetic `now` in the past never reaches the
         // interval, and the sweep would silently never run.
@@ -1012,7 +1023,7 @@ mod tests {
             ..RateLimitConfig::default()
         };
         let limiter = RateLimiter::new(config);
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         // Allow up to burst
         for _ in 0..5 {
@@ -1034,7 +1045,7 @@ mod tests {
             ..RateLimitConfig::default()
         };
         let limiter = RateLimiter::new(config);
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         // Should deny immediately
         assert!(!limiter.should_allow(ip, now));
@@ -1045,7 +1056,7 @@ mod tests {
     #[test]
     fn a_per_second_limit_means_what_it_says() {
         let now = current_unix_timestamp();
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
 
         // The burst is what may arrive at once, before the rate applies.
         let limiter = RateLimiter::new(RateLimitConfig::per_second(1000, 200));
@@ -1070,7 +1081,7 @@ mod tests {
     fn a_rate_of_zero_disables_the_limiter_rather_than_refusing_everything() {
         let now = current_unix_timestamp();
         let limiter = RateLimiter::new(RateLimitConfig::per_second(0, 1));
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
         for i in 0..10_000 {
             assert!(limiter.should_allow(ip, now), "query {i}");
         }
@@ -1085,8 +1096,8 @@ mod tests {
         let limiter = RateLimiter::new(RateLimitConfig::per_second(10, 2).exempting(
             TransferAcl::parse_named(&["192.0.2.0/24".to_string()], "test list").unwrap(),
         ));
-        let exempt = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
-        let ordinary = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let exempt = Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)));
+        let ordinary = Peer::from(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)));
 
         for i in 0..1_000 {
             assert!(limiter.should_allow(exempt, now), "exempt query {i}");
@@ -1105,7 +1116,7 @@ mod tests {
     fn a_burst_of_zero_does_not_become_a_total_outage() {
         let now = current_unix_timestamp();
         let limiter = RateLimiter::new(RateLimitConfig::per_second(10, 0));
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
         assert!(
             limiter.should_allow(ip, now),
             "one query must still get through"
@@ -1122,7 +1133,7 @@ mod tests {
             let limiter = limiter.clone();
             let handle = std::thread::spawn(move || {
                 let now = current_unix_timestamp();
-                let ip = IpAddr::V4(Ipv4Addr::new(127, 0, i, 0));
+                let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, i, 0)));
                 let mut count = 0;
                 for _ in 0..30 {
                     if limiter.should_allow(ip, now) {
@@ -1151,48 +1162,48 @@ mod tests {
     fn test_an_empty_acl_allows_nobody() {
         let acl = TransferAcl::default();
         assert!(acl.is_empty());
-        assert!(!acl.allows("127.0.0.1".parse().unwrap()));
-        assert!(!acl.allows("::1".parse().unwrap()));
+        assert!(!acl.allows(peer("127.0.0.1")));
+        assert!(!acl.allows(peer("::1")));
     }
 
     #[test]
     fn test_bare_address_matches_only_itself() {
         let acl = parse_acl(&["192.0.2.10", "2001:db8::1"]);
-        assert!(acl.allows("192.0.2.10".parse().unwrap()));
-        assert!(!acl.allows("192.0.2.11".parse().unwrap()));
-        assert!(acl.allows("2001:db8::1".parse().unwrap()));
-        assert!(!acl.allows("2001:db8::2".parse().unwrap()));
+        assert!(acl.allows(peer("192.0.2.10")));
+        assert!(!acl.allows(peer("192.0.2.11")));
+        assert!(acl.allows(peer("2001:db8::1")));
+        assert!(!acl.allows(peer("2001:db8::2")));
     }
 
     #[test]
     fn test_cidr_prefixes_match_on_bit_boundaries() {
         let acl = parse_acl(&["10.0.0.0/8", "192.0.2.128/25", "2001:db8::/32"]);
 
-        assert!(acl.allows("10.1.2.3".parse().unwrap()));
-        assert!(!acl.allows("11.1.2.3".parse().unwrap()));
+        assert!(acl.allows(peer("10.1.2.3")));
+        assert!(!acl.allows(peer("11.1.2.3")));
 
         // /25 splits a byte: .128 through .255 are in, .127 and below are not.
-        assert!(acl.allows("192.0.2.200".parse().unwrap()));
-        assert!(acl.allows("192.0.2.128".parse().unwrap()));
-        assert!(!acl.allows("192.0.2.127".parse().unwrap()));
+        assert!(acl.allows(peer("192.0.2.200")));
+        assert!(acl.allows(peer("192.0.2.128")));
+        assert!(!acl.allows(peer("192.0.2.127")));
 
-        assert!(acl.allows("2001:db8:dead:beef::5".parse().unwrap()));
-        assert!(!acl.allows("2001:db9::5".parse().unwrap()));
+        assert!(acl.allows(peer("2001:db8:dead:beef::5")));
+        assert!(!acl.allows(peer("2001:db9::5")));
     }
 
-    /// A v4 rule must not admit a v6 peer, mapped or otherwise.
+    /// Families do not mix, and a mapped peer is IPv4 by the time a rule sees
+    /// it. This asserted the opposite for the mapped peer until `TODO.md` #158,
+    /// which is what refused every IPv4 client of a dual-stack socket.
     #[test]
     fn test_families_do_not_mix() {
         let acl = parse_acl(&["10.0.0.0/8"]);
-        assert!(!acl.allows("::ffff:10.0.0.1".parse().unwrap()));
-        assert!(!acl.allows("::1".parse().unwrap()));
+        assert!(acl.allows(peer("::ffff:10.0.0.1")));
+        assert!(!acl.allows(peer("::1")));
 
         let v6 = parse_acl(&["::/0"]);
-        assert!(
-            v6.allows("2001:db8::1".parse().unwrap()),
-            "/0 matches its own family"
-        );
-        assert!(!v6.allows("10.0.0.1".parse().unwrap()));
+        assert!(v6.allows(peer("2001:db8::1")), "/0 matches its own family");
+        assert!(!v6.allows(peer("10.0.0.1")));
+        assert!(!v6.allows(peer("::ffff:10.0.0.1")));
     }
 
     /// A typo has to stop the server, not shorten the list silently.
@@ -1211,7 +1222,7 @@ mod tests {
     #[test]
     fn test_a_big_answer_costs_more_than_a_small_one() {
         let now = current_unix_timestamp();
-        let ip: IpAddr = "192.0.2.1".parse().unwrap();
+        let ip = peer("192.0.2.1");
         // 4 KiB of budget, no refill within the test's second.
         let limiter = ResponseLimiter::new(1, 4096, 2);
 
@@ -1244,7 +1255,7 @@ mod tests {
     #[test]
     fn test_slip_truncates_every_second_over_budget_response() {
         let now = current_unix_timestamp();
-        let ip: IpAddr = "192.0.2.2".parse().unwrap();
+        let ip = peer("192.0.2.2");
         let limiter = ResponseLimiter::new(1, 100, 2);
         assert_eq!(limiter.admit(ip, 100, now), ResponseVerdict::Send);
 
@@ -1266,7 +1277,7 @@ mod tests {
     #[test]
     fn test_slip_of_one_truncates_all_and_zero_drops_all() {
         let now = current_unix_timestamp();
-        let ip: IpAddr = "192.0.2.3".parse().unwrap();
+        let ip = peer("192.0.2.3");
 
         let always = ResponseLimiter::new(1, 10, 1);
         assert_eq!(always.admit(ip, 100, now), ResponseVerdict::Truncate);
@@ -1282,8 +1293,8 @@ mod tests {
     fn test_budgets_are_per_client() {
         let now = current_unix_timestamp();
         // Different /24s: one /24 is one response target (`TODO.md` #157).
-        let noisy: IpAddr = "192.0.2.4".parse().unwrap();
-        let quiet: IpAddr = "198.51.100.5".parse().unwrap();
+        let noisy = peer("192.0.2.4");
+        let quiet = peer("198.51.100.5");
         let limiter = ResponseLimiter::new(1, 512, 2);
 
         assert_eq!(limiter.admit(noisy, 512, now), ResponseVerdict::Send);
@@ -1307,7 +1318,7 @@ mod tests {
         // (`TODO.md` #157); the addresses of one /24 never reached the bound.
         let mut untracked = 0;
         for i in 0..200u8 {
-            let ip = IpAddr::V4(std::net::Ipv4Addr::new(10, i, 0, 1));
+            let ip = Peer::from(IpAddr::V4(std::net::Ipv4Addr::new(10, i, 0, 1)));
             let judged = limiter.judge(ip, 100, now);
             if judged.untracked {
                 assert_eq!(judged.verdict, ResponseVerdict::Truncate);
@@ -1325,7 +1336,7 @@ mod tests {
     #[test]
     fn test_a_disabled_limiter_sends_everything() {
         let now = current_unix_timestamp();
-        let ip: IpAddr = "192.0.2.6".parse().unwrap();
+        let ip = peer("192.0.2.6");
         let limiter = ResponseLimiter::disabled();
         assert!(!limiter.is_enabled());
         for _ in 0..1000 {
@@ -1342,7 +1353,7 @@ mod tests {
         let now = current_unix_timestamp();
         assert!(!limiter.is_enabled());
         assert_eq!(
-            limiter.admit("192.0.2.9".parse().unwrap(), 60_000, now),
+            limiter.admit(peer("192.0.2.9"), 60_000, now),
             ResponseVerdict::Send,
             "and a maximal response still goes out whole"
         );
@@ -1352,7 +1363,7 @@ mod tests {
     #[test]
     fn test_the_default_budget_passes_an_ordinary_burst() {
         let now = current_unix_timestamp();
-        let ip: IpAddr = "192.0.2.7".parse().unwrap();
+        let ip = peer("192.0.2.7");
         let limiter = ResponseLimiter::with_defaults();
         for i in 0..40 {
             assert_eq!(
@@ -1364,8 +1375,12 @@ mod tests {
     }
 
     /// `n` peers inside one IPv6 /64, which an ordinary host holds.
-    fn rotating(n: u16) -> impl Iterator<Item = IpAddr> {
-        (1..=n).map(|i| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, i)))
+    fn rotating(n: u16) -> impl Iterator<Item = Peer> {
+        (1..=n).map(|i| {
+            Peer::from(IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0xdb8, 0, 1, 0, 0, 0, i,
+            )))
+        })
     }
 
     /// `TODO.md` #157's probe, kept: a host rotating within its /64 is one
@@ -1382,7 +1397,7 @@ mod tests {
 
     #[test]
     fn two_ipv4_peers_in_one_slash_24_have_two_query_buckets_and_one_budget() {
-        let (a, b): (IpAddr, IpAddr) = ("192.0.2.1".parse().unwrap(), "192.0.2.2".parse().unwrap());
+        let (a, b) = (peer("192.0.2.1"), peer("192.0.2.2"));
         let now = 1_000_000;
         let queries = RateLimiter::new(RateLimitConfig::per_second(1, 1));
         assert!(queries.should_allow(a, now));
@@ -1410,7 +1425,7 @@ mod tests {
 
         let v4 = ResponseLimiter::new(1000, 4000, 0);
         let sent = (1..=254u8)
-            .map(|i| IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, i)))
+            .map(|i| Peer::from(IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, i))))
             .filter(|&peer| v4.admit(peer, 1000, now) == ResponseVerdict::Send)
             .count();
         assert_eq!(sent, 4);
@@ -1420,13 +1435,13 @@ mod tests {
     fn a_mapped_peer_is_limited_as_the_ipv4_address_it_maps() {
         let now = 1_000_000;
         let limiter = RateLimiter::new(RateLimitConfig::per_second(1, 1));
-        assert!(limiter.should_allow("192.0.2.1".parse().unwrap(), now));
+        assert!(limiter.should_allow(peer("192.0.2.1"), now));
         assert!(
-            !limiter.should_allow("::ffff:192.0.2.1".parse().unwrap(), now),
+            !limiter.should_allow(peer("::ffff:192.0.2.1"), now),
             "one source"
         );
         assert!(
-            limiter.should_allow("::ffff:198.51.100.1".parse().unwrap(), now),
+            limiter.should_allow(peer("::ffff:198.51.100.1"), now),
             "and a different IPv4 address is another"
         );
     }

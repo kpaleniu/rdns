@@ -42,6 +42,7 @@
 //!   two kinds across zones can tell the difference.
 
 use crate::error::{ConfigError, ConfigResult};
+use crate::peer::Peer;
 use crate::record_types as rt;
 use crate::resolver::NameserverPolicy;
 use crate::zone::{parse_zone_text_at, FileDigest, Located, NameKind, Zone, ZoneRecordRef};
@@ -959,14 +960,12 @@ impl PolicyZones {
 
     /// The rewrite that applies before anything is resolved: the client's
     /// address, then the name it asked for, zone by zone in order.
-    pub fn before_query(
-        &self,
-        client: IpAddr,
-        qname: NameRef<'_>,
-        qtype: Qtype,
-    ) -> Option<Rewrite> {
+    ///
+    /// A [`Peer`], so an IPv4 client of a dual-stack socket matches an IPv4
+    /// client-IP trigger (`TODO.md` #158).
+    pub fn before_query(&self, client: Peer, qname: NameRef<'_>, qtype: Qtype) -> Option<Rewrite> {
         for zone in &self.zones {
-            if let Some(action) = zone.client_action(client, qname, qtype) {
+            if let Some(action) = zone.client_action(client.ip(), qname, qtype) {
                 return Some(zone.rewrite(action, Trigger::ClientIp));
             }
             if let Some(action) = zone.qname_action(qname, qtype) {
@@ -1479,8 +1478,8 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
         (nm(name), Qtype::of(rt::A))
     }
 
-    fn client() -> IpAddr {
-        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 200))
+    fn client() -> Peer {
+        Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 200)))
     }
 
     fn action_for(zones: &PolicyZones, name: &str, qtype: Qtype) -> Option<Action> {
@@ -1615,7 +1614,7 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
     fn a_client_ip_trigger_matches_by_longest_prefix() {
         let zones = zones();
         let blocked = zones.before_query(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9)),
+            Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9))),
             nm("www.example.com.").as_ref(),
             Qtype::of(rt::A),
         );
@@ -1623,7 +1622,7 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
         assert_eq!(blocked.unwrap().trigger, Trigger::ClientIp);
 
         let exempt = zones.before_query(
-            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
             nm("www.example.com.").as_ref(),
             Qtype::of(rt::A),
         );
@@ -1657,7 +1656,11 @@ $TTL 60
         };
         let action = |addr: IpAddr| {
             zones
-                .before_query(addr, nm("www.example.com.").as_ref(), Qtype::of(rt::A))
+                .before_query(
+                    Peer::from(addr),
+                    nm("www.example.com.").as_ref(),
+                    Qtype::of(rt::A),
+                )
                 .map(|r| r.action)
         };
         for (addr, want) in [
@@ -1676,14 +1679,16 @@ $TTL 60
         }
     }
 
-    /// A v4 rule must not match a v4-mapped v6 client, which would be a way
-    /// around the list — the rule `security::TransferAcl` already holds.
+    /// A mapped client is the IPv4 address it maps, so an IPv4 rule matches
+    /// it. This asserted the opposite until `TODO.md` #158, after the rule
+    /// `security::TransferAcl` held, and both refused every IPv4 client of a
+    /// dual-stack socket.
     #[test]
-    fn a_v4_client_rule_does_not_match_a_mapped_v6_client() {
-        let mapped = IpAddr::V6(Ipv4Addr::new(127, 0, 0, 9).to_ipv6_mapped());
+    fn a_v4_client_rule_matches_a_mapped_v6_client() {
+        let mapped = Peer::from(IpAddr::V6(Ipv4Addr::new(127, 0, 0, 9).to_ipv6_mapped()));
         assert!(zones()
             .before_query(mapped, nm("www.example.com.").as_ref(), Qtype::of(rt::A))
-            .is_none());
+            .is_some());
     }
 
     /// The address in an answer is a trigger too: a name nobody blocked that

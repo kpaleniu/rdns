@@ -20,7 +20,9 @@
 //! builds out of `dispatch`'s own transfer path.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
+
+use rdns::peer::Peer;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -136,7 +138,7 @@ impl Secondaries {
     }
 
     /// Act on a NOTIFY: wake the refresh tasks if it came from a master.
-    pub(crate) fn notified(&self, zone: NameRef<'_>, from: IpAddr) -> Notified {
+    pub(crate) fn notified(&self, zone: NameRef<'_>, from: Peer) -> Notified {
         let registry = self.read();
         let Some(replicated) = registry.get(&*zone.folded()) else {
             return Notified::NotOurs;
@@ -144,7 +146,7 @@ impl Secondaries {
         if !replicated
             .tasks
             .iter()
-            .any(|task| task.spec.master.ip() == from)
+            .any(|task| Peer::from(task.spec.master) == from)
         {
             return Notified::NotItsMaster;
         }

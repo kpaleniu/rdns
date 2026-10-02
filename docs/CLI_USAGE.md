@@ -157,8 +157,8 @@ refused — a bucket starts full, and a full bucket of nothing has no token to
 spend, so a mistyped flag would refuse every query.
 
 `--query-rate-exempt` takes an address or CIDR prefix, repeatable, parsed by the
-same code as `--allow-transfer` — including the rule that a v4 prefix never
-matches a v4-mapped v6 peer. It is for the resolvers you run yourself and for a
+same code as `--allow-transfer`, so an IPv4 rule matches an IPv4 client on a
+dual-stack `[::]` socket, where it arrives as `::ffff:a.b.c.d`. It is for the resolvers you run yourself and for a
 monitoring probe whose job is to query more often than a client would. Without
 it, the only way to spare a known-good source is to raise the limit for everyone.
 
@@ -611,8 +611,9 @@ permitted or not.
 
 - A rule is a bare address (`192.0.2.10`) or a CIDR prefix (`10.0.0.0/8`,
   `2001:db8::/32`).
-- Address families do not mix: a v4 rule never matches a v6 peer, including a
-  v4-mapped one.
+- Address families do not mix, but an IPv4-mapped peer (`::ffff:192.0.2.5`,
+  how a dual-stack `[::]` socket reports an IPv4 client) is its IPv4 address
+  and matches an IPv4 rule.
 - A malformed rule stops the server rather than quietly shortening the list.
 - TCP only, because AXFR is defined over TCP alone (RFC 5936 §4.2). A UDP request
   gets FORMERR.

@@ -232,7 +232,7 @@ fn zone_index(c: &mut Criterion) {
 fn admission(c: &mut Criterion) {
     let limiter = RateLimiter::with_defaults();
     let validator = AdmissionCheck::with_defaults();
-    let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    let ip = rdns::peer::Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
     let packet = query_message("www.example.com.", Qtype::of(record_types::A))
         .to_bytes_within(512)
         .expect("serialize");
@@ -292,7 +292,7 @@ fn shared_state(c: &mut Criterion) {
     let logger = QueryLogger::new();
     for i in 0..1_000u32 {
         logger.log_query(
-            IpAddr::V4(Ipv4Addr::from(i.to_be_bytes())),
+            rdns::peer::Peer::from(IpAddr::V4(Ipv4Addr::from(i.to_be_bytes()))),
             Some(Qtype::of(record_types::A)),
             current_unix_timestamp(),
         );
@@ -302,7 +302,7 @@ fn shared_state(c: &mut Criterion) {
         // datagram, so this is still what answering one query pays (#28a).
         b.iter(|| {
             logger.log_query(
-                black_box(ip_of(12_345)),
+                black_box(rdns::peer::Peer::from(ip_of(12_345))),
                 Some(Qtype::of(record_types::A)),
                 current_unix_timestamp(),
             )

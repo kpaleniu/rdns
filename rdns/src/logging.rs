@@ -24,12 +24,11 @@
 //! (`TODO.md` #157).
 
 use crate::clock::current_unix_timestamp;
-use crate::peer::Source;
+use crate::peer::{Peer, Source};
 use crate::shutdown::Stop;
 use crate::Qtype;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -286,7 +285,7 @@ impl QueryLogger {
     /// `now` is the caller's, in seconds; see
     /// [`crate::security::RateLimiter::should_allow`] for why it is not read
     /// here.
-    pub fn log_query(&self, ip: IpAddr, query_type: Option<Qtype>, now: u64) {
+    pub fn log_query(&self, ip: Peer, query_type: Option<Qtype>, now: u64) {
         let Some(mut inner) = self.locked() else {
             return;
         };
@@ -328,14 +327,14 @@ impl QueryLogger {
     /// Count a query error. The caller does the logging: only it knows where the
     /// error came from, and only it can leave the message unbuilt when nothing
     /// is listening.
-    pub fn count_error(&self, _ip: IpAddr) {
+    pub fn count_error(&self, _ip: Peer) {
         if let Some(mut inner) = self.locked() {
             inner.stats.total_errors += 1;
         }
     }
 
     /// Log rate limit event
-    pub fn log_rate_limited(&self, ip: IpAddr) {
+    pub fn log_rate_limited(&self, ip: Peer) {
         let Some(mut inner) = self.locked() else {
             return;
         };
@@ -457,7 +456,7 @@ mod tests {
     #[test]
     fn test_logger_counts_queries() {
         let logger = QueryLogger::new();
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
         logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
@@ -473,7 +472,7 @@ mod tests {
     #[test]
     fn test_logger_counts_errors() {
         let logger = QueryLogger::new();
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         logger.count_error(ip);
         logger.count_error(ip);
@@ -485,7 +484,7 @@ mod tests {
     #[test]
     fn test_logger_rate_limit_tracking() {
         let logger = QueryLogger::new();
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         logger.log_rate_limited(ip);
         logger.log_rate_limited(ip);
@@ -498,7 +497,7 @@ mod tests {
     #[test]
     fn test_logger_reset() {
         let logger = QueryLogger::new();
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
         logger.log_query(ip, Some(Qtype::of(rt::A)), current_unix_timestamp());
         logger.count_error(ip);
@@ -521,11 +520,15 @@ mod tests {
         let logger = QueryLogger::new();
         for i in 0..(MAX_TRACKED_SOURCES as u32 * 3) {
             logger.log_query(
-                IpAddr::V4(std::net::Ipv4Addr::from(i.wrapping_mul(2_654_435_761))),
+                Peer::from(IpAddr::V4(std::net::Ipv4Addr::from(
+                    i.wrapping_mul(2_654_435_761),
+                ))),
                 Some(Qtype::of(rt::A)),
                 current_unix_timestamp(),
             );
-            logger.log_rate_limited(IpAddr::V4(std::net::Ipv4Addr::from(i ^ 0xDEAD_BEEF)));
+            logger.log_rate_limited(Peer::from(IpAddr::V4(std::net::Ipv4Addr::from(
+                i ^ 0xDEAD_BEEF,
+            ))));
         }
 
         let stats = logger.get_stats();
@@ -550,13 +553,15 @@ mod tests {
     #[test]
     fn a_heavy_talker_survives_the_bound() {
         let logger = QueryLogger::new();
-        let heavy = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let heavy = Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
         for _ in 0..1_000 {
             logger.log_query(heavy, Some(Qtype::of(rt::A)), current_unix_timestamp());
         }
         for i in 0..(MAX_TRACKED_SOURCES as u32 * 2) {
             logger.log_query(
-                IpAddr::V4(std::net::Ipv4Addr::from(i.wrapping_mul(2_654_435_761) | 1)),
+                Peer::from(IpAddr::V4(std::net::Ipv4Addr::from(
+                    i.wrapping_mul(2_654_435_761) | 1,
+                ))),
                 Some(Qtype::of(rt::A)),
                 current_unix_timestamp(),
             );
@@ -614,7 +619,7 @@ mod tests {
     fn logging_a_query_costs_the_same_however_many_came_before() {
         use std::time::Instant;
 
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
         let batch = 5_000;
         let depth = 50_000;
         let log = |logger: &QueryLogger, n: usize| {
@@ -668,8 +673,8 @@ mod tests {
     #[test]
     fn test_logger_separate_ips() {
         let logger = QueryLogger::new();
-        let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
-        let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+        let ip1 = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+        let ip2 = Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)));
 
         logger.log_query(ip1, Some(Qtype::of(rt::A)), current_unix_timestamp());
         logger.log_query(ip2, Some(Qtype::of(rt::A)), current_unix_timestamp());
@@ -689,7 +694,7 @@ mod tests {
     #[test]
     fn each_interval_is_judged_on_its_own_traffic() {
         let logger = QueryLogger::new();
-        let heavy = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let heavy = Peer::from(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)));
         let limits = AnomalyThresholds {
             queries_per_source: 2,
             ..AnomalyThresholds::default()
@@ -725,7 +730,9 @@ mod tests {
         let logger = QueryLogger::new();
         let now = current_unix_timestamp();
         for i in 1..=1000u16 {
-            let peer = IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, i));
+            let peer = Peer::from(IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0xdb8, 0, 1, 0, 0, 0, i,
+            )));
             logger.log_query(peer, Some(Qtype::of(rt::A)), now);
         }
         let found = anomalies(&logger.take_stats(now + 60), &AnomalyThresholds::default());
@@ -745,7 +752,7 @@ mod tests {
     #[test]
     fn the_rate_is_over_the_interval_it_covers() {
         let logger = QueryLogger::new();
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)));
         let start = current_unix_timestamp();
 
         for _ in 0..120 {
@@ -763,7 +770,7 @@ mod tests {
     #[test]
     fn a_threshold_of_zero_is_off_rather_than_always() {
         let logger = QueryLogger::new();
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2));
+        let ip = Peer::from(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)));
         let start = current_unix_timestamp();
         logger.log_query(ip, Some(Qtype::of(rt::A)), start);
         logger.count_error(ip);

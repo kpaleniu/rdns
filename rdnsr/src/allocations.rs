@@ -27,7 +27,7 @@ use rdns::validation::Transport;
 use rdns::{DnsMessage, Qtype, ResourceRecord, ResponseCode};
 
 use crate::answer::handle_query;
-use crate::testutil::{context, nm, TEST_PEER};
+use crate::testutil::{context, nm, test_peer};
 
 /// Assert a count is in `range`, printing it either way so a failure says what
 /// to change the range to. `rdns/tests/allocations.rs`'s, for the same reason.
@@ -111,7 +111,7 @@ fn a_cached_answer_costs_what_it_costs() {
     // (`CLAUDE.md` §10), and it also fills the cache's own internals.
     let warm = rt.block_on(handle_query(
         query_bytes(&name),
-        TEST_PEER,
+        test_peer(),
         now,
         &serving,
         Transport::Udp,
@@ -123,8 +123,15 @@ fn a_cached_answer_costs_what_it_costs() {
 
     // Built outside: the query bytes are the client's, not the server's cost.
     let wire = query_bytes(&name);
-    let (answered, count) =
-        allocations(|| rt.block_on(handle_query(wire, TEST_PEER, now, &serving, Transport::Udp)));
+    let (answered, count) = allocations(|| {
+        rt.block_on(handle_query(
+            wire,
+            test_peer(),
+            now,
+            &serving,
+            Transport::Udp,
+        ))
+    });
     assert!(answered.is_some(), "still a cache hit");
     within("answer one query from the cache", count, 12..=12);
 
@@ -173,7 +180,16 @@ fn serving_the_same_answer_costs_the_same_however_many_came_before() {
 
     let ask = || {
         let wire = query_bytes(&name);
-        allocations(|| rt.block_on(handle_query(wire, TEST_PEER, now, &serving, Transport::Udp))).1
+        allocations(|| {
+            rt.block_on(handle_query(
+                wire,
+                test_peer(),
+                now,
+                &serving,
+                Transport::Udp,
+            ))
+        })
+        .1
     };
 
     let _ = ask();

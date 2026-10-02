@@ -252,8 +252,9 @@ The effective policy — including what each TSIG key may transfer — is printe
 the startup banner, because rate-limited queries are dropped without a reply.
 
 `--query-rate-exempt` and `--allow-transfer` are parsed by the same
-`security::TransferAcl`, including the rule that a v4 prefix never matches a
-v4-mapped v6 peer. `TransferAcl::parse_named` carries which list a typo is in.
+`security::TransferAcl`, which matches a `Peer`: an IPv4-mapped address is the
+IPv4 address it maps, then families do not mix (`TODO.md` #158).
+`TransferAcl::parse_named` carries which list a typo is in.
 So is `--dns64-exclude`, which is the same question — is this address in one of
 these prefixes — asked of an answer rather than of a peer.
 

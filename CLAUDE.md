@@ -270,9 +270,12 @@ Two shapes that are drift wearing different clothes:
 
 Reuse the parser you already have for the same syntax. The query-rate exemption
 list is addresses and CIDR prefixes, which `security::TransferAcl` already
-parses — including the rule that a v4 prefix never matches a v4-mapped v6 peer,
-which a second implementation would not have. It grew a `parse_named` so the
-error says which list has the typo, and that is the whole cost.
+parses — including ~~the rule that a v4 prefix never matches a v4-mapped v6
+peer~~ **the rule that families do not mix after a mapped peer is read as its
+IPv4 address** (`TODO.md` #158: the struck rule refused every IPv4 client of a
+dual-stack socket, and its reason held only for UDP), which a second
+implementation would not have. It grew a `parse_named` so the error says which
+list has the typo, and that is the whole cost.
 
 ## 8. DNS rules this codebase has already got wrong
 

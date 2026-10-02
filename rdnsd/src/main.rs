@@ -213,6 +213,7 @@ macro_rules! serving_error {
 pub(crate) use serving_error;
 
 use dispatch::{Server, UpdateHandling, Wire};
+use rdns::peer::Peer;
 
 /// Authoritative DNS server.
 ///
@@ -1127,12 +1128,16 @@ async fn udp_loop(
             r = socket.recv_from(&mut buf) => r,
             _ = stop.wait() => return Ok(()),
         };
-        let (size, peer) = match received {
+        let (size, from) = match received {
             Ok(received) => received,
             Err(e) if recv_error_is_transient(&e) => continue,
             Err(e) => return Err(e),
         };
         let packet = &buf[..size];
+        // Canonical for every check and record (`TODO.md` #158); the reply
+        // goes to `from`, which on a dual-stack socket is the mapped form the
+        // socket can send to.
+        let peer = rdns::peer::canonical(from);
 
         // One clock read per datagram, shared by the limiter, the logger, the
         // TSIG check and the response budget — each used to fetch its own, at
@@ -1143,12 +1148,12 @@ async fn udp_loop(
 
         // Both are decisions to do nothing, so they run on `&buf[..size]` with
         // nothing copied and nothing spawned.
-        if !server.ctx().allow_source(peer.ip(), now) {
+        if !server.ctx().allow_source(Peer::from(peer), now) {
             continue;
         }
         if !server
             .ctx()
-            .accept_packet(peer.ip(), packet, Transport::Udp)
+            .accept_packet(Peer::from(peer), packet, Transport::Udp)
         {
             continue;
         }
@@ -1162,7 +1167,7 @@ async fn udp_loop(
                 packet,
                 peer,
                 now,
-                &Wire::Datagram(&socket, peer),
+                &Wire::Datagram(&socket, from),
                 &mut scratch,
             )
             .await;
@@ -2376,7 +2381,11 @@ mod tests {
         }
 
         let logger = QueryLogger::new();
-        let ip: IpAddr = "198.51.100.7".parse().expect("a documentation address");
+        let ip = Peer::from(
+            "198.51.100.7"
+                .parse::<IpAddr>()
+                .expect("a documentation address"),
+        );
         let formats = Arc::new(AtomicUsize::new(0));
 
         // At WARN, the DEBUG line is not emitted — and not built.
@@ -3096,6 +3105,144 @@ mod tests {
     }
 
     // Loading a directory of zones: three questions, three answers
+
+    /// IPv4 clients of a dual-stack `[::]` socket arrive as `::ffff:a.b.c.d`
+    /// (`TODO.md` #158). Each socket is built with `IPV6_V6ONLY` 0 rather than
+    /// taken from the OS default, which is 0 on Linux and 1 on Windows, so
+    /// these run the same on both (`CLAUDE.md` §1).
+    mod dual_stack {
+        use super::*;
+        use crate::dispatch::Server;
+        use crate::replication::Secondaries;
+        use crate::testutil::test_context;
+        use rdns::security::{TransferAcl, TransferCertificates};
+        use socket2::{Domain, Socket, Type};
+
+        fn dual_stack(kind: Type) -> Socket {
+            let socket = Socket::new(Domain::IPV6, kind, None).expect("an IPv6 socket");
+            socket.set_only_v6(false).expect("IPV6_V6ONLY 0");
+            socket
+                .bind(&"[::]:0".parse::<SocketAddr>().expect("an address").into())
+                .expect("bind [::]:0");
+            socket.set_nonblocking(true).expect("non-blocking");
+            socket
+        }
+
+        fn port_of(socket: &Socket) -> u16 {
+            socket
+                .local_addr()
+                .expect("bound")
+                .as_socket()
+                .expect("an inet address")
+                .port()
+        }
+
+        fn one_record_zone() -> Zone {
+            rdns::zone::parse_zone_file(
+                "$ORIGIN example.com.\n\
+                 $TTL 3600\n\
+                 @   IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                 @   IN NS  ns1.example.com.\n\
+                 ns1 IN A   192.0.2.1\n",
+                "example.com.",
+            )
+            .expect("the zone parses")
+        }
+
+        fn zone_map(zone: Zone) -> Arc<RwLock<Zones>> {
+            let mut zones = HashMap::new();
+            zones.insert(zone_key(&zone), Arc::new(zone));
+            Arc::new(RwLock::new(Zones::new(zones)))
+        }
+
+        /// `--allow-transfer 127.0.0.1`, and a transfer from 127.0.0.1 over
+        /// the dual-stack listener gets the zone.
+        #[tokio::test]
+        async fn an_ipv4_rule_allows_an_ipv4_secondary_on_a_dual_stack_listener() {
+            let socket = dual_stack(Type::STREAM);
+            let port = port_of(&socket);
+            socket.listen(16).expect("listen");
+            let listener =
+                TcpListener::from_std(std::net::TcpListener::from(socket)).expect("a listener");
+            let server = Arc::new(
+                Server::new(zone_map(one_record_zone()), test_context()).with_transfers(
+                    TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl"),
+                    TransferCertificates::default(),
+                    false,
+                ),
+            );
+            let shutdown = Shutdown::new();
+            tokio::spawn(tcp::serve(
+                listener,
+                server,
+                TransportLimits::default(),
+                tcp::RateLimit::PerMessage,
+                shutdown.stop_handle(),
+                shutdown.busy(),
+            ));
+
+            let master = SocketAddr::from(([127, 0, 0, 1], port));
+            let zone = rdns::xfr::fetch_zone(
+                &rdns::xfr::Master::plain(master),
+                nm("example.com.").as_ref(),
+                None,
+            )
+            .await
+            .expect("the IPv4 rule matches the IPv4 client");
+            assert_eq!(zone.serial(), Some(rdns::Serial::new(1)));
+            shutdown.begin();
+        }
+
+        /// A NOTIFY from 127.0.0.1, the master of a zone this server
+        /// replicates, over the dual-stack UDP socket: acted on, and the reply
+        /// reaches the client — which needs the mapped address, not the
+        /// canonical one, as the `send_to` target.
+        #[tokio::test]
+        async fn a_notify_from_an_ipv4_master_on_a_dual_stack_socket_is_acted_on() {
+            let socket = dual_stack(Type::DGRAM);
+            let port = port_of(&socket);
+            let socket =
+                Arc::new(UdpSocket::from_std(std::net::UdpSocket::from(socket)).expect("a socket"));
+            let secondaries = Arc::new(Secondaries::replicating(&[MasterSpec {
+                zone: nm("example.com."),
+                master: "127.0.0.1:53".parse().expect("an address"),
+                key_name: None,
+                tls: None,
+            }]));
+            let server = Arc::new(
+                Server::new(zone_map(one_record_zone()), test_context())
+                    .with_secondaries(secondaries),
+            );
+            let shutdown = Shutdown::new();
+            tokio::spawn(udp_loop(
+                socket,
+                server,
+                shutdown.stop_handle(),
+                shutdown.busy(),
+            ));
+
+            let notify = rdns::notify::notify_request(nm("example.com.").as_ref(), None, 7)
+                .to_bytes_within(512)
+                .expect("serialize");
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+            client
+                .send_to(&notify, SocketAddr::from(([127, 0, 0, 1], port)))
+                .await
+                .expect("send");
+            let mut buf = vec![0u8; 4096];
+            let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+                .await
+                .expect("a reply within 5 s")
+                .expect("a reply");
+            let reply = DnsMessage::try_from_bytes(&buf[..n]).expect("parseable");
+            assert_eq!(
+                reply.rcode,
+                ResponseCode::Ok,
+                "REFUSED: the master match compared the mapped address"
+            );
+            shutdown.begin();
+        }
+    }
 
     mod loading {
         use super::*;

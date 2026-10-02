@@ -36,6 +36,9 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 # `tokio::time::pause`, so the re-signing timer — hours long — can be tested
 # (`TODO.md` #112). A feature of a package already in the lock, not a package.
 tokio = { workspace = true, features = ["test-util"] }
+# A dual-stack socket with `IPV6_V6ONLY` set explicitly, so the #158 tests do
+# not depend on the OS default. Already in the lock under quinn.
+socket2 = "0.6"
 
 [features]
 # Swap in DHAT's allocator shim and write `dhat-heap.json` on exit. Never on by

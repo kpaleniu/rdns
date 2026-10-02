@@ -1,10 +1,11 @@
-//! The address blocks a per-client limit counts as one client.
+//! Who sent a message, as every check here asks it.
 //!
-//! `CONTEXT.md` defines both. A **source** is what the query limiter and the
-//! query logger count; a **response target** is what a response budget is
-//! charged to. Both are built from a peer address and from nothing else, and
-//! neither can be built from the other's mask, so a map keyed on one cannot be
-//! probed with the other or with a raw [`IpAddr`] (`CLAUDE.md` §17).
+//! `CONTEXT.md` defines all three. A [`Peer`] is the exact address, canonical.
+//! A **source** is what the query limiter and the query logger count; a
+//! **response target** is what a response budget is charged to. Both are
+//! built from a peer and from nothing else, and neither can be built from the
+//! other's mask, so a map keyed on one cannot be probed with the other or with
+//! a raw [`IpAddr`] (`CLAUDE.md` §17).
 //!
 //! Keyed on the exact address, an IPv6 host rotating within the /64 it
 //! normally holds was a new client to every limiter on every query (`TODO.md`
@@ -13,7 +14,61 @@
 //! every new address without a bucket.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+/// The address a message or connection came from, with an IPv4-mapped IPv6
+/// address read as the IPv4 address it maps (`TODO.md` #158).
+///
+/// On a dual-stack `[::]` socket every IPv4 client arrives as
+/// `::ffff:a.b.c.d`, so a check comparing the raw address missed every IPv4
+/// rule: `--allow-transfer`, `--query-rate-exempt`, `--rpz-notify-from` and
+/// `rdnsd`'s NOTIFY master match. The only constructor canonicalizes, and every
+/// check takes this type, so no check can be handed the mapped form.
+///
+/// `TransferAcl` refused mapped peers on purpose — "a way around the list" —
+/// and for a stream that reason does not hold: Linux drops incoming TCPv6
+/// with a mapped source, and a peer that completed a handshake is the IPv4
+/// host it names. For UDP the drop does not apply, so a datagram claiming
+/// `::ffff:a.b.c.d` from an IPv6 network now passes an IPv4 rule. What that
+/// grants is query-limit exemption, with the reply going to the real IPv4
+/// host and `ResponseLimiter` still bounding it — the grant plain IPv4
+/// spoofing has wherever BCP 38 is not applied. A transfer is stream-only.
+///
+/// Not for a reply: a datagram back to an IPv4 client on a dual-stack socket
+/// goes to the mapped form the socket reported, so the caller keeps that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Peer(IpAddr);
+
+impl Peer {
+    pub fn ip(self) -> IpAddr {
+        self.0
+    }
+}
+
+impl From<IpAddr> for Peer {
+    fn from(ip: IpAddr) -> Peer {
+        Peer(ip.to_canonical())
+    }
+}
+
+impl From<SocketAddr> for Peer {
+    fn from(addr: SocketAddr) -> Peer {
+        Peer::from(addr.ip())
+    }
+}
+
+impl fmt::Display for Peer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// `addr` with its address canonical, for what is recorded about a message —
+/// a log line, a dnstap frame — once it has arrived. Not for a reply; see
+/// [`Peer`].
+pub fn canonical(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(Peer::from(addr).ip(), addr.port())
+}
 
 /// The IPv6 block both groupings use: BIND's `ipv6-prefix-length` default.
 /// A /64 is what one host or one LAN normally holds; a /56 is a common
@@ -33,12 +88,10 @@ const RESPONSE_TARGET_IPV4_PREFIX: u8 = 24;
 
 /// The block of `peer` at the given prefix lengths.
 ///
-/// An IPv4-mapped IPv6 address is its IPv4 address first: on a dual-stack
-/// socket every IPv4 client arrives as `::ffff:a.b.c.d`, and the /56 of
-/// `::ffff:0:0/96` would make the whole IPv4 internet one block. `TODO.md`
-/// #158 moves this into the one type peers are read as, and deletes it here.
-fn block(peer: IpAddr, v4: u8, v6: u8) -> IpAddr {
-    match peer.to_canonical() {
+/// From a [`Peer`] and so canonical already: the /56 of `::ffff:0:0/96` would
+/// make the whole IPv4 internet one block.
+fn block(peer: Peer, v4: u8, v6: u8) -> IpAddr {
+    match peer.ip() {
         IpAddr::V4(a) => {
             let mask = u32::MAX.checked_shl(u32::from(32 - v4)).unwrap_or(0);
             IpAddr::V4(Ipv4Addr::from(u32::from(a) & mask))
@@ -64,7 +117,7 @@ fn write_block(f: &mut fmt::Formatter<'_>, addr: IpAddr, v4: u8, v6: u8) -> fmt:
 pub struct Source(IpAddr);
 
 impl Source {
-    pub fn of(peer: IpAddr) -> Source {
+    pub fn of(peer: Peer) -> Source {
         Source(block(peer, SOURCE_IPV4_PREFIX, IPV6_PREFIX))
     }
 }
@@ -82,7 +135,7 @@ impl fmt::Display for Source {
 pub struct ResponseTarget(IpAddr);
 
 impl ResponseTarget {
-    pub fn of(peer: IpAddr) -> ResponseTarget {
+    pub fn of(peer: Peer) -> ResponseTarget {
         ResponseTarget(block(peer, RESPONSE_TARGET_IPV4_PREFIX, IPV6_PREFIX))
     }
 }
@@ -97,8 +150,26 @@ impl fmt::Display for ResponseTarget {
 mod tests {
     use super::*;
 
-    fn ip(s: &str) -> IpAddr {
-        s.parse().expect("an address")
+    fn ip(s: &str) -> Peer {
+        Peer::from(s.parse::<IpAddr>().expect("an address"))
+    }
+
+    #[test]
+    fn a_mapped_address_is_the_ipv4_address_and_nothing_else_changes() {
+        assert_eq!(
+            ip("::ffff:192.0.2.1").ip(),
+            "192.0.2.1".parse::<IpAddr>().unwrap()
+        );
+        for unchanged in ["::1", "2001:db8::1", "192.0.2.1"] {
+            assert_eq!(ip(unchanged).ip(), unchanged.parse::<IpAddr>().unwrap());
+        }
+        // RFC 4291 §2.5.5.1's deprecated IPv4-compatible form is not a mapped
+        // address and no socket reports one; it stays IPv6.
+        assert!(ip("::192.0.2.1").ip().is_ipv6());
+        assert_eq!(
+            canonical("[::ffff:192.0.2.1]:5353".parse().unwrap()),
+            "192.0.2.1:5353".parse().unwrap()
+        );
     }
 
     #[test]

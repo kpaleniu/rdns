@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use rdns::peer::Peer;
 use rdns::security::ResponseVerdict;
 use rdns::shutdown::{Busy, Stop};
 use rdns::validation::{Arrival, Transport};
@@ -46,7 +47,7 @@ pub(crate) async fn udp_main(
             r = socket.recv_from(&mut buf) => r,
             _ = stop.wait() => return Ok(()),
         };
-        let (n, peer) = match received {
+        let (n, from) = match received {
             Ok(received) => received,
             // An ICMP report about a datagram already sent, or one that did
             // not fit: neither says anything about this socket. Shared with
@@ -54,6 +55,10 @@ pub(crate) async fn udp_main(
             Err(e) if recv_error_is_transient(&e) => continue,
             Err(e) => return Err(e),
         };
+        // Canonical for every check and record (`TODO.md` #158); the reply
+        // goes to `from`, which on a dual-stack socket is the mapped form the
+        // socket can send to.
+        let peer = Peer::from(from);
         // First, because it is the cheapest rejection and the one a flood
         // should hit: a hash lookup and a token, before the packet is looked
         // at. Dropping is silent, which is why the policy is printed at startup
@@ -63,11 +68,11 @@ pub(crate) async fn udp_main(
         // microseconds of each other; the response budget reads its own, since a
         // recursion sits in between (`TODO.md` #28a).
         let now = ctx.clock.now();
-        if !ctx.allow_source(peer.ip(), now) {
+        if !ctx.allow_source(peer, now) {
             continue;
         }
         // Then the structural checks, on bytes nothing has trusted yet.
-        if !ctx.accept_packet(peer.ip(), &buf[..n], Transport::Udp) {
+        if !ctx.accept_packet(peer, &buf[..n], Transport::Udp) {
             continue;
         }
         // Before the copy, the clones and the task: at the ceiling a datagram
@@ -88,8 +93,7 @@ pub(crate) async fn udp_main(
             let _busy = busy;
             let _permit = permit;
             let ctx = &serving.ctx;
-            if let Some(reply) = handle_query(data, peer.ip(), now, &serving, Transport::Udp).await
-            {
+            if let Some(reply) = handle_query(data, peer, now, &serving, Transport::Udp).await {
                 // Charge the response, not the query. Over budget, TC=1 is
                 // the useful refusal: no records to amplify, and a real client
                 // retries over TCP where the handshake proves who it is.
@@ -97,13 +101,13 @@ pub(crate) async fn udp_main(
                 // recursive resolution sits in between and can take seconds, so
                 // sharing that instant would deny the bucket the refill the wait
                 // earned it.
-                match ctx.admit_response(peer.ip(), reply.len(), ctx.clock.now()) {
+                match ctx.admit_response(peer, reply.len(), ctx.clock.now()) {
                     ResponseVerdict::Send => {
-                        let _ = socket.send_to(&reply, peer).await;
+                        let _ = socket.send_to(&reply, from).await;
                     }
                     ResponseVerdict::Truncate => {
                         if let Some(short) = truncate_reply(&reply) {
-                            let _ = socket.send_to(&short, peer).await;
+                            let _ = socket.send_to(&short, from).await;
                         }
                     }
                     ResponseVerdict::Drop => {}
@@ -131,7 +135,8 @@ impl tcp::Handler for Resolving {
         _arrival: Arrival,
         out: mpsc::Sender<tcp::Reply>,
     ) {
-        if let Some(reply) = handle_query(packet, peer.ip(), now, self, Transport::Tcp).await {
+        if let Some(reply) = handle_query(packet, Peer::from(peer), now, self, Transport::Tcp).await
+        {
             tcp::send_framed(&out, &reply).await;
         }
     }
@@ -223,8 +228,8 @@ mod tests {
             RateLimitConfig::per_second(1, 1)
                 .exempting(TransferAcl::parse_named(&["127.0.0.1".to_string()], "--test").unwrap()),
         );
-        let exempt: std::net::IpAddr = "127.0.0.1".parse().unwrap();
-        let other: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let exempt = Peer::from("127.0.0.1".parse::<std::net::IpAddr>().unwrap());
+        let other = Peer::from("192.0.2.1".parse::<std::net::IpAddr>().unwrap());
         // One instant for the whole test: the bucket refills by whole seconds,
         // so a clock read per call decides the last assertion on whether two of
         // them straddled a boundary (`TODO.md` #52).

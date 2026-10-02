@@ -35,7 +35,6 @@ pub mod tcp;
 mod testutil;
 pub mod tls;
 
-use std::net::IpAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,6 +42,7 @@ use std::time::Duration;
 use rdns::clock::Clock;
 use rdns::logging::QueryLogger;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
+use rdns::peer::Peer;
 use rdns::security::{RateLimiter, ResponseLimiter, ResponseVerdict};
 use rdns::shutdown::{stop_signal, Shutdown};
 use rdns::validation::{AdmissionCheck, Transport};
@@ -207,7 +207,7 @@ impl ServeContext {
     /// because charging a response against the query's instant would deny the
     /// bucket the refill the wait earned it. A pipeline that read the clock
     /// itself would silently pick the first of those (`TODO.md` #28a, #30e).
-    pub fn allow_source(&self, peer: IpAddr, now: u64) -> bool {
+    pub fn allow_source(&self, peer: Peer, now: u64) -> bool {
         let judged = self.limiter.judge(peer, now);
         if judged.untracked {
             self.metrics.count(&self.metrics.rate_limiter_untracked);
@@ -230,7 +230,7 @@ impl ServeContext {
     /// The failure is logged at DEBUG and counted: this is the path a flood
     /// takes, so the message must not be built unless somebody asked for it,
     /// and the counter is the signal in either case.
-    pub fn accept_packet(&self, peer: IpAddr, packet: &[u8], transport: Transport) -> bool {
+    pub fn accept_packet(&self, peer: Peer, packet: &[u8], transport: Transport) -> bool {
         let verdict = self.validator.validate_packet(packet, transport);
         if verdict.is_valid() {
             return true;
@@ -263,7 +263,7 @@ impl ServeContext {
     /// `now` is the caller's, for the reason [`ServeContext::allow_source`]
     /// gives: `rdnsr` reads the clock again here because a recursion sat
     /// between the two reads.
-    pub fn admit_response(&self, peer: IpAddr, len: usize, now: u64) -> ResponseVerdict {
+    pub fn admit_response(&self, peer: Peer, len: usize, now: u64) -> ResponseVerdict {
         let judged = self.responses.judge(peer, len, now);
         if judged.untracked {
             self.metrics.count(&self.metrics.response_limiter_untracked);
@@ -475,7 +475,7 @@ mod tests {
     #[test]
     fn a_refusal_is_silent_and_counted() {
         let ctx = context(1);
-        let peer: IpAddr = "192.0.2.9".parse().unwrap();
+        let peer = Peer::from("192.0.2.9".parse::<std::net::IpAddr>().unwrap());
         let now = current_unix_timestamp();
 
         assert!(ctx.allow_source(peer, now), "a burst of one admits one");
@@ -512,7 +512,7 @@ mod tests {
             responses: Arc::new(ResponseLimiter::new(100, 100, 2)),
             ..context(1)
         };
-        let peer: IpAddr = "192.0.2.11".parse().unwrap();
+        let peer = Peer::from("192.0.2.11".parse::<std::net::IpAddr>().unwrap());
         let now = current_unix_timestamp();
         let counter =
             |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
@@ -544,10 +544,8 @@ mod tests {
             ..context(1)
         };
         let now = current_unix_timestamp();
-        let (a, b): (IpAddr, IpAddr) = (
-            "192.0.2.1".parse().unwrap(),
-            "198.51.100.1".parse().unwrap(),
-        );
+        let ip = |s: &str| Peer::from(s.parse::<std::net::IpAddr>().unwrap());
+        let (a, b) = (ip("192.0.2.1"), ip("198.51.100.1"));
 
         assert!(ctx.allow_source(a, now));
         assert!(ctx.allow_source(b, now), "admitted with no bucket");
@@ -576,7 +574,7 @@ mod tests {
     #[test]
     fn the_size_cap_belongs_to_the_transport() {
         let ctx = context(0);
-        let peer: IpAddr = "192.0.2.10".parse().unwrap();
+        let peer = Peer::from("192.0.2.10".parse::<std::net::IpAddr>().unwrap());
         let mut big = query(0x1234);
         big.resize(8 * 1024, 0);
 

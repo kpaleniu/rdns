@@ -14,7 +14,7 @@
 //! because a recursion is seconds long and almost all of it waiting. Unifying
 //! that loop loses both reasons at once.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rdns::shutdown::{Busy, Stop};
@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::slots::Slots;
 use crate::{ServeContext, TransportLimits};
 use rdns::metrics::StreamListener;
+use rdns::peer::{self, Peer};
 use rdns::validation::{Arrival, Transport};
 
 /// What a connection's writer task can be handed.
@@ -139,7 +140,7 @@ impl RateLimit {
     /// The clock is read here rather than taken, because at accept there is no
     /// message whose instant to reuse — which is the distinction
     /// [`RateLimit::admits_message`] keeps (`TODO.md` #28a).
-    pub fn admits_connection(self, ctx: &ServeContext, peer: IpAddr) -> bool {
+    pub fn admits_connection(self, ctx: &ServeContext, peer: Peer) -> bool {
         self != RateLimit::PerConnection || ctx.allow_source(peer, ctx.clock.now())
     }
 
@@ -153,7 +154,7 @@ impl RateLimit {
     /// (`TODO.md` #105).
     ///
     /// `now` is the caller's, for [`ServeContext::allow_source`]'s reason.
-    pub fn admits_message(self, ctx: &ServeContext, peer: IpAddr, now: u64) -> bool {
+    pub fn admits_message(self, ctx: &ServeContext, peer: Peer, now: u64) -> bool {
         self != RateLimit::PerMessage || ctx.allow_source(peer, now)
     }
 }
@@ -197,7 +198,10 @@ pub async fn serve<H: Handler>(
             },
             _ = stop.wait() => return Ok(()),
         };
-        if !rate.admits_connection(handler.context(), peer.ip()) {
+        // Canonical before anything sees it (`TODO.md` #158). A stream reply
+        // goes down the connection, so nothing needs the mapped form.
+        let peer = peer::canonical(peer);
+        if !rate.admits_connection(handler.context(), Peer::from(peer)) {
             continue;
         }
         slot.open();
@@ -247,7 +251,7 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
                 break;
             };
             if let Err(e) = writer.write_all(&framed).await {
-                writer_logger.count_error(peer.ip());
+                writer_logger.count_error(Peer::from(peer));
                 tracing::debug!(peer = %peer.ip(), "socket write error: {e}");
                 break;
             }
@@ -275,7 +279,7 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
 
         let len = u16::from_be_bytes(len_buf) as usize;
         if len == 0 {
-            handler.context().logger.count_error(peer.ip());
+            handler.context().logger.count_error(Peer::from(peer));
             tracing::debug!(peer = %peer.ip(), "zero-length TCP message");
             break;
         }
@@ -286,12 +290,12 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
         match tokio::time::timeout(limits.read_timeout, reader.read_exact(&mut packet)).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
-                handler.context().logger.count_error(peer.ip());
+                handler.context().logger.count_error(Peer::from(peer));
                 tracing::debug!(peer = %peer.ip(), "socket read error: {e}");
                 break;
             }
             Err(_) => {
-                handler.context().logger.count_error(peer.ip());
+                handler.context().logger.count_error(Peer::from(peer));
                 tracing::debug!(peer = %peer.ip(), "timed out mid-message on TCP");
                 break;
             }
@@ -302,14 +306,14 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
         // backwards. One clock read for the message, handed to the handler so
         // the limiter, the log and a TSIG check all name the same instant.
         let now = handler.context().clock.now();
-        if !rate.admits_message(handler.context(), peer.ip(), now) {
+        if !rate.admits_message(handler.context(), Peer::from(peer), now) {
             continue;
         }
         // The message is skipped, not the connection: a peer that framed it
         // correctly is still speaking the protocol.
         if !handler
             .context()
-            .accept_packet(peer.ip(), &packet, Transport::Tcp)
+            .accept_packet(Peer::from(peer), &packet, Transport::Tcp)
         {
             continue;
         }

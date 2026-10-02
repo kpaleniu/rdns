@@ -1166,6 +1166,7 @@ dependencies = [
  "rdns",
  "rdns-transport",
  "serde",
+ "socket2",
  "tokio",
  "toml",
  "tracing",

@@ -36,6 +36,11 @@ pub(crate) fn nm(text: &str) -> rdns::Name {
 /// Whose queries these are, where the test does not care.
 pub(crate) const TEST_PEER: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7));
 
+/// [`TEST_PEER`] as the checks read it.
+pub(crate) fn test_peer() -> rdns::peer::Peer {
+    rdns::peer::Peer::from(TEST_PEER)
+}
+
 /// A ctx with every limit off, so a test measures the thing it names and
 /// not the rate limiter.
 pub(crate) fn test_shell() -> Arc<ServeContext> {

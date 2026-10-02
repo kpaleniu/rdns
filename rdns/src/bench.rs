@@ -19,7 +19,7 @@ mod benches {
     #[test]
     fn bench_logger_throughput() {
         let logger = QueryLogger::new();
-        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let ip = crate::peer::Peer::from(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
         let iterations = 10_000;
 
         let start = Instant::now();

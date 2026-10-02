@@ -56,6 +56,7 @@ use crate::tcp::{Handler, RateLimit, Reply};
 use crate::tls::CertificateStore;
 use crate::TransportLimits;
 use rdns::metrics::StreamListener;
+use rdns::peer::Peer;
 
 /// The port RFC 8484 uses, which is HTTPS's: DoH is meant to be
 /// indistinguishable from other HTTPS traffic, and a port of its own would
@@ -138,7 +139,9 @@ pub async fn serve<H: Handler>(
             },
             _ = stop.wait() => return Ok(()),
         };
-        if !rate.admits_connection(handler.context(), peer.ip()) {
+        // Canonical before anything sees it, as in `tcp::serve`.
+        let peer = rdns::peer::canonical(peer);
+        if !rate.admits_connection(handler.context(), Peer::from(peer)) {
             continue;
         }
         slot.open();
@@ -241,7 +244,7 @@ async fn answer<H: Handler>(
     // `allow_source` outright charged a `PerConnection` client a second token
     // for the first request of every connection, so `--query-rate` meant one
     // thing over DoT and another over DoH (`TODO.md` #105).
-    if !rate.admits_message(handler.context(), peer.ip(), now) {
+    if !rate.admits_message(handler.context(), Peer::from(peer), now) {
         // 429 rather than a silent drop, and the difference from UDP is the
         // point: this peer completed a TCP and a TLS handshake, so there is
         // nobody to reflect an answer at and nothing to gain by staying quiet.
@@ -250,7 +253,7 @@ async fn answer<H: Handler>(
     // The TCP cap, not the UDP one: a body is not a datagram.
     if !handler
         .context()
-        .accept_packet(peer.ip(), &query, Transport::Tcp)
+        .accept_packet(Peer::from(peer), &query, Transport::Tcp)
     {
         return status(StatusCode::BAD_REQUEST);
     }
