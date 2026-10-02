@@ -171,12 +171,15 @@ impl Resolver {
         // Start as far down the tree as already known. Validating narrows that:
         // a shortcut past a zone cut skips its DS records, so only zones whose
         // keys are already validated may be jumped to.
-        if let Some(start) = self.best_start(query.qname.as_ref()) {
+        if let Some((start, keys)) = self.best_start(query.qname.as_ref()) {
             // The referral that named these servers is the one being skipped,
             // so the policy is asked here instead — otherwise a nameserver rule
             // holds for the client that walked the delegation and for nobody
             // after (`TODO.md` #56).
             state.allows(&start.ns_names, &start.servers)?;
+            if let Some(keys) = keys {
+                state.record_trusted_start(start.zone.clone(), keys);
+            }
             let zone = start.zone;
             match self
                 .walk(query, state, depth, zone.clone(), start.servers)
@@ -205,14 +208,25 @@ impl Resolver {
         .await
     }
 
-    /// The deepest cached delegation we are willing to start from.
-    fn best_start(&self, qname: NameRef<'_>) -> Option<Start> {
-        if self.config.dnssec.is_some() {
-            self.delegations
-                .best_match_where(qname, |zone| self.keys.holds(zone))
-        } else {
-            self.delegations.best_match(qname)
+    /// The deepest cached delegation we are willing to start from, and, when
+    /// validating, the keys that made it acceptable as read at this moment.
+    ///
+    /// Validating, only a zone whose keys are held: a shortcut past a cut
+    /// skips its DS. The keys are handed back rather than asked for again by
+    /// validation, which is where the second read went stale (#151a).
+    fn best_start(&self, qname: NameRef<'_>) -> Option<(Start, Option<Vec<Dnskey>>)> {
+        if self.config.dnssec.is_none() {
+            return self
+                .delegations
+                .best_match(qname)
+                .map(|start| (start, None));
         }
+        let mut held = None;
+        let start = self.delegations.best_match_where(qname, |zone| {
+            held = self.keys.get(zone);
+            held.is_some()
+        })?;
+        Some((start, held))
     }
 
     /// The delegation walk proper, from a known starting point.

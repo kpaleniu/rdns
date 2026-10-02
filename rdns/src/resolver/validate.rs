@@ -152,24 +152,22 @@ impl Resolver {
             return ValidationState::Indeterminate(format!("no trust anchor covers {target}"));
         };
 
-        // Resume as deep as already trusted, by the same rule `best_start` used
-        // to pick where the resolution began. Disagreeing makes the walk skip a
-        // zone cut whose DS this loop then goes looking for.
-        let (mut zone, mut ds_set) = (anchor_zone.clone(), anchor_ds);
-        for candidate in target.ancestors() {
-            if candidate.is_at_or_under(anchor_zone.as_ref()) && self.keys.holds(candidate) {
-                // Cached keys were validated to the anchor already, so the DS
-                // that got us there is not needed again.
-                zone = candidate.to_owned();
-                ds_set = Vec::new();
-                break;
-            }
-        }
+        // Resume from where this resolution started, with the keys it started
+        // on: they were validated to the anchor already, so the DS that got
+        // there is not needed again. Not from the cache: the walk skipped the
+        // referrals above the start, and an entry that expired since would
+        // resume above it with no evidence for the cuts in between
+        // (`TODO.md` #151a).
+        let (mut zone, mut ds_set, mut started_on) =
+            match state.trusted_start_for(target, anchor_zone.as_ref()) {
+                Some(start) => (start.zone.clone(), Vec::new(), Some(start.keys.clone())),
+                None => (anchor_zone.clone(), anchor_ds, None),
+            };
 
         // A chain is at most one zone cut per label, plus the anchor.
         let max_steps = target.label_count() + 2;
         for _ in 0..max_steps {
-            let zone_keys = match self.keys.get(zone.as_ref()) {
+            let zone_keys = match started_on.take().or_else(|| self.keys.get(zone.as_ref())) {
                 Some(cached) => cached,
                 None => {
                     let (records, ttl) = match self.fetch_dnskeys(zone.as_ref(), state).await {

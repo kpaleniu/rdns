@@ -429,6 +429,22 @@ struct Resolution<'a> {
     cuts: Vec<DelegationEvidence>,
     denials: Vec<ResourceRecord>,
     policy: Option<&'a dyn NameserverPolicy>,
+    /// Every zone this resolution started from on the strength of its cached
+    /// keys, one per start (a CNAME hop or a nameserver lookup starts again).
+    trusted: Vec<TrustedStart>,
+}
+
+/// A zone a resolution began from whose DNSKEY set was already validated to a
+/// trust anchor, with the keys as they were read at that moment (`CONTEXT.md`).
+///
+/// Held rather than looked up again at validation: the walk below the start
+/// skipped the referrals above it, so validation has to resume exactly here.
+/// Re-reading the key cache lets an entry that expired in between send the walk
+/// back to the anchor with no evidence for the cuts below it, which turned a
+/// secure answer Bogus (`TODO.md` #151a).
+struct TrustedStart {
+    zone: Name,
+    keys: Vec<Dnskey>,
 }
 
 impl<'a> Resolution<'a> {
@@ -438,7 +454,24 @@ impl<'a> Resolution<'a> {
             cuts: Vec::new(),
             denials: Vec::new(),
             policy,
+            trusted: Vec::new(),
         }
+    }
+
+    fn record_trusted_start(&mut self, zone: Name, keys: Vec<Dnskey>) {
+        self.trusted.push(TrustedStart { zone, keys });
+    }
+
+    /// The deepest trusted start at or above `target` and at or below
+    /// `anchor`, which is where validating `target` resumes.
+    fn trusted_start_for(&self, target: NameRef<'_>, anchor: NameRef<'_>) -> Option<&TrustedStart> {
+        self.trusted
+            .iter()
+            .filter(|start| {
+                target.is_at_or_under(start.zone.as_ref())
+                    && start.zone.as_ref().is_at_or_under(anchor)
+            })
+            .max_by_key(|start| start.zone.as_ref().label_count())
     }
 
     /// Ask the policy about a delegation, if there is one.
@@ -3209,12 +3242,10 @@ this line has no record and is skipped
     /// `example.test.`; the authoritative server moves the clock past every
     /// cached key set while it answers.
     ///
-    /// Asserts `Secure`, which is what the answer is. Against the code that
-    /// filed it this reads `Bogus`: the resume falls back to the anchor, the
-    /// walk has no referral evidence for the cuts below it, and the answer's
-    /// signer has no keys.
+    /// Asserts `Secure`, which is what the answer is. Before #151c this read
+    /// `Bogus`: the resume fell back to the anchor, the walk had no referral
+    /// evidence for the cuts below it, and the answer's signer had no keys.
     #[tokio::test]
-    #[ignore = "TODO.md #151a: Bogus until #151c records trusted starts"]
     async fn a_key_set_expiring_mid_resolution_still_validates() {
         let h = signed_hierarchy(signed_ds, signed_answer);
         let clock = Clock::fixed(crate::clock::current_unix_timestamp());
@@ -3887,10 +3918,13 @@ this line has no record and is skipped
         let (_, first) = resolver.resolve_validated(&query, None).await.unwrap();
         assert_eq!(first, ValidationState::Secure, "{first}");
         assert!(
-            resolver.keys.holds(nm("example.test.").as_ref()),
+            resolver.keys.get(nm("example.test.").as_ref()).is_some(),
             "the leaf zone's keys should be cached after one validated query"
         );
-        assert!(resolver.keys.holds(nm(".").as_ref()), "and the root's");
+        assert!(
+            resolver.keys.get(nm(".").as_ref()).is_some(),
+            "and the root's"
+        );
 
         let (_, second) = resolver.resolve_validated(&query, None).await.unwrap();
         assert_eq!(second, ValidationState::Secure, "{second}");

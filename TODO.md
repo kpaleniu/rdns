@@ -1481,7 +1481,7 @@ Order and states:
 |---|---|---|
 | **151a** | provoke both windows | **done 2026-10-02**: the first reproduces, the second cannot be provoked; below |
 | **151b** | narrow `dnssec_chain`'s resolver-only items to `pub(crate)` | **done 2026-10-02**, `2508d1b` |
-| **151c** | record trusted starts; resume from them | ready-for-agent, **bug** |
+| **151c** | record trusted starts; resume from them | **done 2026-10-02**, **bug**; 151a's test passes |
 | **151** | build the walker and the baseline, then stop | ready-for-agent to the stop |
 
 #### Agent brief — 151a

@@ -73,7 +73,7 @@ impl DelegationCache {
     pub(super) fn best_match_where(
         &self,
         qname: NameRef<'_>,
-        accept: impl Fn(NameRef<'_>) -> bool,
+        mut accept: impl FnMut(NameRef<'_>) -> bool,
     ) -> Option<Start> {
         let now = self.clock.now();
         let mut entries = self.entries.lock().ok()?;
@@ -281,10 +281,6 @@ impl KeyCache {
                 expires_at: Deadline::after(self.clock.now(), ttl.min(MAX_KEY_TTL)),
             },
         );
-    }
-
-    pub(super) fn holds(&self, zone: NameRef<'_>) -> bool {
-        self.get(zone).is_some()
     }
 }
 
