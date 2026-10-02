@@ -78,13 +78,12 @@ use rdns::{
     Serial,
 };
 use rdns::{Name, UdpSizes};
-use rdns_transport::https;
+use rdns_transport::encrypted::{Encrypted, EncryptedFlags, EncryptedListeners};
 use rdns_transport::logging::LogLevel;
 use rdns_transport::metrics_server;
-use rdns_transport::quic;
 use rdns_transport::readiness::Readiness;
 use rdns_transport::tcp;
-use rdns_transport::tls::{self, CertificateStore};
+use rdns_transport::tls::CertificateStore;
 use rdns_transport::{recv_error_is_transient, ServeContext, TransportLimits, UDP_RECEIVE_BUFFER};
 
 /// The request caps `--max-udp-request` and `--max-tcp-request` ask for, with the
@@ -726,8 +725,9 @@ struct ServePolicy {
     udp_workers: usize,
     /// Where to serve Prometheus metrics, if anywhere.
     metrics_listen: Option<String>,
-    /// Where to answer DNS over TLS, and with what. `None` is off.
-    tls: Option<TlsPolicy>,
+    /// Where to answer DNS over TLS, QUIC and HTTPS, and with what. `None` is
+    /// off.
+    tls: Option<Encrypted>,
     /// Whether every zone this server answers for is in the map yet, for
     /// `/readyz` on that same listener.
     readiness: Readiness,
@@ -753,59 +753,6 @@ fn hostname_bytes() -> Vec<u8> {
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .map(String::into_bytes)
         .unwrap_or_default()
-}
-
-/// "853 DoT, 853 DoQ", or whichever of the three is configured.
-///
-/// Takes the addresses rather than a [`TlsPolicy`] because `--check-config`
-/// answers before one is built and so had written its own copy — a copy that
-/// matched on DoT and DoQ alone, so a DoH-only server was reported as
-/// "encrypted transports disabled" by the one command whose whole job is to be
-/// believed before a restart (`CLAUDE.md` §7).
-fn describe_encrypted(dot: Option<&str>, doq: Option<&str>, doh: Option<(&str, &str)>) -> String {
-    let mut parts = Vec::new();
-    if let Some(addr) = dot {
-        parts.push(format!("{addr} DoT"));
-    }
-    if let Some(addr) = doq {
-        parts.push(format!("{addr} DoQ"));
-    }
-    if let Some((addr, path)) = doh {
-        parts.push(format!("{addr}{path} DoH"));
-    }
-    parts.join(", ")
-}
-
-impl TlsPolicy {
-    fn describe(&self) -> String {
-        describe_encrypted(
-            self.dot.as_deref(),
-            self.doq.as_deref(),
-            self.doh.as_ref().map(|(a, p)| (a.as_str(), p.as_str())),
-        )
-    }
-}
-
-/// A DoT listener: the address, and the certificate it presents.
-///
-/// The store is shared with the reload path, so a renewed certificate is picked
-/// up by `rdnsctl reload` or a SIGHUP rather than by a restart (`TODO.md` #42a).
-struct TlsPolicy {
-    /// Where to answer DNS over TLS, if anywhere.
-    dot: Option<String>,
-    /// Where to answer DNS over QUIC, if anywhere.
-    doq: Option<String>,
-    /// Where to answer DNS over HTTPS, and on what path.
-    doh: Option<(String, String)>,
-    /// One store for both, so a renewal reaches both listeners. Two stores over
-    /// the same two files would be a certificate that expires on one port.
-    store: Arc<CertificateStore>,
-    /// Anchors a *client* certificate is verified against, when the operator
-    /// named some (`--transfer-client-ca`, `TODO.md` #59). `None` is the
-    /// ordinary case and means no client is asked for one. On the policy
-    /// rather than on one listener because the three encrypted transports
-    /// share a configuration, and a transfer may arrive over any of them.
-    clients: Option<rdns::tls_identity::TrustAnchors>,
 }
 
 /// Where the control socket lives and how it asks for a reload.
@@ -940,44 +887,9 @@ async fn serve(
         ),
         None => None,
     };
-    // And the TLS listener, for the same reason the metrics one is bound here:
-    // a port conflict on 853 must stop the start rather than leave a server
-    // running that a DoT client cannot reach and nothing reports.
-    let tls_listener = match tls.as_ref().and_then(|p| p.dot.as_ref().map(|a| (p, a))) {
-        Some((policy, addr)) => Some((
-            TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("--tls-listen {addr}"))?,
-            tls::server_config(policy.store.clone(), policy.clients.clone())?,
-        )),
-        None => None,
-    };
-    let https_listener = match tls.as_ref().and_then(|p| p.doh.as_ref().map(|d| (p, d))) {
-        Some((policy, (addr, path))) => Some((
-            TcpListener::bind(addr)
-                .await
-                .with_context(|| format!("--https-listen {addr}"))?,
-            https::endpoint(policy.store.clone(), path, policy.clients.clone())?,
-        )),
-        None => None,
-    };
-    // quinn binds its own UDP socket, so this is the same "fail here, not after
-    // one transport is up" rule applied to a different kind of listener.
-    let quic_endpoint = match tls.as_ref().and_then(|p| p.doq.as_ref().map(|a| (p, a))) {
-        Some((policy, addr)) => Some(
-            quinn::Endpoint::server(
-                quic::server_config(
-                    policy.store.clone(),
-                    TransportLimits::default(),
-                    policy.clients.clone(),
-                )?,
-                addr.parse()
-                    .with_context(|| format!("--quic-listen {addr} is not an address:port"))?,
-            )
-            .with_context(|| format!("--quic-listen {addr}"))?,
-        ),
-        None => None,
-    };
+    // And the encrypted listeners, for the same reason.
+    let stream_listeners =
+        EncryptedListeners::bind(tls.as_ref(), TransportLimits::default()).await?;
     // Same rule for the control socket: a path that cannot be bound stops the
     // start.
     #[cfg(unix)]
@@ -1036,15 +948,7 @@ async fn serve(
          TSIG keys: {}, encrypted: {}, metrics: {}, control: {}",
         server.tsig_keys().len(),
         match &tls {
-            Some(policy) => {
-                let (cert, key) = policy.store.paths();
-                format!(
-                    "{} (cert {}, key {})",
-                    policy.describe(),
-                    cert.display(),
-                    key.display()
-                )
-            }
+            Some(encrypted) => encrypted.describe(),
             None => "off (--tls-listen, --quic-listen)".to_string(),
         },
         match &metrics_listen {
@@ -1100,49 +1004,13 @@ async fn serve(
     }
     // Per message, not per connection: this server's clients are resolvers, and
     // they pipeline (`TODO.md` #30e).
-    loops.spawn(tcp::serve(
+    stream_listeners.spawn(
         listener,
         server.clone(),
-        TransportLimits::default(),
         tcp::RateLimit::PerMessage,
-        shutdown.stop_handle(),
-        shutdown.busy(),
-    ));
-    // Same admission and the same rate rule as the plain TCP loop above: what
-    // TLS changes is who can read the connection, not what this server will
-    // answer on it.
-    if let Some((tls_listener, config)) = tls_listener {
-        loops.spawn(tls::serve(
-            tls_listener,
-            config,
-            server.clone(),
-            TransportLimits::default(),
-            tcp::RateLimit::PerMessage,
-            shutdown.stop_handle(),
-            shutdown.busy(),
-        ));
-    }
-    if let Some(endpoint) = quic_endpoint {
-        loops.spawn(quic::serve(
-            endpoint,
-            server.clone(),
-            TransportLimits::default(),
-            tcp::RateLimit::PerMessage,
-            shutdown.stop_handle(),
-            shutdown.busy(),
-        ));
-    }
-    if let Some((https_listener, endpoint)) = https_listener {
-        loops.spawn(https::serve(
-            https_listener,
-            endpoint,
-            server.clone(),
-            TransportLimits::default(),
-            tcp::RateLimit::PerMessage,
-            shutdown.stop_handle(),
-            shutdown.busy(),
-        ));
-    }
+        &shutdown,
+        &mut loops,
+    );
     // A listener like the others: if it dies, the process does. A server whose
     // metrics stopped is one nobody is watching.
     if let Some(metrics_listener) = metrics_listener {
@@ -1699,30 +1567,36 @@ async fn main() -> Result<()> {
     // or, worse, being read as something wider.
     let transfer_acl = TransferAcl::parse(&cli.allow_transfer)?;
     let tsig_keys = TsigKeyring::parse(&cli.tsig_key)?;
+    // The incoming half of RFC 9103 §7.5: anchors for a *client's*
+    // certificate. Read here because the encrypted listeners below are built
+    // with them.
+    let client_anchors = match &cli.transfer_client_ca {
+        Some(path) => Some(rdns::tls_identity::TrustAnchors::from_ca_file(
+            path,
+            "the transfer client trust anchors",
+        )?),
+        None => None,
+    };
     // Loaded before anything binds, like every other thing that can stop the
     // start. A certificate that will not read is a DoT listener that answers
     // nothing, which is the failure `--metrics-listen` is already refused for.
-    let encrypted =
-        cli.tls_listen.is_some() || cli.quic_listen.is_some() || cli.https_listen.is_some();
-    let tls_store = match (encrypted, &cli.tls_cert, &cli.tls_key) {
-        (true, Some(cert), Some(key)) => Some(CertificateStore::load(cert, key)?),
-        // In code rather than in clap's `requires`, because the config file has
-        // no such mechanism and would otherwise bind 853 with nothing to present
-        // on it — and because either listener needs the pair, which `requires`
-        // cannot express as an "or".
-        (true, _, _) => {
-            return Err(anyhow!(
-                "tls-listen, quic-listen and https-listen need both tls-cert and tls-key"
-            ))
-        }
-        _ => None,
-    };
+    let encrypted = Encrypted::configure(
+        EncryptedFlags {
+            tls_listen: cli.tls_listen.as_deref(),
+            quic_listen: cli.quic_listen.as_deref(),
+            https_listen: cli.https_listen.as_deref(),
+            https_path: &cli.https_path,
+            tls_cert: cli.tls_cert.as_deref(),
+            tls_key: cli.tls_key.as_deref(),
+        },
+        client_anchors,
+    )?;
     // A transfer arrives on a connection, and if none of them can be encrypted
     // then this refuses every transfer there will ever be. That is a
     // configuration that cannot do what it says, so it is a startup error and
     // not a server that answers REFUSED to its own secondaries all night
     // (`CLAUDE.md` §15).
-    if cli.transfer_tls_only && !encrypted {
+    if cli.transfer_tls_only && encrypted.is_none() {
         return Err(anyhow!(
             "--transfer-tls-only needs a listener a transfer can arrive on: \
              --tls-listen, --quic-listen or --https-listen. Without one, every \
@@ -1815,27 +1689,19 @@ async fn main() -> Result<()> {
             }
         );
     }
-    // The incoming half of §7.5: anchors for a *client's* certificate, and the
-    // list of which client may take which zone. Read here with everything else
-    // a dry run has to reach, and both refused without a listener a transfer
-    // can arrive on — a policy that cannot act is one the operator believes is
-    // in force (`CLAUDE.md` §15).
+    // The incoming half of §7.5: the list of which client may take which zone.
+    // Read here with everything else a dry run has to reach, and refused, with
+    // the anchors, without a listener a transfer can arrive on — a policy that
+    // cannot act is one the operator believes is in force (`CLAUDE.md` §15).
     let transfer_clients = TransferCertificates::parse(&cli.allow_transfer_cert)?;
-    let client_anchors = match &cli.transfer_client_ca {
-        Some(path) => Some(rdns::tls_identity::TrustAnchors::from_ca_file(
-            path,
-            "the transfer client trust anchors",
-        )?),
-        None => None,
-    };
-    if let Some(anchors) = &client_anchors {
-        if cli.tls_listen.is_none() && cli.quic_listen.is_none() && cli.https_listen.is_none() {
-            return Err(anyhow!(
-                "--transfer-client-ca asks transfer clients for a certificate, and \
-                 there is no encrypted listener for one to arrive on: add \
-                 --tls-listen, --quic-listen or --https-listen"
-            ));
-        }
+    if cli.transfer_client_ca.is_some() && encrypted.is_none() {
+        return Err(anyhow!(
+            "--transfer-client-ca asks transfer clients for a certificate, and \
+             there is no encrypted listener for one to arrive on: add \
+             --tls-listen, --quic-listen or --https-listen"
+        ));
+    }
+    if let Some(anchors) = encrypted.as_ref().and_then(Encrypted::clients) {
         // What the incoming half is configured to do, and what each client may
         // take. An unscoped rule transfers everything, so it is printed rather
         // than left to be discovered (`CLAUDE.md` §14, §16).
@@ -1979,18 +1845,9 @@ async fn main() -> Result<()> {
             // matched against its key above — a dry run has to run everything
             // that does not bind a socket (`CLAUDE.md` §15), and saying nothing
             // about it would leave an operator unable to tell whether it did.
-            match &tls_store {
+            match &encrypted {
                 None => "disabled".to_string(),
-                Some(_) => format!(
-                    "on {}, certificate loads",
-                    describe_encrypted(
-                        cli.tls_listen.as_deref(),
-                        cli.quic_listen.as_deref(),
-                        cli.https_listen
-                            .as_deref()
-                            .map(|addr| (addr, cli.https_path.as_str())),
-                    )
-                ),
+                Some(encrypted) => format!("on {}, certificate loads", encrypted.listeners()),
             }
         );
         return Ok(());
@@ -2154,7 +2011,7 @@ async fn main() -> Result<()> {
             source,
             served: served.clone(),
             notify,
-            tls: tls_store.clone(),
+            tls: encrypted.as_ref().map(Encrypted::store),
         },
         announced,
         shutdown.lifecycle(),
@@ -2183,13 +2040,7 @@ async fn main() -> Result<()> {
             ),
             udp_workers: cli.udp_workers,
             metrics_listen: cli.metrics_listen,
-            tls: tls_store.clone().map(|store| TlsPolicy {
-                dot: cli.tls_listen,
-                doq: cli.quic_listen,
-                doh: cli.https_listen.map(|addr| (addr, cli.https_path.clone())),
-                store,
-                clients: client_anchors,
-            }),
+            tls: encrypted,
             readiness,
             updates,
             journal,
