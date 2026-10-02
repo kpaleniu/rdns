@@ -12,6 +12,16 @@ with the DNSSEC records that reply owes.
 _Avoid_: authoritative answer (a referral is a zone answer with AA clear,
 RFC 1035 §4.1.1)
 
+**Source**:
+The address block a per-client limit counts as one client: an IPv4 address,
+or an IPv6 /56.
+_Avoid_: client IP, address (when the block is meant)
+
+**Peer**:
+The exact address a message or connection came from. Many peers can be one
+source.
+_Avoid_: source (when the exact address is meant)
+
 **Trusted start**:
 A zone a resolution began from whose DNSKEY set was already validated to a
 trust anchor, held with the keys as they were read at that moment.
