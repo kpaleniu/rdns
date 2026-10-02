@@ -12,6 +12,7 @@
 //! dry-run exit and binds nothing; [`EncryptedListeners`] is bound below it.
 
 use std::io;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -25,7 +26,7 @@ use rdns::tls_identity::TrustAnchors;
 
 use crate::tcp::{self, Handler, RateLimit};
 use crate::tls::CertificateStore;
-use crate::{https, quic, tls, TransportLimits};
+use crate::{bind, https, quic, tls, TransportLimits};
 
 /// The encrypted listeners as the operator configured them, from the merged
 /// view of flags and file.
@@ -89,35 +90,29 @@ impl Encrypted {
         }))
     }
 
-    /// "127.0.0.1:853 DoT, 127.0.0.1:853 DoQ", or whichever are configured.
+    /// "127.0.0.1:853 (IPv4) DoT, 127.0.0.1:853 (IPv4) DoQ", or whichever are
+    /// configured, with the families each will serve (`TODO.md` #159).
     ///
-    /// One spelling for the startup line and `--check-config`: the dry run had
-    /// written its own copy that matched DoT and DoQ alone, so a DoH-only
-    /// server was reported as "encrypted transports disabled" by the one
-    /// command whose job is to be believed before a restart (`CLAUDE.md` §7).
+    /// For `--check-config`, which binds nothing, so the families are what
+    /// [`bind::planned`] says the bind will make of the address. The startup
+    /// line reads them from the sockets instead —
+    /// [`EncryptedListeners::describe`], in the same spelling. The dry run once
+    /// had its own copy that matched DoT and DoQ alone, so a DoH-only server
+    /// was reported as "encrypted transports disabled" by the one command whose
+    /// job is to be believed before a restart (`CLAUDE.md` §7).
     pub fn listeners(&self) -> String {
+        let planned = |addr: &str| bind::planned(addr).unwrap_or_else(|| addr.to_string());
         let mut parts = Vec::new();
         if let Some(addr) = &self.dot {
-            parts.push(format!("{addr} DoT"));
+            parts.push(format!("{} DoT", planned(addr)));
         }
         if let Some(addr) = &self.doq {
-            parts.push(format!("{addr} DoQ"));
+            parts.push(format!("{} DoQ", planned(addr)));
         }
         if let Some((addr, path)) = &self.doh {
-            parts.push(format!("{addr}{path} DoH"));
+            parts.push(format!("{} {path} DoH", planned(addr)));
         }
         parts.join(", ")
-    }
-
-    /// The listeners and the certificate's files, for the startup line.
-    pub fn describe(&self) -> String {
-        let (cert, key) = self.store.paths();
-        format!(
-            "{} (cert {}, key {})",
-            self.listeners(),
-            cert.display(),
-            key.display()
-        )
     }
 
     /// The store, for the daemon's reload path.
@@ -136,6 +131,9 @@ pub struct EncryptedListeners {
     doh: Option<(TcpListener, https::Endpoint)>,
     doq: Option<quinn::Endpoint>,
     limits: TransportLimits,
+    /// Each bound listener as [`Encrypted::listeners`] spells it, with the
+    /// families read from its socket.
+    bound: Vec<String>,
 }
 
 impl EncryptedListeners {
@@ -155,39 +153,69 @@ impl EncryptedListeners {
             doh: None,
             doq: None,
             limits,
+            bound: Vec::new(),
         };
         let Some(config) = config else {
             return Ok(bound);
         };
         if let Some(addr) = &config.dot {
+            let listener = bind::tcp(addr)
+                .await
+                .with_context(|| format!("--tls-listen {addr}"))?;
+            bound.bound.push(format!("{} DoT", listener.describe()));
             bound.dot = Some((
-                TcpListener::bind(addr)
-                    .await
-                    .with_context(|| format!("--tls-listen {addr}"))?,
+                listener.socket,
                 tls::server_config(config.store.clone(), config.clients.clone())?,
             ));
         }
+        // Before DoH, so the order is `Encrypted::listeners`'.
+        let mut doh_line = None;
         if let Some((addr, path)) = &config.doh {
+            let listener = bind::tcp(addr)
+                .await
+                .with_context(|| format!("--https-listen {addr}"))?;
+            doh_line = Some(format!("{} {path} DoH", listener.describe()));
             bound.doh = Some((
-                TcpListener::bind(addr)
-                    .await
-                    .with_context(|| format!("--https-listen {addr}"))?,
+                listener.socket,
                 https::endpoint(config.store.clone(), path, config.clients.clone())?,
             ));
         }
-        // quinn binds its own UDP socket, so the same rule for a different kind
-        // of listener.
+        // quinn would bind its own socket with the OS default for
+        // `IPV6_V6ONLY`, so it is handed one from `bind` instead.
         if let Some(addr) = &config.doq {
+            let at: SocketAddr = addr
+                .parse()
+                .with_context(|| format!("--quic-listen {addr} is not an address:port"))?;
+            let socket = bind::udp_std(at).with_context(|| format!("--quic-listen {addr}"))?;
+            bound.bound.push(format!("{} DoQ", socket.describe()));
+            let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
             bound.doq = Some(
-                quinn::Endpoint::server(
-                    quic::server_config(config.store.clone(), limits, config.clients.clone())?,
-                    addr.parse()
-                        .with_context(|| format!("--quic-listen {addr} is not an address:port"))?,
+                quinn::Endpoint::new(
+                    quinn::EndpointConfig::default(),
+                    Some(quic::server_config(
+                        config.store.clone(),
+                        limits,
+                        config.clients.clone(),
+                    )?),
+                    socket.socket,
+                    runtime,
                 )
                 .with_context(|| format!("--quic-listen {addr}"))?,
             );
         }
+        bound.bound.extend(doh_line);
         Ok(bound)
+    }
+
+    /// The bound listeners and the certificate's files, for the startup line.
+    pub fn describe(&self, config: &Encrypted) -> String {
+        let (cert, key) = config.store.paths();
+        format!(
+            "{} (cert {}, key {})",
+            self.bound.join(", "),
+            cert.display(),
+            key.display()
+        )
     }
 
     /// Spawn plain TCP, already bound beside the UDP socket it shares an
@@ -208,6 +236,7 @@ impl EncryptedListeners {
             doh,
             doq,
             limits,
+            bound: _,
         } = self;
         loops.spawn(tcp::serve(
             plain,
@@ -313,7 +342,7 @@ mod tests {
         )
         .expect("loads")
         .expect("configured");
-        assert_eq!(doh.listeners(), "127.0.0.1:443/dns-query DoH");
+        assert_eq!(doh.listeners(), "127.0.0.1:443 (IPv4) /dns-query DoH");
 
         let both = Encrypted::configure(
             flags(
@@ -328,7 +357,7 @@ mod tests {
         .expect("configured");
         assert_eq!(
             both.listeners(),
-            "127.0.0.1:853 DoT, 127.0.0.1:443/dns-query DoH"
+            "127.0.0.1:853 (IPv4) DoT, 127.0.0.1:443 (IPv4) /dns-query DoH"
         );
     }
 }

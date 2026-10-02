@@ -152,7 +152,9 @@ fn the_dry_run_names_a_doh_only_listener() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     let line = stdout(&out);
     assert!(
-        line.contains("encrypted transports on 127.0.0.1:8443/dns-query DoH, certificate loads"),
+        line.contains(
+            "encrypted transports on 127.0.0.1:8443 (IPv4) /dns-query DoH, certificate loads"
+        ),
         "got: {line:?}"
     );
 }

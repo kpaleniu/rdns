@@ -23,6 +23,7 @@
 // `write!` into the target does not. Off by default (restriction group).
 #![warn(clippy::format_push_string)]
 
+pub mod bind;
 pub mod encrypted;
 pub mod https;
 pub mod logging;

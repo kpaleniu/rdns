@@ -56,12 +56,12 @@ use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl}
 use rdns::shutdown::Shutdown;
 use rdns::validation::{AdmissionCheck, AdmissionLimits};
 use rdns::UdpSizes;
+use rdns_transport::bind;
 use rdns_transport::encrypted::{Encrypted, EncryptedFlags, EncryptedListeners};
 use rdns_transport::logging::LogLevel;
 use rdns_transport::metrics_server;
 use rdns_transport::readiness::Readiness;
 use rdns_transport::{tcp, ServeContext, TransportLimits};
-use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
 
 use crate::anchors::spawn_anchor_manager;
@@ -183,6 +183,9 @@ fn default_rpz_policy() -> rdns::rpz::PolicyOverride {
 #[command(group(clap::ArgGroup::new("refreshing").multiple(true)))]
 struct Cli {
     /// Address to listen on. Defaults to localhost to avoid an open resolver.
+    ///
+    /// `::` serves IPv4 and IPv6 on every platform; a specific IPv6 address,
+    /// such as `::1`, serves IPv6 only.
     #[arg(long, default_value_t = default_host(), conflicts_with = "config")]
     host: String,
     #[arg(long, default_value_t = default_port(), conflicts_with = "config")]
@@ -835,7 +838,8 @@ async fn main() -> anyhow::Result<()> {
             .filter(|z| z.policy() != rdns::rpz::PolicyOverride::Given)
             .count();
         println!(
-            "configuration is valid: {}, {} policy feed(s){}, cache {}, encrypted transports {}",
+            "configuration is valid: {}, {} policy feed(s){}, cache {}, listening on {}, \
+             encrypted transports {}",
             source,
             in_force.zones().len(),
             // Said out loud because a feed at `passthru` or `disabled` blocks
@@ -850,6 +854,12 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 format!("{capacity} entries")
             },
+            // What the bind will make of the address, since nothing is bound
+            // here (`TODO.md` #159).
+            {
+                let addr = format!("{}:{}", cli.host, cli.port);
+                bind::planned(&addr).unwrap_or(addr)
+            },
             match &encrypted {
                 None => "disabled".to_string(),
                 Some(encrypted) => format!("on {}, certificate loads", encrypted.listeners()),
@@ -861,13 +871,15 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("{}:{}", cli.host, cli.port);
     // Both transports are mandatory: an answer over the client's UDP payload
     // size gets TC=1, and RFC 1035 §4.2.1 has the client retry over TCP.
-    let socket = Arc::new(UdpSocket::bind(&addr).await?);
-    let listener = TcpListener::bind(&addr).await?;
+    let socket = bind::udp(&addr).await?;
+    let listening = socket.describe();
+    let socket = Arc::new(socket.socket);
+    let listener = bind::tcp(&addr).await?.socket;
     // Bound before anything is announced, so a typo in `--metrics-listen`
     // stops the start rather than losing the observability silently.
     let metrics_listener = match &cli.metrics_listen {
         Some(spec) => Some(
-            TcpListener::bind(spec)
+            bind::tcp(spec)
                 .await
                 .with_context(|| format!("--metrics-listen {spec}"))?,
         ),
@@ -901,7 +913,7 @@ async fn main() -> anyhow::Result<()> {
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, \
          UDP reply cap: {}B (advertising {}B), UDP in flight: {}, \
          connections: {} per listener, idle {}s, encrypted: {}",
-        addr,
+        listening,
         source,
         if capacity == 0 {
             "disabled".to_string()
@@ -928,7 +940,7 @@ async fn main() -> anyhow::Result<()> {
         cli.max_connections,
         cli.connection_idle_timeout,
         match &encrypted {
-            Some(encrypted) => encrypted.describe(),
+            Some(encrypted) => stream_listeners.describe(encrypted),
             None => "off (--tls-listen, --quic-listen, --https-listen)".to_string(),
         },
     );
@@ -973,7 +985,7 @@ async fn main() -> anyhow::Result<()> {
             "unlimited (--query-rate 0)".to_string()
         } else {
             format!(
-                "{}/s per client, burst {}{}",
+                "{}/s per source (IPv4 address, IPv6 /56), burst {}{}",
                 cli.query_rate,
                 cli.query_burst,
                 if cli.query_rate_exempt.is_empty() {
@@ -986,7 +998,7 @@ async fn main() -> anyhow::Result<()> {
         if cli.response_rate == 0 {
             "off (--response-rate 0)".to_string()
         } else {
-            format!("{} bytes/s per client", cli.response_rate)
+            format!("{} bytes/s per IPv4 /24 or IPv6 /56", cli.response_rate)
         },
         match &cli.metrics_listen {
             Some(spec) => format!("{spec}/metrics"),
@@ -1149,7 +1161,7 @@ async fn main() -> anyhow::Result<()> {
         let (stop, busy) = (shutdown.stop_handle(), shutdown.busy());
         loops.spawn(async move {
             metrics_server::serve(
-                metrics_listener,
+                metrics_listener.socket,
                 ctx.metrics.clone(),
                 // Nothing to wait for: a resolver is ready as soon as it is
                 // up.

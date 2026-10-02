@@ -78,6 +78,7 @@ use rdns::{
     Serial,
 };
 use rdns::{Name, UdpSizes};
+use rdns_transport::bind;
 use rdns_transport::encrypted::{Encrypted, EncryptedFlags, EncryptedListeners};
 use rdns_transport::logging::LogLevel;
 use rdns_transport::metrics_server;
@@ -176,7 +177,7 @@ pub(crate) fn default_udp_workers() -> usize {
         .clamp(2, 32)
 }
 
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 
@@ -223,6 +224,9 @@ use rdns::peer::Peer;
 #[command(version = rdns::VERSION, about, long_about = None)]
 struct Cli {
     /// Address to listen on, for both transports.
+    ///
+    /// `::` serves IPv4 and IPv6 on every platform; a specific IPv6 address,
+    /// such as `::1`, serves IPv6 only.
     #[arg(long, default_value_t = default_host(), conflicts_with = "config")]
     host: String,
     /// Port to listen on, for both transports.
@@ -870,7 +874,7 @@ async fn serve(
     let budget = if response_rate == 0 {
         "off".to_string()
     } else {
-        format!("{response_rate} bytes/s per client")
+        format!("{response_rate} bytes/s per IPv4 /24 or IPv6 /56")
     };
     // Printed at startup: over-limit queries are dropped silently — replying to
     // a spoofed source is what an amplifier does — so the number has to be
@@ -879,7 +883,7 @@ async fn serve(
         "off".to_string()
     } else {
         format!(
-            "{} q/s per client, burst {}{}",
+            "{} q/s per source (IPv4 address, IPv6 /56), burst {}{}",
             query_limit.tokens_per_window,
             query_limit.burst_size,
             if query_limit.exempt.is_empty() {
@@ -912,11 +916,13 @@ async fn serve(
     // Bind everything before announcing anything, so a port conflict fails here
     // rather than after one transport is up. The metrics listener included: a
     // typo in `--metrics-listen` must stop the start, not silently disable it.
-    let socket = Arc::new(UdpSocket::bind(addr).await?);
-    let listener = TcpListener::bind(addr).await?;
+    let socket = bind::udp(addr).await?;
+    let listening = socket.describe();
+    let socket = Arc::new(socket.socket);
+    let listener = bind::tcp(addr).await?.socket;
     let metrics_listener = match &metrics_listen {
         Some(spec) => Some(
-            TcpListener::bind(spec)
+            bind::tcp(spec)
                 .await
                 .with_context(|| format!("--metrics-listen {spec}"))?,
         ),
@@ -974,7 +980,7 @@ async fn serve(
     // The effective policy, at the default level: a control nobody can observe
     // is a control nobody can debug.
     tracing::info!(
-        "rdnsd listening on {addr} (UDP+TCP), zone transfer: {transfers}, \
+        "rdnsd listening on {listening} (UDP+TCP), zone transfer: {transfers}, \
          response budget: {budget}, query rate: {query_limit_note}, \
          request cap: {udp_cap}B UDP / {tcp_cap}B TCP, \
          UDP reply cap: {reply_cap}B (advertising {advertised}B), \
@@ -985,11 +991,11 @@ async fn serve(
         connections.idle_timeout.as_secs(),
         server.tsig_keys().len(),
         match &tls {
-            Some(encrypted) => encrypted.describe(),
+            Some(encrypted) => stream_listeners.describe(encrypted),
             None => "off (--tls-listen, --quic-listen)".to_string(),
         },
-        match &metrics_listen {
-            Some(spec) => format!("{spec}/metrics"),
+        match &metrics_listener {
+            Some(bound) => format!("{}/metrics ({})", bound.local, bound.families),
             None => "off (--metrics-listen)".to_string(),
         },
         match &control.socket {
@@ -1052,7 +1058,7 @@ async fn serve(
     // metrics stopped is one nobody is watching.
     if let Some(metrics_listener) = metrics_listener {
         loops.spawn(metrics_server::serve(
-            metrics_listener,
+            metrics_listener.socket,
             server.ctx().metrics.clone(),
             readiness,
             shutdown.stop_handle(),
@@ -1868,7 +1874,8 @@ async fn main() -> Result<()> {
         // not be able to take away the output of a command whose entire job is
         // to produce it.
         println!(
-            "configuration is valid: {} zone(s){}, {} TSIG key(s), signing {}, encrypted transports {}",
+            "configuration is valid: {} zone(s){}, {} TSIG key(s), signing {}, listening on {}, \
+             encrypted transports {}",
             zones.len(),
             // Said out loud because the member zones are not among the count
             // above: they arrive with the catalog, and what a dry run can check
@@ -1881,6 +1888,12 @@ async fn main() -> Result<()> {
             match &signing {
                 Some(s) => format!("{} zone(s)", s.signed_zone_count(&zones)),
                 None => "disabled".to_string(),
+            },
+            // What the bind will make of the address, since nothing is bound
+            // here (`TODO.md` #159).
+            {
+                let addr = format!("{}:{}", cli.host, cli.port);
+                bind::planned(&addr).unwrap_or(addr)
             },
             // Named because the certificate was read, permission-checked and
             // matched against its key above — a dry run has to run everything
@@ -3162,8 +3175,8 @@ mod tests {
             let socket = dual_stack(Type::STREAM);
             let port = port_of(&socket);
             socket.listen(16).expect("listen");
-            let listener =
-                TcpListener::from_std(std::net::TcpListener::from(socket)).expect("a listener");
+            let listener = tokio::net::TcpListener::from_std(std::net::TcpListener::from(socket))
+                .expect("a listener");
             let server = Arc::new(
                 Server::new(zone_map(one_record_zone()), test_context()).with_transfers(
                     TransferAcl::parse(&["127.0.0.1".to_string()]).expect("acl"),

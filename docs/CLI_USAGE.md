@@ -40,6 +40,11 @@ file would race to write it.
 Listen address, both transports. Default `0.0.0.0`. Takes IPv4 (`127.0.0.1`,
 `0.0.0.0`), IPv6 (`::1`, `::`) or a hostname (`localhost`, `dns.example.com`).
 
+`::` serves IPv4 and IPv6 on Linux and Windows alike: every listener is bound
+with `IPV6_V6ONLY` off, where the OS defaults differ (`docs/adr/0006`). A
+specific IPv6 address serves IPv6 only. The startup line and `--check-config`
+name the families each listener serves, as in `[::]:53 (IPv4 and IPv6)`.
+
 ### `--port <PORT>`
 
 Listen port, both transports. Default `53`, range 1–65535. Below 1024 needs root

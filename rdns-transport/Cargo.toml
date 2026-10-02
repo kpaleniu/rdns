@@ -28,6 +28,9 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 quinn.workspace = true
+# `IPV6_V6ONLY` on every listener (`TODO.md` #159). Already in the lock under
+# quinn, so no package is added.
+socket2 = "0.6"
 rustls.workspace = true
 tokio-rustls.workspace = true
 

@@ -30,8 +30,8 @@ port = 53
 zone-dir = "./zones"
 allow-transfer = ["192.0.2.1"]
 also-notify = ["192.0.2.2:53", "192.0.2.4#partner.key."]   # #key signs the NOTIFY
-response-rate = 8192        # bytes/s per client, 0 = off
-query-rate = 1000           # queries/s per client, 0 = off
+response-rate = 8192        # bytes/s per IPv4 /24 or IPv6 /56, 0 = off
+query-rate = 1000           # queries/s per source, 0 = off
 query-burst = 200
 query-rate-exempt = ["10.0.0.0/8"]
 udp-workers = 8             # default: parallelism clamped to 2..=32
