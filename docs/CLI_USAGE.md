@@ -142,11 +142,13 @@ count separately. Both daemons, same defaults.
   `dns_connection_accept_waits_total{transport}` counts the waits. `0` is
   refused: the ceiling is what stands between a connection flood and the
   descriptor limit.
-- `--connection-idle-timeout` (10 s): how long a TCP, DoT or DoQ connection
-  may sit idle between messages, and how long a DoT or DoH TLS handshake may
-  take; a handshake that runs over counts in
-  `dns_tls_handshake_failures_total`. Not applied to DoH after the handshake
-  (`TODO.md` #161). `0` is refused.
+- `--connection-idle-timeout` (10 s): how long a connection on any stream
+  listener may go without the client starting a message or request, whatever
+  is still being answered, and how long a DoT or DoH TLS handshake may take; a
+  handshake that runs over counts in `dns_tls_handshake_failures_total`. DoH
+  closes gracefully — GOAWAY on HTTP/2, the exchange finished on HTTP/1.1 —
+  and drops the connection if it has not closed one timeout later, so an
+  answer in flight gets between one and two timeouts. `0` is refused.
 - `--max-connections-per-source` (32): connections one source — an IPv4
   address or an IPv6 /56 — may hold on a listener. Over it the connection is
   closed with no reply, counted in

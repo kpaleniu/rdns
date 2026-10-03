@@ -33,9 +33,12 @@
 //! on zone size (`TODO.md` #106). The drain is still here as a backstop: the
 //! `Handler` trait permits a sequence because `tcp` and `quic` need it.
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
 use http_body_util::{BodyExt, Full};
@@ -46,6 +49,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rustls::ServerConfig;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio_rustls::TlsAcceptor;
 
 use rdns::shutdown::{Busy, Stop};
@@ -182,36 +186,81 @@ pub async fn serve<H: Handler>(
                 },
                 crate::tls::presented_certificate(stream.get_ref().1),
             );
-            let service = service_fn(move |request| {
-                let handler = handler.clone();
-                let path = path.clone();
-                let arrival = arrival.clone();
-                async move {
-                    Ok::<_, std::convert::Infallible>(
-                        answer(request, peer, handler, path, arrival, rate).await,
-                    )
+            let started = Arc::new(Notify::new());
+            let service = service_fn({
+                let started = started.clone();
+                move |request| {
+                    started.notify_one();
+                    let handler = handler.clone();
+                    let path = path.clone();
+                    let arrival = arrival.clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(
+                            answer(request, peer, handler, path, arrival, rate).await,
+                        )
+                    }
                 }
             });
             let io = TokioIo::new(stream);
             // Chosen from ALPN rather than sniffed: hyper's `auto` builder would
             // do the same by reading the preface, and the handshake has already
             // told us.
+            let idle = limits.idle_timeout;
             let served = if negotiated_h2 {
-                hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                    .serve_connection(io, service)
-                    .await
+                let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, service);
+                until_idle(conn, |c| c.graceful_shutdown(), &started, idle, &stop).await
             } else {
-                hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, service)
-                    .await
+                let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, service);
+                until_idle(conn, |c| c.graceful_shutdown(), &started, idle, &stop).await
             };
-            if let Err(e) = served {
-                tracing::debug!(peer = %peer.ip(), "HTTPS connection ended: {e}");
+            match served {
+                Some(Ok(())) => {}
+                Some(Err(e)) => {
+                    tracing::debug!(peer = %peer.ip(), "HTTPS connection ended: {e}");
+                }
+                None => {
+                    tracing::debug!(peer = %peer.ip(), "HTTPS connection dropped: no close after GOAWAY");
+                }
             }
             drop(slot);
             drop(busy);
         });
     }
+}
+
+/// Drive `conn` until it ends, closing it gracefully once no request has
+/// started for `idle` or shutdown begins, and dropping it `idle` after that.
+///
+/// Idle is no new request, whatever is in flight, as on TCP (`TODO.md` #161).
+/// hyper's HTTP/2 server has no idle close of its own, and its HTTP/1
+/// `header_read_timeout` starts after a response rather than at a request.
+/// The second deadline is for a peer that stops reading, which stalls HTTP/2
+/// flow control, or that never finishes an HTTP/1 header: `graceful_shutdown`
+/// waits for either without a limit. `None` is a connection dropped there.
+async fn until_idle<C, E>(
+    conn: C,
+    graceful_shutdown: impl FnOnce(Pin<&mut C>),
+    started: &Notify,
+    idle: Duration,
+    stop: &Stop,
+) -> Option<Result<(), E>>
+where
+    C: Future<Output = Result<(), E>>,
+{
+    let mut conn = std::pin::pin!(conn);
+    loop {
+        tokio::select! {
+            served = conn.as_mut() => return Some(served),
+            // `notify_one` keeps a permit when nobody is waiting, so a request
+            // that starts between two turns of this loop is not missed.
+            () = started.notified() => {}
+            () = tokio::time::sleep(idle) => break,
+            () = stop.wait() => break,
+        }
+    }
+    graceful_shutdown(conn.as_mut());
+    tokio::time::timeout(idle, conn).await.ok()
 }
 
 /// One HTTP request: find the DNS message in it, answer it, wrap the answer.
@@ -408,7 +457,8 @@ mod tests {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    struct Echo(ServeContext);
+    /// Echoes the message back, after `.1`.
+    struct Echo(ServeContext, Duration);
 
     impl Handler for Echo {
         fn context(&self) -> &ServeContext {
@@ -423,6 +473,7 @@ mod tests {
             _arrival: Arrival,
             out: tokio::sync::mpsc::Sender<Reply>,
         ) {
+            tokio::time::sleep(self.1).await;
             crate::tcp::send_framed(&out, &packet).await;
         }
     }
@@ -437,14 +488,16 @@ mod tests {
         ctx: ServeContext,
         rate: RateLimit,
     ) -> (SocketAddr, Vec<u8>, Shutdown, tokio::task::JoinHandle<()>) {
-        started_limited(ctx, rate, TransportLimits::default()).await
+        started_limited(ctx, rate, TransportLimits::default(), Duration::ZERO).await
     }
 
-    /// The same, for a test that is about a connection limit.
+    /// The same, for a test that is about a connection limit, with a handler
+    /// that takes `delay` over each answer.
     async fn started_limited(
         ctx: ServeContext,
         rate: RateLimit,
         limits: TransportLimits,
+        delay: Duration,
     ) -> (SocketAddr, Vec<u8>, Shutdown, tokio::task::JoinHandle<()>) {
         let pem = write_pem("doh", "localhost");
         let store = CertificateStore::load(&pem.cert, &pem.key).expect("loads");
@@ -458,7 +511,7 @@ mod tests {
                 let _ = serve(
                     listener,
                     endpoint(store, DEFAULT_PATH, None).expect("a DoH endpoint"),
-                    Arc::new(Echo(ctx)),
+                    Arc::new(Echo(ctx, delay)),
                     limits,
                     rate,
                     stop,
@@ -484,19 +537,8 @@ mod tests {
     /// `PerConnection` refusal looks like from outside, there being no HTTP
     /// yet to carry a 429.
     async fn try_request(addr: SocketAddr, der: &[u8], head: &str, body: &[u8]) -> Option<Vec<u8>> {
-        let mut roots = rustls::RootCertStore::empty();
-        roots
-            .add(CertificateDer::from(der.to_vec()))
-            .expect("a root");
-        let mut config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
         // http/1.1, so the request can be written as text.
-        config.alpn_protocols = vec![ALPN_HTTP11.to_vec()];
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
-        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
-        let mut tls = connector.connect(name, tcp).await.ok()?;
+        let mut tls = connect(addr, der, ALPN_HTTP11).await?;
 
         let mut wire = head.as_bytes().to_vec();
         wire.extend_from_slice(body);
@@ -504,6 +546,74 @@ mod tests {
         let mut out = Vec::new();
         let _ = tls.read_to_end(&mut out).await;
         (!out.is_empty()).then_some(out)
+    }
+
+    /// A TLS connection to `addr` offering only `alpn`, or `None` when the
+    /// handshake failed.
+    async fn connect(
+        addr: SocketAddr,
+        der: &[u8],
+        alpn: &[u8],
+    ) -> Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(der.to_vec()))
+            .expect("a root");
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![alpn.to_vec()];
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
+        connector.connect(name, tcp).await.ok()
+    }
+
+    /// A POST head for `body`, keeping the connection open afterwards.
+    fn keep_alive_post(body: &[u8]) -> String {
+        format!(
+            "POST {DEFAULT_PATH} HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+    }
+
+    /// Read until the server closes, or `None` if it has not within five
+    /// seconds: the bound that makes an unclosed connection a failure rather
+    /// than a hang.
+    async fn read_until_closed(stream: &mut (impl AsyncReadExt + Unpin)) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut out))
+            .await
+            .ok()
+            .map(|_| out)
+    }
+
+    /// One slot and a 200 ms idle timeout, so a test can show both the close
+    /// and that the slot came back.
+    fn one_short_slot() -> TransportLimits {
+        TransportLimits {
+            idle_timeout: Duration::from_millis(200),
+            max_connections: 1,
+            ..TransportLimits::default()
+        }
+    }
+
+    /// The listener answers: with one slot, only once the last connection let
+    /// go of it.
+    async fn answers(addr: SocketAddr, der: &[u8]) {
+        let question = query(0x1610);
+        let head = format!(
+            "POST {DEFAULT_PATH} HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/dns-message\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            question.len()
+        );
+        let response =
+            tokio::time::timeout(Duration::from_secs(5), request(addr, der, &head, &question))
+                .await
+                .expect("the slot was released");
+        assert!(split(&response).0.starts_with("HTTP/1.1 200"));
     }
 
     fn split(response: &[u8]) -> (String, Vec<u8>) {
@@ -529,7 +639,8 @@ mod tests {
             max_connections: 1,
             ..TransportLimits::default()
         };
-        let (addr, der, shutdown, task) = started_limited(ctx, RateLimit::PerMessage, limits).await;
+        let (addr, der, shutdown, task) =
+            started_limited(ctx, RateLimit::PerMessage, limits, Duration::ZERO).await;
 
         let mut silent = tokio::net::TcpStream::connect(addr).await.expect("connect");
         let mut byte = [0u8; 1];
@@ -562,6 +673,141 @@ mod tests {
         assert!(split(&response).0.starts_with("HTTP/1.1 200"));
 
         shutdown.begin();
+        task.abort();
+    }
+
+    /// An HTTP/2 connection that opens and asks nothing is closed at the idle
+    /// timeout, and its slot goes to the next client (`TODO.md` #161).
+    #[tokio::test]
+    async fn an_http2_connection_with_no_request_is_closed_when_idle() {
+        let (addr, der, shutdown, task) = started_limited(
+            context(0),
+            RateLimit::PerMessage,
+            one_short_slot(),
+            Duration::ZERO,
+        )
+        .await;
+        let mut h2 = connect(addr, &der, ALPN_H2).await.expect("the handshake");
+        // The client preface and an empty SETTINGS frame (RFC 9113 §3.4,
+        // §6.5), and then nothing.
+        h2.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+            .await
+            .expect("preface");
+        assert!(
+            read_until_closed(&mut h2).await.is_some(),
+            "an idle HTTP/2 connection is closed"
+        );
+        answers(addr, &der).await;
+        shutdown.begin();
+        task.abort();
+    }
+
+    /// An HTTP/1.1 keep-alive connection is answered, then closed once no
+    /// further request starts.
+    #[tokio::test]
+    async fn an_http1_connection_is_closed_when_idle_after_an_answer() {
+        let (addr, der, shutdown, task) = started_limited(
+            context(0),
+            RateLimit::PerMessage,
+            one_short_slot(),
+            Duration::ZERO,
+        )
+        .await;
+        let mut h1 = connect(addr, &der, ALPN_HTTP11)
+            .await
+            .expect("the handshake");
+        let question = query(0x1611);
+        h1.write_all(keep_alive_post(&question).as_bytes())
+            .await
+            .expect("head");
+        h1.write_all(&question).await.expect("body");
+        let response = read_until_closed(&mut h1)
+            .await
+            .expect("an idle keep-alive connection is closed");
+        let (head, body) = split(&response);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, question, "after the answer, not instead of it");
+        answers(addr, &der).await;
+        shutdown.begin();
+        task.abort();
+    }
+
+    /// The clock is about requests started, not answers finished: a request
+    /// still in flight when it runs out is answered, then the connection
+    /// closes. Half again the idle timeout, inside the one more timeout a
+    /// graceful close is given.
+    #[tokio::test]
+    async fn a_request_in_flight_at_the_idle_timeout_is_still_answered() {
+        let limits = one_short_slot();
+        let (addr, der, shutdown, task) = started_limited(
+            context(0),
+            RateLimit::PerMessage,
+            limits,
+            limits.idle_timeout * 3 / 2,
+        )
+        .await;
+        let mut h1 = connect(addr, &der, ALPN_HTTP11)
+            .await
+            .expect("the handshake");
+        let question = query(0x1612);
+        h1.write_all(keep_alive_post(&question).as_bytes())
+            .await
+            .expect("head");
+        h1.write_all(&question).await.expect("body");
+        let response = read_until_closed(&mut h1).await.expect("closed afterwards");
+        let (head, body) = split(&response);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, question);
+        shutdown.begin();
+        task.abort();
+    }
+
+    /// A header that never finishes is not a request, so it does not hold the
+    /// connection open.
+    #[tokio::test]
+    async fn a_header_that_never_finishes_is_dropped() {
+        let (addr, der, shutdown, task) = started_limited(
+            context(0),
+            RateLimit::PerMessage,
+            one_short_slot(),
+            Duration::ZERO,
+        )
+        .await;
+        let mut h1 = connect(addr, &der, ALPN_HTTP11)
+            .await
+            .expect("the handshake");
+        h1.write_all(b"POST /dns-query HTTP/1.1\r\nHost: loc")
+            .await
+            .expect("half a head");
+        assert!(read_until_closed(&mut h1).await.is_some(), "dropped");
+        answers(addr, &der).await;
+        shutdown.begin();
+        task.abort();
+    }
+
+    /// Shutdown closes an idle keep-alive connection rather than waiting on
+    /// the client, as the TCP loop stops reading at shutdown. The idle timeout
+    /// is the default ten seconds, so a close inside the five-second bound is
+    /// the shutdown's.
+    #[tokio::test]
+    async fn shutdown_closes_an_idle_keep_alive_connection() {
+        let (addr, der, shutdown, task) = started().await;
+        let mut h1 = connect(addr, &der, ALPN_HTTP11)
+            .await
+            .expect("the handshake");
+        let question = query(0x1613);
+        h1.write_all(keep_alive_post(&question).as_bytes())
+            .await
+            .expect("head");
+        h1.write_all(&question).await.expect("body");
+        let mut status = [0u8; 12];
+        h1.read_exact(&mut status).await.expect("the answer starts");
+        assert_eq!(&status, b"HTTP/1.1 200");
+        shutdown.begin();
+        assert!(
+            read_until_closed(&mut h1).await.is_some(),
+            "shutdown closes the connection"
+        );
         task.abort();
     }
 

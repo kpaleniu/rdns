@@ -424,9 +424,10 @@ struct Cli {
         conflicts_with = "config"
     )]
     max_connections: std::num::NonZeroUsize,
-    /// Seconds a TCP, DoT or DoQ connection may sit idle between messages
-    /// before it is closed, and a DoT or DoH TLS handshake may take. Not
-    /// applied to DoH after the handshake (`TODO.md` #161).
+    /// Seconds a stream connection may go without the client starting a
+    /// message or request before it is closed, and a DoT or DoH TLS handshake
+    /// may take. DoH closes gracefully and drops the connection one timeout
+    /// later.
     #[arg(
         long,
         value_name = "SECONDS",
