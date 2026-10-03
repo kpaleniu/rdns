@@ -40,8 +40,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#165, #166 and #167**, as of 2026-10-03, each `docs/issues/NNN.md`; #151, #155-#164 closed
-that day, #150, #152, #153 and #154 on 2026-10-02. #160 was
+**#166 and #167**, as of 2026-10-04, each `docs/issues/NNN.md`; #165 closed
+that day, #151 and #155-#164 on 2026-10-03, #150, #152, #153 and #154 on 2026-10-02. #160 was
 found closing #150, #161 closing #155, #162 triaging #161, #163 grilling it,
 #164 triaging #163, #165 grilling #164, and #166 and #167 closing it.
 
@@ -1085,6 +1085,7 @@ the week; the record is under "How the queue kept going stale" in
 | **160** | `rdnsd`'s fold buffer was passed to nothing since #38, and a DNS-0x20 query allocated twice to fold | **filed 2026-10-02, closed 2026-10-03.** Found closing #150. Both folds onto the stack with `folded_into`; the buffer deleted. Case randomized 4.0 -> 2.0 allocations a query under dhat, same as lower case. `3759784` |
 | **163** | a TCP or DoT peer that never read its replies held its connection, slot and the shutdown drain forever | **filed 2026-10-03, closed 2026-10-03.** Found grilling #161. Each reply is written under a progress deadline of `read_timeout`, and the read loop ends with the writer. `0d0d5f2` |
 | **164** | a DoQ client's packets kept an idle connection open, PINGs included | **filed 2026-10-03, closed 2026-10-03.** Found triaging #163. DoQ's idle is no new stream, as on TCP and DoH; in-flight streams get one more timeout, at idle and at shutdown; a missing FIN closes with `DOQ_PROTOCOL_ERROR`, a starved reply resets with `DOQ_UNSPECIFIED_ERROR`. `9fa0fa5` |
+| **165** | DoQ answered every stream error with a stream reset and `DOQ_PROTOCOL_ERROR` | **filed 2026-10-03, closed 2026-10-04.** Found grilling #164. Framing errors close the connection (RFC 9250 §4.3.3), a client reset gets `DOQ_NO_ERROR`, a refused query `DOQ_UNSPECIFIED_ERROR`, an abandoned transfer `DOQ_INTERNAL_ERROR`; bytes after a query had been answered. See `docs/closed/165.md`, `17823c4` |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
