@@ -100,6 +100,13 @@ pub(crate) fn capture_logs() -> (
             Ok(())
         }
     }
+    // With one scoped dispatcher alive, tracing-core 0.1.36 decides a callsite's
+    // interest from the *registering* thread's default alone, so a line another
+    // test's thread logs first is cached as disabled for the process — and is
+    // then missing here. A second dispatcher, alive for the run, makes it ask
+    // every one. Hit by #155's log test beside #161's and #162's.
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
     let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = Sink(lines.clone());
     let subscriber = tracing_subscriber::fmt()
