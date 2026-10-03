@@ -3284,6 +3284,46 @@ this line has no record and is skipped
         assert_eq!(second, ValidationState::Secure, "{second}; asked {asked:?}");
     }
 
+    /// What one validation costs once the cache is warm: the second resolution
+    /// starts at `example.test.` from the cache and the walk resumes from that
+    /// trusted start (`TODO.md` #151). Counted on this thread, which a
+    /// current-thread runtime keeps every task of the resolution on.
+    ///
+    /// The whole resolution is counted, so the number is a ceiling rather than
+    /// exact: 124 with `establish_chain`'s own loop, 122 once `ChainWalk` took
+    /// the rules over. The walker copies the trusted start's keys into its own
+    /// store where the loop cloned them into locals; the net two are not
+    /// attributed. The ceiling is what #151 chose the walker on: it costs no
+    /// more than the loop it replaced.
+    #[tokio::test]
+    async fn a_resumed_validation_is_counted() {
+        let h = signed_hierarchy(signed_ds, signed_answer);
+        let resolver = h.net.resolver(validating_config(&h));
+        let question = QuerySection {
+            qname: nm("www.example.test."),
+            qtype: Qtype::of(rt::A),
+            qclass: QueryClass::IN,
+        };
+        let (_, first) = resolver
+            .resolve_validated(&question, None)
+            .await
+            .expect("the first resolution succeeds");
+        assert_eq!(first, ValidationState::Secure, "{first}");
+
+        let before = crate::testutil::blocks();
+        let (_, second) = resolver
+            .resolve_validated(&question, None)
+            .await
+            .expect("the second resolution succeeds");
+        let count = crate::testutil::blocks() - before;
+        assert_eq!(second, ValidationState::Secure, "{second}");
+        assert!(
+            count <= 124,
+            "a resumed validation made {count} allocations, more than the loop \
+             the walker replaced"
+        );
+    }
+
     /// The attack the whole apparatus exists to stop: the authoritative server
     /// hands over a different address alongside a perfectly genuine signature
     /// for the original one.

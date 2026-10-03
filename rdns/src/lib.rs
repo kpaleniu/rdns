@@ -21,6 +21,14 @@
 
 pub use rdns_core::*;
 
+/// Allocator calls tallied per thread, so a unit test here can count what one
+/// call costs — the resolver's fixtures are private to this crate's tests
+/// (`TODO.md` #151). `rdnsr`'s reason holds: `System`, a pass-through plus one
+/// thread-local increment for every other test in this binary.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: testutil::Counting<std::alloc::System> = testutil::Counting(std::alloc::System);
+
 // The presentation format is its own crate since `TODO.md` #66a, so that a
 // client can render a record without linking a server. Re-exported under the
 // paths it had, because 11 modules here name them and none of them cares which
