@@ -733,8 +733,6 @@ impl<'a> ChainValidator<'a> {
     }
 }
 
-/// Split records into RRsets by (owner, type, class), skipping RRSIGs — a
-/// signature is not an RRset to validate, it is what validates one.
 /// What a [`ChainWalk`] needs next.
 #[derive(Debug)]
 pub(crate) enum ChainNeed {
@@ -749,9 +747,10 @@ pub(crate) enum ChainNeed {
     Done(ValidationState),
 }
 
-/// The chain of trust from an anchor down to one target zone (RFC 4035 §5),
-/// with no I/O in it: it says what it needs, the resolver fetches it, and it
-/// ends in a [`ValidationState`].
+/// RFC 4033 §2's authentication chain from an anchor, or from a trusted start
+/// below it, down to one target zone (RFC 4035 §5), with no I/O in it: it says
+/// what it needs, the resolver fetches it, and it ends in a
+/// [`ValidationState`].
 ///
 /// The start, the resume from a trusted start, the step cap and the
 /// delegation verdicts are here, so a synchronous test reaches them; the
@@ -912,6 +911,8 @@ impl<'a> ChainWalk<'a> {
     }
 }
 
+/// Split records into RRsets by (owner, type, class), skipping RRSIGs — a
+/// signature is not an RRset to validate, it is what validates one.
 fn group_rrsets(records: &[ResourceRecord]) -> Vec<(Name, Rtype, Class, Vec<RecordData>)> {
     let mut sets: Vec<(Name, Rtype, Class, Vec<RecordData>)> = Vec::new();
     for rr in records {
