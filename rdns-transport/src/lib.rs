@@ -364,6 +364,10 @@ pub struct TransportLimits {
     /// How long the rest of a message may take once its length prefix arrived.
     /// Mid-message the peer has committed to `len` bytes, so a stall gets a much
     /// shorter leash than an idle connection.
+    ///
+    /// Also how long a reply may go without any of it being written
+    /// (`write_progressing`): one value for both directions, as Knot's
+    /// `tcp-io-timeout` is (`TODO.md` #163).
     pub read_timeout: Duration,
     /// Concurrent connections. Without a ceiling, an accept loop that spawns per
     /// connection is a free file-descriptor exhaustion vector.
@@ -400,6 +404,38 @@ impl Default for TransportLimits {
             max_inflight_per_connection: 16,
         }
     }
+}
+
+/// Write all of `buf`, failing with `TimedOut` once nothing has moved for
+/// `stall`.
+///
+/// A deadline on progress rather than on the whole write: a peer that reads
+/// nothing and one that reads slowly differ only in whether anything moves.
+/// A whole-write deadline of 5 s on a 64 KB transfer envelope was a 13 KB/s
+/// floor on every secondary (`TODO.md` #163).
+pub(crate) async fn write_progressing<W>(
+    writer: &mut W,
+    mut buf: &[u8],
+    stall: Duration,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    use tokio::io::AsyncWriteExt;
+    while !buf.is_empty() {
+        match tokio::time::timeout(stall, writer.write(buf)).await {
+            Ok(Ok(0)) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(Ok(n)) => buf = &buf[n..],
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("nothing written for {stall:?}"),
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Serve until a listener stops or the operator does, then drain.

@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rdns::shutdown::{Busy, Stop};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 
@@ -247,7 +247,11 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
     // One task owns the write half: replies may complete out of order
     // (RFC 7766 §6.2.1.1; clients match on the transaction id), but two framed
     // messages must never interleave on the wire.
+    //
+    // Its end drops `rx`, which is how the read loop learns to stop: past it,
+    // nothing asked on this connection can be answered.
     let writer_logger = handler.context().logger.clone();
+    let stall = limits.read_timeout;
     let writer_task = tokio::spawn(async move {
         while let Some(reply) = rx.recv().await {
             let Reply::Frame(framed) = reply else {
@@ -255,7 +259,7 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
                 // half-finished transfer will not be completed.
                 break;
             };
-            if let Err(e) = writer.write_all(&framed).await {
+            if let Err(e) = crate::write_progressing(&mut writer, &framed, stall).await {
                 writer_logger.count_error(Peer::from(peer));
                 tracing::debug!(peer = %peer.ip(), "socket write error: {e}");
                 break;
@@ -276,6 +280,7 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
         let read = tokio::select! {
             r = tokio::time::timeout(limits.idle_timeout, reader.read_exact(&mut len_buf)) => r,
             _ = stop.wait() => break,
+            _ = tx.closed() => break,
         };
         match read {
             Ok(Ok(_)) => {}
@@ -325,8 +330,14 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
 
         // Cap in-flight work per connection: this await is what stops a
         // pipelining client from spawning tasks faster than we retire them.
-        let Ok(permit) = in_flight.clone().acquire_owned().await else {
-            break;
+        // Raced against the writer's end: with it stalled, the permits are held
+        // by handlers waiting on a full channel (`TODO.md` #163).
+        let permit = tokio::select! {
+            permit = in_flight.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+            _ = tx.closed() => break,
         };
         let handler = handler.clone();
         let tx = tx.clone();
@@ -368,6 +379,9 @@ mod tests {
         /// Abort the connection instead of replying, as a transfer that cannot
         /// be finished does.
         Abort,
+        /// Reply with this many octets, the query's id first: a transfer
+        /// envelope's size, so a stalled reader fills the buffers quickly.
+        Bulk(usize),
     }
 
     struct Echo {
@@ -430,6 +444,11 @@ mod tests {
                 }
                 Answer::Abort => {
                     let _ = out.send(Reply::Abort).await;
+                }
+                Answer::Bulk(len) => {
+                    let mut reply = vec![0u8; len];
+                    reply[..2].copy_from_slice(&packet[..2]);
+                    send_framed(&out, &reply).await;
                 }
             }
         }
@@ -815,6 +834,174 @@ mod tests {
         shutdown.begin();
         drop(open);
         let _ = server.await;
+    }
+
+    /// Two halves a test chooses, for a connection `TcpStream` cannot stage: a
+    /// pipe whose buffer is the test's, or a writer that fails.
+    struct Halves<R, W>(R, W);
+
+    impl<R, W> SplitStream for Halves<R, W>
+    where
+        R: tokio::io::AsyncRead + Unpin + Send + 'static,
+        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        type Reader = R;
+        type Writer = W;
+
+        fn split_halves(self) -> (R, W) {
+            (self.0, self.1)
+        }
+    }
+
+    /// A write half whose every write fails, as one to a reset peer does.
+    struct Broken;
+
+    impl tokio::io::AsyncWrite for Broken {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A client that pipelines and reads nothing stalls the writer; the
+    /// connection then ends one `read_timeout` after the last byte moved
+    /// rather than never, freeing its slot and the drain (`TODO.md` #163).
+    ///
+    /// Watched failing without the progress deadline and the read loop's
+    /// `tx.closed()` arms: `serve_one` was still running at the bound.
+    #[tokio::test]
+    async fn a_client_that_reads_nothing_does_not_hold_the_connection() {
+        let shutdown = Shutdown::new();
+        let limits = TransportLimits {
+            read_timeout: Duration::from_millis(200),
+            ..TransportLimits::default()
+        };
+        let (client, task) = connected(
+            Echo::new(Answer::Bulk(60_000), 0),
+            limits,
+            shutdown.stop_handle(),
+        )
+        .await;
+
+        let (_unread, mut sending) = client.into_split();
+        let pipelining = tokio::spawn(async move {
+            let framed = rdns::framed(&query(0x0001)).expect("frames");
+            while sending.write_all(&framed).await.is_ok() {}
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("serve_one returned")
+            .expect("and did not panic");
+        pipelining.abort();
+    }
+
+    /// The deadline is on progress, not on the reply: a reader taking a 64 KB
+    /// envelope in 4 KB sips over several `read_timeout`s gets all of it, as a
+    /// slow secondary must. A whole-write deadline cut this off (`TODO.md`
+    /// #163, grilled).
+    #[tokio::test]
+    async fn a_slow_but_steady_reader_gets_the_whole_reply() {
+        let shutdown = Shutdown::new();
+        let limits = TransportLimits {
+            read_timeout: Duration::from_millis(100),
+            ..TransportLimits::default()
+        };
+        // A 1 KB pipe, so the reply cannot sit in a buffer and the write
+        // lasts as long as the reading does.
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (reader, writer) = tokio::io::split(server);
+        let peer: SocketAddr = "192.0.2.1:53".parse().expect("addr");
+        let task = tokio::spawn(serve_one(
+            Halves(reader, writer),
+            peer,
+            Echo::new(Answer::Bulk(65_000), 0),
+            limits,
+            RateLimit::PerMessage,
+            Arrival::Tcp,
+            shutdown.stop_handle(),
+        ));
+
+        client
+            .write_all(&rdns::framed(&query(0x0102)).expect("frames"))
+            .await
+            .expect("send");
+        let began = std::time::Instant::now();
+        let mut received = Vec::new();
+        let mut sip = [0u8; 4096];
+        while received.len() < 65_002 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let n = client.read(&mut sip).await.expect("read");
+            assert!(n > 0, "closed after {} octets", received.len());
+            received.extend_from_slice(&sip[..n]);
+        }
+        assert_eq!(u16::from_be_bytes([received[0], received[1]]), 65_000);
+        assert_eq!(id_of(&received[2..]), 0x0102);
+        assert!(
+            began.elapsed() > 2 * limits.read_timeout,
+            "read in {:?}, so the test did not outlast one deadline",
+            began.elapsed()
+        );
+
+        drop(client);
+        let _ = task.await;
+    }
+
+    /// Once a reply cannot be written, nothing else asked on the connection
+    /// can be answered, so the read loop ends too rather than admitting and
+    /// answering into a closed channel until the client gives up.
+    ///
+    /// Watched failing without the read loop's `tx.closed()` arm: it sat out
+    /// the 10 s idle timeout.
+    #[tokio::test]
+    async fn a_write_error_ends_the_read_loop() {
+        let shutdown = Shutdown::new();
+        let handler = Echo::new(Answer::AfterIdMillis, 0);
+        let logger = handler.ctx.logger.clone();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let peer: SocketAddr = "192.0.2.1:53".parse().expect("addr");
+        let task = tokio::spawn(serve_one(
+            Halves(server, Broken),
+            peer,
+            handler,
+            TransportLimits::default(),
+            RateLimit::PerMessage,
+            Arrival::Tcp,
+            shutdown.stop_handle(),
+        ));
+
+        client
+            .write_all(&rdns::framed(&query(0x0001)).expect("frames"))
+            .await
+            .expect("send");
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("serve_one returned with the client still connected")
+            .expect("and did not panic");
+        assert_eq!(
+            logger
+                .take_stats(rdns::clock::current_unix_timestamp() + 60)
+                .total_errors,
+            1
+        );
+        drop(client);
     }
 
     /// A reply too long to frame is dropped rather than sent with a wrapped

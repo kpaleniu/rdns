@@ -275,7 +275,10 @@ Timeouts (`rdnsd`, `rdnsr`): the connection may sit idle between messages for
 #161); once a length prefix has arrived the peer gets `read_timeout` (5 s,
 not configurable) for the body.
 
-Writing: the prefix and the message go into one buffer.
+Writing: the prefix and the message go into one buffer. On TCP and DoT a
+reply that has written nothing for `read_timeout` ends the connection, as does
+any write error: the read loop stops with the writer (`TODO.md` #163). The
+deadline restarts on every byte written, so a slow reader is not cut off.
 
 > Deviation D-2 — fixed 2026-08-03. ~~Every writer computes the prefix as
 > `bytes.len() as u16` with no check, in five places.~~ See
