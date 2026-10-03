@@ -11,9 +11,9 @@ roles to the actual label strings used in this repo's issue tracker.
 | `ready-for-human`          | `ready-for-human`    | Requires human implementation            |
 | `wontfix`                  | `wontfix`            | Will not be actioned                     |
 
-`TODO.md` has no label mechanism, so a role is written in bold on the section's
-heading line, beside the `**filed …**` / `**closed …**` markers already there.
-A role that no longer holds is overwritten, not struck through: it is a status,
-not a claim (`CLAUDE.md` §11).
+The tracker has no label mechanism, so a role is written in bold on the issue
+file's heading line, beside the `**filed …**` / `**closed …**` markers already
+there. A role that no longer holds is overwritten, not struck through: it is a
+status, not a claim (`CLAUDE.md` §11).
 
 Edit the right-hand column to match whatever vocabulary you actually use.

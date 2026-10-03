@@ -12,10 +12,12 @@ green suite here has twice not meant what it looked like. `docs/spec/` says
 by reading intent, with every known RFC deviation and gap collected in one
 table.
 
-**A fourth file as of 2026-09-05: `docs/CLOSED_WORK.md`.** Everything finished
+**A fourth file as of 2026-09-05: `docs/CLOSED_WORK.md`, one file per number
+in `docs/closed/` since 2026-10-03**, beside `docs/issues/` for open items;
+`docs/closed/log.md` says why it was split. Everything finished
 lives there — ~~twenty-eight numbered sections covering thirty-one numbers~~, and
 the log of what landed, verbatim, strike-throughs and wrong claims included.
-`grep -c '^### [0-9]' docs/CLOSED_WORK.md` is the count, rather than a number
+`ls docs/closed/[0-9]*.md | wc -l` is the count, rather than a number
 written here: the struck one was already wrong when it was written on 2026-09-05
 (there were twenty-nine sections, not twenty-eight), and what the "thirty-one
 numbers" counted is not recoverable — #5, #8 and #9 are closed with no section
@@ -37,7 +39,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#165, #166 and #167**, as of 2026-10-03; #151, #155-#164 closed
+**#165, #166 and #167**, as of 2026-10-03, each `docs/issues/NNN.md`; #151, #155-#164 closed
 that day, #150, #152, #153 and #154 on 2026-10-02. #160 was
 found closing #150, #161 closing #155, #162 triaging #161, #163 grilling it,
 #164 triaging #163, #165 grilling #164, and #166 and #167 closing it.
@@ -474,7 +476,7 @@ closed; the table under "Closed work" says which, when, and where the
 reasoning went.
 
 **This sentence goes stale faster than anything else on the page** — nine times
-by the page's own count, and the record is in `docs/CLOSED_WORK.md` under "How
+by the page's own count, and the record is in `docs/closed/log.md` under "How
 the queue kept going stale". It used to be corrected the way a wrong *claim* is,
 by striking the old one through and writing the next underneath, and by
 2026-09-12 that was eleven struck restatements of a fact the table already held,
@@ -489,12 +491,12 @@ being current is not that, and deleting it loses nothing the table does not
 hold.
 
 - **#21** — the four deliberate RFC deviations and the not-implemented list,
-  closed 2026-09-29 into `docs/CLOSED_WORK.md`. **Not a queue.** It exists so
+  closed 2026-09-29 into `docs/closed/021.md`. **Not a queue.** It exists so
   the next person to notice one finds the decision instead of re-deriving it.
   If one is ever taken up it gets its own number.
 
 **#33 closed on 2026-09-06**, its last two items a day after the rest; the
-section is in `docs/CLOSED_WORK.md` under its own number, where the five
+section is `docs/closed/033.md`, where the five
 candidates it *dropped* are the half worth reading.
 
 **#35, SVCB and HTTPS (RFC 9460), filed and closed 2026-09-07.** The largest
@@ -510,7 +512,7 @@ not-implemented list named it the only entry there that made this server answer
 *wrong* rather than incomplete. Five commits: the record type, the zone, the
 server algorithm, the resolver, then signing and UPDATE. RFC 6672's Table 1 is a
 test verbatim, and dnspython validates the DNAME's RRSIG against a running
-`rdnsd`. The section is in `docs/CLOSED_WORK.md`.
+`rdnsd`. The section is `docs/closed/034.md`.
 
 **Everything else numbered is closed, withdrawn, or answered no**, and the table
 under "Closed work" says which, when, and where the reasoning is.
@@ -538,7 +540,7 @@ happened to this page's summary paragraphs at least ~~eight~~ ~~nine~~ **ten**
 times between 2026-07-30 and 2026-09-06 — the ninth is the
 `docs/CLOSED_WORK.md` section count above, found wrong on 2026-09-06 and already
 wrong on the day it was written. The record is kept under "How the queue kept
-going stale" in `docs/CLOSED_WORK.md`, because the shape is the lesson.
+going stale" in `docs/closed/log.md`, because the shape is the lesson.
 
 **Two remedies have been tried.** The first was a *shorter list*: two items
 cannot drift from a summary of two items. That held while the list stayed at
@@ -648,7 +650,7 @@ message carried a `Claude-Session:` trailer holding a session URL — 118 of the
 the messages changed: the tree at the old head and the tree at the new one are
 byte-identical. Any hash written down *outside* this repository is now dangling;
 inside it, the commit references in "Done so far" (now
-`docs/CLOSED_WORK.md`) and the entry in
+`docs/closed/log.md`) and the entry in
 `.git-blame-ignore-revs` were remapped by matching subjects, and every one
 resolves. The blame file is the one that would have failed loudly rather than
 quietly — `git blame` refuses a revision it cannot resolve.
@@ -1288,9 +1290,9 @@ Which numbers are open is in "What is open" above, and only there. This line
 carried a second copy of the list and it was three numbers stale — #107, #111
 and #115 had closed under it — which is what a sentence claiming to be the one
 place costs when it is not.
-Every closed section lives in `docs/CLOSED_WORK.md` under its own number; the
-numbers are stable identifiers referenced from the code, so they move rather
-than being renumbered.
+Each open item is `docs/issues/NNN.md` and each closed one `docs/closed/NNN.md`,
+under its own number; the numbers are stable identifiers referenced from the
+code, so a file moves rather than being renumbered.
 
 ### Where to pick up next
 
@@ -1419,150 +1421,10 @@ stops a 20% win in it being reported as a 20% win.
 
 ---
 
-### 165. DoQ resets a stream with `DOQ_PROTOCOL_ERROR` where RFC 9250 names a different remedy — **filed 2026-10-03**, **bug**, **ready-for-agent**, with or after #164
-
-Found grilling #164. `quic::serve_stream` resets one stream with
-`DOQ_PROTOCOL_ERROR` at two kinds of site:
-- A stream too short for a length prefix, or whose prefix does not
-  describe what it carries. RFC 9250 §4.3.3: a protocol error "SHOULD
-  forcibly abort the connection using QUIC's CONNECTION_CLOSE mechanism
-  and SHOULD use the DoQ error code DOQ_PROTOCOL_ERROR"; §4.3 defines the
-  code as "forcibly aborting the connection". Whether a malformed prefix
-  is on §4.3.3's list was not checked.
-- `Reply::Abort`, a transfer the server cannot finish. Not the client's
-  error; §4.3.2: "If a server is incapable of sending a DNS response due
-  to an internal error, it SHOULD issue a QUIC RESET_STREAM frame. The
-  error code SHOULD be set to DOQ_INTERNAL_ERROR."
-
-§4.3.4: a code in an unexpected context "MUST be treated as equivalent to
-DOQ_UNSPECIFIED_ERROR", so a client loses the distinction rather than
-misbehaving. No remedy costed.
-
-> *This was generated by AI during triage.*
-
-**Triaged 2026-10-03.** RFC 9250 §4.3.3, §4.3.2, §4.3.1 and §4.2 read in
-full. Five sites in `serve_stream`, not two, and one check missing:
-
-| site | today | RFC 9250 |
-|---|---|---|
-| too short for a prefix | stream reset | §4.3.3: "a … server receives a STREAM FIN before receiving all the bytes for a message indicated in the 2-octet length field" — close the connection |
-| prefix longer than the stream | stream reset | the same bullet |
-| prefix of zero | stream reset | not named; "malformed, incomplete … (but are not limited to)" |
-| bytes after the query | **answered, rest dropped** | §4.3.3: "a server receives more than one query on a stream" |
-| over 65 537 bytes (`read_to_end`) | stream reset | more than one query, as above |
-| client reset (`read_to_end`) | stream reset, PROTOCOL_ERROR | §4.3.1: "The server MUST issue a RESET_STREAM"; no code named |
-| rejected by `accept_packet` | **FIN, no reply** | the client's protocol error: "a client receives a STREAM FIN before receiving all the expected responses" |
-| `Reply::Abort` | stream reset, PROTOCOL_ERROR | §4.3.2: RESET_STREAM, "The error code SHOULD be set to DOQ_INTERNAL_ERROR" |
-
-For a §4.3.3 error the connection is the remedy: "It SHOULD forcibly
-abort the connection using QUIC's CONNECTION_CLOSE mechanism and SHOULD
-use the DoQ error code DOQ_PROTOCOL_ERROR."
-
-§4.3.3 also lists "a client or server receives a message with a non-zero
-Message ID". `quic.rs`'s module doc declines that on purpose — refusing it
-"would break a client for no gain" — so chosen, not missed; the doc does
-not say the RFC lists it as a protocol error.
-
-There is no DoQ client in the tree, so only the server side changes.
-
-Grilled, and decided:
-- **A rejected query resets its stream** with `DOQ_UNSPECIFIED_ERROR`.
-  The framing was right and the message was not, which is `tcp.rs`'s
-  reason to skip it and keep the connection. Rejected: FORMERR, which a
-  message shorter than a header has nothing to echo into; closing the
-  connection, which §4.3.3's "not limited to" would allow but which ends
-  every good stream beside it.
-- **A client's reset is answered with `DOQ_NO_ERROR`.** Rejected:
-  `DOQ_REQUEST_CANCELLED`, defined as the client's, which §4.3.4 has read
-  as `DOQ_UNSPECIFIED_ERROR` in an unexpected context — the opposite of
-  what is meant.
-
-> *This was generated by AI during triage.*
-
-#### Agent brief
-
-**Category:** bug
-**Summary:** Answer each DoQ stream error with the remedy and code RFC 9250
-names.
-
-**Current behavior:** Every malformed stream, a client's reset and an
-abandoned transfer reset one stream with `DOQ_PROTOCOL_ERROR`; bytes after
-a query are ignored; a query `accept_packet` rejects gets a bare FIN.
-
-**Desired behavior:**
-- Close the connection with `DOQ_PROTOCOL_ERROR`, quoting §4.3.3 beside
-  it: a stream too short for a prefix, a prefix longer than the stream, a
-  prefix of zero, bytes after the query, a stream over 65 537 bytes.
-- A client's RESET_STREAM before its FIN: RESET_STREAM with
-  `DOQ_NO_ERROR` (§4.3.1). quinn's read error tells it apart from a
-  stream too long.
-- A query `accept_packet` rejects: RESET_STREAM with
-  `DOQ_UNSPECIFIED_ERROR`.
-- `Reply::Abort`: RESET_STREAM with `DOQ_INTERNAL_ERROR` (§4.3.2).
-- The module doc's Message ID paragraph says §4.3.3 lists a non-zero ID as
-  a protocol error, and keeps the reason for not enforcing it.
-
-**Acceptance criteria:**
-- [ ] One test per case, the close or reset and its code read on the
-      client side.
-- [ ] `a_stream_that_is_framed_wrongly_is_reset` changes to expect the
-      connection close, and the commit says the test encoded the old
-      behaviour (§1).
-- [ ] Bytes after a query are shown answered against the current code.
-- [ ] Workspace tests and clippy on Windows and Linux; fmt, doc and the §12
-      grep clean.
-
-**Out of scope:** enforcing a zero Message ID; the timeouts (#164).
-
-**Order:** edits `serve_stream`, as #164 does; after it or with it.
-
----
-
-### 166. A DoQ stream answered slower than the idle timeout is lost when the client is silent — **filed 2026-10-03**, **bug**, **needs-triage**
-
-Found closing #164. `quic::server_config` hands `--connection-idle-timeout`
-to quinn as `max_idle_timeout`, and RFC 9000 §10.1 restarts that timer on a
-packet received, or on the first ack-eliciting packet sent after one. A
-client that sends its query and then nothing — no PINGs — gives the server
-nothing to restart it with while the handler works, so a reply that takes
-longer than the idle timeout is never sent: the connection times out under
-it.
-
-Provoked on Windows, throwaway and reverted: idle timeout 300 ms, a handler
-pausing 450 ms, a quinn client with default transport settings. The stream
-read `ConnectionLost(TimedOut)`, against `9fa0fa5`'s code and against the
-code before it, so #164 neither caused nor fixed it. With the client sending
-PINGs the same stream is answered
-(`a_stream_in_flight_at_the_idle_timeout_is_answered`).
-
-TCP and DoH have no such timer, so a slow answer there is bounded by the
-handler alone: this is DoQ's only. At the default 10 s it needs a handler
-slower than ten seconds; how long `rdnsr`'s slowest resolution can take was
-not checked. No remedy costed.
-
----
-
-### 167. `an_idle_connection_is_closed_after_the_configured_timeout` failed once on Linux — **filed 2026-10-03**, **bug**, **needs-info**
-
-Found closing #164. One full `cargo test --workspace` on Linux failed
-`rdnsd/tests/startup.rs`'s only socket-binding test at its first assertion
-(`matches!(read, Ok(0))`), with the whole binary finishing in 0.20 s, so the
-read returned something other than EOF well inside the 1 s idle timeout. The
-panic message, which carries what the read returned, was cut by the filter
-the run was read through.
-
-Not reproduced: 6 runs of the test alone, 12 of the `startup` binary and one
-more full workspace run, all on Linux, all passing. The test takes a port by
-binding `127.0.0.1:0` and releasing it for `rdnsd` to bind, which its own
-comment calls a race that "fails the connect loop below rather than
-passing"; whether this was that race was not checked. No remedy costed.
-
----
-
 ## Closed work
 
 One line each. The reasoning, the RFC citations and the verification are in the
-commit that closed it and in `docs/CLOSED_WORK.md`, which holds every section
+commit that closed it and in `docs/closed/NNN.md`, which holds every section
 below in full under the same number.
 
 **"Every one" has had to be corrected three times**, each time because a section
@@ -1579,7 +1441,7 @@ moved, never renumbered.
 **Read this table, not a summary of it.** Eight times by its own count, a
 sentence at the top of this page has said what was open and been wrong within
 the week; the record is under "How the queue kept going stale" in
-`docs/CLOSED_WORK.md`.
+`docs/closed/log.md`.
 
 | # | what it was | outcome |
 |---|---|---|
@@ -1587,7 +1449,7 @@ the week; the record is under "How the queue kept going stale" in
 | **2** | DNSSEC follow-ups | done |
 | **3** | NSEC3 salt and iterations | done |
 | **4** | zone lookup | done |
-| **5** | smaller items: AXFR, TSIG, NOTIFY, IXFR, amplification, negative caching, `$INCLUDE`, TXT framing | done. No section of its own; the entries are in `docs/CLOSED_WORK.md`'s "Done so far" |
+| **5** | smaller items: AXFR, TSIG, NOTIFY, IXFR, amplification, negative caching, `$INCLUDE`, TXT framing | done. No section of its own; the entries are in `docs/closed/log.md`'s "Done so far" |
 | **6** | special-use names in `rdnsr` | done |
 | **7** | the secondary role, in six steps | **all six done 2026-08-03.** Step 6, persisted deltas, waited on #10 and landed with it: `rdns/src/journal.rs` |
 | **8** | what signing turned up — the re-signing timer and its serial | done. Settled by reading BIND, Knot, PowerDNS and NSD, which converge on something better than either option written down |
@@ -1603,7 +1465,7 @@ the week; the record is under "How the queue kept going stale" in
 | **18** | `rdnsr` has none of the operational shell | **fixed 2026-08-03.** Seven library facilities wired into one daemon and not the other, the more amplifying one |
 | **19** | the 2026-08-03 review's smaller items, 19a-19h | **closed 2026-08-03.** Five stragglers of consolidations that caught most copies and missed one |
 | **20** | `rdnsd/src/main.rs` is one file and eleven subsystems | **done 2026-08-03**, one commit per seam. 8,328 → 5,956 lines, every move diffed against `HEAD` to prove it changed nothing |
-| **21** | the deliberate RFC deviations and the not-implemented list | **filed 2026-08-03, closed 2026-09-29, wontfix.** Decisions, not a queue; every row re-checked against the code the day it closed. A row taken up gets its own number, as #34, #35, #36, #42 and #44f did. See `docs/CLOSED_WORK.md` |
+| **21** | the deliberate RFC deviations and the not-implemented list | **filed 2026-08-03, closed 2026-09-29, wontfix.** Decisions, not a queue; every row re-checked against the code the day it closed. A row taken up gets its own number, as #34, #35, #36, #42 and #44f did. See `docs/closed/021.md` |
 | **22** | the zone lookup is hash-bound | **closed 2026-09-05.** One map instead of two takes a miss from 1,875 to 1,402 instructions. The second direction is a decision and the answer is **no** — the threat model is in the section |
 | **23** | `NsecCache::synthesize` hashes once per cached NSEC3 record, under one mutex | **fixed 2026-08-04** (`9715c3c`), the day after filing. 1 124 ms → 1.28 ms on the same probe |
 | **24** | three costs that grow with something the operator chose | **all three fixed 2026-08-05.** Zone selection 55 µs → 32 ns and flat at ten thousand zones; name compression O(n²) → linear in one message's records; an AXFR at 10.5× less peak memory |
@@ -1689,34 +1551,34 @@ the week; the record is under "How the queue kept going stale" in
 | **78** | `rdnsr`'s query path lost work at three of its exits | **filed 2026-09-19, closed 2026-09-20**, three rows, and the first was verified here while b and c were the review's reading — both held. **78a**: an `rpz-ip` rule over a cache hit dropped the prefetch the answer cache had just asked for, because `impl From<Option<Vec<u8>>> for Answered` fills `refresh: None`. Three shapes built (§19) and the one that shipped is in neither the row nor the review: delete the early `return`, since the hazard is §7's jump over a shared epilogue. **78b**: `Resolver::forward` returned the upstream's AA bit and echoed question verbatim where `recurse` normalized both, so an `rdnsr` in front of an `rdnsr` running 0x20 would have rejected its own answer (RFC 5452 §9.1) — left **#93**. **78c**: QDCOUNT = 0 was dropped by `rdnsr` and answered NOERROR *with AA set* by `rdnsd`. RFC 9619 §4 settles only QDCOUNT > 1; its QDCOUNT = 0 sentence binds firewalls, not responders. RFC 7873 §5.4 says what the query is for and that a server without cookies "will normally send FORMERR", and the peers agree: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all answer it, all FORMERR with no OPT, and none drops it — which is the measurement that could have refuted the finding |
 | **107** | eleven wall-clock reads inside a request path, in the crate #92 did not count | **filed 2026-09-21, closed 2026-09-22**. The eleven are exact and the crate held **fifteen**: the other four are two constructors, a background timer — #92's own category — and `DnssecValidator::validate_rrset`, which is not. `NsecCache`, `DelegationCache` and `KeyCache` take a `Clock` now, `Resolver` holds one and `validate` reads it; the two resolver caches *require* it, since both are `pub(super)` with one production caller, so a cache built without one does not compile (§17). Two tests that could not be written now are: a proof live at +0, +1 800 and +3 599 and gone at +3 601, and a delegation inserted through the public path instead of forged through the mutex — the forgery existed because `insert` clamps `expires_at` to `now + ttl`. **`validate_rrset` declines and the measurement is why**: it is request-reachable, though not by the route triage first named (`dispatch.rs:2433` is `#[cfg(test)]`; the real one is the UPDATE path's pre-install `FreshlySigned::verify`), and the instant it wants is choosable through `SigningPolicy` — #92's own criterion. `clock.rs`'s sentence is struck and corrected, which is what the row was filed for |
 | **108** | `min(SOA MINIMUM, the SOA's own TTL)` written five times | **filed 2026-09-21, closed 2026-09-24**. `Ttl::negative_answer(soa_ttl, minimum)` in `rdns-core::codes`, and the five call it. **The open shape question picked the signature**: four sites hold a record — two `ZoneRecordRef`, two `ResourceRecord`, all four spelling the inputs `ttl` and `rdata.soa_minimum()` — but `zone_signer` holds the `(Ttl, u32)` that `carry_over_records` split out of the SOA 200 lines earlier, so a record-shaped helper would have missed the one site the defect was found in. A sixth candidate is not one: `rdnsr/src/answer.rs:1087` hands the client both numbers and says so. **The larger half is the one the row did not name.** Behaviour is unchanged, so the only thing that can be watched failing is the drift — and reverting `negative_answer` to each one-term spelling found that **not one of the five sites had a test for both**: `rdnsd/answer` had neither, `zone_signer` had only #111c's split guard (which fires because the harness re-spells the rule), `dnssec_answer` had the SOA-TTL direction only and the two caches the mirror of it. Every gap is a fixture: three are `$TTL 3600` over `minimum 300`, #73's masking direction a third time, and the answer path cannot show MINIMUM winning over a zone *this* server signed, because the signer capped the chain first. Five tests added, each watched failing; both drifts now fail at all five sites. 1 304 → 1 309 passed on Windows, 1 330 on Linux, 0 failed |
-| **109** | `struct Server` in the crate root, its implementation in `dispatch` | **filed 2026-09-21, closed 2026-09-24**. `Server` and `UpdateHandling` moved to `dispatch.rs` with all 15 fields private; the root builds one with `Server::new` and six `with_*`, and reads `ctx()`, `tsig_keys()`, `zone_context()`. 13 `pub(crate)` items against 15 fields hidden, #83's predicted loss; paid for by nothing outside `dispatch` reading an ACL, a keyring or the UPDATE lock, and by six test literals losing their refusing defaults. The row counted 2 literals and there were 7. The test half is #116. See `docs/CLOSED_WORK.md` |
-| **110** | one-victim eviction scans left after `Halving` | **filed 2026-09-21, closed 2026-09-24**. Measured before changing, as the row asked: 17-21 µs per insert at the default 10 000, 2.7-8.6 ms at a million, linear in `--delegation-cache-size`, against 0.1 µs with room — #33a's cost again. Five sites, not four: `RttStore` scanned for the slowest server and ranks by speed, so the grep missed it. All three resolver maps halve through `crate::eviction`; `RttStore` slowest first. The two in `nsec_cache` stay, both with the reason. Guard watched failing at 357-418x. See `docs/CLOSED_WORK.md` |
-| **112** | price the reload cluster's constructors | **filed 2026-09-21, closed 2026-09-24**, constructors declined. The row's reason for them was wrong twice: the test module already built three `Reloading` literals, and `tokio::time::pause` needs `test-util`, which nothing enabled. Left with #83's 5-against-1 visibility loss and no test to pay for it. The test gap was real: three tests for `spawn_zone_maintenance` — control reloads answered and the stop drains, no timer without keys, a timer with them under paused time — each watched failing against its own mutation. The keepalive clone is unobservable (`select!` disables an unmatched arm); recorded, not changed. See `docs/CLOSED_WORK.md` |
-| **113** | #103's projection sweep stopped at `[server]` | **filed 2026-09-21, closed 2026-09-24**. Measured first: a `[resolver]` key nothing reads warns, an `[rpz]` key only `check` reads compiles clean — both as the row said. The shape is eight sections across both daemons, not two. Each projection now destructures its table with no `..`, the top-level `Config` too, so a key added and not handled is `E0027`; the probe that compiled clean now fails naming the field. No macro: none of the eight is shared between daemons. See `docs/CLOSED_WORK.md` |
-| **114** | the prefetch ran inside `Handler::handle`, before DoH's answer | **filed 2026-09-21, closed 2026-09-25**. The row counted two hand-written discharges; the TCP one is shared by four transports, and on DoH and DoQ it was a live defect. DoH responds once the handler task is joined and DoQ sends FIN once the sink closes, so a prefetch-due name's reply waited for the upstream (0.9 ms reply, 1.51 s to close, provoked). `rdnsr/src/prefetch.rs` puts refreshes on a bounded queue and pool (`--prefetch-workers` 16, `--prefetch-queue` 256, drops counted in `dns_prefetches_dropped_total`, no `Busy`); `Answered` is gone and the contract is on `Handler::handle`. Three remedies that keep the work in the handler are declined in the section. See `docs/CLOSED_WORK.md` |
-| **116** | `rdnsd`'s answering tests were in the crate root | **filed 2026-09-24, closed 2026-09-25**. The harness was the only thing holding them: a root-private item is visible to every descendant (§17), so moving the tests widened nothing. 58 of 90 moved by subject — 23 to `dispatch`, 15 to `replication` (which had none), 13 to `answer`, 7 to `zones` — and 32 stay because they test root items, the reload cluster among them (#83). 17 fixtures to `testutil`; `zone_text(serial)` became `zone_at_serial` to stop it clashing with `dispatch`'s benchmark helper. Three docs older than the change were wrong, `Server::serve_connection` among them. Same 210 test names, same totals. See `docs/CLOSED_WORK.md` |
-| **117** | `refresh` claimed the query path's storing; prefetch and DNS64 never fed the denial cache | **filed and closed 2026-09-25**. The reason given for storing less was about the reply, not the cache. `Caches::store` holds the four rules and both writers call it. Regression test: a refreshed Secure NXDOMAIN answers the rest of its NSEC gap with no second upstream query, asked twice with the old storing restored. `testutil::SignedZone` is the first Secure resolution `rdnsr`'s tests can reach. Declined: DNS64 consulting the denial cache, since CD would have to be passed in to agree. See `docs/CLOSED_WORK.md` |
-| **118** | `answer_update` checked permission before the zone, and its doc claimed the RFC's order | **filed and closed 2026-09-25**. BIND, Knot and PowerDNS read: all check permission before §3.2, two of three check the zone before permission. Now zone → permission → prerequisites, so an unsigned or wrongly scoped UPDATE for a zone not served is NOTAUTH. The conformance row lists the two deviations, one of them the replicated-zone REFUSED where §3.1.1 forwards. See `docs/CLOSED_WORK.md` |
-| **119** | two UPDATE refusals no test reached, and an unreadable zone directory answered REFUSED | **filed and closed 2026-09-25**. SERVFAIL now, as a failed read of the zone file already was: RFC 2136 §4.6 sends the client to the next server on SERVFAIL and ends the update on REFUSED. `file_for` propagates `read_dir` and entry errors as the loader does. Four tests; the task-failure SERVFAIL stays untested, reachable only by a panic. See `docs/CLOSED_WORK.md` |
-| **68** | a socket test failed once under a parallel suite | **filed 2026-09-15, closed 2026-09-25.** The test it named never failed again; two others in `rdnsd` did, 8 in 200 workspace runs. 68a was a defect: dnstap's pump dropped its queue on stop, frames already counted as sent, so a capture lost its last requests (50 of 50 provoked runs). Now drained before STOP. 68b was the test's: an unanswered NOTIFY is resent after 2 s. 0 in 200 runs after. The same 200 runs filed **#120**. See `docs/CLOSED_WORK.md` |
-| **58** | serve-stale answered a dead upstream and not a slow one | **filed 2026-09-13, closed 2026-09-25.** RFC 8767 §5's 1.8 s client response timer declined on a survey of BIND, Unbound, Knot and PowerDNS — BIND removed it after two CVEs — and BIND's zero form taken as `--serve-stale-first`, refreshing through #114's prefetch pool. A deviation from §4, filed as **D-8** in #21. The timers were §5 and nine places said §4. Two things the grooming did not see: a stale refresh has to be a *period* (§5's 30 s failure recheck), or one failure leaves a name stale and untried for the whole window; and the pool's presence had been the prefetch switch. See `docs/CLOSED_WORK.md` |
-| **120** | three timing flakes found verifying #68 | **filed and closed 2026-09-25.** 120a: the TCP stop tests slept 20 ms and hoped the server had read the query; the handler now says so. 120b: all twelve ratio tests opened — four already took a minimum, one is not a suite test, seven took one sample and now take the best of five through `rdns::testutil::fastest`. After: 0 failures of any of them in 150 Windows and 50 Linux runs, against 4 before. The same runs filed **#121**, a real signing defect, and **#122**. See `docs/CLOSED_WORK.md` |
-| **122** | ratio tests took five of one side, then five of the other | **filed 2026-09-25, closed 2026-09-26.** Measured first: `zone.rs`'s test under load failed 5 in 900 sampling one side then the other, 0 in 900 taking turns, with the same median. `rdns::testutil::fastest_of_each` takes turns, and all eleven suite ratio tests use it; `fastest` is gone. The verification filed **#123** and **#124**. See `docs/CLOSED_WORK.md` |
-| **121** | incremental signing took a key tag for a key | **filed 2026-09-25, closed 2026-09-26.** A new ZSK whose tag matched the old one's read as "keys unchanged", so the old signature was carried alone and the new DNSKEY signed nothing; a swapped-in twin carried a signature from a withdrawn key. Condition 3 now holds only when each signer's tag names exactly its own DNSKEY in the previous run's RRset, checked once per run. A stored colliding Ed25519 pair tests both cases, each watched failing before. Filed **#125**, a collision in `--generate-keys` overwriting a private key file. See `docs/CLOSED_WORK.md` |
-| **123** | two resolver tests timed out under load | **filed and closed 2026-09-26.** The row said they failed before their timeout; each server gets `timeout_ms / 2`, and every failure was that 2 s expiring. The fake never received the query: CPU load alone reproduced it, 7 in 20 runs, with no other network traffic. It polled its stop flag with a 50 ms `SO_RCVTIMEO`, which Windows documents as leaving the socket "in an indeterminate state"; a datagram arriving as it fired was lost. Now a task on the test runtime, aborted on drop. Under 64 spinners, old 25 of 25 runs failing, new 0 of 25 — `zone.rs`'s ratio test included, which the old fakes were disturbing. See `docs/CLOSED_WORK.md` |
-| **124** | `compression.rs`'s ratio test near its bound in debug | **filed and closed 2026-09-26.** The bound was right: the unindexed scan reads 13-15× in debug, the ~2 was release. The samples were not: 500 writes against 16 000, so under load only the long side was preempted — loaded Linux read 6.16× median, 195 of 200 over 5, and more samples did not help. Both sides now write 800 names a sample, best of fifteen: max 3.26× loaded, and the real test failed 0 of 100 there against 83 before. See `docs/CLOSED_WORK.md` |
-| **125** | `--generate-keys` replaced a key file whose tag it collided with | **filed and closed 2026-09-26.** Checked against BIND first: `dnssec-keygen` generates again while a new key's tag, or its tag with REVOKE set, equals either tag of a key of that name and algorithm in the directory (`key_collision`, `dnssectool.c`). `SigningKey::distinct_from` does the same against the directory and the run's other key, bounded at 100 attempts; `write_to_dir` publishes by hard link and refuses an existing file. Tested over #121's stored pair, a stored REVOKE-apart pair and a same-tag pair of two algorithms; the overwrite test watched failing against the old rename, and `rdnsd`'s wiring test against dropping either list. See `docs/CLOSED_WORK.md` |
+| **109** | `struct Server` in the crate root, its implementation in `dispatch` | **filed 2026-09-21, closed 2026-09-24**. `Server` and `UpdateHandling` moved to `dispatch.rs` with all 15 fields private; the root builds one with `Server::new` and six `with_*`, and reads `ctx()`, `tsig_keys()`, `zone_context()`. 13 `pub(crate)` items against 15 fields hidden, #83's predicted loss; paid for by nothing outside `dispatch` reading an ACL, a keyring or the UPDATE lock, and by six test literals losing their refusing defaults. The row counted 2 literals and there were 7. The test half is #116. See `docs/closed/109.md` |
+| **110** | one-victim eviction scans left after `Halving` | **filed 2026-09-21, closed 2026-09-24**. Measured before changing, as the row asked: 17-21 µs per insert at the default 10 000, 2.7-8.6 ms at a million, linear in `--delegation-cache-size`, against 0.1 µs with room — #33a's cost again. Five sites, not four: `RttStore` scanned for the slowest server and ranks by speed, so the grep missed it. All three resolver maps halve through `crate::eviction`; `RttStore` slowest first. The two in `nsec_cache` stay, both with the reason. Guard watched failing at 357-418x. See `docs/closed/110.md` |
+| **112** | price the reload cluster's constructors | **filed 2026-09-21, closed 2026-09-24**, constructors declined. The row's reason for them was wrong twice: the test module already built three `Reloading` literals, and `tokio::time::pause` needs `test-util`, which nothing enabled. Left with #83's 5-against-1 visibility loss and no test to pay for it. The test gap was real: three tests for `spawn_zone_maintenance` — control reloads answered and the stop drains, no timer without keys, a timer with them under paused time — each watched failing against its own mutation. The keepalive clone is unobservable (`select!` disables an unmatched arm); recorded, not changed. See `docs/closed/112.md` |
+| **113** | #103's projection sweep stopped at `[server]` | **filed 2026-09-21, closed 2026-09-24**. Measured first: a `[resolver]` key nothing reads warns, an `[rpz]` key only `check` reads compiles clean — both as the row said. The shape is eight sections across both daemons, not two. Each projection now destructures its table with no `..`, the top-level `Config` too, so a key added and not handled is `E0027`; the probe that compiled clean now fails naming the field. No macro: none of the eight is shared between daemons. See `docs/closed/113.md` |
+| **114** | the prefetch ran inside `Handler::handle`, before DoH's answer | **filed 2026-09-21, closed 2026-09-25**. The row counted two hand-written discharges; the TCP one is shared by four transports, and on DoH and DoQ it was a live defect. DoH responds once the handler task is joined and DoQ sends FIN once the sink closes, so a prefetch-due name's reply waited for the upstream (0.9 ms reply, 1.51 s to close, provoked). `rdnsr/src/prefetch.rs` puts refreshes on a bounded queue and pool (`--prefetch-workers` 16, `--prefetch-queue` 256, drops counted in `dns_prefetches_dropped_total`, no `Busy`); `Answered` is gone and the contract is on `Handler::handle`. Three remedies that keep the work in the handler are declined in the section. See `docs/closed/114.md` |
+| **116** | `rdnsd`'s answering tests were in the crate root | **filed 2026-09-24, closed 2026-09-25**. The harness was the only thing holding them: a root-private item is visible to every descendant (§17), so moving the tests widened nothing. 58 of 90 moved by subject — 23 to `dispatch`, 15 to `replication` (which had none), 13 to `answer`, 7 to `zones` — and 32 stay because they test root items, the reload cluster among them (#83). 17 fixtures to `testutil`; `zone_text(serial)` became `zone_at_serial` to stop it clashing with `dispatch`'s benchmark helper. Three docs older than the change were wrong, `Server::serve_connection` among them. Same 210 test names, same totals. See `docs/closed/116.md` |
+| **117** | `refresh` claimed the query path's storing; prefetch and DNS64 never fed the denial cache | **filed and closed 2026-09-25**. The reason given for storing less was about the reply, not the cache. `Caches::store` holds the four rules and both writers call it. Regression test: a refreshed Secure NXDOMAIN answers the rest of its NSEC gap with no second upstream query, asked twice with the old storing restored. `testutil::SignedZone` is the first Secure resolution `rdnsr`'s tests can reach. Declined: DNS64 consulting the denial cache, since CD would have to be passed in to agree. See `docs/closed/117.md` |
+| **118** | `answer_update` checked permission before the zone, and its doc claimed the RFC's order | **filed and closed 2026-09-25**. BIND, Knot and PowerDNS read: all check permission before §3.2, two of three check the zone before permission. Now zone → permission → prerequisites, so an unsigned or wrongly scoped UPDATE for a zone not served is NOTAUTH. The conformance row lists the two deviations, one of them the replicated-zone REFUSED where §3.1.1 forwards. See `docs/closed/118.md` |
+| **119** | two UPDATE refusals no test reached, and an unreadable zone directory answered REFUSED | **filed and closed 2026-09-25**. SERVFAIL now, as a failed read of the zone file already was: RFC 2136 §4.6 sends the client to the next server on SERVFAIL and ends the update on REFUSED. `file_for` propagates `read_dir` and entry errors as the loader does. Four tests; the task-failure SERVFAIL stays untested, reachable only by a panic. See `docs/closed/119.md` |
+| **68** | a socket test failed once under a parallel suite | **filed 2026-09-15, closed 2026-09-25.** The test it named never failed again; two others in `rdnsd` did, 8 in 200 workspace runs. 68a was a defect: dnstap's pump dropped its queue on stop, frames already counted as sent, so a capture lost its last requests (50 of 50 provoked runs). Now drained before STOP. 68b was the test's: an unanswered NOTIFY is resent after 2 s. 0 in 200 runs after. The same 200 runs filed **#120**. See `docs/closed/068.md` |
+| **58** | serve-stale answered a dead upstream and not a slow one | **filed 2026-09-13, closed 2026-09-25.** RFC 8767 §5's 1.8 s client response timer declined on a survey of BIND, Unbound, Knot and PowerDNS — BIND removed it after two CVEs — and BIND's zero form taken as `--serve-stale-first`, refreshing through #114's prefetch pool. A deviation from §4, filed as **D-8** in #21. The timers were §5 and nine places said §4. Two things the grooming did not see: a stale refresh has to be a *period* (§5's 30 s failure recheck), or one failure leaves a name stale and untried for the whole window; and the pool's presence had been the prefetch switch. See `docs/closed/058.md` |
+| **120** | three timing flakes found verifying #68 | **filed and closed 2026-09-25.** 120a: the TCP stop tests slept 20 ms and hoped the server had read the query; the handler now says so. 120b: all twelve ratio tests opened — four already took a minimum, one is not a suite test, seven took one sample and now take the best of five through `rdns::testutil::fastest`. After: 0 failures of any of them in 150 Windows and 50 Linux runs, against 4 before. The same runs filed **#121**, a real signing defect, and **#122**. See `docs/closed/120.md` |
+| **122** | ratio tests took five of one side, then five of the other | **filed 2026-09-25, closed 2026-09-26.** Measured first: `zone.rs`'s test under load failed 5 in 900 sampling one side then the other, 0 in 900 taking turns, with the same median. `rdns::testutil::fastest_of_each` takes turns, and all eleven suite ratio tests use it; `fastest` is gone. The verification filed **#123** and **#124**. See `docs/closed/122.md` |
+| **121** | incremental signing took a key tag for a key | **filed 2026-09-25, closed 2026-09-26.** A new ZSK whose tag matched the old one's read as "keys unchanged", so the old signature was carried alone and the new DNSKEY signed nothing; a swapped-in twin carried a signature from a withdrawn key. Condition 3 now holds only when each signer's tag names exactly its own DNSKEY in the previous run's RRset, checked once per run. A stored colliding Ed25519 pair tests both cases, each watched failing before. Filed **#125**, a collision in `--generate-keys` overwriting a private key file. See `docs/closed/121.md` |
+| **123** | two resolver tests timed out under load | **filed and closed 2026-09-26.** The row said they failed before their timeout; each server gets `timeout_ms / 2`, and every failure was that 2 s expiring. The fake never received the query: CPU load alone reproduced it, 7 in 20 runs, with no other network traffic. It polled its stop flag with a 50 ms `SO_RCVTIMEO`, which Windows documents as leaving the socket "in an indeterminate state"; a datagram arriving as it fired was lost. Now a task on the test runtime, aborted on drop. Under 64 spinners, old 25 of 25 runs failing, new 0 of 25 — `zone.rs`'s ratio test included, which the old fakes were disturbing. See `docs/closed/123.md` |
+| **124** | `compression.rs`'s ratio test near its bound in debug | **filed and closed 2026-09-26.** The bound was right: the unindexed scan reads 13-15× in debug, the ~2 was release. The samples were not: 500 writes against 16 000, so under load only the long side was preempted — loaded Linux read 6.16× median, 195 of 200 over 5, and more samples did not help. Both sides now write 800 names a sample, best of fifteen: max 3.26× loaded, and the real test failed 0 of 100 there against 83 before. See `docs/closed/124.md` |
+| **125** | `--generate-keys` replaced a key file whose tag it collided with | **filed and closed 2026-09-26.** Checked against BIND first: `dnssec-keygen` generates again while a new key's tag, or its tag with REVOKE set, equals either tag of a key of that name and algorithm in the directory (`key_collision`, `dnssectool.c`). `SigningKey::distinct_from` does the same against the directory and the run's other key, bounded at 100 attempts; `write_to_dir` publishes by hard link and refuses an existing file. Tested over #121's stored pair, a stored REVOKE-apart pair and a same-tag pair of two algorithms; the overwrite test watched failing against the old rename, and `rdnsd`'s wiring test against dropping either list. See `docs/closed/125.md` |
 | **126** | `--generate-keys` left a KSK with no DS when the ZSK's write failed | **filed and closed 2026-09-27.** Found reviewing #125. `write_key_pair` now removes whatever of the pair reached the directory on any write error, by `SigningKey::remove_from_dir`, which compares content rather than trusting the name: the name is the tag, and a file under it holding anything else is a colliding key. A key that cannot be removed is named in the error. |
 | **127** | a cached wildcard synthesis counted neither a hit nor a miss | **filed and closed 2026-09-27.** Found by the deepening sweep that filed #128-#130. `rdnsr`'s RFC 8198 §5.3 arm returned before `cache_hits`, where the other three arms answered from something held count one. One line; the test failed on 0 hits against the old arm. |
-| **128** | RFC 1035 §4.3.5's refresh cycle was written twice and neither copy was tested | **filed 2026-09-27, closed 2026-09-28.** Both shapes built: one cycle in `rdns::secondary` (A) against paused-time tests on each loop (B). A taken: B's tests need real loopback I/O under paused time and a 200 ms real-time quiet period, without which the REFRESH test passed the bug it was for, and they are the same six tests twice. The copies had drifted three times: #135, `rdnsr`'s missing stop guard, and the timers after an expiry. Branches `128-shape-a` and `128-shape-b` kept. See `docs/CLOSED_WORK.md` |
-| **129** | `Caches` sealed its write side and left the read order to its callers | **filed and closed 2026-09-27.** `Caches::lookup` holds the order; `handle_query` has one hit arm. Found doing it: `cached_or_resolve` asked `answers` before `negatives`, so DNS64 synthesized from an A a newer "no" had replaced. Regression test failed against the old order. See `docs/CLOSED_WORK.md` |
-| **130** | four UPDATE refusals had an EDE or rcode no test asserted | **filed 2026-09-27, closed 2026-09-28.** Filed as "decides and replies in one pass"; triage found the socketless seam existed and the evidence was not about interleaving, so no type. NOTAUTH's, the scoped key's and no-source's EDE and the `$INCLUDE` rcode and EDE are asserted at the reply; each mutated exit failed one test. See `docs/CLOSED_WORK.md` |
+| **128** | RFC 1035 §4.3.5's refresh cycle was written twice and neither copy was tested | **filed 2026-09-27, closed 2026-09-28.** Both shapes built: one cycle in `rdns::secondary` (A) against paused-time tests on each loop (B). A taken: B's tests need real loopback I/O under paused time and a 200 ms real-time quiet period, without which the REFRESH test passed the bug it was for, and they are the same six tests twice. The copies had drifted three times: #135, `rdnsr`'s missing stop guard, and the timers after an expiry. Branches `128-shape-a` and `128-shape-b` kept. See `docs/closed/128.md` |
+| **129** | `Caches` sealed its write side and left the read order to its callers | **filed and closed 2026-09-27.** `Caches::lookup` holds the order; `handle_query` has one hit arm. Found doing it: `cached_or_resolve` asked `answers` before `negatives`, so DNS64 synthesized from an A a newer "no" had replaced. Regression test failed against the old order. See `docs/closed/129.md` |
+| **130** | four UPDATE refusals had an EDE or rcode no test asserted | **filed 2026-09-27, closed 2026-09-28.** Filed as "decides and replies in one pass"; triage found the socketless seam existed and the evidence was not about interleaving, so no type. NOTAUTH's, the scoped key's and no-source's EDE and the `$INCLUDE` rcode and EDE are asserted at the reply; each mutated exit failed one test. See `docs/closed/130.md` |
 | **131** | a zone with two masters was withdrawn when one of them was down | **filed and closed 2026-09-27.** Found grooming #128. EXPIRE and the startup/reload vouch read the sidecar per (zone, master); RFC 1034 §4.3.5, BIND and Knot count contact per zone. `StateFile::last_contact` over the masters configured now, so a line from a master no longer configured still vouches for nothing. Both regression tests failed against the per-master lookup. |
 | **132** | a stale lookup served an older "yes" over a newer "no" | **filed and closed 2026-09-27.** Found grooming #129. `Caches::stale` serves the later of the two by `learned_at` (RFC 8767 §4), deciding at read time because an NXDOMAIN is keyed by name and retiring on store would scan the answer cache. Covers other types at the name. Stale NXDOMAIN kept (RFC 8914 §4.20). Both regression tests failed with the "yes" asked first. |
 | **133** | the fresh path could serve an older "no" over a newer "yes" | **filed and closed 2026-09-27.** Found closing #132. `Caches::store` has an answer retire the NODATA for its question and the NXDOMAIN at its name and every ancestor (`NegativeCache::forget_refuted`), so asking `negatives` first is right by construction; one removal per label, no scan. The read side was not built. Both regression tests failed without the call. The denial cache has the same shape: #134. |
-| **134** | a cached RFC 8198 gap or wildcard outranked a newer answer for the name | **filed and closed 2026-09-27.** Found closing #133; the wildcard instance found triaging #129. RFC 8198 Appendix A, Unbound, BIND and Knot Resolver ask the exact-match cache first and synthesize on a miss; `Caches::lookup` now does too. Neither store-side retiring nor `learned_at` on proofs was needed. Both regression tests failed against the old order; a cache hit went from 13 allocations to 12. See `docs/CLOSED_WORK.md` |
-| **135** | a restarted `rdnsr` whose master was gone never reached EXPIRE | **filed and closed 2026-09-27.** Found triaging #128. `refresh_task` started from `RefreshTimers::default()`, EXPIRE never, and held a feed file from the last run; it now starts from the timers of the zone in force. The regression test failed against the default. See `docs/CLOSED_WORK.md` |
-| **136** | the resolver's tests reached it only through a loopback hierarchy | **filed and closed 2026-09-28.** Both shapes built: an `Upstream` seam under `ask_any` (A) against one shared fake behind a `test-util` feature (B). A taken: it removed `ResolverConfig::server_port`, a `pub` field that existed for tests, and B kept it and added test code to `rdns`'s public surface. 46 resolver tests and 3 `rdnsr` tests answer from a table; socket behaviour stays on sockets, plus a source-filter test that did not exist. Filed **#137**. See `docs/CLOSED_WORK.md` |
+| **134** | a cached RFC 8198 gap or wildcard outranked a newer answer for the name | **filed and closed 2026-09-27.** Found closing #133; the wildcard instance found triaging #129. RFC 8198 Appendix A, Unbound, BIND and Knot Resolver ask the exact-match cache first and synthesize on a miss; `Caches::lookup` now does too. Neither store-side retiring nor `learned_at` on proofs was needed. Both regression tests failed against the old order; a cache hit went from 13 allocations to 12. See `docs/closed/134.md` |
+| **135** | a restarted `rdnsr` whose master was gone never reached EXPIRE | **filed and closed 2026-09-27.** Found triaging #128. `refresh_task` started from `RefreshTimers::default()`, EXPIRE never, and held a feed file from the last run; it now starts from the timers of the zone in force. The regression test failed against the default. See `docs/closed/135.md` |
+| **136** | the resolver's tests reached it only through a loopback hierarchy | **filed and closed 2026-09-28.** Both shapes built: an `Upstream` seam under `ask_any` (A) against one shared fake behind a `test-util` feature (B). A taken: it removed `ResolverConfig::server_port`, a `pub` field that existed for tests, and B kept it and added test code to `rdns`'s public surface. 46 resolver tests and 3 `rdnsr` tests answer from a table; socket behaviour stays on sockets, plus a source-filter test that did not exist. Filed **#137**. See `docs/closed/136.md` |
 | **137** | nothing tested fastest-first server order end to end | **filed 2026-09-28, closed 2026-09-29.** Found closing #136. `Upstream::Answering` returns a future and `ask_any` reads `tokio::time::Instant`, so a paused test makes one server slower than another. A per-server latency table built and declined. `15d9add` |
 | **138** | an NSEC3 salt over 255 octets was encoded with the wrong length | **filed and closed 2026-09-28.** Found by the idiom review. `u8::try_from` at both lengths: a 256-octet salt loaded with length 0 and reparsed as another NSEC3, and now fails the zone at its line. `9431916` |
 | **139** | TSIG read a key name off the wire as lossy, unescaped text | **filed and closed 2026-09-28.** Found by the idiom review. Read with `rdns_core::Name` and carried in presentation form, so escapes survive; our own request was BADKEY for `a\.b.`. Not a bypass. `248bdc0` |
@@ -1728,7 +1590,7 @@ the week; the record is under "How the queue kept going stale" in
 | **145** | work done twice or thrown away | **filed and closed 2026-09-28.** Found by the idiom review. 145a-d fixed; 145e became #147; 145f declined on a measured no-change. `1009089` |
 | **146** | small idioms, one sweep | **filed and closed 2026-09-28.** Found by the idiom review. `Class::IN` at all 203 sites, and eight smaller rewrites. `1e6e39e` |
 | **147** | a zone-file field past a name's RDATA was joined into the name | **filed and closed 2026-09-28.** Found probing 145e. `NS ns1.example.com. junk` served `ns1.example.com.\032junk.example.com.`; a name is one field now, MX two, SOA seven. `a5ea7e8` |
-| **148** | domain docs moved to the mattpocock layout | **filed 2026-09-29, closed 2026-09-30.** Reverses #98 on the owner's decision. `docs/agents/domain.md` in the skills' shape; #21's deviations are `docs/adr/0001`-`0005`, the rest move when touched; `docs/spec/07`'s two D-8s split into D-8 and D-9. See `docs/CLOSED_WORK.md` |
+| **148** | domain docs moved to the mattpocock layout | **filed 2026-09-29, closed 2026-09-30.** Reverses #98 on the owner's decision. `docs/agents/domain.md` in the skills' shape; #21's deviations are `docs/adr/0001`-`0005`, the rest move when touched; `docs/spec/07`'s two D-8s split into D-8 and D-9. See `docs/closed/148.md` |
 | **149** | eleven em dashes in comments were double-encoded | **filed 2026-09-30, closed 2026-10-01.** Found reading `answer.rs` for #148; all U+2014, all from #44b. The scan reads 0 over every tracked file; `CLAUDE.md` §12 carries the check. `96f26dd` |
 | **150** | the authoritative answer was split across the `rdns`/`rdnsd` seam | **filed 2026-10-01, closed 2026-10-02.** `rdns::zone_answer::write`, with the proofs private to it; `rdns`'s counts, panic sweep and bench go through it. Found #160. `d19d6e5`, `66199ad` |
 | **152** | the re-signing interval came back without the rule that chose it | **filed 2026-10-01, closed 2026-10-02.** `Resign { every, why }`; the startup line is its `Display` and no longer spells the fraction. `3348cad` |
@@ -1758,7 +1620,7 @@ applied (`CLAUDE.md` §11):
 - **Fourteen section headings were wrong or absent.** Eleven still said
   "filed" for work that had closed (#7, #22, #24-#32) and three carried no
   status at all (#2, #14, #16). All fourteen are corrected in
-  `docs/CLOSED_WORK.md` with the original struck through, because a heading is
+  `docs/closed/` with the original struck through, because a heading is
   the first thing read and was the last thing updated.
 
 ---
@@ -2539,7 +2401,7 @@ a scratch file would make it a single point of failure.
   `EXPIRE (60s) passed with no contact — no longer serving this zone` and answered
   REFUSED thereafter.
 
-That run is also what caught the two bugs under `docs/CLOSED_WORK.md`'s
+That run is also what caught the two bugs under `docs/closed/log.md`'s
 "Done so far" that no unit test
 would have: the validator dropping NOTIFY before anything read its opcode, and the
 refresh loop reading the zone's timers *before* the transfer that installs them,

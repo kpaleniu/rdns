@@ -23,7 +23,7 @@ labels and a root terminator, in one `Box<[u8]>`. It is always absolute, and
   UTF-8, all of them. `to_presentation` spells every one with RFC 1035 §5.1's
   escapes and `Name::from_presentation` reads them back, so the text form is
   injective again. This closed deviation **D-1** on 2026-09-07
-  (`docs/CLOSED_WORK.md` #36).
+  (`docs/closed/036.md`).
 - Presentation text survives at one boundary on purpose: DNSSEC's canonical
   form, through `dnssec::canonical_name_of`. That text is what signatures are
   computed over, so it is converted at the edge and nowhere else.

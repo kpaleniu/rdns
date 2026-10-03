@@ -88,8 +88,9 @@ Nine, split so a client links neither a server nor a crypto library
 | this file | how to run and deploy it |
 | `docs/spec/` | what it does: wire codec, zone model, both daemons, DNSSEC, operations, RFC conformance |
 | `docs/CLI_USAGE.md` | `rdnsd` flags in detail |
-| `TODO.md` | open work, current state, verification recipes |
-| `docs/CLOSED_WORK.md` | every finished item, and the reasoning that produced it |
+| `TODO.md` | what is open, current state, verification recipes |
+| `docs/issues/` | each open item, one file per number |
+| `docs/closed/` | each finished item and the reasoning that produced it, one file per number |
 | `CLAUDE.md` | coding rules for this repo |
 
 ## Quick start
@@ -437,8 +438,8 @@ The gap between the columns is the `#[cfg(unix)]` tests, which a Windows build
 never compiles — which is why a green suite on one platform is not a green
 suite (`CLAUDE.md` §1).
 
-Open work is `TODO.md`. Every closed number is in `docs/CLOSED_WORK.md`,
-including the inventory of deliberate RFC deviations (#21).
+Open work is `docs/issues/`, indexed by `TODO.md`. Every closed number is in
+`docs/closed/`, including the inventory of deliberate RFC deviations (#21).
 
 Not implemented: SIG(0), multi-signer DNSSEC (RFC 8901), EDNS Client Subnet
 (declined on purpose, RFC 7871 §11), DNS Cookies as anything but opaque bytes,

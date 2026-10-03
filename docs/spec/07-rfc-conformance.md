@@ -119,7 +119,7 @@ Consequence: a zone containing such a name cannot be served, and a response
 containing one is unparseable, so a resolver cannot relay it.~~
 
 The representation the trade named is what landed: `Name` holds wire octets
-(`docs/CLOSED_WORK.md` #36), a label is any binary string, and the consequence
+(`docs/closed/036.md`), a label is any binary string, and the consequence
 the last sentence describes is the regression test —
 `a_response_carrying_a_binary_label_relays_byte_for_byte`, which asserts the old
 refusal beside the new behaviour so the contrast is checked rather than

@@ -1,8 +1,8 @@
 # Working on rdns
 
-Orientation lives in `TODO.md`: what each crate is, what is open, how to run the
-binaries, how to verify against dnspython, and four environment traps. Read it
-before planning.
+Orientation lives in `TODO.md`: what each crate is, what is open (each item is
+`docs/issues/NNN.md`), how to run the binaries, how to verify against
+dnspython, and four environment traps. Read it before planning.
 
 @CLAUDE.local.md
 
@@ -457,8 +457,8 @@ Terse. Facts, not essays. Say why, in as few words as it takes, then stop.
 - No new READMEs, design documents or doc-comment essays unless asked for by
   name.
 - `TODO.md` carries one line per finished item, pointing at the commit.
-- Do not quietly edit a claim in `TODO.md` that turned out to be wrong. Correct it
-  in place with a pointer and leave the reasoning that produced it — that
+- Do not quietly edit a claim in `TODO.md` or an issue file that turned out to
+  be wrong. Correct it in place with a pointer and leave the reasoning that produced it — that
   reasoning is why the bug happened.
 - **That applies to a claim, not to a status line.** "What is open" was never
   *wrong*; it stopped being current. Striking it through and writing the next one
@@ -467,8 +467,10 @@ Terse. Facts, not essays. Say why, in as few words as it takes, then stop.
   closed-work table already held, two of them nested into markdown that no longer
   rendered. Overwrite a status line; strike a claim. The test is whether somebody
   reading the struck version learns why something went wrong.
-- The numbered sections in `TODO.md` are stable identifiers referenced from the
-  code and from each other. Move them, never renumber them.
+- Issue numbers are stable identifiers referenced from the code and from each
+  other: `docs/issues/NNN.md` while open, `docs/closed/NNN.md` after. Move the
+  file, never renumber it. A citation reads `TODO.md #N` because the closed
+  table there points at the file.
 
 ## 12. Formatting: `cargo fmt --all`, every time
 
@@ -726,7 +728,7 @@ be unnecessary. Usually the answer is a newtype, and usually it is free.
 ~~The smells, all currently in this tree (`TODO.md` §13 plans the staged
 removal, with the measurements each stage has to hold):~~ **Two of the seven
 are in this tree** (re-measured 2026-09-20, #79b), and §13 closed on
-2026-08-02 — it is in `docs/CLOSED_WORK.md`. Five were taken out by #13a-#13d
+2026-08-02 — it is `docs/closed/013.md`. Five were taken out by #13a-#13d
 (`b48c799`) and #14 (`eff4fcb`), both that day, and they stay on this list
 because the *shape* is what a review looks for. Each bullet says which it is,
 so a fixed one reads as an example rather than as something to go and find:
@@ -963,8 +965,9 @@ This applies to prose in tracked files exactly as it does to commits, and to
 
 ### Issue tracker
 
-Issues are numbered items in `TODO.md`; closed ones move to
-`docs/CLOSED_WORK.md`. See `docs/agents/issue-tracker.md`.
+Issues are numbered files, open in `docs/issues/NNN.md` and closed in
+`docs/closed/NNN.md`; `TODO.md` lists which are open. See
+`docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
