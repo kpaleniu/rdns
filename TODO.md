@@ -37,10 +37,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#160, #163 and #164**, as of 2026-10-03; #151, #155-#159, #161 and #162
-closed that day, #150, #152, #153 and #154 on 2026-10-02. #160 was found
-closing #150, #161 closing #155, #162 triaging #161, #163 grilling it and
-#164 triaging #163.
+**#160, #163, #164 and #165**, as of 2026-10-03; #151, #155-#159, #161
+and #162 closed that day, #150, #152, #153 and #154 on 2026-10-02. #160 was
+found closing #150, #161 closing #155, #162 triaging #161, #163 grilling it,
+#164 triaging #163 and #165 grilling #164.
 #150-#154 came out of a review on 2026-10-01 asking where a missing
 abstraction makes a caller carry state between calls into a module, or
 re-derive what the module already knew. Five rows, none a defect on the wire.
@@ -1498,6 +1498,13 @@ fold and in `Zones::for_query`'s per-candidate fold. `answer_question`'s
 **Out of scope:** `zone_answer::write`'s signature; other `folded()`
 callers.
 
+**Grilled 2026-10-03.** 54 `folded()` call sites in the tree; two are on
+`rdnsr`'s per-query path, `cache.rs:263`/`:306` and
+`negative_cache.rs:196`. Left as chosen, not missed: DNS-0x20 is a
+resolver-to-authoritative technique and a stub does not randomize case, so
+those allocate only when another resolver forwards through `rdnsr`. The
+rest are zone loads, the catalog, IXFR history and signing.
+
 ---
 
 ### 163. A TCP or DoT peer that never reads its replies holds its connection forever — **filed 2026-10-03**, **bug**, **ready-for-agent**
@@ -1562,9 +1569,13 @@ past shutdown, holding a slot and the drain. After a write error the read
 loop keeps answering into a closed channel.
 
 **Desired behavior:**
-- Each `write_all` in `serve_one`'s writer task is bounded by
-  `limits.read_timeout`; on expiry it is counted and logged as the write
-  error path already is, and the writer ends.
+- ~~Each `write_all` in `serve_one`'s writer task is bounded by
+  `limits.read_timeout`~~ **Not the whole write (grilled, below):** each
+  reply is written under a *progress* deadline of `limits.read_timeout`,
+  restarted whenever any bytes go out; when nothing moves for that long
+  it is counted and logged as the write error path already is, and the
+  writer ends.
+- One helper for that write, which #164's reply stream uses too (§7).
 - The read loop ends when the writer has: `tx.closed()` beside `stop` at
   the length read, and raced against the `in_flight` permit wait.
 - `TransportLimits::read_timeout`'s doc says it bounds a write too.
@@ -1574,11 +1585,20 @@ loop keeps answering into a closed channel.
       nothing, with a short `read_timeout`; `serve_one` returns within a
       bound. Shown hanging against the current code, with the test's own
       wait bounded.
+- [ ] A reader taking a 64 KB reply slower than it would arrive in
+      `read_timeout`, but steadily, gets all of it.
 - [ ] A test that a write error ends the read loop.
 - [ ] Workspace tests and clippy on Windows and Linux; fmt, doc and the §12
       grep clean.
 
 **Out of scope:** DoQ (#164); a write-timeout flag.
+
+**Grilled 2026-10-03.** A whole-write deadline cut off a slow secondary:
+transfer envelopes go through the same writer (`dispatch.rs`, the
+`send_framed` in the AXFR loop) at up to 64 KB, so 5 s for one was a
+13 KB/s floor on every transfer. A client that reads nothing and one that
+reads slowly differ in whether anything moves, which only a progress
+deadline sees.
 
 ---
 
@@ -1636,9 +1656,12 @@ read or write has stalled.
   flight finish, and close with `DOQ_NO_ERROR` once they have or one
   `idle_timeout` later, whichever is first.
 - Quinn's `max_idle_timeout` stays: it is the floor for a silent client.
-- Read RFC 9250's connection-handling section before relying on it, and
-  quote what it says about a server closing an idle connection beside the
-  code.
+- Both closes use `DOQ_NO_ERROR`, quoted beside the code (below).
+- A query stream with no FIN after `read_timeout` closes the connection
+  with `DOQ_PROTOCOL_ERROR` (RFC 9250 §4.3.3), as a stalled message ends a
+  TCP connection.
+- A reply that makes no progress for `read_timeout`, through #163's
+  helper, resets that stream only, with `DOQ_UNSPECIFIED_ERROR`.
 - `--connection-idle-timeout`'s help and `docs/CLI_USAGE.md` say DoQ
   follows the same rule.
 
@@ -1650,12 +1673,69 @@ read or write has stalled.
       does not hold the connection past about twice the timeout, PINGs
       or not.
 - [ ] Shutdown closes an open idle connection.
+- [ ] A stream that never sends its FIN closes the connection with
+      `DOQ_PROTOCOL_ERROR` after `read_timeout`.
+- [ ] A reply starved of stream credit is reset with
+      `DOQ_UNSPECIFIED_ERROR`, and another stream on the same connection
+      is still answered.
 - [ ] Each shown failing against the current code, the test's own waits
       bounded.
 - [ ] Workspace tests and clippy on Windows and Linux; fmt, doc and the §12
       grep clean.
 
-**Out of scope:** a DoQ-specific setting.
+**Out of scope:** a DoQ-specific setting; the existing reset codes
+(#165).
+
+**Grilled 2026-10-03,** against RFC 9250 read in full for this:
+- No code is named for a server closing an idle connection. §4.3's
+  `DOQ_NO_ERROR` fits: "used when the connection or stream needs to be
+  closed, but there is no error to signal". `DOQ_EXCESSIVE_LOAD` would
+  claim a load nothing here measures.
+- No graceful drain exists: "A CONNECTION_CLOSE frame causes all streams
+  to immediately become closed" (RFC 9000 §10.2). Stopping `accept_bi`
+  and finishing what is in flight first is ours, as on DoH; a stream the
+  client opens meanwhile is reset at the close, and §4.4 has it abandoned
+  ("all the in-progress transactions on that connection MUST be
+  abandoned").
+- An unfinished query is a "dangling" stream (§4.2): "implementation-
+  defined timeouts", and the remedy named is the connection — "If limits
+  are encountered, implementations MAY close the connection". §4.3.3
+  lists a missing STREAM FIN as a protocol error: "SHOULD forcibly abort
+  the connection ... and SHOULD use the DoQ error code
+  DOQ_PROTOCOL_ERROR". Rejected: resetting the stream alone, which names
+  no RFC remedy and leaves the misbehaving client connected.
+- A reply never read: the RFC is silent, leaving it to flow control
+  (§5.8). Reset per stream, not the connection, because QUIC credit is
+  per stream and one starved stream says nothing of the others; credit
+  withheld for the whole connection stalls every stream and the idle
+  timer does the rest. `DOQ_UNSPECIFIED_ERROR` ("in the absence of a more
+  specific error code"), not `DOQ_NO_ERROR`, because the client did
+  starve it.
+- Keep-alive PINGs: RFC 9250 says nothing about a server facing them;
+  RFC 9000 §10.1.2 asks application protocols to and it does not.
+
+---
+
+### 165. DoQ resets a stream with `DOQ_PROTOCOL_ERROR` where RFC 9250 names a different remedy — **filed 2026-10-03**, **bug**, **needs-triage**
+
+Found grilling #164. `quic::serve_stream` resets one stream with
+`DOQ_PROTOCOL_ERROR` at two kinds of site:
+- A stream too short for a length prefix, or whose prefix does not
+  describe what it carries. RFC 9250 §4.3.3: a protocol error "SHOULD
+  forcibly abort the connection using QUIC's CONNECTION_CLOSE mechanism
+  and SHOULD use the DoQ error code DOQ_PROTOCOL_ERROR"; §4.3 defines the
+  code as "forcibly aborting the connection". Whether a malformed prefix
+  is on §4.3.3's list was not checked.
+- `Reply::Abort`, a transfer the server cannot finish. Not the client's
+  error; §4.3.2: "If a server is incapable of sending a DNS response due
+  to an internal error, it SHOULD issue a QUIC RESET_STREAM frame. The
+  error code SHOULD be set to DOQ_INTERNAL_ERROR."
+
+§4.3.4: a code in an unexpected context "MUST be treated as equivalent to
+DOQ_UNSPECIFIED_ERROR", so a client loses the distinction rather than
+misbehaving. No remedy costed.
+
+> *This was generated by AI during triage.*
 
 ---
 
