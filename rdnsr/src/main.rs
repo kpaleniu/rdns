@@ -305,9 +305,9 @@ struct Cli {
     )]
     max_connections: std::num::NonZeroUsize,
     /// Seconds a stream connection may go without the client starting a
-    /// message or request before it is closed, and a DoT or DoH TLS handshake
-    /// may take. DoH closes gracefully and drops the connection one timeout
-    /// later.
+    /// message, request or DoQ stream before it is closed, and a DoT or DoH
+    /// TLS handshake may take. DoH and DoQ let what is in flight finish, for
+    /// at most one more timeout.
     #[arg(
         long,
         value_name = "SECONDS",

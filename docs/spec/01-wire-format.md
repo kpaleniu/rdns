@@ -271,9 +271,12 @@ Reading, in all five read loops: read exactly 2 bytes, then exactly that many. A
 zero length is treated as a broken peer and closes the connection.
 
 Timeouts (`rdnsd`, `rdnsr`): the connection may sit idle between messages for
-`--connection-idle-timeout` (10 s; TCP, DoT and DoQ, not DoH — `TODO.md`
-#161); once a length prefix has arrived the peer gets `read_timeout` (5 s,
-not configurable) for the body.
+`--connection-idle-timeout` (10 s; every stream transport — `TODO.md` #161,
+#164); once a length prefix has arrived the peer gets `read_timeout` (5 s,
+not configurable) for the body. On DoQ `read_timeout` runs from the stream's
+start to its FIN; a stream that overruns it closes the connection with
+`DOQ_PROTOCOL_ERROR` (RFC 9250 §4.3.3), and a reply that writes nothing for
+`read_timeout` resets its stream with `DOQ_UNSPECIFIED_ERROR`.
 
 Writing: the prefix and the message go into one buffer. On TCP and DoT a
 reply that has written nothing for `read_timeout` ends the connection, as does
