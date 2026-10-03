@@ -28,6 +28,12 @@ IPv4-mapped IPv6 address is the IPv4 address it maps. Many peers can be one
 source.
 _Avoid_: source (when the exact address is meant)
 
+**Idle**:
+Of a stream connection: the client has started no new message or request,
+whatever is still being answered. A connection mid-handshake is idle.
+_Avoid_: silent (a client's pings are not a request), quiescent (nothing in
+flight)
+
 **Trusted start**:
 A zone a resolution began from whose DNSKEY set was already validated to a
 trust anchor, held with the keys as they were read at that moment.

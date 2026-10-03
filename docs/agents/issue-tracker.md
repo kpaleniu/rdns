@@ -12,7 +12,7 @@ each other.
 - **Numbers are stable identifiers: move a section, never renumber it**
   (`CLAUDE.md` §11). The next free number is one past the highest ever used —
   check `TODO.md` *and* `docs/CLOSED_WORK.md`, which holds every closed section
-  in full under the same number. Highest used at the time of writing: #162.
+  in full under the same number. Highest used at the time of writing: #163.
 - `## What is open` names the currently open numbers. It is a status line:
   overwrite it. A *claim* that turned out wrong is struck through in place with
   the correction beside it, keeping the reasoning that produced it (§11) — the
