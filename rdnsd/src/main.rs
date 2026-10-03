@@ -1213,21 +1213,20 @@ async fn udp_loop(
 
 /// What one UDP worker reuses from datagram to datagram.
 ///
-/// Three pieces of per-message state that a task-per-datagram server pays for
-/// every time and a fixed pool pays for once: the reply buffer, which settles at
-/// the largest EDNS payload size this worker has been asked for; the name
-/// compressor, whose two allocations are per message (`TODO.md` #27b); and the
-/// folded lookup key, which a case-randomized QNAME needs somewhere that
-/// outlives the question (#27a).
+/// Per-message state that a task-per-datagram server pays for every time and a
+/// fixed pool pays for once: the reply buffer, which settles at the largest EDNS
+/// payload size this worker has been asked for, and the name compressor, whose
+/// two allocations are per message (`TODO.md` #27b). ~~And the folded lookup
+/// key (#27a)~~: unused since #38 and removed at #160, the folds being on the
+/// stack.
 ///
 /// One struct because they are one thing — the scratch space — and because
-/// three more parameters on `answer_datagram` is what clippy's argument limit is
-/// for (`CLAUDE.md` §14).
+/// more parameters on `answer_datagram` is what clippy's argument limit is for
+/// (`CLAUDE.md` §14).
 #[derive(Default)]
 struct Scratch {
     out: Vec<u8>,
     compressor: NameCompressor,
-    key: String,
 }
 
 /// What a reload has to redo: everything between reading the files and being

@@ -42,11 +42,7 @@ pub(crate) fn write_response(
     scratch: &mut Scratch,
 ) -> Result<(), WireError> {
     let timer = LatencyTimer::new();
-    let Scratch {
-        out,
-        compressor,
-        key,
-    } = scratch;
+    let Scratch { out, compressor } = scratch;
     let mut w = ResponseWriter::start(out, compressor, max_len, msg)?;
     w.set_authoritative(true);
 
@@ -105,7 +101,7 @@ pub(crate) fn write_response(
     // Measured: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all
     // answer FORMERR to one carrying no OPT, and none of them sets AA.
     match msg.queries.as_slice() {
-        [query] => answer_question(query, zones, dnssec_ok, key, &mut w)?,
+        [query] => answer_question(query, zones, dnssec_ok, &mut w)?,
         _ => {
             w.set_rcode(ResponseCode::FormatError);
             w.set_authoritative(false);
@@ -157,7 +153,6 @@ fn answer_question(
     query: &rdns::QuerySection,
     zones: &Zones,
     dnssec_ok: bool,
-    _key_buf: &mut String,
     w: &mut ResponseWriter,
 ) -> Result<(), WireError> {
     // Every zone here is IN, and RFC 1034 §4.3.2 step 1 searches the zones
@@ -207,17 +202,10 @@ fn answer_question(
         return Ok(());
     }
 
-    // One fold for the whole question. `Zones::for_query`, the delegation
-    // walk and every `Zone` lookup fold their argument themselves and borrow
-    // when there is nothing left to fold, so folding once here makes all of
-    // them free — a case-randomized query paid for three (`TODO.md` #27a).
-    //
-    // ~~Into the caller's buffer~~, because a `Cow` here was the last
-    // allocation on this path for a DNS-0x20 query: the folded name has to
-    // outlive the question and a UDP worker can hold the bytes for the life of
-    // the process (#27d's remainder). **Not since #38**: the fold is
-    // `zone_answer`'s, into a buffer of its own, and `_key_buf` is passed to
-    // nothing (`TODO.md` #160).
+    // ~~One fold for the whole question, into the caller's buffer~~ (#27a,
+    // #27d): the fold moved into `zone_answer` at #38, and the buffer was
+    // passed to nothing until #160 deleted it. `for_query` and `zone_answer`
+    // each fold onto the stack, so neither allocates.
     let Some(zone) = zones.for_query(query.qname.as_ref()) else {
         // A zone we do not serve is REFUSED, not NXDOMAIN. NXDOMAIN asserts
         // the name exists nowhere, which we have no standing to say, and a

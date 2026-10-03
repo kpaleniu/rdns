@@ -480,9 +480,12 @@ fn the_lookups_behind_one_answer_allocate_only_the_answer() {
 /// count above is the count for a name that happened to arrive lower-case, and
 /// this is the count for the rest.
 ///
-/// Measured on `rdnsd` under dhat, a whole query goes 13 to 18 with the case
+/// ~~Measured on `rdnsd` under dhat, a whole query goes 13 to 18 with the case
 /// randomized and 17 to 22 with EDNS0 as well: four folds in `Zone` — the walks
-/// here plus `add_answer`'s own — and a fifth in `Zones::for_query`.
+/// here plus `add_answer`'s own — and a fifth in `Zones::for_query`.~~ Those
+/// were 2026-08-31's figures and went stale with #27; the last two folds went
+/// at #160. Measured the same way, on Linux, case randomized: 4.0 a query
+/// before #160 and 2.0 after, the same as lower case, with or without EDNS0.
 fn a_case_randomized_qname_costs_a_fold_per_lookup() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let walks = |zone: &rdns::zone::Zone, name: NameRef<'_>| {
@@ -509,13 +512,13 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
 
     // The answer path itself (#150): the fold at the door, then the
     // delegation walk and one `locate` that serves both the existence test and
-    // the records (#28b, #27c). The fold is the one allocation, and it needs
-    // somewhere to put the bytes that outlives the question (#27d). It read 4
+    // the records (#28b, #27c). The fold is onto the stack, a name being at
+    // most 255 octets; it read 1 folding into a `Vec` (`TODO.md` #160), and 4
     // before #28b, #28c, #27a and #27c.
     let (reply, count) =
         zone_answer_count(&zone, "WwW.eXaMpLe.CoM.", Qtype::of(record_types::A), false);
     assert_eq!(reply.answers.len(), 1);
-    within("the answer path's lookups, case randomized", count, 1..=1);
+    within("the answer path's lookups, case randomized", count, 0..=0);
 
     // The `Zone` primitives the answer path calls, in its order, for the two
     // measurements below.
@@ -529,11 +532,11 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
         (cut, located.kind().clone(), has, records)
     };
     // And with somewhere to put them, the same sequence costs nothing at all.
-    // `rdnsd`'s UDP worker holds such a buffer beside its scratch and its
-    // compressor, and since #38 does not pass it down: `zone_answer::write`
-    // folds into its own, which is the one allocation above (`TODO.md` #160). The buffer is warmed first: the interesting number
-    // is the *steady state* of a worker answering datagram after datagram, not
-    // its first one.
+    // ~~`rdnsd`'s UDP worker holds such a buffer~~: it held one unused from #38
+    // until #160, which put `zone_answer::write`'s fold on the stack instead.
+    // Kept as the measurement of a reused `Vec`, warmed first: the interesting
+    // number is the *steady state* of a worker answering datagram after
+    // datagram, not its first one.
     let buffered = |zone: &rdns::zone::Zone, name: NameRef<'_>, buf: &mut Vec<u8>| {
         let key = name.folded_in(buf);
         let cut = zone.delegation_for(key);

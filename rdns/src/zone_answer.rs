@@ -170,17 +170,18 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome
     let mut chain: Vec<Hop> = Vec::new();
     let mut visited: Vec<Name> = Vec::new();
     let mut name: Cow<'a, Name> = Cow::Borrowed(qname);
-    let mut key_buf = Vec::new();
+    // On the stack: a `Vec` here cost a DNS-0x20 query an allocation (#160).
+    let mut fold = [0u8; crate::dname::MAX_NAME_LEN];
 
     for _ in 0..MAX_REDIRECTS {
         // Folded once per name, not once per lookup. Every `Zone` entry point
-        // folds its argument and `NameRef::folded_in` borrows when there is
+        // folds its argument and `NameRef::folded_into` borrows when there is
         // nothing left to fold, so the three lookups below see a name already
         // lower-case and copy nothing. A case-randomized query — ordinary
         // traffic, not an attack — folded its name three times without this
         // (`TODO.md` #27a). `name` keeps the case it was asked in, which is
         // what goes back out.
-        let key = name.as_ref().as_ref().folded_in(&mut key_buf);
+        let key = name.as_ref().as_ref().folded_into(&mut fold);
 
         // The DNAME that redirects this name, if any: RFC 6672 §2.2, and
         // strictly above it, because a DNAME does not redirect its own owner

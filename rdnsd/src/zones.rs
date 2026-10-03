@@ -16,6 +16,7 @@ use anyhow::{anyhow, Context, Result};
 use tokio::sync::RwLock;
 
 use rdns::clock::current_unix_timestamp;
+use rdns::dname::MAX_NAME_LEN;
 use rdns::dnssec_key::SigningKey;
 use rdns::dnssec_validation_mode::{DnssecValidator, Verdict, ZoneKeys};
 use rdns::ixfr::{plan_change, DeltaLog, PlannedDelta};
@@ -616,9 +617,11 @@ impl Zones {
     /// counting from the left reads the name once per label, 340 ns against 58
     /// on a length the client picks.
     ///
-    /// Both `Cow`s borrow for a name that arrived absolute and lower-case, which
-    /// is every name off the wire, so the lookup allocates nothing.
+    /// Each candidate folds into one buffer on the stack, so the lookup
+    /// allocates nothing whatever the case. `folded()` per candidate cost a
+    /// DNS-0x20 query one allocation (`TODO.md` #160).
     pub(crate) fn for_query(&self, qname: NameRef<'_>) -> Option<&Zone> {
+        let mut fold = [0u8; MAX_NAME_LEN];
         // Every ancestor from `deepest` labels down, which is where the
         // deepest zone this server holds could start.
         qname
@@ -628,7 +631,7 @@ impl Zones {
                     .label_count()
                     .saturating_sub(self.deepest.min(qname.label_count())),
             )
-            .find_map(|candidate| self.by_name.get(candidate.folded().as_ref()))
+            .find_map(|candidate| self.by_name.get(candidate.folded_into(&mut fold).as_wire()))
             .map(|zone| &**zone)
     }
 }
