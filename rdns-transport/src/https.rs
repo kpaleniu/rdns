@@ -159,26 +159,13 @@ pub async fn serve<H: Handler>(
             // The handshake is in the connection's own task, as it is for DoT
             // and DoQ: two round trips with a stranger do not belong in an
             // accept loop.
-            let stream = tokio::select! {
-                accepted = acceptor.accept(stream) => accepted,
-                _ = stop.wait() => {
-                    drop(slot);
-                    drop(busy);
-                    return;
-                }
-            };
-            let stream = match stream {
-                Ok(stream) => stream,
-                Err(e) => {
-                    handler
-                        .context()
-                        .metrics
-                        .count(&handler.context().metrics.tls_handshake_failures);
-                    tracing::debug!(peer = %peer.ip(), "HTTPS handshake failed: {e}");
-                    drop(slot);
-                    drop(busy);
-                    return;
-                }
+            let Some(stream) =
+                crate::tls::handshake(&acceptor, stream, peer, handler.context(), limits, &stop)
+                    .await
+            else {
+                drop(slot);
+                drop(busy);
+                return;
             };
             handler
                 .context()
@@ -418,6 +405,7 @@ mod tests {
     use rdns::clock::Clock;
     use rdns::shutdown::Shutdown;
     use rustls::pki_types::CertificateDer;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct Echo(ServeContext);
@@ -449,6 +437,15 @@ mod tests {
         ctx: ServeContext,
         rate: RateLimit,
     ) -> (SocketAddr, Vec<u8>, Shutdown, tokio::task::JoinHandle<()>) {
+        started_limited(ctx, rate, TransportLimits::default()).await
+    }
+
+    /// The same, for a test that is about a connection limit.
+    async fn started_limited(
+        ctx: ServeContext,
+        rate: RateLimit,
+        limits: TransportLimits,
+    ) -> (SocketAddr, Vec<u8>, Shutdown, tokio::task::JoinHandle<()>) {
         let pem = write_pem("doh", "localhost");
         let store = CertificateStore::load(&pem.cert, &pem.key).expect("loads");
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -462,7 +459,7 @@ mod tests {
                     listener,
                     endpoint(store, DEFAULT_PATH, None).expect("a DoH endpoint"),
                     Arc::new(Echo(ctx)),
-                    TransportLimits::default(),
+                    limits,
                     rate,
                     stop,
                     busy,
@@ -518,6 +515,54 @@ mod tests {
             String::from_utf8_lossy(&response[..at]).to_string(),
             response[at + 4..].to_vec(),
         )
+    }
+
+    /// A peer that connects and never sends a ClientHello is closed at the
+    /// idle timeout, and its slot goes to the next client (`TODO.md` #162).
+    /// One slot, so the request after it is answered only if it was released.
+    #[tokio::test]
+    async fn a_peer_that_never_says_hello_is_closed_and_its_slot_freed() {
+        let ctx = context(0);
+        let metrics = ctx.metrics.clone();
+        let limits = TransportLimits {
+            idle_timeout: Duration::from_millis(200),
+            max_connections: 1,
+            ..TransportLimits::default()
+        };
+        let (addr, der, shutdown, task) = started_limited(ctx, RateLimit::PerMessage, limits).await;
+
+        let mut silent = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut byte = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut byte)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0) | Err(_))),
+            "the server closes a handshake that never starts, got {closed:?}"
+        );
+        assert_eq!(
+            metrics
+                .tls_handshake_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "and counts it with the other handshake failures"
+        );
+
+        let question = query(0x1620);
+        let head = format!(
+            "POST {DEFAULT_PATH} HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/dns-message\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            question.len()
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            request(addr, &der, &head, &question),
+        )
+        .await
+        .expect("the slot was released");
+        assert!(split(&response).0.starts_with("HTTP/1.1 200"));
+
+        shutdown.begin();
+        task.abort();
     }
 
     /// A DoH client is charged one token for its connection, not two.

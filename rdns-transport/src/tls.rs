@@ -294,37 +294,53 @@ pub async fn serve<H: Handler>(
             // slow or malicious peer hold up every other connection — the
             // accept-loop equivalent of the stall RFC 7766 §6.2.1.1 avoids
             // within a connection.
-            let stream = tokio::select! {
-                accepted = acceptor.accept(stream) => accepted,
-                // A handshake that has not finished by shutdown is a client that
-                // has been told nothing yet, so there is nothing to drain.
-                _ = stop.wait() => {
-                    drop(slot);
-                    drop(busy);
-                    return;
-                }
-            };
-            match stream {
-                Ok(stream) => {
-                    serve_one_tls(stream, peer, handler, limits, rate, stop).await;
-                }
-                Err(e) => {
-                    // DEBUG, not WARN. Port 853 is scanned, an expired
-                    // certificate makes every client hang up here, and a
-                    // protocol-version mismatch looks the same as both — none
-                    // of which is worth a log line each at the default level.
-                    // The counter is what an operator alerts on.
-                    handler
-                        .context()
-                        .metrics
-                        .count(&handler.context().metrics.tls_handshake_failures);
-                    tracing::debug!(peer = %peer.ip(), "TLS handshake failed: {e}");
-                }
+            if let Some(stream) =
+                handshake(&acceptor, stream, peer, handler.context(), limits, &stop).await
+            {
+                serve_one_tls(stream, peer, handler, limits, rate, stop).await;
             }
             drop(slot);
             drop(busy);
         });
     }
+}
+
+/// The server side of a TLS handshake, for DoT and DoH alike: `None` when it
+/// failed, ran past `limits.idle_timeout`, or shutdown came first.
+///
+/// The deadline is the idle timeout because a peer that has not finished its
+/// handshake has sent no message, which is what idle means on these
+/// listeners. Unbounded, a peer sending no ClientHello held a
+/// `--max-connections` slot until it hung up (`TODO.md` #162).
+pub(crate) async fn handshake(
+    acceptor: &TlsAcceptor,
+    stream: TcpStream,
+    peer: std::net::SocketAddr,
+    context: &crate::ServeContext,
+    limits: TransportLimits,
+    stop: &Stop,
+) -> Option<TlsStream<TcpStream>> {
+    let failure = tokio::select! {
+        accepted = tokio::time::timeout(limits.idle_timeout, acceptor.accept(stream)) => {
+            match accepted {
+                Ok(Ok(stream)) => return Some(stream),
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => "timed out".to_owned(),
+            }
+        }
+        // A handshake that has not finished by shutdown is a client that has
+        // been told nothing yet, so there is nothing to drain.
+        _ = stop.wait() => return None,
+    };
+    // DEBUG, not WARN. Port 853 is scanned, an expired certificate makes every
+    // client hang up here, and a protocol-version mismatch looks the same as
+    // both — none of which is worth a log line each at the default level. The
+    // counter is what an operator alerts on.
+    context
+        .metrics
+        .count(&context.metrics.tls_handshake_failures);
+    tracing::debug!(peer = %peer.ip(), "TLS handshake failed: {failure}");
+    None
 }
 
 /// The end-entity certificate this client presented, if it presented one.
@@ -777,6 +793,70 @@ mod tests {
             0,
             "and a failed handshake is not also counted as a completed one"
         );
+
+        shutdown.begin();
+        server.abort();
+    }
+
+    /// A peer that connects and never sends a ClientHello is closed at the
+    /// idle timeout, and its slot goes to the next client (`TODO.md` #162).
+    ///
+    /// One slot, so the second client is answered only if the first released
+    /// it. The test bounds its own waits: against an unbounded handshake the
+    /// failure is an assertion, not a hang.
+    #[tokio::test]
+    async fn a_peer_that_never_says_hello_is_closed_and_its_slot_freed() {
+        let pem = write_pem("silent", "localhost");
+        let store = CertificateStore::load(&pem.cert, &pem.key).expect("loads");
+        let config = server_config(store, None).expect("a server config");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let shutdown = Shutdown::new();
+        let handler = Arc::new(Echo::new(context(0)));
+        let metrics = handler.0.metrics.clone();
+        let server = tokio::spawn(serve(
+            listener,
+            config,
+            handler,
+            TransportLimits {
+                idle_timeout: Duration::from_millis(200),
+                max_connections: 1,
+                ..TransportLimits::default()
+            },
+            RateLimit::PerMessage,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        let mut silent = TcpStream::connect(addr).await.expect("connect");
+        let mut byte = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut byte)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0) | Err(_))),
+            "the server closes a handshake that never starts, got {closed:?}"
+        );
+        assert_eq!(
+            metrics
+                .tls_handshake_failures
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "and counts it with the other handshake failures"
+        );
+
+        let connector = tokio_rustls::TlsConnector::from(client_config(&pem.der));
+        let tcp = TcpStream::connect(addr).await.expect("connect");
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
+        let mut tls = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, tcp))
+            .await
+            .expect("the slot was released")
+            .expect("the handshake");
+        let question = query(0x1620);
+        tls.write_all(&rdns::framed(&question).expect("frames"))
+            .await
+            .expect("send");
+        let mut prefix = [0u8; 2];
+        tls.read_exact(&mut prefix).await.expect("length prefix");
 
         shutdown.begin();
         server.abort();
