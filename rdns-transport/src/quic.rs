@@ -15,10 +15,12 @@
 //! redundant and RFC 9250 has a client set it to zero.
 //!
 //! **The ID is echoed, never checked.** A reply repeats the ID the request
-//! carried, which is right whatever the client put there — and refusing a
-//! non-zero one would break a client for no gain, since the stream has already
-//! done the pairing. The RFC's own reason for the rule is linkability, which is
-//! the client's to protect and not something a server can enforce on its behalf.
+//! carried, which is right whatever the client put there. RFC 9250 §4.3.3 does
+//! list "a message with a non-zero Message ID" as a protocol error, and closing
+//! the connection for it would break a client for no gain, since the stream has
+//! already done the pairing. The RFC's own reason for the rule is linkability,
+//! which is the client's to protect and not something a server can enforce on
+//! its behalf.
 //!
 //! **The certificate is [`crate::tls`]'s**, the same store and the same reload:
 //! a renewal that reached DoT and not DoQ would be a certificate expiring on one
@@ -61,9 +63,14 @@ const ALPN_DOQ: &[u8] = b"doq";
 /// when the connection or stream needs to be closed, but there is no error to
 /// signal". `DOQ_EXCESSIVE_LOAD` would claim a load nothing here measures.
 const DOQ_NO_ERROR: u32 = 0x0;
+/// §4.3.2: "If a server is incapable of sending a DNS response due to an
+/// internal error, it SHOULD issue a QUIC RESET_STREAM frame. The error code
+/// SHOULD be set to DOQ_INTERNAL_ERROR."
+const DOQ_INTERNAL_ERROR: u32 = 0x1;
 const DOQ_PROTOCOL_ERROR: u32 = 0x2;
 /// "In the absence of a more specific error code": a reply the client starved
-/// of credit. Not `DOQ_NO_ERROR`, because the client did starve it.
+/// of credit, or a query admission refused. Not `DOQ_NO_ERROR`, because there
+/// is something wrong with the exchange.
 const DOQ_UNSPECIFIED_ERROR: u32 = 0x5;
 
 /// The quinn configuration a DoQ listener serves under.
@@ -272,6 +279,30 @@ async fn serve_connection<H: Handler>(
     connection.close(DOQ_NO_ERROR.into(), why);
 }
 
+/// The one query a stream's bytes frame, or `None` if they frame anything
+/// else: too short for the prefix, a prefix of zero, or one that does not
+/// describe exactly what follows.
+fn framed_query(raw: &[u8]) -> Option<Vec<u8>> {
+    let (prefix, rest) = raw.split_first_chunk::<2>()?;
+    let len = u16::from_be_bytes(*prefix) as usize;
+    (len != 0 && rest.len() == len).then(|| rest.to_vec())
+}
+
+/// Close the connection for a §4.3.3 protocol error: "It SHOULD forcibly abort
+/// the connection using QUIC's CONNECTION_CLOSE mechanism and SHOULD use the DoQ
+/// error code DOQ_PROTOCOL_ERROR." Every stream on it ends, as a misframed
+/// message ends a TCP connection.
+fn protocol_error(
+    connection: &quinn::Connection,
+    logger: &rdns::logging::QueryLogger,
+    peer: SocketAddr,
+    why: &'static str,
+) {
+    logger.count_error(Peer::from(peer));
+    tracing::debug!(peer = %peer.ip(), "DoQ protocol error: {why}");
+    connection.close(DOQ_PROTOCOL_ERROR.into(), why.as_bytes());
+}
+
 /// What a stream knows of the connection it arrived on.
 struct Client {
     /// To close, for a fault RFC 9250 answers on the connection.
@@ -314,45 +345,60 @@ async fn serve_stream<H: Handler>(
             .await
         {
             Ok(Ok(raw)) => raw,
+            // §4.3.1: "The server MUST issue a RESET_STREAM" in reply. No code
+            // is named; `DOQ_REQUEST_CANCELLED` is the client's, and §4.3.4 has
+            // a code in an unexpected context read as `DOQ_UNSPECIFIED_ERROR`.
+            Ok(Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(_)))) => {
+                tracing::debug!(peer = %peer.ip(), "QUIC query stream cancelled by the client");
+                let _ = send.reset(DOQ_NO_ERROR.into());
+                return;
+            }
+            // More than one query's worth, which only more than one query fits.
+            Ok(Err(quinn::ReadToEndError::TooLong)) => {
+                return protocol_error(
+                    &connection,
+                    &handler.context().logger,
+                    peer,
+                    "stream over 65 537 octets",
+                );
+            }
             Ok(Err(e)) => {
                 handler.context().logger.count_error(Peer::from(peer));
                 tracing::debug!(peer = %peer.ip(), "QUIC stream read error: {e}");
-                let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
                 return;
             }
             Err(_) => {
-                handler.context().logger.count_error(Peer::from(peer));
-                tracing::debug!(peer = %peer.ip(), "QUIC query stream sent no FIN");
-                connection.close(DOQ_PROTOCOL_ERROR.into(), b"no STREAM FIN");
-                return;
+                return protocol_error(
+                    &connection,
+                    &handler.context().logger,
+                    peer,
+                    "no STREAM FIN",
+                )
             }
         };
-    if raw.len() < 2 {
-        handler.context().logger.count_error(Peer::from(peer));
-        tracing::debug!(peer = %peer.ip(), "QUIC stream too short to hold a length prefix");
-        let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
-        return;
-    }
-    let len = u16::from_be_bytes([raw[0], raw[1]]) as usize;
-    if len == 0 || raw.len() < 2 + len {
-        handler.context().logger.count_error(Peer::from(peer));
-        tracing::debug!(
-            peer = %peer.ip(),
-            "QUIC stream says {len} octets and carries {}",
-            raw.len().saturating_sub(2)
+    // §4.3.3's list: "a ... server receives a STREAM FIN before receiving all
+    // the bytes for a message indicated in the 2-octet length field", and "a
+    // server receives more than one query on a stream". A zero length is not on
+    // it by name; the list is "not limited to", and it frames nothing.
+    let Some(packet) = framed_query(&raw) else {
+        return protocol_error(
+            &connection,
+            &handler.context().logger,
+            peer,
+            "stream framed wrongly",
         );
-        let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
-        return;
-    }
-    let packet = raw[2..2 + len].to_vec();
+    };
 
     if !handler
         .context()
         .accept_packet(Peer::from(peer), &packet, Transport::Tcp)
     {
         // Same cap as TCP and for the same reason: a stream is not a datagram,
-        // so the UDP ceiling is the wrong one to judge it by.
-        let _ = send.finish();
+        // so the UDP ceiling is the wrong one to judge it by. The stream only,
+        // as TCP skips the message and not the connection: the framing was
+        // right. A reset rather than a FIN, which reads as a complete answer
+        // of nothing.
+        let _ = send.reset(DOQ_UNSPECIFIED_ERROR.into());
         return;
     }
 
@@ -374,7 +420,7 @@ async fn serve_stream<H: Handler>(
         let Reply::Frame(framed) = reply else {
             // `Reply::Abort`: a transfer that cannot be finished. Resetting says
             // so, where finishing cleanly would read as a complete answer.
-            let _ = send.reset(DOQ_PROTOCOL_ERROR.into());
+            let _ = send.reset(DOQ_INTERNAL_ERROR.into());
             let _ = answering.await;
             return;
         };
@@ -416,6 +462,9 @@ mod tests {
     /// small receive window beside one that fits.
     const BULK: u16 = 0xb0b0;
 
+    /// The id answered as a transfer that cannot be finished: `Reply::Abort`.
+    const ABORT: u16 = 0xab07;
+
     struct Echo {
         ctx: ServeContext,
         /// How long `handle` waits before answering, for a stream that must
@@ -452,6 +501,8 @@ mod tests {
                     }
                 }
                 self.finished.notify_one();
+            } else if id_of(&packet) == ABORT {
+                let _ = out.send(Reply::Abort).await;
             } else {
                 crate::tcp::send_framed(&out, &packet).await;
             }
@@ -633,30 +684,162 @@ mod tests {
         server.task.abort();
     }
 
-    /// A stream whose length prefix does not describe what it carries is a
-    /// protocol error, not an answer. Reset rather than closed, because a clean
-    /// close is how this server says "that is the whole answer".
+    /// The code a stream's reply was reset with, or a failure naming what
+    /// came instead.
+    async fn reset_code(recv: &mut quinn::RecvStream) -> u64 {
+        match tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(64 * 1024)).await {
+            Ok(Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)))) => code.into(),
+            other => panic!("expected a reset, got {other:?}"),
+        }
+    }
+
+    /// Each way a stream can fail to frame one query is a §4.3.3 protocol
+    /// error, answered by closing the connection with `DOQ_PROTOCOL_ERROR`:
+    /// "It SHOULD forcibly abort the connection using QUIC's CONNECTION_CLOSE
+    /// mechanism".
+    ///
+    /// This replaces a test that expected the stream alone reset, which
+    /// encoded the old behaviour (`TODO.md` #165). Watched failing against it:
+    /// every case read a stream reset, and a second query after the first was
+    /// answered.
     #[tokio::test]
-    async fn a_stream_that_is_framed_wrongly_is_reset() {
+    async fn a_stream_framed_wrongly_closes_the_connection() {
+        let server = Server::start(TransportLimits::default(), Duration::ZERO).await;
+        let two_queries = [
+            rdns::framed(&query(0x0001)).expect("frames"),
+            rdns::framed(&query(0x0002)).expect("frames"),
+        ]
+        .concat();
+        let mut too_long = rdns::framed(&query(0x0003)).expect("frames");
+        too_long.resize(u16::MAX as usize + 3, 0);
+        let cases: [(&str, Vec<u8>, &[u8]); 5] = [
+            (
+                "too short for a prefix",
+                vec![0x00],
+                b"stream framed wrongly",
+            ),
+            // Says 300 octets and carries two.
+            (
+                "a prefix longer than the stream",
+                vec![0x01, 0x2c, 0xde, 0xad],
+                b"stream framed wrongly",
+            ),
+            (
+                "a prefix of zero",
+                vec![0x00, 0x00],
+                b"stream framed wrongly",
+            ),
+            (
+                "a second query after the first",
+                two_queries,
+                b"stream framed wrongly",
+            ),
+            ("over 65 537 octets", too_long, b"stream over 65 537 octets"),
+        ];
+
+        for (case, bytes, reason) in cases {
+            let connection = server.connect(quinn::TransportConfig::default()).await;
+            let (mut send, mut recv) = connection.open_bi().await.expect("a stream");
+            send.write_all(&bytes).await.expect("write");
+            send.finish().expect("finish");
+
+            match tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(64 * 1024)).await {
+                Ok(Err(quinn::ReadToEndError::Read(quinn::ReadError::ConnectionLost(
+                    quinn::ConnectionError::ApplicationClosed(close),
+                )))) => {
+                    assert_eq!(
+                        u64::from(close.error_code),
+                        u64::from(DOQ_PROTOCOL_ERROR),
+                        "{case}"
+                    );
+                    assert_eq!(&close.reason[..], reason, "{case}");
+                }
+                other => panic!("{case}: expected the connection closed, got {other:?}"),
+            }
+        }
+
+        server.shutdown.begin();
+        let _ = server.task.await;
+    }
+
+    /// A client that cancels its query is answered with RESET_STREAM (§4.3.1:
+    /// "The server MUST issue a RESET_STREAM"), coded `DOQ_NO_ERROR`, and the
+    /// connection goes on.
+    ///
+    /// Watched failing against the old code: the reset carried
+    /// `DOQ_PROTOCOL_ERROR`.
+    #[tokio::test]
+    async fn a_cancelled_query_is_reset_with_no_error() {
         let server = Server::start(TransportLimits::default(), Duration::ZERO).await;
         let connection = server.connect(quinn::TransportConfig::default()).await;
 
-        // Says 300 octets and carries four.
         let (mut send, mut recv) = connection.open_bi().await.expect("a stream");
-        send.write_all(&[0x01, 0x2c, 0xde, 0xad])
+        let framed = rdns::framed(&query(0x0101)).expect("frames");
+        send.write_all(&framed[..4]).await.expect("write");
+        // DOQ_REQUEST_CANCELLED, the code §4.3 gives the client for this.
+        send.reset(0x3u32.into()).expect("reset");
+
+        assert_eq!(reset_code(&mut recv).await, u64::from(DOQ_NO_ERROR));
+        let answered = ask(&connection, 0x0102)
+            .await
+            .expect("the connection goes on");
+        assert_eq!(id_of(&answered[2..]), 0x0102);
+
+        server.shutdown.begin();
+        let _ = server.task.await;
+    }
+
+    /// A query admission refuses is framed right and wrong in itself, so its
+    /// stream is reset, not the connection — as TCP skips the message — and
+    /// with a reset rather than a FIN, which reads as a complete answer of
+    /// nothing.
+    ///
+    /// Watched failing against the old code: the stream ended with a FIN.
+    #[tokio::test]
+    async fn a_refused_query_resets_only_its_stream() {
+        let server = Server::start(TransportLimits::default(), Duration::ZERO).await;
+        let connection = server.connect(quinn::TransportConfig::default()).await;
+
+        // Four octets: framed, and shorter than a DNS header.
+        let (mut send, mut recv) = connection.open_bi().await.expect("a stream");
+        send.write_all(&rdns::framed(&[0xde, 0xad, 0xbe, 0xef]).expect("frames"))
             .await
             .expect("write");
         send.finish().expect("finish");
 
-        match recv.read_to_end(64 * 1024).await {
-            Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code))) => {
-                assert_eq!(u64::from(code), u64::from(DOQ_PROTOCOL_ERROR));
-            }
-            other => panic!("expected a reset carrying DOQ_PROTOCOL_ERROR, got {other:?}"),
-        }
+        assert_eq!(
+            reset_code(&mut recv).await,
+            u64::from(DOQ_UNSPECIFIED_ERROR)
+        );
+        let answered = ask(&connection, 0x0201)
+            .await
+            .expect("the connection goes on");
+        assert_eq!(id_of(&answered[2..]), 0x0201);
 
         server.shutdown.begin();
-        server.task.abort();
+        let _ = server.task.await;
+    }
+
+    /// A transfer the server cannot finish is its own failure, not the
+    /// client's: RESET_STREAM with `DOQ_INTERNAL_ERROR` (§4.3.2).
+    ///
+    /// Watched failing against the old code: the reset carried
+    /// `DOQ_PROTOCOL_ERROR`.
+    #[tokio::test]
+    async fn an_abandoned_transfer_resets_with_internal_error() {
+        let server = Server::start(TransportLimits::default(), Duration::ZERO).await;
+        let connection = server.connect(quinn::TransportConfig::default()).await;
+
+        let (mut send, mut recv) = connection.open_bi().await.expect("a stream");
+        send.write_all(&rdns::framed(&query(ABORT)).expect("frames"))
+            .await
+            .expect("write");
+        send.finish().expect("finish");
+
+        assert_eq!(reset_code(&mut recv).await, u64::from(DOQ_INTERNAL_ERROR));
+
+        server.shutdown.begin();
+        let _ = server.task.await;
     }
 
     /// PINGs restart QUIC's idle timer (RFC 9000 §10.1) and are not a query,

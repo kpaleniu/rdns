@@ -270,6 +270,14 @@ Every message on TCP is preceded by a 2-octet big-endian length, written by
 Reading, in all five read loops: read exactly 2 bytes, then exactly that many. A
 zero length is treated as a broken peer and closes the connection.
 
+DoQ reads a stream to its FIN, and anything but exactly one framed query — too
+short for the prefix, a prefix of zero or not matching the stream, more after
+it, over 65 537 octets — closes the connection with `DOQ_PROTOCOL_ERROR`
+(RFC 9250 §4.3.3). A query admission refuses resets its stream alone with
+`DOQ_UNSPECIFIED_ERROR`; a client's RESET_STREAM is answered with one coded
+`DOQ_NO_ERROR` (§4.3.1); a transfer the server abandons resets with
+`DOQ_INTERNAL_ERROR` (§4.3.2). `TODO.md` #165.
+
 Timeouts (`rdnsd`, `rdnsr`): the connection may sit idle between messages for
 `--connection-idle-timeout` (10 s; every stream transport — `TODO.md` #161,
 #164); once a length prefix has arrived the peer gets `read_timeout` (5 s,

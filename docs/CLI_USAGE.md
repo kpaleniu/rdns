@@ -370,8 +370,10 @@ files would be a certificate that expires on one port and not the other.
 - DoQ is one query per client-initiated bidirectional stream, framed with the
   same 2-octet prefix as TCP. The stream is the request/response pairing, which
   is why RFC 9250 has a client set the DNS Message ID to zero. This server
-  echoes whatever ID it was sent and never checks it: the pairing is already
-  done, and refusing a non-zero ID would break a client for no gain.
+  echoes whatever ID it was sent and never checks it, though §4.3.3 lists a
+  non-zero one as a protocol error: the pairing is already done, and refusing
+  it would break a client for no gain. A stream that frames anything but one
+  query closes the connection with `DOQ_PROTOCOL_ERROR`.
 - No client certificates. RFC 8310 §8.2's mutual TLS authenticates a *client*,
   which TSIG already does here on every transport rather than one.
 
