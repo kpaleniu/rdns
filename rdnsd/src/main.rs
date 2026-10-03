@@ -1950,7 +1950,7 @@ async fn main() -> Result<()> {
     // has held, and a zone read from disk has no previous version here. Every
     // secondary asking for an increment across a restart gets a full transfer
     // instead, which RFC 1995 §4 permits unconditionally and which corrects
-    // itself at the next change. See "Architecture: incremental transfer".
+    // itself at the next change. See `docs/architecture/ixfr.md`.
     let deltas = Arc::new(RwLock::new(DeltaLog::new()));
     // Where those steps are persisted, so the paragraph above stops being true
     // across a restart. Only a directory-shaped source has somewhere to put it:

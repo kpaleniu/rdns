@@ -7,7 +7,7 @@
 //! [`answer`] (a datagram in, the reply out — no sockets), [`reload`] (re-reading
 //! the certificate and the policy feeds, off the worker threads) and [`serve`]
 //! (the two socket loops and the shutdown). One `Resolver` with a mode rather
-//! than two programs; the reasoning is `TODO.md`'s "Architecture: the resolver".
+//! than two programs; the reasoning is `docs/architecture/resolver.md`.
 
 // `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
 #![warn(unreachable_pub)]

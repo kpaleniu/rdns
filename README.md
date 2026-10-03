@@ -91,6 +91,7 @@ Nine, split so a client links neither a server nor a crypto library
 | `TODO.md` | what is open, current state, verification recipes |
 | `docs/issues/` | each open item, one file per number |
 | `docs/closed/` | each finished item and the reasoning that produced it, one file per number |
+| `docs/architecture/` | why the code has the shape it has, one file per topic, and the API quick reference |
 | `CLAUDE.md` | coding rules for this repo |
 
 ## Quick start

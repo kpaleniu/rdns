@@ -264,7 +264,7 @@ budget and no per-source rate limit. It is also unobservable: no counters, no
 probes, so "is it up and answering" has no answer that does not involve sending it
 a query.
 
-`TODO.md`'s "Architecture: why `rdnsr` is separate from `rdnsd`" argues the split
+`docs/architecture/why-rdnsr-is-separate.md` argues the split
 convincingly on trust model, data and lifecycle. None of those arguments implies
 "and therefore no rate limit". The likely history is that #9's operational review
 was scoped to `rdnsd`.

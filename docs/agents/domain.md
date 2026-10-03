@@ -12,8 +12,8 @@ exploring the codebase.
 If either does not exist, **proceed silently**. `/domain-modeling` creates them
 lazily, when a term or a decision is actually resolved.
 
-Older decisions are still where they were made: `TODO.md`'s `## Architecture:`
-sections and `docs/ARCHITECTURE_REVIEW.md`. When work touches one, move it into
+Older decisions are still where they were made: `docs/architecture/`, one
+file per topic, and `docs/ARCHITECTURE_REVIEW.md`. When work touches one, move it into
 an ADR and leave a one-line pointer in its place (#148).
 
 `docs/spec/` says what the code does. It is not a glossary and not a decision
@@ -46,7 +46,7 @@ it with `/domain-modeling`.
 
 ## Flag ADR conflicts
 
-If your output contradicts an ADR, a decision in `TODO.md`'s architecture
-sections, or a rule in `CLAUDE.md`, surface it rather than silently overriding:
+If your output contradicts an ADR, a decision in `docs/architecture/`, or a
+rule in `CLAUDE.md`, surface it rather than silently overriding:
 
 > _Contradicts ADR-0007, but worth reopening because…_
