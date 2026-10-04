@@ -1745,6 +1745,113 @@ mod tests {
         assert!(reply.answers.is_empty());
     }
 
+    /// Forwarding to an upstream that never answers, with an exchange timeout
+    /// of 30 s, so the resolution timer is what ends it.
+    fn black_hole_resolver() -> Arc<rdns::resolver::Resolver> {
+        let upstream = rdns::resolver::Upstream::answering_later(|_, _, _| {
+            std::future::pending::<Option<Vec<u8>>>()
+        });
+        let config = rdns::resolver::ResolverConfig {
+            mode: rdns::resolver::ResolverMode::Forward,
+            upstream_servers: vec!["198.51.100.1:53".parse().expect("an address")],
+            timeout_ms: 60_000,
+            ..Default::default()
+        };
+        Arc::new(rdns::resolver::Resolver::new(config).with_upstream(upstream))
+    }
+
+    /// An A query for example.com. with EDNS, so a reply can carry an EDE.
+    fn edns_query() -> Vec<u8> {
+        rdns::DnsMessageBuilder::new()
+            .with_id(9)
+            .with_query(nm("example.com."), Qtype::of(record_types::A))
+            .with_recursion(true)
+            .with_edns(1232, false)
+            .build()
+            .to_bytes_within(4096)
+            .expect("serialize")
+    }
+
+    /// The resolution timer firing is SERVFAIL with EDE 22, at 10 s, as BIND,
+    /// PowerDNS and Knot answer it (`TODO.md` #168).
+    ///
+    /// Watched failing without the timer: the exchange's own 30 s, and the
+    /// text "no authority answered".
+    #[tokio::test(start_paused = true)]
+    async fn a_resolution_past_its_timer_is_servfail_with_no_reachable_authority() {
+        let (serving, _clock) = timed_with(
+            StalePolicy::OFF,
+            black_hole_resolver(),
+            None,
+            PolicyZones::default(),
+        );
+        let began = tokio::time::Instant::now();
+        let bytes = handle_query(
+            edns_query(),
+            test_peer(),
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+
+        assert_eq!(began.elapsed(), std::time::Duration::from_secs(10));
+        assert_eq!(reply.rcode, ResponseCode::ServerFailure);
+        assert_eq!(
+            stale_errors(&reply),
+            vec![(
+                InfoCode::NO_REACHABLE_AUTHORITY,
+                "the resolution timer expired".to_string()
+            )]
+        );
+    }
+
+    /// The timer is a failure like any other, so RFC 8767 §4's stale answer
+    /// takes the SERVFAIL's place.
+    ///
+    /// Watched failing without the timer: the same stale answer, at 30 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolution_past_its_timer_is_answered_stale() {
+        let (serving, clock) = timed_with(
+            StalePolicy::seconds(3600),
+            black_hole_resolver(),
+            None,
+            PolicyZones::default(),
+        );
+        let name = nm("example.com.");
+        serving.caches.remember(
+            name.as_ref(),
+            Qtype::of(record_types::A),
+            vec![a_record(&name, 300)],
+        );
+        clock.advance(301);
+
+        let began = tokio::time::Instant::now();
+        let bytes = handle_query(
+            edns_query(),
+            test_peer(),
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply");
+
+        assert_eq!(began.elapsed(), std::time::Duration::from_secs(10));
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(reply.answers.len(), 1);
+        assert_eq!(
+            stale_errors(&reply)
+                .into_iter()
+                .map(|(code, _)| code)
+                .collect::<Vec<_>>(),
+            vec![InfoCode::STALE_ANSWER]
+        );
+    }
+
     /// A fresh entry is answered from the cache and never reaches the stale
     /// path: RFC 8767 §4 has the resolver try the authoritative servers first,
     /// so an answer that is still an answer must not be counted as stale.

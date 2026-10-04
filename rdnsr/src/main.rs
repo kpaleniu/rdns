@@ -166,6 +166,11 @@ fn default_anomaly_source_refusals() -> u64 {
 fn default_serve_stale() -> u64 {
     0
 }
+fn default_resolution_timer() -> u64 {
+    rdns::resolver::ResolutionTimer::DEFAULT
+        .duration()
+        .as_secs()
+}
 fn default_rpz_policy() -> rdns::rpz::PolicyOverride {
     rdns::rpz::PolicyOverride::Given
 }
@@ -478,6 +483,16 @@ struct Cli {
     /// DNS Error (RFC 8914 §4.4), and is counted.
     #[arg(long, value_name = "SECONDS", default_value_t = default_serve_stale(), conflicts_with = "config")]
     serve_stale: u64,
+    /// Abandon a resolution, and answer SERVFAIL, after this many seconds:
+    /// RFC 8767 §5's query resolution timer. 1 to 30.
+    ///
+    /// The query budget counts queries and not time, so without it a zone
+    /// delegated to silent nameservers held a UDP slot for 157.5 s
+    /// (`TODO.md` #168). 10, as BIND's `resolver-query-timeout` and Knot
+    /// Resolver have it. A stale answer, under `--serve-stale`, is served
+    /// in place of the SERVFAIL.
+    #[arg(long, value_name = "SECONDS", default_value_t = rdns::resolver::ResolutionTimer::DEFAULT, conflicts_with = "config")]
+    resolution_timer: rdns::resolver::ResolutionTimer,
     /// Answer an expired name from the `--serve-stale` window at once, and
     /// re-resolve it behind the answer — BIND's
     /// `stale-answer-client-timeout 0`.
@@ -647,6 +662,7 @@ async fn main() -> anyhow::Result<()> {
     // Recursion is the default; naming an upstream is what selects forwarding.
     let mut config = ResolverConfig {
         udp_payload_size: udp.advertised(),
+        resolution_timer: cli.resolution_timer,
         ..ResolverConfig::default()
     };
     if cli.upstream.is_empty() {

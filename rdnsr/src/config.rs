@@ -105,6 +105,8 @@ struct ResolverSection {
     auto_trust_anchor: Option<PathBuf>,
     #[serde(default = "crate::default_serve_stale")]
     serve_stale: u64,
+    #[serde(default = "crate::default_resolution_timer")]
+    resolution_timer: u64,
     #[serde(default)]
     serve_stale_first: bool,
     #[serde(default)]
@@ -131,6 +133,7 @@ impl Default for ResolverSection {
             trust_anchor: None,
             auto_trust_anchor: None,
             serve_stale: crate::default_serve_stale(),
+            resolution_timer: crate::default_resolution_timer(),
             serve_stale_first: false,
             prefetch: false,
             prefetch_workers: None,
@@ -282,6 +285,8 @@ impl Config {
                  it; 1 is the smallest resolver"
             );
         }
+        rdns::resolver::ResolutionTimer::try_from(self.resolver.resolution_timer)
+            .context("resolver.resolution-timer")?;
         for (key, value) in [
             ("prefetch-workers", self.resolver.prefetch_workers),
             ("prefetch-queue", self.resolver.prefetch_queue),
@@ -396,6 +401,7 @@ impl Config {
             trust_anchor,
             auto_trust_anchor,
             serve_stale,
+            resolution_timer,
             serve_stale_first,
             prefetch,
             prefetch_workers,
@@ -411,6 +417,9 @@ impl Config {
         cli.trust_anchor = trust_anchor.clone();
         cli.auto_trust_anchor = auto_trust_anchor.clone();
         cli.serve_stale = *serve_stale;
+        cli.resolution_timer = (*resolution_timer)
+            .try_into()
+            .expect("checked in Config::check");
         cli.serve_stale_first = *serve_stale_first;
         cli.prefetch = *prefetch;
         cli.prefetch_workers = prefetch_workers.unwrap_or_else(crate::default_prefetch_workers);
@@ -603,6 +612,7 @@ tls-key = "./key.pem"
             https_path => "server.https-path",
             cache_size => "resolver.cache-size",
             serve_stale => "resolver.serve-stale",
+            resolution_timer => "resolver.resolution-timer",
             prefetch_workers => "resolver.prefetch-workers",
             prefetch_queue => "resolver.prefetch-queue",
             rpz_policy => "rpz.policy",
@@ -1081,5 +1091,21 @@ master = \"192.0.2.9\"
         assert!(err.to_string().contains("query-burst"), "got: {err}");
         // With the limiter off it is meaningless rather than fatal.
         assert!(parse("[server]\nquery-burst = 0\nquery-rate = 0\n").is_ok());
+    }
+
+    /// One range for both spellings: `ResolutionTimer`'s.
+    #[test]
+    fn a_resolution_timer_outside_one_to_thirty_seconds_is_refused() {
+        for seconds in [0, 31] {
+            let err = parse(&format!("[resolver]\nresolution-timer = {seconds}\n"))
+                .expect_err("out of range");
+            assert!(
+                format!("{err:#}").contains("resolver.resolution-timer"),
+                "got: {err:#}"
+            );
+            let flag = seconds.to_string();
+            assert!(Cli::try_parse_from(["rdnsr", "--resolution-timer", &flag]).is_err());
+        }
+        assert!(parse("[resolver]\nresolution-timer = 30\n").is_ok());
     }
 }

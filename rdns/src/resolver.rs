@@ -9,7 +9,7 @@ use crate::dnssec_chain::{
     KeyStore, TrustAnchors, ValidationState,
 };
 use crate::dnssec_denial::{nsec3s_in, nsecs_in, proves_nodata, proves_nxdomain, Denial};
-use crate::error::{DnssecError, WireError};
+use crate::error::{ConfigError, DnssecError, WireError};
 use crate::name::{dname_redirect, Redirect};
 use crate::record_types as rt;
 use crate::socket::bind_addr_for;
@@ -63,6 +63,11 @@ pub enum ResolveError {
     /// has an answer to send and the walk stopped so it could (`TODO.md` #56).
     #[error("a delegation was refused by policy")]
     PolicyStopped,
+    /// The resolution ran past its [`ResolutionTimer`] and was abandoned. Its
+    /// own variant because `NoResponse` is one exchange's silence, and this is
+    /// the resolver's own limit firing (`TODO.md` #168).
+    #[error("the resolution timer expired after {0} s")]
+    ResolutionTimer(ResolutionTimer),
     #[error("{0}")]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -96,6 +101,12 @@ impl ResolveError {
             ResolveError::BudgetExhausted => {
                 ExtendedError::new(InfoCode::OTHER, "the query budget was exhausted")
             }
+            // §4.23 again, as BIND, PowerDNS and Knot all answer it: what the
+            // timer cut short was a wait on authorities that had not answered.
+            ResolveError::ResolutionTimer(_) => ExtendedError::new(
+                InfoCode::NO_REACHABLE_AUTHORITY,
+                "the resolution timer expired",
+            ),
             // §4.16 Blocked: "blocked for administrative reasons". Only read by
             // a caller that set a policy and then discarded what it recorded;
             // the rewrite carries its own code through `apply_policy`.
@@ -221,6 +232,58 @@ pub fn parse_root_hints(text: &str) -> Vec<SocketAddr> {
     hints
 }
 
+/// RFC 8767 §5's query resolution timer: how long one resolution may take,
+/// waiting included, before it is abandoned. "Commonly around 10 to 30
+/// seconds."
+///
+/// Seconds, 1 to 30: BIND's `resolver-query-timeout` ceiling, and §5's range
+/// at the top. The one check, so the flag and the config file cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolutionTimer(Duration);
+
+impl ResolutionTimer {
+    /// BIND's and Knot Resolver's. PowerDNS Recursor's is 7 s.
+    pub const DEFAULT: ResolutionTimer = ResolutionTimer(Duration::from_secs(10));
+    const SECONDS: std::ops::RangeInclusive<u64> = 1..=30;
+
+    pub fn duration(self) -> Duration {
+        self.0
+    }
+}
+
+impl TryFrom<u64> for ResolutionTimer {
+    type Error = ConfigError;
+
+    fn try_from(seconds: u64) -> Result<Self, ConfigError> {
+        if !Self::SECONDS.contains(&seconds) {
+            return Err(ConfigError::new(format!(
+                "a resolution timer of {seconds} s is outside {}-{} s",
+                Self::SECONDS.start(),
+                Self::SECONDS.end()
+            )));
+        }
+        Ok(ResolutionTimer(Duration::from_secs(seconds)))
+    }
+}
+
+impl std::str::FromStr for ResolutionTimer {
+    type Err = ConfigError;
+
+    fn from_str(text: &str) -> Result<Self, ConfigError> {
+        let seconds = text
+            .parse::<u64>()
+            .map_err(|e| ConfigError::new(format!("{text:?} is not a number of seconds: {e}")))?;
+        seconds.try_into()
+    }
+}
+
+/// Seconds, bare: what `FromStr` reads back, which clap needs of a default.
+impl std::fmt::Display for ResolutionTimer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.as_secs())
+    }
+}
+
 /// How the resolver obtains an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResolverMode {
@@ -251,6 +314,10 @@ pub struct ResolverConfig {
     /// CNAME hops and nameserver-address lookups. The NXNSAttack defence: a
     /// referral naming dozens of glueless nameservers costs a resolution each.
     pub query_budget: usize,
+    /// How long one resolution may take, waiting included. The query budget
+    /// counts queries and not time, so without this a referral to dozens of
+    /// silent nameservers spends the whole budget at `timeout_ms` a query.
+    pub resolution_timer: ResolutionTimer,
     /// EDNS0 UDP payload size to advertise upstream (RFC 6891 §6.2.3): what
     /// this host can reassemble, which is the same claim `rdnsr` makes to its
     /// own clients and is set from the same flag.
@@ -338,6 +405,7 @@ impl Default for ResolverConfig {
             max_delegations: 16,
             max_cname_hops: 8,
             query_budget: 64,
+            resolution_timer: ResolutionTimer::DEFAULT,
             // DNS Flag Day 2020, as BIND's `edns-udp-size` and Unbound's
             // `edns-buffer-size` default: above it an answer fragments, and a
             // fragment is what middleboxes drop.
@@ -595,7 +663,25 @@ impl Resolver {
     ///
     /// `policy` sees each delegation on the way down and may stop the walk; see
     /// [`NameserverPolicy`]. `None` is the ordinary case and costs nothing.
+    ///
+    /// Abandoned at [`ResolverConfig::resolution_timer`], validation included.
     pub async fn resolve_validated(
+        &self,
+        query: &QuerySection,
+        policy: Option<&dyn NameserverPolicy>,
+    ) -> Result<(DnsMessage, ValidationState), ResolveError> {
+        let timer = self.config.resolution_timer;
+        // Cancelled, not checked between sends, so an exchange in progress
+        // cannot overrun it as PowerDNS's summed `max-total-msec` can.
+        match tokio::time::timeout(timer.duration(), self.resolve_untimed(query, policy)).await {
+            Ok(resolved) => resolved,
+            // Not `?`: `From<Elapsed>` reads a timeout as one exchange's
+            // `NoResponse`.
+            Err(_) => Err(ResolveError::ResolutionTimer(timer)),
+        }
+    }
+
+    async fn resolve_untimed(
         &self,
         query: &QuerySection,
         policy: Option<&dyn NameserverPolicy>,
@@ -2271,6 +2357,76 @@ this line has no record and is skipped
         }
 
         assert_eq!(*asked.lock().unwrap(), [slow, fast, fast]);
+    }
+
+    /// A referral to 70 glued nameservers that never answer: the query budget
+    /// alone let this run 63 exchanges, 157.5 s (`TODO.md` #168). The timer
+    /// abandons it at 10 s, to the tick, because the clock is paused.
+    ///
+    /// Watched failing without the timer: 157.5 s and `NoResponse`.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolution_is_abandoned_when_its_timer_expires() {
+        let root = fake(1);
+        let upstream = Upstream::answering_later(move |server, _, query| {
+            let reply = (server == root).then(|| {
+                let query = DnsMessage::try_from_bytes(query).expect("a query");
+                let mut resp = response_to(&query);
+                let names: Vec<_> = (1..=70).map(|i| format!("ns{i}.example.test.")).collect();
+                resp.authorities = names
+                    .iter()
+                    .map(|ns| ns_record("example.test.", ns))
+                    .collect();
+                resp.additionals = names
+                    .iter()
+                    .zip(1u8..)
+                    .map(|(ns, i)| a_record(ns, [203, 0, 113, i]))
+                    .collect();
+                resp.to_bytes_within(u16::MAX as usize).expect("fits")
+            });
+            async move {
+                match reply {
+                    Some(reply) => Some(reply),
+                    None => std::future::pending().await,
+                }
+            }
+        });
+        let resolver = Resolver::new(ResolverConfig {
+            timeout_ms: 5000,
+            ..recursing_config(root)
+        })
+        .with_upstream(upstream);
+
+        let began = tokio::time::Instant::now();
+        let resolved = resolver
+            .resolve(&QuerySection {
+                qname: nm("www.example.test."),
+                qtype: Qtype::of(rt::A),
+                qclass: QueryClass::IN,
+            })
+            .await;
+
+        assert!(
+            matches!(resolved, Err(ResolveError::ResolutionTimer(t)) if t == ResolutionTimer::DEFAULT),
+            "{resolved:?}"
+        );
+        assert_eq!(began.elapsed(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_resolution_timer_is_one_to_thirty_seconds() {
+        for seconds in [0, 31] {
+            assert!(ResolutionTimer::try_from(seconds).is_err(), "{seconds}");
+        }
+        for seconds in [1, 30] {
+            let timer = ResolutionTimer::try_from(seconds).expect("in range");
+            assert_eq!(timer.duration(), Duration::from_secs(seconds));
+        }
+        assert!("ten".parse::<ResolutionTimer>().is_err());
+        let shown = ResolutionTimer::DEFAULT.to_string();
+        assert_eq!(
+            shown.parse::<ResolutionTimer>().ok(),
+            Some(ResolutionTimer::DEFAULT)
+        );
     }
 
     /// A second query for the same zone must not go back to the root.

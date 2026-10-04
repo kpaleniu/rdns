@@ -145,6 +145,7 @@ cache-size = 10000
 dnssec-validate = true
 auto-trust-anchor = "/var/lib/rdns/anchors.xml"   # RFC 5011
 serve-stale = 0             # RFC 8767 window in seconds; 0 is off
+resolution-timer = 10       # seconds one resolution may take, 1-30
 serve-stale-first = false   # answer from that window before refreshing
 dns64 = true                # or a prefix; true is the Well-Known Prefix
 
@@ -230,6 +231,7 @@ because a dry run would leave it owned by whoever ran the check.
 | `--connection-idle-timeout` (seconds) | 10 | connection closed; DoH and DoQ finish what is in flight first, for at most one more timeout (`TODO.md` #161, #164) | none: `0` is refused |
 | `--max-connections-per-source` (per stream listener; a source is an IPv4 address or IPv6 /56) | 32 | connection closed with no reply; `dns_connections_refused_per_source_total{transport}`, the source logged at most once a minute | `0`; `--max-connections-per-source-exempt` |
 | `MAX_INFLIGHT_PER_CONNECTION` | 16 | read loop back-pressures | — |
+| `--resolution-timer` (`rdnsr`, seconds) | 10 | the resolution is abandoned: SERVFAIL with EDE 22, or a stale answer under `--serve-stale` (`TODO.md` #168) | none: 1–30 |
 | `RateLimiter::max_tracked` (sources: IPv4 address, IPv6 /56) | 10 000 | an untracked source is allowed, counted in `dns_rate_limiter_untracked_total` | — |
 | `ResponseLimiter::max_tracked` (response targets: IPv4 /24, IPv6 /56) | 10 000 | an untracked target is truncated (TC=1), not dropped and not sent in full; counted in `dns_response_limiter_untracked_total` | — |
 

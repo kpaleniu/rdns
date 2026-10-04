@@ -20,6 +20,7 @@ Everything is async `tokio::net`. Each hop is an `await` on a socket.
 | `max_delegations` | 16 | referrals followed before giving up |
 | `max_cname_hops` | 8 | |
 | `query_budget` | 64 | total upstream queries one `resolve` may spend |
+| `resolution_timer` | 10 s | wall clock for one `resolve`, validation included; `--resolution-timer`, 1–30 |
 | `udp_payload_size` | 1232 | advertised upstream (RFC 6891 §6.2.3). `rdnsr` sets it from `--udp-payload-size`, the same number it advertises to its own clients: one host, one reassembly claim. Not the size an upstream answer is read into, which is `upstream::UPSTREAM_RECEIVE_BUFFER` = 4096 — the two were one number until #41c |
 | `delegation_cache_size` | 10 000 | 0 disables, which restarts every query at the root |
 | `qname_minimization` | on | RFC 9156 |
@@ -103,6 +104,14 @@ not be built.
 One `resolve` may spend `query_budget` upstream queries in total, across
 delegations, CNAME hops and nameserver-address lookups — the NXNSAttack defence.
 Exhausting it is `ResolveError::BudgetExhausted`.
+
+The budget counts queries and not time, so `resolution_timer` bounds the
+other axis: RFC 8767 §5's query resolution timer, 10 s by default as in BIND
+and Knot Resolver. The resolution is cancelled when it fires, an exchange in
+flight included, and the client gets SERVFAIL with EDE 22, or a stale answer
+under `--serve-stale` (step 12 below). Before it, 70 silent glued nameservers
+took 157.5 s while holding a UDP permit (`TODO.md` #168). DNS64's A query
+is a resolution of its own, so a DNS64 client can wait two timers.
 
 ### QNAME minimisation (RFC 9156)
 
