@@ -40,10 +40,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#167 and #169**, as of 2026-10-04, each `docs/issues/NNN.md`; #165, #166 and
-#168 closed that day, #151 and #155-#164 on 2026-10-03, #150, #152, #153 and #154 on 2026-10-02. #160 was
+**#167, #169 and #170**, as of 2026-10-05, each `docs/issues/NNN.md`; #165,
+#166 and #168 closed on 2026-10-04, #151 and #155-#164 on 2026-10-03, #150, #152, #153 and #154 on 2026-10-02. #160 was
 found closing #150, #161 closing #155, #162 triaging #161, #163 grilling it,
-#164 triaging #163, #165 grilling #164, #166 and #167 closing it, #168 grilling #166, and #169 closing #168.
+#164 triaging #163, #165 grilling #164, #166 and #167 closing it, #168 grilling #166, #169 closing #168, and #170 grilling #169.
 
 The history this section accumulated — how each review's items were found and
 closed, the push and CI record, the stale-preamble lesson and the five claims
