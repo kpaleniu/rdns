@@ -888,6 +888,31 @@ mod tests {
         let _ = server.task.await;
     }
 
+    /// The same stream without the client's PINGs is lost: QUIC's idle timer
+    /// (RFC 9000 §10.1) fires on both ends before the reply exists. Kept so,
+    /// on purpose (`TODO.md` #166): RFC 9250 §4.4 gives the watch to the
+    /// client — "Clients SHOULD monitor the idle time" — and no DoQ server
+    /// read for #166 sends keep-alive PINGs.
+    #[tokio::test]
+    async fn a_silent_client_loses_a_stream_slower_than_the_idle_timeout() {
+        let server = Server::start(idle_300ms(), Duration::from_millis(450)).await;
+        let connection = server.connect(quinn::TransportConfig::default()).await;
+
+        let lost = ask(&connection, 0x0303).await;
+        assert!(
+            matches!(
+                lost,
+                Err(quinn::ReadToEndError::Read(
+                    quinn::ReadError::ConnectionLost(quinn::ConnectionError::TimedOut)
+                ))
+            ),
+            "{lost:?}"
+        );
+
+        server.shutdown.begin();
+        let _ = server.task.await;
+    }
+
     /// A reply the client never reads, with or without PINGs, does not hold
     /// the connection past about twice the idle timeout: one for no new
     /// stream, one for the drain. `read_timeout` is left at its 5 s so the
