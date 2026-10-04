@@ -40,10 +40,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#166 and #167**, as of 2026-10-04, each `docs/issues/NNN.md`; #165 closed
-that day, #151 and #155-#164 on 2026-10-03, #150, #152, #153 and #154 on 2026-10-02. #160 was
+**#167 and #168**, as of 2026-10-04, each `docs/issues/NNN.md`; #165 and #166
+closed that day, #151 and #155-#164 on 2026-10-03, #150, #152, #153 and #154 on 2026-10-02. #160 was
 found closing #150, #161 closing #155, #162 triaging #161, #163 grilling it,
-#164 triaging #163, #165 grilling #164, and #166 and #167 closing it.
+#164 triaging #163, #165 grilling #164, #166 and #167 closing it, and #168 grilling #166.
 
 The history this section accumulated — how each review's items were found and
 closed, the push and CI record, the stale-preamble lesson and the five claims
@@ -1086,6 +1086,7 @@ the week; the record is under "How the queue kept going stale" in
 | **163** | a TCP or DoT peer that never read its replies held its connection, slot and the shutdown drain forever | **filed 2026-10-03, closed 2026-10-03.** · `0d0d5f2` · [`docs/closed/163.md`](docs/closed/163.md) |
 | **164** | a DoQ client's packets kept an idle connection open, PINGs included | **filed 2026-10-03, closed 2026-10-03.** · `9fa0fa5` · [`docs/closed/164.md`](docs/closed/164.md) |
 | **165** | DoQ answered every stream error with a stream reset and `DOQ_PROTOCOL_ERROR` | **filed 2026-10-03, closed 2026-10-04.** · `17823c4` · [`docs/closed/165.md`](docs/closed/165.md) |
+| **166** | a DoQ stream answered slower than the idle timeout is lost when the client is silent | **filed 2026-10-03, closed 2026-10-04, not a defect.** · `284ff25` · [`docs/closed/166.md`](docs/closed/166.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
