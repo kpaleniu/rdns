@@ -27,8 +27,11 @@ One file per number since 2026-10-03; before that open items were sections of
   something went wrong.
 - Closing an item: `git mv docs/issues/NNN.md docs/closed/NNN.md`, so history
   follows the file; update the heading's status, append the closing note, and
-  add one row to `TODO.md`'s `## Closed work` pointing at the commit. The text is
-  kept verbatim, strike-throughs and wrong claims included.
+  add one row to `TODO.md`'s `## Closed work`: number, title, the bold status,
+  the commits and the file link, nothing else. What the closing found goes in
+  the file's closing note, not the row; rows that carried it reached 110 KB
+  before 2026-10-04. The text is kept verbatim, strike-throughs and wrong
+  claims included.
 - Nothing in these files describes a particular machine (§20). Paths, the WSL
   image and what is installed belong in the untracked `CLAUDE.local.md`.
 
