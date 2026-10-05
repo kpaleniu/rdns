@@ -374,7 +374,8 @@ pub struct TransportLimits {
     pub max_connections: usize,
     /// Messages one connection may have in flight, which doubles as the reply
     /// channel's depth — so a client that pipelines faster than it reads pushes
-    /// back on the read loop instead of growing a queue in memory.
+    /// back on the read loop instead of growing a queue in memory. DoQ's
+    /// stream credit and DoH's HTTP/2 stream limit too.
     pub max_inflight_per_connection: usize,
 }
 

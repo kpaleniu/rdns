@@ -207,7 +207,11 @@ pub async fn serve<H: Handler>(
             // told us.
             let idle = limits.idle_timeout;
             let served = if negotiated_h2 {
+                // The in-flight cap TCP and DoQ apply; hyper's own default is
+                // 200 (`TODO.md` #170). A stream past it is refused with
+                // REFUSED_STREAM, which RFC 9113 §8.7 makes safe to retry.
                 let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .max_concurrent_streams(limits.max_inflight_per_connection as u32)
                     .serve_connection(io, service);
                 until_idle(conn, |c| c.graceful_shutdown(), &started, idle, &stop).await
             } else {
@@ -671,6 +675,98 @@ mod tests {
         .await
         .expect("the slot was released");
         assert!(split(&response).0.starts_with("HTTP/1.1 200"));
+
+        shutdown.begin();
+        task.abort();
+    }
+
+    /// One HTTP/2 frame: RFC 9113 §4.1's nine-octet header, then `payload`.
+    fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut frame = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        frame.extend_from_slice(&[kind, flags]);
+        frame.extend_from_slice(&stream.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// A DoH GET as a HEADERS frame with END_STREAM and END_HEADERS. HPACK by
+    /// hand (RFC 7541): indexed `:method GET` and `:scheme https`, then
+    /// `:path` and `:authority` as literals with indexed names, not indexed.
+    fn h2_get(stream: u32, path: &str) -> Vec<u8> {
+        let mut block = vec![0x82, 0x87, 0x04, path.len() as u8];
+        block.extend_from_slice(path.as_bytes());
+        block.extend_from_slice(&[0x01, 9]);
+        block.extend_from_slice(b"localhost");
+        h2_frame(0x1, 0x5, stream, &block)
+    }
+
+    /// A client that ignores the server's SETTINGS and opens a seventeenth
+    /// stream while sixteen are being answered gets that stream refused, as
+    /// a TCP connection's seventeenth message waits and DoQ's is never
+    /// credited (`TODO.md` #170). Frames by hand, because a conforming client
+    /// would queue the seventeenth itself and test nothing.
+    ///
+    /// Watched failing without the limit: no refusal, hyper's 200 admitted it.
+    #[tokio::test]
+    async fn a_seventeenth_http2_stream_is_refused() {
+        let (addr, der, shutdown, task) = started_limited(
+            context(0),
+            RateLimit::PerMessage,
+            TransportLimits::default(),
+            Duration::from_secs(2),
+        )
+        .await;
+        let mut h2 = connect(addr, &der, ALPN_H2).await.expect("the handshake");
+        h2.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+            .await
+            .expect("preface");
+        h2.write_all(&h2_frame(0x4, 0, 0, &[]))
+            .await
+            .expect("SETTINGS");
+
+        // h2 applies its SETTINGS once they are acknowledged, so the ACK goes
+        // first and the streams after.
+        let mut head = [0u8; 9];
+        loop {
+            h2.read_exact(&mut head).await.expect("a frame");
+            let mut payload =
+                vec![0u8; u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize];
+            h2.read_exact(&mut payload).await.expect("its payload");
+            if head[3] == 0x4 && head[4] & 0x1 == 0 {
+                break;
+            }
+        }
+        h2.write_all(&h2_frame(0x4, 0x1, 0, &[]))
+            .await
+            .expect("ACK");
+
+        let path = format!(
+            "{DEFAULT_PATH}?dns={}",
+            base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(query(0x1700))
+        );
+        let streams: Vec<u32> = (0..17).map(|i| 1 + 2 * i).collect();
+        for &stream in &streams {
+            h2.write_all(&h2_get(stream, &path)).await.expect("HEADERS");
+        }
+
+        // Inside the handler's two seconds: a refusal is immediate, an answer
+        // is not.
+        let refused = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                h2.read_exact(&mut head).await.expect("a frame");
+                let mut payload =
+                    vec![0u8; u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize];
+                h2.read_exact(&mut payload).await.expect("its payload");
+                let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+                // RST_STREAM, REFUSED_STREAM (RFC 9113 §6.4, §7).
+                if head[3] == 0x3 && payload == [0, 0, 0, 0x7] {
+                    return stream;
+                }
+            }
+        })
+        .await
+        .expect("a stream was refused");
+        assert_eq!(refused, streams[16], "the seventeenth");
 
         shutdown.begin();
         task.abort();
