@@ -40,8 +40,9 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Fifteen items, all filed 2026-10-05 from a comparison against BIND, Knot,
-Unbound and PowerDNS, each claim checked against the code before filing:
+Sixteen items. #171-#185 were filed 2026-10-05 from a comparison against
+BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
+filing; #186 came out of triaging #172:
 
 - `rdnsr`: #171 no client access control, #172 no per-domain forwarding,
   #173 RFC 6303 reverse zones refused unconditionally, #174 no local data,
@@ -53,6 +54,8 @@ Unbound and PowerDNS, each claim checked against the code before filing:
 - #184 stale statements in `docs/`.
 - #185 the UDP path: #28d's figure measured the client (185a), CPU per query
   below saturation (185b), no syscall batching (185c), shared state (185d).
+- #186 no validation-outcome counters; `dns_validation_errors_total` counts
+  malformed packets.
 
 The history this section accumulated — how each review's items were found and
 closed, the push and CI record, the stale-preamble lesson and the five claims

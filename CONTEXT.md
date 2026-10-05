@@ -62,6 +62,23 @@ its start, waiting included. When it fires the resolution is abandoned.
 _Avoid_: timeout (one upstream exchange has its own), deadline, client response
 timer (RFC 8767 §5's other timer, about when a client is answered)
 
+**Routed domain**:
+A subtree `rdnsr` resolves through servers the operator named rather than
+from the root: a forward zone or a stub zone. The most specific one covering
+a name decides; the root is one when `rdnsr` forwards everything.
+_Avoid_: zone alone (`rdnsd`'s zones are data it holds; this is a route),
+conditional forwarder
+
+**Forward zone**:
+A routed domain whose servers are asked with recursion desired and do the
+resolving themselves.
+_Avoid_: forwarder (the server, not the route)
+
+**Stub zone**:
+A routed domain whose servers are where the delegation walk starts, asked
+without recursion as any authority would be.
+_Avoid_: stub resolver (RFC 1034's client, an unrelated thing)
+
 **In-flight query**:
 A UDP query `rdnsr` admitted to resolution and not yet answered or abandoned,
 holding one of `--max-inflight-udp` places. Every place held, the oldest gives
