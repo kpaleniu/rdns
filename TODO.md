@@ -40,8 +40,8 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-**#167 and #170**, as of 2026-10-05, each `docs/issues/NNN.md`; #169 closed
-that day, #165, #166 and #168 on 2026-10-04, #151 and #155-#164 on 2026-10-03, #150, #152, #153 and #154 on 2026-10-02. #160 was
+**#167**, as of 2026-10-05, `docs/issues/167.md`; #169 and #170 closed that
+day, #165, #166 and #168 on 2026-10-04, #151 and #155-#164 on 2026-10-03, #150, #152, #153 and #154 on 2026-10-02. #160 was
 found closing #150, #161 closing #155, #162 triaging #161, #163 grilling it,
 #164 triaging #163, #165 grilling #164, #166 and #167 closing it, #168 grilling #166, #169 closing #168, and #170 grilling #169.
 
@@ -1089,6 +1089,7 @@ the week; the record is under "How the queue kept going stale" in
 | **166** | a DoQ stream answered slower than the idle timeout is lost when the client is silent | **filed 2026-10-03, closed 2026-10-04, not a defect.** · `284ff25` · [`docs/closed/166.md`](docs/closed/166.md) |
 | **168** | a resolution had no time limit: 157.5 s through silent nameservers, holding a UDP permit | **filed 2026-10-04, closed 2026-10-04.** · `d4a7399`, `10edf61` · [`docs/closed/168.md`](docs/closed/168.md) |
 | **169** | a flood of names under silent zones held every UDP place, from ~102 queries a second | **filed 2026-10-04, closed 2026-10-05.** · `287284c` · [`docs/closed/169.md`](docs/closed/169.md) |
+| **170** | DoH allowed 200 queries per HTTP/2 connection where TCP and DoQ allow 16 | **filed 2026-10-05, closed 2026-10-05.** · `4fcfb5e` · [`docs/closed/170.md`](docs/closed/170.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
