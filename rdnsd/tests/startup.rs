@@ -22,7 +22,8 @@
 //! one job no local `cargo` invocation stands in for.
 
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use rdns::testutil::ScratchDir;
 
@@ -35,11 +36,34 @@ $TTL 3600
 ns1 IN A   192.0.2.1
 ";
 
+/// Held while a listener exists only to name a free port, and around every
+/// spawn: a child forked meanwhile inherits the listener until its `exec`, and
+/// a connect in that window is accepted there and reset when the child execs
+/// (`TODO.md` #167).
+static FORKING: Mutex<()> = Mutex::new(());
+
+fn forking() -> MutexGuard<'static, ()> {
+    // A test that panicked holding it left nothing half-done: the guard only
+    // orders forks.
+    FORKING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Spawned under [`FORKING`], waited for outside it.
+fn spawn(command: &mut Command) -> Child {
+    let _forking = forking();
+    command.spawn().expect("rdnsd starts")
+}
+
 fn rdnsd(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_rdnsd"))
-        .args(args)
-        .output()
-        .expect("rdnsd runs")
+    spawn(
+        Command::new(env!("CARGO_BIN_EXE_rdnsd"))
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+    )
+    .wait_with_output()
+    .expect("rdnsd runs")
 }
 
 fn stdout(out: &Output) -> String {
@@ -302,25 +326,25 @@ fn an_idle_connection_is_closed_after_the_configured_timeout() {
     let zone = zone_in(&dir, ZONE);
     // A port the OS just handed out, released for rdnsd to take. A collision
     // in between fails the connect loop below rather than passing.
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("a free port")
-        .port()
-        .to_string();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rdnsd"))
-        .args([
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port,
-            "--zone-file",
-            &zone,
-            "--connection-idle-timeout",
-            "1",
-            "--quiet",
-        ])
-        .spawn()
-        .expect("rdnsd starts");
+    let port = {
+        let _forking = forking();
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free port")
+            .port()
+            .to_string()
+    };
+    let mut child = spawn(Command::new(env!("CARGO_BIN_EXE_rdnsd")).args([
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port,
+        "--zone-file",
+        &zone,
+        "--connection-idle-timeout",
+        "1",
+        "--quiet",
+    ]));
     let addr = format!("127.0.0.1:{port}");
     let started = Instant::now();
     let mut stream = loop {
