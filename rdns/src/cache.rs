@@ -76,7 +76,9 @@ pub const STALE_ANSWER_TTL: u32 = 30;
 /// instead. Kept as a threshold: the bound of one latency bucket
 /// ([`crate::metrics`]) and the comparison behind
 /// `dns_slow_resolutions_total`, which is how an operator tells whether
-/// clients wait long enough for `--serve-stale-first` to be worth it.
+/// clients wait long enough for `--serve-stale-first` to be worth it; and the
+/// age past which `rdnsr`, every UDP place held, abandons a query for a newer
+/// one (`TODO.md` #169).
 pub const CLIENT_RESPONSE_TIMER: Duration = Duration::from_millis(1800);
 
 /// How often an expired entry may hand out a refresh when it is being answered

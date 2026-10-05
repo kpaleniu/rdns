@@ -323,6 +323,13 @@ pub struct Counters {
     /// identical from outside.
     pub stale_answers: AtomicU64,
 
+    /// In-flight UDP queries `rdnsr` abandoned to admit a newer one: every
+    /// place was held, and the oldest had outlived RFC 8767 §5's client
+    /// response timer (`TODO.md` #169). Not `queries_dropped`, which is the
+    /// door shut: climbing, this is a flood holding places past any client's
+    /// patience.
+    pub inflight_evicted: AtomicU64,
+
     /// dnstap payloads queued for the collector, and those the queue had no
     /// room for.
     ///
@@ -399,6 +406,7 @@ impl DnsMetrics {
             stale_refreshes: AtomicU64::new(0),
             stale_refreshes_dropped: AtomicU64::new(0),
             stale_answers: AtomicU64::new(0),
+            inflight_evicted: AtomicU64::new(0),
             slow_resolutions_completed: AtomicU64::new(0),
             slow_resolutions_failed: AtomicU64::new(0),
             policy_rewrites: AtomicU64::new(0),
@@ -670,6 +678,11 @@ impl DnsMetrics {
                 "dns_stale_answers_total",
                 "Answers served from expired cache",
                 &self.stale_answers,
+            ),
+            (
+                "dns_inflight_evicted_total",
+                "In-flight UDP queries abandoned past the client response timer",
+                &self.inflight_evicted,
             ),
         ] {
             counter(&mut out, name, help, value.load(Ordering::Relaxed));
@@ -1183,6 +1196,7 @@ mod tests {
             &m.slow_resolutions_completed,
             &m.slow_resolutions_failed,
             &m.stale_answers,
+            &m.inflight_evicted,
             &m.dnstap_frames,
             &m.dnstap_dropped,
             &m.queries_type_a,

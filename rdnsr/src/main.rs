@@ -21,6 +21,9 @@ mod anchors;
 mod answer;
 mod caches;
 mod config;
+#[cfg(test)]
+mod flood;
+mod inflight;
 mod prefetch;
 mod reload;
 mod rpz_transfer;
@@ -248,8 +251,9 @@ struct Cli {
     /// Errors only. The same as `--log-level error`, and refused with it.
     #[arg(long, conflicts_with = "log_level")]
     quiet: bool,
-    /// How many UDP queries may be in flight at once. Over the ceiling, further
-    /// datagrams are dropped.
+    /// How many UDP queries may be in flight at once. Over the ceiling, the
+    /// oldest gives way if its client has stopped waiting — past RFC 8767 §5's
+    /// 1.8 s client response timer — and otherwise the newcomer is dropped.
     ///
     /// No off switch, unlike `--query-rate 0`: a recursion holds its task for
     /// seconds, so unbounded means a flood of one-datagram queries spawns tasks

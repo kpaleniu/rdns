@@ -56,3 +56,9 @@ RFC 8767 §5's query resolution timer: the time one resolution may take, from
 its start, waiting included. When it fires the resolution is abandoned.
 _Avoid_: timeout (one upstream exchange has its own), deadline, client response
 timer (RFC 8767 §5's other timer, about when a client is answered)
+
+**In-flight query**:
+A UDP query `rdnsr` admitted to resolution and not yet answered or abandoned,
+holding one of `--max-inflight-udp` places. Every place held, the oldest gives
+way once past the client response timer; otherwise the newcomer is dropped.
+_Avoid_: permit, slot

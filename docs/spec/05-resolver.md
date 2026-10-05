@@ -230,7 +230,7 @@ line beside the counter instead.
 
 | bound | value | note |
 |---|---|---|
-| `--max-inflight-udp` | 1024 | a task per datagram; a recursion is seconds of waiting. Floored at 1, no off switch |
+| `--max-inflight-udp` | 1024 | a task per datagram; a recursion is seconds of waiting. Full, the oldest is abandoned if past the 1.8 s client response timer, else the newcomer is dropped (`TODO.md` #169). Floored at 1, no off switch |
 | `--max-connections` | 128 | per stream listener; see `06-operations.md` §6.2 |
 | `MAX_INFLIGHT_PER_CONNECTION` | 16 | also the reply channel's depth, so a client pipelining faster than it reads pushes back on the read loop |
 

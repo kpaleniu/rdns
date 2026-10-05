@@ -352,7 +352,7 @@ Binds 127.0.0.1 by default. Recurses from the root unless given `--upstream`.
 | `--auto-trust-anchor <FILE>` | the same, rewritten as keys roll (RFC 5011) |
 | `--cache-size <N>` | default 10000. Also `--no-cache` |
 | `--root-hints <FILE>` | named.root format |
-| `--max-inflight-udp <N>` | default 1024 |
+| `--max-inflight-udp <N>` | default 1024. Full, a query older than 1.8 s gives way to a new one |
 | `--resolution-timer <SECONDS>` | default 10: a resolution still running is abandoned with SERVFAIL (RFC 8767 §5) |
 | `--query-rate <QUERIES_PER_SEC>` | default 200, with `--query-burst` (100) and `--query-rate-exempt` |
 | `--response-rate <BYTES_PER_SEC>` | default 8192, `0` disables |

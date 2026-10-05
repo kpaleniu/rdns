@@ -15,17 +15,18 @@ use rdns::shutdown::{Busy, Stop};
 use rdns::validation::{Arrival, Transport};
 use rdns_transport::{recv_error_is_transient, tcp, ServeContext, UDP_RECEIVE_BUFFER};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 
 use crate::answer::{handle_query, truncate_reply, Resolving};
+use crate::inflight::{Admission, InFlight};
 
 /// Receive datagrams and resolve each in its own task, up to `max_inflight`.
 ///
-/// The permit is taken *before* the packet is copied and the task created — see
+/// The place is taken *before* the packet is copied and the task created — see
 /// [`crate::MAX_INFLIGHT_UDP`] for why a resolver spawns per datagram at all.
-/// `try_acquire`, not `acquire`: waiting would move the queue from the kernel's
-/// receive buffer into a pile of tasks holding copies. For UDP, shedding is the
-/// back-pressure.
+/// Never waited for: waiting would move the queue from the kernel's receive
+/// buffer into a pile of tasks holding copies. For UDP, shedding is the
+/// back-pressure; who is shed is [`InFlight`]'s.
 pub(crate) async fn udp_main(
     socket: Arc<UdpSocket>,
     serving: Arc<Resolving>,
@@ -35,7 +36,7 @@ pub(crate) async fn udp_main(
 ) -> Result<(), std::io::Error> {
     let ctx = &serving.ctx;
     // Floored, not refused: nobody means "answer nothing".
-    let in_flight = Arc::new(Semaphore::new(max_inflight.max(1)));
+    let in_flight = InFlight::new(max_inflight.max(1));
     // Sized for any datagram a client may send, not the payload size we
     // advertise: on Windows an oversized one fails the receive rather than
     // truncating, and a failed receive ends this loop.
@@ -76,22 +77,29 @@ pub(crate) async fn udp_main(
             continue;
         }
         // Before the copy, the clones and the task: at the ceiling a datagram
-        // costs one comparison. The semaphore is never closed, so the only
-        // failure is "full".
-        let Ok(permit) = in_flight.clone().try_acquire_owned() else {
-            tracing::debug!(%peer, "dropped: {max_inflight} UDP queries already in flight");
-            ctx.metrics.count(&ctx.metrics.queries_dropped);
-            continue;
+        // costs a lock and a comparison.
+        let place = match in_flight.admit() {
+            Admission::Free(place) => place,
+            Admission::Evicted(place) => {
+                ctx.metrics.count(&ctx.metrics.inflight_evicted);
+                place
+            }
+            Admission::Full => {
+                tracing::debug!(%peer, "dropped: {max_inflight} UDP queries already in flight");
+                ctx.metrics.count(&ctx.metrics.queries_dropped);
+                continue;
+            }
         };
+        let id = place.id();
         let data = buf[..n].to_vec();
         let socket = socket.clone();
         // A recursion takes seconds and the client is already waiting, so it
         // is worth the drain.
         let busy = busy.clone();
         let serving = serving.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _busy = busy;
-            let _permit = permit;
+            let _place = place;
             let ctx = &serving.ctx;
             if let Some(reply) = handle_query(data, peer, now, &serving, Transport::Udp).await {
                 // Charge the response, not the query. Over budget, TC=1 is
@@ -114,6 +122,7 @@ pub(crate) async fn udp_main(
                 }
             }
         });
+        in_flight.hold(id, task.abort_handle());
     }
 }
 

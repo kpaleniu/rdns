@@ -313,7 +313,7 @@ what its bounded queue had no room for. See 6.4.
 `dns_cache_hits_total`, `dns_cache_misses_total` and `dns_queries_recursive_total`
 are `rdnsr`'s and stay at zero on `rdnsd`; `queries_authoritative` is the reverse.
 
-Five more are `rdnsr`'s alone, and each counts something that is otherwise
+These are `rdnsr`'s alone, and each counts something that is otherwise
 invisible on the wire (see `05-resolver.md` §5.5-§5.7):
 
 | counter | what it counts |
@@ -324,6 +324,7 @@ invisible on the wire (see `05-resolver.md` §5.5-§5.7):
 | `dns_stale_refreshes_total`, `dns_stale_refreshes_dropped_total` | expired names re-resolved behind a stale answer, and those the queue had no room for; at most one per name per 30 s |
 | `dns_prefetches_total` | names re-resolved before expiry; against `dns_cache_hits_total` it says whether `--prefetch` is paying for itself |
 | `dns_synthesized_total` | AAAA records DNS64 built from an A record; it does not fall to zero on its own when a NAT64 is retired |
+| `dns_inflight_evicted_total` | in-flight UDP queries abandoned to admit a newer one, every place held and the oldest past the 1.8 s client response timer; climbing, a flood is holding places nobody is waiting on. `dns_queries_dropped_total` is the newcomer refused instead (`TODO.md` #169) |
 | `dns_slow_resolutions_total{outcome=...}` | recursions that ran past RFC 8767 §5's 1.8 s client response timer, split `completed`/`failed` — `completed` is a client `--serve-stale-first` would have answered at once, `failed` is one the stale window already covers (`TODO.md` #58) |
 
 > Gap G-3 — fixed 2026-08-03. ~~Those three counters are exported by `rdnsd` and
