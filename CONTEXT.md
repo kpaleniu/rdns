@@ -28,6 +28,11 @@ IPv4-mapped IPv6 address is the IPv4 address it maps. Many peers can be one
 source.
 _Avoid_: source (when the exact address is meant)
 
+**Allowed client**:
+A peer `rdnsr`'s query ACL admits. Matched as a peer, never as a source: the
+ACL names hosts and networks, not the blocks a limit counts.
+_Avoid_: trusted client, whitelisted source
+
 **Idle**:
 Of a stream connection: the client has started no new message or request,
 whatever is still being answered. A connection mid-handshake is idle.
