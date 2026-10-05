@@ -40,9 +40,19 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Nothing, as of 2026-10-05; #167, #169 and #170 closed that day, #165, #166 and #168 on 2026-10-04, #151 and #155-#164 on 2026-10-03, #150, #152, #153 and #154 on 2026-10-02. #160 was
-found closing #150, #161 closing #155, #162 triaging #161, #163 grilling it,
-#164 triaging #163, #165 grilling #164, #166 and #167 closing it, #168 grilling #166, #169 closing #168, and #170 grilling #169.
+Fifteen items, all filed 2026-10-05 from a comparison against BIND, Knot,
+Unbound and PowerDNS, each claim checked against the code before filing:
+
+- `rdnsr`: #171 no client access control, #172 no per-domain forwarding,
+  #173 RFC 6303 reverse zones refused unconditionally, #174 no local data,
+  #175 no encrypted upstream, #176 no negative trust anchors, #177 no local
+  root (RFC 8806), #178 no control channel.
+- `rdnsd`: #179 no NSID, #180 KSK rollover does not check the parent's DS,
+  #181 no views or geo, #182 catalog zones not generated.
+- #183 RSA signing with an imported key is untested.
+- #184 stale statements in `docs/`.
+- #185 the UDP path: #28d's figure measured the client (185a), CPU per query
+  below saturation (185b), no syscall batching (185c), shared state (185d).
 
 The history this section accumulated — how each review's items were found and
 closed, the push and CI record, the stale-preamble lesson and the five claims
