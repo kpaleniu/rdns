@@ -40,16 +40,17 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Nineteen items. #171-#185 were filed 2026-10-05 from a comparison against
+Eighteen items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
-filing; #186-#189 came out of triaging #172, #175, #178 and #179:
+filing; #186-#189 came out of triaging #172, #175, #178 and #179. #181 was
+closed wontfix in triage:
 
 - `rdnsr`: #171 no client access control, #172 no per-domain forwarding,
   #173 RFC 6303 reverse zones refused unconditionally, #174 no local data,
   #175 no encrypted upstream, #176 no negative trust anchors, #177 no local
   root (RFC 8806), #178 no control channel.
 - `rdnsd`: #179 no NSID, #180 KSK rollover does not check the parent's DS,
-  #181 no views or geo, #182 catalog zones not generated.
+  #182 catalog zones not generated.
 - #183 RSA signing with an imported key is untested.
 - #184 stale statements in `docs/`.
 - #185 the UDP path: #28d's figure measured the client (185a), CPU per query
@@ -1106,6 +1107,7 @@ the week; the record is under "How the queue kept going stale" in
 | **169** | a flood of names under silent zones held every UDP place, from ~102 queries a second | **filed 2026-10-04, closed 2026-10-05.** · `287284c` · [`docs/closed/169.md`](docs/closed/169.md) |
 | **170** | DoH allowed 200 queries per HTTP/2 connection where TCP and DoQ allow 16 | **filed 2026-10-05, closed 2026-10-05.** · `4fcfb5e` · [`docs/closed/170.md`](docs/closed/170.md) |
 | **167** | `rdnsd`'s idle-timeout startup test was reset by a listener a concurrent test's child inherited | **filed 2026-10-03, closed 2026-10-05.** · `30e184f` · [`docs/closed/167.md`](docs/closed/167.md) |
+| **181** | `rdnsd` gives every client the same answer: no views, no geo | **filed 2026-10-05, closed 2026-10-06, wontfix.** · [`docs/closed/181.md`](docs/closed/181.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
