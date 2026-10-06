@@ -79,6 +79,17 @@ A routed domain whose servers are where the delegation walk starts, asked
 without recursion as any authority would be.
 _Avoid_: stub resolver (RFC 1034's client, an unrelated thing)
 
+**Empty zone**:
+A reverse zone for address space that is not globally unique, which `rdnsr`
+answers itself as holding nothing but its SOA and NS (RFC 6303 §4). Each can
+be switched off; a routed domain at the same name or below overrides it.
+_Avoid_: local zone (#174's local data), locally served zone
+
+**Special-use name**:
+A name answered here by specification and never configurable: `localhost.`
+and its reverse names, `local.`, `invalid.` (RFC 6761, RFC 6762).
+_Avoid_: empty zone (those can be switched off), reserved name
+
 **In-flight query**:
 A UDP query `rdnsr` admitted to resolution and not yet answered or abandoned,
 holding one of `--max-inflight-udp` places. Every place held, the oldest gives
