@@ -57,7 +57,7 @@ closed wontfix in triage:
   below saturation (185b), no syscall batching (185c), shared state (185d).
 - #186 no validation-outcome counters; `dns_validation_errors_total` counts
   malformed packets.
-- #187 no response is padded when the query asked (RFC 7830 §4 MUST).
+- #187 DoT, DoH and DoQ do not pad when the query asked (RFC 7830 §4 MUST).
 - #188 neither daemon can be controlled or reloaded on Windows.
 - #189 `rdnsr` cannot ask its upstreams for NSID.
 
