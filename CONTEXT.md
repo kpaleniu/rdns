@@ -63,10 +63,11 @@ _Avoid_: timeout (one upstream exchange has its own), deadline, client response
 timer (RFC 8767 §5's other timer, about when a client is answered)
 
 **Routed domain**:
-A subtree `rdnsr` resolves through servers the operator named rather than
-from the root: a forward zone or a stub zone. The most specific one covering
-a name decides; the root is one when `rdnsr` forwards everything.
-_Avoid_: zone alone (`rdnsd`'s zones are data it holds; this is a route),
+A subtree `rdnsr` resolves through servers the operator named, or answers
+from data it holds, rather than from the root: a forward zone, a stub zone or
+a local zone. The most specific one covering a name decides; the root is one
+when `rdnsr` forwards everything.
+_Avoid_: zone alone (only a local zone holds data; the others are routes),
 conditional forwarder
 
 **Forward zone**:
@@ -79,11 +80,16 @@ A routed domain whose servers are where the delegation walk starts, asked
 without recursion as any authority would be.
 _Avoid_: stub resolver (RFC 1034's client, an unrelated thing)
 
+**Local zone**:
+A routed domain whose data `rdnsr` holds and answers from, as `rdnsd` would
+answer for a zone it serves. The operator's data, not a policy rewrite.
+_Avoid_: local data (RPZ's action), auth zone
+
 **Empty zone**:
 A reverse zone for address space that is not globally unique, which `rdnsr`
 answers itself as holding nothing but its SOA and NS (RFC 6303 §4). Each can
 be switched off; a routed domain at the same name or below overrides it.
-_Avoid_: local zone (#174's local data), locally served zone
+_Avoid_: local zone (the operator's data), locally served zone
 
 **Special-use name**:
 A name answered here by specification and never configurable: `localhost.`
