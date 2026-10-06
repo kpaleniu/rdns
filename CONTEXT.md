@@ -85,6 +85,13 @@ A routed domain whose data `rdnsr` holds and answers from, as `rdnsd` would
 answer for a zone it serves. The operator's data, not a policy rewrite.
 _Avoid_: local data (RPZ's action), auth zone
 
+**Authentication name**:
+The name a TLS peer's certificate must carry, written by the operator beside
+the peer's address (RFC 8310 §2, "authentication domain name"). Required
+wherever this project speaks TLS as a client; there is no unauthenticated
+mode.
+_Avoid_: SNI (what is sent, not what is checked), hostname, XoT name
+
 **Empty zone**:
 A reverse zone for address space that is not globally unique, which `rdnsr`
 answers itself as holding nothing but its SOA and NS (RFC 6303 §4). Each can
