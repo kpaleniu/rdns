@@ -62,6 +62,12 @@ its start, waiting included. When it fires the resolution is abandoned.
 _Avoid_: timeout (one upstream exchange has its own), deadline, client response
 timer (RFC 8767 §5's other timer, about when a client is answered)
 
+**Parental agent**:
+A server the operator names for a signed zone's parent, asked for the DS
+RRset to learn whether the parent has acted on the zone's CDS. Every one must
+agree before a key-signing key may retire.
+_Avoid_: parent (the zone, not the server asked), checkds server
+
 **Routed domain**:
 A subtree `rdnsr` resolves through servers the operator named, or answers
 from data it holds, rather than from the root: a forward zone, a stub zone or
