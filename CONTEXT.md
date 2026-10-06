@@ -85,6 +85,13 @@ A routed domain whose data `rdnsr` holds and answers from, as `rdnsd` would
 answer for a zone it serves. The operator's data, not a policy rewrite.
 _Avoid_: local data (RPZ's action), auth zone
 
+**Negative trust anchor**:
+An operator's time-limited order to stop validating at and below one name,
+because that zone's DNSSEC is broken and its owner has been told (RFC 7646).
+It always expires. Answers under it are not proven unsigned, only unchecked.
+_Avoid_: NTA alone in prose, insecure domain (a routed domain with
+validation off is permanent configuration, not an NTA)
+
 **Authentication name**:
 The name a TLS peer's certificate must carry, written by the operator beside
 the peer's address (RFC 8310 §2, "authentication domain name"). Required
