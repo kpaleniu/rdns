@@ -62,6 +62,13 @@ its start, waiting included. When it fires the resolution is abandoned.
 _Avoid_: timeout (one upstream exchange has its own), deadline, client response
 timer (RFC 8767 §5's other timer, about when a client is answered)
 
+**Generated catalog**:
+A catalog zone `rdnsd` builds from the zones it is primary for, so a zone
+added on the primary is provisioned on its secondaries with no second edit
+(RFC 9432). Handed out by transfer only.
+_Avoid_: catalog alone (`rdnsd` also consumes catalogs others produce),
+producer zone
+
 **Parental agent**:
 A server the operator names for a signed zone's parent, asked for the DS
 RRset to learn whether the parent has acted on the zone's CDS. Every one must

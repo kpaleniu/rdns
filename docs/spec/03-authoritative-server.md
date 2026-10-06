@@ -723,8 +723,12 @@ the catalog takes the zone out of service — REFUSED, and the gauge at 0.
 
 ### What is not implemented
 
-- The producer side needs no code: a catalog zone is an ordinary zone, so
-  `rdnsd` already serves and transfers one written by hand or by a script.
+- ~~The producer side needs no code: a catalog zone is an ordinary zone, so
+  `rdnsd` already serves and transfers one written by hand or by a script.~~
+  True of serving one, not of keeping it in step: the zone list and the
+  member records are then two files edited by hand, and a script that
+  relabels a member resets its state on every secondary (RFC 9432 §5.4).
+  Generating it is `TODO.md` #182.
 
 ---
 
