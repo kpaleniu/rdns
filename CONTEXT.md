@@ -99,6 +99,13 @@ wherever this project speaks TLS as a client; there is no unauthenticated
 mode.
 _Avoid_: SNI (what is sent, not what is checked), hostname, XoT name
 
+**Local root**:
+A copy of the root zone served on the same host, which the resolver asks in
+place of the root servers and which answers nobody else (RFC 8806). When it
+cannot be used, the resolver goes to the real root servers.
+_Avoid_: mirror zone (a copy the resolver itself fetches; not built),
+hyperlocal
+
 **Empty zone**:
 A reverse zone for address space that is not globally unique, which `rdnsr`
 answers itself as holding nothing but its SOA and NS (RFC 6303 §4). Each can
