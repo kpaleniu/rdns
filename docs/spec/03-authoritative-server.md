@@ -730,8 +730,11 @@ the catalog takes the zone out of service — REFUSED, and the gauge at 0.
 
 ## 3.9 The control socket
 
-`--control-socket <path>`, Unix only — `tokio` has no `UnixListener` on Windows,
-so it is refused there at startup.
+`--control-socket <path>`, Unix only, and refused at startup on Windows.
+~~`tokio` has no `UnixListener` on Windows, so it is refused there.~~ True of
+`UnixListener` and not a reason: `tokio` has named pipes, which were never
+weighed, and the consequence is that neither daemon can be told to reload on
+Windows (`TODO.md` #188).
 
 Created mode 0600; filesystem permissions are the authentication. There is no
 control port, and these commands are not on `--metrics-listen`.

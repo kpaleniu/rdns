@@ -3,7 +3,7 @@
 //! One connect, one command, one reply, then close ([`rdns_core::control`]). Nothing
 //! to overlap, so `std` rather than `tokio`.
 //!
-//! Unix only, because the socket is. On Windows it says so and exits 2 rather
+//! Unix only, because the socket is (`TODO.md` #188). On Windows it says so and exits 2 rather
 //! than not existing, so `cargo build --workspace` still covers it.
 
 // `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.

@@ -1,9 +1,11 @@
 //! The control socket: `status`, `reload`, `dump` and `catalog`, answered by
 //! the process that knows.
 //!
-//! A Unix socket and no TCP; see [`rdns::control`]. Unix-only because neither
-//! `std` nor `tokio` exposes AF_UNIX on Windows, where `--control-socket` is
-//! refused at startup rather than accepted and ignored.
+//! A Unix socket and no TCP; see [`rdns::control`]. Unix-only, and
+//! `--control-socket` is refused on Windows rather than accepted and ignored.
+//! Neither `std` nor `tokio` exposes AF_UNIX there, which is true and was taken
+//! as the reason; `tokio` has named pipes, which nobody weighed (`TODO.md`
+//! #188).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
