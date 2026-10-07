@@ -25,25 +25,26 @@ use std::net::{IpAddr, SocketAddr};
 use crate::error::{ConfigError, ConfigResult};
 use rustls_pki_types::ServerName;
 
-/// The port RFC 9103 §7.3 says an XoT connection SHOULD use, which is
-/// RFC 7858's.
-pub const XOT_PORT: u16 = 853;
+/// DNS over TLS's port (RFC 7858 §3.1), which RFC 9103 §7.3 says XoT SHOULD
+/// use too.
+pub const DOT_PORT: u16 = 853;
 
-/// The name a master's certificate has to carry, and the SNI sent to it.
+/// The name a server's certificate has to carry, and the SNI sent to it: a
+/// master's for XoT, an upstream's for forwarding (`TODO.md` #175).
 ///
 /// RFC 8310 §6.1 calls this the authentication domain name. A newtype rather
 /// than a `String` because it is parsed once, at startup, where a bad one is a
 /// sentence on stderr instead of a transfer that fails on a timer months later
 /// (`CLAUDE.md` §15).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct XotName {
+pub struct AuthName {
     name: ServerName<'static>,
     /// What the operator wrote, for messages: `ServerName`'s own rendering
     /// lower-cases and normalizes, and an error should quote the flag.
     text: String,
 }
 
-impl XotName {
+impl AuthName {
     pub fn parse(text: &str) -> ConfigResult<Self> {
         let text = text.trim();
         if text.is_empty() {
@@ -58,14 +59,14 @@ impl XotName {
                 "{text:?} is not a name a certificate can be checked against: {e}"
             ))
         })?;
-        Ok(XotName {
+        Ok(AuthName {
             name,
             text: text.to_owned(),
         })
     }
 }
 
-impl XotName {
+impl AuthName {
     /// The checked name, for the one caller that opens a connection with it.
     ///
     /// `pub(crate)` rather than public: what a caller outside this crate has
@@ -75,7 +76,7 @@ impl XotName {
     }
 }
 
-impl std::fmt::Display for XotName {
+impl std::fmt::Display for AuthName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.text)
     }
@@ -92,7 +93,7 @@ pub(crate) struct Endpoint {
     pub(crate) key_name: Option<String>,
     /// `Some` when `+tls=` was given: the name the master's certificate must
     /// carry.
-    pub(crate) tls: Option<XotName>,
+    pub(crate) tls: Option<AuthName>,
 }
 
 /// Split `addr[:port][#keyname][+tls=name]` into its parts.
@@ -116,7 +117,10 @@ pub(crate) fn parse_endpoint(text: &str, spec: &str) -> ConfigResult<Endpoint> {
             }
             (
                 rest,
-                Some(XotName::parse(name).map_err(|e| ConfigError::new(format!("{spec:?}: {e}")))?),
+                Some(
+                    AuthName::parse(name)
+                        .map_err(|e| ConfigError::new(format!("{spec:?}: {e}")))?,
+                ),
             )
         }
         None => (text, None),
@@ -133,7 +137,7 @@ pub(crate) fn parse_endpoint(text: &str, spec: &str) -> ConfigResult<Endpoint> {
     // RFC 9103 §7.3: "The connection for XoT SHOULD be established using port
     // 853". A stated port still wins — §7.3 allows "mutual agreement between
     // the primary and secondary to use a port other than port 853".
-    let default_port = if tls.is_some() { XOT_PORT } else { 53 };
+    let default_port = if tls.is_some() { DOT_PORT } else { 53 };
     Ok(Endpoint {
         addr: parse_address(addr.trim(), spec, default_port)?,
         key_name,
@@ -167,7 +171,7 @@ mod tests {
         (parsed.addr, parsed.key_name)
     }
 
-    fn tls_of(text: &str) -> Option<XotName> {
+    fn tls_of(text: &str) -> Option<AuthName> {
         parse_endpoint(text, text).expect("parses").tls
     }
 

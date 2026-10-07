@@ -1656,10 +1656,11 @@ mod tests {
     }
 
     fn xot_master(master: &TlsMaster, name: &str) -> Master {
-        let trust = crate::xot::XotTrust::from_ca_file(&master.anchors, None).expect("anchors");
+        let trust =
+            crate::xot::TlsClientTrust::from_ca_file(&master.anchors, None).expect("anchors");
         Master::over_tls(
             master.addr,
-            crate::xot::XotClient::new(trust, crate::xot::XotName::parse(name).expect("a name")),
+            crate::xot::XotClient::new(trust, crate::xot::AuthName::parse(name).expect("a name")),
         )
     }
 
@@ -1714,12 +1715,13 @@ mod tests {
 
         // The addresses are the first master's; the anchors are the second's,
         // which issued a different self-signed certificate for the same name.
-        let trust = crate::xot::XotTrust::from_ca_file(&stranger.anchors, None).expect("anchors");
+        let trust =
+            crate::xot::TlsClientTrust::from_ca_file(&stranger.anchors, None).expect("anchors");
         let wrong = Master::over_tls(
             master.addr,
             crate::xot::XotClient::new(
                 trust,
-                crate::xot::XotName::parse("master.test").expect("a name"),
+                crate::xot::AuthName::parse("master.test").expect("a name"),
             ),
         );
         let err = fetch_zone(&wrong, nm("example.com.").as_ref(), None)
@@ -1766,13 +1768,13 @@ mod tests {
             "the transfer client certificate",
         )
         .expect("a pair");
-        let trust =
-            crate::xot::XotTrust::from_ca_file(&master.anchors, Some(identity)).expect("anchors");
+        let trust = crate::xot::TlsClientTrust::from_ca_file(&master.anchors, Some(identity))
+            .expect("anchors");
         let with_cert = Master::over_tls(
             master.addr,
             crate::xot::XotClient::new(
                 trust,
-                crate::xot::XotName::parse("master.test").expect("a name"),
+                crate::xot::AuthName::parse("master.test").expect("a name"),
             ),
         );
         let received = fetch_zone(&with_cert, nm("example.com.").as_ref(), None)

@@ -127,7 +127,7 @@ mod tests {
 /// from one PEM bundle.
 ///
 /// Both directions need this and they used to read it separately: an XoT
-/// *client* checking a master's certificate ([`crate::xot::XotTrust`]) and,
+/// *client* checking a master's certificate ([`crate::xot::TlsClientTrust`]) and,
 /// since `TODO.md` #59, a primary checking a transfer client's. The empty-file
 /// refusal is the reason it is one function — an anchor set with nothing in it
 /// loads, starts, and then refuses every handshake with a message about the

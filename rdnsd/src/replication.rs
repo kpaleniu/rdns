@@ -40,7 +40,7 @@ use rdns::secondary::{
 use rdns::shutdown::{Busy, Lifecycle};
 use rdns::tsig::{TsigKey, TsigKeyring};
 use rdns::xfr::{self, Master};
-use rdns::xot::{XotClient, XotTrust};
+use rdns::xot::{TlsClientTrust, XotClient};
 use rdns::zone::Zone;
 use rdns::zone_writer::write_zone_file;
 use rdns::NameRef;
@@ -275,7 +275,7 @@ pub(crate) struct ReplicationContext {
     /// One per process rather than one per master: who issues certificates is
     /// not a decision an operator takes per peer, and the name that *is* per
     /// peer is in [`MasterSpec::tls`].
-    pub(crate) xot: Option<XotTrust>,
+    pub(crate) xot: Option<TlsClientTrust>,
     /// What contact and EXPIRE are measured on, so a test can move past an
     /// EXPIRE without waiting it out (`TODO.md` #128).
     pub(crate) clock: Clock,

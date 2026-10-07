@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use crate::clock::Clock;
-use crate::endpoint::XotName;
+use crate::endpoint::AuthName;
 use crate::record_types as rt;
 use crate::shutdown::Lifecycle;
 use crate::zone::Zone;
@@ -122,7 +122,7 @@ pub struct MasterSpec {
     /// master's certificate has to carry. The anchors it is checked against are
     /// one per process — `--transfer-tls-ca` — because who issues certificates
     /// is not a decision per master.
-    pub tls: Option<XotName>,
+    pub tls: Option<AuthName>,
 }
 
 impl MasterSpec {

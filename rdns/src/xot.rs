@@ -19,14 +19,14 @@
 //! - **§7.1**: the ALPN token `dot` "MUST be selected in the TLS handshake" —
 //!   `ALPN_DOT`, the same token the DoT listener advertises.
 //! - **§7.2**: "All implementations of this specification MUST use only TLS 1.3
-//!   \[RFC8446\] or later" — [`XotTrust::from_ca_file`] builds the configuration
+//!   \[RFC8446\] or later" — [`TlsClientTrust::from_ca_file`] builds the configuration
 //!   with `TLS13` and nothing else, which is *narrower* than the DoT listener,
 //!   where RFC 7858 still permits 1.2 for a stub resolver.
 //! - **§7.3**: "The connection for XoT SHOULD be established using port 853" —
-//!   [`XOT_PORT`], the default when `+tls=` is given and no port is.
+//!   [`DOT_PORT`], the default when `+tls=` is given and no port is.
 //! - **§7.5**: "The client MUST authenticate the server by use of an
 //!   authentication domain name using a Strict Privacy profile, as described in
-//!   \[RFC8310\]" — hence [`XotName`], which is required rather than optional.
+//!   \[RFC8310\]" — hence [`AuthName`], which is required rather than optional.
 //!   There is no opportunistic mode here on purpose: an unauthenticated TLS
 //!   connection is exactly as forgeable as the cleartext it replaces, while
 //!   looking in a log like it is not.
@@ -64,7 +64,7 @@ use std::sync::Arc;
 // The name and the port moved to `endpoint`, which parses them and needs no
 // TLS stack to do it (`TODO.md` #67c); re-exported because this module is where
 // a reader looks for them.
-pub use crate::endpoint::{XotName, XOT_PORT};
+pub use crate::endpoint::{AuthName, DOT_PORT};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -76,13 +76,15 @@ use crate::tls_identity::TlsIdentity;
 /// The ALPN token RFC 9103 §7.1 requires be selected.
 const ALPN_DOT: &[u8] = b"dot";
 
-/// The trust anchors every XoT connection this server makes is verified
-/// against, and the TLS settings RFC 9103 fixes.
+/// The trust anchors an outgoing TLS connection is verified against, and the
+/// settings RFC 9103 fixes: TLS 1.3 only, ALPN `dot`. XoT's, and the
+/// resolver's for DoT forwarding (RFC 7858, `TODO.md` #175), where RFC 8310's
+/// strict profile asks the same.
 ///
-/// One per process: the anchors are an operator's decision about who issues
-/// certificates, not about one master. Clone is an `Arc`.
+/// One per use: the anchors are an operator's decision about who issues
+/// certificates, not about one server. Clone is an `Arc`.
 #[derive(Clone, Debug)]
-pub struct XotTrust {
+pub struct TlsClientTrust {
     config: Arc<ClientConfig>,
     /// Whether an identity was configured. Read back from the configuration
     /// would be better, and rustls hands back a `ResolvesClientCert` that
@@ -94,7 +96,7 @@ pub struct XotTrust {
     anchors: usize,
 }
 
-impl XotTrust {
+impl TlsClientTrust {
     /// Read a PEM bundle of certificate authorities and build the client
     /// configuration from it.
     ///
@@ -113,7 +115,7 @@ impl XotTrust {
             crate::tls_identity::TrustAnchors::from_ca_file(path, "the transfer trust anchors")?;
         let anchors = roots.len();
         let presenting = identity.is_some();
-        Ok(XotTrust {
+        Ok(TlsClientTrust {
             config: Arc::new(client_config(roots.store(), identity)?),
             anchors,
             presenting,
@@ -174,17 +176,17 @@ fn client_config(
 /// carry.
 #[derive(Clone, Debug)]
 pub struct XotClient {
-    trust: XotTrust,
-    name: XotName,
+    trust: TlsClientTrust,
+    name: AuthName,
 }
 
 impl XotClient {
-    pub fn new(trust: XotTrust, name: XotName) -> Self {
+    pub fn new(trust: TlsClientTrust, name: AuthName) -> Self {
         XotClient { trust, name }
     }
 
     /// The name the certificate is checked against, for a log line.
-    pub fn name(&self) -> &XotName {
+    pub fn name(&self) -> &AuthName {
         &self.name
     }
 
@@ -223,7 +225,7 @@ mod tests {
 
     #[test]
     fn a_name_is_parsed_once_and_kept_as_written() {
-        let name = XotName::parse("ns1.example.com.").expect("a domain name");
+        let name = AuthName::parse("ns1.example.com.").expect("a domain name");
         assert_eq!(name.to_string(), "ns1.example.com.");
     }
 
@@ -231,7 +233,7 @@ mod tests {
     /// spelling of "TLS, but do not check who answered".
     #[test]
     fn an_empty_name_is_refused_with_the_reason() {
-        let err = XotName::parse("  ").expect_err("no name");
+        let err = AuthName::parse("  ").expect_err("no name");
         assert!(
             err.to_string().contains("authenticate the master by name"),
             "the error should say why a name is required: {err}"
@@ -240,14 +242,14 @@ mod tests {
 
     #[test]
     fn a_name_with_a_slash_in_it_is_not_a_name() {
-        assert!(XotName::parse("ns1.example.com/foo").is_err());
+        assert!(AuthName::parse("ns1.example.com/foo").is_err());
     }
 
     /// An IP literal is a `ServerName` rustls can check against an IP SAN, so
     /// it parses. Written down because it looks like it should not.
     #[test]
     fn an_address_is_a_name_rustls_will_check_against_an_ip_san() {
-        assert!(XotName::parse("192.0.2.1").is_ok());
+        assert!(AuthName::parse("192.0.2.1").is_ok());
     }
 
     #[test]
@@ -258,7 +260,7 @@ mod tests {
             line!()
         ));
         std::fs::write(&path, "# no certificates here\n").expect("write");
-        let err = XotTrust::from_ca_file(&path, None).expect_err("an empty bundle");
+        let err = TlsClientTrust::from_ca_file(&path, None).expect_err("an empty bundle");
         assert!(
             err.to_string().contains("no CERTIFICATE block"),
             "unexpected error: {err}"
@@ -293,11 +295,12 @@ mod tests {
             TlsIdentity::from_files(&cert, &key, "the transfer client certificate").expect("pair");
         // The same self-signed certificate doubles as the anchor file: what is
         // under test is the client identity, not who the master is.
-        let trust = XotTrust::from_ca_file(&cert, Some(identity)).expect("anchors and identity");
+        let trust =
+            TlsClientTrust::from_ca_file(&cert, Some(identity)).expect("anchors and identity");
         assert!(trust.presents_a_certificate());
         assert_eq!(trust.anchor_count(), 1);
 
-        let without = XotTrust::from_ca_file(&cert, None).expect("anchors");
+        let without = TlsClientTrust::from_ca_file(&cert, None).expect("anchors");
         assert!(!without.presents_a_certificate());
     }
 
@@ -312,7 +315,7 @@ mod tests {
         let identity =
             TlsIdentity::from_files(&cert, &other_key, "the transfer client certificate")
                 .expect("both files read");
-        let err = XotTrust::from_ca_file(&cert, Some(identity)).expect_err("not a pair");
+        let err = TlsClientTrust::from_ca_file(&cert, Some(identity)).expect_err("not a pair");
         assert!(
             err.to_string().contains("cannot be used together"),
             "unexpected error: {err}"
@@ -323,7 +326,7 @@ mod tests {
     fn a_missing_anchor_file_names_the_path() {
         let path = std::env::temp_dir().join("rdns-xot-nonexistent.pem");
         let _ = std::fs::remove_file(&path);
-        let err = XotTrust::from_ca_file(&path, None).expect_err("no such file");
+        let err = TlsClientTrust::from_ca_file(&path, None).expect_err("no such file");
         assert!(
             err.to_string().contains("rdns-xot-nonexistent.pem"),
             "unexpected error: {err}"

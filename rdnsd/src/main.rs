@@ -57,7 +57,7 @@ use clap::Parser;
 use rdns::clock::Clock;
 use rdns::compression::NameCompressor;
 use rdns::tls_identity::TlsIdentity;
-use rdns::xot::XotTrust;
+use rdns::xot::TlsClientTrust;
 use rdns::{
     dnssec::{DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE},
     dnssec_key::{SigningAlgorithm, SigningKey},
@@ -1754,7 +1754,7 @@ async fn main() -> Result<()> {
         ));
     }
     let xot = match &cli.transfer_tls_ca {
-        Some(path) => Some(XotTrust::from_ca_file(path, transfer_identity)?),
+        Some(path) => Some(TlsClientTrust::from_ca_file(path, transfer_identity)?),
         None => None,
     };
     // What the outgoing half of RFC 9103 is configured to do, where the two
@@ -1762,7 +1762,7 @@ async fn main() -> Result<()> {
     // client certificate is loaded. A certificate is offered only when a master
     // sends a CertificateRequest, so "mTLS is in force" is not a claim this end
     // can make; what it can say is what it holds (`CLAUDE.md` §4). This is also
-    // `XotTrust::anchor_count`'s first caller — it was written for a banner
+    // `TlsClientTrust::anchor_count`'s first caller — it was written for a banner
     // that was never added (`CLAUDE.md` §18).
     if let Some(xot) = &xot {
         tracing::info!(
