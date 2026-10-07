@@ -11,7 +11,11 @@
 //! header: the two daemons are its only consumers, and two copies of a level
 //! table drift (`CLAUDE.md` §7).
 
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// How much a daemon says.
 ///
@@ -59,7 +63,8 @@ impl FromStr for LogLevel {
     }
 }
 
-/// Send this process's log lines to stderr at `level`, honouring `RUST_LOG`.
+/// Send this process's log lines to stderr at `level`, honouring `RUST_LOG`,
+/// or to `file` when one is given (`--log-file`, `TODO.md` #190).
 ///
 /// Called once, by a binary; library code only emits. Shared so that `rdnsd` and
 /// `rdnsr` cannot end up configured differently.
@@ -68,9 +73,13 @@ impl FromStr for LogLevel {
 /// under a level chosen in a unit file, and editing the unit is a restart.
 /// `--quiet` and `--log-level` set the fallback.
 ///
-/// No timestamps and no ANSI: journald stamps every line, and two stamps
-/// disagreeing is worse than losing one in a terminal.
-pub fn init(level: LogLevel) {
+/// No timestamps and no ANSI on stderr: journald stamps every line, and two
+/// stamps disagreeing is worse than losing one in a terminal. A file gets a
+/// UTC timestamp per line, since nothing else stamps it.
+///
+/// A file that cannot be opened for appending is an error: a service whose
+/// log goes nowhere is a service nobody can debug (`CLAUDE.md` §4).
+pub fn init(level: LogLevel, file: Option<&Path>) -> std::io::Result<()> {
     use tracing_subscriber::EnvFilter;
 
     let filter =
@@ -78,10 +87,142 @@ pub fn init(level: LogLevel) {
 
     // `try_init`: a second call is a caller bug, not grounds for panicking a
     // healthy server, and the tests here share a process.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .without_time()
-        .with_target(true)
-        .try_init();
+    match file {
+        None => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::io::stderr)
+                .without_time()
+                .with_target(true)
+                .try_init();
+        }
+        Some(path) => {
+            let log = Arc::new(LogFile::open(path)?);
+            let _ = LOG_FILE.set(log.clone());
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(Shared(log))
+                .with_ansi(false)
+                .with_target(true)
+                .try_init();
+        }
+    }
+    Ok(())
+}
+
+/// Reopen the log file at its path, so a rotation that moved the old one
+/// away is followed (`TODO.md` #190). What every reload calls; nothing
+/// without `--log-file`. A failure keeps writing to the file already open and
+/// says so there.
+pub fn reopen() {
+    if let Some(log) = LOG_FILE.get() {
+        if let Err(e) = log.reopen() {
+            tracing::error!(
+                "could not reopen {}: {e}; still writing to the file already open",
+                log.path.display()
+            );
+        }
+    }
+}
+
+/// Whether log lines go to a file rather than standard error.
+pub fn to_file() -> bool {
+    LOG_FILE.get().is_some()
+}
+
+static LOG_FILE: OnceLock<Arc<LogFile>> = OnceLock::new();
+
+/// The log file and the path it is reopened from.
+struct LogFile {
+    path: PathBuf,
+    file: Mutex<File>,
+}
+
+impl LogFile {
+    fn open(path: &Path) -> std::io::Result<LogFile> {
+        Ok(LogFile {
+            path: path.to_path_buf(),
+            file: Mutex::new(append(path)?),
+        })
+    }
+
+    fn reopen(&self) -> std::io::Result<()> {
+        let fresh = append(&self.path)?;
+        *self.file.lock().unwrap_or_else(PoisonError::into_inner) = fresh;
+        Ok(())
+    }
+}
+
+fn append(path: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| std::io::Error::new(e.kind(), format!("--log-file {}: {e}", path.display())))
+}
+
+/// One event's worth of the file, locked for the line.
+pub struct LogLine<'a>(MutexGuard<'a, File>);
+
+impl Write for LogLine<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+/// The file as the subscriber holds it, shared with [`reopen`].
+struct Shared(Arc<LogFile>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Shared {
+    type Writer = LogLine<'a>;
+
+    fn make_writer(&'a self) -> LogLine<'a> {
+        self.0.make_writer()
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogFile {
+    type Writer = LogLine<'a>;
+
+    fn make_writer(&'a self) -> LogLine<'a> {
+        // A poisoned lock is a panic mid-line in another thread; the file is
+        // still a file, and losing the log is worse than one torn line.
+        LogLine(self.file.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// Appended, and followed to a new file once the old one is moved away
+    /// and `reopen` runs — what a rotation does.
+    #[test]
+    fn a_log_file_is_appended_and_reopened_after_a_move() {
+        let dir = std::env::temp_dir().join(format!("rdns-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("rdnsd.log");
+        let moved = dir.join("rdnsd.log.1");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&moved);
+        let log = LogFile::open(&path).expect("opens");
+        log.make_writer().write_all(b"first\n").expect("write");
+        std::fs::rename(&path, &moved).expect("rotate");
+        log.make_writer()
+            .write_all(b"still the old file\n")
+            .expect("write");
+        log.reopen().expect("reopens");
+        log.make_writer().write_all(b"second\n").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(&moved).expect("read"),
+            "first\nstill the old file\n"
+        );
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "second\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

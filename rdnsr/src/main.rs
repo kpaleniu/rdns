@@ -327,6 +327,18 @@ struct Cli {
     /// administrators and SYSTEM may write to (`TODO.md` #188).
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     control_socket: Option<PathBuf>,
+    /// Write log lines to this file instead of standard error, appended,
+    /// each with a UTC timestamp. Reopened on every reload, so an external
+    /// rotation needs only a reload after the move.
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
+    log_file: Option<PathBuf>,
+    /// Run as Windows service NAME under the service control manager, which
+    /// is what starts it: `sc.exe create NAME binPath= "... --service NAME
+    /// ..."`. STOP drains as Ctrl-C does; PARAMCHANGE (`sc.exe control NAME
+    /// paramchange`) reloads as SIGHUP does. Needs --log-file, since a
+    /// service's standard error goes nowhere. Windows only.
+    #[arg(long, value_name = "NAME")]
+    service: Option<String>,
     /// How much to say: error, warn, info, debug or trace.
     ///
     /// Nothing per-query is above `debug`. `RUST_LOG` overrides it, so a
@@ -795,18 +807,14 @@ async fn query_acl(cli: &Cli, notify_from: Option<&TransferAcl>) -> anyhow::Resu
     Ok(QueryAcl::Only(Arc::new(acl)))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let mut cli = Cli::parse();
+fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+    // `--check-config` is a console answer even with `--service` beside it.
+    let service = cli.service.clone().filter(|_| !cli.check_config);
+    rdns_transport::entry::run(service.as_deref(), move || serve_main(cli))
+}
 
-    // Before anything with something to say, and through the same initialiser
-    // `rdnsd` uses so the two cannot format or filter differently.
-    rdns_transport::logging::init(if cli.quiet {
-        LogLevel::Error
-    } else {
-        cli.log_level
-    });
-
+async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
     // The same settings the flags carry, in a file. It *replaces* the flags
     // rather than layering over them; see `config` for why that is an error
     // rather than a precedence rule.
@@ -815,7 +823,32 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("configured from {}", path.display());
     }
     let cli = cli;
+    // Through the same initialiser `rdnsd` uses so the two cannot format or
+    // filter differently; after the config, which may name the log file.
+    rdns_transport::logging::init(
+        if cli.quiet {
+            LogLevel::Error
+        } else {
+            cli.log_level
+        },
+        cli.log_file.as_deref(),
+    )?;
     let started = std::time::Instant::now();
+    // Before the dry run (`TODO.md` #190).
+    if cli.service.is_some() {
+        if !cfg!(windows) {
+            return Err(anyhow::anyhow!(
+                "--service is the Windows service control manager's; under systemd or \
+                 another supervisor run the binary as it is"
+            ));
+        }
+        if cli.log_file.is_none() {
+            return Err(anyhow::anyhow!(
+                "--service needs --log-file: a service's standard error goes nowhere, so \
+                 without one nothing it says reaches anybody"
+            ));
+        }
+    }
 
     // Refused here, above the dry run, so `--check-config` says so too: on
     // Windows a path that is not a pipe name (`TODO.md` #188).

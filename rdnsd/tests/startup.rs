@@ -789,3 +789,108 @@ fn a_generated_catalog_name_must_be_ours() {
         stderr(&out)
     );
 }
+
+/// `--service` needs a log destination, and is Windows' alone; both refused
+/// before the dry run answers (`TODO.md` #190).
+#[test]
+fn service_refusals() {
+    let dir = ScratchDir::new("service-refusals");
+    let zone = zone_in(&dir, ZONE);
+    let out = rdnsd(&["--zone-file", &zone, "--service", "rdnsd", "--check-config"]);
+    assert!(!out.status.success());
+    let wants = if cfg!(windows) {
+        "--service needs --log-file"
+    } else {
+        "service control manager"
+    };
+    assert!(stderr(&out).contains(wants), "{}", stderr(&out));
+}
+
+/// A log file's lines carry a UTC timestamp; standard error's do not.
+#[test]
+fn a_log_file_is_timestamped_and_stderr_is_not() {
+    let dir = ScratchDir::new("log-file");
+    let zone = zone_in(&dir, ZONE);
+    let log = dir.join("rdnsd.log");
+    let logged = rdnsd(&[
+        "--zone-file",
+        &zone,
+        "--log-file",
+        &log.to_string_lossy(),
+        "--check-config",
+    ]);
+    assert!(logged.status.success(), "{}", stderr(&logged));
+    let text = std::fs::read_to_string(&log).expect("the log file was written");
+    let first = text.lines().next().expect("a line");
+    assert!(
+        first.len() > 20 && first[..4].parse::<u32>().is_ok() && first[4..5] == *"-",
+        "starts with a date: {first:?}"
+    );
+    assert!(
+        !stderr(&logged).contains("loaded zone"),
+        "not on stderr too"
+    );
+
+    let plain = rdnsd(&["--zone-file", &zone, "--check-config"]);
+    let line = stderr(&plain);
+    let line = line.lines().next().expect("a line on stderr");
+    assert!(
+        line.trim_start().starts_with("INFO"),
+        "no timestamp on stderr: {line:?}"
+    );
+}
+
+/// Rotation on Unix: the file is moved away, SIGHUP, and the daemon writes
+/// to a new file at the path (`TODO.md` #190).
+#[cfg(unix)]
+#[test]
+fn a_log_file_is_reopened_after_a_move_and_sighup() {
+    use std::time::{Duration, Instant};
+
+    let dir = ScratchDir::new("log-reopen");
+    let zone = zone_in(&dir, ZONE);
+    let log = dir.join("rdnsd.log");
+    let moved = dir.join("rdnsd.log.1");
+    let port = free_port();
+    let mut child = spawn(Command::new(env!("CARGO_BIN_EXE_rdnsd")).args([
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port,
+        "--zone-file",
+        &zone,
+        "--log-file",
+        &log.to_string_lossy(),
+    ]));
+    let wait_for = |path: &Path, what: &str| {
+        let started = Instant::now();
+        while !std::fs::read_to_string(path).is_ok_and(|t| t.contains(what)) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{what} in {path:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let result = std::panic::catch_unwind(|| {
+        wait_for(&log, "listening");
+        std::fs::rename(&log, &moved).expect("rotate");
+        let sent = Command::new("kill")
+            .args(["-HUP", &child.id().to_string()])
+            .status()
+            .expect("kill runs");
+        assert!(sent.success());
+        wait_for(&log, "zones reloaded");
+        assert!(
+            !std::fs::read_to_string(&moved)
+                .expect("read")
+                .contains("zones reloaded"),
+            "the reload was logged to the new file, not the moved one"
+        );
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}

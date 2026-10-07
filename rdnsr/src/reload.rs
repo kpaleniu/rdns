@@ -130,6 +130,8 @@ async fn reload_now(
     let ntas = ntas.cloned();
     let local = local.cloned();
     let serving = serving.clone();
+    // Rotation: a log file moved away is followed from here (`TODO.md` #190).
+    rdns_transport::logging::reopen();
     let ran = tokio::task::spawn_blocking(move || {
         let mut lines = Vec::new();
         if let Some(store) = certificate {

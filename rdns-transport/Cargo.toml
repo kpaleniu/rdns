@@ -34,6 +34,13 @@ socket2 = "0.6"
 rustls.workspace = true
 tokio-rustls.workspace = true
 
+# `--service` (`TODO.md` #190): the service control manager's dispatcher.
+# +2 packages, Windows only (`bitflags` and `windows-sys` 0.61 are in the lock
+# already), and the `unsafe` stays inside the crate, where a direct
+# `windows-sys` call would be the tree's first in production code.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
 [dev-dependencies]
 # Test-only, so the runtime package count is untouched: the DoT tests need a
 # certificate, and one generated per run beats a key checked into the tree.

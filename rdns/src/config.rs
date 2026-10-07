@@ -220,6 +220,9 @@ macro_rules! server_table {
             /// Windows a pipe name, anything else refused at startup
             /// (`TODO.md` #188). Both daemons since `TODO.md` #178.
             control_socket: Option<std::path::PathBuf>,
+            /// `--log-file`: where log lines go instead of standard error,
+            /// each with a UTC timestamp; reopened on reload (`TODO.md` #190).
+            log_file: Option<std::path::PathBuf>,
             $(
                 $(#[$own_meta])*
                 $own_field: $own_type,
@@ -276,6 +279,7 @@ macro_rules! server_table {
                 cli.tls_cert = $crate::config::taken(&self.tls_cert);
                 cli.tls_key = $crate::config::taken(&self.tls_key);
                 cli.control_socket = $crate::config::taken(&self.control_socket);
+                cli.log_file = $crate::config::taken(&self.log_file);
                 // The one key whose flag has a default, so an absent key means
                 // "keep it" rather than "clear it" — the `Option` here is the
                 // override and not the value (§15). The exception lives with
@@ -321,6 +325,7 @@ macro_rules! server_table {
                     tls_cert: None,
                     tls_key: None,
                     control_socket: None,
+                    log_file: None,
                     $($own_default)*
                 }
             }

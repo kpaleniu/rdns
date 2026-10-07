@@ -130,7 +130,7 @@ impl Shutdown {
 /// returns before systemd's 90-second SIGKILL. Five seconds is more than a
 /// transfer needs once no new work arrives, and roughly the grace Windows gives
 /// on `CTRL_CLOSE_EVENT`.
-const DEFAULT_DRAIN: Duration = Duration::from_secs(5);
+pub const DEFAULT_DRAIN: Duration = Duration::from_secs(5);
 
 impl Default for Shutdown {
     fn default() -> Self {
@@ -177,16 +177,49 @@ pub async fn next_reload(signals: &mut Option<tokio::signal::unix::Signal>) -> b
     }
 }
 
-/// Windows has no SIGHUP, so only a timer or the control socket triggers a
-/// reload there.
+/// Windows has no SIGHUP. Under the service control manager PARAMCHANGE is
+/// its stand-in (`sc.exe control NAME paramchange`, `TODO.md` #190); a console
+/// run has a timer and the control pipe.
 #[cfg(not(unix))]
 pub fn reload_signal() -> Option<()> {
-    None
+    Some(())
 }
 
 #[cfg(not(unix))]
 pub async fn next_reload(_signals: &mut Option<()>) -> bool {
-    std::future::pending().await
+    service_events().reload.notified().await;
+    true
+}
+
+/// What the service control manager has asked for, from the thread it calls
+/// the control handler on (`TODO.md` #190). `Notify` keeps a permit, so a
+/// request made before anything waits is not lost.
+#[cfg(not(unix))]
+struct ServiceEvents {
+    stop: tokio::sync::Notify,
+    reload: tokio::sync::Notify,
+}
+
+#[cfg(not(unix))]
+fn service_events() -> &'static ServiceEvents {
+    static EVENTS: std::sync::OnceLock<ServiceEvents> = std::sync::OnceLock::new();
+    EVENTS.get_or_init(|| ServiceEvents {
+        stop: tokio::sync::Notify::new(),
+        reload: tokio::sync::Notify::new(),
+    })
+}
+
+/// SERVICE_CONTROL_STOP or PRESHUTDOWN: the graceful stop the console events
+/// start.
+#[cfg(not(unix))]
+pub fn service_stop() {
+    service_events().stop.notify_one();
+}
+
+/// SERVICE_CONTROL_PARAMCHANGE: what SIGHUP does on Unix.
+#[cfg(not(unix))]
+pub fn service_reload() {
+    service_events().reload.notify_one();
 }
 
 /// Resolve when the OS asks the process to stop, naming the signal.
@@ -222,7 +255,7 @@ pub async fn stop_signal() -> &'static str {
 /// the same order as the drain budget, so a long transfer may still be cut.
 ///
 /// A Windows *service* stop is none of these; it arrives through the service
-/// control manager, which this does not use.
+/// control manager's handler, which calls [`service_stop`] (`TODO.md` #190).
 #[cfg(not(unix))]
 pub async fn stop_signal() -> &'static str {
     use tokio::signal::windows;
@@ -254,6 +287,7 @@ pub async fn stop_signal() -> &'static str {
         _ = recv!(brk) => "Ctrl-Break",
         _ = recv!(close) => "console close",
         _ = recv!(shutdown) => "system shutdown",
+        _ = service_events().stop.notified() => "service stop",
     }
 }
 
@@ -331,5 +365,25 @@ mod tests {
         shutdown.begin();
         assert!(stop.is_set());
         assert!(shutdown.drain(Duration::from_millis(200)).await);
+    }
+
+    /// What the service control handler calls (`TODO.md` #190): a STOP ends
+    /// the stop signal as the console events do, and a PARAMCHANGE is a
+    /// reload. Asked before anything waits, as the SCM may.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn service_controls_stop_and_reload() {
+        service_reload();
+        let mut signals = reload_signal();
+        let reloaded = tokio::time::timeout(Duration::from_secs(5), next_reload(&mut signals))
+            .await
+            .expect("a PARAMCHANGE is a reload");
+        assert!(reloaded);
+
+        service_stop();
+        let why = tokio::time::timeout(Duration::from_secs(5), stop_signal())
+            .await
+            .expect("a STOP ends the wait");
+        assert_eq!(why, "service stop");
     }
 }

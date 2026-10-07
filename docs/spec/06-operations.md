@@ -417,6 +417,14 @@ Nothing per-packet is above `debug`. `RUST_LOG` overrides the flag when set.
 The log macros (`bad_request!`, `serving_error!`) do not evaluate their arguments
 unless the level is enabled.
 
+`--log-file PATH` (`log-file` in `[server]`, both daemons, `TODO.md` #190):
+lines go to the file instead of standard error, appended, each with a UTC
+timestamp, since nothing stamps a file the way journald stamps standard error.
+Reopened on every reload, so rotation is: move the file, then SIGHUP, `rdnsctl
+reload` or (as a Windows service) PARAMCHANGE. A file that cannot be opened is a
+startup failure. A failed start is also written there, since a service's
+standard error goes nowhere.
+
 ### The query stream — `--dnstap` (dnstap)
 
 A different output from the log, for a different reader. The log answers "is
@@ -539,6 +547,34 @@ messages.
 
 Both transports are owned by a `JoinSet`, not raced as two dropped
 `JoinHandle`s — dropping a handle detaches a task rather than cancelling it.
+
+### As a Windows service (`--service NAME`, `TODO.md` #190)
+
+The service control manager starts a service process and waits up to 30 s for
+it to call `StartServiceCtrlDispatcher`. `--service NAME` makes the daemon do so
+through `windows-service`. Without the flag it is a console process, with no
+detection. `--service` needs `--log-file` and is refused on other platforms,
+both before `--check-config` answers. `--check-config` with `--service` is
+answered on the console.
+
+- STOP and PRESHUTDOWN start the same drain as Ctrl-C, reported as
+  STOP_PENDING (15 s wait hint over the 5 s budget), then STOPPED.
+- The exit code is the daemon's: a failed start is STOPPED with
+  service-specific code 1, and the reason is in the log file.
+- PARAMCHANGE is SIGHUP: `rdnsd` reloads its zones, `rdnsr` re-reads what
+  SIGHUP re-reads.
+
+```bat
+sc.exe create rdnsd binPath= "C:\rdns\rdnsd.exe --service rdnsd --config C:\rdns\rdnsd.toml" start= auto
+sc.exe start rdnsd
+sc.exe control rdnsd paramchange
+sc.exe stop rdnsd
+sc.exe delete rdnsd
+```
+
+The config file sets `log-file` under `[server]`. A wrapper (NSSM, WinSW) works
+only with its stop timeouts raised: NSSM's Ctrl-C is caught, but its next step
+comes 1.5 s later by default, inside the drain.
 
 ---
 

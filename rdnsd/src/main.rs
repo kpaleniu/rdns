@@ -757,6 +757,18 @@ struct Cli {
     /// credential.
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     control_socket: Option<PathBuf>,
+    /// Write log lines to this file instead of standard error, appended,
+    /// each with a UTC timestamp. Reopened on every reload, so an external
+    /// rotation needs only a reload after the move.
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
+    log_file: Option<PathBuf>,
+    /// Run as Windows service NAME under the service control manager, which
+    /// is what starts it: `sc.exe create NAME binPath= "... --service NAME
+    /// ..."`. STOP drains as Ctrl-C does; PARAMCHANGE (`sc.exe control NAME
+    /// paramchange`) reloads as SIGHUP does. Needs --log-file, since a
+    /// service's standard error goes nowhere. Windows only.
+    #[arg(long, value_name = "NAME")]
+    service: Option<String>,
     /// Read the settings from a TOML file instead of from flags.
     ///
     /// Exclusive of the flags it would set: `--config` with `--port` is an
@@ -1419,6 +1431,7 @@ impl ReloadTrigger {
     /// What the log line says this reload was for.
     fn why(&self) -> &'static str {
         match self {
+            ReloadTrigger::Signal if cfg!(windows) => "PARAMCHANGE",
             ReloadTrigger::Signal => "SIGHUP",
             ReloadTrigger::Timer => "signature refresh",
             ReloadTrigger::Control(_) => "control socket",
@@ -1461,6 +1474,8 @@ async fn reload_once(
         tls,
     } = ctx;
     let why = trigger.why();
+    // Rotation: a log file moved away is followed from here (`TODO.md` #190).
+    rdns_transport::logging::reopen();
     // Before the zones, and independent of whether they load. This is the one
     // function SIGHUP, `rdnsctl reload` and the re-signing timer all pass
     // through, which is why the certificate renewal story is a reload and not a
@@ -1620,8 +1635,14 @@ async fn sleep_for(every: Option<Duration>) {
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    let cli = Cli::parse();
+    // `--check-config` is a console answer even with `--service` beside it.
+    let service = cli.service.clone().filter(|_| !cli.check_config);
+    rdns_transport::entry::run(service.as_deref(), move || serve_main(cli))
+}
+
+async fn serve_main(mut cli: Cli) -> Result<()> {
     // Held to the end of `main`, because the profiler writes `dhat-heap.json`
     // on `Drop` — a daemon that never returns from `main` never writes one at
     // all, which is why this item waited on graceful shutdown. Binding it in
@@ -1633,17 +1654,6 @@ async fn main() -> Result<()> {
     // starting once the sockets are bound. On a server with forty signed zones
     // the load *is* the start.
     let started = Instant::now();
-
-    let mut cli = Cli::parse();
-
-    // Before anything that might have something to say. `--quiet` is the same
-    // as `--log-level error`; clap refuses the two together, so this is a
-    // rename and not a precedence rule (`CLAUDE.md` §15).
-    rdns_transport::logging::init(if cli.quiet {
-        LogLevel::Error
-    } else {
-        cli.log_level
-    });
 
     // A config file supplies the same settings the flags do, plus the two things
     // a flag cannot express — a secret in its own file, and per-zone settings.
@@ -1659,6 +1669,33 @@ async fn main() -> Result<()> {
         None => config::PerZone::default(),
     };
     let cli = cli;
+    // As early as the config allows: the file may name the log file. `--quiet`
+    // is the same as `--log-level error`; clap refuses the two together, so
+    // this is a rename and not a precedence rule (`CLAUDE.md` §15).
+    rdns_transport::logging::init(
+        if cli.quiet {
+            LogLevel::Error
+        } else {
+            cli.log_level
+        },
+        cli.log_file.as_deref(),
+    )?;
+
+    // Before the dry run (`TODO.md` #190).
+    if cli.service.is_some() {
+        if !cfg!(windows) {
+            return Err(anyhow!(
+                "--service is the Windows service control manager's; under systemd or \
+                 another supervisor run the binary as it is"
+            ));
+        }
+        if cli.log_file.is_none() {
+            return Err(anyhow!(
+                "--service needs --log-file: a service's standard error goes nowhere, so \
+                 without one nothing it says reaches anybody"
+            ));
+        }
+    }
 
     // Key generation is a mode, not a server option: nothing is served, and it
     // happens once per zone before anything else can.

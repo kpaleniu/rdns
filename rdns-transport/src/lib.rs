@@ -27,11 +27,14 @@ pub mod bind;
 pub mod control;
 pub mod dnstap;
 pub mod encrypted;
+pub mod entry;
 pub mod https;
 pub mod logging;
 pub mod metrics_server;
 pub mod quic;
 pub mod readiness;
+#[cfg(windows)]
+pub mod service;
 mod slots;
 pub mod tcp;
 #[cfg(test)]

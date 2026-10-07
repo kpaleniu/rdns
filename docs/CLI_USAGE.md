@@ -65,6 +65,13 @@ Not recursive — a flat `read_dir`, so organising zones into subdirectories hid
 them. A config file's `[zones."name"] file = "..."` names paths individually if
 you need a tree.
 
+### `--log-file <PATH>` and `--service <NAME>`
+
+`--log-file` writes log lines to PATH instead of standard error, appended,
+timestamped (UTC), and reopened on each reload so rotation is a move and a
+reload. `--service NAME` runs the daemon as Windows service NAME and needs
+`--log-file`; see `docs/spec/06-operations.md` §6.5 for the `sc.exe` recipe.
+
 ### `--log-level <LEVEL>` and `--quiet`
 
 `error`, `warn`, `info`, `debug`, `trace`. Default `info`. `--quiet` equals

@@ -773,3 +773,17 @@ fn an_unvalidated_local_root_is_refused() {
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(stdout(&out).contains("stub zone . -> 127.0.0.1:5353"));
 }
+
+/// `--service` needs a log destination, and is Windows' alone (`TODO.md`
+/// #190).
+#[test]
+fn service_refusals() {
+    let out = rdnsr(&["--service", "rdnsr", "--check-config"]);
+    assert!(!out.status.success());
+    let wants = if cfg!(windows) {
+        "--service needs --log-file"
+    } else {
+        "service control manager"
+    };
+    assert!(stderr(&out).contains(wants), "{}", stderr(&out));
+}
