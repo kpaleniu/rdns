@@ -66,6 +66,9 @@ pub(crate) struct Resolving {
     /// process-wide reload instead would let one publisher make this resolver
     /// re-read every other operator's file.
     pub(crate) feed_wakes: Vec<crate::rpz_transfer::FeedWake>,
+    /// Where client exchanges go, when `--dnstap` writes `client` (`TODO.md`
+    /// #191).
+    pub(crate) dnstap: Option<rdns_transport::dnstap::Sink>,
     pub(crate) ctx: Arc<ServeContext>,
 }
 
@@ -121,6 +124,7 @@ pub(crate) async fn handle_query(
         empty_zones,
         rpz_notify,
         feed_wakes,
+        dnstap: _,
         ctx,
     } = serving;
     // One snapshot for one query: a SIGHUP can install a new set part-way
@@ -1720,6 +1724,7 @@ mod tests {
                 empty_zones: Default::default(),
                 rpz_notify: None,
                 feed_wakes: Vec::new(),
+                dnstap: None,
                 ctx,
             }),
             clock,
@@ -2896,6 +2901,7 @@ mod tests {
             empty_zones: Default::default(),
             rpz_notify: None,
             feed_wakes: Vec::new(),
+            dnstap: None,
             ctx: test_shell(),
         })
     }

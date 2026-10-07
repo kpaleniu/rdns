@@ -49,18 +49,31 @@ const FIELD_CONTENT_TYPE: u32 = 0x01;
 /// bounds what may be written rather than being a buffer size here.
 const CONTROL_FRAME_LENGTH_MAX: usize = 512;
 
-/// `Message.Type` in `dnstap.proto`. Only the four an authoritative server
-/// produces are named: this tree is not a forwarder or a stub.
+/// `Message.Type` in `dnstap.proto`: the types this tree writes.
 ///
-/// `TOOL_QUERY` and the resolver-side types exist in the schema and are not
-/// here, for the reason `crate::ede::InfoCode` names only the codes this tree
-/// emits — a constant nothing writes is a thing to keep in step for nothing.
+/// It said "this tree is not a forwarder or a stub", which `rdnsr` made
+/// false (`TODO.md` #191). `STUB_*` and `TOOL_*` exist in the schema and are
+/// not here, for the reason `crate::ede::InfoCode` names only the codes this
+/// tree emits — a constant nothing writes is a thing to keep in step for
+/// nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
     /// A query received by an authoritative server.
     AuthQuery = 1,
     /// The answer it sent.
     AuthResponse = 2,
+    /// A query a resolver sent while walking the delegation chain.
+    ResolverQuery = 3,
+    /// The reply it received.
+    ResolverResponse = 4,
+    /// A query a resolver received from a client.
+    ClientQuery = 5,
+    /// The answer it sent the client.
+    ClientResponse = 6,
+    /// A query a resolver forwarded to another resolver.
+    ForwarderQuery = 7,
+    /// The reply it received.
+    ForwarderResponse = 8,
     /// An UPDATE received (RFC 2136).
     UpdateQuery = 13,
     /// The answer to one.
@@ -82,6 +95,19 @@ pub enum SocketProtocol {
     Doq = 7,
 }
 
+impl From<&crate::validation::Arrival> for SocketProtocol {
+    /// The stream transport a framed message arrived over.
+    fn from(arrival: &crate::validation::Arrival) -> SocketProtocol {
+        use crate::validation::Arrival;
+        match arrival {
+            Arrival::Tcp => SocketProtocol::Tcp,
+            Arrival::Dot(..) => SocketProtocol::Dot,
+            Arrival::Doh(..) => SocketProtocol::Doh,
+            Arrival::Doq(_) => SocketProtocol::Doq,
+        }
+    }
+}
+
 /// One dnstap payload: a `Dnstap` wrapping a `Message`.
 ///
 /// Borrowed rather than owned, because the caller already holds the query and
@@ -101,10 +127,14 @@ pub struct Entry<'a> {
     /// every case since `TODO.md` #54; before that the three encrypted
     /// transports reached it as one `Privacy` and it left this `None`.
     pub socket_protocol: Option<SocketProtocol>,
-    /// Who asked. `query_address` and `query_port`.
-    pub peer: SocketAddr,
-    /// Which of our addresses answered, when it is known.
-    pub local: Option<SocketAddr>,
+    /// `query_address` and `query_port`: whoever sent the query — the client
+    /// for an authoritative or client entry, this resolver for one it sent,
+    /// which is `None` because the socket it went out on is not known here.
+    pub initiator: Option<SocketAddr>,
+    /// `response_address` and `response_port`: whoever answered — our
+    /// listener when it is known, the upstream server for one this resolver
+    /// sent.
+    pub responder: Option<SocketAddr>,
     /// `query_time_sec` and `query_time_nsec`: when the request arrived.
     pub query_time: Timestamp,
     /// `response_time_sec` and `response_time_nsec`. `None` for a query-only
@@ -216,17 +246,25 @@ impl Entry<'_> {
             self.query.map_or(0, <[u8]>::len) + self.response.map_or(0, <[u8]>::len) + 64,
         );
         put_varint_field(&mut out, 1, self.message_type as u64);
-        put_varint_field(&mut out, 2, socket_family(self.peer.ip()));
+        // The family is the one address present's; both present are one
+        // family, since one socket carried the exchange.
+        if let Some(address) = self.initiator.or(self.responder) {
+            put_varint_field(&mut out, 2, socket_family(address.ip()));
+        }
         if let Some(protocol) = self.socket_protocol {
             put_varint_field(&mut out, 3, protocol as u64);
         }
-        put_bytes_field(&mut out, 4, &address_octets(self.peer.ip()));
-        if let Some(local) = self.local {
-            put_bytes_field(&mut out, 5, &address_octets(local.ip()));
+        if let Some(initiator) = self.initiator {
+            put_bytes_field(&mut out, 4, &address_octets(initiator.ip()));
         }
-        put_varint_field(&mut out, 6, u64::from(self.peer.port()));
-        if let Some(local) = self.local {
-            put_varint_field(&mut out, 7, u64::from(local.port()));
+        if let Some(responder) = self.responder {
+            put_bytes_field(&mut out, 5, &address_octets(responder.ip()));
+        }
+        if let Some(initiator) = self.initiator {
+            put_varint_field(&mut out, 6, u64::from(initiator.port()));
+        }
+        if let Some(responder) = self.responder {
+            put_varint_field(&mut out, 7, u64::from(responder.port()));
         }
         // 8/9 is always the *query*'s time, even on a response entry, so a
         // reader can subtract 8 from 12 and get the latency. An entry carrying
@@ -373,6 +411,116 @@ pub fn read_control_frame(bytes: &[u8]) -> Result<Option<(ControlFrame, usize)>,
     Ok(Some((frame, 8 + length)))
 }
 
+/// The reading half, as far as a test or a quick look at a capture needs it:
+/// the data frames of a stream, and the `Message` fields this tree writes.
+/// Not a general dnstap reader — `dnstap -r` is that.
+pub mod read {
+    /// The data frames of an fstrm stream, control frames skipped. Stops at
+    /// the first frame that does not fit.
+    pub fn data_frames(mut stream: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        while stream.len() >= 4 {
+            let len = u32::from_be_bytes([stream[0], stream[1], stream[2], stream[3]]) as usize;
+            if len == 0 {
+                // A control frame: escape, length, body.
+                if stream.len() < 8 {
+                    break;
+                }
+                let body =
+                    u32::from_be_bytes([stream[4], stream[5], stream[6], stream[7]]) as usize;
+                stream = stream.get(8 + body..).unwrap_or_default();
+                continue;
+            }
+            let Some(frame) = stream.get(4..4 + len) else {
+                break;
+            };
+            out.push(frame);
+            stream = &stream[4 + len..];
+        }
+        out
+    }
+
+    /// One `Message`, as far as this tree's tests look into it.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub struct Message {
+        pub message_type: u64,
+        pub initiator: Option<Vec<u8>>,
+        pub responder: Option<Vec<u8>>,
+        pub responder_port: Option<u64>,
+        pub query: Option<Vec<u8>>,
+        pub zone: Option<Vec<u8>>,
+        pub response: Option<Vec<u8>>,
+    }
+
+    /// Decode a `Dnstap` payload's `Message`, or `None` for one that does not
+    /// parse.
+    pub fn message(payload: &[u8]) -> Option<Message> {
+        let top = fields(payload)?;
+        let body = top.iter().find(|(f, _)| *f == 14).map(|(_, v)| v.clone())?;
+        let mut out = Message::default();
+        for (field, value) in fields(&body)? {
+            match field {
+                1 => out.message_type = as_u64(&value),
+                4 => out.initiator = Some(value),
+                5 => out.responder = Some(value),
+                7 => out.responder_port = Some(as_u64(&value)),
+                10 => out.query = Some(value),
+                11 => out.zone = Some(value),
+                14 => out.response = Some(value),
+                _ => {}
+            }
+        }
+        Some(out)
+    }
+
+    fn as_u64(value: &[u8]) -> u64 {
+        value.try_into().map(u64::from_be_bytes).unwrap_or(0)
+    }
+
+    fn varint(bytes: &[u8]) -> Option<(u64, usize)> {
+        let mut value = 0u64;
+        for (i, byte) in bytes.iter().enumerate().take(10) {
+            value |= u64::from(byte & 0x7f) << (7 * i);
+            if byte & 0x80 == 0 {
+                return Some((value, i + 1));
+            }
+        }
+        None
+    }
+
+    /// Field number and value: a varint as eight big-endian octets, the rest
+    /// as they are.
+    fn fields(mut bytes: &[u8]) -> Option<Vec<(u32, Vec<u8>)>> {
+        let mut out = Vec::new();
+        while !bytes.is_empty() {
+            let (tag, used) = varint(bytes)?;
+            bytes = &bytes[used..];
+            let value = match tag & 7 {
+                0 => {
+                    let (v, used) = varint(bytes)?;
+                    bytes = &bytes[used..];
+                    v.to_be_bytes().to_vec()
+                }
+                5 => {
+                    let v = bytes.get(..4)?.to_vec();
+                    bytes = &bytes[4..];
+                    v
+                }
+                2 => {
+                    let (len, used) = varint(bytes)?;
+                    let end = used + len as usize;
+                    let v = bytes.get(used..end)?.to_vec();
+                    bytes = &bytes[end..];
+                    v
+                }
+                _ => return None,
+            };
+            out.push(((tag >> 3) as u32, value));
+        }
+        Some(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,8 +533,8 @@ mod tests {
             version: b"rdnsd 0.1.0",
             message_type: MessageType::AuthQuery,
             socket_protocol: Some(SocketProtocol::Udp),
-            peer: "192.0.2.10:5353".parse().expect("a test address"),
-            local: Some("192.0.2.1:53".parse().expect("a test address")),
+            initiator: Some("192.0.2.10:5353".parse().expect("a test address")),
+            responder: Some("192.0.2.1:53".parse().expect("a test address")),
             query_time: Timestamp {
                 secs: 1_700_000_000,
                 nanos: 123_456_789,
@@ -528,8 +676,8 @@ mod tests {
             ("192.0.2.10:5353", 1, 4),
         ] {
             let entry = Entry {
-                peer: peer.parse().expect("a test address"),
-                local: None,
+                initiator: Some(peer.parse().expect("a test address")),
+                responder: None,
                 ..entry()
             };
             let top = fields(&entry.encode());

@@ -30,6 +30,7 @@ mod reload;
 mod routes;
 mod rpz_transfer;
 mod serve;
+mod tap;
 #[cfg(test)]
 mod testutil;
 
@@ -149,6 +150,9 @@ fn default_max_connections() -> std::num::NonZeroUsize {
 }
 fn default_connection_idle_timeout() -> std::num::NonZeroU64 {
     rdns_transport::DEFAULT_IDLE_TIMEOUT_SECS
+}
+fn default_dnstap_max_bytes() -> u64 {
+    1_073_741_824
 }
 fn default_max_connections_per_source() -> usize {
     rdns_transport::DEFAULT_MAX_CONNECTIONS_PER_SOURCE
@@ -475,6 +479,26 @@ struct Cli {
     /// put in it (§2.2).
     #[arg(long, value_name = "TEXT|0xHEX", conflicts_with = "config")]
     nsid: Option<String>,
+    /// Stream traffic to dnstap: `tcp:<addr:port>` for a collector,
+    /// `file:<path>` for a capture `dnstap -r` reads. Which traffic is
+    /// `--dnstap-types`. The queue is bounded and drops rather than blocking:
+    /// `dns_dnstap_dropped_total` counts what a slow collector lost.
+    #[arg(long, value_name = "TARGET", conflicts_with = "config")]
+    dnstap: Option<String>,
+    /// Stop writing a dnstap *file* after this many octets. 0 is no limit.
+    #[arg(long, value_name = "OCTETS", default_value_t = default_dnstap_max_bytes(), conflicts_with = "config")]
+    dnstap_max_bytes: u64,
+    /// What `--dnstap` writes, comma-separated: `client` (queries from
+    /// clients and the answers), `resolver` (each query of the delegation
+    /// walk and its reply), `forwarder` (each query to a forward zone's
+    /// server and its reply). BIND's names. Default `client`.
+    #[arg(
+        long,
+        value_name = "TYPES",
+        value_delimiter = ',',
+        conflicts_with = "config"
+    )]
+    dnstap_types: Vec<String>,
     /// Also answer DNS over TLS here (RFC 7858). Needs --tls-cert and --tls-key.
     ///
     /// 853 is the assigned port, and a resolver is what RFC 7858 was written
@@ -900,7 +924,19 @@ async fn main() -> anyhow::Result<()> {
             .join("; ")
     };
     let serving_ntas = config.ntas.clone();
-    let resolver = Arc::new(Resolver::new(config));
+    // Above the dry run (`CLAUDE.md` §15); the sink itself opens after it.
+    let dnstap_target = cli
+        .dnstap
+        .as_deref()
+        .map(str::parse::<rdns_transport::dnstap::Target>)
+        .transpose()?;
+    let dnstap_types = tap::types(&cli.dnstap_types, dnstap_target.is_some())?;
+    let dnstap_slot: Arc<std::sync::OnceLock<rdns_transport::dnstap::Sink>> = Arc::default();
+    let mut resolver = Resolver::new(config);
+    if dnstap_target.is_some() && (dnstap_types.resolver || dnstap_types.forwarder) {
+        resolver = resolver.with_tap(tap::exchange_tap(dnstap_slot.clone(), dnstap_types));
+    }
+    let resolver = Arc::new(resolver);
 
     // A task of its own: following the anchors resolves, so it needs the
     // resolver and cannot be part of building one.
@@ -1347,6 +1383,36 @@ async fn main() -> anyhow::Result<()> {
     } else {
         (None, None)
     };
+    let dnstap = match &dnstap_target {
+        Some(target) => {
+            let sink = rdns_transport::dnstap::Sink::spawn(
+                target,
+                cli.dnstap_max_bytes,
+                rdns_transport::dnstap::hostname(),
+                format!("rdnsr {}", env!("CARGO_PKG_VERSION")).into_bytes(),
+                (*ctx.metrics).clone(),
+                shutdown.stop_handle(),
+            )
+            .await?;
+            let _ = dnstap_slot.set(sink.clone());
+            tracing::info!(
+                "dnstap: {} ({})",
+                cli.dnstap.as_deref().unwrap_or_default(),
+                [
+                    (dnstap_types.client, "client"),
+                    (dnstap_types.resolver, "resolver"),
+                    (dnstap_types.forwarder, "forwarder")
+                ]
+                .iter()
+                .filter(|(on, _)| *on)
+                .map(|(_, name)| *name)
+                .collect::<Vec<_>>()
+                .join(",")
+            );
+            dnstap_types.client.then_some(sink)
+        }
+        None => None,
+    };
     let serving = Arc::new(Resolving {
         resolver,
         caches,
@@ -1356,6 +1422,7 @@ async fn main() -> anyhow::Result<()> {
         empty_zones,
         rpz_notify,
         feed_wakes,
+        dnstap,
         ctx: ctx.clone(),
     });
 

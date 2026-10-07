@@ -120,10 +120,14 @@ rdns::server_table! {
         /// half, because `rdnsd` has no query ACL (`TODO.md` #171).
         #[serde(default)]
         allow_query: Vec<String>,
+        /// What `dnstap` writes: `client`, `resolver`, `forwarder` (#191).
+        #[serde(default)]
+        dnstap_types: Vec<String>,
     }
     defaults {
         max_inflight_udp: crate::default_max_inflight_udp(),
         allow_query: Vec::new(),
+        dnstap_types: Vec::new(),
     }
 }
 

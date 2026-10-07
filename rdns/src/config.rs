@@ -191,6 +191,13 @@ macro_rules! server_table {
             /// RFC 5001's server identifier, in `--nsid`'s spelling. Absent is
             /// off.
             nsid: Option<String>,
+            /// Where the dnstap stream goes: `tcp:<addr:port>` or
+            /// `file:<path>`. Absent is off. Both daemons since `TODO.md` #191.
+            dnstap: Option<String>,
+            /// How large a dnstap *capture file* may grow before the writing
+            /// stops. 0 is no limit; ignored for a `tcp:` target.
+            #[serde(default = "crate::default_dnstap_max_bytes")]
+            dnstap_max_bytes: u64,
             /// Where to answer DNS over TLS (RFC 7858), QUIC (RFC 9250) and
             /// HTTPS (RFC 8484), and with what. A listener with no certificate
             /// is refused — in code, because a config file has no equivalent of
@@ -257,6 +264,8 @@ macro_rules! server_table {
                     $crate::config::taken(&self.anomaly_source_refusals);
                 cli.metrics_listen = $crate::config::taken(&self.metrics_listen);
                 cli.nsid = $crate::config::taken(&self.nsid);
+                cli.dnstap = $crate::config::taken(&self.dnstap);
+                cli.dnstap_max_bytes = $crate::config::taken(&self.dnstap_max_bytes);
                 cli.tls_listen = $crate::config::taken(&self.tls_listen);
                 cli.quic_listen = $crate::config::taken(&self.quic_listen);
                 cli.https_listen = $crate::config::taken(&self.https_listen);
@@ -298,6 +307,8 @@ macro_rules! server_table {
                     anomaly_source_refusals: crate::default_anomaly_source_refusals(),
                     metrics_listen: None,
                     nsid: None,
+                    dnstap: None,
+                    dnstap_max_bytes: crate::default_dnstap_max_bytes(),
                     tls_listen: None,
                     quic_listen: None,
                     https_listen: None,

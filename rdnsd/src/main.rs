@@ -817,20 +817,6 @@ struct ServePolicy {
     control: ControlPolicy,
 }
 
-/// `Dnstap.identity`: this host, as the environment names it.
-///
-/// `HOSTNAME` then `COMPUTERNAME`, and empty if neither is set — which the
-/// encoder omits rather than writing as an empty string. `std` has no portable
-/// way to ask the OS and a crate for one field of one optional output is not a
-/// dependency this earns (`CLAUDE.md` §14). An operator who needs a particular
-/// identity sets the variable, which is where a service manager already puts it.
-fn hostname_bytes() -> Vec<u8> {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .map(String::into_bytes)
-        .unwrap_or_default()
-}
-
 /// Where the control socket lives and how it asks for a reload.
 #[cfg_attr(not(unix), allow(dead_code))]
 struct ControlPolicy {
@@ -987,7 +973,7 @@ async fn serve(
             rdns_transport::dnstap::Sink::spawn(
                 target,
                 *max_bytes,
-                hostname_bytes(),
+                rdns_transport::dnstap::hostname(),
                 format!("rdnsd {}", env!("CARGO_PKG_VERSION")).into_bytes(),
                 (*metrics).clone(),
                 shutdown.stop_handle(),

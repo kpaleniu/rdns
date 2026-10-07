@@ -31,6 +31,20 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
+/// `Dnstap.identity`: this host, as the environment names it.
+///
+/// `HOSTNAME` then `COMPUTERNAME`, and empty if neither is set — which the
+/// encoder omits rather than writing as an empty string. `std` has no portable
+/// way to ask the OS and a crate for one field of one optional output is not a
+/// dependency this earns (`CLAUDE.md` §14). An operator who needs a particular
+/// identity sets the variable, which is where a service manager already puts it.
+pub fn hostname() -> Vec<u8> {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .map(String::into_bytes)
+        .unwrap_or_default()
+}
+
 /// How many encoded payloads may be waiting for the writer.
 ///
 /// Enough to ride out a collector's GC pause or a file's `fsync`, not enough to

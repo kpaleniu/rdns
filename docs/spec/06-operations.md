@@ -451,6 +451,21 @@ for this: a query time rounded down to the second reports a latency of up to a
 second for an answer that took microseconds, and a wrong number is worse than an
 absent one. The extra `SystemTime::now` is paid only when `--dnstap` is on.
 
+**`rdnsr` streams too** (`TODO.md` #191), through the same writer, now in
+`rdns_transport::dnstap`, with the same `--dnstap`, `--dnstap-max-bytes` and
+config keys. `--dnstap-types` picks what, by BIND's names, each meaning both
+directions: `client` (the default) is `CLIENT_QUERY` and `CLIENT_RESPONSE`
+per client exchange, two frames, with the client's address and transport;
+`resolver` is a `RESOLVER_QUERY` and `RESOLVER_RESPONSE` per exchange of the
+delegation walk, and `forwarder` the same pair as `FORWARDER_*` for a forward
+zone's server (`--upstream` included). Upstream entries carry the query as sent
+and the reply as received, wire form, the server as `response_address`, no
+`query_address` (the socket it went out on is not known there), and
+`query_zone` set to the zone the server was asked about. The resolver emits
+through a callback and queues nothing; with none set an exchange costs a
+branch. An unknown type, or `--dnstap-types` without `--dnstap`, is refused
+before the dry run, and a dry run opens no capture.
+
 **`socket_protocol` names all five: UDP, TCP, DOT, DOH and DOQ.** The dispatcher
 is told `validation::Arrival`, which says which protocol carried the message and
 what it negotiated; `Privacy` — what the connection hid — is derived from it and

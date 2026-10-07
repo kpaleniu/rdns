@@ -664,3 +664,34 @@ fn a_bad_routed_domain_is_refused_before_the_dry_run() {
     ]);
     assert!(!out.status.success(), "flag and file together");
 }
+
+/// `--dnstap-types` is refused for an unknown name and without `--dnstap`,
+/// before the dry run answers; a bad target is refused there too
+/// (`TODO.md` #191).
+#[test]
+fn dnstap_settings_are_checked_before_the_dry_run() {
+    for (args, wants) in [
+        (&["--dnstap-types", "client"][..], "--dnstap"),
+        (
+            &["--dnstap", "file:x.fstrm", "--dnstap-types", "bogus"][..],
+            "bogus",
+        ),
+        (&["--dnstap", "nowhere"][..], "tcp:"),
+    ] {
+        let out = rdnsr(&[&["--check-config"][..], args].concat());
+        assert!(!out.status.success(), "{args:?} passed the dry run");
+        assert!(stderr(&out).contains(wants), "{args:?}: {}", stderr(&out));
+    }
+    let out = rdnsr(&[
+        "--check-config",
+        "--dnstap",
+        "file:never-written.fstrm",
+        "--dnstap-types",
+        "client,resolver,forwarder",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        !std::path::Path::new("never-written.fstrm").exists(),
+        "a dry run opens no capture"
+    );
+}

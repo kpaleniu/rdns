@@ -676,6 +676,22 @@ impl<'a> Resolution<'a> {
     }
 }
 
+/// Told about every upstream exchange, for dnstap (`TODO.md` #191): one
+/// `RESOLVER_*` or `FORWARDER_*` entry as the query leaves and one as the reply
+/// arrives, with the identity and version left empty for the sink to fill.
+///
+/// A callback rather than a queue: the library queues nothing, and with none
+/// set an exchange costs one branch.
+pub type ExchangeTap = Arc<dyn Fn(&crate::dnstap::Entry<'_>) + Send + Sync>;
+
+/// Which zone a query was asked about, and whether the server asked is a
+/// forwarder — what an exchange's dnstap entry says beside the bytes.
+#[derive(Clone, Copy)]
+pub(crate) struct Asked<'a> {
+    pub(crate) zone: NameRef<'a>,
+    pub(crate) forwarded: bool,
+}
+
 /// A DNS resolver. See [`Route`].
 pub struct Resolver {
     config: ResolverConfig,
@@ -694,6 +710,7 @@ pub struct Resolver {
     /// their own clone.
     clock: Clock,
     upstream: Upstream,
+    tap: Option<ExchangeTap>,
 }
 
 impl Resolver {
@@ -719,6 +736,7 @@ impl Resolver {
             keys,
             clock,
             upstream: Upstream::Network,
+            tap: None,
         }
     }
 
@@ -750,6 +768,12 @@ impl Resolver {
     /// The positive trust anchors in force, if this resolver validates.
     pub fn trust_anchors(&self) -> Option<TrustAnchors> {
         self.config.dnssec.as_ref().map(SharedAnchors::get)
+    }
+
+    /// Report every upstream exchange to `tap` (`TODO.md` #191).
+    pub fn with_tap(mut self, tap: ExchangeTap) -> Self {
+        self.tap = Some(tap);
+        self
     }
 
     /// The routed domains, as configured.
@@ -4964,6 +4988,106 @@ this line has no record and is skipped
             assert!(
                 matches!(&state, ValidationState::Indeterminate(why) if why.contains("corp.example.test")),
                 "{state}"
+            );
+        }
+    }
+
+    /// The exchange tap (`TODO.md` #191): a query and a reply entry per
+    /// upstream exchange, naming the server and the zone it was asked about,
+    /// `RESOLVER_*` on the walk and `FORWARDER_*` to a forward zone.
+    mod tap {
+        use super::*;
+        use crate::dnstap::MessageType;
+
+        type Seen = Arc<Mutex<Vec<(MessageType, Option<SocketAddr>, Vec<u8>)>>>;
+
+        fn tapped() -> (ExchangeTap, Seen) {
+            let seen: Seen = Arc::default();
+            let log = seen.clone();
+            let tap: ExchangeTap = Arc::new(move |entry: &crate::dnstap::Entry<'_>| {
+                log.lock().unwrap().push((
+                    entry.message_type,
+                    entry.responder,
+                    // DNS case is not data, and 0x20 scrambles it.
+                    entry.zone.unwrap_or_default().to_ascii_lowercase(),
+                ));
+            });
+            (tap, seen)
+        }
+
+        #[tokio::test]
+        async fn every_walk_exchange_is_a_resolver_pair_naming_its_zone() {
+            let net = Net::default();
+            let tld = fake(2);
+            net.serve(fake(1), move |q| {
+                referral(q, "test.", "ns.test.", Some(("ns.test.", tld)))
+            });
+            net.serve(tld, |q| {
+                let name = qname_of(q);
+                authoritative(q, vec![a_record(&name, [192, 0, 2, 1])])
+            });
+            let (tap, seen) = tapped();
+            let resolver = Resolver::new(ResolverConfig {
+                qname_minimization: false,
+                ..recursing_config(fake(1))
+            })
+            .with_upstream(net.upstream())
+            .with_tap(tap);
+            resolver
+                .resolve(&QuerySection {
+                    qname: nm("www.public.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                })
+                .await
+                .expect("resolved");
+
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(
+                seen,
+                vec![
+                    (MessageType::ResolverQuery, Some(fake(1)), vec![0]),
+                    (MessageType::ResolverResponse, Some(fake(1)), vec![0]),
+                    (
+                        MessageType::ResolverQuery,
+                        Some(tld),
+                        nm("test.").as_ref().as_wire().to_vec()
+                    ),
+                    (
+                        MessageType::ResolverResponse,
+                        Some(tld),
+                        nm("test.").as_ref().as_wire().to_vec()
+                    ),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_forward_zone_exchange_is_a_forwarder_pair() {
+            let net = Net::default();
+            net.serve(fake(5), |q| {
+                let name = qname_of(q);
+                authoritative(q, vec![a_record(&name, [10, 0, 0, 5])])
+            });
+            let (tap, seen) = tapped();
+            let resolver = Resolver::new(ResolverConfig {
+                routes: vec![Route::forward(Name::root(), vec![fake(5)])],
+                ..ResolverConfig::default()
+            })
+            .with_upstream(net.upstream())
+            .with_tap(tap);
+            resolver
+                .resolve(&QuerySection {
+                    qname: nm("www.example.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                })
+                .await
+                .expect("forwarded");
+            let types: Vec<_> = seen.lock().unwrap().iter().map(|(t, _, _)| *t).collect();
+            assert_eq!(
+                types,
+                vec![MessageType::ForwarderQuery, MessageType::ForwarderResponse]
             );
         }
     }

@@ -94,6 +94,7 @@ pub(crate) fn serving(
         empty_zones: Default::default(),
         rpz_notify: None,
         feed_wakes: Vec::new(),
+        dnstap: None,
         ctx,
     })
 }
@@ -112,6 +113,7 @@ pub(crate) fn serving_policy(policy: Arc<PolicyStore>) -> Arc<Resolving> {
         empty_zones: Default::default(),
         rpz_notify: None,
         feed_wakes: Vec::new(),
+        dnstap: None,
         ctx,
     })
 }
@@ -138,6 +140,7 @@ pub(crate) fn serving_notified(
             reload: reload.clone(),
         }),
         feed_wakes: Vec::new(),
+        dnstap: None,
         ctx,
     });
     (serving, reload)

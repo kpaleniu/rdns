@@ -108,6 +108,12 @@ pub(crate) async fn udp_main(
         };
         let id = place.id();
         let data = buf[..n].to_vec();
+        // Only when somebody is reading: the copy and the clock read are the
+        // stream's cost (`TODO.md` #191).
+        let tapped = serving
+            .dnstap
+            .as_ref()
+            .map(|_| (data.clone(), rdns::dnstap::Timestamp::now()));
         let socket = socket.clone();
         // A recursion takes seconds and the client is already waiting, so it
         // is worth the drain.
@@ -117,7 +123,18 @@ pub(crate) async fn udp_main(
             let _busy = busy;
             let _place = place;
             let ctx = &serving.ctx;
-            if let Some(reply) = handle_query(data, peer, now, &serving, Transport::Udp).await {
+            let reply = handle_query(data, peer, now, &serving, Transport::Udp).await;
+            if let (Some(sink), Some((query, arrived))) = (&serving.dnstap, &tapped) {
+                crate::tap::record_client(
+                    sink,
+                    rdns::dnstap::SocketProtocol::Udp,
+                    from,
+                    *arrived,
+                    query,
+                    reply.as_deref(),
+                );
+            }
+            if let Some(reply) = reply {
                 send_within_budget(&socket, ctx, peer, from, &reply).await;
             }
         });
@@ -172,6 +189,10 @@ impl tcp::Handler for Resolving {
     ) {
         // Read before `handle_query` takes the packet. Only on an encrypted
         // transport, so plain TCP pays no second parse (`TODO.md` #187).
+        let tapped = self
+            .dnstap
+            .as_ref()
+            .map(|_| (packet.clone(), rdns::dnstap::Timestamp::now()));
         let padding = arrival
             .may_pad()
             .then(|| DnsMessage::try_from_bytes(&packet).ok())
@@ -184,7 +205,19 @@ impl tcp::Handler for Resolving {
             if let Some(payload) = padding {
                 rdns::response::pad_reply(&mut reply, payload, u16::MAX as usize);
             }
+            if let (Some(sink), Some((query, arrived))) = (&self.dnstap, &tapped) {
+                crate::tap::record_client(
+                    sink,
+                    (&arrival).into(),
+                    peer,
+                    *arrived,
+                    query,
+                    Some(&reply),
+                );
+            }
             tcp::send_framed(&out, &reply).await;
+        } else if let (Some(sink), Some((query, arrived))) = (&self.dnstap, &tapped) {
+            crate::tap::record_client(sink, (&arrival).into(), peer, *arrived, query, None);
         }
     }
 }

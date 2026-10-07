@@ -67,13 +67,6 @@ rdns::server_table! {
         /// default comes from so the two cannot drift.
         #[serde(default = "crate::default_udp_workers")]
         udp_workers: usize,
-        /// Where the dnstap query stream goes: `tcp:<addr:port>` or
-        /// `file:<path>`. Absent is off.
-        dnstap: Option<String>,
-        /// How large a dnstap *capture file* may grow before the writing stops.
-        /// 0 is no limit; ignored for a `tcp:` target.
-        #[serde(default = "crate::default_dnstap_max_bytes")]
-        dnstap_max_bytes: u64,
         /// Trust anchors for transfers this server *fetches* over TLS
         /// (RFC 9103), and whether one that arrives must have been encrypted.
         /// Separate settings because they are separate directions: a server can
@@ -110,8 +103,6 @@ rdns::server_table! {
         allow_transfer: Vec::new(),
         also_notify: Vec::new(),
         udp_workers: crate::default_udp_workers(),
-        dnstap: None,
-        dnstap_max_bytes: crate::default_dnstap_max_bytes(),
         transfer_tls_ca: None,
         transfer_tls_cert: None,
         transfer_tls_key: None,

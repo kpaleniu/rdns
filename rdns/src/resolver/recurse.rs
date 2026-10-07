@@ -175,8 +175,12 @@ impl Resolver {
             state.allows(&[], &route.servers)?;
             if matches!(route.kind, RouteKind::Forward) {
                 let out = self.build_query(query, true)?;
+                let asked = Asked {
+                    zone: route.name.as_ref(),
+                    forwarded: true,
+                };
                 let response = self
-                    .ask_any(&route.servers, &out, &mut state.budget)
+                    .ask_any(&route.servers, &out, &mut state.budget, asked)
                     .await
                     .ok_or_else(|| {
                         ResolveError::no_response(format!(
@@ -354,7 +358,12 @@ impl Resolver {
                 Some(local) => local,
                 None => {
                     let out = self.build_query(&step, false)?;
-                    let Some(response) = self.ask_any(&servers, &out, &mut state.budget).await
+                    let asked = Asked {
+                        zone: zone.as_ref(),
+                        forwarded: false,
+                    };
+                    let Some(response) =
+                        self.ask_any(&servers, &out, &mut state.budget, asked).await
                     else {
                         return Err(ResolveError::no_response(format!(
                             "no server for {zone} answered while resolving {qname}"
@@ -439,6 +448,7 @@ impl Resolver {
         servers: &[SocketAddr],
         out: &OutgoingQuery,
         budget: &mut Budget,
+        asked: Asked<'_>,
     ) -> Option<DnsMessage> {
         for server in self.rtt.order(servers) {
             if budget.spend().is_err() {
@@ -447,7 +457,7 @@ impl Resolver {
             // tokio's, not std's: the same clock in production, and one a
             // paused test runtime moves (`TODO.md` #137).
             let started = tokio::time::Instant::now();
-            if let Ok(response) = self.query_server(&server, out).await {
+            if let Ok(response) = self.query_server(&server, out, asked).await {
                 self.rtt
                     .record(&server, started.elapsed().as_secs_f64() * 1000.0);
                 if self.config.request_nsid {
@@ -606,10 +616,10 @@ impl Resolver {
         &self,
         upstream: &SocketAddr,
         out: &OutgoingQuery,
+        asked: Asked<'_>,
     ) -> ResolveResult<DnsMessage> {
         let bytes = self
-            .upstream
-            .exchange(*upstream, Transport::Udp, &out.buf, self.exchange_timeout())
+            .exchange_tapped(*upstream, Transport::Udp, out, asked)
             .await?;
         let response = DnsMessage::try_from_bytes(&bytes)?;
 
@@ -624,7 +634,7 @@ impl Resolver {
         // RFC 1035 §4.2.1: retry a truncated answer over TCP, on the *same*
         // upstream — TC is about the datagram, not the server's health.
         if response.truncation {
-            return self.query_upstream_tcp(upstream, out).await;
+            return self.query_upstream_tcp(upstream, out, asked).await;
         }
 
         Ok(response)
@@ -638,10 +648,10 @@ impl Resolver {
         &self,
         upstream: &SocketAddr,
         out: &OutgoingQuery,
+        asked: Asked<'_>,
     ) -> ResolveResult<DnsMessage> {
         let bytes = self
-            .upstream
-            .exchange(*upstream, Transport::Tcp, &out.buf, self.exchange_timeout())
+            .exchange_tapped(*upstream, Transport::Tcp, out, asked)
             .await?;
         let response = DnsMessage::try_from_bytes(&bytes)?;
 
@@ -653,6 +663,60 @@ impl Resolver {
             )));
         }
         Ok(response)
+    }
+
+    /// One exchange, reported to the tap if there is one: the query as it
+    /// leaves, the reply as it arrives (`TODO.md` #191). Nothing is reported
+    /// for a reply that never came, beyond its query.
+    async fn exchange_tapped(
+        &self,
+        server: SocketAddr,
+        transport: Transport,
+        out: &OutgoingQuery,
+        asked: Asked<'_>,
+    ) -> ResolveResult<Vec<u8>> {
+        let Some(tap) = &self.tap else {
+            return self
+                .upstream
+                .exchange(server, transport, &out.buf, self.exchange_timeout())
+                .await;
+        };
+        use crate::dnstap::{Entry, MessageType, SocketProtocol, Timestamp};
+        let (query_type, response_type) = if asked.forwarded {
+            (MessageType::ForwarderQuery, MessageType::ForwarderResponse)
+        } else {
+            (MessageType::ResolverQuery, MessageType::ResolverResponse)
+        };
+        let sent = Timestamp::now();
+        let query = Entry {
+            identity: b"",
+            version: b"",
+            message_type: query_type,
+            socket_protocol: Some(match transport {
+                Transport::Udp => SocketProtocol::Udp,
+                Transport::Tcp => SocketProtocol::Tcp,
+            }),
+            initiator: None,
+            responder: Some(server),
+            query_time: sent,
+            response_time: None,
+            query: Some(out.buf.as_slice()),
+            response: None,
+            zone: Some(asked.zone.as_wire()),
+        };
+        tap(&query);
+        let bytes = self
+            .upstream
+            .exchange(server, transport, &out.buf, self.exchange_timeout())
+            .await?;
+        tap(&Entry {
+            message_type: response_type,
+            response_time: Some(Timestamp::now()),
+            query: None,
+            response: Some(&bytes),
+            ..query
+        });
+        Ok(bytes)
     }
 
     /// Each wait on one server. Half the per-query timeout, so a second server

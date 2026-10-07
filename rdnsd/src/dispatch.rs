@@ -114,10 +114,7 @@ impl Wire<'_> {
     fn socket_protocol(&self) -> dnstap::SocketProtocol {
         match self {
             Wire::Datagram(..) => dnstap::SocketProtocol::Udp,
-            Wire::Framed(_, Arrival::Tcp) => dnstap::SocketProtocol::Tcp,
-            Wire::Framed(_, Arrival::Dot(..)) => dnstap::SocketProtocol::Dot,
-            Wire::Framed(_, Arrival::Doh(..)) => dnstap::SocketProtocol::Doh,
-            Wire::Framed(_, Arrival::Doq(_)) => dnstap::SocketProtocol::Doq,
+            Wire::Framed(_, arrival) => arrival.into(),
         }
     }
 
@@ -184,7 +181,7 @@ pub(crate) struct Server {
     updates: Arc<UpdateHandling>,
     journal: Option<Arc<Journal>>,
     /// Where the query stream goes, or `None` when `--dnstap` was not given.
-    /// See [`crate::dnstap`] for why the queue behind it drops.
+    /// See [`rdns_transport::dnstap`] for why the queue behind it drops.
     dnstap: Option<rdns_transport::dnstap::Sink>,
 }
 
@@ -790,10 +787,10 @@ impl Server {
             version: sink.version(),
             message_type,
             socket_protocol: Some(wire.socket_protocol()),
-            peer,
+            initiator: Some(peer),
             // The listener's address is not carried this far, and a wrong one
             // is worse than none on a multi-homed host.
-            local: None,
+            responder: None,
             // Both to nanoseconds, because a reader subtracts them. See
             // `Incoming::arrived` for why the transport's `now` is not one of
             // them.
