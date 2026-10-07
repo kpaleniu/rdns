@@ -69,6 +69,30 @@ route, `--upstream` with a route at `.`, `--root-hints` with `.` routed.
 `--root-hints <file>` reads named.root format. A stray line is skipped rather
 than sinking the file (`parse_root_hints` returns a `Vec`).
 
+**DNS over TLS to a forwarder** (RFC 7858, `TODO.md` #175): a server written
+`ADDR[:PORT]+tls=NAME` in `--upstream`, `--forward-zone` or a table's `servers`
+is asked over TLS only — never UDP first, no truncation step, no cleartext
+fallback. Port 853 by default. Strict profile (RFC 8310): TLS 1.3, ALPN `dot`,
+the certificate checked against `NAME` and `--upstream-tls-ca`'s anchors
+(`upstream-tls-ca` in `[resolver]`), the settings XoT uses
+(`xot::TlsClientTrust`). No system trust store. A failed handshake makes that
+server unreachable for the exchange and is counted
+(`dns_upstream_tls_handshake_failures_total`); the next server is tried, and
+with none left the answer is SERVFAIL, EDE 22.
+
+One connection per server, pipelined (§3.3): each query takes an ID not
+pending on it, and a reply is matched by ID and question. A reply to no pending
+ID is dropped and counted (`dns_upstream_tls_unmatched_total`); one whose
+question is not its ID's closes the connection. Queries ask for RFC 7828's
+keepalive and are padded to a multiple of 128 (RFC 8467 §4.1(1)). Idle close
+after 10 s or the server's keepalive; connections close after the shutdown
+drain. One timeout covers connect, handshake and reply.
+
+Refused at startup: `+tls=` without `--upstream-tls-ca`, the CA flag with no
+`+tls=` server, an anchor file with no certificate, `+tls=` on a stub zone (its
+servers are authorities; RFC 9539 is not done), a `#key` on any forwarder, and
+one address written with two TLS settings.
+
 ---
 
 ## 5.2 Query hygiene — what goes out

@@ -16,9 +16,11 @@
 //! require the master's certificate to carry that name. It is last, and the
 //! name is not optional — RFC 9103 §7.5 makes authenticating the server a MUST,
 //! so there is deliberately no spelling of "encrypt but do not check"
-//! ([`crate::xot`]). Only `--secondary` accepts it; the [`Endpoint`] a
-//! `--also-notify` parses to carries the field, and `NotifyTarget::parse`
-//! refuses it rather than accepting a flag that would do nothing.
+//! ([`crate::xot`]). `--secondary` accepts it, and since `TODO.md` #175 so
+//! does a resolver's forwarder ([`parse_server`]), where it means DNS over TLS
+//! (RFC 7858). The `Endpoint` a `--also-notify` parses to carries the field,
+//! and `NotifyTarget::parse` refuses it rather than accepting a flag that
+//! would do nothing.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -143,6 +145,21 @@ pub(crate) fn parse_endpoint(text: &str, spec: &str) -> ConfigResult<Endpoint> {
         key_name,
         tls,
     })
+}
+
+/// A server a resolver forwards to: `addr[:port][+tls=name]`, port 853 with
+/// `+tls=` and 53 without (`TODO.md` #175). The same parser `--secondary`
+/// uses (`CLAUDE.md` §7). A `#key` is refused rather than ignored: nothing
+/// signs a forwarded query.
+pub fn parse_server(text: &str, spec: &str) -> ConfigResult<(SocketAddr, Option<AuthName>)> {
+    let endpoint = parse_endpoint(text.trim(), spec)?;
+    if endpoint.key_name.is_some() {
+        return Err(ConfigError::new(format!(
+            "{spec:?}: a TSIG key on a forwarder is not supported; nothing would sign the \
+             queries"
+        )));
+    }
+    Ok((endpoint.addr, endpoint.tls))
 }
 
 /// `addr` or `addr:port`, defaulting to `default_port`.

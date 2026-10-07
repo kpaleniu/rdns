@@ -147,10 +147,12 @@ impl From<tokio::time::error::Elapsed> for ResolveError {
 }
 
 mod caches;
+mod dot;
 mod recurse;
 mod upstream;
 mod validate;
 
+pub use dot::{DotConfig, DEFAULT_IDLE};
 pub use upstream::{Answering, Reply, Transport, Upstream};
 
 use caches::{DelegationCache, KeyCache, NsidStore, RttStore, Start};
@@ -285,7 +287,8 @@ impl std::fmt::Display for ResolutionTimer {
 
 /// How a routed domain is answered (`TODO.md` #172, #174).
 ///
-/// Room for a transport beside it (#175) is in [`Route`], not here.
+/// TLS is not here: it is a property of a server, which every route naming
+/// it shares (#175, [`DotConfig`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteKind {
     /// Ask the servers with RD=1 and take what they say: they resolve. BIND's
@@ -440,6 +443,8 @@ pub struct ResolverConfig {
     /// Subtrees exempt from validation for a while (RFC 7646, `TODO.md`
     /// #176). Empty unless the daemon loads some.
     pub ntas: crate::nta::SharedNtas,
+    /// Forwarders asked over TLS only (RFC 7858, `TODO.md` #175).
+    pub dot: Option<DotConfig>,
 }
 
 /// Trust anchors the resolver validates against, replaceable while it runs
@@ -510,6 +515,7 @@ impl Default for ResolverConfig {
             dnssec: None,
             request_nsid: false,
             ntas: crate::nta::SharedNtas::default(),
+            dot: None,
         }
     }
 }
@@ -711,6 +717,7 @@ pub struct Resolver {
     clock: Clock,
     upstream: Upstream,
     tap: Option<ExchangeTap>,
+    dot: Option<dot::DotClients>,
 }
 
 impl Resolver {
@@ -728,6 +735,7 @@ impl Resolver {
         let rtt = RttStore::new(config.delegation_cache_size);
         let nsids = NsidStore::new(config.delegation_cache_size);
         let keys = KeyCache::new(config.delegation_cache_size, clock.clone());
+        let dot = config.dot.clone().map(dot::DotClients::new);
         Resolver {
             config,
             delegations,
@@ -737,6 +745,24 @@ impl Resolver {
             clock,
             upstream: Upstream::Network,
             tap: None,
+            dot,
+        }
+    }
+
+    /// The servers asked over TLS, with the name each must present.
+    pub fn upstream_tls(&self) -> HashMap<SocketAddr, crate::endpoint::AuthName> {
+        self.config
+            .dot
+            .as_ref()
+            .map(|d| d.servers.clone())
+            .unwrap_or_default()
+    }
+
+    /// Close every connection to a TLS forwarder, once the shutdown drain is
+    /// over (`TODO.md` #175).
+    pub async fn close_upstream_connections(&self) {
+        if let Some(dot) = &self.dot {
+            dot.close_all().await;
         }
     }
 

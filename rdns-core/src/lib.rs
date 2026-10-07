@@ -54,8 +54,8 @@ pub use codes::{Class, OpCode, Qtype, QueryClass, ResponseCode, Rtype, Serial, T
 pub use ede::{ExtendedError, InfoCode, EDNS_OPTION_EXTENDED_ERROR};
 pub use edns::{
     Edns, EdnsHeader, EdnsOption, UdpSizes, CLASSIC_UDP_SIZE, EDNS_OPTION_CLIENT_SUBNET,
-    EDNS_OPTION_COOKIE, EDNS_OPTION_NSID, EDNS_OPTION_PADDING, EDNS_VERSION, FLAG_DAY_UDP_SIZE,
-    OPT_RECORD_TYPE,
+    EDNS_OPTION_COOKIE, EDNS_OPTION_NSID, EDNS_OPTION_PADDING, EDNS_OPTION_TCP_KEEPALIVE,
+    EDNS_VERSION, FLAG_DAY_UDP_SIZE, OPT_RECORD_TYPE,
 };
 pub use message::{framed, rand_id, DnsMessage, DnsMessageBuilder, QuerySection};
 pub use record::{ParsedRecord, ResourceRecord};

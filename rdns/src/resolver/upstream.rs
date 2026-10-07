@@ -36,6 +36,9 @@ const UPSTREAM_RECEIVE_BUFFER: usize = 4096;
 pub enum Transport {
     Udp,
     Tcp,
+    /// DNS over TLS to a forwarder (RFC 7858, `TODO.md` #175). Over the
+    /// network this is the resolver's connection pool, not a socket here.
+    Tls,
 }
 
 /// Answers in place of the network: the server asked, the transport and the
@@ -108,6 +111,9 @@ impl Upstream {
             Upstream::Network => match transport {
                 Transport::Udp => udp(server, query, timeout).await,
                 Transport::Tcp => tcp(server, query, timeout).await,
+                Transport::Tls => Err(ResolveError::no_response(format!(
+                    "{server} is not configured for TLS"
+                ))),
             },
             Upstream::Answering(answer) => {
                 tokio::time::timeout(timeout, answer(server, transport, query))

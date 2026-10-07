@@ -115,9 +115,14 @@ fn status(control: &Control) -> String {
         serving.resolver.ntas().snapshot().len()
     );
     let routes = serving.resolver.routes();
+    let tls = serving.resolver.upstream_tls();
     let _ = writeln!(out, "routed domains: {}", routes.len());
     for route in routes {
-        let _ = writeln!(out, "  {}", crate::routes::describe(route, &control.local));
+        let _ = writeln!(
+            out,
+            "  {}",
+            crate::routes::describe(route, &control.local, &tls)
+        );
     }
     out
 }

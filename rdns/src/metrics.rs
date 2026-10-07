@@ -309,6 +309,11 @@ pub struct Counters {
     /// Stale refreshes the queue had no room for. The name is tried again
     /// after the interval, and answered stale until then.
     pub stale_refreshes_dropped: AtomicU64,
+    /// TLS handshakes with a forwarder that failed (`TODO.md` #175): an
+    /// expired certificate there otherwise shows only as SERVFAIL.
+    pub upstream_tls_handshake_failures: AtomicU64,
+    /// Replies from a forwarder over TLS matching no pending query, dropped.
+    pub upstream_tls_unmatched: AtomicU64,
 
     /// Resolutions that ran past RFC 8767 §5's client response timer, by what
     /// they did next (`TODO.md` #58).
@@ -437,6 +442,8 @@ impl DnsMetrics {
             prefetches_dropped: AtomicU64::new(0),
             stale_refreshes: AtomicU64::new(0),
             stale_refreshes_dropped: AtomicU64::new(0),
+            upstream_tls_handshake_failures: AtomicU64::new(0),
+            upstream_tls_unmatched: AtomicU64::new(0),
             stale_answers: AtomicU64::new(0),
             inflight_evicted: AtomicU64::new(0),
             slow_resolutions_completed: AtomicU64::new(0),
@@ -730,6 +737,16 @@ impl DnsMetrics {
                 "dns_stale_refreshes_dropped_total",
                 "Stale refreshes dropped because the queue was full",
                 &self.stale_refreshes_dropped,
+            ),
+            (
+                "dns_upstream_tls_handshake_failures_total",
+                "TLS handshakes with a forwarder that failed",
+                &self.upstream_tls_handshake_failures,
+            ),
+            (
+                "dns_upstream_tls_unmatched_total",
+                "Replies from a forwarder over TLS matching no pending query",
+                &self.upstream_tls_unmatched,
             ),
             (
                 "dns_stale_answers_total",
@@ -1302,6 +1319,8 @@ mod tests {
             &m.prefetches_dropped,
             &m.stale_refreshes,
             &m.stale_refreshes_dropped,
+            &m.upstream_tls_handshake_failures,
+            &m.upstream_tls_unmatched,
             &m.slow_resolutions_completed,
             &m.slow_resolutions_failed,
             &m.stale_answers,

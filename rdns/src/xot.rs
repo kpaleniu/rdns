@@ -108,11 +108,20 @@ impl TlsClientTrust {
     /// nothing in it verifies nothing, so it would start, and then fail every
     /// handshake with a message about the master (`CLAUDE.md` §4).
     pub fn from_ca_file(path: &Path, identity: Option<TlsIdentity>) -> ConfigResult<Self> {
+        Self::load(path, identity, "the transfer trust anchors")
+    }
+
+    /// The anchors a resolver checks its TLS forwarders against
+    /// (`--upstream-tls-ca`, `TODO.md` #175). No client certificate.
+    pub fn for_upstreams(path: &Path) -> ConfigResult<Self> {
+        Self::load(path, None, "the upstream TLS trust anchors")
+    }
+
+    fn load(path: &Path, identity: Option<TlsIdentity>, what: &str) -> ConfigResult<Self> {
         // One loader for both ends of the transfer (`CLAUDE.md` §7): the
         // client's anchors here, the primary's client-certificate anchors in
         // `TODO.md` #59.
-        let roots =
-            crate::tls_identity::TrustAnchors::from_ca_file(path, "the transfer trust anchors")?;
+        let roots = crate::tls_identity::TrustAnchors::from_ca_file(path, what)?;
         let anchors = roots.len();
         let presenting = identity.is_some();
         Ok(TlsClientTrust {
@@ -120,6 +129,11 @@ impl TlsClientTrust {
             anchors,
             presenting,
         })
+    }
+
+    /// The client configuration, for a connector.
+    pub(crate) fn client_config(&self) -> Arc<ClientConfig> {
+        self.config.clone()
     }
 
     /// How many anchors were loaded, for the startup banner.

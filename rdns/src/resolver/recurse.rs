@@ -618,6 +618,21 @@ impl Resolver {
         out: &OutgoingQuery,
         asked: Asked<'_>,
     ) -> ResolveResult<DnsMessage> {
+        // Over TLS only, never UDP first: a server written `+tls=` is never
+        // asked in clear, and a stream has no truncation to retry (#175).
+        if self.dot.as_ref().is_some_and(|d| d.serves(upstream)) {
+            let out = &dot::tls_query(out);
+            let bytes = self
+                .exchange_tapped(*upstream, Transport::Tls, out, asked)
+                .await?;
+            let response = DnsMessage::try_from_bytes(&bytes)?;
+            if !self.response_matches(&response, out) {
+                return Err(ResolveError::no_response(format!(
+                    "TLS reply from {upstream} did not match the query"
+                )));
+            }
+            return Ok(response);
+        }
         let bytes = self
             .exchange_tapped(*upstream, Transport::Udp, out, asked)
             .await?;
@@ -676,10 +691,7 @@ impl Resolver {
         asked: Asked<'_>,
     ) -> ResolveResult<Vec<u8>> {
         let Some(tap) = &self.tap else {
-            return self
-                .upstream
-                .exchange(server, transport, &out.buf, self.exchange_timeout())
-                .await;
+            return self.send(server, transport, out).await;
         };
         use crate::dnstap::{Entry, MessageType, SocketProtocol, Timestamp};
         let (query_type, response_type) = if asked.forwarded {
@@ -695,6 +707,7 @@ impl Resolver {
             socket_protocol: Some(match transport {
                 Transport::Udp => SocketProtocol::Udp,
                 Transport::Tcp => SocketProtocol::Tcp,
+                Transport::Tls => SocketProtocol::Dot,
             }),
             initiator: None,
             responder: Some(server),
@@ -705,10 +718,7 @@ impl Resolver {
             zone: Some(asked.zone.as_wire()),
         };
         tap(&query);
-        let bytes = self
-            .upstream
-            .exchange(server, transport, &out.buf, self.exchange_timeout())
-            .await?;
+        let bytes = self.send(server, transport, out).await?;
         tap(&Entry {
             message_type: response_type,
             response_time: Some(Timestamp::now()),
@@ -717,6 +727,26 @@ impl Resolver {
             ..query
         });
         Ok(bytes)
+    }
+
+    /// One exchange: TLS over the network goes through the connection pool,
+    /// everything else through [`Upstream`].
+    async fn send(
+        &self,
+        server: SocketAddr,
+        transport: Transport,
+        out: &OutgoingQuery,
+    ) -> ResolveResult<Vec<u8>> {
+        match (&self.upstream, &self.dot, transport) {
+            (Upstream::Network, Some(dot), Transport::Tls) => {
+                dot.exchange(server, out, self.exchange_timeout()).await
+            }
+            _ => {
+                self.upstream
+                    .exchange(server, transport, &out.buf, self.exchange_timeout())
+                    .await
+            }
+        }
     }
 
     /// Each wait on one server. Half the per-query timeout, so a second server

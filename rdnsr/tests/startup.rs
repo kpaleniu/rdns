@@ -695,3 +695,61 @@ fn dnstap_settings_are_checked_before_the_dry_run() {
         "a dry run opens no capture"
     );
 }
+
+/// `+tls=` and `--upstream-tls-ca` go together, the anchors must be there,
+/// and a forwarder takes no TSIG key — all refused before the dry run
+/// answers (`TODO.md` #175). The valid pair says what it will check.
+#[test]
+fn the_dry_run_checks_the_upstream_tls_settings() {
+    let dir = ScratchDir::new("rdnsr-upstream-tls");
+    let issued =
+        rcgen::generate_simple_self_signed(vec!["dot.test".to_string()]).expect("a certificate");
+    let ca = dir.join("ca.pem");
+    std::fs::write(&ca, issued.cert.pem()).expect("write the anchors");
+    let empty = dir.join("empty.pem");
+    std::fs::write(&empty, "# nothing\n").expect("write");
+    let (ca, empty) = (ca.to_string_lossy(), empty.to_string_lossy());
+
+    let refused = |args: &[&str], wants: &str| {
+        let mut all = vec!["--check-config"];
+        all.extend_from_slice(args);
+        let out = rdnsr(&all);
+        assert!(!out.status.success(), "{args:?} must be refused");
+        assert!(stderr(&out).contains(wants), "{args:?}: {}", stderr(&out));
+    };
+    refused(
+        &["--upstream", "192.0.2.1+tls=dot.test"],
+        "--upstream-tls-ca",
+    );
+    refused(
+        &["--upstream", "192.0.2.1", "--upstream-tls-ca", &ca],
+        "no server is written with +tls=",
+    );
+    refused(
+        &[
+            "--upstream",
+            "192.0.2.1+tls=dot.test",
+            "--upstream-tls-ca",
+            &empty,
+        ],
+        "no CERTIFICATE block",
+    );
+    refused(
+        &["--forward-zone", "corp.test=192.0.2.1#key"],
+        "TSIG key on a forwarder",
+    );
+
+    let out = rdnsr(&[
+        "--check-config",
+        "--upstream",
+        "192.0.2.1+tls=dot.test",
+        "--upstream-tls-ca",
+        &ca,
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("upstream TLS 1 server(s) over TLS, 1 anchor(s)"),
+        "{}",
+        stdout(&out)
+    );
+}

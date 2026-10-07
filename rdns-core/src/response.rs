@@ -643,6 +643,30 @@ pub fn pad_reply(reply: &mut Vec<u8>, payload: usize, frame: usize) -> bool {
     true
 }
 
+/// Append one option to a finished message whose last record is its OPT, in
+/// place. `false` when there is no OPT last or the RDATA would overflow.
+///
+/// For a query built elsewhere that one transport needs more of: the
+/// resolver's DoT queries carry edns-tcp-keepalive (RFC 7828 §3.2.1), which
+/// UDP ones must not.
+pub fn append_option(msg: &mut Vec<u8>, code: u16, data: &[u8]) -> bool {
+    let Some(opt) = last_record_is_opt(msg) else {
+        return false;
+    };
+    let rdlen = u16::from_be_bytes([msg[opt.rdlen], msg[opt.rdlen + 1]]) as usize;
+    let (Ok(rdlen), Ok(len)) = (
+        u16::try_from(rdlen + 4 + data.len()),
+        u16::try_from(data.len()),
+    ) else {
+        return false;
+    };
+    msg[opt.rdlen..opt.rdlen + 2].copy_from_slice(&rdlen.to_be_bytes());
+    msg.extend_from_slice(&code.to_be_bytes());
+    msg.extend_from_slice(&len.to_be_bytes());
+    msg.extend_from_slice(data);
+    true
+}
+
 /// Where an OPT's RDLENGTH sits, found by walking the message.
 struct OptAt {
     rdlen: usize,

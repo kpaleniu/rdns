@@ -6,18 +6,22 @@
 //! names the entry: a routed domain that silently routes nothing is a setting
 //! the operator believes is in force and is not.
 
-use std::net::{IpAddr, SocketAddr};
-
+use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail};
+use rdns::endpoint::AuthName;
 use rdns::resolver::{LocalZone, Route, RouteKind};
 use rdns::zone::Zone;
 use rdns::Name;
 
-/// `NAME=ADDR[,ADDR…]`, `ADDR` an address with an optional port, 53 by default.
-fn parse_spec(flag: &str, spec: &str) -> anyhow::Result<(Name, Vec<SocketAddr>)> {
+/// One server and, with `+tls=`, the name its certificate must carry.
+type Server = (SocketAddr, Option<AuthName>);
+
+/// `NAME=ADDR[,ADDR…]`, `ADDR` as `rdns::endpoint::parse_server` reads it.
+fn parse_spec(flag: &str, spec: &str) -> anyhow::Result<(Name, Vec<Server>)> {
     let (name, servers) = spec
         .split_once('=')
         .ok_or_else(|| anyhow!("{flag} {spec:?}: want NAME=ADDR[,ADDR...]"))?;
@@ -27,21 +31,12 @@ fn parse_spec(flag: &str, spec: &str) -> anyhow::Result<(Name, Vec<SocketAddr>)>
         .split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| parse_addr(s).ok_or_else(|| anyhow!("{flag} {spec:?}: {s:?} is not an address")))
+        .map(|s| rdns::endpoint::parse_server(s, spec).map_err(|e| anyhow!("{flag} {e}")))
         .collect::<anyhow::Result<Vec<_>>>()?;
     if servers.is_empty() {
         bail!("{flag} {spec:?}: no servers to route {name} to");
     }
     Ok((name, servers))
-}
-
-/// `ip`, `ip:port` or `[v6]:port`.
-fn parse_addr(spec: &str) -> Option<SocketAddr> {
-    spec.parse::<SocketAddr>().ok().or_else(|| {
-        spec.parse::<IpAddr>()
-            .ok()
-            .map(|ip| SocketAddr::new(ip, 53))
-    })
 }
 
 /// A local zone's file, for the SIGHUP reload and the banner (`TODO.md`
@@ -113,17 +108,56 @@ pub(crate) fn reload_local(files: &[LocalFile]) -> String {
     format!("local zones: {changed} of {} changed", files.len())
 }
 
+/// What [`build`] made: the routes, the local zone files, and the servers
+/// asked over TLS with the name each must present (`TODO.md` #175).
+#[derive(Debug)]
+pub(crate) struct Built {
+    pub(crate) routes: Vec<Route>,
+    pub(crate) files: Vec<LocalFile>,
+    pub(crate) tls: HashMap<SocketAddr, AuthName>,
+}
+
+/// Record each server's TLS name, refusing one address written two ways:
+/// TLS is a property of the server, which every route naming it shares.
+fn note_tls(
+    tls: &mut HashMap<SocketAddr, AuthName>,
+    plain: &mut Vec<SocketAddr>,
+    servers: Vec<Server>,
+    flag: &str,
+) -> anyhow::Result<Vec<SocketAddr>> {
+    let mut addrs = Vec::new();
+    for (addr, name) in servers {
+        let clash = match &name {
+            Some(name) => plain.contains(&addr) || tls.get(&addr).is_some_and(|n| n != name),
+            None => tls.contains_key(&addr),
+        };
+        if clash {
+            bail!("{flag}: {addr} is written with two different TLS settings; one server, one way");
+        }
+        match name {
+            Some(name) => {
+                tls.insert(addr, name);
+            }
+            None => plain.push(addr),
+        }
+        addrs.push(addr);
+    }
+    Ok(addrs)
+}
+
 /// The table, or the refusal naming what is wrong with it.
 pub(crate) fn build(
     forward: &[String],
     stub: &[String],
     local: &[String],
     no_validate: &[String],
-    upstream: &[SocketAddr],
+    upstream: &[String],
     root_hints: bool,
-) -> anyhow::Result<(Vec<Route>, Vec<LocalFile>)> {
+) -> anyhow::Result<Built> {
     let mut routes: Vec<Route> = Vec::new();
     let mut files = Vec::new();
+    let mut tls = HashMap::new();
+    let mut plain = Vec::new();
     let mut add = |route: Route, flag: &str| -> anyhow::Result<()> {
         if let Some(other) = routes.iter().find(|r| r.name == route.name) {
             bail!(
@@ -137,10 +171,17 @@ pub(crate) fn build(
     };
     for spec in forward {
         let (name, servers) = parse_spec("--forward-zone", spec)?;
+        let servers = note_tls(&mut tls, &mut plain, servers, "--forward-zone")?;
         add(Route::forward(name, servers), "--forward-zone")?;
     }
     for spec in stub {
         let (name, servers) = parse_spec("--stub-zone", spec)?;
+        // A stub zone's servers are authorities, and encrypting to those is
+        // RFC 9539's question, not taken here.
+        if servers.iter().any(|(_, tls)| tls.is_some()) {
+            bail!("--stub-zone {spec:?}: +tls= is for forward zones; a stub's servers are authorities");
+        }
+        let servers = note_tls(&mut tls, &mut plain, servers, "--stub-zone")?;
         add(Route::stub(name, servers), "--stub-zone")?;
     }
     for spec in local {
@@ -166,7 +207,12 @@ pub(crate) fn build(
         if routes.iter().any(|r| r.name.as_ref().is_root()) {
             bail!("--upstream is a forward zone at `.`, and `.` is routed already");
         }
-        routes.push(Route::forward(Name::root(), upstream.to_vec()));
+        let servers = upstream
+            .iter()
+            .map(|s| rdns::endpoint::parse_server(s, s).map_err(|e| anyhow!("--upstream {e}")))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let servers = note_tls(&mut tls, &mut plain, servers, "--upstream")?;
+        routes.push(Route::forward(Name::root(), servers));
     }
     for name in no_validate {
         let parsed = Name::from_presentation(name)
@@ -182,7 +228,7 @@ pub(crate) fn build(
     if root_hints && routes.iter().any(|r| r.name.as_ref().is_root()) {
         bail!("--root-hints says where recursion starts, and `.` is routed, so nothing recurses");
     }
-    Ok((routes, files))
+    Ok(Built { routes, files, tls })
 }
 
 fn kind(kind: &RouteKind) -> &'static str {
@@ -193,8 +239,13 @@ fn kind(kind: &RouteKind) -> &'static str {
     }
 }
 
-/// One line per route, for the startup banner.
-pub(crate) fn describe(route: &Route, files: &[LocalFile]) -> String {
+/// One line per route, for the startup banner: each server with its
+/// authentication name when it is asked over TLS.
+pub(crate) fn describe(
+    route: &Route,
+    files: &[LocalFile],
+    tls: &HashMap<SocketAddr, AuthName>,
+) -> String {
     if let RouteKind::Local(zone) = &route.kind {
         let held = zone.get();
         let path = files
@@ -215,7 +266,10 @@ pub(crate) fn describe(route: &Route, files: &[LocalFile]) -> String {
         route
             .servers
             .iter()
-            .map(SocketAddr::to_string)
+            .map(|addr| match tls.get(addr) {
+                Some(name) => format!("{addr}+tls={name}"),
+                None => addr.to_string(),
+            })
             .collect::<Vec<_>>()
             .join(","),
         if route.validate {
@@ -234,9 +288,36 @@ mod tests {
         specs.iter().map(|s| s.to_string()).collect()
     }
 
+    /// `+tls=` defaults the port to 853 (RFC 7858 §3.1), keeps a stated one,
+    /// and the same server may be named by two routes written the same way.
+    #[test]
+    fn a_tls_server_is_recorded_with_its_name() {
+        let built = build(
+            &strings(&[
+                "corp.test=192.0.2.1+tls=dot.test,192.0.2.2",
+                "lab.test=192.0.2.1+tls=dot.test",
+            ]),
+            &[],
+            &[],
+            &[],
+            &strings(&["[2001:db8::1]:8853+tls=dot.example"]),
+            false,
+        )
+        .expect("builds");
+        let tls_addr: SocketAddr = "192.0.2.1:853".parse().unwrap();
+        assert_eq!(built.routes[0].servers[0], tls_addr);
+        assert_eq!(built.routes[0].servers[1].port(), 53);
+        assert_eq!(built.tls.len(), 2);
+        assert_eq!(built.tls[&tls_addr].to_string(), "dot.test");
+        assert_eq!(
+            describe(&built.routes[2], &[], &built.tls),
+            "forward zone . -> [2001:db8::1]:8853+tls=dot.example"
+        );
+    }
+
     #[test]
     fn specs_parse_with_and_without_ports() {
-        let (routes, _) = build(
+        let Built { routes, .. } = build(
             &strings(&["corp.test=192.0.2.1,192.0.2.2:5353"]),
             &strings(&["lab.test=[2001:db8::1]:53"]),
             &[],
@@ -255,12 +336,12 @@ mod tests {
     /// Each refusal names the entry.
     #[test]
     fn the_refusals() {
-        let refused = |f: &[&str], s: &[&str], n: &[&str], up: &[SocketAddr], hints: bool| {
+        let refused = |f: &[&str], s: &[&str], n: &[&str], up: &[String], hints: bool| {
             build(&strings(f), &strings(s), &[], &strings(n), up, hints)
                 .expect_err("refused")
                 .to_string()
         };
-        let up: SocketAddr = "192.0.2.9:53".parse().unwrap();
+        let up = "192.0.2.9:53".to_string();
         for (message, wants) in [
             (
                 refused(&["a..b=192.0.2.1"], &[], &[], &[], false),
@@ -296,10 +377,44 @@ mod tests {
                 "no routed domain",
             ),
             (
-                refused(&[".=192.0.2.1"], &[], &[], &[up], false),
+                refused(&[".=192.0.2.1"], &[], &[], std::slice::from_ref(&up), false),
                 "--upstream",
             ),
             (refused(&[], &[], &[], &[up], true), "--root-hints"),
+            (
+                refused(
+                    &[],
+                    &["lab.test=192.0.2.1+tls=ns.lab.test"],
+                    &[],
+                    &[],
+                    false,
+                ),
+                "forward zones",
+            ),
+            (
+                refused(&["corp.test=192.0.2.1#key"], &[], &[], &[], false),
+                "TSIG key on a forwarder",
+            ),
+            (
+                refused(
+                    &["a.test=192.0.2.1+tls=dot.test", "b.test=192.0.2.1:853"],
+                    &[],
+                    &[],
+                    &[],
+                    false,
+                ),
+                "two different TLS settings",
+            ),
+            (
+                refused(
+                    &["a.test=192.0.2.1+tls=one.test"],
+                    &[],
+                    &[],
+                    &["192.0.2.1+tls=two.test".to_string()],
+                    false,
+                ),
+                "two different TLS settings",
+            ),
         ] {
             assert!(message.contains(wants), "{wants}: {message}");
         }
@@ -318,7 +433,7 @@ mod tests {
 
         fn held(dir: &ScratchDir, name: &str, text: &str) -> (Vec<Route>, Vec<LocalFile>) {
             let path = dir.write("local.zone", text);
-            build(
+            let built = build(
                 &[],
                 &[],
                 &[format!("{name}={}", path.display())],
@@ -326,7 +441,8 @@ mod tests {
                 &[],
                 false,
             )
-            .expect("builds")
+            .expect("builds");
+            (built.routes, built.files)
         }
 
         fn resolving(routes: Vec<Route>, policy: PolicyZones) -> Arc<crate::answer::Resolving> {

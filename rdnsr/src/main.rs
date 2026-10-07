@@ -43,7 +43,6 @@ mod testutil;
 static ALLOC: rdns::testutil::Counting<std::alloc::System> =
     rdns::testutil::Counting(std::alloc::System);
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -224,8 +223,12 @@ struct Cli {
     /// (repeatable). Passing any `--upstream` switches the resolver from
     /// recursion to forwarding for every name, as BIND's global `forwarders`
     /// does.
+    ///
+    /// `ADDR[:PORT][+tls=NAME]`: with `+tls=` asked over DNS over TLS only
+    /// (RFC 7858), port 853 by default, the certificate checked against NAME
+    /// and --upstream-tls-ca. Never in clear, and no fallback.
     #[arg(long, conflicts_with = "config")]
-    upstream: Vec<SocketAddr>,
+    upstream: Vec<String>,
     /// Send one domain to these servers with RD=1 and take their answers:
     /// `NAME=ADDR[,ADDR...]`, `ADDR` as `ip`, `ip:port` or `[v6]:port`.
     /// Repeatable.
@@ -293,6 +296,17 @@ struct Cli {
     /// a new path is enough to start.
     #[arg(long, conflicts_with = "config")]
     auto_trust_anchor: Option<std::path::PathBuf>,
+    /// PEM certificate authorities a `+tls=` forwarder's certificate is
+    /// checked against. Required with any `+tls=` server, refused without
+    /// one.
+    ///
+    /// No system trust store is read. For a public resolver, point this at
+    /// the system bundle: `/etc/ssl/certs/ca-certificates.crt` and the like
+    /// on Unix; on Windows export the roots to PEM, e.g. with PowerShell's
+    /// `Get-ChildItem Cert:\LocalMachine\Root` and `Export-Certificate`
+    /// then `certutil -encode`.
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
+    upstream_tls_ca: Option<PathBuf>,
     /// A file of negative trust anchors (RFC 7646): subtrees answered without
     /// validation until a set time, for a zone whose DNSSEC its owner broke.
     /// Needs --dnssec-validate.
@@ -828,7 +842,11 @@ async fn main() -> anyhow::Result<()> {
     };
     // Above the dry run, with every refusal naming its entry (`TODO.md` #172).
     // `--upstream` is a forward zone at `.`.
-    let (routes, local_files) = routes::build(
+    let routes::Built {
+        routes,
+        files: local_files,
+        tls,
+    } = routes::build(
         &cli.forward_zone,
         &cli.stub_zone,
         &cli.local_zone,
@@ -837,6 +855,35 @@ async fn main() -> anyhow::Result<()> {
         cli.root_hints.is_some(),
     )?;
     config.routes = routes;
+    // Made here rather than with the shell: the TLS forwarders count their
+    // handshake failures into it (`TODO.md` #175).
+    let metrics = DnsMetrics::new();
+    // Above the dry run: a CA that does not load is a startup failure.
+    let upstream_tls = match (&cli.upstream_tls_ca, tls.is_empty()) {
+        (Some(path), false) => {
+            let trust = rdns::xot::TlsClientTrust::for_upstreams(path)?;
+            let anchors = trust.anchor_count();
+            config.dot = Some(rdns::resolver::DotConfig {
+                trust,
+                servers: tls.clone(),
+                metrics: metrics.clone(),
+            });
+            format!(
+                "{} server(s) over TLS, {anchors} anchor(s) from {}",
+                tls.len(),
+                path.display()
+            )
+        }
+        (None, false) => bail!(
+            "a +tls= server needs --upstream-tls-ca: the certificate is checked against \
+             the operator's anchors and nothing else"
+        ),
+        (Some(_), true) => bail!(
+            "--upstream-tls-ca is given and no server is written with +tls=, so nothing \
+             would use it"
+        ),
+        (None, true) => "off".to_string(),
+    };
     let recursing = !config.routes.iter().any(|r| r.name.as_ref().is_root());
 
     // Fail loudly on a hints file that yields no addresses; falling back to
@@ -935,7 +982,7 @@ async fn main() -> anyhow::Result<()> {
         config
             .routes
             .iter()
-            .map(|route| routes::describe(route, &local_files))
+            .map(|route| routes::describe(route, &local_files, &tls))
             .chain((!rest.is_empty()).then_some(rest))
             .collect::<Vec<_>>()
             .join("; ")
@@ -1105,7 +1152,7 @@ async fn main() -> anyhow::Result<()> {
             .count();
         println!(
             "configuration is valid: {}, {} policy feed(s){}, cache {}, listening on {}, \
-             encrypted transports {}, query ACL {}, empty zones {}, NSID {}",
+             encrypted transports {}, upstream TLS {}, query ACL {}, empty zones {}, NSID {}",
             source,
             in_force.zones().len(),
             // Said out loud because a feed at `passthru` or `disabled` blocks
@@ -1130,6 +1177,7 @@ async fn main() -> anyhow::Result<()> {
                 None => "disabled".to_string(),
                 Some(encrypted) => format!("on {}, certificate loads", encrypted.listeners()),
             },
+            upstream_tls,
             acl.describe(),
             empty_zones.describe(),
             match nsid {
@@ -1182,7 +1230,7 @@ async fn main() -> anyhow::Result<()> {
         udp,
         limiter: Arc::new(RateLimiter::new(query_limit)),
         responses: Arc::new(ResponseLimiter::per_second(cli.response_rate)),
-        metrics: Arc::new(DnsMetrics::new()),
+        metrics: Arc::new(metrics),
         logger: Arc::new(QueryLogger::new()),
         admission: Arc::new(AdmissionCheck::new(admission.clone())),
         per_source: per_source.clone(),
@@ -1198,7 +1246,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, \
          UDP reply cap: {}B (advertising {}B), UDP in flight: {}, \
-         connections: {} per listener, {}, idle {}s, encrypted: {}, query ACL: {}, NSID: {}",
+         connections: {} per listener, {}, idle {}s, encrypted: {}, upstream TLS: {}, \
+         query ACL: {}, NSID: {}",
         listening,
         source,
         if capacity == 0 {
@@ -1230,6 +1279,7 @@ async fn main() -> anyhow::Result<()> {
             Some(encrypted) => stream_listeners.describe(encrypted),
             None => "off (--tls-listen, --quic-listen, --https-listen)".to_string(),
         },
+        upstream_tls,
         acl.describe(),
         match nsid {
             Some(nsid) => rdns::config::show_nsid(nsid),
@@ -1555,5 +1605,7 @@ async fn main() -> anyhow::Result<()> {
     // transport served; what the drain then waits for here is a resolution a
     // client is waiting on, or the RFC 5011 manager part-way through rewriting
     // the anchor file.
-    rdns_transport::serve_until_stopped(loops, anomalies, shutdown).await
+    let stopped = rdns_transport::serve_until_stopped(loops, anomalies, shutdown).await;
+    serving.resolver.close_upstream_connections().await;
+    stopped
 }

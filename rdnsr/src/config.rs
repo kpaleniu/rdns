@@ -15,7 +15,6 @@
 //! is the policy feeds. Every key here is a flag `rdnsr` already has, except
 //! the one the file exists for: `[[rpz.feeds]].policy`, which is per feed.
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -139,7 +138,7 @@ struct ResolverSection {
     /// Naming any upstream switches this from recursion to forwarding, exactly
     /// as the flag does.
     #[serde(default)]
-    upstream: Vec<SocketAddr>,
+    upstream: Vec<String>,
     root_hints: Option<PathBuf>,
     #[serde(default = "crate::default_cache_size")]
     cache_size: usize,
@@ -152,6 +151,8 @@ struct ResolverSection {
     trust_anchor: Option<PathBuf>,
     auto_trust_anchor: Option<PathBuf>,
     negative_trust_anchors: Option<PathBuf>,
+    /// `--upstream-tls-ca`: anchors for the `+tls=` servers (`TODO.md` #175).
+    upstream_tls_ca: Option<PathBuf>,
     #[serde(default = "crate::default_serve_stale")]
     serve_stale: u64,
     #[serde(default = "crate::default_resolution_timer")]
@@ -193,6 +194,7 @@ impl Default for ResolverSection {
             trust_anchor: None,
             auto_trust_anchor: None,
             negative_trust_anchors: None,
+            upstream_tls_ca: None,
             serve_stale: crate::default_serve_stale(),
             resolution_timer: crate::default_resolution_timer(),
             serve_stale_first: false,
@@ -480,6 +482,7 @@ impl Config {
             trust_anchor,
             auto_trust_anchor,
             negative_trust_anchors,
+            upstream_tls_ca,
             serve_stale,
             resolution_timer,
             serve_stale_first,
@@ -500,6 +503,7 @@ impl Config {
         cli.trust_anchor = trust_anchor.clone();
         cli.auto_trust_anchor = auto_trust_anchor.clone();
         cli.negative_trust_anchors = negative_trust_anchors.clone();
+        cli.upstream_tls_ca = upstream_tls_ca.clone();
         cli.serve_stale = *serve_stale;
         cli.resolution_timer = (*resolution_timer)
             .try_into()

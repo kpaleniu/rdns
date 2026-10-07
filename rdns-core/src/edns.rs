@@ -152,6 +152,9 @@ pub const EDNS_OPTION_NSID: u16 = 3;
 pub const EDNS_OPTION_CLIENT_SUBNET: u16 = 8;
 /// DNS Cookie (RFC 7873).
 pub const EDNS_OPTION_COOKIE: u16 = 10;
+/// edns-tcp-keepalive (RFC 7828): empty in a query, a timeout in units of
+/// 100 ms in a reply.
+pub const EDNS_OPTION_TCP_KEEPALIVE: u16 = 11;
 /// Padding (RFC 7830).
 pub const EDNS_OPTION_PADDING: u16 = 12;
 
