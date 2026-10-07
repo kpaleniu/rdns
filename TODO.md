@@ -40,11 +40,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Eleven items. #171-#185 were filed 2026-10-05 from a comparison against
+Ten items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
 #173. #181 was closed wontfix in triage; #171-#174, #176, #179, #183, #184, #186,
-#187 and #189 closed 2026-10-07:
+#187, #189 and #191 closed 2026-10-07:
 
 - `rdnsr`: #175 no encrypted upstream, #177 no local
   root (RFC 8806), #178 no control channel.
@@ -54,7 +54,6 @@ filing; #186-#192 came out of triaging the first batch, #193 out of closing
   closed, 185c and 185d wontfix.
 - #188 neither daemon can be controlled or reloaded on Windows.
 - #190 neither daemon can run as a Windows service.
-- #191 `rdnsr` emits no dnstap.
 - #192 no Windows Event Log sink.
 - #193 six RFC 6303 zones are not empty zones (needs triage).
 
@@ -1116,6 +1115,7 @@ the week; the record is under "How the queue kept going stale" in
 | **176** | `rdnsr` had no negative trust anchors (RFC 7646) | **filed 2026-10-05, closed 2026-10-07.** · `060f989` · [`docs/closed/176.md`](docs/closed/176.md) |
 | **172** | `rdnsr` could not forward one domain and recurse the rest | **filed 2026-10-05, closed 2026-10-07.** · `c76081a` · [`docs/closed/172.md`](docs/closed/172.md) |
 | **174** | `rdnsr` had no local data except through RPZ | **filed 2026-10-05, closed 2026-10-07.** · `977c0f6` · [`docs/closed/174.md`](docs/closed/174.md) |
+| **191** | `rdnsr` emitted no dnstap | **filed 2026-10-07, closed 2026-10-07.** · `410adf9`, `c8810c3` · [`docs/closed/191.md`](docs/closed/191.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
