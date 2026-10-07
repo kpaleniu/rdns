@@ -40,14 +40,14 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Ten items. #171-#185 were filed 2026-10-05 from a comparison against
+Nine items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
 #173. #181 was closed wontfix in triage; #171-#174, #176, #179, #183, #184, #186,
-#187, #189 and #191 closed 2026-10-07:
+#187, #189, #191 and #178 closed 2026-10-07:
 
 - `rdnsr`: #175 no encrypted upstream, #177 no local
-  root (RFC 8806), #178 no control channel.
+  root (RFC 8806).
 - `rdnsd`: #180 KSK rollover does not check the parent's DS,
   #182 catalog zones not generated.
 - #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
@@ -1116,6 +1116,7 @@ the week; the record is under "How the queue kept going stale" in
 | **172** | `rdnsr` could not forward one domain and recurse the rest | **filed 2026-10-05, closed 2026-10-07.** · `c76081a` · [`docs/closed/172.md`](docs/closed/172.md) |
 | **174** | `rdnsr` had no local data except through RPZ | **filed 2026-10-05, closed 2026-10-07.** · `977c0f6` · [`docs/closed/174.md`](docs/closed/174.md) |
 | **191** | `rdnsr` emitted no dnstap | **filed 2026-10-07, closed 2026-10-07.** · `410adf9`, `c8810c3` · [`docs/closed/191.md`](docs/closed/191.md) |
+| **178** | rdnsr control socket: flush, dump, nta, reload | **filed 2026-10-05, closed 2026-10-07.** · `3fcd534` · [`docs/closed/178.md`](docs/closed/178.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
