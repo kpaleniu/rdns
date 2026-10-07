@@ -231,7 +231,23 @@ on TCP. Honouring `udp_payload_size()` alone is what `TODO.md` #41b was.
 `EdnsHeader` is a `Copy` struct of the three fields.
 
 Named option codes, round-tripped as opaque bytes and never interpreted: NSID
-(3), Client Subnet (8), Cookie (10), Padding (12).
+(3), Client Subnet (8), Cookie (10). Padding (12) is read on a request
+(`ClientEdns::padding`) and written on a reply.
+
+### Padding (RFC 7830, RFC 8467), option code 12
+
+A reply over DoT, DoH or DoQ to a query that carried a Padding option, of any
+content (§3), carries one: `response::pad_reply` grows the finished message's
+OPT, which must be its last record, to the next multiple of 468 octets
+(RFC 8467 §4.1(2)) with 0x00 octets. Never on UDP or plain TCP, whatever the
+client sent: RFC 7830 §6, "implementations MUST NOT use this option if the DNS
+transport is not encrypted" (`Arrival::may_pad`). Never unasked.
+
+Bounded by the client's payload size when the reply fits under it (§4), and by
+the frame otherwise. Applied before TSIG, so the MAC covers it and the record
+leaves the total off-block by its own length. A zone transfer over DoT mirrors
+the OPT on every envelope, which RFC 5936 §2.2.5 allows, and pads each
+(`TODO.md` #187).
 
 ### Extended DNS Errors (RFC 8914), option code 15
 

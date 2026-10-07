@@ -316,6 +316,14 @@ impl Edns {
         Ok(options)
     }
 
+    /// Whether an option with `code` is in a well-formed list, without
+    /// copying its data.
+    pub fn has_option(&self, code: u16) -> Result<bool, WireError> {
+        let mut found = false;
+        Self::walk_options(&self.rdata, |c, _| found |= c == code)?;
+        Ok(found)
+    }
+
     /// Whether the option list is well formed, without building it — the
     /// FORMERR question, which the answer path asks and [`Edns::options`] does
     /// more work than it needs to answer.

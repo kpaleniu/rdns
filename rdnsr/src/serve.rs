@@ -10,9 +10,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rdns::peer::Peer;
+use rdns::response::ClientEdns;
 use rdns::security::ResponseVerdict;
 use rdns::shutdown::{Busy, Stop};
 use rdns::validation::{Arrival, Transport};
+use rdns::DnsMessage;
 use rdns_transport::{recv_error_is_transient, tcp, ServeContext, UDP_RECEIVE_BUFFER};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -163,13 +165,25 @@ impl tcp::Handler for Resolving {
         peer: SocketAddr,
         now: u64,
         // A resolver answers a query the same way whatever hid it from the
-        // path. The parameter is `rdnsd`'s: only a zone transfer has a policy
-        // about how private the connection was (RFC 9103 §11).
-        _arrival: Arrival,
+        // path; what the arrival decides here is only whether the reply may be
+        // padded (RFC 7830 §6).
+        arrival: Arrival,
         out: mpsc::Sender<tcp::Reply>,
     ) {
-        if let Some(reply) = handle_query(packet, Peer::from(peer), now, self, Transport::Tcp).await
+        // Read before `handle_query` takes the packet. Only on an encrypted
+        // transport, so plain TCP pays no second parse (`TODO.md` #187).
+        let padding = arrival
+            .may_pad()
+            .then(|| DnsMessage::try_from_bytes(&packet).ok())
+            .flatten()
+            .filter(|request| ClientEdns::of(request).padding())
+            .map(|request| request.udp_payload_size() as usize);
+        if let Some(mut reply) =
+            handle_query(packet, Peer::from(peer), now, self, Transport::Tcp).await
         {
+            if let Some(payload) = padding {
+                rdns::response::pad_reply(&mut reply, payload, u16::MAX as usize);
+            }
             tcp::send_framed(&out, &reply).await;
         }
     }
@@ -392,6 +406,82 @@ mod tests {
 
         shutdown.begin();
         let _ = server.await;
+    }
+
+    /// RFC 7830 §4 over DoT, and never over plain TCP (§6), for this
+    /// daemon's handler (`TODO.md` #187). The UPDATE is NOTIMP out of the
+    /// message alone, so nothing is resolved. Watched failing with the
+    /// handler's padding removed.
+    #[tokio::test]
+    async fn a_padded_query_over_dot_gets_a_padded_reply() {
+        let mut msg = DnsMessage::try_from_bytes(&message(OpCode::Update, false)).expect("parses");
+        msg.set_edns(
+            rdns::Edns::with_options(
+                1232,
+                0,
+                false,
+                &[rdns::EdnsOption {
+                    code: 12,
+                    data: Vec::new(),
+                }],
+            )
+            .expect("options"),
+        );
+        let query = msg.to_bytes_within(512).expect("serialize");
+
+        for (arrival, padded) in [
+            (
+                Arrival::Dot(
+                    rdns::validation::TlsVersion::Tls13,
+                    rdns::validation::PeerCertificate::none(),
+                ),
+                true,
+            ),
+            (Arrival::Tcp, false),
+        ] {
+            let shutdown = Shutdown::new();
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let serving = context();
+            let server = tokio::spawn(async move {
+                let (stream, peer) = listener.accept().await.expect("accept");
+                tcp::serve_one(
+                    stream,
+                    peer,
+                    serving,
+                    TransportLimits::default(),
+                    tcp::RateLimit::PerConnection,
+                    arrival,
+                    shutdown.stop_handle(),
+                )
+                .await;
+            });
+            let mut client = TcpStream::connect(addr).await.expect("connect");
+            client
+                .write_all(&rdns::framed(&query).expect("frames"))
+                .await
+                .expect("send");
+            let mut prefix = [0u8; 2];
+            client.read_exact(&mut prefix).await.expect("a reply");
+            let mut reply = vec![0u8; u16::from_be_bytes(prefix) as usize];
+            client.read_exact(&mut reply).await.expect("its body");
+            let parsed = DnsMessage::try_from_bytes(&reply).expect("well formed");
+            assert_eq!(parsed.rcode, ResponseCode::NotImplemented);
+            let has_padding = parsed
+                .edns
+                .expect("the OPT is mirrored")
+                .options()
+                .expect("options")
+                .iter()
+                .any(|o| o.code == 12);
+            assert_eq!(has_padding, padded);
+            assert_eq!(
+                reply.len().is_multiple_of(rdns::response::PADDING_BLOCK),
+                padded
+            );
+            drop(client);
+            let _ = server.await;
+        }
     }
 
     /// An UPDATE carrying `additionals` additional records, which

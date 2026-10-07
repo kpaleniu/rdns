@@ -418,7 +418,8 @@ pub(crate) fn write_opt(
 /// are out of the way.
 ///
 /// Carries only what a reply needs: whether to attach an OPT at all
-/// (RFC 6891 §6.1.1) and what to set DO to (RFC 3225 §3). The advertised
+/// (RFC 6891 §6.1.1), what to set DO to (RFC 3225 §3), and whether the client
+/// asked for padding (RFC 7830 §4, `TODO.md` #187). The advertised
 /// payload size is not here — that is [`DnsMessage::udp_payload_size`], which
 /// applies §6.2.3's floor, and is a question about the transport rather than
 /// about the reply's OPT.
@@ -426,8 +427,9 @@ pub(crate) fn write_opt(
 pub enum ClientEdns {
     /// No OPT record: the reply carries none either.
     Absent,
-    /// An OPT we can answer, with DO as the client set it.
-    Present { do_bit: bool },
+    /// An OPT we can answer, with DO as the client set it, and whether it
+    /// carried a Padding option (code 12).
+    Present { do_bit: bool, padding: bool },
 }
 
 impl ClientEdns {
@@ -445,7 +447,10 @@ impl ClientEdns {
     /// DO bit, which RFC 3225 §3 says "MUST be copied in the response"
     /// (`CLAUDE.md` §7).
     pub fn of(request: &DnsMessage) -> ClientEdns {
-        client_edns(request).unwrap_or(ClientEdns::Present { do_bit: false })
+        client_edns(request).unwrap_or(ClientEdns::Present {
+            do_bit: false,
+            padding: false,
+        })
     }
 
     fn is_present(self) -> bool {
@@ -455,7 +460,13 @@ impl ClientEdns {
     /// DNSSEC records are the client's to ask for (RFC 4035 §3.1.1); no OPT is
     /// no DO.
     pub fn do_bit(self) -> bool {
-        matches!(self, ClientEdns::Present { do_bit: true })
+        matches!(self, ClientEdns::Present { do_bit: true, .. })
+    }
+
+    /// The query carried RFC 7830's Padding option, so a reply over an
+    /// encrypted transport owes one ([`pad_reply`]).
+    pub fn padding(self) -> bool {
+        matches!(self, ClientEdns::Present { padding: true, .. })
     }
 
     /// The OPT to mirror back at `payload_size`, or `None` when the client used
@@ -506,7 +517,8 @@ impl ClientEdns {
 ///
 /// `edns_header` rather than `edns()`: nothing here wants the option list, which
 /// costs a `Vec` per option, and it still checks the list is well formed. Both
-/// daemons wrote this sequence out (`TODO.md` #30h).
+/// daemons wrote this sequence out (`TODO.md` #30h). The Padding option is
+/// looked for with [`Edns::has_option`], which copies nothing.
 pub fn client_edns(request: &DnsMessage) -> Result<ClientEdns, ResponseCode> {
     let header = request
         .edns_header()
@@ -516,7 +528,110 @@ pub fn client_edns(request: &DnsMessage) -> Result<ClientEdns, ResponseCode> {
         Some(edns) if edns.version > crate::EDNS_VERSION => Err(ResponseCode::BadOptVersion),
         Some(edns) => Ok(ClientEdns::Present {
             do_bit: edns.do_bit,
+            padding: request
+                .edns
+                .as_ref()
+                .is_some_and(|opt| opt.has_option(crate::edns::EDNS_OPTION_PADDING) == Ok(true)),
         }),
+    }
+}
+
+/// RFC 8467 §4.1(2): a server "SHOULD pad the corresponding response to a
+/// multiple of 468 octets".
+pub const PADDING_BLOCK: usize = 468;
+
+/// Pad a finished, unsigned reply whose last record is its OPT, in place
+/// (RFC 7830, `TODO.md` #187). `false` when there is no OPT last, or no room.
+///
+/// The caller decides *whether*: only a reply over an encrypted transport to a
+/// query that carried the option, because RFC 7830 §6 says "implementations
+/// MUST NOT use this option if the DNS transport is not encrypted". This
+/// decides *how much*: the whole message, option header included, to the next
+/// multiple of [`PADDING_BLOCK`], with 0x00 octets (§3).
+///
+/// Here, on bytes, because only the final length decides it, and every reply
+/// leaves through serialization by a different builder. Before TSIG, which
+/// must be last (RFC 8945 §5.1) and has to cover the padding.
+///
+/// `payload` is the client's advertised size and `frame` what the transport
+/// can carry, each less anything the caller will still append. §4: "padded
+/// DNS messages MUST NOT exceed the number of octets specified in the
+/// Requestor's Payload Size field", so a reply that fits under `payload` is
+/// padded at most to it. One already past it — a stream reply larger than a
+/// datagram could be, which is ordinary — was never bounded by it, and is
+/// bounded by `frame` instead.
+pub fn pad_reply(reply: &mut Vec<u8>, payload: usize, frame: usize) -> bool {
+    let Some(opt) = last_record_is_opt(reply) else {
+        return false;
+    };
+    let len = reply.len();
+    let limit = if len <= payload { payload } else { frame };
+    let target = (len + 4).div_ceil(PADDING_BLOCK) * PADDING_BLOCK;
+    let target = target.min(limit);
+    if target < len + 4 {
+        return false;
+    }
+    let pad = target - len - 4;
+    let rdlen = u16::from_be_bytes([reply[opt.rdlen], reply[opt.rdlen + 1]]) as usize;
+    let Ok(rdlen) = u16::try_from(rdlen + 4 + pad) else {
+        return false;
+    };
+    let Ok(pad16) = u16::try_from(pad) else {
+        return false;
+    };
+    reply[opt.rdlen..opt.rdlen + 2].copy_from_slice(&rdlen.to_be_bytes());
+    reply.extend_from_slice(&crate::edns::EDNS_OPTION_PADDING.to_be_bytes());
+    reply.extend_from_slice(&pad16.to_be_bytes());
+    reply.resize(target, 0);
+    true
+}
+
+/// Where an OPT's RDLENGTH sits, found by walking the message.
+struct OptAt {
+    rdlen: usize,
+}
+
+/// The OPT, if it is the message's last record, sits in the additional
+/// section and ends exactly where the message does. Walked rather than assumed
+/// from the tail: a record's start cannot be found from its end.
+fn last_record_is_opt(msg: &[u8]) -> Option<OptAt> {
+    if msg.len() < HEADER_LEN {
+        return None;
+    }
+    let count = |at: usize| u16::from_be_bytes([msg[at], msg[at + 1]]) as usize;
+    let (qd, an, ns, ar) = (count(4), count(6), count(8), count(10));
+    if ar == 0 {
+        return None;
+    }
+    let mut pos = HEADER_LEN;
+    for _ in 0..qd {
+        pos = skip_name(msg, pos)?.checked_add(4)?;
+    }
+    let mut last = None;
+    for _ in 0..an + ns + ar {
+        let start = pos;
+        pos = skip_name(msg, pos)?;
+        let fixed = msg.get(pos..pos + 10)?;
+        let rtype = u16::from_be_bytes([fixed[0], fixed[1]]);
+        let rdlen = u16::from_be_bytes([fixed[8], fixed[9]]) as usize;
+        last = Some((start, rtype, pos + 8));
+        pos = pos.checked_add(10 + rdlen)?;
+    }
+    let (start, rtype, rdlen) = last?;
+    (pos == msg.len() && rtype == OPT_RECORD_TYPE.to_u16() && msg.get(start) == Some(&0))
+        .then_some(OptAt { rdlen })
+}
+
+/// One past a name, compressed or not.
+fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *msg.get(pos)?;
+        match len {
+            0 => return Some(pos + 1),
+            l if l & 0xc0 == 0xc0 => return (pos + 2 <= msg.len()).then_some(pos + 2),
+            l if l & 0xc0 == 0 => pos += 1 + l as usize,
+            _ => return None,
+        }
     }
 }
 
@@ -585,7 +700,10 @@ mod tests {
 
         assert_eq!(
             client_edns(&request("example.com.", true)),
-            Ok(ClientEdns::Present { do_bit: false })
+            Ok(ClientEdns::Present {
+                do_bit: false,
+                padding: false
+            })
         );
 
         let mut dnssec = request("example.com.", false);
@@ -593,7 +711,13 @@ mod tests {
         opt.do_bit = true;
         dnssec.set_edns(opt);
         let asked = client_edns(&dnssec).expect("a version we implement");
-        assert_eq!(asked, ClientEdns::Present { do_bit: true });
+        assert_eq!(
+            asked,
+            ClientEdns::Present {
+                do_bit: true,
+                padding: false
+            }
+        );
         let mirrored = asked.mirror(1232).expect("an OPT to mirror");
         assert!(mirrored.do_bit, "DO is echoed (RFC 3225 §3)");
         assert_eq!(
@@ -885,5 +1009,105 @@ mod tests {
         // The stored form is uncompressed again on the way back in, so this is
         // the round trip and not merely the same bytes.
         assert_eq!(parsed.answers[0].rdata, mx);
+    }
+
+    /// A request for `example.com.` carrying `options`, at payload `size`.
+    fn padded_request(size: u16, options: &[crate::edns::EdnsOption]) -> DnsMessage {
+        let mut request = request("example.com.", false);
+        request.set_edns(Edns::with_options(size, 0, false, options).expect("options"));
+        request
+    }
+
+    fn padding_option(data: Vec<u8>) -> crate::edns::EdnsOption {
+        crate::edns::EdnsOption {
+            code: crate::edns::EDNS_OPTION_PADDING,
+            data,
+        }
+    }
+
+    /// A reply to `request` with `answers` A records and the client's OPT
+    /// mirrored, as bytes.
+    fn reply_bytes(request: &DnsMessage, answers: usize) -> Vec<u8> {
+        let mut reply = DnsMessage::reply_to(request);
+        reply.answers = (0..answers)
+            .map(|i| ResourceRecord {
+                name: nm("example.com."),
+                class: Class::IN,
+                ttl: Ttl::from_secs(60),
+                rdata: a_record([192, 0, 2, i as u8]),
+            })
+            .collect();
+        if let Some(edns) = ClientEdns::of(request).mirror(1232) {
+            reply.set_edns(edns);
+        }
+        reply.to_bytes_within(u16::MAX as usize).expect("serialize")
+    }
+
+    /// The Padding option is read whatever its octets hold: RFC 7830 §3 says
+    /// received padding of any value MUST be accepted.
+    #[test]
+    fn a_padding_option_of_any_content_is_a_request_for_padding() {
+        for data in [Vec::new(), vec![0; 8], vec![1, 2, 3]] {
+            assert!(ClientEdns::of(&padded_request(1232, &[padding_option(data)])).padding());
+        }
+        assert!(!ClientEdns::of(&padded_request(1232, &[])).padding());
+        assert!(!ClientEdns::of(&request("example.com.", false)).padding());
+    }
+
+    /// RFC 8467 §4.1(2)'s block: the whole message to a multiple of 468, one
+    /// option of 0x00 octets, and the reply still reads (`TODO.md` #187).
+    #[test]
+    fn a_reply_is_padded_to_the_next_block() {
+        let request = padded_request(4096, &[padding_option(Vec::new())]);
+        for answers in [1, 40] {
+            let mut bytes = reply_bytes(&request, answers);
+            let before = bytes.len();
+            assert!(pad_reply(&mut bytes, 4096, u16::MAX as usize));
+            assert_eq!(
+                bytes.len() % PADDING_BLOCK,
+                0,
+                "{before} -> {}",
+                bytes.len()
+            );
+            assert!(bytes.len() >= before + 4);
+
+            let parsed = DnsMessage::try_from_bytes(&bytes).expect("still a message");
+            assert_eq!(parsed.answers.len(), answers);
+            let options = parsed.edns.expect("the OPT").options().expect("options");
+            assert_eq!(options.len(), 1);
+            assert_eq!(options[0].code, crate::edns::EDNS_OPTION_PADDING);
+            assert!(options[0].data.iter().all(|&b| b == 0));
+        }
+    }
+
+    /// §4: never past the client's payload size. A 512-octet client with a
+    /// reply that fits gets at most 512, not 936; one that cannot take even
+    /// the option header gets none.
+    #[test]
+    fn padding_stops_at_the_clients_payload_size() {
+        let request = padded_request(512, &[padding_option(Vec::new())]);
+        let mut bytes = reply_bytes(&request, 1);
+        assert!(pad_reply(&mut bytes, 512, u16::MAX as usize));
+        assert!(bytes.len() <= 468, "the first block fits: {}", bytes.len());
+
+        let mut bytes = reply_bytes(&request, 28);
+        let before = bytes.len();
+        assert!(before > 468 && before + 4 < 512, "{before}");
+        assert!(pad_reply(&mut bytes, 512, u16::MAX as usize));
+        assert_eq!(bytes.len(), 512);
+
+        let mut full = reply_bytes(&request, 28);
+        let before = full.len();
+        assert!(!pad_reply(&mut full, before + 3, u16::MAX as usize));
+        assert_eq!(full.len(), before, "no room, untouched");
+    }
+
+    /// No OPT last, no padding: the option has nowhere to go.
+    #[test]
+    fn a_reply_without_an_opt_is_left_alone() {
+        let mut bytes = reply_bytes(&request("example.com.", false), 1);
+        let before = bytes.clone();
+        assert!(!pad_reply(&mut bytes, 4096, u16::MAX as usize));
+        assert_eq!(bytes, before);
     }
 }

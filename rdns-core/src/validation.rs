@@ -266,6 +266,13 @@ impl Arrival {
         }
     }
 
+    /// Whether a reply here may carry RFC 7830's Padding option. §6:
+    /// "implementations MUST NOT use this option if the DNS transport is not
+    /// encrypted", so plain TCP never does (`TODO.md` #187).
+    pub fn may_pad(&self) -> bool {
+        !matches!(self, Arrival::Tcp)
+    }
+
     /// Whether this transport can carry a *sequence* of messages in answer to
     /// one request, which a zone transfer is (RFC 5936 §2.2).
     ///

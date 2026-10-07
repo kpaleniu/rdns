@@ -121,6 +121,15 @@ impl Wire<'_> {
         }
     }
 
+    /// Whether a reply to `request` here owes RFC 7830 padding. A datagram
+    /// never does.
+    fn pads(&self, request: &DnsMessage) -> bool {
+        match self {
+            Wire::Framed(_, arrival) => pads(arrival, request),
+            Wire::Datagram(..) => false,
+        }
+    }
+
     /// Put one finished message on the wire, framing it if the transport frames.
     ///
     /// Callers hand over unframed bytes whichever transport they are on, which
@@ -369,19 +378,39 @@ struct Refused<'a> {
     ip: Peer,
     now: u64,
     max_len: usize,
+    /// The reply owes RFC 7830 padding ([`pads`]).
+    pad: bool,
 }
 
 impl<'a> Refused<'a> {
     /// A transfer's, whose reply is framed and so has the whole 16-bit length
     /// to spend rather than a datagram's ceiling.
-    fn transfer(msg: &'a DnsMessage, ip: Peer, now: u64) -> Self {
+    fn transfer(msg: &'a DnsMessage, ip: Peer, now: u64, arrival: &Arrival) -> Self {
         Refused {
             msg,
             ip,
             now,
             max_len: u16::MAX as usize,
+            pad: pads(arrival, msg),
         }
     }
+}
+
+/// Whether a reply to `request` arriving over `arrival` owes RFC 7830 padding:
+/// the client asked, and the transport is encrypted (§6) (`TODO.md` #187).
+fn pads(arrival: &Arrival, request: &DnsMessage) -> bool {
+    arrival.may_pad() && ClientEdns::of(request).padding()
+}
+
+/// [`rdns::response::pad_reply`] with this daemon's two bounds: the client's
+/// payload size and the frame, each less `overhead` — the TSIG the signer is
+/// about to append, which then leaves the total off-block by its own length.
+fn pad(bytes: &mut Vec<u8>, request: &DnsMessage, overhead: usize) {
+    rdns::response::pad_reply(
+        bytes,
+        (request.udp_payload_size() as usize).saturating_sub(overhead),
+        (u16::MAX as usize).saturating_sub(overhead),
+    );
 }
 
 /// What `answer` has settled about a request before it is answered.
@@ -494,13 +523,20 @@ impl Server {
                 // A `match` and not a `let ... else`: this is an arm now, so
                 // "no reply fits" is a value it produces rather than a
                 // divergence it escapes through.
-                match error_reply(
+                let response = error_reply(
                     &msg,
                     ResponseCode::NotAuthorized,
                     None,
                     reserve(ceiling, rejection.reply_overhead()),
                     advertised,
-                ) {
+                )
+                .map(|mut response| {
+                    if wire.pads(&msg) {
+                        pad(&mut response, &msg, rejection.reply_overhead());
+                    }
+                    response
+                });
+                match response {
                     None => None,
                     Some(response) => match rejection.attach(response, now) {
                         Ok(bytes) => {
@@ -593,7 +629,7 @@ impl Server {
             // either transport, and the checks, the ordering and the
             // persistence are the request's, not the transport's.
             let reply = self
-                .answer_update(msg, peer, session.as_mut(), now, max_len)
+                .answer_update(msg, peer, session.as_mut(), now, max_len, wire.pads(msg))
                 .await;
             if let Some(reply) = &reply {
                 wire.send(reply, &self.ctx.logger, ip).await;
@@ -683,6 +719,16 @@ impl Server {
         // that being true of every reply.
         if session.is_some() && reply.as_deref().is_some_and(rdns::response::is_truncated) {
             reply = truncated_reply(request, ceiling, advertised).map(Cow::Owned);
+        }
+        // Before the signature, which has to cover it (`TODO.md` #187).
+        if wire.pads(request) {
+            if let Some(owned) = reply.as_mut() {
+                pad(
+                    owned.to_mut(),
+                    request,
+                    session.as_ref().map_or(0, |s| s.reply_overhead()),
+                );
+            }
         }
         // Sign whatever we ended up sending — including a truncated one, since
         // that is still our answer to a question someone authenticated. Same
@@ -783,7 +829,7 @@ impl Server {
         let ip = Peer::from(peer);
         // One for all nine ways out of this function, so none of them can pick
         // a different instant than the one that verified the request.
-        let refused = Refused::transfer(msg, ip, now);
+        let refused = Refused::transfer(msg, ip, now, arrival);
         let qname = msg
             .queries
             .first()
@@ -1031,8 +1077,16 @@ impl Server {
 
         let mut records = 0;
         let mut sent = 0usize;
-        for message in envelopes {
+        for mut message in envelopes {
             records += message.answers.len();
+            // Padding rides in the OPT, which RFC 5936 §2.2.5 puts on the first
+            // envelope and allows on the rest: a padded transfer carries it on
+            // every one, so every one is padded.
+            if refused.pad && message.edns.is_none() {
+                if let Some(edns) = ClientEdns::of(msg).mirror(msg.udp_payload_size()) {
+                    message.set_edns(edns);
+                }
+            }
             let bytes = match message.to_bytes_within(u16::MAX as usize) {
                 Ok(bytes) => bytes,
                 Err(e) => {
@@ -1045,6 +1099,14 @@ impl Server {
                     return;
                 }
             };
+            let mut bytes = bytes;
+            if refused.pad {
+                pad(
+                    &mut bytes,
+                    msg,
+                    session.as_ref().map_or(0, |s| s.reply_overhead()),
+                );
+            }
             // Every envelope is signed, and the MACs chain (RFC 8945 §5.3.1): a
             // dropped or reordered message then fails at the client instead of
             // passing for a complete zone.
@@ -1148,11 +1210,20 @@ impl Server {
             ip,
             now,
             max_len,
+            pad: padding,
         } = refused;
-        let Some(bytes) = error_reply(msg, rcode, why, max_len, self.ctx.udp.advertised()) else {
+        let Some(mut bytes) = error_reply(msg, rcode, why, max_len, self.ctx.udp.advertised())
+        else {
             serving_error!(self.ctx.logger, ip, "could not serialize an error response");
             return None;
         };
+        if padding {
+            pad(
+                &mut bytes,
+                msg,
+                session.as_ref().map_or(0, |s| s.reply_overhead()),
+            );
+        }
         match session {
             Some(session) => match session.sign(bytes, now) {
                 Ok(signed) => Some(signed),
@@ -1186,6 +1257,7 @@ impl Server {
         session: Option<&mut TsigSession>,
         now: u64,
         max_len: usize,
+        pad: bool,
     ) -> Option<Vec<u8>> {
         let ip = Peer::from(peer);
         // One for all thirteen ways out of this function, for the reason
@@ -1195,6 +1267,7 @@ impl Server {
             ip,
             now,
             max_len,
+            pad,
         };
 
         // §3.1: read it, and reject the ways it can be malformed.
@@ -4305,5 +4378,155 @@ pub(crate) mod tests {
             answered(&server, &wire(&question), peer).await.is_empty(),
             "a response is not a question, and replying to one is a packet loop"
         );
+    }
+
+    /// RFC 7830 padding over the transports that may carry it (`TODO.md`
+    /// #187), answered by `tcp::serve_one` with the arrival asserted, as the
+    /// transfer tests do.
+    mod padding {
+        use super::*;
+        use rdns::response::PADDING_BLOCK;
+        use rdns::{Edns, EdnsOption};
+        use std::fmt::Write as _;
+
+        const PADDING: u16 = 12;
+
+        fn key() -> TsigKey {
+            TsigKey::new("pad.key.", TsigAlgorithm::HmacSha256, vec![7u8; 32])
+        }
+
+        /// Enough records that an AXFR is several envelopes.
+        fn zone() -> Zone {
+            let mut text = String::from(
+                "$ORIGIN example.com.\n$TTL 3600\n\
+                 @ IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                 @ IN NS ns1.example.com.\nns1 IN A 192.0.2.1\n",
+            );
+            for i in 0..3000 {
+                let _ = writeln!(text, "host{i} IN A 192.0.2.{}", i % 250);
+            }
+            rdns::zone::parse_zone_file(&text, "example.com.").expect("parse")
+        }
+
+        async fn primary(arrival: Arrival) -> SocketAddr {
+            spawn_primary_full(
+                zone(),
+                &[],
+                DeltaLog::new(),
+                TsigKeyring::new(vec![key()]),
+                false,
+                arrival,
+            )
+            .await
+        }
+
+        fn dot() -> Arrival {
+            Arrival::Dot(
+                rdns::validation::TlsVersion::Tls13,
+                rdns::validation::PeerCertificate::none(),
+            )
+        }
+
+        fn question(qtype: Qtype, padding: Option<Vec<u8>>) -> DnsMessage {
+            let mut msg = query("example.com.", qtype, false);
+            let options: Vec<EdnsOption> = padding
+                .into_iter()
+                .map(|data| EdnsOption {
+                    code: PADDING,
+                    data,
+                })
+                .collect();
+            msg.set_edns(Edns::with_options(1232, 0, false, &options).expect("options"));
+            msg
+        }
+
+        async fn read_one(stream: &mut TcpStream) -> Vec<u8> {
+            let mut prefix = [0u8; 2];
+            stream.read_exact(&mut prefix).await.expect("a length");
+            let mut body = vec![0u8; u16::from_be_bytes(prefix) as usize];
+            stream.read_exact(&mut body).await.expect("a body");
+            body
+        }
+
+        async fn ask(addr: SocketAddr, bytes: &[u8]) -> TcpStream {
+            let mut stream = TcpStream::connect(addr).await.expect("connect");
+            stream
+                .write_all(&rdns::framed(bytes).expect("frames"))
+                .await
+                .expect("send");
+            stream
+        }
+
+        fn padding_of(reply: &[u8]) -> Option<Vec<u8>> {
+            let msg = DnsMessage::try_from_bytes(reply).expect("a reply");
+            msg.edns?
+                .options()
+                .expect("options")
+                .into_iter()
+                .find(|o| o.code == PADDING)
+                .map(|o| o.data)
+        }
+
+        /// RFC 7830 §4's MUST over an encrypted transport, a Padding option
+        /// of any content asking (§3); none unasked; none over plain TCP,
+        /// which §6 forbids. Watched failing with `pads` returning `false`.
+        #[tokio::test]
+        async fn a_padded_query_over_dot_gets_a_padded_reply() {
+            let dot = primary(dot()).await;
+            for asked in [Vec::new(), vec![0xff; 5]] {
+                let bytes = question(Qtype::of(record_types::A), Some(asked))
+                    .to_bytes_within(512)
+                    .expect("bytes");
+                let reply = read_one(&mut ask(dot, &bytes).await).await;
+                assert_eq!(reply.len() % PADDING_BLOCK, 0, "{}", reply.len());
+                let pad = padding_of(&reply).expect("a Padding option");
+                assert!(pad.iter().all(|&b| b == 0));
+            }
+
+            let unasked = question(Qtype::of(record_types::A), None)
+                .to_bytes_within(512)
+                .expect("bytes");
+            let reply = read_one(&mut ask(dot, &unasked).await).await;
+            assert!(padding_of(&reply).is_none(), "not asked, not padded");
+
+            let tcp = primary(Arrival::Tcp).await;
+            let bytes = question(Qtype::of(record_types::A), Some(Vec::new()))
+                .to_bytes_within(512)
+                .expect("bytes");
+            let reply = read_one(&mut ask(tcp, &bytes).await).await;
+            assert!(padding_of(&reply).is_none(), "§6: never in the clear");
+        }
+
+        /// Every envelope of a signed AXFR over DoT is padded and its MAC,
+        /// which covers the padding, chains and verifies. Watched failing with
+        /// the transfer loop's padding removed: envelope 0 carried none.
+        #[tokio::test]
+        async fn every_envelope_of_a_signed_transfer_is_padded_and_verifies() {
+            let addr = primary(dot()).await;
+            let request = question(Qtype::AXFR, Some(Vec::new()))
+                .to_bytes_within(512)
+                .expect("bytes");
+            let request = tsig::sign_request(request, &key(), tsig::now()).expect("signs");
+            let mut previous = tsig::request_mac(&request).expect("a MAC");
+            let mut stream = ask(addr, &request).await;
+
+            let mut envelopes = 0;
+            let mut soas = 0;
+            while soas < 2 {
+                let reply = read_one(&mut stream).await;
+                previous =
+                    tsig::check_response(&reply, &key(), &previous, envelopes == 0, tsig::now())
+                        .unwrap_or_else(|e| panic!("envelope {envelopes}: {e:?}"));
+                assert!(padding_of(&reply).is_some(), "envelope {envelopes}");
+                let msg = DnsMessage::try_from_bytes(&reply).expect("parses");
+                soas += msg
+                    .answers
+                    .iter()
+                    .filter(|r| r.rdata.rtype() == record_types::SOA)
+                    .count();
+                envelopes += 1;
+            }
+            assert!(envelopes > 1, "the fixture is several envelopes");
+        }
     }
 }
