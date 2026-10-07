@@ -33,6 +33,7 @@ pub(crate) fn context(rate: u32) -> ServeContext {
         udp: rdns::UdpSizes::default(),
         per_source: crate::SourceConnections::default(),
         acl: crate::QueryAcl::Open,
+        nsid: None,
         // A test that asserts on the rate limiter overrides this with a
         // `Clock::fixed`; the rest never read it.
         clock: Clock::system(),

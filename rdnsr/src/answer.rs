@@ -17,7 +17,7 @@ use rdns::metrics::LatencyTimer;
 use rdns::record_types;
 use rdns::resolver::ResolveError;
 use rdns::resolver::{NameserverPolicy, Resolver};
-use rdns::response::ClientEdns;
+use rdns::response::{ClientEdns, ServerOpt};
 use rdns::rpz::{Action, DelegationPolicy, PolicyStore, PolicyZones, Rewrite};
 use rdns::security::TransferAcl;
 use rdns::special_names::{self, EmptyZones};
@@ -166,7 +166,7 @@ pub(crate) async fn handle_query(
                 acl,
                 &policy,
                 feed_wakes,
-                ctx.udp.advertised(),
+                ctx.server_opt(),
                 client_max,
             );
             ctx.record_answer(rcode, timer);
@@ -178,7 +178,7 @@ pub(crate) async fn handle_query(
     // plausible QUERY-shaped reply the sender will misread (RFC 1035 §4.1.1).
     if msg.opcode != OpCode::Query {
         ctx.record_answer(ResponseCode::NotImplemented, timer);
-        return unsupported_opcode(&msg, ctx.udp.advertised(), client_max);
+        return unsupported_opcode(&msg, ctx.server_opt(), client_max);
     }
 
     let id = msg.id;
@@ -219,7 +219,7 @@ pub(crate) async fn handle_query(
             &msg,
             ResponseCode::FormatError,
             None,
-            ctx.udp.advertised(),
+            ctx.server_opt(),
             client_max,
         );
     };
@@ -1031,7 +1031,7 @@ fn finish(
     // `why` rides in that OPT and nowhere else (RFC 8914 §2), which is why it
     // is `mirror_with`'s business rather than a check here — and so is what
     // happens to a reason too long to encode.
-    if let Some(edns) = client.edns.mirror_with(ctx.udp.advertised(), why) {
+    if let Some(edns) = client.edns.mirror_with(ctx.server_opt(), why) {
         resp.set_edns(edns);
     } else {
         resp.additionals
@@ -1073,7 +1073,7 @@ fn empty_error(
     msg: &DnsMessage,
     rcode: ResponseCode,
     why: Option<ExtendedError>,
-    advertised: u16,
+    advertised: ServerOpt,
     max_len: usize,
 ) -> Option<Vec<u8>> {
     let mut resp = build_response(msg, Vec::new(), rcode);
@@ -1099,13 +1099,13 @@ pub(crate) fn refused_by_acl(data: &[u8], ctx: &ServeContext) -> Option<Vec<u8>>
         &msg,
         ResponseCode::Refused,
         Some(NOT_LISTED),
-        ctx.udp.advertised(),
+        ctx.server_opt(),
         ctx.udp.reply_ceiling(&msg, Transport::Udp),
     )
 }
 
 /// NOTIMP for an opcode this resolver does not implement.
-fn unsupported_opcode(msg: &DnsMessage, advertised: u16, max_len: usize) -> Option<Vec<u8>> {
+fn unsupported_opcode(msg: &DnsMessage, advertised: ServerOpt, max_len: usize) -> Option<Vec<u8>> {
     const WHY: ExtendedError =
         ExtendedError::new(InfoCode::NOT_SUPPORTED, "this opcode is not implemented");
     empty_error(
@@ -1148,7 +1148,7 @@ fn policy_notify(
     acl: &NotifyAcl,
     policy: &PolicyZones,
     feed_wakes: &[crate::rpz_transfer::FeedWake],
-    advertised: u16,
+    advertised: ServerOpt,
     max_len: usize,
 ) -> (Option<Vec<u8>>, ResponseCode) {
     // RFC 8914 §4.19's "a query from an 'unauthorized' client", which is what
@@ -1363,7 +1363,7 @@ mod tests {
         let udp = rdns::UdpSizes::default();
         let bytes = unsupported_opcode(
             &request,
-            udp.advertised(),
+            rdns::response::ServerOpt::sized(udp.advertised()),
             udp.reply_ceiling(&request, Transport::Udp),
         )
         .expect("a NOTIMP reply");
@@ -3747,6 +3747,50 @@ mod tests {
                 "{:?}",
                 reply.authorities[0].name
             );
+        }
+    }
+
+    /// NSID (RFC 5001) through this daemon's mirror: answered with the
+    /// configured value when asked, whatever the request carried, and not
+    /// otherwise (`TODO.md` #179). `localhost`, so nothing is resolved.
+    #[tokio::test]
+    async fn an_nsid_request_gets_the_configured_identifier() {
+        let ctx = Arc::new(ServeContext {
+            nsid: Some(b"edge-7"),
+            ..(*test_shell()).clone()
+        });
+        let serving = serving(test_resolver(), ctx, PolicyZones::default());
+        for (asked, expected) in [
+            (Some(Vec::new()), Some(b"edge-7".to_vec())),
+            (Some(b"who".to_vec()), Some(b"edge-7".to_vec())),
+            (None, None),
+        ] {
+            let mut msg =
+                DnsMessage::try_from_bytes(&query_for("localhost.", 1, false)).expect("parses");
+            let options: Vec<rdns::EdnsOption> = asked
+                .into_iter()
+                .map(|data| rdns::EdnsOption { code: 3, data })
+                .collect();
+            msg.set_edns(Edns::with_options(1232, 0, false, &options).expect("options"));
+            let bytes = handle_query(
+                msg.to_bytes_within(512).expect("serialize"),
+                test_peer(),
+                current_unix_timestamp(),
+                &serving,
+                Transport::Udp,
+            )
+            .await
+            .expect("answered");
+            let reply = DnsMessage::try_from_bytes(&bytes).expect("a reply");
+            let nsid = reply
+                .edns
+                .expect("the OPT")
+                .options()
+                .expect("options")
+                .into_iter()
+                .find(|o| o.code == 3)
+                .map(|o| o.data);
+            assert_eq!(nsid, expected);
         }
     }
 

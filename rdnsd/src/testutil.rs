@@ -48,7 +48,7 @@ pub(crate) fn make_response(msg: &DnsMessage, zones: &Zones, metrics: &DnsMetric
         zones,
         metrics,
         u16::MAX as usize,
-        rdns::UdpSizes::default().advertised(),
+        rdns::response::ServerOpt::sized(rdns::UdpSizes::default().advertised()),
         &mut scratch,
     )
     .expect("the response serializes");
@@ -150,6 +150,7 @@ fn context_at(clock: Clock) -> ServeContext {
         udp: UdpSizes::default(),
         per_source: Default::default(),
         acl: rdns_transport::QueryAcl::Open,
+        nsid: None,
         clock,
     }
 }

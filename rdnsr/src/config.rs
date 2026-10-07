@@ -68,7 +68,7 @@ fn default_tsig_algorithm() -> String {
     rdns::tsig::TsigAlgorithm::DEFAULT.config_name().to_string()
 }
 
-// `[server]`: the 26 keys both daemons have, from `rdns::server_table!`, then
+// `[server]`: the keys both daemons have, from `rdns::server_table!`, then
 // `max-inflight-udp`, which is a resolver's shape of `rdnsd`'s `udp-workers`,
 // and `allow-query`.
 // The macro writes `Default` too, so the shared half is spelled once.
@@ -537,6 +537,7 @@ anomaly-error-percent = 5.0
 anomaly-source-queries = 50
 anomaly-source-refusals = 2
 metrics-listen = "127.0.0.1:9153"
+nsid = "edge-7"
 tls-listen = "127.0.0.1:8530"
 quic-listen = "127.0.0.1:8531"
 https-listen = "127.0.0.1:8532"
@@ -588,6 +589,7 @@ tls-key = "./key.pem"
             anomaly_source_queries = 50,
             anomaly_source_refusals = 2,
             metrics_listen = Some("127.0.0.1:9153".to_string()),
+            nsid = Some("edge-7".to_string()),
             tls_listen = Some("127.0.0.1:8530".to_string()),
             quic_listen = Some("127.0.0.1:8531".to_string()),
             https_listen = Some("127.0.0.1:8532".to_string()),

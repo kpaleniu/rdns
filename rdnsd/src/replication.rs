@@ -1386,7 +1386,12 @@ mod tests {
                 .expect("the first NOTIFY")
                 .expect("recv");
         let request = DnsMessage::try_from_bytes(&buf[..n]).expect("parse the NOTIFY");
-        let ack = notify::notify_response(&request, ResponseCode::Ok, 1232, None);
+        let ack = notify::notify_response(
+            &request,
+            ResponseCode::Ok,
+            rdns::response::ServerOpt::sized(1232),
+            None,
+        );
         downstream
             .send_to(&ack.to_bytes_within(512).expect("serialize"), from)
             .await

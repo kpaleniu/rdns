@@ -418,8 +418,9 @@ pub(crate) fn write_opt(
 /// are out of the way.
 ///
 /// Carries only what a reply needs: whether to attach an OPT at all
-/// (RFC 6891 §6.1.1), what to set DO to (RFC 3225 §3), and whether the client
-/// asked for padding (RFC 7830 §4, `TODO.md` #187). The advertised
+/// (RFC 6891 §6.1.1), what to set DO to (RFC 3225 §3), and which options the
+/// client asked for that a reply honours — Padding (RFC 7830 §4, `TODO.md`
+/// #187) and NSID (RFC 5001, #179), one field each. The advertised
 /// payload size is not here — that is [`DnsMessage::udp_payload_size`], which
 /// applies §6.2.3's floor, and is a question about the transport rather than
 /// about the reply's OPT.
@@ -428,8 +429,35 @@ pub enum ClientEdns {
     /// No OPT record: the reply carries none either.
     Absent,
     /// An OPT we can answer, with DO as the client set it, and whether it
-    /// carried a Padding option (code 12).
-    Present { do_bit: bool, padding: bool },
+    /// carried a Padding option (code 12) and an NSID option (code 3).
+    Present {
+        do_bit: bool,
+        padding: bool,
+        nsid: bool,
+    },
+}
+
+/// What this server says about itself in a reply's OPT: the payload size it
+/// can reassemble and, if the operator set one, its NSID (RFC 5001).
+///
+/// One value for [`ClientEdns::mirror`] to read rather than a size and an
+/// identifier passed separately, so a site that mirrors an OPT cannot mirror
+/// it without the NSID (`CLAUDE.md` §7). `Copy`, with the identifier
+/// `'static`: it is set once at startup and read on every reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerOpt {
+    pub payload_size: u16,
+    pub nsid: Option<&'static [u8]>,
+}
+
+impl ServerOpt {
+    /// A server with no NSID configured, advertising `payload_size`.
+    pub fn sized(payload_size: u16) -> ServerOpt {
+        ServerOpt {
+            payload_size,
+            nsid: None,
+        }
+    }
 }
 
 impl ClientEdns {
@@ -450,6 +478,7 @@ impl ClientEdns {
         client_edns(request).unwrap_or(ClientEdns::Present {
             do_bit: false,
             padding: false,
+            nsid: false,
         })
     }
 
@@ -469,11 +498,35 @@ impl ClientEdns {
         matches!(self, ClientEdns::Present { padding: true, .. })
     }
 
-    /// The OPT to mirror back at `payload_size`, or `None` when the client used
-    /// no EDNS — replying with an unsolicited OPT is not mirroring.
-    pub fn mirror(self, payload_size: u16) -> Option<Edns> {
+    /// The query carried an NSID option (RFC 5001 §2.1).
+    pub fn nsid(self) -> bool {
+        matches!(self, ClientEdns::Present { nsid: true, .. })
+    }
+
+    /// The OPT to mirror back, or `None` when the client used no EDNS —
+    /// replying with an unsolicited OPT is not mirroring.
+    ///
+    /// Carries the server's NSID when the client asked for it and one is
+    /// configured. RFC 5001 §2.2: the server "MUST ignore any NSID payload data
+    /// that might be present in the query message" and "MUST NOT send an NSID
+    /// option back to a resolver which did not request it" — so the value is
+    /// the configuration's and the trigger the request's.
+    pub fn mirror(self, server: ServerOpt) -> Option<Edns> {
         self.is_present().then(|| {
-            let mut edns = Edns::with_payload_size(payload_size);
+            let mut edns = match server.nsid.filter(|_| self.nsid()) {
+                Some(nsid) => Edns::with_options(
+                    server.payload_size,
+                    crate::EDNS_VERSION,
+                    false,
+                    &[crate::edns::EdnsOption {
+                        code: crate::edns::EDNS_OPTION_NSID,
+                        data: nsid.to_vec(),
+                    }],
+                )
+                // Validated at startup to fit the 16-bit length field.
+                .unwrap_or_else(|_| Edns::with_payload_size(server.payload_size)),
+                None => Edns::with_payload_size(server.payload_size),
+            };
             edns.do_bit = self.do_bit();
             edns
         })
@@ -493,8 +546,8 @@ impl ClientEdns {
     /// refusal without its annotation is still the answer and a refusal that
     /// failed to serialize is not. One decision written three times is the
     /// second copy waiting to differ (`CLAUDE.md` §7), so it is here.
-    pub fn mirror_with(self, payload_size: u16, error: Option<ExtendedError>) -> Option<Edns> {
-        let mirrored = self.mirror(payload_size)?;
+    pub fn mirror_with(self, server: ServerOpt, error: Option<ExtendedError>) -> Option<Edns> {
+        let mirrored = self.mirror(server)?;
         let Some(error) = error else {
             return Some(mirrored);
         };
@@ -502,7 +555,7 @@ impl ClientEdns {
             Ok(annotated) => Some(annotated),
             // `with_extended_error` consumed the OPT, so the unreachable arm
             // rebuilds the bare one rather than cloning it up front for it.
-            Err(_) => self.mirror(payload_size),
+            Err(_) => self.mirror(server),
         }
     }
 }
@@ -528,6 +581,10 @@ pub fn client_edns(request: &DnsMessage) -> Result<ClientEdns, ResponseCode> {
         Some(edns) if edns.version > crate::EDNS_VERSION => Err(ResponseCode::BadOptVersion),
         Some(edns) => Ok(ClientEdns::Present {
             do_bit: edns.do_bit,
+            nsid: request
+                .edns
+                .as_ref()
+                .is_some_and(|opt| opt.has_option(crate::edns::EDNS_OPTION_NSID) == Ok(true)),
             padding: request
                 .edns
                 .as_ref()
@@ -671,7 +728,7 @@ mod tests {
         );
 
         let mirrored = ClientEdns::of(&request)
-            .mirror(1232)
+            .mirror(ServerOpt::sized(1232))
             .expect("the client used EDNS, so it gets an OPT back");
         assert!(
             mirrored.options().expect("well formed").is_empty(),
@@ -694,7 +751,7 @@ mod tests {
             Ok(ClientEdns::Absent)
         );
         assert!(
-            ClientEdns::Absent.mirror(4096).is_none(),
+            ClientEdns::Absent.mirror(ServerOpt::sized(4096)).is_none(),
             "no OPT asked for, no OPT sent (RFC 6891 §6.1.1)"
         );
 
@@ -702,7 +759,8 @@ mod tests {
             client_edns(&request("example.com.", true)),
             Ok(ClientEdns::Present {
                 do_bit: false,
-                padding: false
+                padding: false,
+                nsid: false
             })
         );
 
@@ -715,10 +773,13 @@ mod tests {
             asked,
             ClientEdns::Present {
                 do_bit: true,
-                padding: false
+                padding: false,
+                nsid: false
             }
         );
-        let mirrored = asked.mirror(1232).expect("an OPT to mirror");
+        let mirrored = asked
+            .mirror(ServerOpt::sized(1232))
+            .expect("an OPT to mirror");
         assert!(mirrored.do_bit, "DO is echoed (RFC 3225 §3)");
         assert_eq!(
             mirrored.udp_payload_size, 1232,
@@ -763,7 +824,7 @@ mod tests {
                 InfoCode::NOT_AUTHORITATIVE,
                 "no zone here",
             ));
-            if let Some(edns) = ClientEdns::of(&request).mirror(1232) {
+            if let Some(edns) = ClientEdns::of(&request).mirror(ServerOpt::sized(1232)) {
                 w.set_edns(edns);
             }
             w.finish().expect("a reply");
@@ -1037,7 +1098,7 @@ mod tests {
                 rdata: a_record([192, 0, 2, i as u8]),
             })
             .collect();
-        if let Some(edns) = ClientEdns::of(request).mirror(1232) {
+        if let Some(edns) = ClientEdns::of(request).mirror(ServerOpt::sized(1232)) {
             reply.set_edns(edns);
         }
         reply.to_bytes_within(u16::MAX as usize).expect("serialize")

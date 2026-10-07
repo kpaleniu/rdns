@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::record_types as rt;
-use crate::response::ClientEdns;
+use crate::response::{ClientEdns, ServerOpt};
 use crate::tsig::{TsigKey, TsigKeyring};
 use crate::zone::Zone;
 use crate::{
@@ -248,7 +248,7 @@ pub fn notify_request(zone: NameRef<'_>, soa: Option<ResourceRecord>, id: u16) -
 pub fn notify_response(
     request: &DnsMessage,
     rcode: ResponseCode,
-    advertised: u16,
+    advertised: ServerOpt,
     why: Option<ExtendedError>,
 ) -> DnsMessage {
     let mut msg = DnsMessage::reply_to(request);
@@ -396,7 +396,7 @@ mod tests {
     #[test]
     fn test_a_notify_response_acknowledges_it() {
         let request = notify_request(nm("example.com.").as_ref(), None, 0x4321);
-        let reply = notify_response(&request, ResponseCode::Ok, 1232, None);
+        let reply = notify_response(&request, ResponseCode::Ok, ServerOpt::sized(1232), None);
 
         let mut buf = vec![0u8; 512];
         let n = reply.to_bytes(&mut buf).expect("serialize");
@@ -424,7 +424,10 @@ mod tests {
     fn test_a_refusal_ends_the_retries_without_being_an_acceptance() {
         let request = notify_request(nm("example.com.").as_ref(), None, 5);
         assert_eq!(
-            outcome(&notify_response(&request, ResponseCode::Ok, 1232, None), 5),
+            outcome(
+                &notify_response(&request, ResponseCode::Ok, ServerOpt::sized(1232), None),
+                5
+            ),
             Some(NotifyOutcome::Accepted)
         );
         for rcode in [
@@ -433,7 +436,10 @@ mod tests {
             ResponseCode::ServerFailure,
         ] {
             assert_eq!(
-                outcome(&notify_response(&request, rcode, 1232, None), 5),
+                outcome(
+                    &notify_response(&request, rcode, ServerOpt::sized(1232), None),
+                    5
+                ),
                 Some(NotifyOutcome::Rejected(rcode)),
                 "{rcode:?} arrived, so stop retrying, but nothing will refresh"
             );
@@ -524,7 +530,7 @@ mod tests {
         let reply = notify_response(
             &notify_request(nm("example.com.").as_ref(), None, 1),
             ResponseCode::Ok,
-            1232,
+            ServerOpt::sized(1232),
             None,
         );
         assert!(notified_zone(&reply).is_none());

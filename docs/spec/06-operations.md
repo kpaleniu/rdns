@@ -36,6 +36,7 @@ query-burst = 200
 query-rate-exempt = ["10.0.0.0/8"]
 udp-workers = 8             # default: parallelism clamped to 2..=32
 metrics-listen = "127.0.0.1:9153"
+nsid = "edge-7"              # RFC 5001; text, or 0x and hex. Unset is off
 tls-listen = "0.0.0.0:853"     # DoT; DoQ is quic-listen, DoH is https-listen
 quic-listen = "0.0.0.0:853"    # UDP, so it does not collide with DoT
 https-listen = "0.0.0.0:443"
@@ -138,6 +139,7 @@ query-rate = 200            # 200 and not rdnsd's 1000: one resolver behind one
 query-burst = 100           # address asks far more than one person does
 max-inflight-udp = 1024     # concurrent recursions; a resolver's udp-workers
 metrics-listen = "127.0.0.1:9153"
+nsid = "edge-7"              # RFC 5001; text, or 0x and hex. Unset is off
 
 [resolver]
 upstream = ["8.8.8.8:53"]   # naming any switches recursion to forwarding

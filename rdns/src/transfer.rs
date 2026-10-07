@@ -8,7 +8,7 @@
 
 use crate::error::{TransferError, TransferResult};
 use crate::record_types as rt;
-use crate::response::ClientEdns;
+use crate::response::{ClientEdns, ServerOpt};
 use crate::zone::Zone;
 #[cfg(test)]
 use crate::Name;
@@ -177,7 +177,8 @@ impl<I: Iterator<Item = ResourceRecord>> Iterator for Envelopes<'_, I> {
         if std::mem::take(&mut self.first) {
             // The client's own size, echoed: a transfer is framed by the TCP
             // length prefix, so ours says nothing useful here.
-            if let Some(edns) = ClientEdns::of(self.request).mirror(self.request.udp_payload_size())
+            if let Some(edns) = ClientEdns::of(self.request)
+                .mirror(ServerOpt::sized(self.request.udp_payload_size()))
             {
                 message.set_edns(edns);
             }

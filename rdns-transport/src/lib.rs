@@ -189,6 +189,9 @@ pub struct ServeContext {
     pub per_source: SourceConnections,
     /// Which peers may be answered at all. `rdnsd` is [`QueryAcl::Open`].
     pub acl: QueryAcl,
+    /// The operator's NSID (RFC 5001, `--nsid`), or `None` for off. `'static`
+    /// because it is read on every reply and set once, at startup.
+    pub nsid: Option<&'static [u8]>,
     /// Where the accept loops read the wall clock.
     ///
     /// The four of them had `rdns::clock::current_unix_timestamp()` written out
@@ -201,6 +204,15 @@ pub struct ServeContext {
 }
 
 impl ServeContext {
+    /// What a reply's OPT says about this server: what it can reassemble and
+    /// its NSID, for [`rdns::response::ClientEdns::mirror`].
+    pub fn server_opt(&self) -> rdns::response::ServerOpt {
+        rdns::response::ServerOpt {
+            payload_size: self.udp.advertised(),
+            nsid: self.nsid,
+        }
+    }
+
     /// Whether a stream listener may serve a connection from `peer`, counted
     /// per listener when it may not.
     ///

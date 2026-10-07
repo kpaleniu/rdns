@@ -18,7 +18,7 @@ use rdns::ede::InfoCode;
 use rdns::error::WireError;
 use rdns::metrics::{DnsMetrics, LatencyTimer};
 use rdns::record_types;
-use rdns::response::{ResponseWriter, Section};
+use rdns::response::{ResponseWriter, Section, ServerOpt};
 use rdns::Qtype;
 use rdns::{DnsMessage, Edns, ExtendedError, OpCode, QueryClass, ResponseCode};
 #[cfg(test)]
@@ -38,7 +38,7 @@ pub(crate) fn write_response(
     zones: &Zones,
     metrics: &DnsMetrics,
     max_len: usize,
-    advertised: u16,
+    advertised: ServerOpt,
     scratch: &mut Scratch,
 ) -> Result<(), WireError> {
     let timer = LatencyTimer::new();
@@ -56,7 +56,7 @@ pub(crate) fn write_response(
         Err(rcode) => {
             w.set_rcode(rcode);
             // `with_payload_size` carries no options, so encoding it cannot fail.
-            w.set_edns(Edns::with_payload_size(advertised));
+            w.set_edns(Edns::with_payload_size(advertised.payload_size));
             return w.finish();
         }
     };

@@ -1,7 +1,7 @@
 //! The `[server]` keys both daemons have, written once.
 //!
-//! `rdnsd`'s `[server]` table holds 40 keys and 26 of them name a setting
-//! `rdnsr` has as a flag under the same name (`TODO.md` #63b, #155, #156). Two parsers for
+//! Most of `rdnsd`'s `[server]` keys name a setting `rdnsr` has as a flag
+//! under the same name (`TODO.md` #63b, #155, #156, #179). Two parsers for
 //! one setting is how `[zones."x"].also-notify` came to be parsed into a field
 //! nothing read (#46c), so the shared half is written here.
 //!
@@ -25,6 +25,7 @@
 //! field, and `check` reads ten of `rdnsd`'s, so the plausible version of the
 //! mistake — validate the new key, forget to project it — compiled without a
 //! warning (`TODO.md` #103).
+use crate::error::{ConfigError, ConfigResult};
 
 /// `Clone::clone`, behind a generic.
 ///
@@ -37,7 +38,61 @@ pub fn taken<T: Clone>(value: &T) -> T {
     value.clone()
 }
 
-/// Declare a `[server]` table: the 26 shared keys, then this daemon's own.
+/// `--nsid`'s value as the octets RFC 5001 carries: `0x` and hex for raw
+/// bytes, anything else as its ASCII text.
+///
+/// Refused rather than read leniently (`CLAUDE.md` §15): an empty value, which
+/// would answer an NSID request with nothing an operator can use; hex that does
+/// not decode; text that is not ASCII, which no NSID reader prints the same
+/// way; and more than an option can carry.
+pub fn parse_nsid(spec: &str) -> ConfigResult<Vec<u8>> {
+    let bytes = match spec.strip_prefix("0x").or_else(|| spec.strip_prefix("0X")) {
+        Some(hex) => {
+            if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(ConfigError::new(format!(
+                    "--nsid {spec:?}: after 0x, an even number of hex digits"
+                )));
+            }
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("checked as hex"))
+                .collect()
+        }
+        None if spec.is_ascii() => spec.as_bytes().to_vec(),
+        None => {
+            return Err(ConfigError::new(format!(
+                "--nsid {spec:?}: text is ASCII; give anything else as 0x and hex"
+            )))
+        }
+    };
+    if bytes.is_empty() {
+        return Err(ConfigError::new(
+            "--nsid is empty; leave it unset to answer no NSID".to_string(),
+        ));
+    }
+    if bytes.len() > 512 {
+        return Err(ConfigError::new(format!(
+            "--nsid is {} octets, more than the 512 a reply can spare",
+            bytes.len()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// An NSID for the startup line: the text when it is printable, hex otherwise.
+pub fn show_nsid(nsid: &[u8]) -> String {
+    if nsid.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        String::from_utf8_lossy(nsid).into_owned()
+    } else {
+        let mut out = String::from("0x");
+        for b in nsid {
+            let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{b:02x}"));
+        }
+        out
+    }
+}
+
+/// Declare a `[server]` table: the shared keys, then this daemon's own.
 ///
 /// ```ignore
 /// rdns::server_table! {
@@ -132,6 +187,9 @@ macro_rules! server_table {
             anomaly_source_refusals: u64,
             /// Prometheus and the liveness probe.
             metrics_listen: Option<String>,
+            /// RFC 5001's server identifier, in `--nsid`'s spelling. Absent is
+            /// off.
+            nsid: Option<String>,
             /// Where to answer DNS over TLS (RFC 7858), QUIC (RFC 9250) and
             /// HTTPS (RFC 8484), and with what. A listener with no certificate
             /// is refused — in code, because a config file has no equivalent of
@@ -197,6 +255,7 @@ macro_rules! server_table {
                 cli.anomaly_source_refusals =
                     $crate::config::taken(&self.anomaly_source_refusals);
                 cli.metrics_listen = $crate::config::taken(&self.metrics_listen);
+                cli.nsid = $crate::config::taken(&self.nsid);
                 cli.tls_listen = $crate::config::taken(&self.tls_listen);
                 cli.quic_listen = $crate::config::taken(&self.quic_listen);
                 cli.https_listen = $crate::config::taken(&self.https_listen);
@@ -237,6 +296,7 @@ macro_rules! server_table {
                     anomaly_source_queries: crate::default_anomaly_source_queries(),
                     anomaly_source_refusals: crate::default_anomaly_source_refusals(),
                     metrics_listen: None,
+                    nsid: None,
                     tls_listen: None,
                     quic_listen: None,
                     https_listen: None,

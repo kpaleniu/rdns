@@ -184,7 +184,7 @@ fn weigh(zones: &Zones, msg: &DnsMessage) -> usize {
         zones,
         &DnsMetrics::new(),
         u16::MAX as usize,
-        UdpSizes::default().advertised(),
+        rdns::response::ServerOpt::sized(UdpSizes::default().advertised()),
         &mut scratch,
     )
     .expect("the response serializes");

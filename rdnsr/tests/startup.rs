@@ -512,3 +512,20 @@ fn the_empty_zone_keys_are_the_flags() {
         stderr(&out)
     );
 }
+
+/// `--nsid` is checked before the dry run answers: empty, bad hex and text
+/// that is not ASCII are refused by name, and `0x` hex is the raw octets
+/// (`TODO.md` #179).
+#[test]
+fn a_malformed_nsid_is_refused_and_hex_is_octets() {
+    for bad in ["", "0xzz", "0x6", "edge-\u{e9}"] {
+        let out = rdnsr(&["--check-config", "--nsid", bad]);
+        assert!(!out.status.success(), "{bad:?} passed the dry run");
+        assert!(stderr(&out).contains("--nsid"), "{bad:?}: {}", stderr(&out));
+    }
+    let out = rdnsr(&["--check-config", "--nsid", "0x6564"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("NSID ed"), "got: {}", stdout(&out));
+    let out = rdnsr(&["--check-config"]);
+    assert!(stdout(&out).contains("NSID off"), "got: {}", stdout(&out));
+}

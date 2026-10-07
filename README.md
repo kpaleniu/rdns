@@ -334,9 +334,11 @@ UDP and TCP from one process, same host and port.
 | `--catalog <ZONE@MASTER[:PORT][#KEY]>` | consume a catalog zone (RFC 9432): replicate it, and serve the zones it lists from the same master. Repeatable; requires `--zone-dir` |
 | `--config <FILE>`, `--check-config` | read settings from TOML, and dry-run them. Mutually exclusive with the flags above |
 
-Nineteen of `rdnsd`'s fifty-one flags, counted from `--help` rather than
-remembered — the denominator here has been stale twice, at twenty-seven and at
-forty-three. `rdnsd --help` is the full list;
+Nineteen of `rdnsd`'s flags. ~~Nineteen of `rdnsd`'s fifty-one flags, counted
+from `--help` rather than remembered — the denominator here has been stale
+twice, at twenty-seven and at forty-three.~~ The denominator went stale a third
+time with `--nsid` (`TODO.md` #179), and is gone rather than recounted.
+`rdnsd --help` is the full list;
 `docs/CLI_USAGE.md` covers them individually and `docs/spec/06-operations.md`
 has every default.
 
@@ -358,6 +360,7 @@ Binds 127.0.0.1 by default. Recurses from the root unless given `--upstream`.
 | `--query-rate <QUERIES_PER_SEC>` | default 200, with `--query-burst` (100) and `--query-rate-exempt` |
 | `--response-rate <BYTES_PER_SEC>` | default 8192, `0` disables |
 | `--metrics-listen <ADDR:PORT>` | Prometheus metrics and `/healthz`. No `/readyz` |
+| `--nsid <TEXT\|0xHEX>` | answer an NSID request (RFC 5001) with this identifier; off by default |
 | `--config <FILE>`, `--check-config` | read settings from TOML, and dry-run them. Mutually exclusive with the flags above. `[[rpz.feeds]]` is what only the file can say: a policy per feed, so a new one is measured in `passthru` while the rest stay enforced |
 | `--rpz <FILE>` | a response policy zone, repeatable and consulted in order; `--rpz-policy` overrides what its rules say, for every feed at once. How blocking is delivered |
 | `--serve-stale <SECONDS>` | answer from expired cache when the authoritative servers cannot be reached (RFC 8767). `0`, off, by default |

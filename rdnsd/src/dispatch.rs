@@ -34,7 +34,7 @@ use rdns::{
     journal::Journal,
     logging::QueryLogger,
     notify,
-    response::ClientEdns,
+    response::{ClientEdns, ServerOpt},
     security::{ResponseVerdict, TransferAcl, TransferCertificates},
     transfer::axfr_envelopes,
     tsig::{self, TsigCheck, TsigKeyring, TsigSession},
@@ -423,7 +423,7 @@ struct Admitted<'a> {
     peer: SocketAddr,
     now: u64,
     ceiling: usize,
-    advertised: u16,
+    advertised: ServerOpt,
 }
 
 impl Server {
@@ -487,7 +487,7 @@ impl Server {
         // the transport that will carry it and from this server's own limit —
         // not from the client's advertisement alone (`TODO.md` #41b).
         let ceiling = self.ctx.udp.reply_ceiling(&msg, wire.transport());
-        let advertised = self.ctx.udp.advertised();
+        let advertised = self.ctx.server_opt();
 
         let incoming = Incoming {
             msg: &msg,
@@ -686,7 +686,7 @@ impl Server {
         scratch: &'s Scratch,
     ) -> Option<Cow<'s, [u8]>> {
         let ip = Peer::from(peer);
-        let advertised = self.ctx.udp.advertised();
+        let advertised = self.ctx.server_opt();
         // The ceiling `answer` wrote the body against, signature reserved and
         // all: a truncated reply is signed too, so it is bounded by the same
         // number.
@@ -1083,7 +1083,10 @@ impl Server {
             // envelope and allows on the rest: a padded transfer carries it on
             // every one, so every one is padded.
             if refused.pad && message.edns.is_none() {
-                if let Some(edns) = ClientEdns::of(msg).mirror(msg.udp_payload_size()) {
+                if let Some(edns) = ClientEdns::of(msg).mirror(ServerOpt {
+                    payload_size: msg.udp_payload_size(),
+                    nsid: self.ctx.nsid,
+                }) {
                     message.set_edns(edns);
                 }
             }
@@ -1212,8 +1215,7 @@ impl Server {
             max_len,
             pad: padding,
         } = refused;
-        let Some(mut bytes) = error_reply(msg, rcode, why, max_len, self.ctx.udp.advertised())
-        else {
+        let Some(mut bytes) = error_reply(msg, rcode, why, max_len, self.ctx.server_opt()) else {
             serving_error!(self.ctx.logger, ip, "could not serialize an error response");
             return None;
         };
@@ -1615,7 +1617,11 @@ const NO_SUCH_ZONE: ExtendedError = ExtendedError::new(InfoCode::OTHER, "not a z
 /// `why` is RFC 8914's reason for the RCODE, and rides in that OPT or nowhere
 /// (§2) — which is [`ClientEdns::mirror_with`]'s rule, and so is what happens
 /// to a reason that will not encode.
-fn empty_reply(request: &DnsMessage, advertised: u16, why: Option<ExtendedError>) -> DnsMessage {
+fn empty_reply(
+    request: &DnsMessage,
+    advertised: ServerOpt,
+    why: Option<ExtendedError>,
+) -> DnsMessage {
     let mut resp = DnsMessage::reply_to(request);
     if let Some(edns) = ClientEdns::of(request).mirror_with(advertised, why) {
         resp.set_edns(edns);
@@ -1646,7 +1652,7 @@ fn error_reply(
     rcode: ResponseCode,
     why: Option<ExtendedError>,
     max_len: usize,
-    advertised: u16,
+    advertised: ServerOpt,
 ) -> Option<Vec<u8>> {
     let mut resp = empty_reply(request, advertised, why);
     resp.rcode = rcode;
@@ -1836,7 +1842,7 @@ struct UpdateReport {
 /// No AA — the reply carries no data — and bounded by the caller's ceiling,
 /// which on the transport this can happen on is the smaller of the client's
 /// EDNS payload size and this server's own, rather than 512 (RFC 6891 §6.2.4).
-fn truncated_reply(request: &DnsMessage, max_len: usize, advertised: u16) -> Option<Vec<u8>> {
+fn truncated_reply(request: &DnsMessage, max_len: usize, advertised: ServerOpt) -> Option<Vec<u8>> {
     let mut resp = empty_reply(request, advertised, None);
     resp.truncation = true;
     resp.to_bytes_within(max_len).ok()
@@ -1860,7 +1866,7 @@ fn notify_reply(
     zone_map: &ZoneMap,
     secondaries: &Secondaries,
     peer: SocketAddr,
-    advertised: u16,
+    advertised: ServerOpt,
 ) -> DnsMessage {
     let zone = notify::notified_zone(msg).unwrap_or_default();
 
@@ -2794,7 +2800,8 @@ pub(crate) mod tests {
         let asked = query("www.example.com.", Qtype::of(record_types::A), true);
         let ceiling = udp.reply_ceiling(&asked, Transport::Udp);
 
-        let bytes = truncated_reply(&asked, ceiling, udp.advertised()).expect("a truncated reply");
+        let bytes = truncated_reply(&asked, ceiling, ServerOpt::sized(udp.advertised()))
+            .expect("a truncated reply");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
         assert!(reply.truncation, "TC=1");
         assert!(
@@ -2809,7 +2816,7 @@ pub(crate) mod tests {
             ResponseCode::Refused,
             None,
             ceiling,
-            udp.advertised(),
+            ServerOpt::sized(udp.advertised()),
         )
         .expect("an error reply");
         let reply = DnsMessage::try_from_bytes(&bytes).expect("it parses");
@@ -2819,13 +2826,14 @@ pub(crate) mod tests {
         let plain = query("www.example.com.", Qtype::of(record_types::A), false);
         let ceiling = udp.reply_ceiling(&plain, Transport::Udp);
         for bytes in [
-            truncated_reply(&plain, ceiling, udp.advertised()).expect("a truncated reply"),
+            truncated_reply(&plain, ceiling, ServerOpt::sized(udp.advertised()))
+                .expect("a truncated reply"),
             error_reply(
                 &plain,
                 ResponseCode::Refused,
                 None,
                 ceiling,
-                udp.advertised(),
+                ServerOpt::sized(udp.advertised()),
             )
             .expect("an error reply"),
         ] {
@@ -2864,7 +2872,7 @@ pub(crate) mod tests {
             let mut msg = notify::notify_request(nm(zone).as_ref(), None, 1);
             msg.set_edns(rdns::Edns::with_payload_size(1232));
             let peer: SocketAddr = format!("{ip}:5353").parse().unwrap();
-            notify_reply(&msg, &zones, &secondaries, peer, 1232)
+            notify_reply(&msg, &zones, &secondaries, peer, ServerOpt::sized(1232))
         };
         let why = |reply: &DnsMessage| {
             let edns = reply.edns().expect("the sender's OPT is mirrored");
@@ -2938,7 +2946,7 @@ pub(crate) mod tests {
         assert!(msg.edns().is_none(), "the fixture sends no OPT");
 
         let peer: SocketAddr = "192.0.2.1:5353".parse().expect("a test address");
-        let reply = notify_reply(&msg, &zones, &secondaries, peer, 1232);
+        let reply = notify_reply(&msg, &zones, &secondaries, peer, ServerOpt::sized(1232));
 
         assert_eq!(reply.rcode, ResponseCode::NotAuthorized);
         assert!(
@@ -2963,7 +2971,7 @@ pub(crate) mod tests {
             edns.do_bit = do_bit;
             msg.set_edns(edns);
 
-            let reply = notify_reply(&msg, &zones, &secondaries, peer, 1232);
+            let reply = notify_reply(&msg, &zones, &secondaries, peer, ServerOpt::sized(1232));
             assert_eq!(
                 reply.edns().expect("an OPT").do_bit,
                 do_bit,
@@ -4527,6 +4535,160 @@ pub(crate) mod tests {
                 envelopes += 1;
             }
             assert!(envelopes > 1, "the fixture is several envelopes");
+        }
+    }
+
+    /// RFC 5001: an NSID request is answered with the configured identifier,
+    /// on every reply that carries an OPT, and nothing else is (`TODO.md`
+    /// #179).
+    mod nsid {
+        use super::*;
+        use rdns::{Edns, EdnsOption};
+        use std::fmt::Write as _;
+
+        const NSID: u16 = 3;
+
+        fn server(nsid: Option<&'static [u8]>) -> Arc<Server> {
+            let mut text = String::from(
+                "$ORIGIN example.com.\n$TTL 3600\n\
+                 @ IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )\n\
+                 @ IN NS ns1.example.com.\nns1 IN A 192.0.2.1\n",
+            );
+            // A TXT RRset whose reply is over 512 octets, for the truncation case.
+            for fill in ["x", "y", "z"] {
+                let _ = writeln!(text, "big IN TXT \"{}\"", fill.repeat(200));
+            }
+            let zone = rdns::zone::parse_zone_file(&text, "example.com.").expect("parse");
+            let mut zones = HashMap::new();
+            zones.insert(zone_key(&zone), std::sync::Arc::new(zone));
+            Arc::new(Server::new(
+                Arc::new(RwLock::new(Zones::new(zones))),
+                ServeContext {
+                    nsid,
+                    ..test_context()
+                },
+            ))
+        }
+
+        fn question(name: &str, qtype: Qtype, nsid: Option<Vec<u8>>, size: u16) -> Vec<u8> {
+            let mut msg = query(name, qtype, false);
+            let options: Vec<EdnsOption> = nsid
+                .into_iter()
+                .map(|data| EdnsOption { code: NSID, data })
+                .collect();
+            msg.set_edns(Edns::with_options(size, 0, false, &options).expect("options"));
+            msg.to_bytes_within(4096).expect("serialize")
+        }
+
+        async fn over_udp(server: &Server, packet: &[u8]) -> Vec<u8> {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+            let peer = client.local_addr().expect("addr");
+            server
+                .answer(
+                    packet,
+                    peer,
+                    tsig::now(),
+                    &Wire::Datagram(&socket, peer),
+                    &mut Scratch::default(),
+                )
+                .await;
+            let mut buf = vec![0u8; 65_535];
+            let (n, _) = client.recv_from(&mut buf).await.expect("a reply");
+            buf.truncate(n);
+            buf
+        }
+
+        async fn over_tcp(server: &Server, packet: &[u8]) -> Vec<u8> {
+            let peer: SocketAddr = "127.0.0.1:5300".parse().expect("addr");
+            let framed = answered(server, packet, peer).await;
+            framed[0][2..].to_vec()
+        }
+
+        fn nsid_of(reply: &[u8]) -> Option<Vec<u8>> {
+            let msg = DnsMessage::try_from_bytes(reply).expect("a reply");
+            msg.edns?
+                .options()
+                .expect("options")
+                .into_iter()
+                .find(|o| o.code == NSID)
+                .map(|o| o.data)
+        }
+
+        /// Asked over either transport, with or without a payload in the
+        /// request (§2.2: "MUST ignore any NSID payload data"), the answer is
+        /// the configured value; unasked, or unconfigured, there is none.
+        /// Watched failing with `mirror` ignoring `server.nsid`.
+        #[tokio::test]
+        async fn an_nsid_request_gets_the_configured_identifier() {
+            let on = server(Some(b"edge-7"));
+            let a = Qtype::of(record_types::A);
+            for asked in [Vec::new(), b"who".to_vec()] {
+                let packet = question("ns1.example.com.", a, Some(asked), 1232);
+                assert_eq!(
+                    nsid_of(&over_udp(&on, &packet).await),
+                    Some(b"edge-7".to_vec())
+                );
+                assert_eq!(
+                    nsid_of(&over_tcp(&on, &packet).await),
+                    Some(b"edge-7".to_vec())
+                );
+            }
+            let unasked = question("ns1.example.com.", a, None, 1232);
+            assert_eq!(
+                nsid_of(&over_udp(&on, &unasked).await),
+                None,
+                "§2.2 MUST NOT"
+            );
+
+            let off = server(None);
+            let asked = question("ns1.example.com.", a, Some(Vec::new()), 1232);
+            assert_eq!(nsid_of(&over_udp(&off, &asked).await), None);
+        }
+
+        /// Refusals and denials carry it too: the one mirror every reply
+        /// passes through, rather than a step on the answer path.
+        #[tokio::test]
+        async fn a_refusal_and_a_denial_carry_it() {
+            let on = server(Some(b"edge-7"));
+            let a = Qtype::of(record_types::A);
+            for (name, rcode) in [
+                ("www.example.org.", ResponseCode::Refused),
+                ("nope.example.com.", ResponseCode::NoSuchDomain),
+            ] {
+                let reply = over_udp(&on, &question(name, a, Some(Vec::new()), 1232)).await;
+                assert_eq!(
+                    DnsMessage::try_from_bytes(&reply).expect("parses").rcode,
+                    rcode
+                );
+                assert_eq!(nsid_of(&reply), Some(b"edge-7".to_vec()), "{name}");
+            }
+        }
+
+        /// The option counts against the client's size: a reply that fitted
+        /// exactly without it is truncated with it, never sent over.
+        #[tokio::test]
+        async fn a_reply_that_no_longer_fits_is_truncated() {
+            let txt = Qtype::of(record_types::TXT);
+            let exact = over_udp(
+                &server(None),
+                &question("big.example.com.", txt, Some(Vec::new()), 1232),
+            )
+            .await;
+            let size = exact.len() as u16;
+            assert!(size > 512, "the fixture is over the floor: {size}");
+
+            let reply = over_udp(
+                &server(Some(b"edge-7")),
+                &question("big.example.com.", txt, Some(Vec::new()), size),
+            )
+            .await;
+            assert!(reply.len() <= size as usize, "{} > {size}", reply.len());
+            assert!(
+                DnsMessage::try_from_bytes(&reply)
+                    .expect("parses")
+                    .truncation
+            );
         }
     }
 }

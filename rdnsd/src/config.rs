@@ -47,7 +47,7 @@ pub(crate) struct Config {
     zones: BTreeMap<String, ZoneConfig>,
 }
 
-// `[server]`: the 26 keys both daemons have, from `rdns::server_table!`, then
+// `[server]`: the keys both daemons have, from `rdns::server_table!`, then
 // this daemon's fourteen. The macro also writes `Default`, so the shared half is
 // spelled once there rather than once per daemon (`TODO.md` #63).
 rdns::server_table! {
@@ -755,6 +755,7 @@ anomaly-source-queries = 50
 anomaly-source-refusals = 2
 udp-workers = 3
 metrics-listen = "127.0.0.1:9153"
+nsid = "edge-7"
 dnstap = "file:./dnstap.fstrm"
 dnstap-max-bytes = 1024
 tls-listen = "127.0.0.1:8530"
@@ -825,6 +826,7 @@ allow-partial-load = true
             anomaly_source_refusals = 2,
             udp_workers = 3,
             metrics_listen = Some("127.0.0.1:9153".to_string()),
+            nsid = Some("edge-7".to_string()),
             dnstap = Some("file:./dnstap.fstrm".to_string()),
             dnstap_max_bytes = 1024,
             tls_listen = Some("127.0.0.1:8530".to_string()),

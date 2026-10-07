@@ -715,6 +715,14 @@ struct Cli {
     /// address.
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     metrics_listen: Option<String>,
+    /// Answer an NSID request (RFC 5001) with this identifier: text, or `0x`
+    /// and hex for raw bytes. Off unless given — RFC 5001 §5 counts what it
+    /// says about the server as "security sensitive".
+    ///
+    /// Only a query that carries an NSID option gets one back, whatever it
+    /// put in it (§2.2).
+    #[arg(long, value_name = "TEXT|0xHEX", conflicts_with = "config")]
+    nsid: Option<String>,
     /// Answer `rdnsctl` on this Unix socket: `status`, `reload`, `dump <zone>`.
     ///
     /// Filesystem permissions are the authentication: the socket is mode 0600,
@@ -790,6 +798,8 @@ struct ServePolicy {
     connections: TransportLimits,
     /// And how many of them one source may hold.
     per_source: SourceConnections,
+    /// RFC 5001's identifier, or off.
+    nsid: Option<&'static [u8]>,
     /// Where to serve Prometheus metrics, if anywhere.
     metrics_listen: Option<String>,
     /// Where to answer DNS over TLS, QUIC and HTTPS, and with what. `None` is
@@ -865,6 +875,7 @@ async fn serve(
         udp_workers,
         connections,
         per_source,
+        nsid,
         metrics_listen,
         tls,
         readiness,
@@ -1001,6 +1012,7 @@ async fn serve(
                 // A query ACL is `rdnsr`'s (`TODO.md` #171): an authoritative
                 // server answers whoever asks about its zones.
                 acl: QueryAcl::Open,
+                nsid,
                 clock: Clock::system(),
             },
         )
@@ -1020,7 +1032,7 @@ async fn serve(
          UDP reply cap: {reply_cap}B (advertising {advertised}B), \
          UDP workers: {udp_workers}, anomaly warnings: {anomaly_note}, \
          connections: {} per listener, {}, idle {}s, \
-         TSIG keys: {}, encrypted: {}, metrics: {}, control: {}",
+         TSIG keys: {}, encrypted: {}, metrics: {}, control: {}, NSID: {}",
         connections.max_connections,
         per_source.describe(),
         connections.idle_timeout.as_secs(),
@@ -1036,6 +1048,10 @@ async fn serve(
         match &control.socket {
             Some(path) => format!("{} (mode 0600)", path.display()),
             None => "off (--control-socket)".to_string(),
+        },
+        match nsid {
+            Some(nsid) => rdns::config::show_nsid(nsid),
+            None => "off (--nsid)".to_string(),
         },
         reply_cap = udp.max_response(),
         advertised = udp.advertised(),
@@ -1707,6 +1723,15 @@ async fn main() -> Result<()> {
             "--max-connections-per-source-exempt",
         )?,
     );
+    // Above the dry run, as every setting is (`CLAUDE.md` §15). Leaked once:
+    // it is read on every reply for the life of the process, and `'static`
+    // keeps `ServerOpt` `Copy`.
+    let nsid: Option<&'static [u8]> = cli
+        .nsid
+        .as_deref()
+        .map(rdns::config::parse_nsid)
+        .transpose()?
+        .map(|bytes| &*Box::leak(bytes.into_boxed_slice()));
 
     let mut secondary_specs = parse_secondary_specs(&cli.secondary)?;
     // A catalog is replicated by the same machinery as any other zone
@@ -1916,7 +1941,7 @@ async fn main() -> Result<()> {
         // to produce it.
         println!(
             "configuration is valid: {} zone(s){}, {} TSIG key(s), signing {}, listening on {}, \
-             encrypted transports {}",
+             encrypted transports {}, NSID {}",
             zones.len(),
             // Said out loud because the member zones are not among the count
             // above: they arrive with the catalog, and what a dry run can check
@@ -1943,6 +1968,10 @@ async fn main() -> Result<()> {
             match &encrypted {
                 None => "disabled".to_string(),
                 Some(encrypted) => format!("on {}, certificate loads", encrypted.listeners()),
+            },
+            match nsid {
+                Some(nsid) => rdns::config::show_nsid(nsid),
+                None => "off (--nsid)".to_string(),
             }
         );
         return Ok(());
@@ -2139,6 +2168,7 @@ async fn main() -> Result<()> {
                 cli.connection_idle_timeout,
             ),
             per_source,
+            nsid,
             metrics_listen: cli.metrics_listen,
             tls: encrypted,
             readiness,

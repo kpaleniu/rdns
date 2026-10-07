@@ -228,6 +228,7 @@ mod tests {
             udp: rdns::UdpSizes::default(),
             per_source: Default::default(),
             acl: rdns_transport::QueryAcl::Open,
+            nsid: None,
             clock: rdns::clock::Clock::fixed(1_000_000_000),
         });
         let metrics = ctx.metrics.clone();

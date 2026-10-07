@@ -422,6 +422,14 @@ struct Cli {
     /// because it is shared with `rdnsd`.
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     metrics_listen: Option<String>,
+    /// Answer an NSID request (RFC 5001) with this identifier: text, or `0x`
+    /// and hex for raw bytes. Off unless given — RFC 5001 §5 counts what it
+    /// says about the server as "security sensitive".
+    ///
+    /// Only a query that carries an NSID option gets one back, whatever it
+    /// put in it (§2.2).
+    #[arg(long, value_name = "TEXT|0xHEX", conflicts_with = "config")]
+    nsid: Option<String>,
     /// Also answer DNS over TLS here (RFC 7858). Needs --tls-cert and --tls-key.
     ///
     /// 853 is the assigned port, and a resolver is what RFC 7858 was written
@@ -889,6 +897,16 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    // Above the dry run, as every setting is (`CLAUDE.md` §15). Leaked once:
+    // it is read on every reply for the life of the process, and `'static`
+    // keeps `ServerOpt` `Copy`.
+    let nsid: Option<&'static [u8]> = cli
+        .nsid
+        .as_deref()
+        .map(rdns::config::parse_nsid)
+        .transpose()?
+        .map(|bytes| &*Box::leak(bytes.into_boxed_slice()));
+
     // Above the dry run: a name that is not an empty zone switches nothing
     // off, and the operator would believe it had (`CLAUDE.md` §15).
     let empty_zones =
@@ -961,7 +979,7 @@ async fn main() -> anyhow::Result<()> {
             .count();
         println!(
             "configuration is valid: {}, {} policy feed(s){}, cache {}, listening on {}, \
-             encrypted transports {}, query ACL {}, empty zones {}",
+             encrypted transports {}, query ACL {}, empty zones {}, NSID {}",
             source,
             in_force.zones().len(),
             // Said out loud because a feed at `passthru` or `disabled` blocks
@@ -988,6 +1006,10 @@ async fn main() -> anyhow::Result<()> {
             },
             acl.describe(),
             empty_zones.describe(),
+            match nsid {
+                Some(nsid) => rdns::config::show_nsid(nsid),
+                None => "off (--nsid)".to_string(),
+            },
         );
         return Ok(());
     }
@@ -1033,6 +1055,7 @@ async fn main() -> anyhow::Result<()> {
         admission: Arc::new(AdmissionCheck::new(admission.clone())),
         per_source: per_source.clone(),
         acl: acl.clone(),
+        nsid,
         clock,
     });
     // Without validation every answer is indeterminate, so the family would
@@ -1043,7 +1066,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, \
          UDP reply cap: {}B (advertising {}B), UDP in flight: {}, \
-         connections: {} per listener, {}, idle {}s, encrypted: {}, query ACL: {}",
+         connections: {} per listener, {}, idle {}s, encrypted: {}, query ACL: {}, NSID: {}",
         listening,
         source,
         if capacity == 0 {
@@ -1076,6 +1099,10 @@ async fn main() -> anyhow::Result<()> {
             None => "off (--tls-listen, --quic-listen, --https-listen)".to_string(),
         },
         acl.describe(),
+        match nsid {
+            Some(nsid) => rdns::config::show_nsid(nsid),
+            None => "off (--nsid)".to_string(),
+        },
     );
     // And the two limits, for the same reason: both drop in silence, so an
     // operator who cannot see the policy blames the network.

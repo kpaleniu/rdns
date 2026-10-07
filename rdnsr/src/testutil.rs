@@ -53,6 +53,7 @@ pub(crate) fn test_shell() -> Arc<ServeContext> {
         udp: rdns::UdpSizes::default(),
         per_source: Default::default(),
         acl: rdns_transport::QueryAcl::Open,
+        nsid: None,
         clock: rdns::clock::Clock::system(),
     })
 }
