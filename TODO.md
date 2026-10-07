@@ -40,13 +40,12 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Five items. #171-#185 were filed 2026-10-05 from a comparison against
+Four items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
 #173. #181 was closed wontfix in triage; #171-#174, #176, #179, #183, #184, #186,
-#187, #189, #191, #178, #188, #175, #177 and #180 closed 2026-10-07:
+#187, #189, #191, #178, #188, #175, #177, #180 and #182 closed 2026-10-07:
 
-- `rdnsd`: #182 catalog zones not generated.
 - #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
   closed, 185c and 185d wontfix.
 - #190 neither daemon can run as a Windows service.
@@ -1118,6 +1117,7 @@ the week; the record is under "How the queue kept going stale" in
 | **175** | DNS over TLS to forwarders | **filed 2026-10-05, closed 2026-10-07.** · `b21b5dd`, ` d8f5561` · [`docs/closed/175.md`](docs/closed/175.md) |
 | **177** | Local root fallback (RFC 8806) | **filed 2026-10-05, closed 2026-10-07.** · `d30aabb` · [`docs/closed/177.md`](docs/closed/177.md) |
 | **180** | KSK retirement gated on the parent's DS | **filed 2026-10-05, closed 2026-10-07.** · `4a5e544` · [`docs/closed/180.md`](docs/closed/180.md) |
+| **182** | Catalog zone generated from the primary zones | **filed 2026-10-05, closed 2026-10-07.** · `eab1069` · [`docs/closed/182.md`](docs/closed/182.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
