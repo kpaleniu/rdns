@@ -185,7 +185,7 @@ pub(crate) struct Server {
     journal: Option<Arc<Journal>>,
     /// Where the query stream goes, or `None` when `--dnstap` was not given.
     /// See [`crate::dnstap`] for why the queue behind it drops.
-    dnstap: Option<crate::dnstap::Sink>,
+    dnstap: Option<rdns_transport::dnstap::Sink>,
 }
 
 impl Server {
@@ -258,7 +258,7 @@ impl Server {
         }
     }
 
-    pub(crate) fn with_dnstap(self, dnstap: Option<crate::dnstap::Sink>) -> Self {
+    pub(crate) fn with_dnstap(self, dnstap: Option<rdns_transport::dnstap::Sink>) -> Self {
         Server { dnstap, ..self }
     }
 
@@ -3562,7 +3562,7 @@ pub(crate) mod tests {
         dir: &Path,
         key: TsigKey,
         journal: Option<Arc<rdns::journal::Journal>>,
-        dnstap: Option<crate::dnstap::Sink>,
+        dnstap: Option<rdns_transport::dnstap::Sink>,
     ) -> SocketAddr {
         listen_updatable(
             updatable_server(dir, key)
@@ -3747,8 +3747,8 @@ pub(crate) mod tests {
         // `test_shutdown` is one static that every other test's accept loop is
         // holding.
         let shutdown = Shutdown::new();
-        let sink = crate::dnstap::Sink::spawn(
-            &crate::dnstap::Target::File(capture.clone()),
+        let sink = rdns_transport::dnstap::Sink::spawn(
+            &rdns_transport::dnstap::Target::File(capture.clone()),
             0,
             Vec::new(),
             Vec::new(),

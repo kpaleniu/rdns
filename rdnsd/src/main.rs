@@ -31,7 +31,6 @@ mod config;
 mod control;
 /// Answering one request, on either transport.
 mod dispatch;
-mod dnstap;
 mod notify_out;
 mod replication;
 /// What a signed answer weighs, for `TODO.md` #41's choice of ceiling.
@@ -813,7 +812,7 @@ struct ServePolicy {
     /// Where the delta log is persisted, if anywhere.
     journal: Option<Arc<Journal>>,
     /// Where the query stream goes, and what a capture file may weigh.
-    dnstap: Option<(crate::dnstap::Target, u64)>,
+    dnstap: Option<(rdns_transport::dnstap::Target, u64)>,
     /// The control socket, and what a `reload` on it pokes.
     control: ControlPolicy,
 }
@@ -985,7 +984,7 @@ async fn serve(
     // appears (`CLAUDE.md` §4).
     let dnstap = match &dnstap {
         Some((target, max_bytes)) => Some(
-            crate::dnstap::Sink::spawn(
+            rdns_transport::dnstap::Sink::spawn(
                 target,
                 *max_bytes,
                 hostname_bytes(),
@@ -1921,7 +1920,10 @@ async fn main() -> Result<()> {
     // is evaluated below the dry-run exit, which made this the one flag
     // `--check-config` accepted and the real start refused (`TODO.md` #99).
     let dnstap = match &cli.dnstap {
-        Some(spec) => Some((spec.parse::<dnstap::Target>()?, cli.dnstap_max_bytes)),
+        Some(spec) => Some((
+            spec.parse::<rdns_transport::dnstap::Target>()?,
+            cli.dnstap_max_bytes,
+        )),
         None => None,
     };
 

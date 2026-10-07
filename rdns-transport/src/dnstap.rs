@@ -41,7 +41,7 @@ const QUEUE_DEPTH: usize = 8192;
 
 /// Where the stream goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Target {
+pub enum Target {
     /// A collector listening on TCP, the ordinary production shape.
     Tcp(String),
     /// A capture file, which `dnstap -r` reads. Not rotated and not reopened:
@@ -76,7 +76,7 @@ impl FromStr for Target {
 /// Cloned into every task, so it is an `Arc`-free `mpsc::Sender` plus the two
 /// constant fields every payload repeats.
 #[derive(Clone)]
-pub(crate) struct Sink {
+pub struct Sink {
     frames: mpsc::Sender<Vec<u8>>,
     metrics: DnsMetrics,
     identity: Arc<Vec<u8>>,
@@ -85,11 +85,11 @@ pub(crate) struct Sink {
 
 impl Sink {
     /// `Dnstap.identity`, usually the host name, and `Dnstap.version`.
-    pub(crate) fn identity(&self) -> &[u8] {
+    pub fn identity(&self) -> &[u8] {
         &self.identity
     }
 
-    pub(crate) fn version(&self) -> &[u8] {
+    pub fn version(&self) -> &[u8] {
         &self.version
     }
 
@@ -98,7 +98,7 @@ impl Sink {
     /// `try_send`, never `send`: this is called from the answer path, and an
     /// `.await` here would put a collector that stopped reading in front of
     /// every query.
-    pub(crate) fn send(&self, payload: Vec<u8>) {
+    pub fn send(&self, payload: Vec<u8>) {
         match self.frames.try_send(payload) {
             Ok(()) => self.metrics.count(&self.metrics.dnstap_frames),
             // Full, or the writer task is gone. Both are "this payload is not
@@ -109,7 +109,7 @@ impl Sink {
 
     /// Encode `entry` and queue it. Nothing is encoded when the queue is
     /// already full, which is the cheap half of the drop.
-    pub(crate) fn record(&self, entry: &dnstap::Entry<'_>) {
+    pub fn record(&self, entry: &dnstap::Entry<'_>) {
         if self.frames.capacity() == 0 {
             self.metrics.count(&self.metrics.dnstap_dropped);
             return;
@@ -132,7 +132,7 @@ impl Sink {
     /// reopened on SIGHUP: a capture is a capture, and a rotation policy with
     /// no way to say "and then what" is a disk-filling knob with a doc comment
     /// in front of it. `--dnstap-max-bytes` is the bound instead.
-    pub(crate) async fn spawn(
+    pub async fn spawn(
         target: &Target,
         max_bytes: u64,
         identity: Vec<u8>,
