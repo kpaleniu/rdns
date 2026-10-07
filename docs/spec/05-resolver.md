@@ -572,3 +572,28 @@ without a restart. Every change is reported at `info`.
 `SharedAnchors` is a `std::sync::RwLock`, not tokio's: every use is a
 clone-and-release with no await inside. A poisoned lock uses the recovered value
 rather than panicking.
+
+---
+
+## 5.10 The control socket (`--control-socket`, `TODO.md` #178)
+
+`rdnsd`'s transport (`03` §3.9): mode 0600, refused over a live socket, Unix
+only and refused at startup on Windows (`TODO.md` #188). The socket half is
+`rdns_transport::control`; each daemon supplies its command table.
+
+| command | does |
+|---|---|
+| `status` (default) | uptime, entries per cache, NTAs in force, routed domains |
+| `reload` | SIGHUP's reload through SIGHUP's task, replying with what it re-read or why not |
+| `flush` | every cache: answers, negatives, denials, delegations, keys, RTTs, NSIDs |
+| `flushname NAME` | answers and negative answers at exactly `NAME`, every type |
+| `flushtree NAME` | answers, negatives, denials, delegations and keys at and below `NAME` |
+| `dump [NAME]` | cached answers as zone-file lines, TTL left, outcome, stale ones marked |
+| `nta` | the negative trust anchors in force, with expiry and recheck |
+| `version`, `help` | |
+
+Each flush replies with the count removed, so one that matched nothing says 0.
+Trust anchors and RPZ policy are not caches and no flush touches them. NTAs
+change only through the file and `reload` (§5.7a); one lifted by a recheck is
+no longer in force and is not listed. `dump` copies under the cache lock and
+formats after releasing it; negative answers are not dumped.

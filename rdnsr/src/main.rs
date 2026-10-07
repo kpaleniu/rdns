@@ -21,6 +21,10 @@ mod anchors;
 mod answer;
 mod caches;
 mod config;
+// Compiled everywhere so its tests run on Windows too; only the socket is
+// `cfg(unix)` (`TODO.md` #188).
+#[cfg_attr(not(unix), allow(dead_code))]
+mod control;
 #[cfg(test)]
 mod flood;
 mod inflight;
@@ -303,6 +307,14 @@ struct Cli {
     /// lifted when it does, unless `norecheck`.
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     negative_trust_anchors: Option<PathBuf>,
+    /// Answer `rdnsctl -s PATH` on this Unix socket: flush and dump the
+    /// caches, list the negative trust anchors, reload. `help` on the socket
+    /// lists the commands.
+    ///
+    /// Mode 0600, so the server's user and root; that is the authentication.
+    /// Unix only, and refused on Windows rather than ignored (`TODO.md` #188).
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
+    control_socket: Option<PathBuf>,
     /// How much to say: error, warn, info, debug or trace.
     ///
     /// Nothing per-query is above `debug`. `RUST_LOG` overrides it, so a
@@ -791,6 +803,18 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("configured from {}", path.display());
     }
     let cli = cli;
+    let started = std::time::Instant::now();
+
+    // Refused here, above the dry run, so `--check-config` says so too.
+    #[cfg(not(unix))]
+    if cli.control_socket.is_some() {
+        anyhow::bail!(
+            "--control-socket needs a Unix domain socket, and neither std nor \
+             tokio exposes one on Windows — the flag is parsed everywhere so a \
+             config file written on Linux is not a syntax error here, but it \
+             cannot be honoured"
+        );
+    }
 
     // Before anything is spawned: it owns the only durable state this process
     // writes.
@@ -1140,6 +1164,13 @@ async fn main() -> anyhow::Result<()> {
         ),
         None => None,
     };
+    // The same rule for the control socket: a path that cannot be bound stops
+    // the start.
+    #[cfg(unix)]
+    let control_listener = match &cli.control_socket {
+        Some(path) => Some(rdns_transport::control::bind(path)?),
+        None => None,
+    };
 
     let stream_listeners = EncryptedListeners::bind(
         encrypted.as_ref(),
@@ -1469,20 +1500,45 @@ async fn main() -> anyhow::Result<()> {
         nta::spawn_maintainer(serving.clone(), shutdown.stop_handle(), shutdown.busy());
     }
     let local_files = Arc::new(local_files);
+    // A control socket's `reload` goes through this task, so it runs whenever
+    // there is a socket, even with nothing to re-read: it says so.
+    let (control_reloads, controlled) = tokio::sync::mpsc::channel(1);
     if encrypted.is_some()
         || serving.policy.is_configured()
         || nta_file.is_some()
         || !local_files.is_empty()
+        || cli.control_socket.is_some()
     {
         tokio::spawn(reload::reload_task(
             encrypted.as_ref().map(Encrypted::store),
             nta_file,
-            local_files,
+            local_files.clone(),
             serving.clone(),
             reload,
+            controlled,
             shutdown.stop_handle(),
         ));
     }
+    // A listener like the others: if it dies, the process does.
+    #[cfg(unix)]
+    if let Some(control_listener) = control_listener {
+        loops.spawn(rdns_transport::control::serve(
+            control_listener,
+            cli.control_socket
+                .clone()
+                .expect("a listener implies a path"),
+            Arc::new(control::Control {
+                serving: serving.clone(),
+                reloads: control_reloads,
+                local: local_files.clone(),
+                started,
+            }),
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+    }
+    #[cfg(not(unix))]
+    let _ = (control_reloads, started);
     // A listener like the others: if it dies, the process does. Metrics that
     // silently stopped are worse than a resolver that is plainly down.
     if let Some(metrics_listener) = metrics_listener {

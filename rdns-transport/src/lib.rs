@@ -24,6 +24,7 @@
 #![warn(clippy::format_push_string)]
 
 pub mod bind;
+pub mod control;
 pub mod dnstap;
 pub mod encrypted;
 pub mod https;

@@ -1,4 +1,5 @@
-//! `rdnsctl` — ask a running `rdnsd` what it is doing, and tell it to reload.
+//! `rdnsctl` — ask a running `rdnsd` or `rdnsr` what it is doing, and tell it
+//! to reload.
 //!
 //! One connect, one command, one reply, then close ([`rdns_core::control`]). Nothing
 //! to overlap, so `std` rather than `tokio`.
@@ -22,7 +23,8 @@ const DEFAULT_SOCKET: &str = "/run/rdns/rdnsd.sock";
 #[derive(Parser)]
 #[command(version = rdns_core::VERSION, about, long_about = None)]
 struct Cli {
-    /// The control socket `rdnsd` was started with (`--control-socket`).
+    /// The control socket the server was started with (`--control-socket`).
+    /// The default is `rdnsd`'s; `rdnsr`'s has to be named.
     #[arg(short, long, value_name = "PATH", default_value = DEFAULT_SOCKET)]
     socket: std::path::PathBuf,
     /// How long to wait for a reply, in seconds.
@@ -31,11 +33,12 @@ struct Cli {
     /// answering, and the server bounds its own reply at 120 seconds.
     #[arg(short, long, value_name = "SECONDS", default_value = "150")]
     timeout: u64,
-    /// `status`, `reload`, `dump <zone>`, `catalog [<zone>]`, `version`, or
-    /// `help`.
+    /// What to ask. Each server has its own commands, and `help` lists them:
+    /// this client does not, so it cannot fall behind either server
+    /// (`TODO.md` #178).
     #[arg(value_name = "COMMAND", default_value = "status")]
     command: String,
-    /// Arguments for the command — a zone name, for `dump` and `catalog`.
+    /// Arguments for the command, such as a name.
     #[arg(value_name = "ARG")]
     args: Vec<String>,
 }
@@ -75,7 +78,7 @@ fn run(cli: &Cli) -> anyhow::Result<std::process::ExitCode> {
 
     let mut stream = UnixStream::connect(&cli.socket).with_context(|| {
         format!(
-            "connecting to {} — is rdnsd running with --control-socket?",
+            "connecting to {} — is the server running with --control-socket?",
             cli.socket.display()
         )
     })?;

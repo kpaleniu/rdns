@@ -143,6 +143,21 @@ impl DelegationCache {
             entries.remove(zone.folded().as_ref());
         }
     }
+
+    pub(super) fn len(&self) -> usize {
+        self.entries.lock().map_or(0, |e| e.len())
+    }
+
+    /// Drop the delegations at or below `node` (all of them for the root),
+    /// returning how many went.
+    pub(super) fn forget_at_or_below(&self, node: NameRef<'_>) -> usize {
+        let Ok(mut entries) = self.entries.lock() else {
+            return 0;
+        };
+        let before = entries.len();
+        entries.retain(|key, _| !crate::name_keys::is_at_or_below(key, node));
+        before - entries.len()
+    }
 }
 
 /// A smoothed round-trip time per nameserver, so a zone's servers are tried
@@ -215,9 +230,16 @@ impl NsidStore {
         changed
     }
 
-    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.seen.lock().map_or(0, |t| t.by_server.len())
+    }
+
+    pub(super) fn clear(&self) -> usize {
+        self.seen.lock().map_or(0, |mut t| {
+            let n = t.by_server.len();
+            t.by_server.clear();
+            n
+        })
     }
 }
 
@@ -269,6 +291,18 @@ impl RttStore {
         }
     }
 
+    pub(super) fn len(&self) -> usize {
+        self.rtts.lock().map_or(0, |m| m.len())
+    }
+
+    pub(super) fn clear(&self) -> usize {
+        self.rtts.lock().map_or(0, |mut m| {
+            let n = m.len();
+            m.clear();
+            n
+        })
+    }
+
     /// `servers` reordered fastest-known-first, ties keeping their input order
     /// (so a freshly learned, all-unmeasured set is tried as given).
     pub(super) fn order(&self, servers: &[SocketAddr]) -> Vec<SocketAddr> {
@@ -311,6 +345,20 @@ impl KeyCache {
             capacity,
             clock,
         }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.entries.lock().map_or(0, |e| e.len())
+    }
+
+    /// Drop the key sets at or below `node`, returning how many went.
+    pub(super) fn forget_at_or_below(&self, node: NameRef<'_>) -> usize {
+        let Ok(mut entries) = self.entries.lock() else {
+            return 0;
+        };
+        let before = entries.len();
+        entries.retain(|key, _| !crate::name_keys::is_at_or_below(key, node));
+        before - entries.len()
     }
 
     pub(super) fn get(&self, zone: NameRef<'_>) -> Option<Vec<Dnskey>> {

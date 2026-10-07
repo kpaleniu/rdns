@@ -43,12 +43,22 @@ pub(crate) fn load(
 /// Re-read the file and put it in force, or keep the set in force if it does
 /// not load (§4's "the old set"). Called from the SIGHUP reload, off the
 /// worker threads.
-pub(crate) fn reload(serving: &Resolving, path: &Path) {
+///
+/// Returns the line a `reload` command reports (`TODO.md` #178).
+pub(crate) fn reload(serving: &Resolving, path: &Path) -> String {
     let now = serving.ctx.clock.now();
     let anchors = serving.resolver.trust_anchors();
     match load(path, now, anchors.as_ref()) {
-        Ok(set) => install(serving, set),
-        Err(e) => tracing::warn!("{e:#}; keeping the negative trust anchors in force"),
+        Ok(set) => {
+            let count = set.len();
+            install(serving, set);
+            format!("negative trust anchors: {count} in force")
+        }
+        Err(e) => {
+            let line = format!("{e:#}; keeping the negative trust anchors in force");
+            tracing::warn!("{line}");
+            line
+        }
     }
 }
 

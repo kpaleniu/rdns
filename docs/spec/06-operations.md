@@ -571,9 +571,11 @@ checking our signatures is worth more than our own client checking them.
 
 ## 6.7 `rdnsctl` — the control client
 
-See `03-authoritative-server.md` §3.9 for the protocol and the commands.
+See `03-authoritative-server.md` §3.9 for the protocol and `rdnsd`'s commands,
+`05-resolver.md` §5.10 for `rdnsr`'s. The client knows neither list: `help` on
+the socket is the server's own.
 
 - Default socket `/run/rdns/rdnsd.sock`, which is what a systemd unit's
-  `RuntimeDirectory=` creates.
+  `RuntimeDirectory=` creates. `rdnsr`'s is named with `-s`.
 - Default timeout 150 s; the server bounds its own `reload` reply at 120 s.
 - Unix only. On Windows it says so and exits 2 rather than not existing.

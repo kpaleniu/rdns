@@ -52,6 +52,7 @@ Recursive (`rdnsr`):
 - Response Policy Zones, for an operator with a blocklist to enforce
 - DNS64 (RFC 6147) for an IPv6-only network behind a NAT64
 - Rate limits, response-byte budget, Prometheus metrics, `/healthz`
+- A control socket: `flush`, `flushname`, `flushtree`, `dump`, `nta`, `reload`
 
 Operations:
 
@@ -62,7 +63,8 @@ Operations:
 - Prometheus metrics: RED counters, answer-latency histogram, per-zone serial and
   last-refresh gauges, `/healthz` and `/readyz`
 - A container image (`Dockerfile`), unprivileged, built and exercised in CI
-- A control socket and `rdnsctl`: `status`, `reload`, `dump`, `catalog`
+- A control socket and `rdnsctl`: `status`, `reload`, `dump`, `catalog`; `help`
+  on either daemon's socket lists its own
 
 ## Crates
 
@@ -79,7 +81,7 @@ Nine, split so a client links neither a server nor a crypto library
 | `rdnsd` | authoritative server — every transport from one process |
 | `rdnsr` | recursive resolver with caching; forwards on `--upstream` |
 | `rdnsc` | command-line query client |
-| `rdnsctl` | control client for a running `rdnsd` (Unix only) |
+| `rdnsctl` | control client for a running `rdnsd` or `rdnsr` (Unix only) |
 
 ## Documentation
 

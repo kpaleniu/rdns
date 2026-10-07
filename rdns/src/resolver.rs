@@ -770,6 +770,29 @@ impl Resolver {
         self.config.dnssec.as_ref().map(SharedAnchors::get)
     }
 
+    /// How many entries each of the resolver's own caches holds: delegations,
+    /// DNSKEY sets, server RTTs, upstream NSIDs (`TODO.md` #178).
+    pub fn cache_sizes(&self) -> [(&'static str, usize); 4] {
+        [
+            ("delegations", self.delegations.len()),
+            ("keys", self.keys.len()),
+            ("rtts", self.rtt.len()),
+            ("nsids", self.nsids.len()),
+        ]
+    }
+
+    /// Forget the delegations and key sets at or below `node`, and with the
+    /// root every RTT and NSID too: what is learned about a subtree, for a
+    /// flush (`TODO.md` #178). Returns how many entries went.
+    pub fn forget_at_or_below(&self, node: NameRef<'_>) -> usize {
+        let mut gone =
+            self.delegations.forget_at_or_below(node) + self.keys.forget_at_or_below(node);
+        if node.is_root() {
+            gone += self.rtt.clear() + self.nsids.clear();
+        }
+        gone
+    }
+
     /// Report every upstream exchange to `tap` (`TODO.md` #191).
     pub fn with_tap(mut self, tap: ExchangeTap) -> Self {
         self.tap = Some(tap);

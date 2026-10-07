@@ -187,6 +187,17 @@ pub struct Cached {
     pub learned_at: u64,
 }
 
+/// One entry of a [`DnsCache::dump`].
+#[derive(Debug, Clone)]
+pub struct Dumped {
+    pub records: Vec<ResourceRecord>,
+    /// Seconds of TTL left; 0 once expired.
+    pub remaining: u64,
+    /// Past its TTL and held for the stale window (RFC 8767).
+    pub stale: bool,
+    pub outcome: Outcome,
+}
+
 /// DNS response cache with TTL support.
 ///
 /// Keyed by (domain_name, record_type), and *answers* only: a negative answer
@@ -446,6 +457,46 @@ impl DnsCache {
         let before = cache.len();
         cache.retain(|key, _| !crate::name_keys::is_at_or_below(key.name(), node));
         before - cache.len()
+    }
+
+    /// Entries held, live or stale.
+    pub fn len(&self) -> usize {
+        self.cache.lock().map_or(0, |c| c.len())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drop every type held at exactly `name`, returning how many went.
+    pub fn forget_name(&self, name: NameRef<'_>) -> usize {
+        let Ok(mut cache) = self.cache.lock() else {
+            return 0;
+        };
+        let folded = name.folded();
+        let before = cache.len();
+        cache.retain(|key, _| key.name() != folded.as_ref());
+        before - cache.len()
+    }
+
+    /// What is held at or below `node`, for a dump: copied out under the lock
+    /// and handed back for the caller to format after releasing it
+    /// (`CLAUDE.md` §9, `TODO.md` #178).
+    pub fn dump(&self, node: NameRef<'_>) -> Vec<Dumped> {
+        let now = self.clock.now();
+        let Ok(cache) = self.cache.lock() else {
+            return Vec::new();
+        };
+        cache
+            .iter()
+            .filter(|(key, _)| crate::name_keys::is_at_or_below(key.name(), node))
+            .map(|(_, entry)| Dumped {
+                records: entry.records.clone(),
+                remaining: entry.expires_at.remaining(now),
+                stale: entry.is_expired(now),
+                outcome: entry.outcome,
+            })
+            .collect()
     }
 
     /// Clear all cache entries.

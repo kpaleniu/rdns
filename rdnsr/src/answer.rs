@@ -867,11 +867,14 @@ pub(crate) fn log_policy(zones: &PolicyZones) {
 /// Neither line below names SIGHUP any more: [`crate::reload`] coalesces its
 /// triggers, so a message naming one of them would be a guess. Which trigger
 /// asked is logged where it arrives.
-pub(crate) fn reload_policy(serving: &Resolving) {
+///
+/// Returns the line a `reload` command reports (`TODO.md` #178), or none when
+/// no policy is configured.
+pub(crate) fn reload_policy(serving: &Resolving) -> Option<String> {
     if !serving.policy.is_configured() {
-        return;
+        return None;
     }
-    match serving.policy.reload() {
+    Some(match serving.policy.reload() {
         Ok(reloaded) => {
             // The count, not just "re-read": a feed whose file has not moved is
             // kept whole (`TODO.md` #71b), so an operator whose edit did not
@@ -881,12 +884,13 @@ pub(crate) fn reload_policy(serving: &Resolving) {
             // process transferred and wrote is installed from the copy it
             // already held (`TODO.md` #71f), and reporting that as "0 changed"
             // would send an operator to look at a file that is in force.
-            tracing::info!(
+            let line = format!(
                 "policy zones re-read: {} of {} feeds had changed, {} installed from a transfer",
                 reloaded.reread,
                 reloaded.zones.zones().len(),
                 reloaded.installed,
             );
+            tracing::info!("{line}");
             log_policy(&reloaded.zones);
             // The one thing a new rule cannot reach on its own. A QNAME or
             // client-IP rule is consulted before every cache and a response-IP
@@ -902,14 +906,18 @@ pub(crate) fn reload_policy(serving: &Resolving) {
                      was offered to it"
                 );
             }
+            line
         }
         // The previous set is still in force, which is the whole point of
         // saying so: a half-written feed must not lift a block.
-        Err(e) => tracing::warn!(
-            "could not re-read the policy zones; the previous ones are still in \
-             force: {e}"
-        ),
-    }
+        Err(e) => {
+            let line = format!(
+                "could not re-read the policy zones; the previous ones are still in force: {e}"
+            );
+            tracing::warn!("{line}");
+            line
+        }
+    })
 }
 
 /// What a policy match did, since one of the six actions is to do nothing.

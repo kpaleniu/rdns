@@ -1,5 +1,6 @@
-//! The control socket: `status`, `reload`, `dump` and `catalog`, answered by
-//! the process that knows.
+//! The control socket's commands: `status`, `reload`, `dump` and `catalog`,
+//! answered by the process that knows. The socket itself is
+//! `rdns_transport::control`, shared with `rdnsr` (`TODO.md` #178).
 //!
 //! A Unix socket and no TCP; see [`rdns::control`]. Unix-only, and
 //! `--control-socket` is refused on Windows rather than accepted and ignored.
@@ -12,23 +13,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use rdns::clock::current_unix_timestamp;
-use rdns::control::{err, ok, Request, MAX_REQUEST};
+use rdns::control::{duration, err, ok, Request};
 use rdns::metrics::ZoneFacts;
-use rdns::persist;
 use rdns::shutdown::{Busy, Stop};
 use rdns::zone_writer::zone_to_string;
 use rdns::Name;
 use rdns::Serial;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 
 use crate::{ReloadTrigger, ZoneContext};
-
-/// How long a client gets to send its command before we give up on it.
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long `reload` waits for the maintenance task before answering anyway.
 ///
@@ -57,58 +53,13 @@ pub(crate) struct Control {
     pub(crate) listen: String,
 }
 
-/// Bind the socket, refusing rather than stealing it if a server is already
-/// there.
-///
-/// - `connect` first: something accepting means another `rdnsd` holds the path.
-///   Connection refused means a leftover from a dead process, which must not
-///   stop a start.
-/// - Bind under a temporary name, restrict to the owner, rename over the
-///   target: the mode is in place before the published path exists, and the
-///   rename leaves no unlink-then-bind gap for a racing process.
+/// Bind the socket; the transport is `rdns_transport::control`'s, shared
+/// with `rdnsr` (`TODO.md` #178).
 pub(crate) fn bind(path: &Path) -> Result<UnixListener> {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() && !dir.is_dir() {
-            return Err(anyhow!(
-                "--control-socket {}: {} is not a directory",
-                path.display(),
-                dir.display()
-            ));
-        }
-    }
-    if std::os::unix::net::UnixStream::connect(path).is_ok() {
-        return Err(anyhow!(
-            "--control-socket {}: another server is already listening there",
-            path.display()
-        ));
-    }
-
-    let temp = temp_path(path);
-    // A leftover from an interrupted start of our own; the target is left alone
-    // until the rename.
-    let _ = std::fs::remove_file(&temp);
-    let listener = UnixListener::bind(&temp)
-        .with_context(|| format!("--control-socket {}", path.display()))?;
-    let restricted = persist::restrict_to_owner(&temp).and_then(|()| std::fs::rename(&temp, path));
-    if let Err(e) = restricted {
-        let _ = std::fs::remove_file(&temp);
-        return Err(anyhow::Error::from(e).context(format!("--control-socket {}", path.display())));
-    }
-    Ok(listener)
-}
-
-/// `<name>.<pid>.tmp` beside the target, so two servers racing to start cannot
-/// collide on the temporary either.
-fn temp_path(path: &Path) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.tmp", std::process::id()));
-    path.with_file_name(name)
+    rdns_transport::control::bind(path)
 }
 
 /// Accept control connections until told to stop.
-///
-/// The socket file is removed on the way out: a leftover makes `rdnsctl` say
-/// "connection refused" where "no such file" is the truth.
 pub(crate) async fn serve(
     listener: UnixListener,
     path: PathBuf,
@@ -116,66 +67,13 @@ pub(crate) async fn serve(
     stop: Stop,
     busy: Busy,
 ) -> Result<(), std::io::Error> {
-    let result = accept_loop(listener, &control, stop, busy).await;
-    let _ = std::fs::remove_file(&path);
-    result
+    rdns_transport::control::serve(listener, path, control, stop, busy).await
 }
 
-async fn accept_loop(
-    listener: UnixListener,
-    control: &Arc<Control>,
-    stop: Stop,
-    busy: Busy,
-) -> Result<(), std::io::Error> {
-    loop {
-        // `accept` is cancel-safe, so losing this race drops nothing.
-        let (stream, _) = tokio::select! {
-            accepted = listener.accept() => accepted?,
-            _ = stop.wait() => return Ok(()),
-        };
-        let control = control.clone();
-        // A command in flight holds the drain: a half-written `dump` cannot be
-        // told from a complete one.
-        let busy = busy.clone();
-        tokio::spawn(async move {
-            let _busy = busy;
-            if let Err(e) = converse(stream, &control).await {
-                // DEBUG: a client hanging up mid-write is not actionable, and
-                // this socket is reachable only by the trusted.
-                tracing::debug!("control connection: {e}");
-            }
-        });
+impl rdns_transport::control::Commands for Control {
+    async fn run(&self, request: Request) -> String {
+        run(request, self).await
     }
-}
-
-/// One connection: read a command, run it, write the reply, close.
-async fn converse(mut stream: UnixStream, control: &Control) -> std::io::Result<()> {
-    let mut buf = Vec::with_capacity(256);
-    let line = loop {
-        if let Some(at) = buf.iter().position(|b| *b == b'\n') {
-            break String::from_utf8_lossy(&buf[..at]).into_owned();
-        }
-        if buf.len() >= MAX_REQUEST {
-            return write_all(&mut stream, &err("command too long")).await;
-        }
-        let mut chunk = [0u8; 256];
-        match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk)).await {
-            // A client that closed without a newline still gets its command
-            // run: `printf status | socat ...` sends no trailing newline.
-            Ok(Ok(0)) => break String::from_utf8_lossy(&buf).into_owned(),
-            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return write_all(&mut stream, &err("timed out waiting for a command")).await,
-        }
-    };
-
-    let reply = run(Request::parse(&line), control).await;
-    write_all(&mut stream, &reply).await
-}
-
-async fn write_all(stream: &mut UnixStream, text: &str) -> std::io::Result<()> {
-    stream.write_all(text.as_bytes()).await?;
-    stream.flush().await
 }
 
 /// The command table.
@@ -395,23 +293,6 @@ async fn catalog(args: &[String], control: &Control) -> String {
     ok(&out)
 }
 
-/// `1d 2h`, `3h 4m`, `5m 6s`, `7s`. Rounds down: for an age, "0s ago" is a fact
-/// and "1s ago" would be a guess.
-fn duration(seconds: u64) -> String {
-    let (d, h, m, s) = (
-        seconds / 86_400,
-        (seconds % 86_400) / 3600,
-        (seconds % 3600) / 60,
-        seconds % 60,
-    );
-    match (d, h, m) {
-        (0, 0, 0) => format!("{s}s"),
-        (0, 0, _) => format!("{m}m {s}s"),
-        (0, _, _) => format!("{h}h {m}m"),
-        _ => format!("{d}d {h}h"),
-    }
-}
-
 /// Re-read every zone file, sign, verify, install — and say whether it worked.
 ///
 /// No per-zone reload: `Reloading::load` is all-or-nothing, because a partial
@@ -487,6 +368,8 @@ mod tests {
     use crate::testutil::{nm, ScratchDir};
     use rdns::control::{parse_reply, Reply};
     use rdns::zone::Zone;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::UnixStream;
 
     fn zone() -> Zone {
         rdns::zone::parse_zone_file(

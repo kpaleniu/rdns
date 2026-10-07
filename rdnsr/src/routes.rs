@@ -71,7 +71,9 @@ fn read_local(name: &Name, path: &Path) -> anyhow::Result<(Zone, Vec<u8>)> {
 /// Re-read every local zone file, all or nothing (`CLAUDE.md` §4): one that
 /// does not parse keeps the whole old set in force. Logs each serial that
 /// moved.
-pub(crate) fn reload_local(files: &[LocalFile]) {
+///
+/// Returns the line a `reload` command reports (`TODO.md` #178).
+pub(crate) fn reload_local(files: &[LocalFile]) -> String {
     let mut fresh = Vec::new();
     for file in files {
         let name = file.zone.get().origin().to_owned();
@@ -85,11 +87,13 @@ pub(crate) fn reload_local(files: &[LocalFile]) {
         match read_local(&name, &file.path) {
             Ok(read) => fresh.push((file, read)),
             Err(e) => {
-                tracing::warn!("{e:#}; keeping every local zone as it was");
-                return;
+                let line = format!("{e:#}; keeping every local zone as it was");
+                tracing::warn!("{line}");
+                return line;
             }
         }
     }
+    let changed = fresh.len();
     for (file, (zone, bytes)) in fresh {
         let before = file.zone.get().serial();
         let after = zone.serial();
@@ -106,6 +110,7 @@ pub(crate) fn reload_local(files: &[LocalFile]) {
             *last = bytes;
         }
     }
+    format!("local zones: {changed} of {} changed", files.len())
 }
 
 /// The table, or the refusal naming what is wrong with it.

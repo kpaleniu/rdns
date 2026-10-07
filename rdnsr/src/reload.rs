@@ -85,27 +85,37 @@ impl PolicyReload {
 ///
 /// The negative trust anchors are SIGHUP's too, for the certificate's reason:
 /// a NOTIFY is about a policy zone.
+///
+/// A control socket's `reload` is SIGHUP's, through the same loop so two
+/// reloads never overlap, with the report sent back (`TODO.md` #178).
 pub(crate) async fn reload_task(
     certificate: Option<Arc<CertificateStore>>,
     ntas: Option<NtaFile>,
     local: Arc<Vec<LocalFile>>,
     serving: Arc<Resolving>,
     wanted: PolicyReload,
+    mut controlled: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<String>>,
     stop: Stop,
 ) {
     let mut signals = reload_signal();
     loop {
-        let (certificate, ntas, local) = tokio::select! {
+        let (certificate, ntas, local, report) = tokio::select! {
             reloaded = next_reload(&mut signals) => {
                 if !reloaded {
                     break;
                 }
-                (certificate.as_ref(), ntas.as_ref(), Some(&local))
+                (certificate.as_ref(), ntas.as_ref(), Some(&local), None)
             }
-            () = wanted.requested() => (None, None, None),
+            Some(report) = controlled.recv() => {
+                (certificate.as_ref(), ntas.as_ref(), Some(&local), Some(report))
+            }
+            () = wanted.requested() => (None, None, None, None),
             () = stop.wait() => break,
         };
-        reload_now(certificate, ntas, local, &serving).await;
+        let lines = reload_now(certificate, ntas, local, &serving).await;
+        if let Some(report) = report {
+            let _ = report.send(lines.join("\n"));
+        }
     }
 }
 
@@ -115,33 +125,46 @@ async fn reload_now(
     ntas: Option<&NtaFile>,
     local: Option<&Arc<Vec<LocalFile>>>,
     serving: &Arc<Resolving>,
-) {
+) -> Vec<String> {
     let certificate = certificate.cloned();
     let ntas = ntas.cloned();
     let local = local.cloned();
     let serving = serving.clone();
     let ran = tokio::task::spawn_blocking(move || {
+        let mut lines = Vec::new();
         if let Some(store) = certificate {
-            match store.reload() {
-                Ok(()) => tracing::info!("TLS certificate re-read"),
-                Err(e) => tracing::warn!("could not re-read the TLS certificate: {e:#}"),
-            }
+            lines.push(match store.reload() {
+                Ok(()) => {
+                    tracing::info!("TLS certificate re-read");
+                    "TLS certificate re-read".to_string()
+                }
+                Err(e) => {
+                    tracing::warn!("could not re-read the TLS certificate: {e:#}");
+                    format!("could not re-read the TLS certificate: {e:#}")
+                }
+            });
         }
         if let Some(NtaFile(path)) = ntas {
-            crate::nta::reload(&serving, &path);
+            lines.push(crate::nta::reload(&serving, &path));
         }
-        if let Some(local) = local {
-            crate::routes::reload_local(&local);
+        if let Some(local) = local.filter(|l| !l.is_empty()) {
+            lines.push(crate::routes::reload_local(&local));
         }
-        reload_policy(&serving);
+        lines.extend(reload_policy(&serving));
+        lines
     })
     .await;
-    if let Err(e) = ran {
-        // The task must survive it: what panicked did not install anything, so
-        // the previous set is still in force and the next request can still be
-        // served. Ending the loop here would leave a resolver that looks healthy
-        // and never reloads again (`CLAUDE.md` §4).
-        tracing::error!("the reload panicked and nothing was re-read: {e}");
+    match ran {
+        Ok(lines) if lines.is_empty() => vec!["nothing configured to re-read".to_string()],
+        Ok(lines) => lines,
+        Err(e) => {
+            // The task must survive it: what panicked did not install anything,
+            // so the previous set is still in force and the next request can
+            // still be served. Ending the loop here would leave a resolver that
+            // looks healthy and never reloads again (`CLAUDE.md` §4).
+            tracing::error!("the reload panicked and nothing was re-read: {e}");
+            vec![format!("the reload panicked and nothing was re-read: {e}")]
+        }
     }
 }
 

@@ -216,6 +216,12 @@ macro_rules! server_table {
             https_path: Option<String>,
             tls_cert: Option<std::path::PathBuf>,
             tls_key: Option<std::path::PathBuf>,
+            /// Where `rdnsctl` reaches this server. Unix only, and refused at
+            /// startup on Windows rather than ignored — the field parses
+            /// everywhere so that one config file can be read on either
+            /// platform and fail with a sentence instead of an unknown-key
+            /// error. Both daemons since `TODO.md` #178.
+            control_socket: Option<std::path::PathBuf>,
             $(
                 $(#[$own_meta])*
                 $own_field: $own_type,
@@ -271,6 +277,7 @@ macro_rules! server_table {
                 cli.https_listen = $crate::config::taken(&self.https_listen);
                 cli.tls_cert = $crate::config::taken(&self.tls_cert);
                 cli.tls_key = $crate::config::taken(&self.tls_key);
+                cli.control_socket = $crate::config::taken(&self.control_socket);
                 // The one key whose flag has a default, so an absent key means
                 // "keep it" rather than "clear it" — the `Option` here is the
                 // override and not the value (§15). The exception lives with
@@ -315,6 +322,7 @@ macro_rules! server_table {
                     https_path: None,
                     tls_cert: None,
                     tls_key: None,
+                    control_socket: None,
                     $($own_default)*
                 }
             }

@@ -1,7 +1,8 @@
 //! The control channel's protocol: one line in, a status line and a body out.
 //!
-//! Only the protocol. The commands and the accept loop are `rdnsd`'s; this is
-//! what both ends must agree on, so the daemon and `rdnsctl` cannot drift.
+//! Only the protocol. The commands are each daemon's and the accept loop is
+//! `rdns_transport::control`; this is what both ends must agree on, so the
+//! daemons and `rdnsctl` cannot drift.
 //!
 //! A Unix socket with filesystem permissions, as `knotc` and `pdns_control`
 //! use — authorization by file mode, so nothing here authenticates.
@@ -116,6 +117,23 @@ pub fn parse_reply(text: &str) -> Reply {
             "unrecognized reply from the control socket: {:?}",
             first.chars().take(40).collect::<String>()
         ))
+    }
+}
+
+/// `1d 2h`, `3h 4m`, `5m 6s`, `7s`. Rounds down: for an age, "0s ago" is a fact
+/// and "1s ago" would be a guess.
+pub fn duration(seconds: u64) -> String {
+    let (d, h, m, s) = (
+        seconds / 86_400,
+        (seconds % 86_400) / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60,
+    );
+    match (d, h, m) {
+        (0, 0, 0) => format!("{s}s"),
+        (0, 0, _) => format!("{m}m {s}s"),
+        (0, _, _) => format!("{h}h {m}m"),
+        _ => format!("{d}d {h}h"),
     }
 }
 

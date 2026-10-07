@@ -337,6 +337,21 @@ impl NegativeCache {
         before - entries.len()
     }
 
+    /// Drop the "no" for every type at exactly `name`, NXDOMAIN included,
+    /// returning how many went.
+    pub fn forget_name(&self, name: NameRef<'_>) -> usize {
+        let Ok(mut entries) = self.entries.lock() else {
+            return 0;
+        };
+        let folded = name.folded();
+        let before = entries.len();
+        entries.nxdomain.remove(folded.as_ref());
+        entries
+            .nodata
+            .retain(|key, _| key.name() != folded.as_ref());
+        before - entries.len()
+    }
+
     pub fn clear(&self) {
         if let Ok(mut entries) = self.entries.lock() {
             entries.nxdomain.clear();

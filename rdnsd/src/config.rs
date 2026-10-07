@@ -90,11 +90,6 @@ rdns::server_table! {
         /// operator believes is in force and is not.
         #[serde(default)]
         allow_transfer_cert: Vec<String>,
-        /// Where `rdnsctl` reaches this server. Unix only, and refused at
-        /// startup on Windows rather than ignored — the field parses everywhere
-        /// so that one config file can be read on either platform and fail with
-        /// a sentence instead of an unknown-key error.
-        control_socket: Option<PathBuf>,
         #[serde(default)]
         allow_partial_load: bool,
     }
@@ -109,7 +104,6 @@ rdns::server_table! {
         transfer_tls_only: false,
         transfer_client_ca: None,
         allow_transfer_cert: Vec::new(),
-        control_socket: None,
         allow_partial_load: false,
     }
 }
