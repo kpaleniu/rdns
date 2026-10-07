@@ -40,11 +40,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Nine items. #171-#185 were filed 2026-10-05 from a comparison against
+Eight items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
 #173. #181 was closed wontfix in triage; #171-#174, #176, #179, #183, #184, #186,
-#187, #189, #191 and #178 closed 2026-10-07:
+#187, #189, #191, #178 and #188 closed 2026-10-07:
 
 - `rdnsr`: #175 no encrypted upstream, #177 no local
   root (RFC 8806).
@@ -52,7 +52,6 @@ filing; #186-#192 came out of triaging the first batch, #193 out of closing
   #182 catalog zones not generated.
 - #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
   closed, 185c and 185d wontfix.
-- #188 neither daemon can be controlled or reloaded on Windows.
 - #190 neither daemon can run as a Windows service.
 - #192 no Windows Event Log sink.
 - #193 six RFC 6303 zones are not empty zones (needs triage).
@@ -1118,6 +1117,7 @@ the week; the record is under "How the queue kept going stale" in
 | **174** | `rdnsr` had no local data except through RPZ | **filed 2026-10-05, closed 2026-10-07.** · `977c0f6` · [`docs/closed/174.md`](docs/closed/174.md) |
 | **191** | `rdnsr` emitted no dnstap | **filed 2026-10-07, closed 2026-10-07.** · `410adf9`, `c8810c3` · [`docs/closed/191.md`](docs/closed/191.md) |
 | **178** | rdnsr control socket: flush, dump, nta, reload | **filed 2026-10-05, closed 2026-10-07.** · `3fcd534` · [`docs/closed/178.md`](docs/closed/178.md) |
+| **188** | Windows control channel: a named pipe | **filed 2026-10-06, closed 2026-10-07.** · `e8ebd1c` · [`docs/closed/188.md`](docs/closed/188.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
