@@ -179,6 +179,15 @@ pub enum BrokenCatalog {
         #[source]
         source: WireError,
     },
+    /// Generating, not reading (`TODO.md` #182): two members whose names hash
+    /// to one node label. Refused rather than published, because the catalog
+    /// would be broken at every consumer (§4.1).
+    #[error("{first} and {second} share the member label {label} (RFC 9432 §4.1)")]
+    LabelCollision {
+        label: String,
+        first: crate::Name,
+        second: crate::Name,
+    },
 }
 
 /// Per-layer `Result` aliases, matching core's. `ResolveResult` is

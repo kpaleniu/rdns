@@ -24,6 +24,7 @@
 mod answer;
 /// Consuming catalog zones: what `--catalog` provisions (RFC 9432).
 mod catalog;
+mod catalog_gen;
 mod config;
 /// Control socket: a Unix socket, or a named pipe on Windows.
 mod control;
@@ -352,6 +353,16 @@ struct Cli {
     /// holding 40 zones would rather serve 39 than none — but as a decision.
     #[arg(long, conflicts_with = "config")]
     allow_partial_load: bool,
+    /// Publish an RFC 9432 catalog zone at NAME listing every zone this
+    /// server is primary for, so a secondary consuming it provisions a new
+    /// zone with no edit of its own. NAME under invalid., or strictly under a
+    /// zone served here as primary (§6).
+    ///
+    /// Rebuilt on every reload; a zone opts out with `catalog-member = false`
+    /// in its `[zones.*]` table. Served by transfer only, under
+    /// --allow-transfer; ordinary queries under it are REFUSED.
+    #[arg(long, value_name = "NAME", conflicts_with = "config")]
+    generate_catalog: Option<String>,
     /// Response bytes per second, per IPv4 /24 or IPv6 /56 a reply goes to.
     /// 0 turns the budget off.
     ///
@@ -812,6 +823,9 @@ struct ServePolicy {
     connections: TransportLimits,
     /// And how many of them one source may hold.
     per_source: SourceConnections,
+    /// The catalog this server generates, whose names ordinary queries are
+    /// refused for (`TODO.md` #182).
+    generated_catalog: Option<Name>,
     /// RFC 5001's identifier, or off.
     nsid: Option<&'static [u8]>,
     /// Where to serve Prometheus metrics, if anywhere.
@@ -864,6 +878,7 @@ async fn serve(
     metrics: Arc<DnsMetrics>,
 ) -> Result<()> {
     let ServePolicy {
+        generated_catalog,
         transfer_acl,
         transfer_clients,
         transfer_tls_only,
@@ -1021,7 +1036,8 @@ async fn serve(
         .with_secondaries(secondaries)
         .with_history(deltas, journal)
         .with_updates(updates)
-        .with_dnstap(dnstap),
+        .with_dnstap(dnstap)
+        .with_generated_catalog(generated_catalog),
     );
     // The effective policy, at the default level: a control nobody can observe
     // is a control nobody can debug.
@@ -1276,6 +1292,9 @@ struct Reloading {
     /// a reload that re-signs a zone with the same keys has nothing new to
     /// check (`TODO.md` #53).
     proved: ProvenSigning,
+    /// The catalog to rebuild from the zones each reload loads (`TODO.md`
+    /// #182).
+    catalog: Option<Arc<catalog_gen::GeneratedCatalog>>,
     /// What each zone file held when it was last parsed, so a reload can keep
     /// the zone it is serving for a file nobody touched — 11.4 s per unchanged
     /// million-record signed zone (`TODO.md` #64f). Shared with the startup
@@ -1330,6 +1349,16 @@ impl Reloading {
             None => SigningRun::default(),
         };
         verify_zones(&zones, &self.validator, &run, &self.proved)?;
+        // From the set that loaded, all or nothing: a reload that failed above
+        // never reaches here, so the catalog keeps its members.
+        if let Some(catalog) = &self.catalog {
+            let zone = catalog.build(
+                zones.keys().map(|k| k.as_name()),
+                |z| self.secondaries.replicates(z),
+                signed_at,
+            )?;
+            zones.insert(crate::zones::zone_key(&zone), Arc::new(zone));
+        }
         Ok(zones)
     }
 
@@ -1929,6 +1958,36 @@ async fn main() -> Result<()> {
     // `proved` was empty above, so this pass checks everything; what it proves is
     // what the reload path may then skip.
     verify_zones(&zones, &validator, &run, &proved)?;
+    // Before the dry run answers (`TODO.md` #182).
+    let generator = match &cli.generate_catalog {
+        Some(text) => {
+            let name = Name::from_presentation(text)
+                .map_err(|e| anyhow!("--generate-catalog {text:?}: {e}"))?;
+            if catalog_specs.iter().any(|spec| spec.zone == name) {
+                return Err(anyhow!(
+                    "--generate-catalog {name}: this server would consume the catalog it \
+                     generates; a consumer takes it from somewhere else"
+                ));
+            }
+            let replicated: Vec<&Name> = secondary_specs.iter().map(|s| &s.zone).collect();
+            catalog_gen::check_name(
+                &name,
+                zones
+                    .keys()
+                    .map(|k| k.as_name())
+                    .filter(|z| !replicated.iter().any(|r| r.as_ref() == *z)),
+            )?;
+            Some(Arc::new(catalog_gen::GeneratedCatalog::new(
+                name,
+                per_zone
+                    .not_in_catalog
+                    .iter()
+                    .filter_map(|z| Name::from_presentation(z).ok())
+                    .collect(),
+            )))
+        }
+        None => None,
+    };
     if let Some(origin) = gated
         .iter()
         .find(|o| !zones.keys().any(|k| k.as_name() == o.as_ref()))
@@ -2128,6 +2187,20 @@ async fn main() -> Result<()> {
         }
     }
 
+    // After the secondaries and catalog members are registered, so none of
+    // them is listed as ours (`TODO.md` #182).
+    if let Some(generator) = &generator {
+        let zone = {
+            let zones = zone_map.read().await;
+            generator.build(
+                zones.keys().map(|k| k.as_name()),
+                |z| secondaries.replicates(z),
+                rdns::clock::current_unix_timestamp(),
+            )?
+        };
+        crate::zones::install_zone(&served, zone).await;
+    }
+
     // A zone that has just been loaded is news to every secondary, which is why
     // this runs at startup and not only on reload.
     let announced = notify_out::announce_zones(&zone_map, &[], &notify, &shutdown.busy()).await;
@@ -2155,6 +2228,7 @@ async fn main() -> Result<()> {
                 validator,
                 proved,
                 files,
+                catalog: generator.clone(),
             },
             source,
             served: served.clone(),
@@ -2182,6 +2256,7 @@ async fn main() -> Result<()> {
         &addr,
         zone_map,
         ServePolicy {
+            generated_catalog: generator.as_ref().map(|g| g.name().clone()),
             transfer_acl,
             transfer_clients,
             transfer_tls_only: cli.transfer_tls_only,
@@ -3662,6 +3737,7 @@ mod tests {
                 validator: Arc::new(DnssecValidator::new(false)),
                 proved: ProvenSigning::default(),
                 files: LoadedFiles::default(),
+                catalog: None,
             };
             let source = ZoneSource::Directory(dir.path().to_string_lossy().to_string());
 
@@ -3758,6 +3834,7 @@ mod tests {
                 validator: Arc::new(DnssecValidator::new(true)),
                 proved: ProvenSigning::default(),
                 files: LoadedFiles::default(),
+                catalog: None,
             },
             source: ZoneSource::Directory(dir.path().to_string_lossy().to_string()),
             served: served(&zone_map, &deltas),
@@ -3850,6 +3927,7 @@ mod tests {
                 validator: Arc::new(DnssecValidator::new(false)),
                 proved: ProvenSigning::default(),
                 files: LoadedFiles::default(),
+                catalog: None,
             },
             source: ZoneSource::Directory(dir.path().to_string_lossy().to_string()),
             served: served(zone_map, &Arc::new(RwLock::new(DeltaLog::new()))),
@@ -4028,6 +4106,7 @@ mod tests {
             validator: Arc::new(DnssecValidator::new(true)),
             proved: ProvenSigning::default(),
             files: LoadedFiles::default(),
+            catalog: None,
         };
         let source = ZoneSource::Directory(zone_dir.to_string_lossy().to_string());
 
@@ -4053,5 +4132,72 @@ mod tests {
 
             println!("{records:>9}  {:>10.1?} {:>10.1?}", first, unchanged);
         }
+    }
+
+    /// The generated catalog through the reload path (`TODO.md` #182): a
+    /// new file is a new member, a removed one is gone, and a directory that
+    /// cannot be read fails the reload rather than publishing an empty
+    /// catalog — so the one being served keeps its members.
+    #[tokio::test]
+    async fn a_reload_rebuilds_the_generated_catalog_all_or_nothing() {
+        let dir = ScratchDir::new("generated-catalog");
+        let write = |zone: &str| {
+            std::fs::write(
+                dir.join(format!("{zone}.zone")),
+                format!(
+                    "@ IN SOA ns1.{zone} admin.{zone} 1 3600 600 604800 300\n@ IN NS ns1.{zone}\n"
+                ),
+            )
+            .expect("write");
+        };
+        for zone in ["a.test.", "b.test.", "c.test."] {
+            write(zone);
+        }
+        let generator = Arc::new(crate::catalog_gen::GeneratedCatalog::new(
+            nm("catalog.invalid."),
+            std::collections::HashSet::new(),
+        ));
+        let reloading = Reloading {
+            replicating: false,
+            allow_partial: false,
+            secondaries: Arc::new(Secondaries::default()),
+            zone_dir: Some(dir.path().to_path_buf()),
+            signing: None,
+            validator: Arc::new(DnssecValidator::new(false)),
+            proved: ProvenSigning::default(),
+            files: LoadedFiles::default(),
+            catalog: Some(generator),
+        };
+        let source = ZoneSource::Directory(dir.path().to_string_lossy().to_string());
+        let members = |zones: &ZoneMap| {
+            let catalog = zones
+                .values()
+                .find(|z| z.origin() == nm("catalog.invalid.").as_ref())
+                .expect("the catalog is in the set");
+            let mut m: Vec<String> = rdns::catalog::Catalog::from_zone(catalog)
+                .expect("well formed")
+                .members()
+                .iter()
+                .map(|m| m.zone().to_string())
+                .collect();
+            m.sort();
+            (m, catalog.serial().expect("a serial"))
+        };
+
+        let (three, first) = members(&reloading.load(&source, None).await.expect("loads"));
+        assert_eq!(three, ["a.test.", "b.test.", "c.test."]);
+        write("d.test.");
+        let (four, second) = members(&reloading.load(&source, None).await.expect("loads"));
+        assert_eq!(four.len(), 4);
+        assert!(second.is_newer_than(first));
+        std::fs::remove_file(dir.join("b.test..zone")).expect("remove");
+        let (fewer, _) = members(&reloading.load(&source, None).await.expect("loads"));
+        assert_eq!(fewer, ["a.test.", "c.test.", "d.test."]);
+
+        let gone = ZoneSource::Directory(dir.join("no-such-dir").to_string_lossy().to_string());
+        assert!(
+            reloading.load(&gone, None).await.is_err(),
+            "an unreadable directory fails the reload; nothing new is installed"
+        );
     }
 }

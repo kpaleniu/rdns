@@ -183,6 +183,10 @@ pub(crate) struct Server {
     /// Where the query stream goes, or `None` when `--dnstap` was not given.
     /// See [`rdns_transport::dnstap`] for why the queue behind it drops.
     dnstap: Option<rdns_transport::dnstap::Sink>,
+    /// The catalog this server generates (`TODO.md` #182): served by
+    /// transfer, and to ordinary queries only its apex SOA, to whoever may
+    /// transfer it — a consumer's refresh asks that.
+    generated_catalog: Option<Name>,
 }
 
 impl Server {
@@ -201,7 +205,30 @@ impl Server {
             updates: Arc::new(UpdateHandling::disabled()),
             journal: None,
             dnstap: None,
+            generated_catalog: None,
         }
+    }
+
+    pub(crate) fn with_generated_catalog(self, catalog: Option<Name>) -> Self {
+        Server {
+            generated_catalog: catalog,
+            ..self
+        }
+    }
+
+    /// Whether an ordinary query is for the generated catalog and not one
+    /// this server answers: RFC 9432 §6, "operators SHOULD limit the systems
+    /// able to query these zones". The apex SOA goes to whoever may transfer
+    /// the catalog, since a consumer's refresh is that query.
+    fn catalog_refuses(&self, msg: &DnsMessage, ip: Peer, signed: bool) -> bool {
+        let (Some(catalog), Some(q)) = (&self.generated_catalog, msg.queries.first()) else {
+            return false;
+        };
+        if !q.qname.as_ref().is_at_or_under(catalog.as_ref()) {
+            return false;
+        }
+        let refresh = q.qname == *catalog && q.qtype == Qtype::of(rdns::record_types::SOA);
+        !(refresh && (signed || self.transfer_acl.allows(ip)))
     }
 
     /// Who may transfer, by address and by certificate, and whether only over
@@ -619,6 +646,24 @@ impl Server {
             // says a transfer arrived, which is what a reader cannot get
             // anywhere else.
             None
+        } else if msg.opcode == OpCode::Query && self.catalog_refuses(msg, ip, session.is_some()) {
+            let refused = Refused {
+                msg,
+                ip,
+                now,
+                max_len,
+                pad: wire.pads(msg),
+            };
+            let reply = self.signed_error(
+                refused,
+                ResponseCode::Refused,
+                Some(NOT_YOURS),
+                session.as_mut(),
+            );
+            if let Some(reply) = &reply {
+                wire.send(reply, &self.ctx.logger, ip).await;
+            }
+            reply.map(Cow::Owned)
         } else if msg.opcode == OpCode::Update {
             // Likewise, plus: an UPDATE installs a new zone, and
             // `make_response` holds a read guard on the zone map that
@@ -4687,5 +4732,69 @@ pub(crate) mod tests {
                     .truncation
             );
         }
+    }
+
+    /// RFC 9432 §6 for the catalog this server generates (`TODO.md` #182):
+    /// an ordinary query under it is REFUSED; the apex SOA, a consumer's
+    /// refresh, goes to a peer the transfer ACL admits and to nobody else.
+    #[tokio::test]
+    async fn queries_under_the_generated_catalog_are_refused() {
+        let ask = |acl: &[&str], qname: &'static str, qtype: Qtype| {
+            let acl: Vec<String> = acl.iter().map(|s| s.to_string()).collect();
+            async move {
+                let mut zones = Zones::default();
+                drop(
+                    zones.insert(
+                        rdns::catalog::generate(
+                            nm("catalog.invalid.").as_ref(),
+                            &[nm("example.com.")],
+                            Serial::new(7),
+                        )
+                        .expect("a catalog"),
+                    ),
+                );
+                let server = Server::new(Arc::new(RwLock::new(zones)), test_context())
+                    .with_transfers(
+                        TransferAcl::parse(&acl).expect("an ACL"),
+                        TransferCertificates::default(),
+                        false,
+                    )
+                    .with_generated_catalog(Some(nm("catalog.invalid.")));
+                let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+                let client = UdpSocket::bind("127.0.0.1:0").await.expect("bind a client");
+                let peer = client.local_addr().expect("addr");
+                let bytes = query(qname, qtype, false)
+                    .to_bytes_within(512)
+                    .expect("serialize");
+                server
+                    .answer(
+                        &bytes,
+                        peer,
+                        current_unix_timestamp(),
+                        &Wire::Datagram(&socket, peer),
+                        &mut Scratch::default(),
+                    )
+                    .await;
+                let mut buf = vec![0u8; 4096];
+                let (n, _) = client.recv_from(&mut buf).await.expect("a reply");
+                DnsMessage::try_from_bytes(&buf[..n]).expect("parses").rcode
+            }
+        };
+        let soa = Qtype::of(record_types::SOA);
+        let txt = Qtype::of(record_types::TXT);
+        assert_eq!(
+            ask(&["127.0.0.1"], "version.catalog.invalid.", txt).await,
+            ResponseCode::Refused
+        );
+        assert_eq!(
+            ask(&["127.0.0.1"], "catalog.invalid.", soa).await,
+            ResponseCode::Ok,
+            "a consumer's refresh"
+        );
+        assert_eq!(
+            ask(&[], "catalog.invalid.", soa).await,
+            ResponseCode::Refused,
+            "not to a peer that may not transfer it"
+        );
     }
 }

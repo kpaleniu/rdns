@@ -585,3 +585,207 @@ fn parental_agents_are_checked_before_the_dry_run_answers() {
         assert!(stderr(&out).contains(wants), "{args:?}: {}", stderr(&out));
     }
 }
+
+/// `TODO.md` #182 end to end: one `rdnsd` generates a catalog from its zone
+/// directory, a second consumes it and serves every member with no edit of
+/// its own — and a zone added on the first, after a reload over the control
+/// channel, reaches the second by NOTIFY.
+#[test]
+fn a_consumer_provisions_every_zone_the_producer_lists() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    use rdns::{DnsMessage, OpCode, Qtype, QueryClass, QuerySection, ResponseCode};
+
+    fn authoritative_soa(port: &str, zone: &str) -> bool {
+        let query = DnsMessage {
+            id: 7,
+            response: false,
+            opcode: OpCode::Query,
+            authoritive: false,
+            truncation: false,
+            recursion: false,
+            recursion_ok: false,
+            ad: false,
+            cd: false,
+            rcode: ResponseCode::Ok,
+            queries: vec![QuerySection {
+                qname: zone.parse().expect("a name"),
+                qtype: Qtype::of(rdns::record_types::SOA),
+                qclass: QueryClass::IN,
+            }],
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+            edns: None,
+        }
+        .to_bytes_within(512)
+        .expect("serialize");
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        if socket.send_to(&query, format!("127.0.0.1:{port}")).is_err() {
+            return false;
+        }
+        let mut buf = [0u8; 2048];
+        let Ok(n) = socket.recv(&mut buf) else {
+            return false;
+        };
+        DnsMessage::try_from_bytes(&buf[..n])
+            .is_ok_and(|r| r.rcode == ResponseCode::Ok && r.authoritive && !r.answers.is_empty())
+    }
+
+    fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+        let started = Instant::now();
+        while !check() {
+            assert!(started.elapsed() < Duration::from_secs(30), "{what}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn reload(control: &str) -> String {
+        #[cfg(windows)]
+        let mut stream = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(control)
+            .expect("open the control pipe");
+        #[cfg(unix)]
+        let mut stream = std::os::unix::net::UnixStream::connect(control)
+            .expect("connect to the control socket");
+        stream.write_all(b"reload\n").expect("send");
+        let mut reply = String::new();
+        stream.read_to_string(&mut reply).expect("read");
+        reply
+    }
+
+    let dir = ScratchDir::new("catalog-e2e");
+    let produced = dir.join("producer");
+    let consumed = dir.join("consumer");
+    std::fs::create_dir_all(&produced).expect("mkdir");
+    std::fs::create_dir_all(&consumed).expect("mkdir");
+    let zone = |name: &str| {
+        std::fs::write(
+            produced.join(format!("{name}.zone")),
+            format!(
+                "$ORIGIN {name}.\n$TTL 300\n@ IN SOA ns1 admin 1 3600 600 604800 300\n\
+                 @ IN NS ns1\nns1 IN A 192.0.2.1\n"
+            ),
+        )
+        .expect("write a zone");
+    };
+    for name in ["a.test", "b.test", "c.test"] {
+        zone(name);
+    }
+    let (producer_port, consumer_port) = (free_port(), free_port());
+    #[cfg(windows)]
+    let control = format!(r"\\.\pipe\rdnsd-catalog-{}", std::process::id());
+    #[cfg(unix)]
+    let control = dir.join("producer.sock").to_string_lossy().into_owned();
+
+    let produced_dir = produced.to_string_lossy().into_owned();
+    let consumed_dir = consumed.to_string_lossy().into_owned();
+    let notify = format!("127.0.0.1:{consumer_port}");
+    let catalog = format!("catalog.invalid.@127.0.0.1:{producer_port}");
+    let mut producer = spawn(Command::new(env!("CARGO_BIN_EXE_rdnsd")).args([
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &producer_port,
+        "--zone-dir",
+        &produced_dir,
+        "--generate-catalog",
+        "catalog.invalid.",
+        "--allow-transfer",
+        "127.0.0.1",
+        "--also-notify",
+        &notify,
+        "--control-socket",
+        &control,
+        "--quiet",
+    ]));
+    let mut consumer = spawn(Command::new(env!("CARGO_BIN_EXE_rdnsd")).args([
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &consumer_port,
+        "--zone-dir",
+        &consumed_dir,
+        "--catalog",
+        &catalog,
+        "--quiet",
+    ]));
+    let result = std::panic::catch_unwind(|| {
+        for name in ["a.test.", "b.test.", "c.test."] {
+            eventually(&format!("the consumer never served {name}"), || {
+                authoritative_soa(&consumer_port, name)
+            });
+        }
+        assert!(
+            !authoritative_soa(&consumer_port, "d.test."),
+            "not before it exists"
+        );
+        zone("d.test");
+        let reply = reload(&control);
+        assert!(reply.starts_with("+OK"), "{reply}");
+        eventually("the consumer never provisioned the new zone", || {
+            authoritative_soa(&consumer_port, "d.test.")
+        });
+    });
+    let _ = producer.kill();
+    let _ = consumer.kill();
+    let _ = producer.wait();
+    let _ = consumer.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// `--generate-catalog` refusals, before the dry run answers: a name neither
+/// reserved nor under a zone served here, and consuming one's own catalog.
+#[test]
+fn a_generated_catalog_name_must_be_ours() {
+    let dir = ScratchDir::new("catalog-name");
+    let zone = zone_in(&dir, ZONE);
+    for (args, wants) in [
+        (
+            vec![
+                "--zone-file",
+                &zone,
+                "--generate-catalog",
+                "catalog.example.net.",
+            ],
+            "RFC 9432 §6",
+        ),
+        (
+            vec![
+                "--zone-dir",
+                dir.path().to_str().expect("utf-8"),
+                "--generate-catalog",
+                "catalog.invalid.",
+                "--catalog",
+                "catalog.invalid.@192.0.2.1",
+            ],
+            "consume the catalog it generates",
+        ),
+    ] {
+        let mut all = args.clone();
+        all.push("--check-config");
+        let out = rdnsd(&all);
+        assert!(!out.status.success(), "{args:?} must be refused");
+        assert!(stderr(&out).contains(wants), "{args:?}: {}", stderr(&out));
+    }
+    let out = rdnsd(&[
+        "--zone-file",
+        &zone,
+        "--generate-catalog",
+        "catalog.example.com.",
+        "--check-config",
+    ]);
+    assert!(
+        out.status.success(),
+        "under a zone served here: {}",
+        stderr(&out)
+    );
+}

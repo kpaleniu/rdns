@@ -262,6 +262,20 @@ rdnsd --zone-dir ./zones --secondary example.com@192.0.2.1:5353
 `rdnsctl status` reports `secondary` from the configuration rather than inferring
 it from an absent last-contact time, which a primary also has.
 
+### `--generate-catalog <NAME>`
+
+Publish an RFC 9432 catalog zone at NAME listing every zone this server is
+primary for (`TODO.md` #182), so a secondary consuming it with `--catalog`
+provisions every new zone file with no edit of its own. NAME must be under
+`invalid.` or strictly under a zone served here. A zone opts out with
+`catalog-member = false`. Served by transfer only; see
+`docs/spec/03-authoritative-server.md` §3.10.
+
+```bash
+rdnsd --zone-dir ./zones --generate-catalog catalog.invalid. \
+      --allow-transfer 192.0.2.53 --also-notify 192.0.2.53
+```
+
 ### `--catalog <ZONE@MASTER[:PORT][#KEY]>`
 
 Consume a catalog zone (RFC 9432): a zone whose contents are the *list* of zones

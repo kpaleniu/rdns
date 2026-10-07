@@ -92,6 +92,8 @@ rdns::server_table! {
         allow_transfer_cert: Vec<String>,
         #[serde(default)]
         allow_partial_load: bool,
+        /// `--generate-catalog` (`TODO.md` #182).
+        generate_catalog: Option<String>,
     }
     defaults {
         zone_dir: None,
@@ -105,6 +107,7 @@ rdns::server_table! {
         transfer_client_ca: None,
         allow_transfer_cert: Vec::new(),
         allow_partial_load: false,
+        generate_catalog: None,
     }
 }
 
@@ -152,6 +155,10 @@ struct Key {
     update_zones: Vec<String>,
 }
 
+fn yes() -> bool {
+    true
+}
+
 fn default_algorithm() -> String {
     rdns::tsig::TsigAlgorithm::DEFAULT.config_name().to_string()
 }
@@ -169,6 +176,11 @@ struct ZoneConfig {
     /// `server.transfer-tls-ca`.
     #[serde(default)]
     masters: Vec<String>,
+    /// `false` keeps this zone out of the catalog `generate-catalog`
+    /// publishes (`TODO.md` #182). Not `catalog`, which already means "this
+    /// zone is a catalog to consume".
+    #[serde(default = "yes")]
+    catalog_member: bool,
     /// Who to ask for this zone's DS before a key-signing key retires:
     /// `--parental-agent`'s spelling after the `zone@` (`TODO.md` #180).
     #[serde(default)]
@@ -258,6 +270,8 @@ pub(crate) struct PerZone {
     pub(crate) notify: BTreeMap<String, Vec<String>>,
     /// Signing settings that differ from `[signing]`.
     pub(crate) signing: BTreeMap<String, ZoneSigningOverride>,
+    /// Zones kept out of the generated catalog (`TODO.md` #182).
+    pub(crate) not_in_catalog: std::collections::BTreeSet<String>,
     /// Per-catalog group rules (RFC 9432 §4.3.2), by catalog zone: the group
     /// value, and the masters a member carrying it is fetched from.
     ///
@@ -606,6 +620,7 @@ impl Config {
                 masters: _,
                 // Above, as `--parental-agent` specs.
                 parental_agents: _,
+                catalog_member,
                 also_notify,
                 catalog: _,
                 groups,
@@ -632,6 +647,9 @@ impl Config {
             }
             if !also_notify.is_empty() {
                 per_zone.notify.insert(origin.clone(), also_notify.clone());
+            }
+            if !catalog_member {
+                per_zone.not_in_catalog.insert(origin.clone());
             }
             if !groups.is_empty() {
                 per_zone.groups.insert(

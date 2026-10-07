@@ -728,7 +728,38 @@ the catalog takes the zone out of service — REFUSED, and the gauge at 0.
   True of serving one, not of keeping it in step: the zone list and the
   member records are then two files edited by hand, and a script that
   relabels a member resets its state on every secondary (RFC 9432 §5.4).
-  Generating it is `TODO.md` #182.
+  Generating it is `TODO.md` #182, which is now done: see below.
+
+### The producer side (`--generate-catalog`, `TODO.md` #182)
+
+`--generate-catalog NAME` (`generate-catalog` in `[server]`, one per server)
+publishes a version 2 catalog listing every zone this server is primary for.
+A zone file dropped into `--zone-dir` is provisioned on every consumer with no
+second edit.
+
+- `NAME` at or under `invalid.`, or strictly under a zone served here as
+  primary (§6's "names ... under the control of the catalog producer").
+  Consuming the catalog one generates is refused. Both before `--check-config`
+  answers.
+- Members: the primary zones, minus the catalog and any zone with
+  `catalog-member = false` in its `[zones.*]` table. Not `catalog = false`:
+  that key already means "consume this zone as a catalog". Opt-out, because
+  zones arrive here as files. Secondary zones, catalog members included, are
+  never members.
+- Labels: the first 16 hex digits of SHA-256 over the member's lowercased
+  wire name (`rdns::catalog::member_label`). Stable across restarts with no
+  state, as §5.4 and §5.6 need. A collision refuses the generation.
+- Contents: SOA, `NS invalid.`, `version TXT "2"`, a PTR per member, TTL 0.
+- Serial: Unix seconds when the membership changes, or the last serial plus
+  one if the clock is not ahead; unchanged otherwise. Not `signed_serial`'s
+  hours: two changes in one hour would share a serial.
+- Rebuilt after every reload from the same all-or-nothing load, so an
+  unreadable directory fails the reload and the catalog keeps its members.
+  Each member that leaves is logged at WARN. NOTIFY goes to `also-notify` on
+  every change, as for any zone.
+- Served by transfer, under `--allow-transfer` and key scoping. An ordinary
+  query under it is REFUSED, except the apex SOA to a peer that may transfer
+  it — a consumer's refresh is that query.
 
 ---
 

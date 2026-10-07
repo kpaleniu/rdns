@@ -349,6 +349,96 @@ fn folded(label: &[u8]) -> Vec<u8> {
     label.to_ascii_lowercase()
 }
 
+/// A member's node label in a catalog this server generates (`TODO.md`
+/// #182): the first 16 hex digits of SHA-256 over the member's lowercased
+/// wire-format name.
+///
+/// Stable with no state: §5.4 and §5.6 have a consumer treat a changed label
+/// as a removal and an addition, resetting the zone, so the label must come
+/// from the name alone. 64 bits makes a collision among real zone sets a
+/// curiosity, and [`generate`] refuses one rather than publish two members
+/// under one label (§4.1).
+pub fn member_label(member: NameRef<'_>) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let digest = Sha256::digest(member.folded().as_ref());
+    digest[..8]
+        .iter()
+        .fold(String::with_capacity(16), |mut out, b| {
+            let _ = write!(out, "{b:02x}");
+            out
+        })
+}
+
+/// A version 2 catalog (RFC 9432 §4) at `catalog` listing `members`: SOA,
+/// `NS invalid.`, `version TXT "2"`, and one PTR per member at
+/// `<member_label>.zones`. Nothing else: no groups, no `coo`, no extensions.
+///
+/// Refused: two members under one label, which §4.1 makes a broken catalog.
+pub fn generate(
+    catalog: NameRef<'_>,
+    members: &[Name],
+    serial: crate::Serial,
+) -> Result<Zone, BrokenCatalog> {
+    use crate::zone::ZoneRecord;
+    use crate::{Class, RecordData, Ttl};
+
+    let undecodable = |source| BrokenCatalog::Undecodable {
+        name: catalog.to_owned(),
+        source,
+    };
+    let at = |label: &str| -> Result<Name, BrokenCatalog> {
+        Name::from_presentation(&format!("{label}.{catalog}")).map_err(undecodable)
+    };
+    let record = |name: Name, rdata: ParsedRecord| -> Result<ZoneRecord, BrokenCatalog> {
+        Ok(ZoneRecord {
+            name,
+            // §4: a consumer reads the zone, never caches it; 0 says so.
+            ttl: Ttl::ZERO,
+            class: Class::IN,
+            rdata: RecordData::from_parsed(&rdata).map_err(undecodable)?,
+        })
+    };
+    let invalid = Name::from_presentation("invalid.").expect("a literal name");
+    let mut zone = Zone::new(catalog.to_owned());
+    zone.add_record(record(
+        catalog.to_owned(),
+        ParsedRecord::SOA {
+            mname: invalid.clone(),
+            rname: invalid.clone(),
+            serial,
+            refresh: 3600,
+            retry: 600,
+            // Long: §6's failure is a catalog gone empty or expired taking
+            // every member off every consumer, and NOTIFY is what carries a
+            // change, not the timers.
+            expire: 2_419_200,
+            minimum: 0,
+        },
+    )?);
+    zone.add_record(record(catalog.to_owned(), ParsedRecord::NS(invalid))?);
+    zone.add_record(record(
+        at("version")?,
+        ParsedRecord::TXT(vec![b"2".to_vec()]),
+    )?);
+    let mut seen: BTreeMap<String, &Name> = BTreeMap::new();
+    for member in members {
+        let label = member_label(member.as_ref());
+        if let Some(other) = seen.insert(label.clone(), member) {
+            return Err(BrokenCatalog::LabelCollision {
+                label,
+                first: other.clone(),
+                second: member.clone(),
+            });
+        }
+        zone.add_record(record(
+            at(&format!("{label}.zones"))?,
+            ParsedRecord::PTR(member.clone()),
+        )?);
+    }
+    Ok(zone)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
