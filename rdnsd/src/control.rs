@@ -2,11 +2,10 @@
 //! answered by the process that knows. The socket itself is
 //! `rdns_transport::control`, shared with `rdnsr` (`TODO.md` #178).
 //!
-//! A Unix socket and no TCP; see [`rdns::control`]. Unix-only, and
-//! `--control-socket` is refused on Windows rather than accepted and ignored.
-//! Neither `std` nor `tokio` exposes AF_UNIX there, which is true and was taken
-//! as the reason; `tokio` has named pipes, which nobody weighed (`TODO.md`
-//! #188).
+//! A Unix socket, or a named pipe on Windows, and no TCP; see
+//! [`rdns::control`]. ~~Unix-only: neither `std` nor `tokio` exposes AF_UNIX
+//! on Windows.~~ True, and taken as the reason without weighing `tokio`'s
+//! named pipes, which is what Windows now uses (`TODO.md` #188).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -21,7 +20,6 @@ use rdns::shutdown::{Busy, Stop};
 use rdns::zone_writer::zone_to_string;
 use rdns::Name;
 use rdns::Serial;
-use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 
 use crate::{ReloadTrigger, ZoneContext};
@@ -55,13 +53,13 @@ pub(crate) struct Control {
 
 /// Bind the socket; the transport is `rdns_transport::control`'s, shared
 /// with `rdnsr` (`TODO.md` #178).
-pub(crate) fn bind(path: &Path) -> Result<UnixListener> {
+pub(crate) fn bind(path: &Path) -> Result<rdns_transport::control::Listener> {
     rdns_transport::control::bind(path)
 }
 
 /// Accept control connections until told to stop.
 pub(crate) async fn serve(
-    listener: UnixListener,
+    listener: rdns_transport::control::Listener,
     path: PathBuf,
     control: Arc<Control>,
     stop: Stop,
@@ -365,10 +363,14 @@ async fn dump(args: &[String], control: &Control) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::{nm, ScratchDir};
+    use crate::testutil::nm;
+    #[cfg(unix)]
+    use crate::testutil::ScratchDir;
     use rdns::control::{parse_reply, Reply};
     use rdns::zone::Zone;
+    #[cfg(unix)]
     use tokio::io::AsyncReadExt;
+    #[cfg(unix)]
     use tokio::net::UnixStream;
 
     fn zone() -> Zone {
@@ -694,6 +696,7 @@ mod tests {
 
     /// End to end over a real socket: everything above tests the command table
     /// and none of it the framing, the permissions or the bind.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_socket_answers_and_is_private_to_its_owner() {
         use std::os::unix::fs::PermissionsExt;
@@ -736,6 +739,7 @@ mod tests {
 
     /// A second server over a running one would leave two daemons and one
     /// working control channel, and the second would look fine.
+    #[cfg(unix)]
     #[tokio::test]
     async fn binding_over_a_live_socket_is_refused() {
         let dir = ScratchDir::new("control-live");

@@ -734,7 +734,8 @@ the catalog takes the zone out of service — REFUSED, and the gauge at 0.
 
 ## 3.9 The control socket
 
-`--control-socket <path>`, Unix only, and refused at startup on Windows.
+`--control-socket <path>`: a Unix socket, or a named pipe on Windows.
+~~Unix only, and refused at startup on Windows.~~ Until #188.
 ~~`tokio` has no `UnixListener` on Windows, so it is refused there.~~ True of
 `UnixListener` and not a reason: `tokio` has named pipes, which were never
 weighed, and the consequence is that neither daemon can be told to reload on
@@ -742,6 +743,16 @@ Windows (`TODO.md` #188).
 
 Created mode 0600; filesystem permissions are the authentication. There is no
 control port, and these commands are not on `--metrics-listen`.
+
+On Windows (`TODO.md` #188) the value is a named pipe, `\\.\pipe\NAME`;
+anything else is refused at startup, `--check-config` included. The pipe is
+created with `first_pipe_instance` (a taken name is refused, the pipe form of
+not stealing a live socket) and `reject_remote_clients`, and with the default
+security descriptor: write for the creator owner, administrators and
+LocalSystem, read for Everyone and anonymous. A read-only client cannot send a
+command, and a conversation that sends nothing is closed without a reply. A
+custom descriptor would need tokio's `unsafe`
+`create_with_security_attributes_raw`.
 
 Protocol (~~`rdns/src/control.rs`~~ `rdns-core/src/control.rs` (2026-10-07, `TODO.md` #184)): one command line in, a status line
 (`+OK` / `-ERR`) and a body out, then close. Plain text, so

@@ -66,6 +66,21 @@ fn rdnsd(args: &[&str]) -> Output {
     .expect("rdnsd runs")
 }
 
+/// A port free for both UDP and TCP, released for rdnsd to take. A TCP port
+/// alone is not enough: Windows excludes UDP ranges the TCP ephemeral range
+/// overlaps, and the bind fails with WSAEACCES. A collision in between fails
+/// the caller's connect loop rather than passing.
+fn free_port() -> String {
+    let _forking = forking();
+    loop {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("a UDP port");
+        let port = udp.local_addr().expect("bound").port();
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port.to_string();
+        }
+    }
+}
+
 fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
@@ -326,14 +341,7 @@ fn an_idle_connection_is_closed_after_the_configured_timeout() {
     let zone = zone_in(&dir, ZONE);
     // A port the OS just handed out, released for rdnsd to take. A collision
     // in between fails the connect loop below rather than passing.
-    let port = {
-        let _forking = forking();
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .expect("a free port")
-            .port()
-            .to_string()
-    };
+    let port = free_port();
     let mut child = spawn(Command::new(env!("CARGO_BIN_EXE_rdnsd")).args([
         "--host",
         "127.0.0.1",
@@ -429,4 +437,104 @@ fn a_malformed_nsid_is_refused_and_hex_is_octets() {
     assert!(stdout(&out).contains("NSID ed"), "got: {}", stdout(&out));
     let out = rdnsd(&["--check-config", "--zone-file", &zone]);
     assert!(stdout(&out).contains("NSID off"), "got: {}", stdout(&out));
+}
+
+/// On Windows `--control-socket` takes a pipe name and nothing else, refused
+/// before the dry run answers (`TODO.md` #188).
+#[cfg(windows)]
+#[test]
+fn a_control_socket_that_is_not_a_pipe_is_refused_on_windows() {
+    let dir = ScratchDir::new("control-not-a-pipe");
+    let zone = zone_in(&dir, ZONE);
+    let out = rdnsd(&[
+        "--zone-file",
+        &zone,
+        "--control-socket",
+        r"C:\some\path",
+        "--check-config",
+    ]);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(stderr(&out).contains(r"\\.\pipe\NAME"), "{}", stderr(&out));
+}
+
+/// The control channel on Windows, against the process: `status`, `reload`
+/// re-reading a changed zone file, `dump` showing it, and a second server on
+/// the same pipe refused (`TODO.md` #188).
+#[cfg(windows)]
+#[test]
+fn the_control_pipe_reloads_a_changed_zone() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+
+    let ask = |pipe: &str, line: &str| -> std::io::Result<String> {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(pipe)?;
+        file.write_all(format!("{line}\n").as_bytes())?;
+        let mut reply = String::new();
+        file.read_to_string(&mut reply)?;
+        Ok(reply)
+    };
+
+    let dir = ScratchDir::new("control-pipe");
+    let zone = zone_in(&dir, ZONE);
+    let pipe = format!(r"\\.\pipe\rdnsd-test-{}", std::process::id());
+    let port = free_port();
+    let args = [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port,
+        "--zone-file",
+        &zone,
+        "--control-socket",
+        &pipe,
+        "--quiet",
+    ];
+    let mut child = spawn(Command::new(env!("CARGO_BIN_EXE_rdnsd")).args(args));
+    let started = Instant::now();
+    let status = loop {
+        match ask(&pipe, "status") {
+            Ok(reply) => break reply,
+            Err(_) if started.elapsed() < Duration::from_secs(10) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                panic!("rdnsd did not open {pipe}: {e}");
+            }
+        }
+    };
+    let result = std::panic::catch_unwind(|| {
+        assert!(status.starts_with("+OK\n"), "{status}");
+        assert!(status.contains("example.com."), "{status}");
+
+        // Its own DNS port, so what refuses it is the pipe.
+        let other = free_port();
+        let mut args = args;
+        args[3] = &other;
+        let second = rdnsd(&args);
+        assert!(!second.status.success(), "a second server must not start");
+        assert!(
+            stderr(&second).contains("already listening"),
+            "{}",
+            stderr(&second)
+        );
+
+        std::fs::write(&zone, ZONE.replace("( 1 3600", "( 2 3600")).expect("rewrite");
+        let reload = ask(&pipe, "reload").expect("reload");
+        assert_eq!(reload, "+OK\nreloaded 1 zone(s)\n");
+        let dump = ask(&pipe, "dump example.com.").expect("dump");
+        assert!(
+            dump.lines()
+                .any(|l| l.split_whitespace().collect::<Vec<_>>() == ["2", ";", "serial"]),
+            "the served zone is the new one: {dump}"
+        );
+    });
+    let _ = child.kill();
+    let _ = child.wait();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }

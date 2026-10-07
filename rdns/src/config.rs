@@ -216,11 +216,9 @@ macro_rules! server_table {
             https_path: Option<String>,
             tls_cert: Option<std::path::PathBuf>,
             tls_key: Option<std::path::PathBuf>,
-            /// Where `rdnsctl` reaches this server. Unix only, and refused at
-            /// startup on Windows rather than ignored — the field parses
-            /// everywhere so that one config file can be read on either
-            /// platform and fail with a sentence instead of an unknown-key
-            /// error. Both daemons since `TODO.md` #178.
+            /// Where `rdnsctl` reaches this server: a socket path, or on
+            /// Windows a pipe name, anything else refused at startup
+            /// (`TODO.md` #188). Both daemons since `TODO.md` #178.
             control_socket: Option<std::path::PathBuf>,
             $(
                 $(#[$own_meta])*

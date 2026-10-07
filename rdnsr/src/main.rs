@@ -21,9 +21,6 @@ mod anchors;
 mod answer;
 mod caches;
 mod config;
-// Compiled everywhere so its tests run on Windows too; only the socket is
-// `cfg(unix)` (`TODO.md` #188).
-#[cfg_attr(not(unix), allow(dead_code))]
 mod control;
 #[cfg(test)]
 mod flood;
@@ -312,7 +309,8 @@ struct Cli {
     /// lists the commands.
     ///
     /// Mode 0600, so the server's user and root; that is the authentication.
-    /// Unix only, and refused on Windows rather than ignored (`TODO.md` #188).
+    /// On Windows a named pipe, `\\.\pipe\NAME`, which only the owner,
+    /// administrators and SYSTEM may write to (`TODO.md` #188).
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     control_socket: Option<PathBuf>,
     /// How much to say: error, warn, info, debug or trace.
@@ -805,15 +803,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = cli;
     let started = std::time::Instant::now();
 
-    // Refused here, above the dry run, so `--check-config` says so too.
-    #[cfg(not(unix))]
-    if cli.control_socket.is_some() {
-        anyhow::bail!(
-            "--control-socket needs a Unix domain socket, and neither std nor \
-             tokio exposes one on Windows — the flag is parsed everywhere so a \
-             config file written on Linux is not a syntax error here, but it \
-             cannot be honoured"
-        );
+    // Refused here, above the dry run, so `--check-config` says so too: on
+    // Windows a path that is not a pipe name (`TODO.md` #188).
+    if let Some(path) = &cli.control_socket {
+        rdns_transport::control::check(path)?;
     }
 
     // Before anything is spawned: it owns the only durable state this process
@@ -1166,7 +1159,6 @@ async fn main() -> anyhow::Result<()> {
     };
     // The same rule for the control socket: a path that cannot be bound stops
     // the start.
-    #[cfg(unix)]
     let control_listener = match &cli.control_socket {
         Some(path) => Some(rdns_transport::control::bind(path)?),
         None => None,
@@ -1520,7 +1512,6 @@ async fn main() -> anyhow::Result<()> {
         ));
     }
     // A listener like the others: if it dies, the process does.
-    #[cfg(unix)]
     if let Some(control_listener) = control_listener {
         loops.spawn(rdns_transport::control::serve(
             control_listener,
@@ -1537,8 +1528,6 @@ async fn main() -> anyhow::Result<()> {
             shutdown.busy(),
         ));
     }
-    #[cfg(not(unix))]
-    let _ = (control_reloads, started);
     // A listener like the others: if it dies, the process does. Metrics that
     // silently stopped are worse than a resolver that is plainly down.
     if let Some(metrics_listener) = metrics_listener {

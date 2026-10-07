@@ -1,7 +1,7 @@
 //! The control socket's commands for `rdnsr` (`TODO.md` #178): flush and dump
 //! the caches, list the negative trust anchors, and run SIGHUP's reload. The
-//! socket is `rdns_transport::control`, shared with `rdnsd`; this is only the
-//! command table, so it compiles on every platform and is tested on both.
+//! socket, or named pipe on Windows, is `rdns_transport::control`, shared with
+//! `rdnsd`; this is only the command table.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -523,6 +523,7 @@ mod tests {
     }
 
     /// End to end over a real socket, and the two properties of the bind.
+    /// Windows' pipe has its own in `rdns_transport::control`.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_socket_is_private_answers_and_refuses_a_second_server() {

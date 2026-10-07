@@ -577,8 +577,8 @@ rather than panicking.
 
 ## 5.10 The control socket (`--control-socket`, `TODO.md` #178)
 
-`rdnsd`'s transport (`03` §3.9): mode 0600, refused over a live socket, Unix
-only and refused at startup on Windows (`TODO.md` #188). The socket half is
+`rdnsd`'s transport (`03` §3.9): a socket at mode 0600, or a named pipe on
+Windows (`TODO.md` #188), refused over a live one. The socket half is
 `rdns_transport::control`; each daemon supplies its command table.
 
 | command | does |

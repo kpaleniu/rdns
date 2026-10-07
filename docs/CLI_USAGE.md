@@ -560,7 +560,7 @@ a 2048-bit DKIM rotation weighs 566 octets with its TSIG and an ACME order with
 ten SANs 898, measured by
 `cargo run --release -p rdns --example request_size_probe`.
 
-### `--control-socket <PATH>` (Unix only)
+### `--control-socket <PATH>` (a named pipe on Windows)
 
 Answer `rdnsctl` on this Unix domain socket. Off by default.
 
@@ -618,8 +618,14 @@ partial reload leaves the server serving a mixture of two versions and the half
 that failed is the half that needed attention. `rdnsctl reload example.com.` is
 refused and says so.
 
-Unix only. `tokio` exposes no `UnixListener` on Windows, so `rdnsd` refuses
-`--control-socket` there at startup rather than accepting it and doing nothing.
+~~Unix only. `tokio` exposes no `UnixListener` on Windows, so `rdnsd` refuses
+`--control-socket` there at startup rather than accepting it and doing nothing.~~
+True of `UnixListener` and not a reason (`TODO.md` #188). On Windows the value
+is a named pipe, `\\.\pipe\NAME`, and anything else is refused at startup.
+The pipe's default security descriptor lets the owner, administrators and
+SYSTEM write and everyone else only read, which cannot send a command. A second
+server on a taken name is refused. `rdnsctl` defaults to `\\.\pipe\rdnsd`
+there.
 
 ```bash
 # Under systemd, with RuntimeDirectory=rdns creating /run/rdns.
@@ -1000,7 +1006,8 @@ zone from...", then that the record is actually in the file:
 grep example.com zones/example.com.zone
 ```
 
-`kill -HUP` does nothing — SIGHUP reload is Unix only, and the handler is
+`kill -HUP` does nothing — SIGHUP reload is Unix only; on Windows,
+`rdnsctl reload` over `--control-socket` is the way in. The handler is
 compiled in there alone. On Unix:
 
 ```bash

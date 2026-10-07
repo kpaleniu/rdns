@@ -578,4 +578,5 @@ the socket is the server's own.
 - Default socket `/run/rdns/rdnsd.sock`, which is what a systemd unit's
   `RuntimeDirectory=` creates. `rdnsr`'s is named with `-s`.
 - Default timeout 150 s; the server bounds its own `reload` reply at 120 s.
-- Unix only. On Windows it says so and exits 2 rather than not existing.
+- On Windows a named pipe, default `\\.\pipe\rdnsd`, opened as a file; a
+  pipe has no half-close, so the request ends at its newline (`TODO.md` #188).

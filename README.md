@@ -81,7 +81,7 @@ Nine, split so a client links neither a server nor a crypto library
 | `rdnsd` | authoritative server — every transport from one process |
 | `rdnsr` | recursive resolver with caching; forwards on `--upstream` |
 | `rdnsc` | command-line query client |
-| `rdnsctl` | control client for a running `rdnsd` or `rdnsr` (Unix only) |
+| `rdnsctl` | control client for a running `rdnsd` or `rdnsr` |
 
 ## Documentation
 
@@ -108,7 +108,8 @@ dig @127.0.0.1 -p 5353 +tcp example.com
 dig @127.0.0.1 -p 5353 example.com MX
 ```
 
-`kill -HUP <pid>` reloads zones without stopping service (Unix only).
+`kill -HUP <pid>` reloads zones without stopping service (Unix only;
+`rdnsctl reload` works on both).
 
 ## Zone file format
 

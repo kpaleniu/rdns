@@ -5,7 +5,9 @@
 //! daemons and `rdnsctl` cannot drift.
 //!
 //! A Unix socket with filesystem permissions, as `knotc` and `pdns_control`
-//! use — authorization by file mode, so nothing here authenticates.
+//! use — authorization by file mode, so nothing here authenticates. On
+//! Windows a named pipe, authorized by its default descriptor (`TODO.md`
+//! #188).
 //! `unbound-control` was once listed here too; its default is TCP on loopback
 //! with TLS, a Unix socket only if configured, and BIND's `rndc` is TCP with a
 //! shared key. The socket is this project's choice, not the field's

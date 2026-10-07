@@ -81,7 +81,7 @@ one). Two are new as of 2026-09-05 and are #31's answer:
 | `rdns`           | DNS above the wire: zones, DNSSEC, transfers, the resolver, the operational furniture. Re-exports all of `rdns-core` |
 | `rdns-transport` | the socket layer both daemons run: admission, framing, accept loops, the shutdown epilogue. May use `anyhow`, which is why it is not a module of `rdns` (`CLAUDE.md` §3) |
 | `rdnsc`          | command-line query client. Synchronous, and links `rdns-core` alone |
-| `rdnsctl`        | control client for a running `rdnsd`: `status`, `reload`, `dump` (Unix only) |
+| `rdnsctl`        | control client for a running `rdnsd` or `rdnsr`; a named pipe on Windows |
 | `rdnsd`          | authoritative server — serves zone files over UDP and TCP in one process |
 | `rdnsr`          | recursive resolver with a caching layer; forwards on `--upstream` |
 
@@ -523,7 +523,8 @@ cargo run -p rdnsr -- --port 15353 --max-inflight-udp 4096
 
 # Ask a running server what it is doing. A Unix socket at mode 0600 — the
 # filesystem is the authentication, which is what knotc, pdns_control and
-# unbound-control do; there is no control port. Unix only.
+# unbound-control do; there is no control port. On Windows a named pipe,
+# --control-socket '\\.\pipe\rdnsd'.
 cargo run -p rdnsd -- --port 15353 --zone-file example.com.zone \
   --control-socket /tmp/rdnsd.sock
 cargo run -p rdnsctl -- -s /tmp/rdnsd.sock status

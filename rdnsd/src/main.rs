@@ -9,8 +9,7 @@
 //! #20 and #38d lifted out of it, one seam per commit, is [`zones`] (where a zone
 //! comes from and how it is swapped in), [`replication`] (being a secondary),
 //! [`dispatch`] (one request in, its reply on the wire), [`answer`] (what a name
-//! deserves, with no sockets in it), [`config`] and — Unix only, so spelled rather
-//! than linked — `control`.
+//! deserves, with no sockets in it), [`config`] and [`control`].
 //!
 //! Every listening socket this binary binds is bound here or in `control`, and
 //! nothing below them decides to exit. A change about *what an answer is* belongs
@@ -26,8 +25,7 @@ mod answer;
 /// Consuming catalog zones: what `--catalog` provisions (RFC 9432).
 mod catalog;
 mod config;
-/// Control socket. Needs a Unix domain socket, so Unix only.
-#[cfg(unix)]
+/// Control socket: a Unix socket, or a named pipe on Windows.
 mod control;
 /// Answering one request, on either transport.
 mod dispatch;
@@ -722,13 +720,14 @@ struct Cli {
     /// put in it (§2.2).
     #[arg(long, value_name = "TEXT|0xHEX", conflicts_with = "config")]
     nsid: Option<String>,
-    /// Answer `rdnsctl` on this Unix socket: `status`, `reload`, `dump <zone>`.
+    /// Answer `rdnsctl` on this Unix socket, or on Windows this named pipe
+    /// (`\\.\pipe\NAME`): `status`, `reload`, `dump <zone>`.
     ///
-    /// Filesystem permissions are the authentication: the socket is mode 0600,
-    /// so the server's user and root. That is also why these commands are not
-    /// on `--metrics-listen`, where `reload` would be a POST with no
-    /// credential. Unix only — `tokio` has no `UnixListener` on Windows, so
-    /// this is refused there at startup rather than ignored.
+    /// Access control is the authentication: the socket is mode 0600, so the
+    /// server's user and root; the pipe's default descriptor lets only the
+    /// owner, administrators and SYSTEM write. That is also why these commands
+    /// are not on `--metrics-listen`, where `reload` would be a POST with no
+    /// credential.
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     control_socket: Option<PathBuf>,
     /// Read the settings from a TOML file instead of from flags.
@@ -818,7 +817,6 @@ struct ServePolicy {
 }
 
 /// Where the control socket lives and how it asks for a reload.
-#[cfg_attr(not(unix), allow(dead_code))]
 struct ControlPolicy {
     socket: Option<PathBuf>,
     reloads: mpsc::Sender<ReloadTrigger>,
@@ -958,7 +956,6 @@ async fn serve(
     let stream_listeners = EncryptedListeners::bind(tls.as_ref(), connections).await?;
     // Same rule for the control socket: a path that cannot be bound stops the
     // start.
-    #[cfg(unix)]
     let control_listener = match &control.socket {
         Some(path) => Some(control::bind(path)?),
         None => None,
@@ -1031,7 +1028,7 @@ async fn serve(
             None => "off (--metrics-listen)".to_string(),
         },
         match &control.socket {
-            Some(path) => format!("{} (mode 0600)", path.display()),
+            Some(path) => format!("{} ({})", path.display(), rdns_transport::control::ACCESS),
             None => "off (--control-socket)".to_string(),
         },
         match nsid {
@@ -1102,7 +1099,6 @@ async fn serve(
         ));
     }
     // And the control socket, for the same reason.
-    #[cfg(unix)]
     if let Some(control_listener) = control_listener {
         let ControlPolicy {
             socket,
@@ -1621,18 +1617,10 @@ async fn main() -> Result<()> {
     }
 
     validate_cli_args(&cli.host, cli.port)?;
-    // Refused rather than ignored, and refused *here* so `--check-config` says
-    // so too. A setting the operator believes is in force and is not is the
-    // whole failure `deny_unknown_fields` exists to prevent, and silently
-    // dropping a flag we parsed would be that failure with our name on it.
-    #[cfg(not(unix))]
-    if cli.control_socket.is_some() {
-        return Err(anyhow!(
-            "--control-socket needs a Unix domain socket, and neither std nor \
-             tokio exposes one on Windows — the flag is parsed everywhere so a \
-             config file written on Linux is not a syntax error here, but it \
-             cannot be honoured"
-        ));
+    // Refused *here* so `--check-config` says so too: on Windows a path that
+    // is not a pipe name (`TODO.md` #188).
+    if let Some(path) = &cli.control_socket {
+        rdns_transport::control::check(path)?;
     }
 
     // Created here rather than in `serve`, because the things that need to be

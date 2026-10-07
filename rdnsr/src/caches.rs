@@ -289,12 +289,10 @@ impl Caches {
 
     /// Answers and negative answers at exactly `name`, every type. Not the
     /// denials: an NSEC range is not *at* a name (`TODO.md` #178).
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn forget_name(&self, name: NameRef<'_>) -> usize {
         self.answers.forget_name(name) + self.negatives.forget_name(name)
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn sizes(&self) -> [(&'static str, usize); 3] {
         [
             ("answers", self.answers.len()),
@@ -303,7 +301,6 @@ impl Caches {
         ]
     }
 
-    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn dump(&self, node: NameRef<'_>) -> Vec<rdns::cache::Dumped> {
         self.answers.dump(node)
     }
