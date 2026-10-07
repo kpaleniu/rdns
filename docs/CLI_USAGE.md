@@ -730,6 +730,20 @@ failure rather than a handshake one — TLS 1.3 lets the client finish first.
 rdnsd --zone-dir ./zones   --secondary example.com@192.0.2.1+tls=ns1.example.net   --transfer-tls-ca /etc/rdns/anchors.pem   --transfer-tls-cert /etc/rdns/client.pem   --transfer-tls-key /etc/rdns/client.key
 ```
 
+### `--parental-agent <ZONE@ADDR[:PORT][#KEY][+tls=NAME]>`
+
+Ask this server for ZONE's DS before one of ZONE's key-signing keys retires
+(`TODO.md` #180). Repeatable; `parental-agents = [...]` in `[zones.*]`. A KSK
+past its `Inactive` or `Delete` keeps signing and stays published until every
+agent shows a DS for an active successor, and has for the DS TTL. The answers
+are not validated: use `#KEY` or `+tls=` across an untrusted path. See
+`docs/spec/04-dnssec.md`.
+
+```bash
+rdnsd --zone-dir ./zones --signing-key-dir ./keys \
+      --parental-agent example.com.@192.0.2.53#parent-key
+```
+
 ### `--also-notify <ADDR[:PORT][#KEY]>`
 
 A secondary to notify when a zone changes (RFC 1996). Repeatable; port defaults

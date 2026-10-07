@@ -538,3 +538,50 @@ fn the_control_pipe_reloads_a_changed_zone() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// `--parental-agent` refusals, all before the dry run answers (`TODO.md`
+/// #180): an endpoint that does not parse, a zone nothing signs, a zone
+/// signed but not served.
+#[test]
+fn parental_agents_are_checked_before_the_dry_run_answers() {
+    let dir = ScratchDir::new("parental-agent");
+    let zone = zone_in(&dir, ZONE);
+    let keys = dir.join("keys");
+    std::fs::create_dir_all(&keys).expect("a key dir");
+    let keys = keys.to_string_lossy().into_owned();
+    let made = rdnsd(&["--generate-keys", "other.com.", "--signing-key-dir", &keys]);
+    assert!(made.status.success(), "{}", stderr(&made));
+
+    for (args, wants) in [
+        (
+            vec!["--zone-file", &zone, "--parental-agent", "example.com."],
+            "--parental-agent",
+        ),
+        (
+            vec![
+                "--zone-file",
+                &zone,
+                "--parental-agent",
+                "example.com.@192.0.2.1",
+            ],
+            "does not sign",
+        ),
+        (
+            vec![
+                "--zone-file",
+                &zone,
+                "--signing-key-dir",
+                &keys,
+                "--parental-agent",
+                "other.com.@192.0.2.1",
+            ],
+            "no zone other.com. is served",
+        ),
+    ] {
+        let mut all = args.clone();
+        all.push("--check-config");
+        let out = rdnsd(&all);
+        assert!(!out.status.success(), "{args:?} must be refused");
+        assert!(stderr(&out).contains(wants), "{args:?}: {}", stderr(&out));
+    }
+}

@@ -610,6 +610,71 @@ pub async fn fetch_soa(
         .map_err(|_| TransferError::timeout(format!("SOA probe to {master} timed out")))?
 }
 
+/// The DS RRset a parental agent holds for a zone, and its TTL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DsAnswer {
+    pub ds: Vec<crate::dnssec::Ds>,
+    /// The RRset's TTL as the agent returned it; 0 with no DS.
+    pub ttl: u32,
+}
+
+/// Ask a parental agent for `zone`'s DS RRset, over TCP and TSIG or TLS as
+/// `master` says, like [`fetch_soa`] (`TODO.md` #180).
+///
+/// NODATA is an empty set, not an error: a parent with no DS for the zone is
+/// an answer. Anything but NOERROR is an error, so a REFUSED from an agent
+/// that does not serve the parent holds a key rather than reading as "no DS".
+/// Not validated: the operator chose the agents, and `#key` or `+tls=` is
+/// how a path to one is trusted.
+pub async fn fetch_ds(
+    master: &Master,
+    zone: NameRef<'_>,
+    key: Option<&TsigKey>,
+) -> TransferResult<DsAnswer> {
+    let deadline = tokio::time::timeout(SOA_TIMEOUT, async {
+        let id = rand_id();
+        let request = question(zone, Qtype::of(rt::DS), id);
+        let mut session = TransferSession::open(master, &request, key).await?;
+        let reply = session.next().await?;
+        if reply.rcode != ResponseCode::Ok {
+            return Err(TransferError::Rcode(reply.rcode));
+        }
+        let mut answer = DsAnswer {
+            ds: Vec::new(),
+            ttl: 0,
+        };
+        for rr in reply
+            .answers
+            .iter()
+            .filter(|rr| rr.rdata.rtype() == rt::DS && rr.name.as_ref() == zone)
+        {
+            let Ok(ParsedRecord::DS {
+                key_tag,
+                algorithm,
+                digest_type,
+                digest,
+                ..
+            }) = rr.rdata.parse()
+            else {
+                return Err(TransferError::malformed("a DS record does not parse"));
+            };
+            answer.ttl = answer.ttl.max(rr.ttl.as_secs());
+            answer.ds.push(crate::dnssec::Ds {
+                owner: zone.to_owned(),
+                key_tag,
+                algorithm,
+                digest_type,
+                digest,
+            });
+        }
+        Ok(answer)
+    });
+
+    deadline
+        .await
+        .map_err(|_| TransferError::timeout(format!("DS query to {master} timed out")))?
+}
+
 /// Transfer the zone from `master`, verifying it as it arrives.
 pub async fn fetch_zone(
     master: &Master,
@@ -1559,6 +1624,112 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A parental agent's DS answer, TSIG-signed when the agent holds `key`
+    /// (`TODO.md` #180): the request is checked and the reply signed with the
+    /// session, as the transfer master above does.
+    async fn spawn_ds_agent(ds: Vec<ResourceRecord>, key: Option<TsigKey>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind an agent");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut length = [0u8; 2];
+                if stream.read_exact(&mut length).await.is_err() {
+                    continue;
+                }
+                let mut packet = vec![0u8; u16::from_be_bytes(length) as usize];
+                if stream.read_exact(&mut packet).await.is_err() {
+                    continue;
+                }
+                let request = DnsMessage::try_from_bytes(&packet).expect("parse");
+                let mut reply = request.clone();
+                reply.response = true;
+                reply.answers = ds.clone();
+                let mut session = None;
+                if let Some(k) = &key {
+                    let keyring = crate::tsig::TsigKeyring::new(vec![k.clone()]);
+                    match tsig::check_request(&packet, &keyring, tsig::now()) {
+                        tsig::TsigCheck::Verified(verified) => session = Some(verified),
+                        _ => reply.rcode = ResponseCode::NotAuthorized,
+                    }
+                }
+                let mut buf = vec![0u8; 4096];
+                let n = reply.to_bytes(&mut buf).expect("serialize");
+                let mut bytes = buf[..n].to_vec();
+                if let Some(session) = session.as_mut() {
+                    bytes = session.sign(bytes, tsig::now()).expect("sign");
+                }
+                let mut framed = (bytes.len() as u16).to_be_bytes().to_vec();
+                framed.extend_from_slice(&bytes);
+                let _ = stream.write_all(&framed).await;
+            }
+        });
+        addr
+    }
+
+    fn ds_record(tag: u16, ttl: u32) -> ResourceRecord {
+        ResourceRecord {
+            name: nm("example.com."),
+            class: Class::IN,
+            ttl: Ttl::from_secs(ttl),
+            rdata: crate::RecordData::from_parsed(&ParsedRecord::DS {
+                rtype: rt::DS,
+                key_tag: tag,
+                algorithm: 13,
+                digest_type: 2,
+                digest: vec![0xab; 32],
+            })
+            .unwrap(),
+        }
+    }
+
+    /// Asked with TSIG, and the signed reply verified; a key the agent does
+    /// not hold is an error, not an empty DS set.
+    #[tokio::test]
+    async fn a_ds_query_is_signed_and_its_reply_verified() {
+        let key = TsigKey::parse("agent-key:c2VjcmV0c2VjcmV0c2VjcmV0").expect("a key");
+        let addr = spawn_ds_agent(vec![ds_record(4711, 3600)], Some(key.clone())).await;
+        let answer = fetch_ds(
+            &Master::plain(addr),
+            nm("example.com.").as_ref(),
+            Some(&key),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(answer.ttl, 3600);
+        assert_eq!(answer.ds.len(), 1);
+        assert_eq!(answer.ds[0].key_tag, 4711);
+
+        let other = TsigKey::parse("agent-key:b3RoZXJvdGhlcm90aGVyb3RoZXI=").expect("a key");
+        assert!(
+            fetch_ds(
+                &Master::plain(addr),
+                nm("example.com.").as_ref(),
+                Some(&other)
+            )
+            .await
+            .is_err(),
+            "a reply that does not verify under our key is not a DS set"
+        );
+
+        let unsigned = spawn_ds_agent(Vec::new(), None).await;
+        assert!(
+            fetch_ds(
+                &Master::plain(unsigned),
+                nm("example.com.").as_ref(),
+                Some(&key)
+            )
+            .await
+            .is_err(),
+            "an unsigned reply to a signed query is refused"
+        );
+        let empty = fetch_ds(&Master::plain(unsigned), nm("example.com.").as_ref(), None)
+            .await
+            .expect("NODATA is an answer");
+        assert!(empty.ds.is_empty());
     }
 
     /// A certificate for `name`, its own PEM anchor file, and a TLS master

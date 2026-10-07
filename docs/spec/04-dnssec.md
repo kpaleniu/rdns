@@ -169,6 +169,31 @@ sharing DS's and DNSKEY's formats (RFC 7344 §3.1, §3.2) and one parser each. T
 were `TYPE59`/`TYPE60` generic RDATA before `TODO.md` #55 — which is to say a
 hand-written `CDS` line did not parse at all.
 
+**The old KSK's retirement waits on the parent** (`TODO.md` #180). ~~"withdraw
+the old one after the parent has switched" — nothing checks that it has.~~ With
+`--parental-agent ZONE@ENDPOINT` (repeatable; `parental-agents` in
+`[zones.*]`; the endpoint is `--secondary`'s, so `#key` and `+tls=` work), a
+SEP key past its `Inactive` or `Delete` keeps signing and stays published until
+every agent's DS RRset holds a DS for another SEP key that is active and not
+retiring, and has for the RRset's TTL (RFC 7583's DS propagation). Knot's
+`submission.parent` with `parent-delay`, BIND's `parental-agents`.
+
+- Every agent must agree; one that does not answer holds the key.
+- Unknown is hold: in memory only, so after a restart nothing retires until the
+  first check has answered.
+- Asked hourly (a constant), at each retirement time, and when the TTL wait
+  ends — and only while a SEP key is in its sync window or past a time.
+- A key let go is re-signed out at once, not at the next tick.
+- Held keys are logged once per reason and listed by `rdnsctl status`.
+- The answers are not validated. Reach an agent over an untrusted path with
+  `#key` or `+tls=`: a forged DS can make a key retire early.
+- ZSKs retire on their timestamps, agents or not.
+- A zone with no agents and a SEP key carrying `Inactive` or `Delete` retires
+  on the timestamps, as before, with a warning at startup and at each signing
+  run that finds it retired.
+- Refused at startup, `--check-config` included: an endpoint that does not
+  parse, a zone this server does not sign or does not serve.
+
 The signer never removes a key file. `Delete` withdraws the DNSKEY from the zone,
 which is reversible; taking the private key off the disk is the operator's.
 

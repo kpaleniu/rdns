@@ -49,6 +49,8 @@ pub(crate) struct Control {
     pub(crate) started: Instant,
     /// The address the DNS listeners are on, for the header line.
     pub(crate) listen: String,
+    /// Key-signing keys held until the parent's DS moves (`TODO.md` #180).
+    pub(crate) parental: crate::parental::ParentalGate,
 }
 
 /// Bind the socket; the transport is `rdns_transport::control`'s, shared
@@ -203,6 +205,9 @@ async fn status(control: &Control) -> String {
     }
     if rows.is_empty() {
         out.push_str("(none — every query will be REFUSED)\n");
+    }
+    for (zone, tag, why) in control.parental.held() {
+        let _ = writeln!(out, "held: {zone} key {tag}: {why}");
     }
     out
 }
@@ -427,6 +432,7 @@ mod tests {
                 reloads: tx,
                 started: Instant::now(),
                 listen: "127.0.0.1:15353".to_string(),
+                parental: Default::default(),
             }),
             rx,
         )

@@ -309,6 +309,27 @@ pub struct SigningKey {
     /// that carries no timing, which is every one written before `TODO.md` #44f
     /// and every zone that does not roll.
     timing: KeyTiming,
+    /// Set while the parent's DS has not shown a successor (`TODO.md` #180):
+    /// `Inactive` and `Delete` are then not reached. In memory only, and
+    /// shared with whatever decides it, so every predicate below follows the
+    /// decision without the signer being told.
+    held: RetirementHold,
+}
+
+/// Whether a key's retirement is held, and the handle that decides it.
+///
+/// Clone shares the flag.
+#[derive(Debug, Clone, Default)]
+pub struct RetirementHold(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl RetirementHold {
+    pub fn set(&self, held: bool) {
+        self.0.store(held, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn is_held(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for SigningKey {
@@ -320,6 +341,7 @@ impl std::fmt::Debug for SigningKey {
             .field("algorithm", &self.algorithm.name())
             .field("key_tag", &self.key_tag())
             .field("timing", &self.timing)
+            .field("held", &self.held.is_held())
             .finish_non_exhaustive()
     }
 }
@@ -443,12 +465,33 @@ impl SigningKey {
             pkcs8: pkcs8.to_vec(),
             pair,
             timing: KeyTiming::default(),
+            held: RetirementHold::default(),
         })
     }
 
-    /// When this key is published and when it signs (`TODO.md` #44f).
+    /// When this key is published and when it signs (`TODO.md` #44f), as in
+    /// force: while its retirement is held, without `Inactive` and `Delete`
+    /// (#180).
     pub fn timing(&self) -> KeyTiming {
+        if self.held.is_held() {
+            KeyTiming {
+                inactive: None,
+                delete: None,
+                ..self.timing
+            }
+        } else {
+            self.timing
+        }
+    }
+
+    /// The timing as the key file has it, hold or no hold.
+    pub fn file_timing(&self) -> KeyTiming {
         self.timing
+    }
+
+    /// The handle that holds this key's retirement (`TODO.md` #180).
+    pub fn retirement_hold(&self) -> RetirementHold {
+        self.held.clone()
     }
 
     /// Set it, for a caller building a key rather than reading one.
@@ -462,11 +505,11 @@ impl SigningKey {
     /// may sign. Both are [`KeyTiming`]'s; here so a caller holding a key need
     /// not reach through to it.
     pub fn is_published(&self, now: u64) -> bool {
-        self.timing.is_published(now)
+        self.timing().is_published(now)
     }
 
     pub fn is_active(&self, now: u64) -> bool {
-        self.timing.is_active(now)
+        self.timing().is_active(now)
     }
 
     pub fn owner(&self) -> NameRef<'_> {

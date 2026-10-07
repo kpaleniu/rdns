@@ -764,9 +764,34 @@ pub(crate) struct ZoneSigning {
     /// Only a config file can populate this: there is no flag shape for "NSEC3
     /// for this zone and NSEC for the rest".
     per_zone: BTreeMap<String, config::ZoneSigningOverride>,
+    /// Zones with parental agents, whose key-signing keys retire on the
+    /// parent's DS rather than on their timestamps alone (`TODO.md` #180).
+    gated: std::collections::HashSet<Name>,
 }
 
 impl ZoneSigning {
+    /// Name the zones whose KSK retirement is gated, and warn about every
+    /// other zone with a KSK carrying a retirement time: that one retires on
+    /// the timestamp whether or not the parent has moved (`TODO.md` #180).
+    pub(crate) fn gate(&mut self, zones: &[Name]) {
+        self.gated = zones.iter().cloned().collect();
+        for (origin, keys) in &self.keys {
+            if self.gated.contains(origin) {
+                continue;
+            }
+            for key in keys.iter().filter(|k| k.is_sep()) {
+                let timing = key.file_timing();
+                if timing.inactive.is_some() || timing.delete.is_some() {
+                    tracing::warn!(
+                        "{origin} key {} (KSK) retires on its timestamps alone: no \
+                         --parental-agent checks the parent's DS first",
+                        key.key_tag()
+                    );
+                }
+            }
+        }
+    }
+
     pub(crate) fn load(
         cli: &Cli,
         per_zone: &BTreeMap<String, config::ZoneSigningOverride>,
@@ -790,6 +815,7 @@ impl ZoneSigning {
         }
         Ok(Some(ZoneSigning {
             keys,
+            gated: Default::default(),
             per_zone: per_zone.clone(),
             validity: u64::from(cli.signature_validity) * 86_400,
             chain: if cli.nsec3 {
@@ -1021,6 +1047,7 @@ impl ZoneSigning {
             }
             let carried = previous.and_then(|served| served.get(key));
             let apex = origin.to_owned();
+            let gated = self.gated.contains(&apex);
             let origin = origin.to_presentation();
             let policy = self.policy_for(&origin, signed_at);
             *zone = Arc::new(match carried {
@@ -1054,7 +1081,7 @@ impl ZoneSigning {
                 }
             );
             warn_about_unsigned_algorithms(&origin, zone);
-            log_key_schedule(&origin, keys, signed_at);
+            log_key_schedule(&origin, keys, signed_at, gated);
         }
         Ok(run)
     }
@@ -1206,11 +1233,24 @@ pub(crate) struct Checked {
 /// weeks earlier; a line per key at startup is how they find out the server
 /// agrees. INFO, not DEBUG: this is a handful of lines per reload, and the
 /// alternative is discovering the disagreement from a validator.
-fn log_key_schedule(origin: &str, keys: &[SigningKey], now: u64) {
+fn log_key_schedule(origin: &str, keys: &[SigningKey], now: u64, gated: bool) {
     for key in keys {
         let timing = key.timing();
         if timing == rdns::dnssec_key::KeyTiming::default() {
             continue;
+        }
+        // Each retirement step of an ungated KSK, said where it is taken
+        // (`TODO.md` #180).
+        if key.is_sep()
+            && !gated
+            && !key.is_active(now)
+            && timing.inactive.is_some_and(|t| now >= t)
+        {
+            tracing::warn!(
+                "{origin} key {} (KSK) has retired with nothing checking the parent's DS \
+                 for its successor (--parental-agent)",
+                key.key_tag()
+            );
         }
         let state = if key.is_active(now) {
             "signing"
@@ -1749,6 +1789,7 @@ mod tests {
                 validity: 30 * 86_400,
                 chain: DenialChain::Nsec,
                 per_zone: BTreeMap::new(),
+                gated: Default::default(),
             }
         };
 
@@ -2426,6 +2467,7 @@ mod tests {
             validity: 30 * 86_400,
             chain: DenialChain::Nsec,
             per_zone: BTreeMap::new(),
+            gated: Default::default(),
         }
     }
 

@@ -169,6 +169,10 @@ struct ZoneConfig {
     /// `server.transfer-tls-ca`.
     #[serde(default)]
     masters: Vec<String>,
+    /// Who to ask for this zone's DS before a key-signing key retires:
+    /// `--parental-agent`'s spelling after the `zone@` (`TODO.md` #180).
+    #[serde(default)]
+    parental_agents: Vec<String>,
     /// Who to NOTIFY for *this* zone, in addition to `server.also-notify`.
     #[serde(default)]
     also_notify: Vec<String>,
@@ -573,6 +577,11 @@ impl Config {
         cli.tsig_key = self.tsig_specs()?;
         cli.secondary = self.secondary_specs();
         cli.catalog = self.catalog_specs();
+        cli.parental_agent = self
+            .zones
+            .iter()
+            .flat_map(|(zone, z)| z.parental_agents.iter().map(move |a| format!("{zone}@{a}")))
+            .collect();
 
         if let Some(Signing {
             key_dir,
@@ -595,6 +604,8 @@ impl Config {
                 file,
                 // `zone_specs`, above: the `--secondary` and `--catalog` lists.
                 masters: _,
+                // Above, as `--parental-agent` specs.
+                parental_agents: _,
                 also_notify,
                 catalog: _,
                 groups,

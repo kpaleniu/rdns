@@ -30,6 +30,7 @@ mod control;
 /// Answering one request, on either transport.
 mod dispatch;
 mod notify_out;
+mod parental;
 mod replication;
 /// What a signed answer weighs, for `TODO.md` #41's choice of ceiling.
 #[cfg(test)]
@@ -272,6 +273,21 @@ struct Cli {
         conflicts_with = "config"
     )]
     secondary: Vec<String>,
+    /// Ask this server for ZONE's DS before one of ZONE's key-signing keys
+    /// retires: `ZONE@ADDR[:PORT][#KEY][+tls=NAME]`, repeatable, the
+    /// endpoint spelled as for --secondary.
+    ///
+    /// A KSK past its Inactive or Delete time keeps signing and stays
+    /// published until every agent's DS RRset shows an active successor and
+    /// has for the RRset's TTL. The answers are not validated, so reach an
+    /// agent across an untrusted path with #KEY or +tls=: a forged DS can
+    /// make a key retire early, which is the outage this exists to stop.
+    #[arg(
+        long,
+        value_name = "ZONE@AGENT[:PORT][#KEY][+tls=NAME]",
+        conflicts_with = "config"
+    )]
+    parental_agent: Vec<String>,
     /// A catalog zone to consume: `zone@master[:port][#tsig-key-name]`,
     /// repeatable.
     ///
@@ -833,6 +849,8 @@ struct ControlPolicy {
     /// For `status`'s uptime. Taken in `main`, not here: loading and signing
     /// every zone happens before `serve` and is the bulk of a big start.
     started: Instant,
+    /// Keys whose retirement waits on the parent's DS (`TODO.md` #180).
+    parental: parental::ParentalGate,
 }
 
 /// Bind both transports and serve them from one process.
@@ -1106,6 +1124,7 @@ async fn serve(
             secondaries,
             catalogs,
             started,
+            parental,
         } = control;
         loops.spawn(control::serve(
             control_listener,
@@ -1117,6 +1136,7 @@ async fn serve(
                 reloads,
                 started,
                 listen: addr.to_string(),
+                parental,
             }),
             shutdown.stop_handle(),
             shutdown.busy(),
@@ -1347,6 +1367,10 @@ enum ReloadTrigger {
     /// the number of zones installed.
     #[cfg_attr(not(unix), allow(dead_code))]
     Control(tokio::sync::oneshot::Sender<Result<usize, String>>),
+    /// A key-signing key let go by the parental-agent gate (`TODO.md` #180):
+    /// the DNSKEY RRset changes, so the zone is re-signed now rather than at
+    /// the next tick.
+    ParentDs,
 }
 
 impl ReloadTrigger {
@@ -1369,6 +1393,7 @@ impl ReloadTrigger {
             ReloadTrigger::Signal => "SIGHUP",
             ReloadTrigger::Timer => "signature refresh",
             ReloadTrigger::Control(_) => "control socket",
+            ReloadTrigger::ParentDs => "a key retiring once the parent's DS moved",
         }
     }
 }
@@ -1829,7 +1854,22 @@ async fn main() -> Result<()> {
     let replicating = !secondary_specs.is_empty();
     // Read before the source is taken apart, which consumes the two path
     // fields.
-    let signing = ZoneSigning::load(&cli, &per_zone.signing)?.map(Arc::new);
+    let mut signing = ZoneSigning::load(&cli, &per_zone.signing)?;
+    // Before the first signing run: unknown is hold, so a key past its
+    // retirement time keeps signing until the parent has been asked
+    // (`TODO.md` #180).
+    let parental_agents = parental::parse_agents(&cli.parental_agent, &tsig_keys, xot.as_ref())?;
+    let gated: Vec<Name> = parental_agents.keys().cloned().collect();
+    let parental = parental::ParentalGate::new(parental_agents, |origin| {
+        signing
+            .as_ref()
+            .and_then(|s| s.keys_for(origin))
+            .map(|keys| keys.iter().collect())
+    })?;
+    if let Some(signing) = &mut signing {
+        signing.gate(&gated);
+    }
+    let signing = signing.map(Arc::new);
     let source = if per_zone.files.is_empty() {
         validate_zone_source(cli.zone_file, cli.zone_dir, replicating)?
     } else {
@@ -1889,6 +1929,14 @@ async fn main() -> Result<()> {
     // `proved` was empty above, so this pass checks everything; what it proves is
     // what the reload path may then skip.
     verify_zones(&zones, &validator, &run, &proved)?;
+    if let Some(origin) = gated
+        .iter()
+        .find(|o| !zones.keys().any(|k| k.as_name() == o.as_ref()))
+    {
+        return Err(anyhow!(
+            "--parental-agent {origin}@...: no zone {origin} is served here"
+        ));
+    }
 
     // Parsed here and not in `serve`'s argument list: an argument expression
     // is evaluated below the dry-run exit, which made this the one flag
@@ -2116,6 +2164,19 @@ async fn main() -> Result<()> {
         announced,
         shutdown.lifecycle(),
     );
+    if !parental.is_empty() {
+        let reloads = reloads.clone();
+        tokio::spawn(parental::run(
+            parental.clone(),
+            parental::Network,
+            rdns::clock::Clock::system(),
+            // `try_send`: a reload already queued re-signs with the key let go.
+            move || {
+                let _ = reloads.try_send(ReloadTrigger::ParentDs);
+            },
+            shutdown.stop_handle(),
+        ));
+    }
 
     serve(
         &addr,
@@ -2170,6 +2231,7 @@ async fn main() -> Result<()> {
                     )?,
                 },
                 started,
+                parental,
             },
         },
         secondaries,
