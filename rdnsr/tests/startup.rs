@@ -584,3 +584,83 @@ fn negative_trust_anchors_are_checked_before_the_dry_run() {
     let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
     assert!(!out.status.success(), "the file key reaches the same check");
 }
+
+/// Each routed-domain refusal stops the dry run, naming the entry, and the
+/// file's tables reach the same parser (`TODO.md` #172).
+#[test]
+fn a_bad_routed_domain_is_refused_before_the_dry_run() {
+    for (args, wants) in [
+        (&["--forward-zone", "corp.test="][..], "no servers"),
+        (
+            &[
+                "--forward-zone",
+                "corp.test=192.0.2.1",
+                "--stub-zone",
+                "corp.test=192.0.2.2",
+            ][..],
+            "already routed",
+        ),
+        (&["--no-validate-zone", "corp.test"][..], "no routed domain"),
+        (
+            &[
+                "--upstream",
+                "192.0.2.9:53",
+                "--forward-zone",
+                ".=192.0.2.1",
+            ][..],
+            "--upstream",
+        ),
+        (
+            &["--upstream", "192.0.2.9:53", "--root-hints", "hints"][..],
+            "--root-hints",
+        ),
+    ] {
+        let out = rdnsr(&[&["--check-config"][..], args].concat());
+        assert!(!out.status.success(), "{args:?} passed the dry run");
+        assert!(stderr(&out).contains(wants), "{args:?}: {}", stderr(&out));
+    }
+
+    let out = rdnsr(&[
+        "--check-config",
+        "--forward-zone",
+        "corp.test=192.0.2.1",
+        "--no-validate-zone",
+        "corp.test",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let line = stdout(&out);
+    assert!(
+        line.contains("forward zone corp.test. -> 192.0.2.1:53, not validated")
+            && line.contains("recursing from the built-in root hints"),
+        "got: {line}"
+    );
+
+    let dir = ScratchDir::new("rdnsr-routes");
+    let config = dir.join("rdnsr.toml");
+    std::fs::write(
+        &config,
+        "[[stub-zone]]\nname = \"corp.test\"\nservers = []\n",
+    )
+    .expect("write the config");
+    let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
+    assert!(!out.status.success(), "an empty server list in the file");
+    assert!(stderr(&out).contains("no servers"), "{}", stderr(&out));
+
+    std::fs::write(
+        &config,
+        "[[forward-zone]]\nname = \"corp.test\"\nservers = [\"192.0.2.1\"]\nvalidate = false\n",
+    )
+    .expect("write the config");
+    let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("not validated"), "{}", stdout(&out));
+
+    let out = rdnsr(&[
+        "--config",
+        &config.to_string_lossy(),
+        "--forward-zone",
+        "x.test=192.0.2.1",
+        "--check-config",
+    ]);
+    assert!(!out.status.success(), "flag and file together");
+}

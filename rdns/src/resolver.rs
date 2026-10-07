@@ -1,6 +1,5 @@
-//! The resolver: obtains an answer for a query, either by walking the
-//! delegation chain from the root ourselves or by forwarding to a configured
-//! upstream. See [`ResolverMode`].
+//! The resolver: obtains an answer for a query by walking the delegation chain
+//! from the root, or from a routed domain's servers. See [`Route`].
 
 use crate::clock::Clock;
 use crate::dnssec::{Dnskey, Rrsig};
@@ -284,23 +283,64 @@ impl std::fmt::Display for ResolutionTimer {
     }
 }
 
-/// How the resolver obtains an answer.
+/// How a routed domain's servers are asked (`TODO.md` #172).
+///
+/// Room for a transport beside it (#175) is in [`Route`], not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolverMode {
-    /// Walk the delegation chain ourselves: root → TLD → authoritative.
-    Recurse,
-    /// Ask a configured upstream resolver and return what it says. Cheaper and
-    /// simpler, but it makes that upstream a trusted third party.
+pub enum RouteKind {
+    /// Ask the servers with RD=1 and take what they say: they resolve. BIND's
+    /// `forward only` zone, Unbound's `forward-zone`.
     Forward,
+    /// Walk the delegation chain from the servers with RD=0: they are the
+    /// domain's authorities. Unbound's `stub-zone`.
+    Stub,
+}
+
+/// A subtree sent to named servers rather than found from the root.
+///
+/// `--upstream` is a forward route at `.`. The most specific route covering
+/// a name decides it, and there is no fallback to recursion when its servers
+/// fail: that would leak an internal name to the public tree and cache the
+/// public NXDOMAIN over the subtree (RFC 8020).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
+    pub name: Name,
+    pub kind: RouteKind,
+    pub servers: Vec<SocketAddr>,
+    /// `false` answers the subtree `Indeterminate`, AD clear: a private
+    /// domain under a signed public one is provably absent from the public
+    /// tree, so validating it can only fail.
+    pub validate: bool,
+}
+
+impl Route {
+    /// A forward route, validated.
+    pub fn forward(name: Name, servers: Vec<SocketAddr>) -> Route {
+        Route {
+            name,
+            kind: RouteKind::Forward,
+            servers,
+            validate: true,
+        }
+    }
+
+    /// A stub route, validated.
+    pub fn stub(name: Name, servers: Vec<SocketAddr>) -> Route {
+        Route {
+            name,
+            kind: RouteKind::Stub,
+            servers,
+            validate: true,
+        }
+    }
 }
 
 /// Configuration for the resolver.
 #[derive(Debug, Clone)]
 pub struct ResolverConfig {
-    /// Whether to recurse from the root or forward to `upstream_servers`.
-    pub mode: ResolverMode,
-    /// Upstream resolvers for [`ResolverMode::Forward`] (e.g. "8.8.8.8:53").
-    pub upstream_servers: Vec<SocketAddr>,
+    /// Subtrees asked of named servers rather than found from the root. Empty
+    /// is recursion for every name.
+    pub routes: Vec<Route>,
     /// Where recursion starts. Defaults to the built-in `ROOT_HINTS`.
     pub root_hints: Vec<SocketAddr>,
     /// Per-query timeout in milliseconds.
@@ -390,12 +430,7 @@ impl From<TrustAnchors> for SharedAnchors {
 impl Default for ResolverConfig {
     fn default() -> Self {
         ResolverConfig {
-            mode: ResolverMode::Recurse,
-            // Google and Cloudflare public DNS, used only in Forward mode.
-            upstream_servers: vec![
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53),
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53),
-            ],
+            routes: Vec::new(),
             // Interleaved v4/v6 so whichever family the host has is reached in
             // the first hop or two, before RTT selection has anything to go on.
             root_hints: ROOT_HINTS
@@ -591,7 +626,7 @@ impl<'a> Resolution<'a> {
     }
 }
 
-/// A DNS resolver. See [`ResolverMode`].
+/// A DNS resolver. See [`Route`].
 pub struct Resolver {
     config: ResolverConfig,
     /// Shared across concurrent resolutions.
@@ -652,8 +687,7 @@ impl Resolver {
     #[cfg(test)]
     fn forwarding_to(upstreams: Vec<SocketAddr>) -> Self {
         Self::new(ResolverConfig {
-            mode: ResolverMode::Forward,
-            upstream_servers: upstreams,
+            routes: vec![Route::forward(Name::root(), upstreams)],
             ..ResolverConfig::default()
         })
     }
@@ -668,8 +702,18 @@ impl Resolver {
         self.config.dnssec.as_ref().map(SharedAnchors::get)
     }
 
-    pub fn mode(&self) -> ResolverMode {
-        self.config.mode
+    /// The routed domains, as configured.
+    pub fn routes(&self) -> &[Route] {
+        &self.config.routes
+    }
+
+    /// The most specific route covering `name`, if any.
+    pub fn route_for(&self, name: NameRef<'_>) -> Option<&Route> {
+        self.config
+            .routes
+            .iter()
+            .filter(|route| name.is_at_or_under(route.name.as_ref()))
+            .max_by_key(|route| route.name.as_ref().label_count())
     }
 
     /// Resolve a query. The answer only; [`Resolver::resolve_validated`] also
@@ -733,10 +777,7 @@ impl Resolver {
         ntas: Ntas,
     ) -> Result<(DnsMessage, ValidationState), ResolveError> {
         let mut state = Resolution::new(self.config.query_budget, policy);
-        let mut response = match self.config.mode {
-            ResolverMode::Forward => self.forward(query, &mut state).await?,
-            ResolverMode::Recurse => self.recurse(query, &mut state).await?,
-        };
+        let mut response = self.recurse(query, &mut state).await?;
         // Past both modes, because `recurse` did this and `forward` relayed
         // the upstream's header verbatim (`TODO.md` #78b). The question is the
         // client's byte for byte: 0x20 sent a different case upstream, and a
@@ -760,6 +801,20 @@ impl Resolver {
         // unsigned", AD clear. Indeterminate and not Insecure: nothing proved
         // it unsigned, an operator said to stop asking. No EDE — RFC 8914 has
         // no code for it.
+        // A routed domain set not to validate: the same answer an NTA gives,
+        // reached by configuration rather than by a time-limited exemption.
+        if let Some(route) = self
+            .route_for(query.qname.as_ref())
+            .filter(|route| !route.validate)
+        {
+            return Ok((
+                response,
+                ValidationState::Indeterminate(format!(
+                    "routed domain {} is not validated",
+                    route.name
+                )),
+            ));
+        }
         if ntas == Ntas::Honoured {
             if let Some(nta) =
                 self.config
@@ -792,24 +847,6 @@ impl Resolver {
             );
         }
         Ok((response, verdict))
-    }
-
-    /// Forward the query to each upstream in turn and return the first answer.
-    async fn forward(
-        &self,
-        query: &QuerySection,
-        state: &mut Resolution<'_>,
-    ) -> ResolveResult<DnsMessage> {
-        // RD=1: the upstream does the recursion.
-        let out = self.build_query(query, true)?;
-        self.ask_any(&self.config.upstream_servers, &out, &mut state.budget)
-            .await
-            .ok_or_else(|| {
-                ResolveError::no_response(format!(
-                    "failed to resolve {} with all upstream servers",
-                    query.qname
-                ))
-            })
     }
 
     /// Serialize a query message. `recursion_desired` is false while walking the
@@ -1021,8 +1058,7 @@ mod tests {
     /// Forwarding to one fake upstream.
     fn test_config(upstream: SocketAddr) -> ResolverConfig {
         ResolverConfig {
-            mode: ResolverMode::Forward,
-            upstream_servers: vec![upstream],
+            routes: vec![Route::forward(Name::root(), vec![upstream])],
             timeout_ms: 4000,
             ..ResolverConfig::default()
         }
@@ -1031,7 +1067,6 @@ mod tests {
     /// Recursing from a fake root.
     fn recursing_config(root: SocketAddr) -> ResolverConfig {
         ResolverConfig {
-            mode: ResolverMode::Recurse,
             root_hints: vec![root],
             timeout_ms: 4000,
             ..ResolverConfig::default()
@@ -1132,8 +1167,8 @@ mod tests {
     #[test]
     fn test_resolver_config_default() {
         let config = ResolverConfig::default();
-        // Recursion is the default; forwarding is opt-in by naming an upstream.
-        assert_eq!(config.mode, ResolverMode::Recurse);
+        // Recursion is the default; forwarding is opt-in by routing a domain.
+        assert!(config.routes.is_empty());
         assert_eq!(
             config.root_hints.len(),
             26,
@@ -1142,7 +1177,6 @@ mod tests {
         // Interleaved: the first two are a.root-servers.net v4 then v6.
         assert!(config.root_hints[0].is_ipv4());
         assert!(config.root_hints[1].is_ipv6());
-        assert!(!config.upstream_servers.is_empty());
         assert!(config.timeout_ms > 0);
         assert!(config.max_delegations > 0);
         assert!(config.query_budget > 0);
@@ -1233,14 +1267,16 @@ this line has no record and is skipped
     #[test]
     fn test_resolver_creation() {
         let resolver = Resolver::with_defaults();
-        assert_eq!(resolver.mode(), ResolverMode::Recurse);
+        assert!(resolver.routes().is_empty());
 
         let forwarding = Resolver::forwarding_to(vec![SocketAddr::new(
             IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
             53,
         )]);
-        assert_eq!(forwarding.mode(), ResolverMode::Forward);
-        assert_eq!(forwarding.config.upstream_servers.len(), 1);
+        let route = forwarding
+            .route_for(Name::root().as_ref())
+            .expect("a route at .");
+        assert_eq!((route.kind, route.servers.len()), (RouteKind::Forward, 1));
     }
 
     /// The budget is what stops one client query becoming unbounded upstream
@@ -1248,8 +1284,10 @@ this line has no record and is skipped
     #[tokio::test]
     async fn test_query_budget_is_enforced() {
         let config = ResolverConfig {
-            mode: ResolverMode::Forward,
-            upstream_servers: vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)],
+            routes: vec![Route::forward(
+                Name::root(),
+                vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53)],
+            )],
             timeout_ms: 1000,
             query_budget: 0,
             ..ResolverConfig::default()
@@ -2451,7 +2489,7 @@ this line has no record and is skipped
             }
         });
         let config = ResolverConfig {
-            upstream_servers: vec![slow, fast],
+            routes: vec![Route::forward(Name::root(), vec![slow, fast])],
             ..test_config(slow)
         };
         let resolver = Resolver::new(config).with_upstream(upstream);
@@ -4263,8 +4301,7 @@ this line has no record and is skipped
             });
             let config = ResolverConfig {
                 request_nsid,
-                mode: ResolverMode::Forward,
-                upstream_servers: vec![fake(9)],
+                routes: vec![Route::forward(Name::root(), vec![fake(9)])],
                 ..ResolverConfig::default()
             };
             (Resolver::new(config).with_upstream(upstream), seen)
@@ -4371,6 +4408,318 @@ this line has no record and is skipped
                     assert!(bogus.why.contains("NSID node-a"), "{}", bogus.why)
                 }
                 other => panic!("expected bogus, got {other}"),
+            }
+        }
+    }
+
+    /// Routed domains (`TODO.md` #172): forward and stub routes over the mock
+    /// network, every query logged with its server and RD bit.
+    mod routed {
+        use super::*;
+
+        type Log = Arc<Mutex<Vec<(SocketAddr, String, bool)>>>;
+
+        /// The network's servers, each query recorded before it is answered.
+        fn logged(net: &Net) -> (Upstream, Log) {
+            let log: Log = Arc::default();
+            let (net, seen) = (net.clone(), log.clone());
+            let upstream = Upstream::answering(move |server, _, query| {
+                let query = DnsMessage::try_from_bytes(query).ok()?;
+                seen.lock()
+                    .unwrap()
+                    .push((server, qname_of(&query), query.recursion));
+                let answer = net.0.lock().unwrap().get(&server)?.clone();
+                answer(&query).to_bytes_within(u16::MAX as usize).ok()
+            });
+            (upstream, log)
+        }
+
+        fn asked_of(log: &Log, server: SocketAddr) -> Vec<(String, bool)> {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|(s, _, _)| *s == server)
+                .map(|(_, n, rd)| (n.clone(), *rd))
+                .collect()
+        }
+
+        fn a(name: &str) -> QuerySection {
+            QuerySection {
+                qname: nm(name),
+                qtype: Qtype::of(rt::A),
+                qclass: QueryClass::IN,
+            }
+        }
+
+        /// Root fake(1) delegates `test.` to fake(2), which answers every name
+        /// under it with 192.0.2.1 and owns `public.test.`.
+        fn public_tree(net: &Net) {
+            let tld = fake(2);
+            net.serve(fake(1), move |q| {
+                referral(q, "test.", "ns.test.", Some(("ns.test.", tld)))
+            });
+            net.serve(tld, |q| {
+                let name = qname_of(q);
+                authoritative(q, vec![a_record(&name, [192, 0, 2, 1])])
+            });
+        }
+
+        fn config(routes: Vec<Route>) -> ResolverConfig {
+            ResolverConfig {
+                routes,
+                ..recursing_config(fake(1))
+            }
+        }
+
+        /// A forward zone is asked with RD=1 and a public name is recursed;
+        /// neither side hears the other's names. Watched failing with the
+        /// route lookup removed from `resolve_from_root`: the corp name went
+        /// to the root.
+        #[tokio::test]
+        async fn a_forward_zone_takes_its_names_and_nothing_else() {
+            let net = Net::default();
+            public_tree(&net);
+            net.serve(fake(5), |q| {
+                let mut r = authoritative(q, vec![a_record("www.corp.test.", [10, 0, 0, 5])]);
+                r.authoritive = false;
+                r
+            });
+            let (upstream, log) = logged(&net);
+            let resolver = Resolver::new(config(vec![Route::forward(
+                nm("corp.test."),
+                vec![fake(5)],
+            )]))
+            .with_upstream(upstream);
+
+            let corp = resolver
+                .resolve(&a("www.corp.test."))
+                .await
+                .expect("routed");
+            assert_eq!(
+                corp.answers[0].rdata.parse().unwrap(),
+                ParsedRecord::A(Ipv4Addr::new(10, 0, 0, 5))
+            );
+            resolver
+                .resolve(&a("www.public.test."))
+                .await
+                .expect("recursed");
+
+            assert_eq!(
+                asked_of(&log, fake(5)),
+                vec![("www.corp.test.".to_string(), true)],
+                "RD=1, and no public name"
+            );
+            assert!(
+                asked_of(&log, fake(1))
+                    .iter()
+                    .all(|(n, _)| !n.contains("corp")),
+                "the root heard no corp name: {:?}",
+                asked_of(&log, fake(1))
+            );
+        }
+
+        /// A stub zone is walked from its servers with RD=0, and a referral
+        /// below it is followed.
+        #[tokio::test]
+        async fn a_stub_zone_is_walked_from_its_servers() {
+            let net = Net::default();
+            public_tree(&net);
+            let (stub, child) = (fake(5), fake(6));
+            net.serve(stub, move |q| {
+                referral(
+                    q,
+                    "lab.corp.test.",
+                    "ns.lab.corp.test.",
+                    Some(("ns.lab.corp.test.", child)),
+                )
+            });
+            net.serve(child, |q| {
+                authoritative(q, vec![a_record("www.lab.corp.test.", [10, 0, 0, 6])])
+            });
+            let (upstream, log) = logged(&net);
+            let resolver = Resolver::new(config(vec![Route::stub(nm("corp.test."), vec![stub])]))
+                .with_upstream(upstream);
+
+            let answer = resolver
+                .resolve(&a("www.lab.corp.test."))
+                .await
+                .expect("walked");
+            assert_eq!(answer.answers.len(), 1);
+            assert!(asked_of(&log, stub).iter().all(|(_, rd)| !rd), "RD=0");
+            assert!(
+                !asked_of(&log, child).is_empty(),
+                "the referral was followed"
+            );
+            assert!(asked_of(&log, fake(1)).is_empty(), "nothing from the root");
+        }
+
+        /// A stub zone whose nameserver names lie inside it: the glueless
+        /// lookup of the child's server is routed back to the stub.
+        #[tokio::test]
+        async fn a_routed_domain_whose_nameservers_lie_inside_it_resolves() {
+            let net = Net::default();
+            public_tree(&net);
+            let (stub, child) = (fake(5), fake(6));
+            net.serve(stub, move |q| match qname_of(q).as_str() {
+                "ns.corp.test." => {
+                    authoritative(q, vec![a_record("ns.corp.test.", [198, 51, 100, 6])])
+                }
+                _ => referral(q, "lab.corp.test.", "ns.corp.test.", None),
+            });
+            net.serve(child, |q| {
+                authoritative(q, vec![a_record("www.lab.corp.test.", [10, 0, 0, 6])])
+            });
+            let (upstream, log) = logged(&net);
+            let resolver = Resolver::new(config(vec![Route::stub(nm("corp.test."), vec![stub])]))
+                .with_upstream(upstream);
+            resolver
+                .resolve(&a("www.lab.corp.test."))
+                .await
+                .expect("resolved");
+            assert!(asked_of(&log, fake(1)).is_empty());
+        }
+
+        /// The deeper of two nested routes wins, and a route beats a
+        /// delegation cached for its parent.
+        #[tokio::test]
+        async fn the_deeper_route_wins_and_beats_a_cached_delegation() {
+            let net = Net::default();
+            public_tree(&net);
+            for (n, octet) in [(5u8, 5u8), (6, 6)] {
+                net.serve(fake(n), move |q| {
+                    let name = qname_of(q);
+                    authoritative(q, vec![a_record(&name, [10, 0, 0, octet])])
+                });
+            }
+            let (upstream, log) = logged(&net);
+            let resolver = Resolver::new(config(vec![
+                Route::forward(nm("corp.test."), vec![fake(5)]),
+                Route::forward(nm("lab.corp.test."), vec![fake(6)]),
+            ]))
+            .with_upstream(upstream);
+
+            // `test.` is cached from here on.
+            resolver
+                .resolve(&a("www.public.test."))
+                .await
+                .expect("recursed");
+            resolver.resolve(&a("a.corp.test.")).await.expect("routed");
+            resolver
+                .resolve(&a("a.lab.corp.test."))
+                .await
+                .expect("routed");
+            assert_eq!(
+                asked_of(&log, fake(5)),
+                vec![("a.corp.test.".to_string(), true)]
+            );
+            assert_eq!(
+                asked_of(&log, fake(6)),
+                vec![("a.lab.corp.test.".to_string(), true)]
+            );
+            assert!(asked_of(&log, fake(2))
+                .iter()
+                .all(|(n, _)| !n.contains("corp")));
+        }
+
+        /// A CNAME from a public name into a routed domain, and back out, is
+        /// resolved through the right servers at each hop.
+        #[tokio::test]
+        async fn a_cname_chain_crosses_into_and_out_of_a_route() {
+            let net = Net::default();
+            let tld = fake(2);
+            net.serve(fake(1), move |q| {
+                referral(q, "test.", "ns.test.", Some(("ns.test.", tld)))
+            });
+            net.serve(tld, |q| match qname_of(q).as_str() {
+                "in.public.test." => {
+                    authoritative(q, vec![cname_record("in.public.test.", "hop.corp.test.")])
+                }
+                name => authoritative(q, vec![a_record(name, [192, 0, 2, 1])]),
+            });
+            net.serve(fake(5), |q| {
+                let mut r =
+                    authoritative(q, vec![cname_record("hop.corp.test.", "out.public.test.")]);
+                r.authoritive = false;
+                r
+            });
+            let (upstream, log) = logged(&net);
+            let resolver = Resolver::new(config(vec![Route::forward(
+                nm("corp.test."),
+                vec![fake(5)],
+            )]))
+            .with_upstream(upstream);
+
+            let answer = resolver
+                .resolve(&a("in.public.test."))
+                .await
+                .expect("resolved");
+            assert_eq!(answer.answers.len(), 3, "{:?}", answer.answers);
+            assert_eq!(
+                asked_of(&log, fake(5)),
+                vec![("hop.corp.test.".to_string(), true)]
+            );
+            assert!(asked_of(&log, tld)
+                .iter()
+                .any(|(n, _)| n == "out.public.test."));
+        }
+
+        /// No fallback: a route whose servers are silent is an error (EDE 22)
+        /// and the root hears nothing.
+        #[tokio::test]
+        async fn an_unreachable_route_fails_without_falling_back() {
+            let net = Net::default();
+            public_tree(&net);
+            let (upstream, log) = logged(&net);
+            let resolver = Resolver::new(config(vec![Route::forward(
+                nm("corp.test."),
+                vec![fake(9)],
+            )]))
+            .with_upstream(upstream);
+            let err = resolver
+                .resolve(&a("www.corp.test."))
+                .await
+                .expect_err("nothing answered");
+            assert_eq!(
+                err.extended_error().info_code(),
+                crate::ede::InfoCode::NO_REACHABLE_AUTHORITY
+            );
+            assert!(asked_of(&log, fake(1)).is_empty());
+        }
+
+        /// A routed domain with no public delegation under a signed parent:
+        /// bogus validated, `Indeterminate` with `validate` off.
+        #[tokio::test]
+        async fn validation_of_a_routed_domain_is_on_unless_switched_off() {
+            let h = signed_hierarchy(signed_ds, signed_answer);
+            h.net.serve(fake(7), |q| {
+                let mut r =
+                    authoritative(q, vec![a_record("www.corp.example.test.", [10, 0, 0, 7])]);
+                r.authoritive = false;
+                r
+            });
+            for (validate, bogus) in [(true, true), (false, false)] {
+                let route = Route {
+                    validate,
+                    ..Route::forward(nm("corp.example.test."), vec![fake(7)])
+                };
+                let config = ResolverConfig {
+                    routes: vec![route],
+                    ..validating_config(&h)
+                };
+                let (_, state) = h
+                    .net
+                    .resolver(config)
+                    .resolve_validated(&a("www.corp.example.test."), None)
+                    .await
+                    .expect("answered");
+                if bogus {
+                    assert!(state.is_bogus(), "{state}");
+                } else {
+                    assert!(
+                        matches!(&state, ValidationState::Indeterminate(why) if why.contains("corp.example.test")),
+                        "{state}"
+                    );
+                }
             }
         }
     }

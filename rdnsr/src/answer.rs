@@ -245,7 +245,12 @@ pub(crate) async fn handle_query(
     // Not skipped for CD, unlike the denial cache: CD is a statement about
     // DNSSEC, not a request to be told what a public server thinks `localhost`
     // is.
-    if let Some(local) = special_names::lookup(query.qname.as_ref(), query.qtype, empty_zones) {
+    let routed = resolver
+        .route_for(query.qname.as_ref())
+        .map(|route| route.name.as_ref());
+    if let Some(local) =
+        special_names::lookup(query.qname.as_ref(), query.qtype, empty_zones, routed)
+    {
         let mut resp = build_response(&msg, local.answers, local.rcode);
         resp.authorities = local.authority;
         // AA=1, unlike everything resolved (`Resolver::resolve_validated`
@@ -1816,8 +1821,10 @@ mod tests {
             std::future::pending::<Option<Vec<u8>>>()
         });
         let config = rdns::resolver::ResolverConfig {
-            mode: rdns::resolver::ResolverMode::Forward,
-            upstream_servers: vec!["198.51.100.1:53".parse().expect("an address")],
+            routes: vec![rdns::resolver::Route::forward(
+                rdns::Name::root(),
+                vec!["198.51.100.1:53".parse().expect("an address")],
+            )],
             timeout_ms: 60_000,
             ..Default::default()
         };
@@ -3249,7 +3256,6 @@ mod tests {
 
         let resolver = Arc::new(
             Resolver::new(rdns::resolver::ResolverConfig {
-                mode: rdns::resolver::ResolverMode::Recurse,
                 root_hints: vec![root_addr],
                 timeout_ms: 2000,
                 ..Default::default()
@@ -3323,8 +3329,10 @@ mod tests {
         });
 
         let resolver = Arc::new(Resolver::new(rdns::resolver::ResolverConfig {
-            mode: rdns::resolver::ResolverMode::Forward,
-            upstream_servers: vec![addr],
+            routes: vec![rdns::resolver::Route::forward(
+                rdns::Name::root(),
+                vec![addr],
+            )],
             ..Default::default()
         }));
         let serving = serving(resolver, test_shell(), PolicyZones::default());
@@ -3371,8 +3379,10 @@ mod tests {
             .expect("bind");
         let addr = black_hole.local_addr().expect("addr");
         let resolver = Arc::new(Resolver::new(rdns::resolver::ResolverConfig {
-            mode: rdns::resolver::ResolverMode::Forward,
-            upstream_servers: vec![addr],
+            routes: vec![rdns::resolver::Route::forward(
+                rdns::Name::root(),
+                vec![addr],
+            )],
             timeout_ms: 4_000,
             ..Default::default()
         }));
@@ -3641,8 +3651,10 @@ mod tests {
             reply.to_bytes_within(4096).ok()
         });
         let resolver = rdns::resolver::Resolver::new(rdns::resolver::ResolverConfig {
-            mode: rdns::resolver::ResolverMode::Forward,
-            upstream_servers: vec!["198.51.100.1:53".parse().expect("an address")],
+            routes: vec![rdns::resolver::Route::forward(
+                rdns::Name::root(),
+                vec!["198.51.100.1:53".parse().expect("an address")],
+            )],
             ..Default::default()
         })
         .with_upstream(upstream);
@@ -3718,6 +3730,33 @@ mod tests {
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
+    /// A routed domain for the empty zone answers from its servers, not
+    /// the built-in NXDOMAIN (ADR 0008, `TODO.md` #172). Watched failing with
+    /// `routed` passed as `None`: NXDOMAIN, nothing asked.
+    #[tokio::test]
+    async fn a_route_under_an_empty_zone_is_asked() {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        let upstream = rdns::resolver::Upstream::answering(move |_, _, query| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut reply = DnsMessage::try_from_bytes(query).ok()?;
+            reply.response = true;
+            reply.to_bytes_within(4096).ok()
+        });
+        let resolver = rdns::resolver::Resolver::new(rdns::resolver::ResolverConfig {
+            routes: vec![rdns::resolver::Route::forward(
+                nm("10.in-addr.arpa."),
+                vec!["198.51.100.1:53".parse().expect("an address")],
+            )],
+            ..Default::default()
+        })
+        .with_upstream(upstream);
+        let serving = serving(Arc::new(resolver), test_shell(), PolicyZones::default());
+        let reply = ask(&serving, "4.3.2.10.in-addr.arpa.", record_types::PTR).await;
+        assert_eq!(reply.rcode, ResponseCode::Ok);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// All off leaves `localhost` and its reverse names local.
     #[tokio::test]
     async fn no_empty_zones_leaves_the_special_use_names_local() {
@@ -3783,8 +3822,10 @@ mod tests {
             reply.to_bytes_within(4096).ok()
         });
         let resolver = rdns::resolver::Resolver::new(rdns::resolver::ResolverConfig {
-            mode: rdns::resolver::ResolverMode::Forward,
-            upstream_servers: vec!["198.51.100.1:53".parse().expect("an address")],
+            routes: vec![rdns::resolver::Route::forward(
+                rdns::Name::root(),
+                vec!["198.51.100.1:53".parse().expect("an address")],
+            )],
             request_nsid: true,
             ..Default::default()
         })

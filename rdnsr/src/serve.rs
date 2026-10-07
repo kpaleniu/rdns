@@ -195,7 +195,7 @@ mod tests {
 
     use rdns::logging::QueryLogger;
     use rdns::metrics::DnsMetrics;
-    use rdns::resolver::{Resolver, ResolverConfig, ResolverMode};
+    use rdns::resolver::{Resolver, ResolverConfig};
     use rdns::rpz::PolicyZones;
     use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
     use rdns::shutdown::Shutdown;
@@ -587,8 +587,10 @@ mod tests {
         let black_hole = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
         let upstream = black_hole.local_addr().expect("addr");
         let resolver = Arc::new(Resolver::new(ResolverConfig {
-            mode: ResolverMode::Forward,
-            upstream_servers: vec![upstream],
+            routes: vec![rdns::resolver::Route::forward(
+                rdns::Name::root(),
+                vec![upstream],
+            )],
             // Long enough that the first query is still outstanding at the
             // end of the test.
             timeout_ms: 30_000,

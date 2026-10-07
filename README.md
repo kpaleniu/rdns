@@ -349,7 +349,8 @@ Binds 127.0.0.1 by default. Recurses from the root unless given `--upstream`.
 | flag | |
 |---|---|
 | `--allow-query <ADDR\|CIDR>` | who may be answered, repeatable; anybody else is REFUSED (UDP) or closed (TCP, DoT, DoH, DoQ). Required once any listener binds off loopback |
-| `--upstream <ADDR:PORT>` | forward instead of recursing. Repeatable |
+| `--upstream <ADDR:PORT>` | forward every name instead of recursing — a forward zone at `.`. Repeatable |
+| `--forward-zone <NAME=ADDR[,ADDR]>`, `--stub-zone <NAME=ADDR[,ADDR]>`, `--no-validate-zone <NAME>` | send one domain to named servers, as a forwarder (RD=1) or its authorities (RD=0); no fallback to recursion. Validated unless named by `--no-validate-zone` |
 | `--dnssec-validate` | walk the chain of trust; AD only on answers that verify, SERVFAIL on those that do not unless the client sets CD |
 | `--trust-anchor <FILE>` | anchors in DS presentation format, read only |
 | `--auto-trust-anchor <FILE>` | the same, rewritten as keys roll (RFC 5011) |

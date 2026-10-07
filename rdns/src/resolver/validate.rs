@@ -189,14 +189,11 @@ impl Resolver {
             qtype: Qtype::of(rt::DNSKEY),
             qclass: crate::QueryClass::IN,
         };
-        let response = match self.config.mode {
-            ResolverMode::Forward => Box::pin(self.forward(&query, state)).await?,
-            ResolverMode::Recurse => {
-                Box::pin(self.resolve_from_root(&query, state, 0))
-                    .await?
-                    .response
-            }
-        };
+        // Routed like any other lookup (`TODO.md` #172): a forwarded domain's
+        // keys come from its forwarder.
+        let response = Box::pin(self.resolve_from_root(&query, state, 0))
+            .await?
+            .response;
         let ttl = response
             .answers
             .iter()

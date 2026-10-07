@@ -189,8 +189,16 @@ impl EmptyZones {
 /// The answer for `qname`/`qtype` if it is a name we must not send upstream.
 ///
 /// `None` means "an ordinary name": resolve it as usual. An empty zone that
-/// `empty` has switched off is an ordinary name.
-pub fn lookup(qname: NameRef<'_>, qtype: Qtype, empty: &EmptyZones) -> Option<LocalAnswer> {
+/// `empty` has switched off is an ordinary name, and so is one that `routed`
+/// — the routed domain covering `qname`, if any — is at or below: the more
+/// specific name decides, and a tie goes to the routed domain
+/// (`docs/adr/0008`).
+pub fn lookup(
+    qname: NameRef<'_>,
+    qtype: Qtype,
+    empty: &EmptyZones,
+    routed: Option<NameRef<'_>>,
+) -> Option<LocalAnswer> {
     let table = table();
 
     // RFC 6761 §6.3: `localhost.` and the whole subtree under it is the loopback
@@ -255,7 +263,8 @@ pub fn lookup(qname: NameRef<'_>, qtype: Qtype, empty: &EmptyZones) -> Option<Lo
     // RFC 6303 §4: a PTR for non-globally-unique space describes part of
     // somebody's internal network — unless the operator said this one is not.
     for (zone, on) in table.empty.iter().zip(empty.on) {
-        if on && qname.is_at_or_under(zone.as_ref()) {
+        let overridden = routed.is_some_and(|route| route.is_at_or_under(zone.as_ref()));
+        if on && !overridden && qname.is_at_or_under(zone.as_ref()) {
             return Some(in_zone(
                 qname,
                 qtype,
@@ -421,7 +430,7 @@ mod tests {
 
     /// The table as it stands with nothing configured.
     fn lookup(qname: NameRef<'_>, qtype: Qtype) -> Option<LocalAnswer> {
-        super::lookup(qname, qtype, &EmptyZones::default())
+        super::lookup(qname, qtype, &EmptyZones::default(), None)
     }
 
     fn answer(qname: &str, qtype: Qtype) -> LocalAnswer {
@@ -635,10 +644,40 @@ mod tests {
         let zones =
             EmptyZones::configure(false, &["10.IN-ADDR.ARPA.".to_string()]).expect("configures");
         let ptr = Qtype::of(rt::PTR);
-        assert!(super::lookup(nm("1.2.3.10.in-addr.arpa.").as_ref(), ptr, &zones).is_none());
-        assert!(super::lookup(nm("10.in-addr.arpa.").as_ref(), ptr, &zones).is_none());
-        assert!(super::lookup(nm("1.1.168.192.in-addr.arpa.").as_ref(), ptr, &zones).is_some());
+        assert!(super::lookup(nm("1.2.3.10.in-addr.arpa.").as_ref(), ptr, &zones, None).is_none());
+        assert!(super::lookup(nm("10.in-addr.arpa.").as_ref(), ptr, &zones, None).is_none());
+        assert!(
+            super::lookup(nm("1.1.168.192.in-addr.arpa.").as_ref(), ptr, &zones, None).is_some()
+        );
         assert_eq!(zones.describe(), "off: 10.in-addr.arpa.");
+    }
+
+    /// ADR 0008: a routed domain at or below an empty zone overrides it, a
+    /// tie included; one above it does not.
+    #[test]
+    fn a_route_at_or_below_an_empty_zone_overrides_it() {
+        let ptr = Qtype::of(rt::PTR);
+        let on = EmptyZones::default();
+        let name = nm("5.4.1.10.in-addr.arpa.");
+        for (route, local) in [
+            ("1.10.in-addr.arpa.", false),
+            ("10.in-addr.arpa.", false),
+            ("in-addr.arpa.", true),
+            (".", true),
+        ] {
+            let route = nm(route);
+            assert_eq!(
+                super::lookup(name.as_ref(), ptr, &on, Some(route.as_ref())).is_some(),
+                local,
+                "{route}"
+            );
+        }
+        let loopback = nm("1.0.0.127.in-addr.arpa.");
+        let route = nm("127.in-addr.arpa.");
+        assert!(
+            super::lookup(loopback.as_ref(), ptr, &on, Some(route.as_ref())).is_some(),
+            "a special-use name is not an empty zone and is not overridden"
+        );
     }
 
     /// All off leaves every special-use name where it was.
@@ -648,7 +687,7 @@ mod tests {
         assert_eq!(zones.describe(), "all off");
         for zone in EMPTY_ZONES {
             assert!(
-                super::lookup(nm(zone).as_ref(), Qtype::of(rt::PTR), &zones).is_none(),
+                super::lookup(nm(zone).as_ref(), Qtype::of(rt::PTR), &zones, None).is_none(),
                 "{zone}"
             );
         }
@@ -660,7 +699,7 @@ mod tests {
             "x.invalid.",
         ] {
             assert!(
-                super::lookup(nm(name).as_ref(), Qtype::of(rt::PTR), &zones).is_some(),
+                super::lookup(nm(name).as_ref(), Qtype::of(rt::PTR), &zones, None).is_some(),
                 "{name}"
             );
         }

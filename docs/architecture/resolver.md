@@ -1,11 +1,12 @@
 ## Architecture: the resolver
 
-One `Resolver` type with `ResolverMode::{Recurse, Forward}`, chosen by config —
-not two programs. That is how BIND, Unbound, Knot Resolver and PowerDNS Recursor
+One `Resolver` type ~~with `ResolverMode::{Recurse, Forward}`, chosen by config~~
+**whose routed domains say which subtrees are forwarded or walked from named
+servers; everything else recurses** (2026-10-07, `TODO.md` #172) — not two programs. That is how BIND, Unbound, Knot Resolver and PowerDNS Recursor
 all model it, and for the same reasons: the client-facing half is identical, only
 the means of obtaining an answer differs, and mixed deployments (forward one
 zone, recurse the rest) need both in one process. `rdnsr` recurses by default;
-any `--upstream` selects forwarding.
+~~any `--upstream` selects forwarding~~ `--upstream` is a forward zone at `.`.
 
 **Recursion** walks root hints → TLD → authoritative, following referrals. The
 built-in hints carry both an A and an AAAA for each of the 13 roots, interleaved

@@ -44,6 +44,32 @@ pub(crate) struct Config {
     /// A policy feed's `master` names one with `#name` (`TODO.md` #57f).
     #[serde(default)]
     keys: std::collections::BTreeMap<String, Key>,
+    /// Routed domains (`TODO.md` #172): `[[forward-zone]]` and `[[stub-zone]]`.
+    #[serde(default)]
+    forward_zone: Vec<RouteEntry>,
+    #[serde(default)]
+    stub_zone: Vec<RouteEntry>,
+}
+
+/// One routed domain. Written into `--forward-zone`/`--stub-zone`'s spelling
+/// and parsed there, so the two sources cannot disagree (`CLAUDE.md` §15).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct RouteEntry {
+    name: String,
+    servers: Vec<String>,
+    #[serde(default = "default_validate")]
+    validate: bool,
+}
+
+fn default_validate() -> bool {
+    true
+}
+
+impl RouteEntry {
+    fn spec(&self) -> String {
+        format!("{}={}", self.name, self.servers.join(","))
+    }
 }
 
 /// One TSIG key, client-side.
@@ -412,7 +438,17 @@ impl Config {
             rpz,
             // `tsig_specs`, below, which destructures `Key` in turn.
             keys: _,
+            forward_zone,
+            stub_zone,
         } = self;
+        cli.forward_zone = forward_zone.iter().map(RouteEntry::spec).collect();
+        cli.stub_zone = stub_zone.iter().map(RouteEntry::spec).collect();
+        cli.no_validate_zone = forward_zone
+            .iter()
+            .chain(stub_zone)
+            .filter(|entry| !entry.validate)
+            .map(|entry| entry.name.clone())
+            .collect();
         server.apply_to(cli);
 
         let ResolverSection {
@@ -693,6 +729,7 @@ tls-key = "./key.pem"
         let renamed = |long: &str| match long {
             "rpz" => Some("feeds"),
             "no-empty-zones" => Some("empty-zones"),
+            "no-validate-zone" => Some("validate"),
             "rpz-policy" => Some("policy"),
             "rpz-notify-from" => Some("notify-from"),
             _ => None,
@@ -701,17 +738,21 @@ tls-key = "./key.pem"
         for arg in replaced {
             let Some(long) = arg.get_long() else { continue };
             let key = renamed(long).unwrap_or(long);
-            let found = ["server", "resolver", "rpz"].iter().any(|table| {
-                let text = format!(
-                    "[{table}]
+            // The routed domains are arrays of tables at the top, so their
+            // keys are probed there and inside an entry as well.
+            let found = ["[server]", "[resolver]", "[rpz]", "", "[[forward-zone]]"]
+                .iter()
+                .any(|table| {
+                    let text = format!(
+                        "{table}
 {key} = 0
 "
-                );
-                match toml::from_str::<Config>(&text) {
-                    Ok(_) => true,
-                    Err(e) => !e.to_string().contains("unknown field"),
-                }
-            });
+                    );
+                    match toml::from_str::<Config>(&text) {
+                        Ok(_) => true,
+                        Err(e) => !e.to_string().contains("unknown field"),
+                    }
+                });
             if !found {
                 missing.push(long.to_string());
             }

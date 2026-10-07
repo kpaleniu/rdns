@@ -13,7 +13,7 @@ use rdns::dnssec_key::{SigningAlgorithm, SigningKey};
 use rdns::logging::QueryLogger;
 use rdns::metrics::DnsMetrics;
 use rdns::record_types;
-use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, Upstream};
+use rdns::resolver::{Resolver, ResolverConfig, Upstream};
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
 use rdns::validation::AdmissionCheck;
 use rdns::zone_signer::{sign_zone, SigningPolicy};
@@ -62,9 +62,11 @@ pub(crate) fn test_shell() -> Arc<ServeContext> {
 /// refused before any resolution is attempted.
 pub(crate) fn test_resolver() -> Arc<Resolver> {
     let config = ResolverConfig {
-        mode: ResolverMode::Forward,
         // Nothing here reaches an upstream.
-        upstream_servers: vec!["127.0.0.1:1".parse().unwrap()],
+        routes: vec![rdns::resolver::Route::forward(
+            rdns::Name::root(),
+            vec!["127.0.0.1:1".parse().unwrap()],
+        )],
         ..Default::default()
     };
     Arc::new(Resolver::new(config))
@@ -305,8 +307,10 @@ impl SignedZone {
     ) -> (Arc<Resolver>, Arc<AtomicUsize>) {
         let asked = Arc::new(AtomicUsize::new(0));
         let config = ResolverConfig {
-            mode: ResolverMode::Forward,
-            upstream_servers: vec!["198.51.100.1:53".parse().expect("an address")],
+            routes: vec![rdns::resolver::Route::forward(
+                rdns::Name::root(),
+                vec!["198.51.100.1:53".parse().expect("an address")],
+            )],
             dnssec: Some(TrustAnchors::new(vec![self.anchor.clone()]).into()),
             ..Default::default()
         };
@@ -330,8 +334,10 @@ impl SignedZone {
 pub(crate) fn silent_resolver() -> (Arc<Resolver>, std::net::UdpSocket) {
     let upstream = std::net::UdpSocket::bind("127.0.0.1:0").expect("a loopback port");
     let config = ResolverConfig {
-        mode: ResolverMode::Forward,
-        upstream_servers: vec![upstream.local_addr().expect("bound")],
+        routes: vec![rdns::resolver::Route::forward(
+            rdns::Name::root(),
+            vec![upstream.local_addr().expect("bound")],
+        )],
         timeout_ms: 10_000,
         ..Default::default()
     };

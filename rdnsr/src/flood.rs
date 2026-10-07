@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, Upstream};
+use rdns::resolver::{Resolver, ResolverConfig, Upstream};
 use rdns::rpz::PolicyZones;
 use rdns::shutdown::Shutdown;
 use rdns::{Class, DnsMessage, ParsedRecord, Qtype, RecordData, ResourceRecord, ResponseCode, Ttl};
@@ -110,7 +110,6 @@ async fn a_flood_of_silent_zones_leaves_room_for_a_client_that_is_waiting() {
 
     let resolver = Arc::new(
         Resolver::new(ResolverConfig {
-            mode: ResolverMode::Recurse,
             root_hints: vec![ROOT],
             qname_minimization: false,
             ..Default::default()

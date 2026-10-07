@@ -27,6 +27,7 @@ mod inflight;
 mod nta;
 mod prefetch;
 mod reload;
+mod routes;
 mod rpz_transfer;
 mod serve;
 #[cfg(test)]
@@ -53,7 +54,7 @@ use rdns::dns64::{Dns64, Nat64Prefix};
 use rdns::dnssec_chain::TrustAnchors;
 use rdns::logging::{watch_anomalies, AnomalyThresholds, QueryLogger};
 use rdns::metrics::DnsMetrics;
-use rdns::resolver::{Resolver, ResolverConfig, ResolverMode, SharedAnchors};
+use rdns::resolver::{Resolver, ResolverConfig, SharedAnchors};
 use rdns::rfc5011::ManagedAnchors;
 use rdns::rpz::{Feed, PolicyStore};
 use rdns::security::{RateLimitConfig, RateLimiter, ResponseLimiter, TransferAcl};
@@ -220,8 +221,28 @@ struct Cli {
     /// does.
     #[arg(long, conflicts_with = "config")]
     upstream: Vec<SocketAddr>,
+    /// Send one domain to these servers with RD=1 and take their answers:
+    /// `NAME=ADDR[,ADDR...]`, `ADDR` as `ip`, `ip:port` or `[v6]:port`.
+    /// Repeatable.
+    ///
+    /// The most specific routed domain covering a name decides it, ahead of
+    /// any cached delegation, and there is no fallback to recursion when its
+    /// servers fail: SERVFAIL, with EDE 22, rather than an internal name sent
+    /// to the public tree. Validated unless `--no-validate-zone` names it.
+    #[arg(long, value_name = "NAME=ADDR[,ADDR]", conflicts_with = "config")]
+    forward_zone: Vec<String>,
+    /// Walk one domain's delegations starting from these servers, with RD=0:
+    /// they are its authorities. Same spelling and rules as `--forward-zone`.
+    #[arg(long, value_name = "NAME=ADDR[,ADDR]", conflicts_with = "config")]
+    stub_zone: Vec<String>,
+    /// Answer a routed domain without validating it: `Indeterminate`, AD
+    /// clear. For a private domain under a signed public one, which validation
+    /// can only call bogus. Repeatable; must name a routed domain.
+    #[arg(long, value_name = "NAME", conflicts_with = "config")]
+    no_validate_zone: Vec<String>,
     /// Root hints file (named.root format) to prime recursion from, replacing
-    /// the built-in list. Only used when recursing; ignored with --upstream.
+    /// the built-in list. Refused when `.` is routed — with `--upstream`, or a
+    /// forward or stub zone at `.` — since then nothing recurses.
     #[arg(long, conflicts_with = "config")]
     root_hints: Option<std::path::PathBuf>,
     /// Maximum number of cached RRsets.
@@ -758,29 +779,29 @@ async fn main() -> anyhow::Result<()> {
         request_nsid: cli.request_nsid,
         ..ResolverConfig::default()
     };
-    if cli.upstream.is_empty() {
-        config.mode = ResolverMode::Recurse;
-    } else {
-        config.mode = ResolverMode::Forward;
-        config.upstream_servers = cli.upstream.clone();
-    }
+    // Above the dry run, with every refusal naming its entry (`TODO.md` #172).
+    // `--upstream` is a forward zone at `.`.
+    config.routes = routes::build(
+        &cli.forward_zone,
+        &cli.stub_zone,
+        &cli.no_validate_zone,
+        &cli.upstream,
+        cli.root_hints.is_some(),
+    )?;
+    let recursing = !config.routes.iter().any(|r| r.name.as_ref().is_root());
 
     // Fail loudly on a hints file that yields no addresses; falling back to
     // the built-ins would hide the misconfiguration.
     let mut custom_hints = false;
     if let Some(path) = &cli.root_hints {
-        if config.mode == ResolverMode::Recurse {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading root hints {}", path.display()))?;
-            let hints = rdns::resolver::parse_root_hints(&text);
-            if hints.is_empty() {
-                return Err(anyhow!("no A/AAAA records found in {}", path.display()));
-            }
-            config.root_hints = hints;
-            custom_hints = true;
-        } else {
-            tracing::warn!("--root-hints is ignored when forwarding (--upstream)");
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("reading root hints {}", path.display()))?;
+        let hints = rdns::resolver::parse_root_hints(&text);
+        if hints.is_empty() {
+            return Err(anyhow!("no A/AAAA records found in {}", path.display()));
         }
+        config.root_hints = hints;
+        custom_hints = true;
     }
 
     // The built-in ICANN root key is the fallback so plain --dnssec-validate
@@ -848,16 +869,27 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let source = match config.mode {
-        ResolverMode::Recurse if custom_hints => {
-            format!(
+    // Every routed domain on the line, then where everything else goes.
+    let source = {
+        let rest = match (recursing, custom_hints) {
+            (false, _) => String::new(),
+            (true, true) => format!(
                 "recursing from {} root hints in {}",
                 config.root_hints.len(),
-                cli.root_hints.as_ref().unwrap().display()
-            )
-        }
-        ResolverMode::Recurse => "recursing from the built-in root hints".to_string(),
-        ResolverMode::Forward => format!("forwarding to {:?}", config.upstream_servers),
+                cli.root_hints
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ),
+            (true, false) => "recursing from the built-in root hints".to_string(),
+        };
+        config
+            .routes
+            .iter()
+            .map(routes::describe)
+            .chain((!rest.is_empty()).then_some(rest))
+            .collect::<Vec<_>>()
+            .join("; ")
     };
     let serving_ntas = config.ntas.clone();
     let resolver = Arc::new(Resolver::new(config));

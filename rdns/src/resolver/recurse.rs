@@ -102,20 +102,18 @@ impl Resolver {
                 }
             }
 
-            // Done if we got the type we asked for, or if there is no CNAME to
-            // follow (an empty answer is NODATA/NXDOMAIN, which is an answer).
+            // Done if we got the type we asked for at the end of the chain, or
+            // if there is no CNAME to follow (an empty answer is NODATA or
+            // NXDOMAIN, which is an answer). The end is followed through the
+            // CNAMEs this response already carried: a forwarder resolves the
+            // chain and hands it over whole, and asking for its target again
+            // duplicated every record after the CNAME (`TODO.md` #172).
+            let cname = chain_end(&answers, qname.as_ref(), self.config.max_cname_hops)?;
+            let end = cname.as_ref().unwrap_or(&qname);
             let got_type = response
                 .answers
                 .iter()
-                .any(|rr| query.qtype.matches(rr.rdata.rtype()) && rr.name == qname);
-            let cname = response
-                .answers
-                .iter()
-                .filter(|rr| rr.rdata.rtype() == rt::CNAME && rr.name == qname)
-                .find_map(|rr| match rr.rdata.parse() {
-                    Ok(ParsedRecord::CNAME(target)) => Some(target),
-                    _ => None,
-                });
+                .any(|rr| query.qtype.matches(rr.rdata.rtype()) && &rr.name == end);
 
             // RFC 6672 §3.4: "Recursive caching name servers MUST perform
             // CNAME synthesis on behalf of clients." A conforming authoritative
@@ -168,10 +166,41 @@ impl Resolver {
             )));
         }
 
+        // A routed domain beats every cached delegation at or above it, and
+        // has no fallback to the root (`TODO.md` #172).
+        let route = self.route_for(query.qname.as_ref()).cloned();
+        if let Some(route) = &route {
+            // The policy is asked about the route's servers at entry, as it
+            // is for a walk started from a cached delegation (#56).
+            state.allows(&[], &route.servers)?;
+            if route.kind == RouteKind::Forward {
+                let out = self.build_query(query, true)?;
+                let response = self
+                    .ask_any(&route.servers, &out, &mut state.budget)
+                    .await
+                    .ok_or_else(|| {
+                        ResolveError::no_response(format!(
+                            "no forwarder for {} answered while resolving {}",
+                            route.name, query.qname
+                        ))
+                    })?;
+                return Ok(Answered {
+                    response,
+                    zone: route.name.clone(),
+                });
+            }
+        }
+
         // Start as far down the tree as already known. Validating narrows that:
         // a shortcut past a zone cut skips its DS records, so only zones whose
-        // keys are already validated may be jumped to.
-        if let Some((start, keys)) = self.best_start(query.qname.as_ref()) {
+        // keys are already validated may be jumped to. Under a stub route only
+        // a delegation strictly below it is a shortcut.
+        let shortcut = self.best_start(query.qname.as_ref()).filter(|(start, _)| {
+            route.as_ref().is_none_or(|route| {
+                start.zone != route.name && start.zone.as_ref().is_at_or_under(route.name.as_ref())
+            })
+        });
+        if let Some((start, keys)) = shortcut {
             // The referral that named these servers is the one being skipped,
             // so the policy is asked here instead — otherwise a nameserver rule
             // holds for the client that walked the delegation and for nobody
@@ -198,14 +227,22 @@ impl Resolver {
             }
         }
 
-        self.walk(
-            query,
-            state,
-            depth,
-            Name::root(),
-            self.config.root_hints.clone(),
-        )
-        .await
+        match route {
+            Some(route) => {
+                self.walk(query, state, depth, route.name, route.servers)
+                    .await
+            }
+            None => {
+                self.walk(
+                    query,
+                    state,
+                    depth,
+                    Name::root(),
+                    self.config.root_hints.clone(),
+                )
+                .await
+            }
+        }
     }
 
     /// The deepest cached delegation we are willing to start from, and, when
@@ -590,6 +627,44 @@ impl Resolver {
     /// still gets a turn.
     fn exchange_timeout(&self) -> Duration {
         Duration::from_millis(self.config.timeout_ms / 2)
+    }
+}
+
+/// Where `name`'s CNAME chain ends within `answers`, or `None` when no CNAME
+/// there owns `name` — the common case, which allocates nothing. A chain that
+/// comes back to a name already passed is a loop, and one longer than `hops` is
+/// refused as the walk refuses it.
+fn chain_end(
+    answers: &[ResourceRecord],
+    name: NameRef<'_>,
+    hops: usize,
+) -> ResolveResult<Option<Name>> {
+    let target_of = |owner: NameRef<'_>| {
+        answers
+            .iter()
+            .filter(|rr| rr.rdata.rtype() == rt::CNAME && rr.name.as_ref() == owner)
+            .find_map(|rr| match rr.rdata.parse() {
+                Ok(ParsedRecord::CNAME(target)) => Some(target),
+                _ => None,
+            })
+    };
+    let Some(mut end) = target_of(name) else {
+        return Ok(None);
+    };
+    let mut seen: HashSet<Name> = HashSet::from([name.to_owned()]);
+    loop {
+        if !seen.insert(end.clone()) {
+            return Err(ResolveError::no_response(format!("CNAME loop at {end}")));
+        }
+        if seen.len() > hops {
+            return Err(ResolveError::no_response(format!(
+                "CNAME chain longer than {hops} hops"
+            )));
+        }
+        match target_of(end.as_ref()) {
+            Some(target) => end = target,
+            None => return Ok(Some(end)),
+        }
     }
 }
 

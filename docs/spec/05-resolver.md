@@ -13,8 +13,9 @@ Everything is async `tokio::net`. Each hop is an `await` on a socket.
 
 | field | default | note |
 |---|---|---|
-| `mode` | `Recurse` | any `--upstream` switches to `Forward` |
-| `upstream_servers` | 8.8.8.8:53, 1.1.1.1:53 | Forward mode only |
+| ~~`mode`~~ | ~~`Recurse`~~ | ~~any `--upstream` switches to `Forward`~~ **gone** (2026-10-07, `TODO.md` #172) |
+| ~~`upstream_servers`~~ | ~~8.8.8.8:53, 1.1.1.1:53~~ | ~~Forward mode only~~ **gone** (2026-10-07, `TODO.md` #172) |
+| `routes` | none | routed domains, each a forward zone (RD=1, take the answer) or a stub zone (walk from its servers, RD=0); `--upstream` is a forward zone at `.`. See §5.1a |
 | `root_hints` | built-in, v4/v6 interleaved | so either family is reached in the first hop or two, before RTT selection has data |
 | `timeout_ms` | 5000 | per query |
 | `max_delegations` | 16 | referrals followed before giving up |
@@ -26,6 +27,31 @@ Everything is async `tokio::net`. Each hop is an `await` on a socket.
 | `qname_minimization` | on | RFC 9156 |
 | `zero_x20` | on | draft-vixie-dnsext-dns0x20 |
 | `dnssec` | `None` | off by default |
+
+### 5.1a Routed domains (`--forward-zone`, `--stub-zone`, `--no-validate-zone`)
+
+`NAME=ADDR[,ADDR...]`, repeatable, or `[[forward-zone]]` / `[[stub-zone]]` with
+`name`, `servers`, `validate`. Routing happens in `resolve_from_root`, which
+every lookup passes through: CNAME hops, glueless nameserver lookups and
+validation's DNSKEY fetches are routed too. The most specific covering route
+wins and beats any cached delegation at or above it; under a stub zone a
+delegation cached below it is still a shortcut. No fallback to recursion: a
+route whose servers fail is SERVFAIL with EDE 22, because falling back leaks an
+internal name to the public tree and caches its NXDOMAIN over the subtree
+(RFC 8020). The RPZ nameserver policy is asked about a route's servers at entry.
+
+Validated unless `validate = false`, which answers `Indeterminate`, AD clear —
+not `Insecure`, which means proven unsigned. A route at or below an RFC 6303
+empty zone overrides it for its subtree, a tie included (ADR 0008).
+
+Forwarded answers pass the same CNAME-chain filter and DNAME synthesis as
+recursed ones, which is stricter than before: records a forwarder volunteers
+for names off the chain are not cached. The chain loop follows the CNAMEs a
+response already carries, so a forwarder's whole chain is not re-asked.
+
+Refused at startup, naming the entry: a name that does not parse, one routed
+twice or as both kinds, an empty server list, `--no-validate-zone` naming no
+route, `--upstream` with a route at `.`, `--root-hints` with `.` routed.
 
 `--root-hints <file>` reads named.root format. A stray line is skipped rather
 than sinking the file (`parse_root_hints` returns a `Vec`).
