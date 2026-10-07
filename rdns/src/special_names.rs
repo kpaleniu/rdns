@@ -45,12 +45,18 @@ pub struct LocalAnswer {
 const LOCAL_TTL: Ttl = Ttl::from_secs(3600);
 
 /// Reverse zones for address space that is not globally unique, so a name in
-/// one cannot have a globally meaningful answer (RFC 6303 §4.3–§4.6, §4.8).
+/// one cannot have a globally meaningful answer: RFC 6303 §4.1 (RFC 1918),
+/// two of §4.2's, §4.4 and §4.5.
 ///
 /// 172.16/12 is sixteen zones: `in-addr.arpa` splits on octet boundaries and
 /// the block does not. Not `127.in-addr.arpa.` or the `::1` reverse, which
-/// RFC 6303 lists too (§4.2, §4.7) but which describe `localhost`, so they are
+/// RFC 6303 lists too (§4.2, §4.3) but which describe `localhost`, so they are
 /// special-use names and cannot be switched off.
+///
+/// The table was written citing §4.3–§4.6 and §4.8, which hold none of the
+/// RFC 1918 zones and do not exist past §4.6. `c.f.ip6.arpa.` is not in
+/// RFC 6303 at all: §5 says it "will need to be added" only if fc00::/8 is
+/// never delegated. RFC 6303's other zones are not here (`TODO.md` #193).
 pub const EMPTY_ZONES: &[&str] = &[
     // RFC 1918 private space.
     "10.in-addr.arpa.",
@@ -71,11 +77,11 @@ pub const EMPTY_ZONES: &[&str] = &[
     "30.172.in-addr.arpa.",
     "31.172.in-addr.arpa.",
     "168.192.in-addr.arpa.",
-    // Link-local (RFC 3927) — 169.254/16.
+    // RFC 6303 §4.2: link-local (RFC 3927) 169.254/16, and 0/8.
     "254.169.in-addr.arpa.",
-    // "This host on this network" (RFC 1122 §3.2.1.3) — 0/8.
     "0.in-addr.arpa.",
-    // Link-local (fe80::/10) and unique-local (fc00::/7), in nibble form.
+    // §4.5 link-local (fe80::/10); §4.4 locally assigned ULA (fd00::/8), and
+    // fc00::/8 beside it, which §5 holds in reserve; in nibble form.
     "8.e.f.ip6.arpa.",
     "9.e.f.ip6.arpa.",
     "a.e.f.ip6.arpa.",
@@ -84,7 +90,7 @@ pub const EMPTY_ZONES: &[&str] = &[
     "d.f.ip6.arpa.",
 ];
 
-/// The IPv6 loopback's reverse zone (RFC 6303 §4.7), one name deep.
+/// The IPv6 loopback's reverse zone (RFC 6303 §4.3), one name deep.
 const LOOPBACK_V6_REVERSE: &str =
     "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.";
 
@@ -224,7 +230,7 @@ pub fn lookup(qname: NameRef<'_>, qtype: Qtype, empty: &EmptyZones) -> Option<Lo
                 qname,
                 qtype,
                 zone.as_ref(),
-                "the loopback reverse zones are answered locally (RFC 6303 §4.2, §4.7)",
+                "the loopback reverse zones are answered locally (RFC 6303 §4.2, §4.3)",
             ));
         }
     }
@@ -329,8 +335,9 @@ fn in_zone(qname: NameRef<'_>, qtype: Qtype, zone: NameRef<'_>, why: &'static st
             authority: Vec::new(),
             why,
         },
-        // §3: "the name server SHOULD return a single NS record naming the
-        // zone itself", which is the SOA's MNAME too.
+        // §3: "It is RECOMMENDED that the NS record defaults to the name of
+        // the zone and the SOA MNAME defaults to the name of the only NS RR's
+        // (Resource Record's) target."
         rt::NS => match RecordData::from_parsed(&ParsedRecord::NS(zone.to_owned())) {
             Ok(rdata) => positive(qname, rdata, why),
             Err(_) => nodata(zone, why),

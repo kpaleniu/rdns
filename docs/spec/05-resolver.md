@@ -483,10 +483,10 @@ zone does: SOA, one NS naming the zone itself, NODATA for anything else.
 |---|---|---|---|
 | `localhost.`, `*.localhost.` | 127.0.0.1 / ::1; NODATA for other types | 6761 §6.3 | no |
 | `1.0.0.127.in-addr.arpa.` PTR | `localhost.` | 6303 §4.2 | no |
-| `127.in-addr.arpa.` and below, and the `::1` reverse | apex as above; NXDOMAIN below | 6303 §4.2, §4.7 | no |
+| `127.in-addr.arpa.` and below, and the `::1` reverse | apex as above; NXDOMAIN below | 6303 §4.2, §4.3 | no |
 | `local.` and below | NXDOMAIN — mDNS, not DNS | 6762 §3 | no |
 | `invalid.` and below | NXDOMAIN | 6761 §6.4 | no |
-| **empty zones**: RFC 1918 (`10.`, `16–31.172.`, `168.192.in-addr.arpa.`), `254.169.`, `0.in-addr.arpa.`, `8–b.e.f.ip6.arpa.`, `c.f.` and `d.f.ip6.arpa.` | apex as above; NXDOMAIN below | 6303 §4 | yes |
+| **empty zones**: RFC 1918 (`10.`, `16–31.172.`, `168.192.in-addr.arpa.`), `254.169.`, `0.in-addr.arpa.`, `8–b.e.f.ip6.arpa.`, `c.f.` and `d.f.ip6.arpa.` | apex as above; NXDOMAIN below | 6303 §4.1, §4.2, §4.4, §4.5; `c.f.` is §5's reserve | yes |
 
 RFC 6303 §3: "An implementation of this recommendation MUST provide a mechanism
 to disable this new behaviour, and SHOULD allow this decision on a zone-by-zone

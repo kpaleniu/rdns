@@ -20,7 +20,7 @@ else would already mean a query going out.
 - **`.local` is mDNS** (RFC 6762 §3), so NXDOMAIN is the literal truth rather than
   a policy: the name really does not exist in the DNS.
 - **`invalid.`** is reserved to be unresolvable (§6.4).
-- **The loopback reverse zones** (RFC 6303 §4.2, §4.7): `127.in-addr.arpa` with
+- **The loopback reverse zones** (RFC 6303 §4.2, §4.3): `127.in-addr.arpa` with
   `1.0.0.127` answering `localhost.`, and the `::1` reverse.
 - **The empty zones** (RFC 6303 §4), the private-address reverse zones,
   including the sixteen separate zones that 172.16/12 actually is —
