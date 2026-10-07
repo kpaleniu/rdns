@@ -40,14 +40,14 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Fourteen items. #171-#185 were filed 2026-10-05 from a comparison against
+Thirteen items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
-#173. #181 was closed wontfix in triage; #171, #173, #179, #183, #184, #186, #187
-and #189 closed 2026-10-07:
+#173. #181 was closed wontfix in triage; #171, #173, #176, #179, #183, #184, #186,
+#187 and #189 closed 2026-10-07:
 
 - `rdnsr`: #172 no per-domain forwarding, #174 no local data,
-  #175 no encrypted upstream, #176 no negative trust anchors, #177 no local
+  #175 no encrypted upstream, #177 no local
   root (RFC 8806), #178 no control channel.
 - `rdnsd`: #180 KSK rollover does not check the parent's DS,
   #182 catalog zones not generated.
@@ -1114,6 +1114,7 @@ the week; the record is under "How the queue kept going stale" in
 | **183** | signing with an imported RSA key was implemented and never tested | **filed 2026-10-05, closed 2026-10-07.** · `1288421` · [`docs/closed/183.md`](docs/closed/183.md) |
 | **179** | `rdnsd` and `rdnsr` did not answer NSID (RFC 5001) | **filed 2026-10-05, closed 2026-10-07.** · `76b0bb8` · [`docs/closed/179.md`](docs/closed/179.md) |
 | **189** | `rdnsr` could not ask its upstreams for NSID | **filed 2026-10-06, closed 2026-10-07.** · `262fe23` · [`docs/closed/189.md`](docs/closed/189.md) |
+| **176** | `rdnsr` had no negative trust anchors (RFC 7646) | **filed 2026-10-05, closed 2026-10-07.** · `060f989` · [`docs/closed/176.md`](docs/closed/176.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
