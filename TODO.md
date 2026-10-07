@@ -40,14 +40,13 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Twelve items. #171-#185 were filed 2026-10-05 from a comparison against
+Eleven items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
-#173. #181 was closed wontfix in triage; #171-#173, #176, #179, #183, #184, #186,
+#173. #181 was closed wontfix in triage; #171-#174, #176, #179, #183, #184, #186,
 #187 and #189 closed 2026-10-07:
 
-- `rdnsr`: #174 no local data,
-  #175 no encrypted upstream, #177 no local
+- `rdnsr`: #175 no encrypted upstream, #177 no local
   root (RFC 8806), #178 no control channel.
 - `rdnsd`: #180 KSK rollover does not check the parent's DS,
   #182 catalog zones not generated.
@@ -1116,6 +1115,7 @@ the week; the record is under "How the queue kept going stale" in
 | **189** | `rdnsr` could not ask its upstreams for NSID | **filed 2026-10-06, closed 2026-10-07.** · `262fe23` · [`docs/closed/189.md`](docs/closed/189.md) |
 | **176** | `rdnsr` had no negative trust anchors (RFC 7646) | **filed 2026-10-05, closed 2026-10-07.** · `060f989` · [`docs/closed/176.md`](docs/closed/176.md) |
 | **172** | `rdnsr` could not forward one domain and recurse the rest | **filed 2026-10-05, closed 2026-10-07.** · `c76081a` · [`docs/closed/172.md`](docs/closed/172.md) |
+| **174** | `rdnsr` had no local data except through RPZ | **filed 2026-10-05, closed 2026-10-07.** · `977c0f6` · [`docs/closed/174.md`](docs/closed/174.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
