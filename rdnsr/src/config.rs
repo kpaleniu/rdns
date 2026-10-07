@@ -126,6 +126,16 @@ struct ResolverSection {
     dns64: Option<Dns64>,
     #[serde(default)]
     dns64_exclude: Vec<String>,
+    /// `--disable-empty-zone` and, negated, `--no-empty-zones`. Both given is
+    /// refused where the flags' pair is, in `EmptyZones::configure`.
+    #[serde(default)]
+    disable_empty_zone: Vec<String>,
+    #[serde(default = "default_empty_zones")]
+    empty_zones: bool,
+}
+
+fn default_empty_zones() -> bool {
+    true
 }
 
 impl Default for ResolverSection {
@@ -146,6 +156,8 @@ impl Default for ResolverSection {
             prefetch_queue: None,
             dns64: None,
             dns64_exclude: Vec::new(),
+            disable_empty_zone: Vec::new(),
+            empty_zones: default_empty_zones(),
         }
     }
 }
@@ -414,6 +426,8 @@ impl Config {
             prefetch_queue,
             dns64,
             dns64_exclude,
+            disable_empty_zone,
+            empty_zones,
         } = resolver;
         cli.upstream = upstream.clone();
         cli.root_hints = root_hints.clone();
@@ -436,6 +450,8 @@ impl Config {
             Some(Dns64::Prefix(prefix)) => Some(prefix.clone()),
         };
         cli.dns64_exclude = dns64_exclude.clone();
+        cli.disable_empty_zone = disable_empty_zone.clone();
+        cli.no_empty_zones = !*empty_zones;
 
         let Rpz {
             feeds,
@@ -659,11 +675,13 @@ tls-key = "./key.pem"
             "the file replaces {} flags, which is too few to be the whole set",
             replaced.len(),
         );
-        // The three flags the file spells differently, because the table name
-        // carries half of it. Written down rather than inferred: a rename is a
-        // decision, and one that is not declared here is a typo.
+        // The flags the file spells differently: three because the table name
+        // carries half of it, and `--no-empty-zones` because a file says
+        // `empty-zones = false`. Written down rather than inferred: a rename is
+        // a decision, and one that is not declared here is a typo.
         let renamed = |long: &str| match long {
             "rpz" => Some("feeds"),
+            "no-empty-zones" => Some("empty-zones"),
             "rpz-policy" => Some("policy"),
             "rpz-notify-from" => Some("notify-from"),
             _ => None,

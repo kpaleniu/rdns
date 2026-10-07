@@ -425,3 +425,90 @@ fn allow_query_in_the_config_file_is_the_flag() {
     assert!(!out.status.success());
     assert!(stderr(&out).contains("--allow-query"), "{}", stderr(&out));
 }
+
+/// An entry that would switch nothing off is refused before the dry run
+/// answers, naming it and saying why (`TODO.md` #173).
+#[test]
+fn a_name_that_is_not_an_empty_zone_is_refused_at_startup() {
+    for (name, why) in [
+        ("localhost.", "special-use"),
+        ("127.in-addr.arpa.", "special-use"),
+        (
+            "1.10.in-addr.arpa.",
+            "inside the empty zone 10.in-addr.arpa.",
+        ),
+        ("example.", "not an empty zone"),
+    ] {
+        let out = rdnsr(&["--check-config", "--disable-empty-zone", name]);
+        assert!(!out.status.success(), "{name} passed the dry run");
+        let message = stderr(&out);
+        assert!(
+            message.contains(name) && message.contains(why),
+            "{name}: {message}"
+        );
+    }
+    let out = rdnsr(&[
+        "--check-config",
+        "--no-empty-zones",
+        "--disable-empty-zone",
+        "10.in-addr.arpa.",
+    ]);
+    assert!(!out.status.success(), "stdout: {}", stdout(&out));
+    assert!(
+        stderr(&out).contains("--no-empty-zones"),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = rdnsr(&["--check-config", "--disable-empty-zone", "10.in-addr.arpa."]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("empty zones off: 10.in-addr.arpa."),
+        "got: {}",
+        stdout(&out)
+    );
+}
+
+/// The file's two keys reach the same set as the flags, and their pair is
+/// refused as the flags' is.
+#[test]
+fn the_empty_zone_keys_are_the_flags() {
+    let dir = ScratchDir::new("rdnsr-empty-zones");
+    let config = dir.join("rdnsr.toml");
+    for (text, ok, said) in [
+        (
+            "[resolver]\nempty-zones = false\n",
+            true,
+            "empty zones all off",
+        ),
+        (
+            "[resolver]\ndisable-empty-zone = [\"168.192.in-addr.arpa.\"]\n",
+            true,
+            "empty zones off: 168.192.in-addr.arpa.",
+        ),
+        (
+            "[resolver]\nempty-zones = false\ndisable-empty-zone = [\"10.in-addr.arpa.\"]\n",
+            false,
+            "--no-empty-zones",
+        ),
+    ] {
+        std::fs::write(&config, text).expect("write the config");
+        let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
+        assert_eq!(out.status.success(), ok, "{text}: {}", stderr(&out));
+        let shown = if ok { stdout(&out) } else { stderr(&out) };
+        assert!(shown.contains(said), "{text}: {shown}");
+    }
+
+    let out = rdnsr(&[
+        "--config",
+        &config.to_string_lossy(),
+        "--no-empty-zones",
+        "--check-config",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("--no-empty-zones"),
+        "{}",
+        stderr(&out)
+    );
+}

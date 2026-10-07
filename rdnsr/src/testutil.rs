@@ -88,6 +88,7 @@ pub(crate) fn serving(
         policy: PolicyStore::in_memory(policy),
         refreshes: None,
         dns64: None,
+        empty_zones: Default::default(),
         rpz_notify: None,
         feed_wakes: Vec::new(),
         ctx,
@@ -105,6 +106,7 @@ pub(crate) fn serving_policy(policy: Arc<PolicyStore>) -> Arc<Resolving> {
         policy,
         refreshes: None,
         dns64: None,
+        empty_zones: Default::default(),
         rpz_notify: None,
         feed_wakes: Vec::new(),
         ctx,
@@ -127,6 +129,7 @@ pub(crate) fn serving_notified(
         policy,
         refreshes: None,
         dns64: None,
+        empty_zones: Default::default(),
         rpz_notify: Some(NotifyAcl {
             from: TransferAcl::parse_named(&specs, "--rpz-notify-from").expect("the list parses"),
             reload: reload.clone(),

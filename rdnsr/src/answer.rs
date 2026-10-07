@@ -20,7 +20,7 @@ use rdns::resolver::{NameserverPolicy, Resolver};
 use rdns::response::ClientEdns;
 use rdns::rpz::{Action, DelegationPolicy, PolicyStore, PolicyZones, Rewrite};
 use rdns::security::TransferAcl;
-use rdns::special_names;
+use rdns::special_names::{self, EmptyZones};
 use rdns::validation::{Request, Transport};
 use rdns::Qtype;
 use rdns::Rtype;
@@ -53,6 +53,9 @@ pub(crate) struct Resolving {
     pub(crate) refreshes: Option<Refreshes>,
     /// The NAT64 prefix to synthesize AAAA records into, if any (`--dns64`).
     pub(crate) dns64: Option<Dns64>,
+    /// Which RFC 6303 empty zones are answered here (`--disable-empty-zone`,
+    /// `--no-empty-zones`).
+    pub(crate) empty_zones: EmptyZones,
     /// Who may send a NOTIFY asking for the `--rpz` files to be re-read, and
     /// how to queue one. `None` unless `--rpz-notify-from` named somebody, and
     /// then a NOTIFY is NOTIMP as it was before `TODO.md` #57c — because then
@@ -115,6 +118,7 @@ pub(crate) async fn handle_query(
         policy,
         refreshes,
         dns64: _,
+        empty_zones,
         rpz_notify,
         feed_wakes,
         ctx,
@@ -234,16 +238,20 @@ pub(crate) async fn handle_query(
         max_len: client_max,
     };
 
-    // Names that must not leave this machine (RFC 6761, 6762, 6303). Before
-    // every cache: the table *is* the answer, and consulting anything else means
-    // a query going out.
+    // Names that must not leave this machine (RFC 6761, 6762, 6303), and the
+    // empty zones the operator left on. Before every cache: the table *is* the
+    // answer, and consulting anything else means a query going out.
     //
     // Not skipped for CD, unlike the denial cache: CD is a statement about
     // DNSSEC, not a request to be told what a public server thinks `localhost`
     // is.
-    if let Some(local) = special_names::lookup(query.qname.as_ref(), query.qtype) {
+    if let Some(local) = special_names::lookup(query.qname.as_ref(), query.qtype, empty_zones) {
         let mut resp = build_response(&msg, local.answers, local.rcode);
         resp.authorities = local.authority;
+        // AA=1, unlike everything resolved (`Resolver::resolve_validated`
+        // clears it): RFC 6303 §3 asks for it, and these zones are defined to
+        // be empty, so the subtree claim RFC 8020 reads into AA is intended.
+        resp.authoritive = true;
         // DEBUG: one line per query, with the name on it. Logging every query
         // is the operator's decision, not the default's.
         tracing::debug!(qname = %query.qname, why = %local.why, "answered locally");
@@ -256,9 +264,12 @@ pub(crate) async fn handle_query(
     // blocked name must cost no upstream query, and an answer held from before
     // the rule was written must not outlive it.
     //
-    // After `special_names` and not before, because that table is a protocol
-    // requirement rather than a preference — RFC 6761 §6.3's `localhost` is the
-    // loopback address whatever a feed says about it.
+    // After `special_names` and not before. For a special-use name that is
+    // because the table is a protocol requirement rather than a preference —
+    // RFC 6761 §6.3's `localhost` is the loopback address whatever a feed says
+    // about it. Not for an empty zone, which RFC 6303 §3 says the operator
+    // MUST be able to switch off (`TODO.md` #173); one that is on still
+    // answers first, and switching it off is how a feed reaches inside it.
     if !policy.is_empty() {
         if let Some(rewrite) = policy.before_query(peer, query.qname.as_ref(), query.qtype) {
             if let Applied::Replied(reply) =
@@ -1666,6 +1677,7 @@ mod tests {
                 policy: PolicyStore::in_memory(zones),
                 refreshes,
                 dns64: None,
+                empty_zones: Default::default(),
                 rpz_notify: None,
                 feed_wakes: Vec::new(),
                 ctx,
@@ -2739,6 +2751,7 @@ mod tests {
                 rdns::dns64::Dns64::new(rdns::dns64::Nat64Prefix::well_known(), &[])
                     .expect("the Well-Known Prefix"),
             ),
+            empty_zones: Default::default(),
             rpz_notify: None,
             feed_wakes: Vec::new(),
             ctx: test_shell(),
@@ -3479,6 +3492,140 @@ mod tests {
             reply.answers.is_empty(),
             "the address the cache held is what the rule is about"
         );
+    }
+
+    /// A forwarder whose upstream answers every question NOERROR and counts
+    /// them, serving `empty_zones` and `rules`.
+    fn empty_zone_resolver(
+        empty_zones: EmptyZones,
+        rules: &str,
+    ) -> (Arc<Resolving>, Arc<std::sync::atomic::AtomicUsize>) {
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        let upstream = rdns::resolver::Upstream::answering(move |_, _, query| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut reply = DnsMessage::try_from_bytes(query).ok()?;
+            reply.response = true;
+            reply.recursion_ok = true;
+            reply.to_bytes_within(4096).ok()
+        });
+        let resolver = rdns::resolver::Resolver::new(rdns::resolver::ResolverConfig {
+            mode: rdns::resolver::ResolverMode::Forward,
+            upstream_servers: vec!["198.51.100.1:53".parse().expect("an address")],
+            ..Default::default()
+        })
+        .with_upstream(upstream);
+        let serving = serving(Arc::new(resolver), test_shell(), policy(rules));
+        let mut serving = Arc::into_inner(serving).expect("not shared yet");
+        serving.empty_zones = empty_zones;
+        (Arc::new(serving), asked)
+    }
+
+    async fn ask(serving: &Resolving, name: &str, qtype: Rtype) -> DnsMessage {
+        let mut msg = DnsMessage::try_from_bytes(&query_for(name, 1, false)).expect("parses");
+        msg.queries[0].qtype = Qtype::of(qtype);
+        let bytes = handle_query(
+            msg.to_bytes_within(512).expect("serialize"),
+            test_peer(),
+            current_unix_timestamp(),
+            serving,
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply")
+    }
+
+    /// RFC 6303 §3: a name in an empty zone is an authoritative NXDOMAIN, with
+    /// the zone's SOA, and nothing is asked upstream. The apex is the zone's
+    /// SOA, NS and NODATA. AA was clear on all of these until `TODO.md` #173;
+    /// watched failing on that with the `authoritive = true` removed.
+    #[tokio::test]
+    async fn an_empty_zone_is_answered_authoritatively_and_never_forwarded() {
+        let (serving, asked) = empty_zone_resolver(EmptyZones::default(), "");
+        let ptr = ask(&serving, "4.3.2.10.in-addr.arpa.", record_types::PTR).await;
+        assert_eq!(ptr.rcode, ResponseCode::NoSuchDomain);
+        assert!(ptr.authoritive, "AA=1 (RFC 6303 §3)");
+        assert_eq!(ptr.authorities[0].name, nm("10.in-addr.arpa."));
+
+        for zone in ["10.in-addr.arpa.", "127.in-addr.arpa."] {
+            let soa = ask(&serving, zone, record_types::SOA).await;
+            assert_eq!(
+                (soa.rcode, soa.answers.len()),
+                (ResponseCode::Ok, 1),
+                "{zone}"
+            );
+            assert!(soa.authoritive, "{zone}");
+            let ns = ask(&serving, zone, record_types::NS).await;
+            assert_eq!(ns.answers[0].rdata.rtype(), record_types::NS, "{zone}");
+            let a = ask(&serving, zone, record_types::A).await;
+            assert_eq!(
+                (a.rcode, a.answers.len()),
+                (ResponseCode::Ok, 0),
+                "NODATA at {zone}"
+            );
+            assert!(a.authoritive, "{zone}");
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    /// One empty zone switched off is resolved like any other name, and its
+    /// neighbours stay local. Watched failing with `lookup` ignoring the set:
+    /// nothing reached the upstream.
+    #[tokio::test]
+    async fn a_switched_off_empty_zone_is_resolved() {
+        let zones =
+            EmptyZones::configure(false, &["10.in-addr.arpa.".to_string()]).expect("configures");
+        let (serving, asked) = empty_zone_resolver(zones, "");
+        let ptr = ask(&serving, "4.3.2.10.in-addr.arpa.", record_types::PTR).await;
+        assert_eq!(ptr.rcode, ResponseCode::Ok);
+        assert!(!ptr.authoritive, "a resolved answer is not ours");
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let other = ask(&serving, "1.1.168.192.in-addr.arpa.", record_types::PTR).await;
+        assert_eq!(other.rcode, ResponseCode::NoSuchDomain);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// All off leaves `localhost` and its reverse names local.
+    #[tokio::test]
+    async fn no_empty_zones_leaves_the_special_use_names_local() {
+        let zones = EmptyZones::configure(true, &[]).expect("configures");
+        let (serving, asked) = empty_zone_resolver(zones, "");
+        for (name, qtype) in [
+            ("localhost.", record_types::A),
+            ("1.0.0.127.in-addr.arpa.", record_types::PTR),
+            (
+                "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.",
+                record_types::PTR,
+            ),
+        ] {
+            let reply = ask(&serving, name, qtype).await;
+            assert!(reply.authoritive, "{name} is answered locally");
+        }
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        ask(&serving, "1.1.168.192.in-addr.arpa.", record_types::PTR).await;
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A policy rule inside an empty zone applies once the zone is off, and
+    /// not while it is on: the zone answers first.
+    #[tokio::test]
+    async fn a_policy_reaches_inside_an_empty_zone_only_once_it_is_off() {
+        let rule = "4.3.2.10.in-addr.arpa IN CNAME .\n";
+        let off =
+            EmptyZones::configure(false, &["10.in-addr.arpa.".to_string()]).expect("configures");
+        for (zones, rpz_answers) in [(EmptyZones::default(), false), (off, true)] {
+            let (serving, _) = empty_zone_resolver(zones, rule);
+            let reply = ask(&serving, "4.3.2.10.in-addr.arpa.", record_types::PTR).await;
+            assert_eq!(reply.rcode, ResponseCode::NoSuchDomain);
+            assert_eq!(
+                reply.authorities[0].name == nm("rpz.invalid."),
+                rpz_answers,
+                "{:?}",
+                reply.authorities[0].name
+            );
+        }
     }
 
     /// RFC 6761 §6.3's `localhost` is the loopback address whatever a feed says

@@ -20,9 +20,21 @@ else would already mean a query going out.
 - **`.local` is mDNS** (RFC 6762 §3), so NXDOMAIN is the literal truth rather than
   a policy: the name really does not exist in the DNS.
 - **`invalid.`** is reserved to be unresolvable (§6.4).
-- **The private reverse zones** (RFC 6303 §4), including `127.in-addr.arpa` with
-  `1.0.0.127` answering `localhost.`, and the sixteen separate zones that 172.16/12
-  actually is — `in-addr.arpa` splits on octet boundaries and that block does not.
+- **The loopback reverse zones** (RFC 6303 §4.2, §4.7): `127.in-addr.arpa` with
+  `1.0.0.127` answering `localhost.`, and the `::1` reverse.
+- **The empty zones** (RFC 6303 §4), the private-address reverse zones,
+  including the sixteen separate zones that 172.16/12 actually is —
+  `in-addr.arpa` splits on octet boundaries and that block does not.
+
+The last group is the only one an operator may switch off, singly or all at
+once: RFC 6303 §3 says an implementation MUST allow it, because a site with its
+own `10.in-addr.arpa` has to be able to reach it. The others are protocol
+requirements and are fixed. The two are separate tables so that difference is
+in the code rather than in a comment (`TODO.md` #173).
+
+Every answer here carries **AA=1**, which RFC 6303 §3 asks for and every
+resolved answer lacks: these zones are defined to be empty, so the subtree
+claim RFC 8020 reads into AA is the intended one.
 
 **Not in the table, deliberately:** RFC 6761 also reserves `example.`,
 `example.com.`, `.net` and `.org` — as *ordinary* names, delegated and resolvable.

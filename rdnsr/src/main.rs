@@ -463,6 +463,18 @@ struct Cli {
     #[arg(long, value_name = "PREFIX", num_args = 0..=1,
           default_missing_value = rdns::dns64::WELL_KNOWN_PREFIX, conflicts_with = "config")]
     dns64: Option<String>,
+    /// Resolve this RFC 6303 empty zone instead of answering it locally,
+    /// repeatable: `10.in-addr.arpa.`, `168.192.in-addr.arpa.` and the rest
+    /// of the private-address reverse zones.
+    ///
+    /// For a site whose own DNS holds the reverse zone for its private space.
+    /// `localhost` and its reverse names, `local.` and `invalid.` are not
+    /// empty zones and cannot be switched off.
+    #[arg(long, value_name = "ZONE", conflicts_with = "config")]
+    disable_empty_zone: Vec<String>,
+    /// Resolve every RFC 6303 empty zone instead of answering it locally.
+    #[arg(long, conflicts_with = "config")]
+    no_empty_zones: bool,
     /// An IPv6 prefix whose presence in a AAAA answer is to be read as no
     /// answer at all (RFC 6147 §5.1.4), repeatable.
     ///
@@ -876,6 +888,11 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    // Above the dry run: a name that is not an empty zone switches nothing
+    // off, and the operator would believe it had (`CLAUDE.md` §15).
+    let empty_zones =
+        rdns::special_names::EmptyZones::configure(cli.no_empty_zones, &cli.disable_empty_zone)?;
+
     // Above the dry run, and after `--rpz-notify-from`, which it is checked
     // against: an open resolver must fail `--check-config` too.
     let acl = query_acl(&cli, rpz_notify.as_ref().map(|n| &n.from)).await?;
@@ -943,7 +960,7 @@ async fn main() -> anyhow::Result<()> {
             .count();
         println!(
             "configuration is valid: {}, {} policy feed(s){}, cache {}, listening on {}, \
-             encrypted transports {}, query ACL {}",
+             encrypted transports {}, query ACL {}, empty zones {}",
             source,
             in_force.zones().len(),
             // Said out loud because a feed at `passthru` or `disabled` blocks
@@ -969,6 +986,7 @@ async fn main() -> anyhow::Result<()> {
                 Some(encrypted) => format!("on {}, certificate loads", encrypted.listeners()),
             },
             acl.describe(),
+            empty_zones.describe(),
         );
         return Ok(());
     }
@@ -1078,6 +1096,11 @@ async fn main() -> anyhow::Result<()> {
             "no --rpz-notify-from: a feed is re-read on SIGHUP only, and a NOTIFY is NOTIMP"
         );
     }
+
+    // Printed because a private PTR that leaves the host is the leak RFC 6303
+    // exists to stop, and one answered here is a name an internal zone cannot
+    // serve.
+    tracing::info!("empty zones (RFC 6303): {}", empty_zones.describe());
 
     if let Some(dns64) = dns64.as_ref() {
         tracing::info!(
@@ -1212,6 +1235,7 @@ async fn main() -> anyhow::Result<()> {
         policy,
         refreshes,
         dns64,
+        empty_zones,
         rpz_notify,
         feed_wakes,
         ctx: ctx.clone(),

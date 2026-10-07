@@ -362,6 +362,7 @@ Binds 127.0.0.1 by default. Recurses from the root unless given `--upstream`.
 | `--rpz <FILE>` | a response policy zone, repeatable and consulted in order; `--rpz-policy` overrides what its rules say, for every feed at once. How blocking is delivered |
 | `--serve-stale <SECONDS>` | answer from expired cache when the authoritative servers cannot be reached (RFC 8767). `0`, off, by default |
 | `--prefetch` | re-resolve a cached name in the last tenth of its TTL, after the reply that found it |
+| `--disable-empty-zone <ZONE>`, `--no-empty-zones` | resolve an RFC 6303 private-address reverse zone, or all of them, instead of answering it locally |
 | `--dns64 [PREFIX]` | synthesize AAAA from A for an IPv6-only client behind a NAT64 (RFC 6147). The Well-Known Prefix if given no value; `--dns64-exclude` adds to RFC 6147 §5.1.4's default |
 
 The last four are off unless given, and each is specified in

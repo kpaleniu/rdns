@@ -171,13 +171,14 @@ never a forwarding header. Counted in `dns_queries_refused_by_acl_total` and
    EDE 21 (Not Supported).
 3. EDNS sanity: malformed option list → FORMERR; version > 0 → BADVERS.
    Neither carries an Extended DNS Error, for the reason `03`'s §3.2.1 gives.
-4. Special-use names (`special_names::lookup`) — answered locally, never
-   forwarded, before every cache and before any resolution. AD is never set. Not
-   skipped for a client with CD. See §5.8.
+4. Special-use names and the empty zones left on (`special_names::lookup`) —
+   answered locally with AA=1, never forwarded, before every cache and before
+   any resolution. AD is never set. Not skipped for a client with CD. See §5.8.
 5. Response policy (`rpz::PolicyZones::before_query`), when `--rpz` named a
    zone: the client's address, then the name, zone by zone in order. After the
-   special-use table, because that table is a protocol requirement and a policy
-   zone is a preference. See §5.6.
+   special-use table, because that half is a protocol requirement and a policy
+   zone is a preference; after an empty zone that is on, because switching it
+   off is how a feed reaches inside it. See §5.6.
 6. DNS64 reverse mapping, when `--dns64` is on and the question is a PTR under
    `ip6.arpa` for an address inside the NAT64 prefix: the question is rewritten
    rather than answered. See §5.7.
@@ -474,17 +475,28 @@ bits 64-71 reserved and zero in every form but the /96.
 
 ## 5.8 Names that never leave (`special_names.rs`)
 
-Answered locally, never forwarded, each with a reason recorded for the log. Local
-TTL 3600.
+Answered locally with AA=1, never forwarded, each with a reason recorded for
+the log. Local TTL 3600. A reverse zone answers at its apex as RFC 6303 §3's
+zone does: SOA, one NS naming the zone itself, NODATA for anything else.
 
-| name | answer | RFC |
-|---|---|---|
-| `localhost.`, `*.localhost.` | 127.0.0.1 / ::1; NODATA for other types | 6761 §6.3 |
-| `1.0.0.127.in-addr.arpa.` PTR | `localhost.` | 6303 §4.2 |
-| `127.in-addr.arpa.` and below | NXDOMAIN | 6303 §4.2 |
-| `local.` and below | NXDOMAIN — mDNS, not DNS | 6762 §3 |
-| `invalid.` and below | NXDOMAIN | 6761 §6.4 |
-| RFC 1918 reverse zones (`10.`, `16–31.172.`, `168.192.in-addr.arpa.`) | NXDOMAIN | 6303 §4 |
+| name | answer | RFC | switchable |
+|---|---|---|---|
+| `localhost.`, `*.localhost.` | 127.0.0.1 / ::1; NODATA for other types | 6761 §6.3 | no |
+| `1.0.0.127.in-addr.arpa.` PTR | `localhost.` | 6303 §4.2 | no |
+| `127.in-addr.arpa.` and below, and the `::1` reverse | apex as above; NXDOMAIN below | 6303 §4.2, §4.7 | no |
+| `local.` and below | NXDOMAIN — mDNS, not DNS | 6762 §3 | no |
+| `invalid.` and below | NXDOMAIN | 6761 §6.4 | no |
+| **empty zones**: RFC 1918 (`10.`, `16–31.172.`, `168.192.in-addr.arpa.`), `254.169.`, `0.in-addr.arpa.`, `8–b.e.f.ip6.arpa.`, `c.f.` and `d.f.ip6.arpa.` | apex as above; NXDOMAIN below | 6303 §4 | yes |
+
+RFC 6303 §3: "An implementation of this recommendation MUST provide a mechanism
+to disable this new behaviour, and SHOULD allow this decision on a zone-by-zone
+basis." `--disable-empty-zone ZONE` (repeatable) and `--no-empty-zones`, or
+`disable-empty-zone` and `empty-zones = false` under `[resolver]`, make a zone
+an ordinary name: policy, caches, then resolution. Anything that is not exactly
+an empty zone is refused at startup, naming it — a special-use name, a name
+inside an empty zone, any other name — and so is the pair together
+(`TODO.md` #173). A routed domain at least as specific as an empty zone will
+override it (`docs/adr/0008`); `--upstream` is a route at `.` and does not.
 
 ---
 
