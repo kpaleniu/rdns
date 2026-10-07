@@ -361,6 +361,7 @@ Binds 127.0.0.1 by default. Recurses from the root unless given `--upstream`.
 | `--response-rate <BYTES_PER_SEC>` | default 8192, `0` disables |
 | `--metrics-listen <ADDR:PORT>` | Prometheus metrics and `/healthz`. No `/readyz` |
 | `--nsid <TEXT\|0xHEX>` | answer an NSID request (RFC 5001) with this identifier; off by default |
+| `--negative-trust-anchors <FILE>` | answer a subtree whose DNSSEC is broken unvalidated until a set time (RFC 7646); re-read on SIGHUP, rechecked every 5 minutes |
 | `--request-nsid` | ask every upstream for its NSID and log which instance answered, at INFO when it changes |
 | `--config <FILE>`, `--check-config` | read settings from TOML, and dry-run them. Mutually exclusive with the flags above. `[[rpz.feeds]]` is what only the file can say: a policy per feed, so a new one is measured in `passthru` while the rest stay enforced |
 | `--rpz <FILE>` | a response policy zone, repeatable and consulted in order; `--rpz-policy` overrides what its rules say, for every feed at once. How blocking is delivered |

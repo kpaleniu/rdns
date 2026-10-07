@@ -369,6 +369,11 @@ pub struct Counters {
     outcomes: [AtomicU64; Outcome::ALL.len()],
     validating: AtomicBool,
 
+    /// Negative trust anchors in force (RFC 7646, `TODO.md` #176), and whether
+    /// this server reads a file of them at all — absent is not zero.
+    ntas: AtomicU64,
+    ntas_configured: AtomicBool,
+
     // Cumulative buckets plus count and sum: what `histogram_quantile()` needs.
     //
     // Length from the bounds, not repeated: the two were `8` twice, and a bound
@@ -443,6 +448,8 @@ impl DnsMetrics {
             listeners: Default::default(),
             outcomes: std::array::from_fn(|_| AtomicU64::new(0)),
             validating: AtomicBool::new(false),
+            ntas: AtomicU64::new(0),
+            ntas_configured: AtomicBool::new(false),
             zones: RwLock::new(BTreeMap::new()),
             catalogs: RwLock::new(BTreeMap::new()),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -468,6 +475,13 @@ impl DnsMetrics {
     /// This server validates DNSSEC, so its outcomes belong in the scrape.
     pub fn validating(&self) {
         self.validating.store(true, Ordering::Relaxed);
+    }
+
+    /// How many negative trust anchors are in force. Written where the set
+    /// changes (`CLAUDE.md` §14).
+    pub fn negative_trust_anchors(&self, count: usize) {
+        self.ntas_configured.store(true, Ordering::Relaxed);
+        self.ntas.store(count as u64, Ordering::Relaxed);
     }
 
     /// One answer sent to a client, by what validation concluded about it.
@@ -889,6 +903,20 @@ impl DnsMetrics {
             self.latency_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0
         );
         let _ = writeln!(out, "dns_answer_latency_seconds_count {count}");
+
+        if self.ntas_configured.load(Ordering::Relaxed) {
+            declare(
+                &mut out,
+                "dns_negative_trust_anchors",
+                "gauge",
+                "Negative trust anchors in force (RFC 7646)",
+            );
+            let _ = writeln!(
+                out,
+                "dns_negative_trust_anchors {}",
+                self.ntas.load(Ordering::Relaxed)
+            );
+        }
 
         if self.validating.load(Ordering::Relaxed) {
             declare(

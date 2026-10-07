@@ -434,6 +434,20 @@ impl DnsCache {
         }
     }
 
+    /// Drop every entry at or below `node`, returning how many went.
+    ///
+    /// For a validation decision that changed under them — a negative trust
+    /// anchor added, lifted or expired (RFC 7646 §4, `TODO.md` #176). A scan,
+    /// which is fine for an operator's action and would not be per query.
+    pub fn forget_at_or_below(&self, node: NameRef<'_>) -> usize {
+        let Ok(mut cache) = self.cache.lock() else {
+            return 0;
+        };
+        let before = cache.len();
+        cache.retain(|key, _| !crate::name_keys::is_at_or_below(key.name(), node));
+        before - cache.len()
+    }
+
     /// Clear all cache entries.
     ///
     /// A poisoned lock is left alone; the entries expire on their own.

@@ -271,6 +271,8 @@ impl SignedZone {
         let w = nm("w.example.test.");
         if question.qtype.is(record_types::DNSKEY) {
             reply.answers = self.at("example.test.", record_types::DNSKEY);
+        } else if question.qtype.is(record_types::SOA) && question.qname == nm("example.test.") {
+            reply.answers = self.at("example.test.", record_types::SOA);
         } else if question.qname.as_ref().is_at_or_under(w.as_ref()) {
             // Expanded: re-owned onto the name asked for, the RRSIG's label
             // count left saying a wildcard signed it (RFC 4035 §5.3.2).

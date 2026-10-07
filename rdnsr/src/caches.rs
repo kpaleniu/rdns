@@ -273,6 +273,14 @@ impl Caches {
     /// NXDOMAIN (RFC 8198) skips it exactly as a cache hit does. The one
     /// caller is the policy reload (`TODO.md` #57); there is no index from a
     /// nameserver to the names it served, so the sweep is the whole cache.
+    /// Forget what any cache holds at or below `node`: a negative trust
+    /// anchor changed how that subtree validates (`TODO.md` #176).
+    pub(crate) fn forget_at_or_below(&self, node: NameRef<'_>) -> usize {
+        self.answers.forget_at_or_below(node)
+            + self.negatives.forget_at_or_below(node)
+            + self.denials.forget_at_or_below(node)
+    }
+
     pub(crate) fn clear(&self) {
         self.answers.clear();
         self.negatives.clear();

@@ -318,6 +318,25 @@ impl NegativeCache {
         self.len() == 0
     }
 
+    /// Drop every entry at or below `node`, returning how many went.
+    ///
+    /// For a validation decision that changed under them — a negative trust
+    /// anchor added, lifted or expired (RFC 7646 §4, `TODO.md` #176). A scan,
+    /// which is fine for an operator's action and would not be per query.
+    pub fn forget_at_or_below(&self, node: NameRef<'_>) -> usize {
+        let Ok(mut entries) = self.entries.lock() else {
+            return 0;
+        };
+        let before = entries.len();
+        entries
+            .nxdomain
+            .retain(|key, _| !key.as_name().is_at_or_under(node));
+        entries
+            .nodata
+            .retain(|key, _| !crate::name_keys::is_at_or_below(key.name(), node));
+        before - entries.len()
+    }
+
     pub fn clear(&self) {
         if let Ok(mut entries) = self.entries.lock() {
             entries.nxdomain.clear();

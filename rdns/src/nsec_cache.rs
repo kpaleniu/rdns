@@ -533,6 +533,23 @@ impl NsecCache {
         self.len() == 0
     }
 
+    /// Drop every zone's proofs at or below `node`, returning how many went.
+    ///
+    /// For a validation decision that changed under them — a negative trust
+    /// anchor added, lifted or expired (RFC 7646 §4, `TODO.md` #176). A scan,
+    /// which is fine for an operator's action and would not be per query.
+    ///
+    /// A zone above `node` keeps its proofs: they were validated in that
+    /// zone, which the anchor does not reach.
+    pub fn forget_at_or_below(&self, node: NameRef<'_>) -> usize {
+        let Ok(mut zones) = self.zones.lock() else {
+            return 0;
+        };
+        let before = zones.len();
+        zones.retain(|zone, _| !zone.as_ref().is_at_or_under(node));
+        before - zones.len()
+    }
+
     pub fn clear(&self) {
         if let Ok(mut zones) = self.zones.lock() {
             zones.clear();

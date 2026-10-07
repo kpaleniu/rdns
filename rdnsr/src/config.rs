@@ -111,6 +111,7 @@ struct ResolverSection {
     dnssec_validate: bool,
     trust_anchor: Option<PathBuf>,
     auto_trust_anchor: Option<PathBuf>,
+    negative_trust_anchors: Option<PathBuf>,
     #[serde(default = "crate::default_serve_stale")]
     serve_stale: u64,
     #[serde(default = "crate::default_resolution_timer")]
@@ -151,6 +152,7 @@ impl Default for ResolverSection {
             dnssec_validate: false,
             trust_anchor: None,
             auto_trust_anchor: None,
+            negative_trust_anchors: None,
             serve_stale: crate::default_serve_stale(),
             resolution_timer: crate::default_resolution_timer(),
             serve_stale_first: false,
@@ -422,6 +424,7 @@ impl Config {
             dnssec_validate,
             trust_anchor,
             auto_trust_anchor,
+            negative_trust_anchors,
             serve_stale,
             resolution_timer,
             serve_stale_first,
@@ -441,6 +444,7 @@ impl Config {
         cli.dnssec_validate = *dnssec_validate;
         cli.trust_anchor = trust_anchor.clone();
         cli.auto_trust_anchor = auto_trust_anchor.clone();
+        cli.negative_trust_anchors = negative_trust_anchors.clone();
         cli.serve_stale = *serve_stale;
         cli.resolution_timer = (*resolution_timer)
             .try_into()

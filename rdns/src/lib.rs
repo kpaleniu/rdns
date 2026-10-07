@@ -69,6 +69,7 @@ pub mod metrics;
 pub mod negative_cache;
 pub mod notify;
 pub mod nsec_cache;
+pub mod nta;
 pub mod peer;
 pub mod resolver;
 pub mod rfc5011;

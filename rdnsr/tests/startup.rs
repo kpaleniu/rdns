@@ -529,3 +529,58 @@ fn a_malformed_nsid_is_refused_and_hex_is_octets() {
     let out = rdnsr(&["--check-config"]);
     assert!(stdout(&out).contains("NSID off"), "got: {}", stdout(&out));
 }
+
+/// The NTA file is checked before the dry run answers: refused without
+/// validation, refused more than a week ahead, accepted otherwise, and the
+/// file key is the flag (`TODO.md` #176).
+#[test]
+fn negative_trust_anchors_are_checked_before_the_dry_run() {
+    let dir = ScratchDir::new("rdnsr-nta");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    let good = dir.join("good.nta");
+    std::fs::write(&good, format!("broken.example. {}\n", now + 3600)).expect("write");
+    let far = dir.join("far.nta");
+    std::fs::write(&far, format!("broken.example. {}\n", now + 8 * 86_400)).expect("write");
+    let good = good.to_string_lossy().into_owned();
+    let far = far.to_string_lossy().into_owned();
+
+    let out = rdnsr(&["--check-config", "--negative-trust-anchors", &good]);
+    assert!(!out.status.success(), "accepted without validation");
+    assert!(
+        stderr(&out).contains("--dnssec-validate"),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = rdnsr(&[
+        "--check-config",
+        "--dnssec-validate",
+        "--negative-trust-anchors",
+        &far,
+    ]);
+    assert!(!out.status.success(), "eight days ahead was accepted");
+    assert!(stderr(&out).contains("week"), "{}", stderr(&out));
+
+    let out = rdnsr(&[
+        "--check-config",
+        "--dnssec-validate",
+        "--negative-trust-anchors",
+        &good,
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    let config = dir.join("rdnsr.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[resolver]\ndnssec-validate = true\nnegative-trust-anchors = {:?}\n",
+            far
+        ),
+    )
+    .expect("write the config");
+    let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
+    assert!(!out.status.success(), "the file key reaches the same check");
+}

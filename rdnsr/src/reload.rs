@@ -40,6 +40,7 @@ use rdns_transport::tls::CertificateStore;
 use tokio::sync::Notify;
 
 use crate::answer::{reload_policy, Resolving};
+use crate::nta::NtaFile;
 
 /// A handle for asking that the `--rpz` files be re-read.
 ///
@@ -80,31 +81,40 @@ impl PolicyReload {
 /// no business making this process re-open its key material — nor leaving a
 /// "could not re-read the TLS certificate" line behind to be diagnosed by
 /// somebody who did not touch it.
+///
+/// The negative trust anchors are SIGHUP's too, for the certificate's reason:
+/// a NOTIFY is about a policy zone.
 pub(crate) async fn reload_task(
     certificate: Option<Arc<CertificateStore>>,
+    ntas: Option<NtaFile>,
     serving: Arc<Resolving>,
     wanted: PolicyReload,
     stop: Stop,
 ) {
     let mut signals = reload_signal();
     loop {
-        let certificate = tokio::select! {
+        let (certificate, ntas) = tokio::select! {
             reloaded = next_reload(&mut signals) => {
                 if !reloaded {
                     break;
                 }
-                certificate.as_ref()
+                (certificate.as_ref(), ntas.as_ref())
             }
-            () = wanted.requested() => None,
+            () = wanted.requested() => (None, None),
             () = stop.wait() => break,
         };
-        reload_now(certificate, &serving).await;
+        reload_now(certificate, ntas, &serving).await;
     }
 }
 
 /// One reload, on a blocking thread.
-async fn reload_now(certificate: Option<&Arc<CertificateStore>>, serving: &Arc<Resolving>) {
+async fn reload_now(
+    certificate: Option<&Arc<CertificateStore>>,
+    ntas: Option<&NtaFile>,
+    serving: &Arc<Resolving>,
+) {
     let certificate = certificate.cloned();
+    let ntas = ntas.cloned();
     let serving = serving.clone();
     let ran = tokio::task::spawn_blocking(move || {
         if let Some(store) = certificate {
@@ -112,6 +122,9 @@ async fn reload_now(certificate: Option<&Arc<CertificateStore>>, serving: &Arc<R
                 Ok(()) => tracing::info!("TLS certificate re-read"),
                 Err(e) => tracing::warn!("could not re-read the TLS certificate: {e:#}"),
             }
+        }
+        if let Some(NtaFile(path)) = ntas {
+            crate::nta::reload(&serving, &path);
         }
         reload_policy(&serving);
     })
@@ -213,7 +226,7 @@ mod tests {
         tokio::task::yield_now().await;
         let before = ticks.load(Ordering::Relaxed);
 
-        tokio::spawn(async move { reload_now(None, &serving).await })
+        tokio::spawn(async move { reload_now(None, None, &serving).await })
             .await
             .expect("the reload finished");
         let during = ticks.load(Ordering::Relaxed) - before;

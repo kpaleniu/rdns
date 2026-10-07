@@ -347,6 +347,9 @@ pub struct ResolverConfig {
     /// answered — BIND's `request-nsid`, off by default as there (`TODO.md`
     /// #189).
     pub request_nsid: bool,
+    /// Subtrees exempt from validation for a while (RFC 7646, `TODO.md`
+    /// #176). Empty unless the daemon loads some.
+    pub ntas: crate::nta::SharedNtas,
 }
 
 /// Trust anchors the resolver validates against, replaceable while it runs
@@ -421,6 +424,7 @@ impl Default for ResolverConfig {
             // misconfigured zone into a failure, so it is the operator's call.
             dnssec: None,
             request_nsid: false,
+            ntas: crate::nta::SharedNtas::default(),
         }
     }
 }
@@ -654,6 +658,16 @@ impl Resolver {
         })
     }
 
+    /// The negative trust anchors this resolver consults (RFC 7646).
+    pub fn ntas(&self) -> &crate::nta::SharedNtas {
+        &self.config.ntas
+    }
+
+    /// The positive trust anchors in force, if this resolver validates.
+    pub fn trust_anchors(&self) -> Option<TrustAnchors> {
+        self.config.dnssec.as_ref().map(SharedAnchors::get)
+    }
+
     pub fn mode(&self) -> ResolverMode {
         self.config.mode
     }
@@ -680,10 +694,31 @@ impl Resolver {
         query: &QuerySection,
         policy: Option<&dyn NameserverPolicy>,
     ) -> Result<(DnsMessage, ValidationState), ResolveError> {
-        let timer = self.config.resolution_timer;
         // Cancelled, not checked between sends, so an exchange in progress
         // cannot overrun it as PowerDNS's summed `max-total-msec` can.
-        match tokio::time::timeout(timer.duration(), self.resolve_untimed(query, policy)).await {
+        self.resolve_timed(query, policy, Ntas::Honoured).await
+    }
+
+    /// As [`Resolver::resolve_validated`], validating as if no negative trust
+    /// anchor were in force: RFC 7646 §4's recheck, which asks whether the
+    /// zone under one validates again.
+    pub async fn resolve_ignoring_ntas(
+        &self,
+        query: &QuerySection,
+    ) -> Result<(DnsMessage, ValidationState), ResolveError> {
+        self.resolve_timed(query, None, Ntas::Ignored).await
+    }
+
+    async fn resolve_timed(
+        &self,
+        query: &QuerySection,
+        policy: Option<&dyn NameserverPolicy>,
+        ntas: Ntas,
+    ) -> Result<(DnsMessage, ValidationState), ResolveError> {
+        let timer = self.config.resolution_timer;
+        match tokio::time::timeout(timer.duration(), self.resolve_untimed(query, policy, ntas))
+            .await
+        {
             Ok(resolved) => resolved,
             // Not `?`: `From<Elapsed>` reads a timeout as one exchange's
             // `NoResponse`.
@@ -695,6 +730,7 @@ impl Resolver {
         &self,
         query: &QuerySection,
         policy: Option<&dyn NameserverPolicy>,
+        ntas: Ntas,
     ) -> Result<(DnsMessage, ValidationState), ResolveError> {
         let mut state = Resolution::new(self.config.query_budget, policy);
         let mut response = match self.config.mode {
@@ -720,6 +756,25 @@ impl Resolver {
         // Taken once for the whole resolve: anchors changing mid-walk would
         // trust a key for one step and not the next.
         let anchors = anchors.get();
+        // RFC 7646 §1.1: under an NTA the answer is treated "as if the zone is
+        // unsigned", AD clear. Indeterminate and not Insecure: nothing proved
+        // it unsigned, an operator said to stop asking. No EDE — RFC 8914 has
+        // no code for it.
+        if ntas == Ntas::Honoured {
+            if let Some(nta) =
+                self.config
+                    .ntas
+                    .covering(query.qname.as_ref(), self.clock.now(), &anchors)
+            {
+                return Ok((
+                    response,
+                    ValidationState::Indeterminate(format!(
+                        "negative trust anchor at {} until {}",
+                        nta.name, nta.until
+                    )),
+                ));
+            }
+        }
         let mut verdict = self.validate(query, &response, &mut state, &anchors).await;
         // The failure is the one place the instance behind an anycast address
         // is worth more than a DEBUG line (`TODO.md` #189).
@@ -875,6 +930,13 @@ fn randomize_case(name: NameRef<'_>) -> Name {
         // Folding case changes no length octet, so this cannot fail; taking
         // the name unscrambled if it somehow did costs entropy, not an answer.
         .unwrap_or_else(|_| name.to_owned())
+}
+
+/// Whether a resolution consults the negative trust anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ntas {
+    Honoured,
+    Ignored,
 }
 
 /// The NSID an upstream put in its reply, if it put one there (RFC 5001).

@@ -35,6 +35,15 @@ use crate::{NameRef, Qtype};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NameKeyBuf(Box<[u8]>);
 
+/// Whether a key's folded octets name `node` or something below it.
+///
+/// One predicate for every cache keyed by these octets, so a subtree flush
+/// cannot be written two ways (`CLAUDE.md` §7). A key that is somehow not a
+/// name is kept: dropping it would be a flush of something nobody named.
+pub fn is_at_or_below(key: &[u8], node: NameRef<'_>) -> bool {
+    NameRef::from_wire_slice(key).is_ok_and(|name| name.is_at_or_under(node))
+}
+
 impl NameKeyBuf {
     /// Fold `name` into key form. The only way to make one.
     pub fn new(name: NameRef<'_>) -> NameKeyBuf {

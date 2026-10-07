@@ -24,6 +24,7 @@ mod config;
 #[cfg(test)]
 mod flood;
 mod inflight;
+mod nta;
 mod prefetch;
 mod reload;
 mod rpz_transfer;
@@ -260,6 +261,17 @@ struct Cli {
     /// a new path is enough to start.
     #[arg(long, conflicts_with = "config")]
     auto_trust_anchor: Option<std::path::PathBuf>,
+    /// A file of negative trust anchors (RFC 7646): subtrees answered without
+    /// validation until a set time, for a zone whose DNSSEC its owner broke.
+    /// Needs --dnssec-validate.
+    ///
+    /// One per line, `NAME UNTIL [norecheck]`, `UNTIL` in UTC as
+    /// `YYYYMMDDHHmmSS` or Unix seconds, at most a week ahead (§4). Re-read on
+    /// SIGHUP; a file that does not load keeps the set in force. Each zone is
+    /// asked every five minutes whether it validates again, and its anchor
+    /// lifted when it does, unless `norecheck`.
+    #[arg(long, value_name = "PATH", conflicts_with = "config")]
+    negative_trust_anchors: Option<PathBuf>,
     /// How much to say: error, warn, info, debug or trace.
     ///
     /// Nothing per-query is above `debug`. `RUST_LOG` overrides it, so a
@@ -817,6 +829,19 @@ async fn main() -> anyhow::Result<()> {
         };
         shared_anchors = Some(SharedAnchors::new(in_force));
         config.dnssec = shared_anchors.clone();
+        // Above the dry run, as every file is (`CLAUDE.md` §15).
+        if let Some(path) = &cli.negative_trust_anchors {
+            let anchors = shared_anchors.as_ref().map(SharedAnchors::get);
+            config.ntas = rdns::nta::SharedNtas::new(nta::load(
+                path,
+                current_unix_timestamp(),
+                anchors.as_ref(),
+            )?);
+        }
+    } else if cli.negative_trust_anchors.is_some() {
+        // Refused, not warned: an exemption from validation that does not
+        // validate is a setting the operator believes is in force and is not.
+        bail!("--negative-trust-anchors exempts names from validation, and there is none: add --dnssec-validate");
     } else if cli.trust_anchor.is_some() || cli.auto_trust_anchor.is_some() {
         tracing::warn!(
             "--trust-anchor and --auto-trust-anchor do nothing without --dnssec-validate"
@@ -834,6 +859,7 @@ async fn main() -> anyhow::Result<()> {
         ResolverMode::Recurse => "recursing from the built-in root hints".to_string(),
         ResolverMode::Forward => format!("forwarding to {:?}", config.upstream_servers),
     };
+    let serving_ntas = config.ntas.clone();
     let resolver = Arc::new(Resolver::new(config));
 
     // A task of its own: following the anchors resolves, so it needs the
@@ -1141,6 +1167,18 @@ async fn main() -> anyhow::Result<()> {
     // exists to stop, and one answered here is a name an internal zone cannot
     // serve.
     tracing::info!("empty zones (RFC 6303): {}", empty_zones.describe());
+    // Printed because every name under one is answered unvalidated.
+    if let Some(path) = &cli.negative_trust_anchors {
+        let ntas = serving_ntas.snapshot();
+        tracing::info!(
+            "negative trust anchors (RFC 7646): {} from {}{}",
+            ntas.len(),
+            path.display(),
+            ntas.iter()
+                .map(|n| format!(", {} until {}", n.name, n.until))
+                .collect::<String>()
+        );
+    }
 
     if let Some(dns64) = dns64.as_ref() {
         tracing::info!(
@@ -1315,9 +1353,18 @@ async fn main() -> anyhow::Result<()> {
     //
     // Not in the `JoinSet` below: that set's rule is "the first task to end ends
     // the process", and this one ends on the stop signal by design.
-    if encrypted.is_some() || serving.policy.is_configured() {
+    let nta_file = cli.negative_trust_anchors.clone().map(nta::NtaFile);
+    if nta_file.is_some() {
+        serving
+            .ctx
+            .metrics
+            .negative_trust_anchors(serving.resolver.ntas().snapshot().len());
+        nta::spawn_maintainer(serving.clone(), shutdown.stop_handle(), shutdown.busy());
+    }
+    if encrypted.is_some() || serving.policy.is_configured() || nta_file.is_some() {
         tokio::spawn(reload::reload_task(
             encrypted.as_ref().map(Encrypted::store),
+            nta_file,
             serving.clone(),
             reload,
             shutdown.stop_handle(),

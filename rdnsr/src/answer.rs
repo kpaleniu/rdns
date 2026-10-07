@@ -303,12 +303,21 @@ pub(crate) async fn handle_query(
     // third is RFC 8914's reason, which only the two failing arms have.
     //
     // RFC 8198 synthesis is skipped for CD, which asks us not to filter on the
-    // client's behalf.
+    // client's behalf, and under a negative trust anchor: a proof validated in
+    // the zone above would answer the exempted names as secure, and that
+    // zone's proofs cannot be flushed by subtree (`TODO.md` #176).
     let prefetching = refreshes.as_ref().is_some_and(Refreshes::prefetching);
+    let under_nta = !resolver.ntas().is_empty()
+        && resolver.trust_anchors().is_some_and(|anchors| {
+            resolver
+                .ntas()
+                .covering(query.qname.as_ref(), ctx.clock.now(), &anchors)
+                .is_some()
+        });
     let hit = match caches.lookup(
         query.qname.as_ref(),
         query.qtype,
-        !checking_disabled,
+        !checking_disabled && !under_nta,
         prefetching,
     ) {
         Some(Held::Answer(hit)) => Some(hit),

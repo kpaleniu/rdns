@@ -473,6 +473,26 @@ bits 64-71 reserved and zero in every form but the /96.
 
 ---
 
+## 5.7a Negative trust anchors (RFC 7646, `--negative-trust-anchors`)
+
+A file of `NAME UNTIL [norecheck]` lines, `UNTIL` in UTC as `YYYYMMDDHHmmSS` or
+Unix seconds. Loaded before the dry run, refused without `--dnssec-validate`,
+refused whole for a line that does not parse or one more than a week ahead
+(§4); a lapsed line is skipped with a warning. Re-read on SIGHUP; a file that
+does not load keeps the set in force.
+
+A name at or below a node is answered `Indeterminate`, AD clear, no EDE —
+unless a positive anchor lies strictly between, where validation resumes
+(§1.1). An anchor at the node itself is overridden, with a warning (§3).
+RFC 8198 synthesis is skipped under one: a proof from the zone above would
+answer the exempted names as secure, and cannot be flushed by subtree.
+
+Expiry at `UNTIL` and the recheck run in one task: every 5 minutes (BIND's
+`nta-recheck`) an SOA query at the node, validated ignoring the anchors; Secure
+or Insecure lifts it in memory and logs. Every add, change, lift and expiry
+flushes the answer, negative and denial caches at and below the node, and logs.
+`dns_negative_trust_anchors` is the count in force.
+
 ## 5.8 Names that never leave (`special_names.rs`)
 
 Answered locally with AA=1, never forwarded, each with a reason recorded for
