@@ -154,6 +154,73 @@ pub(super) struct RttStore {
     capacity: usize,
 }
 
+/// The NSID last seen from each upstream address (`TODO.md` #189).
+///
+/// INFO when the instance behind an address changes — the first sighting
+/// included — and DEBUG otherwise, so the log says when an anycast route moved
+/// rather than repeating every reply. Keyed on the address, which is this
+/// resolver's own configuration or a delegation it followed, and bounded all
+/// the same, as `RttStore` is (`CLAUDE.md` §5): past `capacity` the oldest
+/// half is forgotten and re-learned at INFO.
+#[derive(Debug)]
+pub(super) struct NsidStore {
+    seen: Mutex<NsidTable>,
+    capacity: usize,
+}
+
+#[derive(Debug, Default)]
+struct NsidTable {
+    by_server: HashMap<SocketAddr, (Vec<u8>, u64)>,
+    next: u64,
+}
+
+impl NsidStore {
+    pub(super) fn new(capacity: usize) -> Self {
+        NsidStore {
+            seen: Mutex::new(NsidTable::default()),
+            capacity,
+        }
+    }
+
+    /// Note that `server` answered `response` with `nsid`, log it, and say
+    /// whether the instance changed.
+    pub(super) fn observe(&self, server: SocketAddr, response: &DnsMessage, nsid: &[u8]) -> bool {
+        let shown = crate::config::show_nsid(nsid);
+        let question = response.queries.first();
+        let qname = question.map(|q| q.qname.to_string()).unwrap_or_default();
+        let qtype = question.map(|q| q.qtype.to_string()).unwrap_or_default();
+        // Poisoned: nothing panics holding this lock; logging at DEBUG is the
+        // direction that cannot flood.
+        let changed = match self.seen.lock() {
+            Ok(mut table) if self.capacity > 0 => {
+                let NsidTable { by_server, next } = &mut *table;
+                *next += 1;
+                let seq = *next;
+                let changed = by_server.get(&server).is_none_or(|(old, _)| old != nsid);
+                if changed {
+                    if !by_server.contains_key(&server) && by_server.len() >= self.capacity {
+                        halve(by_server, self.capacity, |(_, seq)| *seq);
+                    }
+                    by_server.insert(server, (nsid.to_vec(), seq));
+                }
+                changed
+            }
+            _ => false,
+        };
+        if changed {
+            tracing::info!(%server, %qname, %qtype, nsid = %shown, "upstream instance (NSID)");
+        } else {
+            tracing::debug!(%server, %qname, %qtype, nsid = %shown, "upstream NSID");
+        }
+        changed
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.seen.lock().map_or(0, |t| t.by_server.len())
+    }
+}
+
 /// Weight of the newest sample in the moving average; the SRTT smoothing factor
 /// of RFC 6298.
 const RTT_ALPHA: f64 = 0.25;

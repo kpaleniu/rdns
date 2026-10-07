@@ -106,6 +106,8 @@ struct ResolverSection {
     #[serde(default)]
     no_cache: bool,
     #[serde(default)]
+    request_nsid: bool,
+    #[serde(default)]
     dnssec_validate: bool,
     trust_anchor: Option<PathBuf>,
     auto_trust_anchor: Option<PathBuf>,
@@ -145,6 +147,7 @@ impl Default for ResolverSection {
             root_hints: None,
             cache_size: crate::default_cache_size(),
             no_cache: false,
+            request_nsid: false,
             dnssec_validate: false,
             trust_anchor: None,
             auto_trust_anchor: None,
@@ -415,6 +418,7 @@ impl Config {
             root_hints,
             cache_size,
             no_cache,
+            request_nsid,
             dnssec_validate,
             trust_anchor,
             auto_trust_anchor,
@@ -433,6 +437,7 @@ impl Config {
         cli.root_hints = root_hints.clone();
         cli.cache_size = *cache_size;
         cli.no_cache = *no_cache;
+        cli.request_nsid = *request_nsid;
         cli.dnssec_validate = *dnssec_validate;
         cli.trust_anchor = trust_anchor.clone();
         cli.auto_trust_anchor = auto_trust_anchor.clone();

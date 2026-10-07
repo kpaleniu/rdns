@@ -381,6 +381,11 @@ impl Resolver {
             if let Ok(response) = self.query_server(&server, out).await {
                 self.rtt
                     .record(&server, started.elapsed().as_secs_f64() * 1000.0);
+                if self.config.request_nsid {
+                    if let Some(nsid) = nsid_of(&response) {
+                        self.nsids.observe(server, &response, &nsid);
+                    }
+                }
                 return Some(response);
             }
             // A server that failed or timed out is charged the full timeout, so

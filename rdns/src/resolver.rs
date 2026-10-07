@@ -154,7 +154,7 @@ mod validate;
 
 pub use upstream::{Answering, Reply, Transport, Upstream};
 
-use caches::{DelegationCache, KeyCache, RttStore, Start};
+use caches::{DelegationCache, KeyCache, NsidStore, RttStore, Start};
 
 /// A DNS message sent over TCP is prefixed with a 2-byte big-endian length
 /// (RFC 1035 §4.2.2), so no message can exceed what that field can express.
@@ -343,6 +343,10 @@ pub struct ResolverConfig {
     /// returns SERVFAIL leaves nothing to check, which is the same as trusting
     /// it.
     pub dnssec: Option<SharedAnchors>,
+    /// Ask every upstream for its NSID (RFC 5001 §2.1) and log which instance
+    /// answered — BIND's `request-nsid`, off by default as there (`TODO.md`
+    /// #189).
+    pub request_nsid: bool,
 }
 
 /// Trust anchors the resolver validates against, replaceable while it runs
@@ -416,6 +420,7 @@ impl Default for ResolverConfig {
             // Off by default: validation costs round trips and turns a
             // misconfigured zone into a failure, so it is the operator's call.
             dnssec: None,
+            request_nsid: false,
         }
     }
 }
@@ -590,6 +595,9 @@ pub struct Resolver {
     /// Per-server round-trip times. Shares its bound with the delegation cache;
     /// 0 disables recording, and `order` then keeps the input order.
     rtt: RttStore,
+    /// The NSID last seen from each upstream address, for `request_nsid`.
+    /// Bounded like `rtt`.
+    nsids: NsidStore,
     /// Zones whose DNSKEY set we have already validated.
     keys: KeyCache,
     /// The one every read on this resolver's request path goes through
@@ -612,11 +620,13 @@ impl Resolver {
     pub fn with_clock(config: ResolverConfig, clock: Clock) -> Self {
         let delegations = DelegationCache::new(config.delegation_cache_size, clock.clone());
         let rtt = RttStore::new(config.delegation_cache_size);
+        let nsids = NsidStore::new(config.delegation_cache_size);
         let keys = KeyCache::new(config.delegation_cache_size, clock.clone());
         Resolver {
             config,
             delegations,
             rtt,
+            nsids,
             keys,
             clock,
             upstream: Upstream::Network,
@@ -710,7 +720,22 @@ impl Resolver {
         // Taken once for the whole resolve: anchors changing mid-walk would
         // trust a key for one step and not the next.
         let anchors = anchors.get();
-        let verdict = self.validate(query, &response, &mut state, &anchors).await;
+        let mut verdict = self.validate(query, &response, &mut state, &anchors).await;
+        // The failure is the one place the instance behind an anycast address
+        // is worth more than a DEBUG line (`TODO.md` #189).
+        if let (ValidationState::Bogus(bogus), Some(nsid)) = (
+            &mut verdict,
+            self.config
+                .request_nsid
+                .then(|| nsid_of(&response))
+                .flatten(),
+        ) {
+            bogus.why = format!(
+                "{} (answered by NSID {})",
+                bogus.why,
+                crate::config::show_nsid(&nsid)
+            );
+        }
         Ok((response, verdict))
     }
 
@@ -771,7 +796,21 @@ impl Resolver {
         // EDNS0 to exceed 512 bytes, DO to get signatures. CD goes with DO: we
         // do the checking, so the upstream must not withhold what it judged
         // bogus.
-        let mut edns = Edns::with_payload_size(self.config.udp_payload_size);
+        // RFC 5001 §2.1: "The resolver MUST NOT include any NSID payload data
+        // in the query message", so the option is empty.
+        let mut edns = if self.config.request_nsid {
+            Edns::with_options(
+                self.config.udp_payload_size,
+                crate::EDNS_VERSION,
+                false,
+                &[crate::EdnsOption {
+                    code: crate::EDNS_OPTION_NSID,
+                    data: Vec::new(),
+                }],
+            )?
+        } else {
+            Edns::with_payload_size(self.config.udp_payload_size)
+        };
         edns.do_bit = self.config.dnssec.is_some();
         msg.cd = self.config.dnssec.is_some();
         msg.set_edns(edns);
@@ -836,6 +875,16 @@ fn randomize_case(name: NameRef<'_>) -> Name {
         // Folding case changes no length octet, so this cannot fail; taking
         // the name unscrambled if it somehow did costs entropy, not an answer.
         .unwrap_or_else(|_| name.to_owned())
+}
+
+/// The NSID an upstream put in its reply, if it put one there (RFC 5001).
+fn nsid_of(response: &DnsMessage) -> Option<Vec<u8>> {
+    response
+        .edns
+        .as_ref()?
+        .option(crate::EDNS_OPTION_NSID)
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
@@ -4112,5 +4161,155 @@ this line has no record and is skipped
 
         let (_, second) = resolver.resolve_validated(&query, None).await.unwrap();
         assert_eq!(second, ValidationState::Secure, "{second}");
+    }
+
+    /// `--request-nsid` (`TODO.md` #189): every upstream query carries an empty
+    /// NSID option when on and none when off, the instance behind an address
+    /// is reported when it changes, and a bogus answer names it.
+    mod request_nsid {
+        use super::*;
+
+        fn nsid_in(query: &DnsMessage) -> Option<Vec<u8>> {
+            nsid_of(query)
+        }
+
+        /// A forwarder whose upstream answers NOERROR with `nsid`, recording
+        /// the NSID option of each query it is sent.
+        /// The NSID option of each query the mock was sent.
+        type Seen = Arc<Mutex<Vec<Option<Vec<u8>>>>>;
+
+        fn forwarder(request_nsid: bool, nsid: &'static [u8]) -> (Resolver, Seen) {
+            let seen: Seen = Arc::default();
+            let log = seen.clone();
+            let upstream = Upstream::answering(move |_, _, query| {
+                let query = DnsMessage::try_from_bytes(query).ok()?;
+                log.lock().unwrap().push(nsid_in(&query));
+                let mut reply = response_to(&query);
+                reply.set_edns(
+                    Edns::with_options(
+                        1232,
+                        0,
+                        false,
+                        &[crate::EdnsOption {
+                            code: crate::EDNS_OPTION_NSID,
+                            data: nsid.to_vec(),
+                        }],
+                    )
+                    .unwrap(),
+                );
+                reply.to_bytes_within(4096).ok()
+            });
+            let config = ResolverConfig {
+                request_nsid,
+                mode: ResolverMode::Forward,
+                upstream_servers: vec![fake(9)],
+                ..ResolverConfig::default()
+            };
+            (Resolver::new(config).with_upstream(upstream), seen)
+        }
+
+        fn www() -> QuerySection {
+            QuerySection {
+                qname: nm("www.example.test."),
+                qtype: Qtype::of(rt::A),
+                qclass: QueryClass::IN,
+            }
+        }
+
+        /// RFC 5001 §2.1: the resolver "MUST NOT include any NSID payload
+        /// data in the query message". Watched failing with the option left
+        /// out of `build_query`.
+        #[tokio::test]
+        async fn every_upstream_query_carries_an_empty_nsid_option_when_on() {
+            let (off, seen) = forwarder(false, b"node-a");
+            off.resolve_validated(&www(), None).await.expect("answered");
+            assert_eq!(seen.lock().unwrap().as_slice(), &[None]);
+
+            let (on, seen) = forwarder(true, b"node-a");
+            on.resolve_validated(&www(), None).await.expect("answered");
+            assert_eq!(seen.lock().unwrap().as_slice(), &[Some(Vec::new())]);
+        }
+
+        /// The first sighting and every change are reported; a repeat is not.
+        #[test]
+        fn the_instance_is_reported_when_it_changes() {
+            let store = caches::NsidStore::new(16);
+            let reply = DnsMessage::try_from_bytes(
+                &crate::DnsMessageBuilder::new()
+                    .with_query(nm("www.example.test."), Qtype::of(rt::A))
+                    .build()
+                    .to_bytes_within(512)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(store.observe(fake(1), &reply, b"node-a"), "first sighting");
+            assert!(!store.observe(fake(1), &reply, b"node-a"), "the same again");
+            assert!(store.observe(fake(1), &reply, b"node-b"), "the route moved");
+            assert!(store.observe(fake(2), &reply, b"node-b"), "another address");
+        }
+
+        /// §5: keyed on addresses, so bounded; past the bound the oldest go.
+        #[test]
+        fn the_table_stays_within_its_bound() {
+            let store = caches::NsidStore::new(4);
+            let reply = DnsMessage::try_from_bytes(
+                &crate::DnsMessageBuilder::new()
+                    .with_query(nm("www.example.test."), Qtype::of(rt::A))
+                    .build()
+                    .to_bytes_within(512)
+                    .unwrap(),
+            )
+            .unwrap();
+            for n in 1..=20 {
+                store.observe(fake(n), &reply, b"node");
+                assert!(store.len() <= 4, "{} after {n}", store.len());
+            }
+        }
+
+        /// A bogus answer names the instance that gave it; the resolver
+        /// never puts an upstream's NSID anywhere a client could get it,
+        /// which is `rdnsr`'s mirror building a fresh OPT.
+        #[tokio::test]
+        async fn a_bogus_answer_names_the_instance() {
+            let h = signed_hierarchy(signed_ds, |auth| {
+                let real = a_record("www.example.test.", [192, 0, 2, 1]);
+                let sig = auth.sign_records(std::slice::from_ref(&real));
+                vec![a_record("www.example.test.", [6, 6, 6, 6]), sig]
+            });
+            let net = h.net.clone();
+            let upstream = Upstream::answering(move |server, _, query| {
+                let answer = net.0.lock().unwrap().get(&server)?.clone();
+                let query = DnsMessage::try_from_bytes(query).ok()?;
+                let mut reply = answer(&query);
+                reply.set_edns(
+                    Edns::with_options(
+                        1232,
+                        0,
+                        true,
+                        &[crate::EdnsOption {
+                            code: crate::EDNS_OPTION_NSID,
+                            data: b"node-a".to_vec(),
+                        }],
+                    )
+                    .unwrap(),
+                );
+                reply.to_bytes_within(u16::MAX as usize).ok()
+            });
+            let config = ResolverConfig {
+                request_nsid: true,
+                ..validating_config(&h)
+            };
+            let (_, state) = Resolver::new(config)
+                .with_upstream(upstream)
+                .resolve_validated(&www(), None)
+                .await
+                .expect("resolved");
+            match state {
+                ValidationState::Bogus(bogus) => {
+                    assert!(bogus.why.contains("NSID node-a"), "{}", bogus.why)
+                }
+                other => panic!("expected bogus, got {other}"),
+            }
+        }
     }
 }

@@ -79,7 +79,8 @@ pub fn parse_nsid(spec: &str) -> ConfigResult<Vec<u8>> {
     Ok(bytes)
 }
 
-/// An NSID for the startup line: the text when it is printable, hex otherwise.
+/// An NSID for a log line: the text when it is printable, hex otherwise — a
+/// line must not carry an upstream's control characters (`TODO.md` #189).
 pub fn show_nsid(nsid: &[u8]) -> String {
     if nsid.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
         String::from_utf8_lossy(nsid).into_owned()

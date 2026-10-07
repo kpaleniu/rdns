@@ -3750,6 +3750,66 @@ mod tests {
         }
     }
 
+    /// An upstream's NSID never reaches a client (RFC 5001 §2.1-§2.2,
+    /// `TODO.md` #189): the reply carries this resolver's own, here none, even
+    /// to a client that asked and with `--request-nsid` on.
+    #[tokio::test]
+    async fn an_upstreams_nsid_is_not_passed_on() {
+        let upstream = rdns::resolver::Upstream::answering(|_, _, query| {
+            let mut reply = DnsMessage::try_from_bytes(query).ok()?;
+            reply.response = true;
+            reply.answers = vec![a_record(&reply.queries[0].qname.clone(), 300)];
+            reply.set_edns(
+                Edns::with_options(
+                    1232,
+                    0,
+                    false,
+                    &[rdns::EdnsOption {
+                        code: 3,
+                        data: b"node-a".to_vec(),
+                    }],
+                )
+                .ok()?,
+            );
+            reply.to_bytes_within(4096).ok()
+        });
+        let resolver = rdns::resolver::Resolver::new(rdns::resolver::ResolverConfig {
+            mode: rdns::resolver::ResolverMode::Forward,
+            upstream_servers: vec!["198.51.100.1:53".parse().expect("an address")],
+            request_nsid: true,
+            ..Default::default()
+        })
+        .with_upstream(upstream);
+        let serving = serving(Arc::new(resolver), test_shell(), PolicyZones::default());
+        let mut msg =
+            DnsMessage::try_from_bytes(&query_for("www.example.net.", 1, false)).expect("parses");
+        msg.set_edns(
+            Edns::with_options(
+                1232,
+                0,
+                false,
+                &[rdns::EdnsOption {
+                    code: 3,
+                    data: Vec::new(),
+                }],
+            )
+            .expect("options"),
+        );
+        let bytes = handle_query(
+            msg.to_bytes_within(512).expect("serialize"),
+            test_peer(),
+            current_unix_timestamp(),
+            &serving,
+            Transport::Udp,
+        )
+        .await
+        .expect("answered");
+        let reply = DnsMessage::try_from_bytes(&bytes).expect("a reply");
+        assert_eq!(reply.answers.len(), 1, "resolved through the upstream");
+        let options = reply.edns.expect("the OPT").options().expect("options");
+        assert!(options.iter().all(|o| o.code != 3), "{options:?}");
+    }
+
     /// NSID (RFC 5001) through this daemon's mirror: answered with the
     /// configured value when asked, whatever the request carried, and not
     /// otherwise (`TODO.md` #179). `localhost`, so nothing is resolved.

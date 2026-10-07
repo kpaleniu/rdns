@@ -229,6 +229,12 @@ struct Cli {
     /// Disable caching entirely.
     #[arg(long, conflicts_with = "config")]
     no_cache: bool,
+    /// Ask every upstream for its NSID (RFC 5001) and log which instance
+    /// answered: INFO when the instance behind an address changes, DEBUG
+    /// otherwise, and beside a validation failure. Off by default, as BIND's
+    /// `request-nsid` is. An upstream's NSID never reaches a client.
+    #[arg(long, conflicts_with = "config")]
+    request_nsid: bool,
     /// Validate DNSSEC on resolved answers: walk the chain of trust from a
     /// trust anchor, set AD only on answers that verify, and refuse to serve
     /// ones that fail (SERVFAIL, unless the client sets CD).
@@ -737,6 +743,7 @@ async fn main() -> anyhow::Result<()> {
     let mut config = ResolverConfig {
         udp_payload_size: udp.advertised(),
         resolution_timer: cli.resolution_timer,
+        request_nsid: cli.request_nsid,
         ..ResolverConfig::default()
     };
     if cli.upstream.is_empty() {
