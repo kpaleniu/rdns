@@ -144,7 +144,7 @@ fn context_at(clock: Clock) -> ServeContext {
     ServeContext {
         limiter: Arc::new(RateLimiter::with_defaults()),
         responses: Arc::new(ResponseLimiter::disabled()),
-        validator: Arc::new(AdmissionCheck::with_defaults()),
+        admission: Arc::new(AdmissionCheck::with_defaults()),
         logger: Arc::new(QueryLogger::new()),
         metrics: Arc::new(DnsMetrics::new()),
         udp: UdpSizes::default(),

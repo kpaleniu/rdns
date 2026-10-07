@@ -49,7 +49,7 @@ pub(crate) fn test_shell() -> Arc<ServeContext> {
         responses: Arc::new(ResponseLimiter::disabled()),
         metrics: Arc::new(DnsMetrics::new()),
         logger: Arc::new(QueryLogger::new()),
-        validator: Arc::new(AdmissionCheck::with_defaults()),
+        admission: Arc::new(AdmissionCheck::with_defaults()),
         udp: rdns::UdpSizes::default(),
         per_source: Default::default(),
         acl: rdns_transport::QueryAcl::Open,
@@ -292,6 +292,14 @@ impl SignedZone {
     /// answers with [`SignedZone::reply`], and the count of what it was asked
     /// other than the DNSKEY RRset.
     pub(crate) fn upstream(self) -> (Arc<Resolver>, Arc<AtomicUsize>) {
+        self.upstream_altering(|_| {})
+    }
+
+    /// The same, with every reply passed through `alter` before it is sent.
+    pub(crate) fn upstream_altering(
+        self,
+        alter: impl Fn(&mut DnsMessage) + Send + Sync + 'static,
+    ) -> (Arc<Resolver>, Arc<AtomicUsize>) {
         let asked = Arc::new(AtomicUsize::new(0));
         let config = ResolverConfig {
             mode: ResolverMode::Forward,
@@ -305,7 +313,9 @@ impl SignedZone {
             if !query.queries[0].qtype.is(record_types::DNSKEY) {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
-            self.reply(&query).to_bytes_within(4096).ok()
+            let mut reply = self.reply(&query);
+            alter(&mut reply);
+            reply.to_bytes_within(4096).ok()
         });
         let resolver = Resolver::new(config).with_upstream(upstream);
         (Arc::new(resolver), asked)

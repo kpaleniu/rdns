@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use rdns::dns64::Dns64;
 use rdns::dnssec::Bogus;
-use rdns::dnssec_chain::ValidationState;
+use rdns::dnssec_chain::{Outcome, ValidationState};
 use rdns::ede::InfoCode;
 use rdns::metrics::LatencyTimer;
 use rdns::record_types;
@@ -316,12 +316,22 @@ pub(crate) async fn handle_query(
             rcode,
             answers,
             authority,
-            secure,
+            outcome,
         }) => {
             ctx.metrics.count(&ctx.metrics.cache_hits);
+            ctx.metrics.count_outcome(outcome);
             let mut resp = build_response(&msg, answers, rcode);
             resp.authorities = authority;
-            return finish_dns64(resp, secure, None, &client, &query, serving, timer).await;
+            return finish_dns64(
+                resp,
+                outcome.is_secure(),
+                None,
+                &client,
+                &query,
+                serving,
+                timer,
+            )
+            .await;
         }
         None => None,
     };
@@ -342,12 +352,13 @@ pub(crate) async fn handle_query(
         .as_ref()
         .filter(|r| r.stale_first())
         .map(StaleBecause::First);
-    let (mut resp, secure, why) = if let Some(hit) = hit {
+    // The outcome is `None` where there is none to report: a resolution
+    // that failed, or one a policy stopped.
+    let (mut resp, outcome, why) = if let Some(hit) = hit {
         ctx.metrics.count(&ctx.metrics.cache_hits);
-        let (records, secure) = (hit.records, hit.secure);
         (
-            build_response(&msg, records, ResponseCode::Ok),
-            secure,
+            build_response(&msg, hit.records, ResponseCode::Ok),
+            Some(hit.outcome),
             None,
         )
     } else if let Some(stale) =
@@ -413,6 +424,7 @@ pub(crate) async fn handle_query(
                     // checks for itself, and RFC 4035 §3.2.2 requires the
                     // data unfiltered.
                     if !checking_disabled {
+                        ctx.metrics.count_outcome(Outcome::Bogus);
                         let resp = build_response(&msg, Vec::new(), ResponseCode::ServerFailure);
                         return finish(
                             resp,
@@ -427,7 +439,7 @@ pub(crate) async fn handle_query(
                 }
 
                 caches.store(&query, &upstream, &state);
-                (upstream, state.is_secure(), None)
+                (upstream, Some(state.outcome()), None)
             }
             // A nameserver trigger matched, so the walk stopped and the
             // policy has the answer. Nothing was cached: the resolution
@@ -451,7 +463,7 @@ pub(crate) async fn handle_query(
                     // the reason was lost".
                     None => (
                         build_response(&msg, Vec::new(), ResponseCode::ServerFailure),
-                        false,
+                        None,
                         Some(ResolveError::PolicyStopped.extended_error()),
                     ),
                 }
@@ -475,7 +487,7 @@ pub(crate) async fn handle_query(
                     Some(stale) => stale,
                     None => (
                         build_response(&msg, Vec::new(), ResponseCode::ServerFailure),
-                        false,
+                        None,
                         Some(e.extended_error()),
                     ),
                 }
@@ -484,6 +496,12 @@ pub(crate) async fn handle_query(
     };
 
     resp.cd = checking_disabled;
+    // Once per answer a client gets, cache hits included; a prefetch and
+    // DNS64's A query resolve outside this function (`TODO.md` #186).
+    if let Some(outcome) = outcome {
+        ctx.metrics.count_outcome(outcome);
+    }
+    let secure = outcome.is_some_and(Outcome::is_secure);
 
     // The address in an answer is a trigger too (`rpz-ip`): a name nobody
     // blocked that resolves into blocked space. After a cache hit as well as
@@ -738,7 +756,7 @@ fn stale_answer(
     query: &QuerySection,
     ctx: &ServeContext,
     because: StaleBecause<'_>,
-) -> Option<(DnsMessage, bool, Option<ExtendedError>)> {
+) -> Option<(DnsMessage, Option<Outcome>, Option<ExtendedError>)> {
     const UNREACHABLE: &str = "the authoritative servers could not be reached";
     // Not the text above: nothing has been tried, and saying so sends an
     // operator after an outage that is not happening.
@@ -778,7 +796,7 @@ fn stale_answer(
             served(hit.refresh);
             return Some((
                 build_response(request, hit.records, ResponseCode::Ok),
-                hit.secure,
+                Some(hit.outcome),
                 Some(ExtendedError::new(InfoCode::STALE_ANSWER, text)),
             ));
         }
@@ -792,7 +810,11 @@ fn stale_answer(
     } else {
         InfoCode::STALE_ANSWER
     };
-    Some((resp, negative.secure, Some(ExtendedError::new(code, text))))
+    Some((
+        resp,
+        Some(negative.outcome),
+        Some(ExtendedError::new(code, text)),
+    ))
 }
 
 /// What each policy zone holds, by trigger kind.
@@ -2420,6 +2442,106 @@ mod tests {
         }
     }
 
+    /// `[secure, insecure, bogus, indeterminate]` as counted so far.
+    fn outcomes(serving: &Resolving) -> [u64; 4] {
+        Outcome::ALL.map(|o| serving.ctx.metrics.outcome_count(o))
+    }
+
+    /// Every answer a client gets is counted once by what validation concluded
+    /// (`TODO.md` #186): secure resolved and secure again from the cache,
+    /// unanchored, and insecure out of the cache, where it is seeded because
+    /// the signed fixture has no unsigned delegation to prove. A prefetch is
+    /// counted nowhere: no client is getting it.
+    ///
+    /// Watched failing with the count after the answer tuple removed: the
+    /// resolved and cached answers moved nothing.
+    #[tokio::test]
+    async fn each_answer_is_counted_by_what_validation_concluded() {
+        // Outside the anchored zone the fixture's NXDOMAIN proof is the wrong
+        // zone's, which is bogus; an unanchored name gets a plain answer.
+        let (resolver, _asked) = SignedZone::new().upstream_altering(|reply| {
+            let qname = reply.queries[0].qname.clone();
+            if !qname.as_ref().is_at_or_under(nm("example.test.").as_ref()) {
+                reply.rcode = ResponseCode::Ok;
+                reply.authorities.clear();
+                reply.answers = vec![a_record(&qname, 300)];
+            }
+        });
+        let serving = serving(resolver, test_shell(), PolicyZones::default());
+
+        ask(&serving, "x.w.example.test.", record_types::A).await;
+        assert_eq!(outcomes(&serving), [1, 0, 0, 0]);
+        ask(&serving, "x.w.example.test.", record_types::A).await;
+        assert_eq!(outcomes(&serving), [2, 0, 0, 0], "a cache hit is an answer");
+
+        ask(&serving, "www.example.org.", record_types::A).await;
+        assert_eq!(outcomes(&serving), [2, 0, 0, 1], "no anchor covers it");
+
+        let plain = a_question("plain.example.net.");
+        let mut found =
+            DnsMessage::try_from_bytes(&query_for("plain.example.net.", 1, false)).expect("parses");
+        found.response = true;
+        found.answers = vec![a_record(&nm("plain.example.net."), 300)];
+        serving
+            .caches
+            .store(&plain, &found, &ValidationState::Insecure);
+        ask(&serving, "plain.example.net.", record_types::A).await;
+        assert_eq!(outcomes(&serving), [2, 1, 0, 1]);
+
+        refresh(
+            &serving,
+            Refresh {
+                query: a_question("y.w.example.test."),
+                why: Why::Prefetch,
+            },
+        )
+        .await;
+        assert_eq!(
+            outcomes(&serving),
+            [2, 1, 0, 1],
+            "a prefetch is nobody's answer"
+        );
+    }
+
+    /// A signature that does not verify is bogus, counted whether the client
+    /// gets the SERVFAIL or, with CD, the data.
+    #[tokio::test]
+    async fn a_bogus_answer_is_counted_as_bogus() {
+        let (resolver, _asked) = SignedZone::new().upstream_altering(|reply| {
+            for rr in &mut reply.answers {
+                if rr.rdata.rtype() == record_types::RRSIG {
+                    let mut bytes = rr.rdata.bytes().to_vec();
+                    let last = bytes.len() - 1;
+                    bytes[last] ^= 0xff;
+                    rr.rdata =
+                        rdns::RecordData::new(record_types::RRSIG, bytes).expect("still an RRSIG");
+                }
+            }
+        });
+        let serving = serving(resolver, test_shell(), PolicyZones::default());
+        let reply = ask(&serving, "x.w.example.test.", record_types::A).await;
+        assert_eq!(reply.rcode, ResponseCode::ServerFailure);
+        assert_eq!(outcomes(&serving), [0, 0, 1, 0]);
+    }
+
+    /// With validation off the family is absent, not a column of
+    /// indeterminates.
+    #[test]
+    fn the_outcomes_are_in_the_scrape_only_when_validating() {
+        let metrics = rdns::metrics::DnsMetrics::new();
+        metrics.count_outcome(Outcome::Indeterminate);
+        assert!(!metrics
+            .to_prometheus_format()
+            .contains("dns_validation_outcomes_total"));
+        metrics.validating();
+        let scrape = metrics.to_prometheus_format();
+        assert!(
+            scrape.contains("dns_validation_outcomes_total{outcome=\"indeterminate\"} 1"),
+            "{scrape}"
+        );
+        assert!(scrape.contains("dns_validation_outcomes_total{outcome=\"secure\"} 0"));
+    }
+
     /// Which caches a resolution reaches, by what validation concluded and
     /// whether it answered (`TODO.md` #117). Read back through the lookups a
     /// later query makes, so a row is what that query would find.
@@ -2503,7 +2625,7 @@ mod tests {
             .negative(nm("a.example.test.").as_ref(), Qtype::of(record_types::A))
             .expect("the refresh kept the NXDOMAIN");
         // Otherwise the fixture is what failed, and not the storing.
-        assert!(held.secure, "the fixture validates");
+        assert!(held.outcome.is_secure(), "the fixture validates");
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let answered = handle_query(

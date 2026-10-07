@@ -24,6 +24,7 @@
 use crate::cache::{StalePolicy, STALE_ANSWER_TTL};
 use crate::clock::Clock;
 use crate::deadline::Deadline;
+use crate::dnssec_chain::Outcome;
 use crate::eviction::Halving;
 use crate::name_keys::{NameKeyBuf, NameType, NameTypeKey};
 use crate::record_types as rt;
@@ -47,9 +48,9 @@ pub struct NegativeAnswer {
     /// The authority section as it arrived — SOA, any NSEC/NSEC3, and the
     /// signatures over them — with TTLs counted down to what is left.
     pub authority: Vec<ResourceRecord>,
-    /// Whether the answer was DNSSEC-validated when it was stored. The AD bit
-    /// has to survive the cache, and must never be picked up on the way out.
-    pub secure: bool,
+    /// What validation concluded when it was stored. The AD bit has to survive
+    /// the cache, and must never be picked up on the way out.
+    pub outcome: Outcome,
     /// What is left of the negative TTL.
     pub ttl: u32,
     /// A stale "no" whose caller is owed its refresh — the negative half of
@@ -64,7 +65,7 @@ pub struct NegativeAnswer {
 struct Entry {
     rcode: ResponseCode,
     authority: Vec<ResourceRecord>,
-    secure: bool,
+    outcome: Outcome,
     expires_at: Deadline,
     /// When a stale answer may next hand out a refresh
     /// ([`crate::cache::STALE_REFRESH_INTERVAL`]). The epoch on a new entry.
@@ -141,13 +142,19 @@ impl NegativeCache {
 
     /// Store the "no" in `response`, if that is what it is and it may be cached.
     ///
-    /// `secure` must be what validation concluded, and a bogus answer must not
+    /// `outcome` must be what validation concluded, and a bogus answer must not
     /// be offered here at all: a cache is where a mistake outlives its query.
     ///
     /// A response with answer records is skipped: a CNAME chain ending in NODATA
     /// is negative in RFC 2308's terms, but the chain is data with nowhere to go
     /// here.
-    pub fn insert(&self, qname: NameRef<'_>, qtype: Qtype, response: &DnsMessage, secure: bool) {
+    pub fn insert(
+        &self,
+        qname: NameRef<'_>,
+        qtype: Qtype,
+        response: &DnsMessage,
+        outcome: Outcome,
+    ) {
         if self.max_entries == 0 || !response.answers.is_empty() {
             return;
         }
@@ -182,7 +189,7 @@ impl NegativeCache {
         let entry = Entry {
             rcode: response.rcode,
             authority: response.authorities.clone(),
-            secure,
+            outcome,
             expires_at: Deadline::after(now, u64::from(ttl)),
             stale_refresh_after: Deadline::default(),
             learned_at: now,
@@ -350,7 +357,7 @@ impl Entry {
                     ..rr.clone()
                 })
                 .collect(),
-            secure: self.secure,
+            outcome: self.outcome,
             ttl,
             refresh: false,
             learned_at: self.learned_at,
@@ -429,7 +436,7 @@ mod tests {
                 ResponseCode::NoSuchDomain,
                 vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
             ),
-            false,
+            Outcome::Indeterminate,
         );
         clock.advance(61);
 
@@ -475,7 +482,7 @@ mod tests {
                 ResponseCode::Ok,
                 vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
             ),
-            false,
+            Outcome::Indeterminate,
         );
         clock.advance(61);
         assert!(cache
@@ -503,7 +510,7 @@ mod tests {
                 ResponseCode::NoSuchDomain,
                 vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
             ),
-            false,
+            Outcome::Indeterminate,
         );
         clock.advance(61);
         let owed = |name: &str| {
@@ -545,14 +552,19 @@ mod tests {
         };
         for i in 0..10 {
             let name = format!("gone{i}.example.com.");
-            cache.insert(nm(&name).as_ref(), Qtype::of(rt::A), &deny(&name), false);
+            cache.insert(
+                nm(&name).as_ref(),
+                Qtype::of(rt::A),
+                &deny(&name),
+                Outcome::Indeterminate,
+            );
         }
         clock.advance(61);
         cache.insert(
             nm("eleventh.example.com.").as_ref(),
             Qtype::of(rt::A),
             &deny("eleventh.example.com."),
-            false,
+            Outcome::Indeterminate,
         );
 
         let held = cache.len();
@@ -574,7 +586,7 @@ mod tests {
                 ResponseCode::NoSuchDomain,
                 vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
             ),
-            false,
+            Outcome::Indeterminate,
         );
         clock.advance(61);
         assert!(cache
@@ -622,7 +634,7 @@ mod tests {
             nm("nope.example.com.").as_ref(),
             Qtype::of(rt::A),
             &nxdomain_for("nope.example.com."),
-            false,
+            Outcome::Indeterminate,
         );
 
         for qtype in [rt::A, rt::AAAA, rt::MX, rt::TXT] {
@@ -644,7 +656,7 @@ mod tests {
             nm("gone.example.com.").as_ref(),
             Qtype::of(rt::A),
             &nxdomain_for("gone.example.com."),
-            false,
+            Outcome::Indeterminate,
         );
 
         assert!(cache
@@ -675,7 +687,7 @@ mod tests {
             nm("www.example.com.").as_ref(),
             Qtype::of(rt::AAAA),
             &response,
-            false,
+            Outcome::Indeterminate,
         );
 
         let answer = cache
@@ -707,19 +719,29 @@ mod tests {
             )
         };
         let www = nm("www.example.com.");
-        cache.insert(www.as_ref(), a, &nodata("www.example.com."), false);
-        cache.insert(www.as_ref(), aaaa, &nodata("www.example.com."), false);
+        cache.insert(
+            www.as_ref(),
+            a,
+            &nodata("www.example.com."),
+            Outcome::Indeterminate,
+        );
+        cache.insert(
+            www.as_ref(),
+            aaaa,
+            &nodata("www.example.com."),
+            Outcome::Indeterminate,
+        );
         cache.insert(
             nm("gone.example.com.").as_ref(),
             a,
             &nxdomain_for("gone.example.com."),
-            false,
+            Outcome::Indeterminate,
         );
         cache.insert(
             nm("beside.example.com.").as_ref(),
             a,
             &nxdomain_for("beside.example.com."),
-            false,
+            Outcome::Indeterminate,
         );
 
         cache.forget_refuted(www.as_ref(), a);
@@ -758,7 +780,7 @@ mod tests {
             nm("a.example.com.").as_ref(),
             Qtype::of(rt::A),
             &minimum_wins,
-            false,
+            Outcome::Indeterminate,
         );
         assert!(
             cache
@@ -777,7 +799,7 @@ mod tests {
             nm("b.example.com.").as_ref(),
             Qtype::of(rt::A),
             &record_ttl_wins,
-            false,
+            Outcome::Indeterminate,
         );
         assert!(
             cache
@@ -797,7 +819,7 @@ mod tests {
             nm("c.example.com.").as_ref(),
             Qtype::of(rt::A),
             &greedy,
-            false,
+            Outcome::Indeterminate,
         );
         let answer = cache
             .get(nm("c.example.com.").as_ref(), Qtype::of(rt::A))
@@ -819,7 +841,7 @@ mod tests {
             nm("a.example.com.").as_ref(),
             Qtype::of(rt::A),
             &response,
-            false,
+            Outcome::Indeterminate,
         );
 
         let answer = cache
@@ -849,7 +871,7 @@ mod tests {
             nm("a.example.com.").as_ref(),
             Qtype::of(rt::A),
             &negative("a.example.com.", ResponseCode::NoSuchDomain, Vec::new()),
-            false,
+            Outcome::Indeterminate,
         );
         assert!(cache.is_empty());
         assert!(cache
@@ -868,7 +890,7 @@ mod tests {
                 ResponseCode::NoSuchDomain,
                 vec![soa_record("example.com.", 0, Ttl::from_secs(3600))],
             ),
-            false,
+            Outcome::Indeterminate,
         );
         assert!(
             cache
@@ -889,7 +911,7 @@ mod tests {
                 ResponseCode::ServerFailure,
                 vec![soa_record("example.com.", 300, Ttl::from_secs(3600))],
             ),
-            false,
+            Outcome::Indeterminate,
         );
         assert!(cache.is_empty());
     }
@@ -913,7 +935,7 @@ mod tests {
             nm("www.example.com.").as_ref(),
             Qtype::of(rt::AAAA),
             &response,
-            false,
+            Outcome::Indeterminate,
         );
         assert!(cache.is_empty());
     }
@@ -926,27 +948,25 @@ mod tests {
             nm("a.example.com.").as_ref(),
             Qtype::of(rt::A),
             &nxdomain_for("a.example.com."),
-            true,
+            Outcome::Secure,
         );
         cache.insert(
             nm("b.example.com.").as_ref(),
             Qtype::of(rt::A),
             &nxdomain_for("b.example.com."),
-            false,
+            Outcome::Indeterminate,
         );
 
-        assert!(
-            cache
-                .get(nm("a.example.com.").as_ref(), Qtype::of(rt::A))
-                .unwrap()
-                .secure
-        );
-        assert!(
-            !cache
-                .get(nm("b.example.com.").as_ref(), Qtype::of(rt::A))
-                .unwrap()
-                .secure
-        );
+        assert!(cache
+            .get(nm("a.example.com.").as_ref(), Qtype::of(rt::A))
+            .unwrap()
+            .outcome
+            .is_secure());
+        assert!(!cache
+            .get(nm("b.example.com.").as_ref(), Qtype::of(rt::A))
+            .unwrap()
+            .outcome
+            .is_secure());
     }
 
     #[test]
@@ -956,7 +976,7 @@ mod tests {
             nm("NoPe.Example.COM.").as_ref(),
             Qtype::of(rt::A),
             &nxdomain_for("NoPe.Example.COM."),
-            false,
+            Outcome::Indeterminate,
         );
         assert!(cache
             .get(nm("nope.example.com.").as_ref(), Qtype::of(rt::A))
@@ -970,7 +990,7 @@ mod tests {
             nm("a.example.com.").as_ref(),
             Qtype::of(rt::A),
             &nxdomain_for("a.example.com."),
-            false,
+            Outcome::Indeterminate,
         );
         assert!(cache.is_empty());
         assert!(cache
@@ -987,14 +1007,19 @@ mod tests {
                 nm(&name).as_ref(),
                 Qtype::of(rt::A),
                 &nxdomain_for(&name),
-                false,
+                Outcome::Indeterminate,
             );
             let nodata = negative(
                 &name,
                 ResponseCode::Ok,
                 vec![soa_record("example.com.", 300, Ttl::from_secs(3600))],
             );
-            cache.insert(nm(&name).as_ref(), Qtype::of(rt::AAAA), &nodata, false);
+            cache.insert(
+                nm(&name).as_ref(),
+                Qtype::of(rt::AAAA),
+                &nodata,
+                Outcome::Indeterminate,
+            );
         }
         assert!(cache.len() <= 4, "held {} entries", cache.len());
     }
@@ -1020,7 +1045,7 @@ mod tests {
                     nm(&name).as_ref(),
                     Qtype::of(rt::A),
                     &nxdomain_for(&name),
-                    false,
+                    Outcome::Indeterminate,
                 );
             }
         };
@@ -1061,7 +1086,7 @@ mod tests {
                 ResponseCode::NoSuchDomain,
                 vec![soa_record("example.com.", 60, Ttl::from_secs(60))],
             ),
-            false,
+            Outcome::Indeterminate,
         );
         assert!(cache
             .get(nm("gone.example.com.").as_ref(), Qtype::of(rt::A))

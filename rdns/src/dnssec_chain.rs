@@ -48,9 +48,58 @@ pub enum ValidationState {
     Indeterminate(String),
 }
 
+/// What validation concluded, without the reason: what a cache keeps beside
+/// an answer and what a counter counts (`TODO.md` #186).
+///
+/// It replaced a `secure: bool` in both caches, which kept the AD bit and lost
+/// the rest: a cache hit could not say whether it was provably unsigned or
+/// never in scope.
+///
+/// The discriminants index [`Outcome::ALL`], which the metrics rely on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    Secure = 0,
+    Insecure = 1,
+    Bogus = 2,
+    Indeterminate = 3,
+}
+
+impl Outcome {
+    pub const ALL: [Outcome; 4] = [
+        Outcome::Secure,
+        Outcome::Insecure,
+        Outcome::Bogus,
+        Outcome::Indeterminate,
+    ];
+
+    /// The AD bit's half: the only outcome that earns it.
+    pub fn is_secure(self) -> bool {
+        self == Outcome::Secure
+    }
+
+    /// The scrape's `outcome` label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Outcome::Secure => "secure",
+            Outcome::Insecure => "insecure",
+            Outcome::Bogus => "bogus",
+            Outcome::Indeterminate => "indeterminate",
+        }
+    }
+}
+
 impl ValidationState {
     pub fn is_secure(&self) -> bool {
         matches!(self, ValidationState::Secure)
+    }
+
+    pub fn outcome(&self) -> Outcome {
+        match self {
+            ValidationState::Secure => Outcome::Secure,
+            ValidationState::Insecure => Outcome::Insecure,
+            ValidationState::Bogus(_) => Outcome::Bogus,
+            ValidationState::Indeterminate(_) => Outcome::Indeterminate,
+        }
     }
 
     pub fn is_bogus(&self) -> bool {

@@ -224,7 +224,7 @@ mod tests {
             responses: Arc::new(ResponseLimiter::disabled()),
             metrics: Arc::new(DnsMetrics::new()),
             logger: Arc::new(QueryLogger::new()),
-            validator: Arc::new(AdmissionCheck::with_defaults()),
+            admission: Arc::new(AdmissionCheck::with_defaults()),
             udp: rdns::UdpSizes::default(),
             per_source: Default::default(),
             acl: rdns_transport::QueryAcl::Open,
@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(reply.rcode, ResponseCode::NotImplemented);
         assert_eq!(
             metrics
-                .validation_errors
+                .packets_rejected
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "and the drop is counted, since it is silent on the wire"

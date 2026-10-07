@@ -3,6 +3,7 @@
 //! Relaxed atomics: each counter is independent, nothing branches on one, and a
 //! scrape is a snapshot of a moving system either way.
 
+use crate::dnssec_chain::Outcome;
 use crate::name_keys::NameKeyBuf;
 use crate::record_types as rt;
 use crate::NameRef;
@@ -242,7 +243,10 @@ pub struct Counters {
 
     // Security metrics
     pub rate_limited: AtomicU64,
-    pub validation_errors: AtomicU64,
+    /// Packets refused by `AdmissionCheck`'s size and section caps, before
+    /// parsing. Renamed from a name a validating resolver's operator would
+    /// read as DNSSEC failures (`TODO.md` #186).
+    pub packets_rejected: AtomicU64,
     pub queries_dropped: AtomicU64,
     /// Queries the query limiter admitted with no bucket, and responses the
     /// response limiter truncated with none, because each table was at its
@@ -357,6 +361,14 @@ pub struct Counters {
     /// Indexed by [`StreamListener`]; reached through [`DnsMetrics::listener`].
     listeners: [ListenerSlots; StreamListener::ALL.len()],
 
+    /// Answers a client got, by what DNSSEC validation concluded, indexed by
+    /// [`Outcome::ALL`] (`TODO.md` #186). Exported only once
+    /// [`DnsMetrics::validating`] says validation is on: with it off every
+    /// answer is indeterminate, and a family that says so about everything
+    /// says nothing.
+    outcomes: [AtomicU64; Outcome::ALL.len()],
+    validating: AtomicBool,
+
     // Cumulative buckets plus count and sum: what `histogram_quantile()` needs.
     //
     // Length from the bounds, not repeated: the two were `8` twice, and a bound
@@ -406,7 +418,7 @@ impl DnsMetrics {
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
-            validation_errors: AtomicU64::new(0),
+            packets_rejected: AtomicU64::new(0),
             queries_dropped: AtomicU64::new(0),
             rate_limiter_untracked: AtomicU64::new(0),
             response_limiter_untracked: AtomicU64::new(0),
@@ -429,6 +441,8 @@ impl DnsMetrics {
             dnstap_frames: AtomicU64::new(0),
             dnstap_dropped: AtomicU64::new(0),
             listeners: Default::default(),
+            outcomes: std::array::from_fn(|_| AtomicU64::new(0)),
+            validating: AtomicBool::new(false),
             zones: RwLock::new(BTreeMap::new()),
             catalogs: RwLock::new(BTreeMap::new()),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -449,6 +463,20 @@ impl DnsMetrics {
     /// Add one to a counter: `metrics.count(&metrics.rate_limited)`.
     pub fn count(&self, counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// This server validates DNSSEC, so its outcomes belong in the scrape.
+    pub fn validating(&self) {
+        self.validating.store(true, Ordering::Relaxed);
+    }
+
+    /// One answer sent to a client, by what validation concluded about it.
+    pub fn count_outcome(&self, outcome: Outcome) {
+        self.outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn outcome_count(&self, outcome: Outcome) -> u64 {
+        self.outcomes[outcome as usize].load(Ordering::Relaxed)
     }
 
     /// One stream listener's connection slots.
@@ -748,9 +776,9 @@ impl DnsMetrics {
                 &self.rate_limited,
             ),
             (
-                "dns_validation_errors_total",
-                "Validation errors",
-                &self.validation_errors,
+                "dns_packets_rejected_total",
+                "Packets refused before parsing: size or section caps",
+                &self.packets_rejected,
             ),
             (
                 "dns_queries_dropped_total",
@@ -861,6 +889,24 @@ impl DnsMetrics {
             self.latency_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0
         );
         let _ = writeln!(out, "dns_answer_latency_seconds_count {count}");
+
+        if self.validating.load(Ordering::Relaxed) {
+            declare(
+                &mut out,
+                "dns_validation_outcomes_total",
+                "counter",
+                "Answers sent to clients, by what DNSSEC validation concluded",
+            );
+            for outcome in Outcome::ALL {
+                labelled(
+                    &mut out,
+                    "dns_validation_outcomes_total",
+                    "outcome",
+                    outcome.label(),
+                    self.outcome_count(outcome),
+                );
+            }
+        }
 
         // Only listeners that were bound: a DoT gauge at zero on a server with
         // no DoT listener would be a claim, where its absence is the fact.
@@ -1213,7 +1259,7 @@ mod tests {
             &m.cache_hits,
             &m.cache_misses,
             &m.rate_limited,
-            &m.validation_errors,
+            &m.packets_rejected,
             &m.queries_dropped,
             &m.rate_limiter_untracked,
             &m.response_limiter_untracked,

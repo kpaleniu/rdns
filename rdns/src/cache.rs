@@ -11,8 +11,8 @@
 //! Two invariants this file owns, both of which have been got wrong here or in a
 //! sibling:
 //!
-//! - **`secure` is what validation concluded**, never what the cache assumed. It
-//!   is the AD bit surviving the cache, so an answer stored as validated tells
+//! - **`outcome` is what validation concluded**, never what the cache assumed.
+//!   It is the AD bit surviving the cache, so an answer stored as secure tells
 //!   every later client it was authentic.
 //! - **The TTL is the shortest in the RRset, capped at a day** (RFC 8767 §4), and
 //!   not clamped here: [`crate::Ttl`] clamps at the parse boundary, which is the
@@ -30,6 +30,7 @@
 
 use crate::clock::Clock;
 use crate::deadline::Deadline;
+use crate::dnssec_chain::Outcome;
 use crate::eviction::Halving;
 use crate::name_keys::{NameType, NameTypeKey};
 use crate::NameRef;
@@ -139,10 +140,10 @@ struct CacheEntry {
     /// fixed number of seconds — a minute left is nothing on a day's TTL and
     /// everything on two minutes'.
     ttl: u64,
-    /// Whether this answer was DNSSEC-validated when stored. The AD bit has to
+    /// What validation concluded when this was stored. The AD bit has to
     /// survive the cache, and must never be picked up here by an answer that
     /// arrived without it.
-    secure: bool,
+    outcome: Outcome,
     /// Whether a prefetch has already been handed out for this entry.
     ///
     /// Set by the lookup that hands it out, so a popular name in the last tenth
@@ -172,8 +173,8 @@ impl CacheEntry {
 pub struct Cached {
     pub records: Vec<ResourceRecord>,
     /// What validation concluded when this was stored — the AD bit surviving
-    /// the cache.
-    pub secure: bool,
+    /// the cache, and the outcome a hit is counted under.
+    pub outcome: Outcome,
     /// The entry is in the last tenth of its TTL and no refresh has been handed
     /// out for it yet, so this caller is the one to re-resolve the name once its
     /// own answer is on its way (Unbound's `prefetch`).
@@ -241,7 +242,7 @@ impl DnsCache {
         qtype: Qtype,
     ) -> Option<(Vec<ResourceRecord>, bool)> {
         self.lookup(name, qtype, false)
-            .map(|hit| (hit.records, hit.secure))
+            .map(|hit| (hit.records, hit.outcome.is_secure()))
     }
 
     /// The whole of a cache hit: the records, what validation concluded, and
@@ -275,7 +276,7 @@ impl DnsCache {
                 }
                 return Some(Cached {
                     records: entry.records.clone(),
-                    secure: entry.secure,
+                    outcome: entry.outcome,
                     refresh,
                     learned_at: entry.learned_at,
                 });
@@ -324,7 +325,7 @@ impl DnsCache {
             .collect();
         Some(Cached {
             records,
-            secure: entry.secure,
+            outcome: entry.outcome,
             refresh,
             learned_at: entry.learned_at,
         })
@@ -332,19 +333,19 @@ impl DnsCache {
 
     /// Put records in cache with TTL, unvalidated.
     pub fn put(&self, name: NameRef<'_>, qtype: Qtype, records: Vec<ResourceRecord>) {
-        self.put_validated(name, qtype, records, false)
+        self.put_validated(name, qtype, records, Outcome::Indeterminate)
     }
 
-    /// Put records in cache, remembering whether they were DNSSEC-validated.
+    /// Put records in cache, remembering what validation concluded.
     ///
-    /// `secure` must be what validation concluded: storing an unvalidated answer
-    /// as validated tells every later client it is authentic.
+    /// `outcome` must be what validation concluded: storing an unvalidated
+    /// answer as secure tells every later client it is authentic.
     pub fn put_validated(
         &self,
         name: NameRef<'_>,
         qtype: Qtype,
         records: Vec<ResourceRecord>,
-        secure: bool,
+        outcome: Outcome,
     ) {
         if records.is_empty() || self.max_entries == 0 {
             return;
@@ -380,7 +381,7 @@ impl DnsCache {
                 records,
                 expires_at,
                 ttl: min_ttl,
-                secure,
+                outcome,
                 refreshing: false,
                 stale_refresh_after: Deadline::default(),
                 learned_at: now,
@@ -720,7 +721,7 @@ mod tests {
         );
         let Cached {
             records,
-            secure,
+            outcome,
             refresh,
             ..
         } = cache
@@ -733,7 +734,10 @@ mod tests {
             STALE_ANSWER_TTL,
             "the TTL a stale answer carries is chosen, not counted down (§4)"
         );
-        assert!(!secure, "and AD is what validation concluded, unchanged");
+        assert!(
+            !outcome.is_secure(),
+            "and AD is what validation concluded, unchanged"
+        );
 
         // Past the window it is gone, and the lookup that finds it says so.
         clock.advance(3600);

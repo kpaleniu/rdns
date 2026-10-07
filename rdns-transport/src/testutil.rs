@@ -27,7 +27,7 @@ pub(crate) fn context(rate: u32) -> ServeContext {
     ServeContext {
         limiter: Arc::new(RateLimiter::new(RateLimitConfig::per_second(rate, rate))),
         responses: Arc::new(ResponseLimiter::disabled()),
-        validator: Arc::new(AdmissionCheck::with_defaults()),
+        admission: Arc::new(AdmissionCheck::with_defaults()),
         logger: Arc::new(QueryLogger::new()),
         metrics: Arc::new(DnsMetrics::new()),
         udp: rdns::UdpSizes::default(),

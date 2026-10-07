@@ -300,9 +300,13 @@ no header.
 
 `queries_received`, `queries_authoritative`, `responses_sent`,
 `responses_noerror`, `responses_nxdomain`, `responses_servfail`,
-`responses_refused`, `rate_limited`, `validation_errors`, `queries_dropped`,
+`responses_refused`, `rate_limited`, `packets_rejected`, `queries_dropped`,
 `rate_limiter_untracked`, `response_limiter_untracked`, and
 `dns_queries_type{type=...}` for A/AAAA/MX/NS/CNAME/TXT/SOA/PTR/OTHER.
+
+`dns_packets_rejected_total` is packets the size and section caps refused
+before parsing. Renamed by `TODO.md` #186 from a name a validating resolver's
+operator would read as DNSSEC failures, with no copy under the old name.
 
 `dns_tls_handshakes_total` and `dns_tls_handshake_failures_total`, and the same
 pair for QUIC: the ratio is how an expired or mismatched certificate is seen at
@@ -326,6 +330,7 @@ invisible on the wire (see `05-resolver.md` §5.5-§5.7):
 | `dns_prefetches_total` | names re-resolved before expiry; against `dns_cache_hits_total` it says whether `--prefetch` is paying for itself |
 | `dns_synthesized_total` | AAAA records DNS64 built from an A record; it does not fall to zero on its own when a NAT64 is retired |
 | `dns_inflight_evicted_total` | in-flight UDP queries abandoned to admit a newer one, every place held and the oldest past the 1.8 s client response timer; climbing, a flood is holding places nobody is waiting on. `dns_queries_dropped_total` is the newcomer refused instead (`TODO.md` #169) |
+| `dns_validation_outcomes_total{outcome=...}` | answers sent to clients by what DNSSEC validation concluded — `secure`, `insecure`, `bogus`, `indeterminate` — cache hits included, prefetches and DNS64's A query not. Exported only under `--dnssec-validate`, where it is not every answer reading indeterminate (`TODO.md` #186) |
 | `dns_slow_resolutions_total{outcome=...}` | recursions that ran past RFC 8767 §5's 1.8 s client response timer, split `completed`/`failed` — `completed` is a client `--serve-stale-first` would have answered at once, `failed` is one the stale window already covers (`TODO.md` #58) |
 
 > Gap G-3 — fixed 2026-08-03. ~~Those three counters are exported by `rdnsd` and

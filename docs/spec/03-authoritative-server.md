@@ -26,7 +26,7 @@ In order. Every step that drops a packet does so silently unless noted.
    dropped, counted in `dns_rate_limited_total`. Dropped rather than REFUSED — a
    reply to a spoofed source amplifies.
 3. `AdmissionCheck::validate_packet(packet, is_tcp=false)`. Fails: dropped,
-   counted in `dns_validation_errors_total`. Caps applied to a request: 512
+   counted in `dns_packets_rejected_total`. Caps applied to a request: 512
    octets on UDP (`AdmissionLimits::max_udp_size`), at most 10 questions, at most
    4 records in each of the answer, authority and additional sections. A UDP
    request over 512 octets is dropped silently; the only trace is a `debug` line

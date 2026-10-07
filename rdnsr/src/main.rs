@@ -1029,11 +1029,16 @@ async fn main() -> anyhow::Result<()> {
         responses: Arc::new(ResponseLimiter::per_second(cli.response_rate)),
         metrics: Arc::new(DnsMetrics::new()),
         logger: Arc::new(QueryLogger::new()),
-        validator: Arc::new(AdmissionCheck::new(admission.clone())),
+        admission: Arc::new(AdmissionCheck::new(admission.clone())),
         per_source: per_source.clone(),
         acl: acl.clone(),
         clock,
     });
+    // Without validation every answer is indeterminate, so the family would
+    // say nothing; absent says that (`TODO.md` #186).
+    if cli.dnssec_validate {
+        ctx.metrics.validating();
+    }
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, \
          UDP reply cap: {}B (advertising {}B), UDP in flight: {}, \

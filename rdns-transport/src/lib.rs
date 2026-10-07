@@ -177,7 +177,7 @@ pub struct ServeContext {
     /// completed a handshake, so there is nobody to reflect at.
     pub responses: Arc<ResponseLimiter>,
     /// Size and section caps, applied before a packet is parsed.
-    pub validator: Arc<AdmissionCheck>,
+    pub admission: Arc<AdmissionCheck>,
     /// Per-source counters and the periodic anomaly warnings.
     pub logger: Arc<QueryLogger>,
     /// What an operator scrapes.
@@ -252,7 +252,7 @@ impl ServeContext {
     /// takes, so the message must not be built unless somebody asked for it,
     /// and the counter is the signal in either case.
     pub fn accept_packet(&self, peer: Peer, packet: &[u8], transport: Transport) -> bool {
-        let verdict = self.validator.validate_packet(packet, transport);
+        let verdict = self.admission.validate_packet(packet, transport);
         if verdict.is_valid() {
             return true;
         }
@@ -267,7 +267,7 @@ impl ServeContext {
                 .error()
                 .map_or_else(|| "unknown error".to_string(), |e| e.to_string())
         );
-        self.metrics.count(&self.metrics.validation_errors);
+        self.metrics.count(&self.metrics.packets_rejected);
         false
     }
 
@@ -624,7 +624,7 @@ mod tests {
         );
         assert_eq!(
             ctx.metrics
-                .validation_errors
+                .packets_rejected
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );

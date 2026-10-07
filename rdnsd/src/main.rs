@@ -993,7 +993,7 @@ async fn serve(
             ServeContext {
                 limiter: Arc::new(RateLimiter::new(query_limit)),
                 responses: Arc::new(ResponseLimiter::per_second(response_rate)),
-                validator: Arc::new(AdmissionCheck::new(admission.clone())),
+                admission: Arc::new(AdmissionCheck::new(admission.clone())),
                 logger: Arc::new(QueryLogger::new()),
                 metrics,
                 udp,

@@ -7,7 +7,7 @@
 
 use rdns::cache::{Cached, StalePolicy};
 use rdns::clock::Clock;
-use rdns::dnssec_chain::ValidationState;
+use rdns::dnssec_chain::{Outcome, ValidationState};
 use rdns::negative_cache::{NegativeAnswer, NegativeCache};
 use rdns::nsec_cache::NsecCache;
 use rdns::{DnsCache, DnsMessage, NameRef, Qtype, QuerySection, ResourceRecord, ResponseCode};
@@ -21,7 +21,7 @@ pub(crate) enum Held {
         rcode: ResponseCode,
         answers: Vec<ResourceRecord>,
         authority: Vec<ResourceRecord>,
-        secure: bool,
+        outcome: Outcome,
     },
 }
 
@@ -92,11 +92,12 @@ impl Caches {
         if state.is_bogus() {
             return;
         }
-        let secure = state.is_secure();
+        let outcome = state.outcome();
+        let secure = outcome.is_secure();
         let (name, qtype) = (query.qname.as_ref(), query.qtype);
         if !response.answers.is_empty() {
             self.answers
-                .put_validated(name, qtype, response.answers.clone(), secure);
+                .put_validated(name, qtype, response.answers.clone(), outcome);
             // The lookups ask `negatives` first, so an older "no" left there
             // outranks this until it expires (`TODO.md` #133). No trust check,
             // as BIND's has: an answer contradicting a signed denial that does
@@ -106,7 +107,7 @@ impl Caches {
         // A "no" is an answer; re-resolving it makes a typo storm cost one
         // upstream walk per repeat. The SOA in the authority section says how
         // long it is good for (RFC 2308).
-        self.negatives.insert(name, qtype, response, secure);
+        self.negatives.insert(name, qtype, response, outcome);
         // A *validated* "no" covers a whole range of names, so it also goes in
         // the denial cache. Only when Secure: an unvalidated NSEC is an
         // attacker's claim about which names do not exist.
@@ -147,7 +148,7 @@ impl Caches {
                 rcode: negative.rcode,
                 answers: Vec::new(),
                 authority: negative.authority,
-                secure: negative.secure,
+                outcome: negative.outcome,
             });
         }
         if let Some(hit) = self.answers.lookup(name, qtype, prefetching) {
@@ -173,7 +174,7 @@ impl Caches {
                 rcode: ResponseCode::Ok,
                 answers: wildcard.answers,
                 authority: wildcard.authority,
-                secure: true,
+                outcome: Outcome::Secure,
             });
         }
         // The proofs were validated before storage, so what is derived from
@@ -184,7 +185,7 @@ impl Caches {
                 rcode: denial.rcode,
                 answers: Vec::new(),
                 authority: denial.authority,
-                secure: true,
+                outcome: Outcome::Secure,
             })
     }
 
