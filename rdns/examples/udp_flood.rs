@@ -1,9 +1,17 @@
-//! A closed-loop UDP load generator, for asking whether something on the answer
-//! path is a ceiling. Kept because #28d's answer is a *negative* result, and a
-//! negative result nobody can reproduce is an opinion (`TODO.md` §10).
+//! A closed-loop UDP **latency probe**: one query in flight per thread. Kept
+//! because #28d's answer is a *negative* result, and a negative result nobody
+//! can reproduce is an opinion (`TODO.md` §10).
+//!
+//! **Not a throughput measurement.** With one query outstanding per thread the
+//! rate is `threads / round trip` (Little's law), so it measures the round trip
+//! — #28d's ~170k/s at 16 threads was a ~97 µs round trip through the VM, and
+//! was quoted as a ceiling it never was (`TODO.md` #185a). `rdnsd` saturates
+//! near 950k/s under an open-loop generator; use `dnsperf -c 16 -T 8 -q 1000`
+//! for throughput.
 //!
 //! Each thread owns a socket bound to its own loopback address, sends one query,
-//! waits for the answer, repeats. Reports answers per second across all threads.
+//! waits for the answer, repeats. Reports answers per second and the mean round
+//! trip that rate implies.
 //! Pair it with the server's own CPU time — `utime + stime` from
 //! `/proc/<pid>/stat` — since on one box the client competes with the server for
 //! cores and throughput alone cannot tell you which of them the ceiling belongs
@@ -52,7 +60,13 @@ fn query(id: u16, mixed_case: bool) -> Vec<u8> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let target = args.get(1).cloned().unwrap_or("127.0.0.1:15353".into());
+    // Parsed once: `send_to(&str)` resolved it on every send, which was in the
+    // loop being timed.
+    let target: std::net::SocketAddr = args
+        .get(1)
+        .map_or("127.0.0.1:15353", String::as_str)
+        .parse()
+        .expect("an ADDR:PORT");
     let threads: usize = args.get(2).map_or(8, |s| s.parse().unwrap());
     let secs: u64 = args.get(3).map_or(5, |s| s.parse().unwrap());
     let mixed = args.get(4).is_some_and(|s| s == "mixed");
@@ -63,12 +77,7 @@ fn main() {
 
     let mut handles = Vec::new();
     for t in 0..threads {
-        let (answered, stop, barrier, target) = (
-            answered.clone(),
-            stop.clone(),
-            barrier.clone(),
-            target.clone(),
-        );
+        let (answered, stop, barrier) = (answered.clone(), stop.clone(), barrier.clone());
         handles.push(std::thread::spawn(move || {
             // A distinct source address per thread. All of them sharing one
             // would put the whole load in a single token bucket, so the run
@@ -83,7 +92,7 @@ fn main() {
             let mut n = 0u64;
             barrier.wait();
             while !stop.load(Ordering::Relaxed) {
-                if socket.send_to(&packet, &target).is_err() {
+                if socket.send_to(&packet, target).is_err() {
                     continue;
                 }
                 if socket.recv_from(&mut buf).is_ok() {
@@ -103,8 +112,10 @@ fn main() {
     }
     let elapsed = start.elapsed().as_secs_f64();
     let total = answered.load(Ordering::Relaxed);
+    let rate = total as f64 / elapsed;
     println!(
-        "{:.0} answers/s ({total} in {elapsed:.2}s, {threads} client threads)",
-        total as f64 / elapsed
+        "{rate:.0} answers/s ({total} in {elapsed:.2}s, {threads} client threads), \
+         {:.1} us mean round trip — a latency figure, not a ceiling",
+        threads as f64 / rate * 1e6
     );
 }
