@@ -3,9 +3,12 @@
 //! Only the protocol. The commands and the accept loop are `rdnsd`'s; this is
 //! what both ends must agree on, so the daemon and `rdnsctl` cannot drift.
 //!
-//! A Unix socket with filesystem permissions, as `knotc`, `pdns_control` and
-//! `unbound-control` use — authorization by file mode, so nothing here
-//! authenticates.
+//! A Unix socket with filesystem permissions, as `knotc` and `pdns_control`
+//! use — authorization by file mode, so nothing here authenticates.
+//! `unbound-control` was once listed here too; its default is TCP on loopback
+//! with TLS, a Unix socket only if configured, and BIND's `rndc` is TCP with a
+//! shared key. The socket is this project's choice, not the field's
+//! (`TODO.md` #188).
 //!
 //! Text, one command per connection, terminated by the close, so
 //! `printf 'status\n' | socat - UNIX-CONNECT:/run/rdns/rdnsd.sock` is a working
