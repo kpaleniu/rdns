@@ -348,13 +348,16 @@ impl SigningKey {
                 .as_ref()
                 .to_vec(),
             rsa => {
+                // `genpkey -outform DER` alone writes PKCS#1 for RSA, which
+                // `ring` refuses; the message recommended it until #183 tried it.
                 return Err(DnssecError::key(format!(
                     "{} keys cannot be generated here — ring implements RSA signing but not \
-                     RSA key generation. Make one elsewhere and import the PKCS#8: \
-                     openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
-                     -outform DER -out key.der",
+                     RSA key generation. Make one elsewhere and put its PKCS#8, base64, in \
+                     a key file's PrivateKey field: openssl genpkey -algorithm RSA -pkeyopt \
+                     rsa_keygen_bits:2048 | openssl pkcs8 -topk8 -nocrypt -outform DER | \
+                     base64 -w0",
                     rsa.name(),
-                )))
+                )));
             }
         };
         Self::from_pkcs8(algorithm, owner, flags, &pkcs8)
@@ -410,8 +413,13 @@ impl SigningKey {
                 (Pair::Ed25519(Box::new(pair)), public)
             }
             SigningAlgorithm::RsaSha256 | SigningAlgorithm::RsaSha512 => {
-                let pair = RsaKeyPair::from_pkcs8(pkcs8)
-                    .map_err(|e| DnssecError::key(format!("reading an RSA key: {e}")))?;
+                let pair = RsaKeyPair::from_pkcs8(pkcs8).map_err(|e| {
+                    DnssecError::key(format!(
+                        "reading an RSA key: {e} — PKCS#8 is expected, and `openssl genpkey \
+                         -outform DER` writes PKCS#1 for RSA; convert with `openssl pkcs8 \
+                         -topk8 -nocrypt`"
+                    ))
+                })?;
                 let public = rsa_dnskey_public_key(pair.public().as_ref())?;
                 (Pair::Rsa(Box::new(pair)), public)
             }

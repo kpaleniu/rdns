@@ -2483,13 +2483,47 @@ a\.b    IN A   192.0.2.50
 
     #[test]
     fn every_authoritative_rrset_verifies_against_the_published_keys() {
-        let zone = sign_test_zone(DenialChain::Nsec);
-        let keys = published_keys(&zone);
-        let sigs = rrsigs_in(&resources(&zone));
-        let layout = Layout::of(&zone, nm(ORIGIN).as_ref());
+        assert_every_rrset_verifies(&sign_test_zone(DenialChain::Nsec));
+    }
+
+    /// RSA is imported, never generated, and signing with an imported key had
+    /// no test (`TODO.md` #183). The key goes through the operator's path — a
+    /// key file written and read back by `load_dir` — and signs at algorithm 8
+    /// and 10. Watched failing with `Pair::Rsa` signing PKCS#1 SHA-256 at both
+    /// algorithms: the first algorithm-10 RRset checked was bogus.
+    #[test]
+    fn a_zone_signs_with_an_imported_rsa_key() {
+        use crate::dnssec::{DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE};
+        for algorithm in [SigningAlgorithm::RsaSha256, SigningAlgorithm::RsaSha512] {
+            let dir = crate::testutil::ScratchDir::new("rsa-import");
+            SigningKey::from_pkcs8_base64(
+                algorithm,
+                ORIGIN,
+                DNSKEY_FLAG_ZONE | DNSKEY_FLAG_SEP,
+                crate::dnssec_test_util::RSA_2048_PKCS8,
+            )
+            .write_to_dir(dir.path())
+            .expect("written");
+            let keys = SigningKey::load_dir(dir.path()).expect("read back");
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0].algorithm(), algorithm);
+
+            let zone = parse_zone_file(ZONE, ORIGIN).expect("the test zone parses");
+            let signed = sign_zone(&zone, &keys, &policy(DenialChain::Nsec)).expect("signs");
+            assert!(rrsigs_in(&resources(&signed))
+                .iter()
+                .all(|s| s.algorithm == algorithm.code()));
+            assert_every_rrset_verifies(&signed);
+        }
+    }
+
+    fn assert_every_rrset_verifies(zone: &Zone) {
+        let keys = published_keys(zone);
+        let sigs = rrsigs_in(&resources(zone));
+        let layout = Layout::of(zone, nm(ORIGIN).as_ref());
 
         let mut checked = 0;
-        for ((name, rtype), rdatas) in rrsets(&zone) {
+        for ((name, rtype), rdatas) in rrsets(zone) {
             if rtype == rt::RRSIG {
                 continue;
             }

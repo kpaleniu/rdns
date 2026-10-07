@@ -861,8 +861,11 @@ zone. A zone that arrived by transfer is not signed either: it is the master's,
 signatures included, and the parent's DS points at their key rather than yours.
 
 - Key files are `K<zone>+<algorithm>+<tag>.rdnskey` and hold PKCS#8. They are not
-  BIND's `.private` format and do not pretend to be; a key from `openssl genpkey`
-  imports as-is.
+  BIND's `.private` format and do not pretend to be; ~~a key from `openssl genpkey`
+  imports as-is~~ **the body of `openssl genpkey`'s PEM output is the PKCS#8, but
+  its `-outform DER` is PKCS#1 for RSA and SEC1 for ECDSA, which do not import:
+  convert those with `openssl pkcs8 -topk8 -nocrypt -outform DER`** (2026-10-07,
+  `TODO.md` #183).
 - Signatures last `--signature-validity` days, 30 by default, made when the zone
   loads. A server running longer than that without a reload serves expired
   signatures, which validating clients treat as bogus — SIGHUP or restart it well

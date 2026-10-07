@@ -370,6 +370,38 @@ pub(crate) fn one_tag_two_algorithms(origin: &str) -> [SigningKey; 2] {
     })
 }
 
+/// A 2048-bit RSA private key as PKCS#8 DER, base64, made once with
+/// `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | openssl pkcs8
+/// -topk8 -nocrypt -outform DER` (`TODO.md` #183). Not `genpkey -outform DER`
+/// alone, which writes PKCS#1 for RSA and which `ring` refuses.
+///
+/// Stored, not generated: `ring` cannot generate RSA keys, which is why
+/// `SigningKey::generate` refuses them and an operator imports one. A test
+/// key, signing nothing outside this crate's tests.
+pub(crate) const RSA_2048_PKCS8: &str = concat!(
+    "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQD6/28NHovUsFD50WivmmUHiswphwYP",
+    "ZMyW1hJvxE+V0tIuN4IMVYLAFgZbgg2JnXjVMnne4nctQQfCn0Ob1Penj9RWkiXzaQ4mj8vxS6bqbrIG",
+    "Yp+sTqkO4+SO/7QcegwTML75e1sFTZJ7kbBO64iADcwkBdq1H4c/u4b5ALfsd/8JB1diqYMh4fCe/KYp",
+    "d2EI5YvBrxnKozPSyJxP6qMmQHTJpmi3A/Eqt0mc+Qr0RlMxxvQ7/YJCcNWwN59wQW7e0QAnjAc//3sU",
+    "UnDyWjFXJOHpEk1Gj+nFdfdus8F6Dqa9jfUWfyPUflq23hXuDNdm0FoTIuKsZ3mp8S/V7IS9AgMBAAEC",
+    "ggEAPRz2mBYo68dmX/1J5P/Nu5Fi9nWG1zauzccfxBDjY9JqFJC1XHVxmX2DXMKEs04hPp/Epq0zYVRl",
+    "JFEM8CNhjW3qwI1jKioZJPB8Mqs93/TF6eIXiKe6aAK7Asplu01IJWAID8ymM9tYYDfv2rdki/FQFDFM",
+    "uC8OCkmJqpUvMyblBE69J71Wnta4I6tO6NU02hV3pNXfw/uqb1NnbjHJvByDX6S35cPZtSTWgzXBSTVe",
+    "ensvSvurimq1HUQpJuJvS0m9vnpFmB2GEn3RKngB4qLBKpQ2KjPnpu94NsmY7SdQGRDVzxSgHoRZb+1t",
+    "oxCm6l7KwzY6aun3ETkpHHvvIQKBgQD9hjVaWLY5fNzxgqp7RpR/zh9D7FaN+RYkrnVyjvbTr/yRYw+G",
+    "BOz7mgQvO8MfZ6/sTxpAZO7P+l+Fay+KPy2y28tByNjhBZ75l+uIPwf88v1khXVmiA4Ltj0UAXKi/i7Y",
+    "crQm/d8E5qz5XZ7u/dai4FUXI7YqZOrFV0yhpqzMlQKBgQD9cujPc+QjH0txM/o1uqoPZaL5XJS/EAQX",
+    "pRbouKuugtKuJrAtRbj0fY0qpYzNOm+tyEoCRazfhY6R1po2ev6N/RHjQ/zdxWecIiEQENFO/xahtJOR",
+    "gB1PvljP0WYF2HzAaLVG4tunU0RcrPY6Ik9MAxfS+GSXiHCHKI7cGHuliQKBgQDrY53L6cwfajh2IH0L",
+    "gofEdmv/E8N1hE0z96tilyzDdYYKszApng8uuFykQlezpADqZrOYEF7PScdAyDlWobxbccmxpbsAisiF",
+    "M7HjSaqwCCiPGX7cmPx5kVX6ajG29kwmebGc9mAIW+lEitFTUunjRmia2HR9vj9gxOKIwIl2VQKBgE51",
+    "hBy0g6tbxL8GmC6J2ptpm0oWnvWGv72SHcVtZbhgR1giIefh7Z/CPjE1jqD5thjWKBML/rgzYC9Ff/fd",
+    "m2/ZJ/By25TLx4dOCW4vxpvt29OzUvt37ZsCEfxDlpG4suXdhECtedIStNb7tD3K4UFms7lbq8g9NJii",
+    "tZbs/VoBAoGAaCR4kR4S3LGJ80vbR2c69fjd/0PD+E2ahWwd4e4xYSVlJV4xUyMmq/tYgMjHJww1dmrB",
+    "bVExWT7CTNmDimX2IPYni/vhyQZtfSaBnYxwxF93RAV4z6EwXlVlEd0Ld+0avnySvQHOrPUHRIezlLri",
+    "ndkdc5VW4IOdhgkys7oPpw4=",
+);
+
 /// Thirty days' validity from `now`, which is the default the daemon runs and
 /// the only value either signing test has wanted.
 pub(crate) fn signing_policy(now: u64, chain: DenialChain) -> SigningPolicy {
