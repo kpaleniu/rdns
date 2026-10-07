@@ -9,13 +9,18 @@ which is what you need when the zone is edited in place by dynamic UPDATE —
 there, the journal *is* the record of what happened. Here a zone comes from a file
 and changes in discrete events (a reload, or a transfer from a master), so the
 difference between two versions can be computed when the new one arrives and kept
-in memory. That is `ixfr-from-differences` without the journal, and the same call
-NSD made. A journal earns its keep at #7 step 6 and not before.
+in memory. ~~That is `ixfr-from-differences` without the journal, and the same call
+NSD made. A journal earns its keep at #7 step 6 and not before.~~ **The journal
+came with dynamic UPDATE on 2026-08-03 (#10)**, and with zones from a directory
+every delta is written to it, a reload's and a transfer's as well as an
+UPDATE's (`rdnsd/src/zones.rs`, `journal.save`) (2026-10-07, `TODO.md` #184).
 
-**The consequence, stated so nobody is surprised:** a restart forgets the deltas.
+~~**The consequence, stated so nobody is surprised:** a restart forgets the deltas.
 Every secondary asking for an increment across one gets a full transfer instead,
 which RFC 1995 §4 permits unconditionally and which corrects itself at the next
-change. `DeltaLog` also keeps only `MAX_DELTAS_PER_ZONE` (32) steps per zone; a
+change.~~ **Journalled since 2026-08-03** (2026-10-07, `TODO.md` #184): each step is written beside the
+zone and `restore_journals` reads it back at startup, so a restart keeps the
+history (`docs/spec/03`, the journal paragraph). `DeltaLog` also keeps only `MAX_DELTAS_PER_ZONE` (32) steps per zone; a
 client further behind than that gets the zone.
 
 **The response is positional, and that is the part to get right.** Not "the

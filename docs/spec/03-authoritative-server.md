@@ -743,7 +743,7 @@ Windows (`TODO.md` #188).
 Created mode 0600; filesystem permissions are the authentication. There is no
 control port, and these commands are not on `--metrics-listen`.
 
-Protocol (`rdns/src/control.rs`): one command line in, a status line
+Protocol (~~`rdns/src/control.rs`~~ `rdns-core/src/control.rs` (2026-10-07, `TODO.md` #184)): one command line in, a status line
 (`+OK` / `-ERR`) and a body out, then close. Plain text, so
 `printf 'status\n' | socat - UNIX-CONNECT:...` is a working client.
 

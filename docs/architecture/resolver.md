@@ -49,10 +49,14 @@ authoritative server or middlebox that does not preserve case.
 send the full name every hop). Each hop asks the current servers only for the
 next label down toward the target — `com.`, then `example.com.`, then the leaf —
 so the root learns the TLD and no more, and the full name reaches only the
-server authoritative for it. Intermediate probes use QTYPE=NS: a zone cut answers
-with a referral, a plain in-zone name with NODATA, telling the two apart without
-disclosing the leaf. An empty non-terminal (a name with descendants but no
-records of its own) returns NODATA to the NS probe, so the walk deepens by a
+server authoritative for it. Intermediate probes use ~~QTYPE=NS~~ **QTYPE=A**
+(2026-10-07, `TODO.md` #184): RFC 9156 §2.3 replaced RFC 7816's NS with "the QTYPE least likely to
+raise issues in DNS software and middleboxes" (`MINIMIZED_PROBE_TYPE`). A zone
+cut answers with a referral, a plain in-zone name with NODATA or its address,
+telling the two apart without disclosing the leaf. After `MAX_MINIMISE_COUNT`
+(10, §2.3) probes the rest of the walk sends the full name. An empty
+non-terminal (a name with descendants but no
+records of its own) returns NODATA to the ~~NS~~ probe, so the walk deepens by a
 label and re-asks the same servers rather than mistaking it for a final answer;
 that costs one extra probe per such label. NXDOMAIN on an ancestor ends the walk
 — the whole subtree is empty (RFC 8020). Bailiwick is still judged against the

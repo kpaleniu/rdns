@@ -7,7 +7,7 @@ files, no database**, with the format chosen per kind of state.
 |-------|-------|-----|
 | fetched zone data | a text **zone file**, written by us | the format already parsed and tested here; inspectable; what NSD and BIND do |
 | per-zone transfer state | a small **line-based text file** (`zone serial last-refresh master`) | keeps operational state out of the interchange format — BIND leans on the file's mtime instead and pays in imprecision |
-| IXFR deltas | **in memory**, derived by diffing at load time | zones come from files and reload in discrete events; NSD answered AXFR instead of deltas as a primary for years |
+| IXFR deltas | ~~**in memory**~~ **journalled beside the zone since 2026-08-03** (2026-10-07, `TODO.md` #184), derived by diffing at load time | zones come from files and reload in discrete events; NSD answered AXFR instead of deltas as a primary for years |
 | RFC 5011 anchors | a **writable trust-anchor file** | Unbound's `auto-trust-anchor-file:` model; `TrustAnchors::parse`/`from_file` already exist |
 
 Four rules, and the first is why step 1 of #7 exists at all:

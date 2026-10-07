@@ -123,8 +123,9 @@ impl Default for UdpSizes {
 /// Poisonous" (draft-ietf-dnsop-fragmentation-poisoned) is about.
 pub const FLAG_DAY_UDP_SIZE: u16 = 1232;
 
-// EDNS option codes (IANA "DNS EDNS0 Option Codes"). None is interpreted;
-// options round-trip as opaque bytes.
+// EDNS option codes (IANA "DNS EDNS0 Option Codes"). The codec carries any
+// option as opaque bytes; what a reply does with one is `ClientEdns`'s, which
+// reads Padding and builds every other option fresh.
 /// Name Server Identifier (RFC 5001).
 pub const EDNS_OPTION_NSID: u16 = 3;
 /// Client Subnet (RFC 7871).

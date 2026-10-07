@@ -24,8 +24,11 @@ advertised UDP payload we reply TC=1, and RFC 1035 §4.2.1 has the client retry
 over TCP. The transport reaches `handle_query` as a `Transport` enum whose only
 job is picking the response size limit.
 
-Two things `rdnsr` does *not* share with `rdnsd`: it doesn't run the
-`RequestValidator`, and it has no zone storage. `--no-cache` is a zero-capacity
+~~Two things `rdnsr` does *not* share with `rdnsd`: it doesn't run the
+`RequestValidator`, and it has no zone storage.~~ **One thing** (2026-10-07, `TODO.md` #184): it has
+no zone storage. It runs the same admission as `rdnsd` — `AdmissionCheck`,
+which `RequestValidator` became — and parses through `validation::Request`,
+since `docs/spec/07` G-2. `--no-cache` is a zero-capacity
 `DnsCache` (`put` is a no-op at 0) rather than an `Option`. `--dnssec-validate`
 turns on the chain walk described under [DNSSEC](dnssec.md); the cache
 remembers each entry's validation state alongside it, so an answer served from

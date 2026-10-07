@@ -182,8 +182,9 @@ fn default_rpz_policy() -> rdns::rpz::PolicyOverride {
 ///
 /// Unlike the authoritative server (`rdnsd`), `rdnsr` answers by resolving:
 /// walking the delegation chain from the root and caching what it learns.
-/// Passing `--upstream` switches it to forwarding instead, the way
-/// `forwarders`/`forward-zone` does in BIND and Unbound.
+/// Passing `--upstream` switches it to forwarding instead, for every name, as
+/// BIND's global `forwarders` does — not per domain, as `forward-zone` is
+/// (`TODO.md` #172).
 ///
 /// Binds to localhost by default so it is not accidentally exposed as an open
 /// resolver (an amplification vector).
@@ -214,8 +215,8 @@ struct Cli {
     allow_query: Vec<String>,
     /// Forward to this resolver instead of recursing, e.g. 8.8.8.8:53
     /// (repeatable). Passing any `--upstream` switches the resolver from
-    /// recursion to forwarding, the way `forwarders`/`forward-zone` does in
-    /// BIND and Unbound.
+    /// recursion to forwarding for every name, as BIND's global `forwarders`
+    /// does.
     #[arg(long, conflicts_with = "config")]
     upstream: Vec<SocketAddr>,
     /// Root hints file (named.root format) to prime recursion from, replacing

@@ -3,7 +3,9 @@
 Two limiters, because there are two different quantities to bound and the second
 one is what a reflection attack is measured in.
 
-`RateLimiter` counts **queries** per client: 100 per 10 s, burst 20. That is a
+`RateLimiter` counts **queries** per client: ~~100 per 10 s, burst 20~~
+**`--query-rate`, 1000 a second with a burst of 200 on `rdnsd` and 200 with 100
+on `rdnsr`** (2026-10-07, `TODO.md` #184). That is a
 fairness limit, and it is blind to amplification — a query is a query whether the
 answer is 60 bytes or 4000, so a client staying inside it can still have the
 server emit 25 KB/s at whatever address it claims to be.
@@ -22,7 +24,9 @@ budget stops applying. Dropping every over-budget response instead would leave a
 legitimate client with nothing but a timeout and no hint that TCP would work;
 answering every one of them would make the refusal itself the reflector.
 
-The per-client table is **bounded** (10k addresses). A spoofed flood arrives from
+The per-client table is **bounded** (~~10k addresses~~ **10 000 sources: an
+IPv4 address or IPv6 /56 for queries, an IPv4 /24 or IPv6 /56 for responses,
+since #157** (2026-10-07, `TODO.md` #184)). A spoofed flood arrives from
 every address there is, so unbounded tracking would be the next thing to exhaust;
 past the bound the limiter stops growing and truncates instead, which is small,
 still answerable over TCP, and no longer proportional to the number of forged
