@@ -48,7 +48,8 @@ filing; #186-#192 came out of triaging the first batch, #193 out of closing
 
 - #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
   closed, 185c and 185d wontfix.
-- #190 neither daemon can run as a Windows service.
+- #190 Windows service: implemented (`36f2353`); the four SCM criteria need an
+  elevated session to run.
 - #192 no Windows Event Log sink.
 - #193 six RFC 6303 zones are not empty zones (needs triage).
 
