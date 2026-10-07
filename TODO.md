@@ -40,10 +40,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Nineteen items. #171-#185 were filed 2026-10-05 from a comparison against
+Eighteen items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
-#173. #181 was closed wontfix in triage; #171, #173 and #187 closed 2026-10-07:
+#173. #181 was closed wontfix in triage; #171, #173, #186 and #187 closed 2026-10-07:
 
 - `rdnsr`: #172 no per-domain forwarding, #174 no local data,
   #175 no encrypted upstream, #176 no negative trust anchors, #177 no local
@@ -54,8 +54,6 @@ filing; #186-#192 came out of triaging the first batch, #193 out of closing
 - #184 stale statements in `docs/`.
 - #185 the UDP path: #28d's figure measured the client (185a), CPU per query
   below saturation (185b), no syscall batching (185c), shared state (185d).
-- #186 no validation-outcome counters; `dns_validation_errors_total` counts
-  malformed packets.
 - #188 neither daemon can be controlled or reloaded on Windows.
 - #189 `rdnsr` cannot ask its upstreams for NSID.
 - #190 neither daemon can run as a Windows service.
@@ -1113,6 +1111,7 @@ the week; the record is under "How the queue kept going stale" in
 | **171** | `rdnsr` had no client access control: bound off localhost, it was an open resolver | **filed 2026-10-05, closed 2026-10-07.** · `f9716c8` · [`docs/closed/171.md`](docs/closed/171.md) |
 | **173** | `rdnsr` answered NXDOMAIN for every RFC 6303 reverse zone, and nothing could override it | **filed 2026-10-05, closed 2026-10-07.** · `458734e` · [`docs/closed/173.md`](docs/closed/173.md) |
 | **187** | no response was padded when the query asked for it (RFC 7830 §4 MUST) | **filed 2026-10-06, closed 2026-10-07.** · `16c43fe` · [`docs/closed/187.md`](docs/closed/187.md) |
+| **186** | `rdnsr` counted no validation outcomes, and `dns_validation_errors_total` was not about DNSSEC | **filed 2026-10-06, closed 2026-10-07.** · `2c9a926` · [`docs/closed/186.md`](docs/closed/186.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
