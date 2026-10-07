@@ -40,16 +40,16 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Sixteen items. #171-#185 were filed 2026-10-05 from a comparison against
+Fifteen items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
-#173. #181 was closed wontfix in triage; #171, #173, #183, #184, #186 and #187
-closed 2026-10-07:
+#173. #181 was closed wontfix in triage; #171, #173, #179, #183, #184, #186 and
+#187 closed 2026-10-07:
 
 - `rdnsr`: #172 no per-domain forwarding, #174 no local data,
   #175 no encrypted upstream, #176 no negative trust anchors, #177 no local
   root (RFC 8806), #178 no control channel.
-- `rdnsd`: #179 no NSID, #180 KSK rollover does not check the parent's DS,
+- `rdnsd`: #180 KSK rollover does not check the parent's DS,
   #182 catalog zones not generated.
 - #185 the UDP path: #28d's figure measured the client (185a), CPU per query
   below saturation (185b), no syscall batching (185c), shared state (185d).
@@ -1113,6 +1113,7 @@ the week; the record is under "How the queue kept going stale" in
 | **186** | `rdnsr` counted no validation outcomes, and `dns_validation_errors_total` was not about DNSSEC | **filed 2026-10-06, closed 2026-10-07.** · `2c9a926` · [`docs/closed/186.md`](docs/closed/186.md) |
 | **184** | stale statements in `docs/` and two code comments | **filed 2026-10-05, closed 2026-10-07.** · `0d95e3b` · [`docs/closed/184.md`](docs/closed/184.md) |
 | **183** | signing with an imported RSA key was implemented and never tested | **filed 2026-10-05, closed 2026-10-07.** · `1288421` · [`docs/closed/183.md`](docs/closed/183.md) |
+| **179** | `rdnsd` and `rdnsr` did not answer NSID (RFC 5001) | **filed 2026-10-05, closed 2026-10-07.** · `76b0bb8` · [`docs/closed/179.md`](docs/closed/179.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
