@@ -40,11 +40,11 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Fifteen items. #171-#185 were filed 2026-10-05 from a comparison against
+Fourteen items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
-#173. #181 was closed wontfix in triage; #171, #173, #179, #183, #184, #186 and
-#187 closed 2026-10-07:
+#173. #181 was closed wontfix in triage; #171, #173, #179, #183, #184, #186, #187
+and #189 closed 2026-10-07:
 
 - `rdnsr`: #172 no per-domain forwarding, #174 no local data,
   #175 no encrypted upstream, #176 no negative trust anchors, #177 no local
@@ -54,7 +54,6 @@ filing; #186-#192 came out of triaging the first batch, #193 out of closing
 - #185 the UDP path: #28d's figure measured the client (185a), CPU per query
   below saturation (185b), no syscall batching (185c), shared state (185d).
 - #188 neither daemon can be controlled or reloaded on Windows.
-- #189 `rdnsr` cannot ask its upstreams for NSID.
 - #190 neither daemon can run as a Windows service.
 - #191 `rdnsr` emits no dnstap.
 - #192 no Windows Event Log sink.
@@ -1114,6 +1113,7 @@ the week; the record is under "How the queue kept going stale" in
 | **184** | stale statements in `docs/` and two code comments | **filed 2026-10-05, closed 2026-10-07.** · `0d95e3b` · [`docs/closed/184.md`](docs/closed/184.md) |
 | **183** | signing with an imported RSA key was implemented and never tested | **filed 2026-10-05, closed 2026-10-07.** · `1288421` · [`docs/closed/183.md`](docs/closed/183.md) |
 | **179** | `rdnsd` and `rdnsr` did not answer NSID (RFC 5001) | **filed 2026-10-05, closed 2026-10-07.** · `76b0bb8` · [`docs/closed/179.md`](docs/closed/179.md) |
+| **189** | `rdnsr` could not ask its upstreams for NSID | **filed 2026-10-06, closed 2026-10-07.** · `262fe23` · [`docs/closed/189.md`](docs/closed/189.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
 applied (`CLAUDE.md` §11):
