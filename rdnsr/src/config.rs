@@ -49,6 +49,16 @@ pub(crate) struct Config {
     forward_zone: Vec<RouteEntry>,
     #[serde(default)]
     stub_zone: Vec<RouteEntry>,
+    /// `[[local-zone]]`: a name and the file to answer it from (#174).
+    #[serde(default)]
+    local_zone: Vec<LocalEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct LocalEntry {
+    name: String,
+    file: PathBuf,
 }
 
 /// One routed domain. Written into `--forward-zone`/`--stub-zone`'s spelling
@@ -440,7 +450,12 @@ impl Config {
             keys: _,
             forward_zone,
             stub_zone,
+            local_zone,
         } = self;
+        cli.local_zone = local_zone
+            .iter()
+            .map(|entry| format!("{}={}", entry.name, entry.file.display()))
+            .collect();
         cli.forward_zone = forward_zone.iter().map(RouteEntry::spec).collect();
         cli.stub_zone = stub_zone.iter().map(RouteEntry::spec).collect();
         cli.no_validate_zone = forward_zone

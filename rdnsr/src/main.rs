@@ -235,6 +235,12 @@ struct Cli {
     /// they are its authorities. Same spelling and rules as `--forward-zone`.
     #[arg(long, value_name = "NAME=ADDR[,ADDR]", conflicts_with = "config")]
     stub_zone: Vec<String>,
+    /// Answer a domain from a zone file this resolver holds: `NAME=PATH`,
+    /// repeatable. AA set, AD never, not cached; a referral inside it is
+    /// followed, a CNAME out of it resolved. Re-read on SIGHUP, all or
+    /// nothing. Not at or under a special-use name.
+    #[arg(long, value_name = "NAME=PATH", conflicts_with = "config")]
+    local_zone: Vec<String>,
     /// Answer a routed domain without validating it: `Indeterminate`, AD
     /// clear. For a private domain under a signed public one, which validation
     /// can only call bogus. Repeatable; must name a routed domain.
@@ -781,13 +787,15 @@ async fn main() -> anyhow::Result<()> {
     };
     // Above the dry run, with every refusal naming its entry (`TODO.md` #172).
     // `--upstream` is a forward zone at `.`.
-    config.routes = routes::build(
+    let (routes, local_files) = routes::build(
         &cli.forward_zone,
         &cli.stub_zone,
+        &cli.local_zone,
         &cli.no_validate_zone,
         &cli.upstream,
         cli.root_hints.is_some(),
     )?;
+    config.routes = routes;
     let recursing = !config.routes.iter().any(|r| r.name.as_ref().is_root());
 
     // Fail loudly on a hints file that yields no addresses; falling back to
@@ -886,7 +894,7 @@ async fn main() -> anyhow::Result<()> {
         config
             .routes
             .iter()
-            .map(routes::describe)
+            .map(|route| routes::describe(route, &local_files))
             .chain((!rest.is_empty()).then_some(rest))
             .collect::<Vec<_>>()
             .join("; ")
@@ -1393,10 +1401,16 @@ async fn main() -> anyhow::Result<()> {
             .negative_trust_anchors(serving.resolver.ntas().snapshot().len());
         nta::spawn_maintainer(serving.clone(), shutdown.stop_handle(), shutdown.busy());
     }
-    if encrypted.is_some() || serving.policy.is_configured() || nta_file.is_some() {
+    let local_files = Arc::new(local_files);
+    if encrypted.is_some()
+        || serving.policy.is_configured()
+        || nta_file.is_some()
+        || !local_files.is_empty()
+    {
         tokio::spawn(reload::reload_task(
             encrypted.as_ref().map(Encrypted::store),
             nta_file,
+            local_files,
             serving.clone(),
             reload,
             shutdown.stop_handle(),

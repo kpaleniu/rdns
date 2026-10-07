@@ -49,6 +49,19 @@ recursed ones, which is stricter than before: records a forwarder volunteers
 for names off the chain are not cached. The chain loop follows the CNAMEs a
 response already carries, so a forwarder's whole chain is not re-asked.
 
+**Local zones** (`--local-zone NAME=PATH`, `[[local-zone]]` with `name` and
+`file`, `TODO.md` #174) are the third kind: the file is read by the zone parser
+`rdnsd` uses and answered by `zone_answer`, through the walk, so a referral
+inside it is followed as a stub zone's would be and a CNAME out of it is
+resolved. AA set (cleared on a referral), AD never, no EDE; `Indeterminate`
+whenever the question or any answer record lies in one, and never validated.
+Answers touching a local zone are not cached, so a reload is seen at once —
+which means a public name whose chain enters one is not cached either, since
+the cache holds whole answers per question. RPZ runs before them. SIGHUP
+re-reads the files, all or nothing, skipping a file whose bytes did not move,
+and logs each serial that did. Refused at startup: a file that does not parse
+or has no SOA at its name, and a name at or under a special-use name.
+
 Refused at startup, naming the entry: a name that does not parse, one routed
 twice or as both kinds, an empty server list, `--no-validate-zone` naming no
 route, `--upstream` with a route at `.`, `--root-hints` with `.` routed.
@@ -388,6 +401,9 @@ PowerDNS implement it. A policy zone is an ordinary DNS zone whose owner names
 are triggers and whose RRsets are actions; the trigger name is the thing matched
 with the policy zone's origin appended, so the lookup is `Zone::locate` and the
 RPZ wildcard rule is RFC 1034 §4.3.3's.
+
+Data the operator owns, rather than a rewrite of somebody else's, belongs in a
+local zone (§5.1a): authoritative, its own owners, no EDE 4.
 
 | action | spelling | effect |
 |---|---|---|

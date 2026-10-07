@@ -452,7 +452,9 @@ pub(crate) async fn handle_query(
                     }
                 }
 
-                caches.store(&query, &upstream, &state);
+                if !resolver.touches_local_zone(&query, &upstream) {
+                    caches.store(&query, &upstream, &state);
+                }
                 (upstream, Some(state.outcome()), None)
             }
             // A nameserver trigger matched, so the walk stopped and the
@@ -684,7 +686,9 @@ async fn resolve_and_store(
     };
     // A name that has gone is exactly what a prefetch should notice before a
     // client does, so the "no" is stored like any other.
-    serving.caches.store(query, &answer, &state);
+    if !serving.resolver.touches_local_zone(query, &answer) {
+        serving.caches.store(query, &answer, &state);
+    }
     if state.is_bogus() {
         return None;
     }

@@ -173,7 +173,7 @@ impl Resolver {
             // The policy is asked about the route's servers at entry, as it
             // is for a walk started from a cached delegation (#56).
             state.allows(&[], &route.servers)?;
-            if route.kind == RouteKind::Forward {
+            if matches!(route.kind, RouteKind::Forward) {
                 let out = self.build_query(query, true)?;
                 let response = self
                     .ask_any(&route.servers, &out, &mut state.budget)
@@ -228,6 +228,15 @@ impl Resolver {
         }
 
         match route {
+            Some(Route {
+                name,
+                kind: RouteKind::Local(zone),
+                ..
+            }) => {
+                let first = answer_locally(&zone.get(), query)?;
+                self.walk_from(query, state, depth, name, Vec::new(), Some(first))
+                    .await
+            }
             Some(route) => {
                 self.walk(query, state, depth, route.name, route.servers)
                     .await
@@ -275,6 +284,22 @@ impl Resolver {
         start_zone: Name,
         start_servers: Vec<SocketAddr>,
     ) -> ResolveResult<Answered> {
+        self.walk_from(query, state, depth, start_zone, start_servers, None)
+            .await
+    }
+
+    /// As [`Resolver::walk`], with `first` standing in for the first server's
+    /// reply to the full name: a local zone's answer, whose referral the walk
+    /// then follows as a stub zone's would be (`TODO.md` #174).
+    async fn walk_from(
+        &self,
+        query: &QuerySection,
+        state: &mut Resolution<'_>,
+        depth: usize,
+        start_zone: Name,
+        start_servers: Vec<SocketAddr>,
+        mut first: Option<DnsMessage>,
+    ) -> ResolveResult<Answered> {
         let qname = query.qname.clone();
         let qname_labels = qname.as_ref().label_count();
 
@@ -297,8 +322,9 @@ impl Resolver {
         // trips spent minimizing.
         let mut minimized_probes = 0usize;
         for _ in 0..max_steps {
-            let minimizing =
-                self.config.qname_minimization && minimized_probes < MAX_MINIMISE_COUNT;
+            let minimizing = first.is_none()
+                && self.config.qname_minimization
+                && minimized_probes < MAX_MINIMISE_COUNT;
             let labels = if minimizing {
                 sent_labels.min(qname_labels)
             } else {
@@ -324,12 +350,18 @@ impl Resolver {
                 },
                 qclass: query.qclass,
             };
-            let out = self.build_query(&step, false)?;
-
-            let Some(response) = self.ask_any(&servers, &out, &mut state.budget).await else {
-                return Err(ResolveError::no_response(format!(
-                    "no server for {zone} answered while resolving {qname}"
-                )));
+            let response = match first.take() {
+                Some(local) => local,
+                None => {
+                    let out = self.build_query(&step, false)?;
+                    let Some(response) = self.ask_any(&servers, &out, &mut state.budget).await
+                    else {
+                        return Err(ResolveError::no_response(format!(
+                            "no server for {zone} answered while resolving {qname}"
+                        )));
+                    };
+                    response
+                }
             };
 
             // Bailiwick is judged against the full `qname` even when a shorter
@@ -628,6 +660,42 @@ impl Resolver {
     fn exchange_timeout(&self) -> Duration {
         Duration::from_millis(self.config.timeout_ms / 2)
     }
+}
+
+/// What a local zone says to `query`, as the reply a server would have sent:
+/// `zone_answer`, the engine `rdnsd` answers with, so there is no second one
+/// (`CLAUDE.md` §7). AA set, and cleared by `zone_answer` on a referral; DO
+/// on, since `rdnsr` strips DNSSEC records a client did not ask for.
+fn answer_locally(zone: &crate::zone::Zone, query: &QuerySection) -> ResolveResult<DnsMessage> {
+    let request = DnsMessage {
+        id: 0,
+        response: false,
+        opcode: crate::OpCode::Query,
+        authoritive: false,
+        truncation: false,
+        recursion: false,
+        recursion_ok: false,
+        ad: false,
+        cd: false,
+        rcode: ResponseCode::Ok,
+        queries: vec![query.clone()],
+        answers: Vec::new(),
+        authorities: Vec::new(),
+        additionals: Vec::new(),
+        edns: None,
+    };
+    let mut out = Vec::new();
+    let mut compressor = crate::compression::NameCompressor::new();
+    let mut writer = crate::response::ResponseWriter::start(
+        &mut out,
+        &mut compressor,
+        u16::MAX as usize,
+        &request,
+    )?;
+    writer.set_authoritative(true);
+    crate::zone_answer::write(zone, &query.qname, query.qtype, true, &mut writer)?;
+    writer.finish()?;
+    Ok(DnsMessage::try_from_bytes(&out)?)
 }
 
 /// Where `name`'s CNAME chain ends within `answers`, or `None` when no CNAME

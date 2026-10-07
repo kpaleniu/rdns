@@ -283,10 +283,10 @@ impl std::fmt::Display for ResolutionTimer {
     }
 }
 
-/// How a routed domain's servers are asked (`TODO.md` #172).
+/// How a routed domain is answered (`TODO.md` #172, #174).
 ///
 /// Room for a transport beside it (#175) is in [`Route`], not here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RouteKind {
     /// Ask the servers with RD=1 and take what they say: they resolve. BIND's
     /// `forward only` zone, Unbound's `forward-zone`.
@@ -294,7 +294,46 @@ pub enum RouteKind {
     /// Walk the delegation chain from the servers with RD=0: they are the
     /// domain's authorities. Unbound's `stub-zone`.
     Stub,
+    /// Answer from a zone this resolver holds, by `zone_answer` — the engine
+    /// `rdnsd` answers with — and follow a referral out of it as a stub
+    /// zone's would be (#174).
+    Local(LocalZone),
 }
+
+/// A zone held for a [`RouteKind::Local`] route, replaceable while the
+/// resolver runs: a SIGHUP re-reads its file.
+///
+/// Equal by identity, not content: two routes are the same local zone when
+/// they share the slot a reload writes into.
+#[derive(Debug, Clone)]
+pub struct LocalZone(Arc<std::sync::RwLock<Arc<crate::zone::Zone>>>);
+
+impl LocalZone {
+    pub fn new(zone: crate::zone::Zone) -> LocalZone {
+        LocalZone(Arc::new(std::sync::RwLock::new(Arc::new(zone))))
+    }
+
+    /// The zone in force.
+    pub fn get(&self) -> Arc<crate::zone::Zone> {
+        self.0
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Put a new version in force.
+    pub fn replace(&self, zone: crate::zone::Zone) {
+        *self.0.write().unwrap_or_else(PoisonError::into_inner) = Arc::new(zone);
+    }
+}
+
+impl PartialEq for LocalZone {
+    fn eq(&self, other: &LocalZone) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for LocalZone {}
 
 /// A subtree sent to named servers rather than found from the root.
 ///
@@ -331,6 +370,17 @@ impl Route {
             kind: RouteKind::Stub,
             servers,
             validate: true,
+        }
+    }
+
+    /// A local zone at the zone's origin, never validated: it is the
+    /// operator's own data, and there is no chain of trust to it (#174).
+    pub fn local(zone: LocalZone) -> Route {
+        Route {
+            name: zone.get().origin().to_owned(),
+            kind: RouteKind::Local(zone),
+            servers: Vec::new(),
+            validate: false,
         }
     }
 }
@@ -707,6 +757,16 @@ impl Resolver {
         &self.config.routes
     }
 
+    /// Whether a local zone answered any part of `response`: the question or
+    /// any answer record lies in one. Such an answer is not cached, so a
+    /// reload of the zone takes effect at once (#174).
+    pub fn touches_local_zone(&self, query: &QuerySection, response: &DnsMessage) -> bool {
+        std::iter::once(&query.qname)
+            .chain(response.answers.iter().map(|rr| &rr.name))
+            .filter_map(|name| self.route_for(name.as_ref()))
+            .any(|route| matches!(route.kind, RouteKind::Local(_)))
+    }
+
     /// The most specific route covering `name`, if any.
     pub fn route_for(&self, name: NameRef<'_>) -> Option<&Route> {
         self.config
@@ -786,7 +846,13 @@ impl Resolver {
         // resolver is authoritative for nothing (RFC 1035 §4.1.1); with AA
         // set, RFC 8020 reads an NXDOMAIN as a claim about the whole subtree.
         response.queries = vec![query.clone()];
-        response.authoritive = false;
+        // AA stays on an answer from a local zone, which this resolver *is*
+        // authoritative for (#174); `zone_answer` already cleared it on a
+        // referral.
+        let local = self
+            .route_for(query.qname.as_ref())
+            .is_some_and(|route| matches!(route.kind, RouteKind::Local(_)));
+        response.authoritive &= local;
 
         let Some(anchors) = &self.config.dnssec else {
             return Ok((
@@ -801,11 +867,14 @@ impl Resolver {
         // unsigned", AD clear. Indeterminate and not Insecure: nothing proved
         // it unsigned, an operator said to stop asking. No EDE — RFC 8914 has
         // no code for it.
-        // A routed domain set not to validate: the same answer an NTA gives,
-        // reached by configuration rather than by a time-limited exemption.
-        if let Some(route) = self
-            .route_for(query.qname.as_ref())
-            .filter(|route| !route.validate)
+        // A routed domain not validated — set so, or a local zone — the same
+        // answer an NTA gives, reached by configuration. The question's own
+        // route, or any route an answer record lies in: a chain through an
+        // unvalidated domain has nothing to validate it with (#174).
+        if let Some(route) = std::iter::once(&query.qname)
+            .chain(response.answers.iter().map(|rr| &rr.name))
+            .filter_map(|name| self.route_for(name.as_ref()))
+            .find(|route| !route.validate)
         {
             return Ok((
                 response,
@@ -1276,7 +1345,7 @@ this line has no record and is skipped
         let route = forwarding
             .route_for(Name::root().as_ref())
             .expect("a route at .");
-        assert_eq!((route.kind, route.servers.len()), (RouteKind::Forward, 1));
+        assert_eq!((&route.kind, route.servers.len()), (&RouteKind::Forward, 1));
     }
 
     /// The budget is what stops one client query becoming unbounded upstream
@@ -4721,6 +4790,181 @@ this line has no record and is skipped
                     );
                 }
             }
+        }
+    }
+
+    /// Local zones (`TODO.md` #174): answered from a zone the resolver holds,
+    /// through the walk, so referrals and CNAMEs leave it as they would a
+    /// stub zone.
+    mod local {
+        use super::*;
+
+        fn local_route(text: &str, origin: &str) -> Route {
+            Route::local(LocalZone::new(
+                crate::zone::parse_zone_file(text, origin).expect("the zone parses"),
+            ))
+        }
+
+        const CORP: &str = "$TTL 300\n\
+             @ IN SOA ns.corp.test. admin.corp.test. 1 3600 600 86400 300\n\
+             @ IN NS ns.corp.test.\n\
+             ns IN A 198.51.100.8\n\
+             www IN A 10.0.0.1\n\
+             out IN CNAME www.public.test.\n\
+             lab IN NS ns.lab.corp.test.\n\
+             ns.lab IN A 198.51.100.6\n";
+
+        fn resolver(net: &Net) -> Resolver {
+            net.resolver(ResolverConfig {
+                routes: vec![local_route(CORP, "corp.test.")],
+                ..recursing_config(fake(1))
+            })
+        }
+
+        fn public_tree(net: &Net) {
+            let tld = fake(2);
+            net.serve(fake(1), move |q| {
+                referral(q, "test.", "ns.test.", Some(("ns.test.", tld)))
+            });
+            net.serve(tld, |q| match qname_of(q).as_str() {
+                "in.public.test." => {
+                    authoritative(q, vec![cname_record("in.public.test.", "www.corp.test.")])
+                }
+                name => authoritative(q, vec![a_record(name, [192, 0, 2, 1])]),
+            });
+        }
+
+        /// From the file, AA set, nothing asked of anyone; and a name not in
+        /// it is NXDOMAIN with the zone's SOA, AA set.
+        #[tokio::test]
+        async fn a_local_name_is_answered_from_the_zone() {
+            let net = Net::default();
+            let resolver = resolver(&net);
+            let www = resolver
+                .resolve(&QuerySection {
+                    qname: nm("www.corp.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                })
+                .await
+                .expect("answered");
+            assert!(www.authoritive);
+            assert_eq!(
+                www.answers[0].rdata.parse().unwrap(),
+                ParsedRecord::A(Ipv4Addr::new(10, 0, 0, 1))
+            );
+            let nope = resolver
+                .resolve(&QuerySection {
+                    qname: nm("nope.corp.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                })
+                .await
+                .expect("answered");
+            assert_eq!(nope.rcode, ResponseCode::NoSuchDomain);
+            assert!(nope.authoritive);
+            assert_eq!(nope.authorities[0].rdata.rtype(), rt::SOA);
+        }
+
+        /// A CNAME out of the zone and one into it are both followed.
+        #[tokio::test]
+        async fn cnames_into_and_out_of_a_local_zone_resolve() {
+            let net = Net::default();
+            public_tree(&net);
+            let resolver = resolver(&net);
+            for name in ["out.corp.test.", "in.public.test."] {
+                let answer = resolver
+                    .resolve(&QuerySection {
+                        qname: nm(name),
+                        qtype: Qtype::of(rt::A),
+                        qclass: QueryClass::IN,
+                    })
+                    .await
+                    .expect("resolved");
+                assert_eq!(answer.answers.len(), 2, "{name}: {:?}", answer.answers);
+            }
+        }
+
+        /// A delegation inside the zone is followed to the child's server.
+        #[tokio::test]
+        async fn a_delegation_inside_a_local_zone_is_followed() {
+            let net = Net::default();
+            net.serve(fake(6), |q| {
+                authoritative(q, vec![a_record("www.lab.corp.test.", [10, 0, 0, 6])])
+            });
+            let answer = resolver(&net)
+                .resolve(&QuerySection {
+                    qname: nm("www.lab.corp.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                })
+                .await
+                .expect("followed");
+            assert_eq!(
+                answer.answers[0].rdata.parse().unwrap(),
+                ParsedRecord::A(Ipv4Addr::new(10, 0, 0, 6))
+            );
+        }
+
+        /// A public delegation whose nameserver's address is in a local zone
+        /// is reached through it.
+        #[tokio::test]
+        async fn a_nameserver_in_a_local_zone_is_reached_through_it() {
+            let net = Net::default();
+            let tld = fake(2);
+            net.serve(fake(1), move |q| {
+                referral(q, "test.", "ns.test.", Some(("ns.test.", tld)))
+            });
+            net.serve(tld, |q| {
+                referral(q, "glueless.test.", "ns.corp.test.", None)
+            });
+            net.serve(fake(8), |q| {
+                authoritative(q, vec![a_record("www.glueless.test.", [192, 0, 2, 8])])
+            });
+            let answer = resolver(&net)
+                .resolve(&QuerySection {
+                    qname: nm("www.glueless.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                })
+                .await
+                .expect("reached");
+            assert_eq!(answer.answers.len(), 1);
+        }
+
+        /// Validating, under a signed parent that proves the zone absent: not
+        /// bogus but `Indeterminate`, naming the zone.
+        #[tokio::test]
+        async fn a_local_zone_under_a_signed_parent_is_indeterminate() {
+            let h = signed_hierarchy(signed_ds, signed_answer);
+            let config = ResolverConfig {
+                routes: vec![local_route(
+                    "$TTL 300\n\
+                     @ IN SOA ns admin 1 3600 600 86400 300\n\
+                     @ IN NS ns\n\
+                     ns IN A 10.0.0.2\n\
+                     www IN A 10.0.0.3\n",
+                    "corp.example.test.",
+                )],
+                ..validating_config(&h)
+            };
+            let (_, state) = h
+                .net
+                .resolver(config)
+                .resolve_validated(
+                    &QuerySection {
+                        qname: nm("www.corp.example.test."),
+                        qtype: Qtype::of(rt::A),
+                        qclass: QueryClass::IN,
+                    },
+                    None,
+                )
+                .await
+                .expect("answered");
+            assert!(
+                matches!(&state, ValidationState::Indeterminate(why) if why.contains("corp.example.test")),
+                "{state}"
+            );
         }
     }
 }

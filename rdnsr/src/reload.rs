@@ -41,6 +41,7 @@ use tokio::sync::Notify;
 
 use crate::answer::{reload_policy, Resolving};
 use crate::nta::NtaFile;
+use crate::routes::LocalFile;
 
 /// A handle for asking that the `--rpz` files be re-read.
 ///
@@ -87,23 +88,24 @@ impl PolicyReload {
 pub(crate) async fn reload_task(
     certificate: Option<Arc<CertificateStore>>,
     ntas: Option<NtaFile>,
+    local: Arc<Vec<LocalFile>>,
     serving: Arc<Resolving>,
     wanted: PolicyReload,
     stop: Stop,
 ) {
     let mut signals = reload_signal();
     loop {
-        let (certificate, ntas) = tokio::select! {
+        let (certificate, ntas, local) = tokio::select! {
             reloaded = next_reload(&mut signals) => {
                 if !reloaded {
                     break;
                 }
-                (certificate.as_ref(), ntas.as_ref())
+                (certificate.as_ref(), ntas.as_ref(), Some(&local))
             }
-            () = wanted.requested() => (None, None),
+            () = wanted.requested() => (None, None, None),
             () = stop.wait() => break,
         };
-        reload_now(certificate, ntas, &serving).await;
+        reload_now(certificate, ntas, local, &serving).await;
     }
 }
 
@@ -111,10 +113,12 @@ pub(crate) async fn reload_task(
 async fn reload_now(
     certificate: Option<&Arc<CertificateStore>>,
     ntas: Option<&NtaFile>,
+    local: Option<&Arc<Vec<LocalFile>>>,
     serving: &Arc<Resolving>,
 ) {
     let certificate = certificate.cloned();
     let ntas = ntas.cloned();
+    let local = local.cloned();
     let serving = serving.clone();
     let ran = tokio::task::spawn_blocking(move || {
         if let Some(store) = certificate {
@@ -125,6 +129,9 @@ async fn reload_now(
         }
         if let Some(NtaFile(path)) = ntas {
             crate::nta::reload(&serving, &path);
+        }
+        if let Some(local) = local {
+            crate::routes::reload_local(&local);
         }
         reload_policy(&serving);
     })
@@ -226,7 +233,7 @@ mod tests {
         tokio::task::yield_now().await;
         let before = ticks.load(Ordering::Relaxed);
 
-        tokio::spawn(async move { reload_now(None, None, &serving).await })
+        tokio::spawn(async move { reload_now(None, None, None, &serving).await })
             .await
             .expect("the reload finished");
         let during = ticks.load(Ordering::Relaxed) - before;

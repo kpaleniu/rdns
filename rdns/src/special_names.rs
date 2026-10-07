@@ -277,6 +277,12 @@ pub fn lookup(
     None
 }
 
+/// Whether `name` is a special-use name or under one — never an empty zone,
+/// and nothing configuration may take over (`TODO.md` #174).
+pub fn is_special_use(name: NameRef<'_>) -> bool {
+    table().special_use().any(|s| name.is_at_or_under(s))
+}
+
 /// The table's names, parsed once.
 ///
 /// A query used to pay `to_presentation()` and a down-casing `String` to be
