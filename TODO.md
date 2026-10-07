@@ -50,8 +50,8 @@ filing; #186-#192 came out of triaging the first batch, #193 out of closing
   root (RFC 8806), #178 no control channel.
 - `rdnsd`: #180 KSK rollover does not check the parent's DS,
   #182 catalog zones not generated.
-- #185 the UDP path: #28d's figure measured the client (185a), CPU per query
-  below saturation (185b), no syscall batching (185c), shared state (185d).
+- #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
+  closed, 185c and 185d wontfix.
 - #188 neither daemon can be controlled or reloaded on Windows.
 - #190 neither daemon can run as a Windows service.
 - #191 `rdnsr` emits no dnstap.
