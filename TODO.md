@@ -40,10 +40,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Twenty items. #171-#185 were filed 2026-10-05 from a comparison against
+Twenty-one items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
-filing; #186-#191 came out of triaging #172, #175, #178, #179, #188 and #189.
-#181 was closed wontfix in triage:
+filing; #186-#192 came out of triaging the first batch. #181 was closed
+wontfix in triage:
 
 - `rdnsr`: #171 no client access control, #172 no per-domain forwarding,
   #173 RFC 6303 reverse zones refused unconditionally, #174 no local data,
@@ -62,6 +62,7 @@ filing; #186-#191 came out of triaging #172, #175, #178, #179, #188 and #189.
 - #189 `rdnsr` cannot ask its upstreams for NSID.
 - #190 neither daemon can run as a Windows service.
 - #191 `rdnsr` emits no dnstap.
+- #192 no Windows Event Log sink.
 
 The history this section accumulated — how each review's items were found and
 closed, the push and CI record, the stale-preamble lesson and the five claims
