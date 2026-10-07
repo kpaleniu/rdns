@@ -146,6 +146,14 @@ pub async fn serve<H: Handler>(
         };
         // Canonical before anything sees it, as in `tcp::serve`.
         let peer = rdns::peer::canonical(peer);
+        // The query ACL first: a peer it refuses is closed before the rate
+        // limiter or the per-source table hears of it (`TODO.md` #171).
+        if !handler
+            .context()
+            .admits_connection(Peer::from(peer), StreamListener::Doh)
+        {
+            continue;
+        }
         if !rate.admits_connection(handler.context(), Peer::from(peer)) {
             continue;
         }

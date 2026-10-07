@@ -131,6 +131,9 @@ pub struct ListenerSlots {
     /// (`TODO.md` #156). No per-address label: that would be §5's unbounded
     /// table in the scrape.
     refused_per_source: AtomicU64,
+    /// Connections closed unserved because `rdnsr`'s query ACL does not list
+    /// the peer (`TODO.md` #171).
+    refused_by_acl: AtomicU64,
 }
 
 impl ListenerSlots {
@@ -162,6 +165,14 @@ impl ListenerSlots {
 
     pub fn refused_per_source(&self) -> u64 {
         self.refused_per_source.load(Ordering::Relaxed)
+    }
+
+    pub fn refused_for_acl(&self) {
+        self.refused_by_acl.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn refused_by_acl(&self) -> u64 {
+        self.refused_by_acl.load(Ordering::Relaxed)
     }
 
     pub fn accept_waits(&self) -> u64 {
@@ -238,6 +249,9 @@ pub struct Counters {
     /// `max_tracked` (`TODO.md` #157). The first is traffic nothing limits.
     pub rate_limiter_untracked: AtomicU64,
     pub response_limiter_untracked: AtomicU64,
+    /// UDP queries answered REFUSED because `rdnsr`'s query ACL does not list
+    /// the peer (`TODO.md` #171). Stream listeners count theirs per listener.
+    pub acl_refused: AtomicU64,
 
     /// DoT connections whose handshake completed, and those that did not.
     ///
@@ -396,6 +410,7 @@ impl DnsMetrics {
             queries_dropped: AtomicU64::new(0),
             rate_limiter_untracked: AtomicU64::new(0),
             response_limiter_untracked: AtomicU64::new(0),
+            acl_refused: AtomicU64::new(0),
             tls_handshakes: AtomicU64::new(0),
             tls_handshake_failures: AtomicU64::new(0),
             quic_handshakes: AtomicU64::new(0),
@@ -753,6 +768,11 @@ impl DnsMetrics {
                 &self.response_limiter_untracked,
             ),
             (
+                "dns_queries_refused_by_acl_total",
+                "UDP queries refused because the query ACL does not list the peer",
+                &self.acl_refused,
+            ),
+            (
                 "dns_tls_handshakes_total",
                 "DoT handshakes completed",
                 &self.tls_handshakes,
@@ -892,6 +912,21 @@ impl DnsMetrics {
                     "transport",
                     l.label(),
                     self.listener(l).refused_per_source(),
+                );
+            }
+            declare(
+                &mut out,
+                "dns_connections_refused_by_acl_total",
+                "counter",
+                "Connections closed because the query ACL does not list the peer",
+            );
+            for &l in &bound {
+                labelled(
+                    &mut out,
+                    "dns_connections_refused_by_acl_total",
+                    "transport",
+                    l.label(),
+                    self.listener(l).refused_by_acl(),
                 );
             }
         }

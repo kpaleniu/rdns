@@ -1050,6 +1050,27 @@ fn empty_error(
     resp.to_bytes_within(max_len).ok()
 }
 
+/// REFUSED for a datagram from a peer the query ACL does not list
+/// (`TODO.md` #171), or `None` for one that is not a question at all — a QR=1
+/// datagram gets nothing from anybody (`CLAUDE.md` §8).
+///
+/// The question echoed and the client's OPT mirrored with RFC 8914 §4.19's
+/// code, which names this case: "a query from an 'unauthorized' client". No
+/// EXTRA-TEXT, because the reply goes to an address nothing has proved and
+/// every octet of it is somebody else's amplification.
+pub(crate) fn refused_by_acl(data: &[u8], ctx: &ServeContext) -> Option<Vec<u8>> {
+    const NOT_LISTED: ExtendedError = ExtendedError::new(InfoCode::PROHIBITED, "");
+    let msg = Request::from_bytes(data).ok()?;
+    ctx.metrics.count_response(ResponseCode::Refused);
+    empty_error(
+        &msg,
+        ResponseCode::Refused,
+        Some(NOT_LISTED),
+        ctx.udp.advertised(),
+        ctx.udp.reply_ceiling(&msg, Transport::Udp),
+    )
+}
+
 /// NOTIMP for an opcode this resolver does not implement.
 fn unsupported_opcode(msg: &DnsMessage, advertised: u16, max_len: usize) -> Option<Vec<u8>> {
     const WHY: ExtendedError =

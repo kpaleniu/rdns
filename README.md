@@ -346,6 +346,7 @@ Binds 127.0.0.1 by default. Recurses from the root unless given `--upstream`.
 
 | flag | |
 |---|---|
+| `--allow-query <ADDR\|CIDR>` | who may be answered, repeatable; anybody else is REFUSED (UDP) or closed (TCP, DoT, DoH, DoQ). Required once any listener binds off loopback |
 | `--upstream <ADDR:PORT>` | forward instead of recursing. Repeatable |
 | `--dnssec-validate` | walk the chain of trust; AD only on answers that verify, SERVFAIL on those that do not unless the client sets CD |
 | `--trust-anchor <FILE>` | anchors in DS presentation format, read only |

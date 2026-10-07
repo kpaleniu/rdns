@@ -231,6 +231,7 @@ because a dry run would leave it owned by whoever ran the check.
 | `--connection-idle-timeout` (seconds) | 10 | connection closed; DoH and DoQ finish what is in flight first, for at most one more timeout (`TODO.md` #161, #164) | none: `0` is refused |
 | `--max-connections-per-source` (per stream listener; a source is an IPv4 address or IPv6 /56) | 32 | connection closed with no reply; `dns_connections_refused_per_source_total{transport}`, the source logged at most once a minute | `0`; `--max-connections-per-source-exempt` |
 | `MAX_INFLIGHT_PER_CONNECTION` | 16 | TCP and DoT: the read loop back-pressures. DoQ: no stream credit past it. DoH over HTTP/2: the stream is refused with `REFUSED_STREAM`, which a client may retry (`TODO.md` #170) | — |
+| `--allow-query` (`rdnsr`) | none, which is allowed only on loopback | UDP: REFUSED with EDE 18, `dns_queries_refused_by_acl_total`. Stream: closed before any handshake, `dns_connections_refused_by_acl_total{transport}` | `0.0.0.0/0` and `::/0` |
 | `--resolution-timer` (`rdnsr`, seconds) | 10 | the resolution is abandoned: SERVFAIL with EDE 22, or a stale answer under `--serve-stale` (`TODO.md` #168) | none: 1–30 |
 | `RateLimiter::max_tracked` (sources: IPv4 address, IPv6 /56) | 10 000 | an untracked source is allowed, counted in `dns_rate_limiter_untracked_total` | — |
 | `ResponseLimiter::max_tracked` (response targets: IPv4 /24, IPv6 /56) | 10 000 | an untracked target is truncated (TC=1), not dropped and not sent in full; counted in `dns_response_limiter_untracked_total` | — |
@@ -254,8 +255,8 @@ the peer has completed two handshakes and there is nobody to reflect at.
 The effective policy — including what each TSIG key may transfer — is printed in
 the startup banner, because rate-limited queries are dropped without a reply.
 
-`--query-rate-exempt` and `--allow-transfer` are parsed by the same
-`security::TransferAcl`, which matches a `Peer`: an IPv4-mapped address is the
+`--query-rate-exempt`, `--allow-transfer` and `rdnsr`'s `--allow-query` are
+parsed by the same `security::TransferAcl`, which matches a `Peer`: an IPv4-mapped address is the
 IPv4 address it maps, then families do not mix (`TODO.md` #158).
 `TransferAcl::parse_named` carries which list a typo is in.
 So is `--dns64-exclude`, which is the same question — is this address in one of

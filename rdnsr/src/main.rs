@@ -44,7 +44,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use clap::Parser;
 use rdns::cache::StalePolicy;
 use rdns::clock::current_unix_timestamp;
@@ -64,7 +64,7 @@ use rdns_transport::encrypted::{Encrypted, EncryptedFlags, EncryptedListeners};
 use rdns_transport::logging::LogLevel;
 use rdns_transport::metrics_server;
 use rdns_transport::readiness::Readiness;
-use rdns_transport::{tcp, ServeContext, SourceConnections, TransportLimits};
+use rdns_transport::{tcp, QueryAcl, ServeContext, SourceConnections, TransportLimits};
 use tokio::task::JoinSet;
 
 use crate::anchors::spawn_anchor_manager;
@@ -193,7 +193,8 @@ fn default_rpz_policy() -> rdns::rpz::PolicyOverride {
 // `multiple`, because clap's default makes a group's members conflict.
 #[command(group(clap::ArgGroup::new("refreshing").multiple(true)))]
 struct Cli {
-    /// Address to listen on. Defaults to localhost to avoid an open resolver.
+    /// Address to listen on. Defaults to localhost to avoid an open resolver;
+    /// anything else needs `--allow-query`.
     ///
     /// `::` serves IPv4 and IPv6 on every platform; a specific IPv6 address,
     /// such as `::1`, serves IPv6 only.
@@ -201,6 +202,16 @@ struct Cli {
     host: String,
     #[arg(long, default_value_t = default_port(), conflicts_with = "config")]
     port: u16,
+    /// An address or CIDR prefix that may be answered, repeatable. Anybody
+    /// else gets REFUSED over UDP and a closed connection on a stream
+    /// listener.
+    ///
+    /// Required once any listener binds off loopback, `0.0.0.0` and `::`
+    /// included; an open resolver is written `0.0.0.0/0` and `::/0`. Once
+    /// given, nothing is allowed that it does not list, loopback included
+    /// (`docs/adr/0007`).
+    #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
+    allow_query: Vec<String>,
     /// Forward to this resolver instead of recursing, e.g. 8.8.8.8:53
     /// (repeatable). Passing any `--upstream` switches the resolver from
     /// recursion to forwarding, the way `forwarders`/`forward-zone` does in
@@ -632,6 +643,44 @@ impl Cli {
     }
 }
 
+/// The query ACL, or the refusal to start without one (`docs/adr/0007`).
+///
+/// No list is [`QueryAcl::Open`], and allowed only while every listener is on
+/// loopback. A given list must hold every `--rpz-notify-from` rule: the ACL
+/// runs before a NOTIFY is parsed, so a primary it does not list would be
+/// refused without anything saying why.
+async fn query_acl(cli: &Cli, notify_from: Option<&TransferAcl>) -> anyhow::Result<QueryAcl> {
+    let acl = TransferAcl::parse_named(&cli.allow_query, "--allow-query")?;
+    if acl.is_empty() {
+        let plain = format!("{}:{}", cli.host, cli.port);
+        for (flag, addr) in [
+            ("--host", Some(plain.as_str())),
+            ("--tls-listen", cli.tls_listen.as_deref()),
+            ("--quic-listen", cli.quic_listen.as_deref()),
+            ("--https-listen", cli.https_listen.as_deref()),
+        ] {
+            let Some(addr) = addr else { continue };
+            if !bind::loopback_only(addr)
+                .await
+                .with_context(|| format!("{flag} {addr}"))?
+            {
+                bail!(
+                    "{flag} {addr} is off loopback and no --allow-query says who may be \
+                     answered; an open resolver is --allow-query 0.0.0.0/0 --allow-query ::/0"
+                );
+            }
+        }
+        return Ok(QueryAcl::Open);
+    }
+    if let Some(rule) = notify_from.and_then(|from| from.first_not_within(&acl)) {
+        bail!(
+            "--rpz-notify-from {rule} is inside no --allow-query rule, and the query ACL \
+             refuses a NOTIFY from it before --rpz-notify-from is consulted"
+        );
+    }
+    Ok(QueryAcl::Only(Arc::new(acl)))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
@@ -827,6 +876,10 @@ async fn main() -> anyhow::Result<()> {
         })
     };
 
+    // Above the dry run, and after `--rpz-notify-from`, which it is checked
+    // against: an open resolver must fail `--check-config` too.
+    let acl = query_acl(&cli, rpz_notify.as_ref().map(|n| &n.from)).await?;
+
     // Before anything binds, as everything else operator-supplied is: a NAT64
     // prefix that does not parse is an IPv6-only network with no DNS at all.
     let dns64 = match &cli.dns64 {
@@ -890,7 +943,7 @@ async fn main() -> anyhow::Result<()> {
             .count();
         println!(
             "configuration is valid: {}, {} policy feed(s){}, cache {}, listening on {}, \
-             encrypted transports {}",
+             encrypted transports {}, query ACL {}",
             source,
             in_force.zones().len(),
             // Said out loud because a feed at `passthru` or `disabled` blocks
@@ -915,6 +968,7 @@ async fn main() -> anyhow::Result<()> {
                 None => "disabled".to_string(),
                 Some(encrypted) => format!("on {}, certificate loads", encrypted.listeners()),
             },
+            acl.describe(),
         );
         return Ok(());
     }
@@ -959,12 +1013,13 @@ async fn main() -> anyhow::Result<()> {
         logger: Arc::new(QueryLogger::new()),
         validator: Arc::new(AdmissionCheck::new(admission.clone())),
         per_source: per_source.clone(),
+        acl: acl.clone(),
         clock,
     });
     tracing::info!(
         "rdnsr listening on {} (UDP+TCP), {}, cache: {}{}, \
          UDP reply cap: {}B (advertising {}B), UDP in flight: {}, \
-         connections: {} per listener, {}, idle {}s, encrypted: {}",
+         connections: {} per listener, {}, idle {}s, encrypted: {}, query ACL: {}",
         listening,
         source,
         if capacity == 0 {
@@ -996,6 +1051,7 @@ async fn main() -> anyhow::Result<()> {
             Some(encrypted) => stream_listeners.describe(encrypted),
             None => "off (--tls-listen, --quic-listen, --https-listen)".to_string(),
         },
+        acl.describe(),
     );
     // And the two limits, for the same reason: both drop in silence, so an
     // operator who cannot see the policy blames the network.

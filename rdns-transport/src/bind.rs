@@ -172,6 +172,23 @@ pub async fn tcp(addr: &str) -> io::Result<Bound<tokio::net::TcpListener>> {
     })
 }
 
+/// Whether every address `addr` names is loopback: `127.0.0.0/8` or `::1`.
+///
+/// Every address and not the first, which is the one a bind takes: a name
+/// that resolves to loopback and something else is not a promise about which
+/// the bind will get. The wildcards are not loopback — they are every
+/// interface.
+pub async fn loopback_only(addr: &str) -> io::Result<bool> {
+    let mut any = false;
+    for resolved in tokio::net::lookup_host(addr).await? {
+        if !resolved.ip().to_canonical().is_loopback() {
+            return Ok(false);
+        }
+        any = true;
+    }
+    Ok(any)
+}
+
 /// A std socket, for quinn, which wraps its own.
 pub fn udp_std(addr: SocketAddr) -> io::Result<Bound<std::net::UdpSocket>> {
     Ok(bind_one(addr, Type::DGRAM)?.map(std::net::UdpSocket::from))
@@ -251,5 +268,26 @@ mod tests {
             Some("[2001:db8::1]:53 (IPv6)")
         );
         assert_eq!(planned("localhost:53"), None);
+    }
+
+    #[tokio::test]
+    async fn only_loopback_is_loopback() {
+        for addr in [
+            "127.0.0.1:53",
+            "127.9.9.9:53",
+            "[::1]:53",
+            "[::ffff:127.0.0.1]:53",
+        ] {
+            assert!(loopback_only(addr).await.expect(addr), "{addr}");
+        }
+        for addr in [
+            "0.0.0.0:53",
+            ":::53",
+            "[::]:53",
+            "192.0.2.1:53",
+            "[2001:db8::1]:53",
+        ] {
+            assert!(!loopback_only(addr).await.expect(addr), "{addr}");
+        }
     }
 }

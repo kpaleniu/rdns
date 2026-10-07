@@ -145,6 +145,14 @@ pub async fn serve<H: Handler>(
         // Canonical before anything sees it, as in `tcp::serve`; quinn keeps
         // the address it replies to itself.
         let peer = rdns::peer::canonical(incoming.remote_address());
+        // The query ACL first, as in `tcp::serve`.
+        if !handler
+            .context()
+            .admits_connection(Peer::from(peer), StreamListener::Doq)
+        {
+            incoming.refuse();
+            continue;
+        }
         if !rate.admits_connection(handler.context(), Peer::from(peer)) {
             // Refuse before the handshake: a retry-able refusal costs the
             // source a round trip and costs us no crypto at all.

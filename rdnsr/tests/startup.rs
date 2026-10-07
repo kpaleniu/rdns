@@ -286,3 +286,142 @@ fn a_malformed_per_source_exemption_is_refused_by_name() {
     let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
 }
+
+/// Off loopback with no `--allow-query` is an open resolver, refused before
+/// the dry run answers and naming the flag that put it there (`TODO.md` #171,
+/// `docs/adr/0007`). Every listener counts, the wildcard included.
+#[test]
+fn an_open_resolver_is_refused_until_the_acl_says_who_may_ask() {
+    for args in [
+        &["--check-config", "--host", "0.0.0.0"][..],
+        &["--check-config", "--host", "::"][..],
+        &["--check-config", "--host", "192.0.2.1"][..],
+    ] {
+        let out = rdnsr(args);
+        assert!(!out.status.success(), "{args:?} passed the dry run");
+        let message = stderr(&out);
+        assert!(message.contains("--host"), "{args:?}: {message}");
+        assert!(message.contains("--allow-query"), "{args:?}: {message}");
+    }
+
+    let out = rdnsr(&[
+        "--check-config",
+        "--host",
+        "0.0.0.0",
+        "--allow-query",
+        "192.0.2.0/24",
+        "--allow-query",
+        "2001:db8::/32",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("query ACL 2 --allow-query rule(s)"),
+        "got: {}",
+        stdout(&out)
+    );
+    let out = rdnsr(&["--check-config", "--host", "127.0.0.2"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("query ACL open"),
+        "got: {}",
+        stdout(&out)
+    );
+}
+
+/// An encrypted listener off loopback is an open resolver too, though `--host`
+/// is the default.
+#[test]
+fn an_encrypted_listener_off_loopback_needs_the_acl_too() {
+    let dir = ScratchDir::new("rdnsr-acl-doh");
+    let issued =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a certificate");
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    std::fs::write(&cert, issued.cert.pem()).expect("write the certificate");
+    std::fs::write(&key, issued.signing_key.serialize_pem()).expect("write the key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+    }
+    let out = rdnsr(&[
+        "--check-config",
+        "--https-listen",
+        "0.0.0.0:8443",
+        "--tls-cert",
+        &cert.to_string_lossy(),
+        "--tls-key",
+        &key.to_string_lossy(),
+    ]);
+    assert!(!out.status.success(), "stdout: {}", stdout(&out));
+    assert!(stderr(&out).contains("--https-listen"), "{}", stderr(&out));
+}
+
+/// The ACL runs before a NOTIFY is read, so a primary it does not list would
+/// be refused with nothing saying why; that is refused at startup instead,
+/// naming the rule.
+#[test]
+fn a_notify_sender_outside_the_acl_is_refused_at_startup() {
+    let dir = ScratchDir::new("rdnsr-acl-notify");
+    let feed = dir.join("block.zone");
+    std::fs::write(
+        &feed,
+        "\
+$ORIGIN rpz.example.
+$TTL 300
+@       IN SOA ns.rpz.example. admin.rpz.example. ( 1 3600 600 604800 300 )
+@       IN NS  ns.rpz.example.
+",
+    )
+    .expect("write the feed");
+    let feed = feed.to_string_lossy();
+    let base = [
+        "--check-config",
+        "--rpz",
+        &feed,
+        "--allow-query",
+        "10.0.0.0/8",
+    ];
+
+    let out = rdnsr(&[&base[..], &["--rpz-notify-from", "192.0.2.1"]].concat());
+    assert!(!out.status.success(), "stdout: {}", stdout(&out));
+    let message = stderr(&out);
+    assert!(
+        message.contains("192.0.2.1/32"),
+        "names the rule: {message}"
+    );
+    assert!(message.contains("--allow-query"), "{message}");
+
+    let out = rdnsr(&[&base[..], &["--rpz-notify-from", "10.1.0.0/16"]].concat());
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+}
+
+/// The config file's key reaches the same check as the flag, and the two
+/// together are refused as every other pair is (`CLAUDE.md` §15).
+#[test]
+fn allow_query_in_the_config_file_is_the_flag() {
+    let dir = ScratchDir::new("rdnsr-acl-config");
+    let config = dir.join("rdnsr.toml");
+    std::fs::write(&config, "[server]\nhost = \"0.0.0.0\"\n").expect("write the config");
+    let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
+    assert!(!out.status.success(), "stdout: {}", stdout(&out));
+    assert!(stderr(&out).contains("--allow-query"), "{}", stderr(&out));
+
+    std::fs::write(
+        &config,
+        "[server]\nhost = \"0.0.0.0\"\nallow-query = [\"10.0.0.0/8\"]\n",
+    )
+    .expect("write the config");
+    let out = rdnsr(&["--config", &config.to_string_lossy(), "--check-config"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    let out = rdnsr(&[
+        "--config",
+        &config.to_string_lossy(),
+        "--allow-query",
+        "10.0.0.0/8",
+        "--check-config",
+    ]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--allow-query"), "{}", stderr(&out));
+}

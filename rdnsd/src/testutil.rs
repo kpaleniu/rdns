@@ -149,6 +149,7 @@ fn context_at(clock: Clock) -> ServeContext {
         metrics: Arc::new(DnsMetrics::new()),
         udp: UdpSizes::default(),
         per_source: Default::default(),
+        acl: rdns_transport::QueryAcl::Open,
         clock,
     }
 }

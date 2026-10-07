@@ -13,6 +13,14 @@ use rdns::validation::AdmissionCheck;
 
 use crate::ServeContext;
 
+/// A query ACL listing `specs` and nobody else.
+pub(crate) fn only(specs: &[&str]) -> crate::QueryAcl {
+    let specs: Vec<String> = specs.iter().map(|s| s.to_string()).collect();
+    crate::QueryAcl::Only(Arc::new(
+        rdns::security::TransferAcl::parse(&specs).expect("acl"),
+    ))
+}
+
 /// A context whose query rate is `rate` per second with a burst of the same,
 /// and whose other limits are off, so a test measures the thing it names.
 pub(crate) fn context(rate: u32) -> ServeContext {
@@ -24,6 +32,7 @@ pub(crate) fn context(rate: u32) -> ServeContext {
         metrics: Arc::new(DnsMetrics::new()),
         udp: rdns::UdpSizes::default(),
         per_source: crate::SourceConnections::default(),
+        acl: crate::QueryAcl::Open,
         // A test that asserts on the rate limiter overrides this with a
         // `Clock::fixed`; the rest never read it.
         clock: Clock::system(),

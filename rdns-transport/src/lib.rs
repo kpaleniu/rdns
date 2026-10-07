@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use rdns::clock::Clock;
 use rdns::logging::QueryLogger;
-use rdns::metrics::{DnsMetrics, LatencyTimer};
+use rdns::metrics::{DnsMetrics, LatencyTimer, StreamListener};
 use rdns::peer::Peer;
 use rdns::security::{RateLimiter, ResponseLimiter, ResponseVerdict, TransferAcl};
 use rdns::shutdown::{stop_signal, Shutdown};
@@ -187,6 +187,8 @@ pub struct ServeContext {
     pub udp: UdpSizes,
     /// How many connections one source may hold on each stream listener.
     pub per_source: SourceConnections,
+    /// Which peers may be answered at all. `rdnsd` is [`QueryAcl::Open`].
+    pub acl: QueryAcl,
     /// Where the accept loops read the wall clock.
     ///
     /// The four of them had `rdns::clock::current_unix_timestamp()` written out
@@ -199,6 +201,22 @@ pub struct ServeContext {
 }
 
 impl ServeContext {
+    /// Whether a stream listener may serve a connection from `peer`, counted
+    /// per listener when it may not.
+    ///
+    /// Before the per-source limit, the rate limiter and any handshake: a
+    /// peer the ACL refuses gets no table entry anywhere (`CLAUDE.md` §5),
+    /// and a TLS or QUIC handshake is work done for somebody who may ask
+    /// nothing.
+    pub fn admits_connection(&self, peer: Peer, listener: StreamListener) -> bool {
+        if self.acl.admits(peer) {
+            return true;
+        }
+        self.metrics.listener(listener).refused_for_acl();
+        tracing::debug!(%peer, transport = listener.label(), "connection refused: query ACL");
+        false
+    }
+
     /// Whether this source may be answered at all.
     ///
     /// Silent when it may not: replying to a source that may be spoofed is what
@@ -293,6 +311,36 @@ impl ServeContext {
     pub fn record_answer(&self, rcode: ResponseCode, timer: LatencyTimer) {
         self.metrics.count_response(rcode);
         self.metrics.observe_latency_us(timer.elapsed_us());
+    }
+}
+
+/// Who may be answered (`TODO.md` #171, `docs/adr/0007`).
+///
+/// Not `Option<TransferAcl>`: an empty `TransferAcl` allows nobody, so `None`
+/// would mean the opposite of the list it stands beside (`CLAUDE.md` §17).
+#[derive(Clone)]
+pub enum QueryAcl {
+    /// Everybody. `rdnsd`, and `rdnsr` bound to loopback only with no list.
+    Open,
+    /// The listed addresses and prefixes, matched as a [`Peer`]; nobody else,
+    /// loopback included.
+    Only(Arc<TransferAcl>),
+}
+
+impl QueryAcl {
+    pub fn admits(&self, peer: Peer) -> bool {
+        match self {
+            QueryAcl::Open => true,
+            QueryAcl::Only(acl) => acl.allows(peer),
+        }
+    }
+
+    /// For the startup line.
+    pub fn describe(&self) -> String {
+        match self {
+            QueryAcl::Open => "open (loopback listeners only)".to_string(),
+            QueryAcl::Only(acl) => format!("{} --allow-query rule(s)", acl.len()),
+        }
     }
 }
 

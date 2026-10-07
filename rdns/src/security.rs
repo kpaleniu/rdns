@@ -687,9 +687,28 @@ impl TransferAcl {
     pub fn len(&self) -> usize {
         self.rules.len()
     }
+
+    /// The first rule of `self` that no rule of `outer` wholly contains, as
+    /// written in prefix form, or `None` when every address `self` allows
+    /// `outer` allows too.
+    ///
+    /// Rule by rule, so two outer rules that only together cover an inner one
+    /// do not count: `rdnsr` uses this to refuse a startup it would otherwise
+    /// complete, and naming one rule to widen is the useful answer there.
+    pub fn first_not_within(&self, outer: &TransferAcl) -> Option<String> {
+        self.rules
+            .iter()
+            .find(|inner| !outer.rules.iter().any(|o| o.contains(inner)))
+            .map(|rule| format!("{}/{}", rule.addr, rule.prefix))
+    }
 }
 
 impl AclRule {
+    /// Whether every address `inner` matches, `self` matches.
+    fn contains(&self, inner: &AclRule) -> bool {
+        self.prefix <= inner.prefix && self.matches(inner.addr)
+    }
+
     fn matches(&self, ip: IpAddr) -> bool {
         match (self.addr, ip) {
             (IpAddr::V4(rule), IpAddr::V4(peer)) => {
@@ -1204,6 +1223,39 @@ mod tests {
         assert!(v6.allows(peer("2001:db8::1")), "/0 matches its own family");
         assert!(!v6.allows(peer("10.0.0.1")));
         assert!(!v6.allows(peer("::ffff:10.0.0.1")));
+    }
+
+    /// Containment is per rule and per family, and a wider inner rule is not
+    /// contained by a narrower outer one however the two overlap.
+    #[test]
+    fn a_rule_is_within_a_list_only_inside_one_of_its_rules() {
+        let outer = parse_acl(&["10.0.0.0/8", "192.0.2.0/25", "2001:db8::/32"]);
+        assert_eq!(
+            parse_acl(&["10.1.0.0/16", "10.2.3.4", "192.0.2.0/25", "2001:db8:1::/48"])
+                .first_not_within(&outer),
+            None
+        );
+        assert_eq!(
+            parse_acl(&["10.1.0.0/16", "192.0.2.0/24"]).first_not_within(&outer),
+            Some("192.0.2.0/24".to_string()),
+            "a /24 is not inside a /25"
+        );
+        assert_eq!(
+            parse_acl(&["10.0.0.1"]).first_not_within(&parse_acl(&["::/0"])),
+            Some("10.0.0.1/32".to_string()),
+            "and families do not mix"
+        );
+        assert_eq!(
+            parse_acl(&["192.0.2.0/25", "192.0.2.128/25"])
+                .first_not_within(&parse_acl(&["192.0.2.0/25", "192.0.2.128/25"])),
+            None
+        );
+        assert_eq!(
+            parse_acl(&["192.0.2.0/24"])
+                .first_not_within(&parse_acl(&["192.0.2.0/25", "192.0.2.128/25"])),
+            Some("192.0.2.0/24".to_string()),
+            "two halves together are not one rule containing it"
+        );
     }
 
     /// A typo has to stop the server, not shorten the list silently.

@@ -146,6 +146,22 @@ from an upstream is an error, not an empty answer.
 UDP and TCP on one host:port, both spawned; whichever fails first takes the
 process down. Binds 127.0.0.1 by default.
 
+### Who is answered (`--allow-query`, `TODO.md` #171)
+
+No list is open, and allowed only while every listener — `--host`,
+`--tls-listen`, `--quic-listen`, `--https-listen` — is on `127.0.0.0/8` or
+`::1`; off loopback with no list refuses to start, `--check-config` included
+(`docs/adr/0007`). A list allows exactly what it names, loopback included, and
+must contain every `--rpz-notify-from` rule.
+
+The check is the first thing a packet or connection meets. Over UDP an unlisted
+peer's well-formed question is answered REFUSED, question echoed, OPT mirrored
+with EDE 18 (Prohibited) and no EXTRA-TEXT, within the response budget; it never
+reaches the rate limiter. A stream connection is closed before the rate limiter,
+the per-source count and any TLS or QUIC handshake. DoH matches the TCP peer,
+never a forwarding header. Counted in `dns_queries_refused_by_acl_total` and
+`dns_connections_refused_by_acl_total{transport}`. Read once at startup.
+
 ### Per-query path (`handle_query`, shared by both transports)
 
 1. `validation::Request::from_bytes` — parses and refuses QR=1. Both failures are

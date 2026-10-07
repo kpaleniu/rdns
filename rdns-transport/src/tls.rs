@@ -275,6 +275,14 @@ pub async fn serve<H: Handler>(
         };
         // Canonical before anything sees it, as in `tcp::serve`.
         let peer = rdns::peer::canonical(peer);
+        // The query ACL first: a peer it refuses is closed before the rate
+        // limiter or the per-source table hears of it (`TODO.md` #171).
+        if !handler
+            .context()
+            .admits_connection(Peer::from(peer), StreamListener::Dot)
+        {
+            continue;
+        }
         if !rate.admits_connection(handler.context(), Peer::from(peer)) {
             continue;
         }
@@ -656,6 +664,51 @@ mod tests {
             ),
             other => panic!("expected a DoT arrival, got {other:?}"),
         }
+
+        shutdown.begin();
+        let _ = server.await;
+    }
+
+    /// A peer the query ACL does not list never reaches the handshake
+    /// (`TODO.md` #171): the connection closes, and neither handshake counter
+    /// moves because no handshake was started.
+    #[tokio::test]
+    async fn a_peer_the_query_acl_does_not_list_gets_no_handshake() {
+        let pem = write_pem("acl", "localhost");
+        let store = CertificateStore::load(&pem.cert, &pem.key).expect("loads");
+        let config = server_config(store, None).expect("a server config");
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let shutdown = Shutdown::new();
+        let handler = Arc::new(Echo::new(ServeContext {
+            acl: crate::testutil::only(&["192.0.2.0/24"]),
+            ..context(0)
+        }));
+        let metrics = handler.0.metrics.clone();
+        let server = tokio::spawn(serve(
+            listener,
+            config,
+            handler,
+            TransportLimits::default(),
+            RateLimit::PerMessage,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        let connector = tokio_rustls::TlsConnector::from(client_config(&pem.der));
+        let tcp = TcpStream::connect(addr).await.expect("connect");
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
+        assert!(connector.connect(name, tcp).await.is_err());
+        assert_eq!(
+            metrics
+                .listener(rdns::metrics::StreamListener::Dot)
+                .refused_by_acl(),
+            1
+        );
+        let count = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(count(&metrics.tls_handshakes), 0);
+        assert_eq!(count(&metrics.tls_handshake_failures), 0);
 
         shutdown.begin();
         let _ = server.await;

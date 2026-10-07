@@ -86,7 +86,8 @@ use rdns_transport::readiness::Readiness;
 use rdns_transport::tcp;
 use rdns_transport::tls::CertificateStore;
 use rdns_transport::{
-    recv_error_is_transient, ServeContext, SourceConnections, TransportLimits, UDP_RECEIVE_BUFFER,
+    recv_error_is_transient, QueryAcl, ServeContext, SourceConnections, TransportLimits,
+    UDP_RECEIVE_BUFFER,
 };
 
 /// The request caps `--max-udp-request` and `--max-tcp-request` ask for, with the
@@ -997,6 +998,9 @@ async fn serve(
                 metrics,
                 udp,
                 per_source: per_source.clone(),
+                // A query ACL is `rdnsr`'s (`TODO.md` #171): an authoritative
+                // server answers whoever asks about its zones.
+                acl: QueryAcl::Open,
                 clock: Clock::system(),
             },
         )

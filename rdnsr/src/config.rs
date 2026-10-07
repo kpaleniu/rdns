@@ -69,7 +69,8 @@ fn default_tsig_algorithm() -> String {
 }
 
 // `[server]`: the 26 keys both daemons have, from `rdns::server_table!`, then
-// `max-inflight-udp`, which is a resolver's shape of `rdnsd`'s `udp-workers`.
+// `max-inflight-udp`, which is a resolver's shape of `rdnsd`'s `udp-workers`,
+// and `allow-query`.
 // The macro writes `Default` too, so the shared half is spelled once.
 rdns::server_table! {
     #[derive(Debug, Deserialize)]
@@ -79,9 +80,14 @@ rdns::server_table! {
         /// `query-rate` — see the flag.
         #[serde(default = "crate::default_max_inflight_udp")]
         max_inflight_udp: usize,
+        /// Who may be answered; `--allow-query`. Here and not in the shared
+        /// half, because `rdnsd` has no query ACL (`TODO.md` #171).
+        #[serde(default)]
+        allow_query: Vec<String>,
     }
     defaults {
         max_inflight_udp: crate::default_max_inflight_udp(),
+        allow_query: Vec::new(),
     }
 }
 
@@ -508,6 +514,7 @@ max-tcp-request = 8192
 udp-payload-size = 1400
 max-udp-response = 1100
 max-inflight-udp = 7
+allow-query = ["192.0.2.0/24", "2001:db8::/32"]
 anomaly-interval = 30
 anomaly-query-rate = 25.0
 anomaly-error-percent = 5.0
@@ -558,6 +565,7 @@ tls-key = "./key.pem"
             udp_payload_size = 1400,
             max_udp_response = 1100,
             max_inflight_udp = 7,
+            allow_query = vec!["192.0.2.0/24".to_string(), "2001:db8::/32".to_string()],
             anomaly_interval = 30,
             anomaly_query_rate = 25.0,
             anomaly_error_percent = 5.0,

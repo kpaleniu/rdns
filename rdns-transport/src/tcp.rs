@@ -202,6 +202,14 @@ pub async fn serve<H: Handler>(
         // Canonical before anything sees it (`TODO.md` #158). A stream reply
         // goes down the connection, so nothing needs the mapped form.
         let peer = peer::canonical(peer);
+        // The query ACL first: a peer it refuses is closed before the rate
+        // limiter or the per-source table hears of it (`TODO.md` #171).
+        if !handler
+            .context()
+            .admits_connection(Peer::from(peer), StreamListener::Tcp)
+        {
+            continue;
+        }
         if !rate.admits_connection(handler.context(), Peer::from(peer)) {
             continue;
         }
@@ -833,6 +841,58 @@ mod tests {
 
         shutdown.begin();
         drop(open);
+        let _ = server.await;
+    }
+
+    /// A peer the query ACL does not list is closed unserved, before the rate
+    /// limiter hears of it, and counted on its listener (`TODO.md` #171).
+    ///
+    /// A limiter with a burst of one and per-connection charging: were the ACL
+    /// after it, the second and third connections would be rate-limited
+    /// instead. Watched failing with the `admits_connection` call removed: the
+    /// echo came back.
+    #[tokio::test]
+    async fn a_peer_the_query_acl_does_not_list_is_closed_unserved() {
+        let shutdown = Shutdown::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let echo = Arc::new(Echo {
+            ctx: ServeContext {
+                acl: crate::testutil::only(&["192.0.2.0/24"]),
+                ..context(1)
+            },
+            answer: Answer::AfterIdMillis,
+            started: Arc::new(tokio::sync::Notify::new()),
+        });
+        let metrics = echo.ctx.metrics.clone();
+        let server = tokio::spawn(serve(
+            listener,
+            echo,
+            TransportLimits::default(),
+            RateLimit::PerConnection,
+            shutdown.stop_handle(),
+            shutdown.busy(),
+        ));
+
+        for id in [0x0100u16, 0x0200, 0x0300] {
+            let mut client = TcpStream::connect(addr).await.expect("connect");
+            send(&mut client, &query(id)).await;
+            assert!(next_reply(&mut client).await.is_none(), "closed unserved");
+        }
+        let tcp = metrics.listener(StreamListener::Tcp);
+        assert_eq!(tcp.refused_by_acl(), 3);
+        assert_eq!(tcp.open(), 0, "never opened");
+        assert_eq!(
+            metrics
+                .rate_limited
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the limiter never saw them"
+        );
+
+        shutdown.begin();
         let _ = server.await;
     }
 
