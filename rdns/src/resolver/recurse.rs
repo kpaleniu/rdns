@@ -167,8 +167,19 @@ impl Resolver {
         }
 
         // A routed domain beats every cached delegation at or above it, and
-        // has no fallback to the root (`TODO.md` #172).
-        let route = self.route_for(query.qname.as_ref()).cloned();
+        // has no fallback to the root (`TODO.md` #172) — except a local root
+        // marked down, which the root hints stand in for (#177).
+        let route = self
+            .route_for(query.qname.as_ref())
+            .filter(|route| {
+                !(route.name.as_ref().is_root()
+                    && state.probe == Probe::None
+                    && self.local_root.as_ref().is_some_and(|l| !l.in_use()))
+            })
+            .cloned();
+        let via_local_root = route
+            .as_ref()
+            .is_some_and(|route| route.name.as_ref().is_root() && route.kind == RouteKind::Stub);
         if let Some(route) = &route {
             // The policy is asked about the route's servers at entry, as it
             // is for a walk started from a cached delegation (#56).
@@ -240,6 +251,35 @@ impl Resolver {
                 let first = answer_locally(&zone.get(), query)?;
                 self.walk_from(query, state, depth, name, Vec::new(), Some(first))
                     .await
+            }
+            Some(route) if via_local_root => {
+                match self
+                    .walk(query, state, depth, route.name, route.servers)
+                    .await
+                {
+                    Ok(answered) => {
+                        state.local_root_answered |= answered.zone.as_ref().is_root();
+                        Ok(answered)
+                    }
+                    // Marked down on the way: this lookup goes to the hints
+                    // now rather than failing, as §3's "immediately" asks. Not
+                    // the probe, whose question is the local root alone.
+                    Err(e)
+                        if state.probe == Probe::None
+                            && !matches!(e, ResolveError::PolicyStopped)
+                            && self.local_root.as_ref().is_some_and(|l| !l.in_use()) =>
+                    {
+                        self.walk(
+                            query,
+                            state,
+                            depth,
+                            Name::root(),
+                            self.config.root_hints.clone(),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Some(route) => {
                 self.walk(query, state, depth, route.name, route.servers)
@@ -362,13 +402,26 @@ impl Resolver {
                         zone: zone.as_ref(),
                         forwarded: false,
                     };
+                    let local_root = self
+                        .local_root
+                        .as_ref()
+                        .filter(|l| l.is(zone.as_ref(), &servers));
                     let Some(response) =
                         self.ask_any(&servers, &out, &mut state.budget, asked).await
                     else {
+                        if let Some(local) = local_root {
+                            local.down("no local root server answered");
+                        }
                         return Err(ResolveError::no_response(format!(
                             "no server for {zone} answered while resolving {qname}"
                         )));
                     };
+                    // REFUSED is what `rdnsd` answers for a zone past EXPIRE,
+                    // and §3 forbids serving the root stale.
+                    if let (Some(local), ResponseCode::Refused) = (local_root, response.rcode) {
+                        local.down("the local root answered REFUSED");
+                        return Err(ResolveError::no_response("the local root answered REFUSED"));
+                    }
                     response
                 }
             };

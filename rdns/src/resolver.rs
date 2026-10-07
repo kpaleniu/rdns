@@ -148,11 +148,14 @@ impl From<tokio::time::error::Elapsed> for ResolveError {
 
 mod caches;
 mod dot;
+mod local_root;
 mod recurse;
 mod upstream;
 mod validate;
 
 pub use dot::{DotConfig, DEFAULT_IDLE};
+pub use local_root::LOCAL_ROOT_PROBE_INTERVAL;
+use local_root::{LocalRoot, Probe};
 pub use upstream::{Answering, Reply, Transport, Upstream};
 
 use caches::{DelegationCache, KeyCache, NsidStore, RttStore, Start};
@@ -445,6 +448,9 @@ pub struct ResolverConfig {
     pub ntas: crate::nta::SharedNtas,
     /// Forwarders asked over TLS only (RFC 7858, `TODO.md` #175).
     pub dot: Option<DotConfig>,
+    /// Where the resolver's own counters and gauges go: TLS handshake
+    /// failures (#175), whether the local root is in use (#177).
+    pub metrics: crate::metrics::DnsMetrics,
 }
 
 /// Trust anchors the resolver validates against, replaceable while it runs
@@ -516,6 +522,7 @@ impl Default for ResolverConfig {
             request_nsid: false,
             ntas: crate::nta::SharedNtas::default(),
             dot: None,
+            metrics: crate::metrics::DnsMetrics::new(),
         }
     }
 }
@@ -600,6 +607,12 @@ struct Resolution<'a> {
     /// Every zone this resolution started from on the strength of its cached
     /// keys, one per start (a CNAME hop or a nameserver lookup starts again).
     trusted: Vec<TrustedStart>,
+    /// Whether this is the probe asking a local root that is down if it is
+    /// back, which is the one resolution that may still use it (#177).
+    probe: Probe,
+    /// Whether the local root answered for the root zone itself in this
+    /// resolution, so a Bogus verdict can be laid at its door (#177).
+    local_root_answered: bool,
 }
 
 /// A zone a resolution began from whose DNSKEY set was already validated to a
@@ -623,6 +636,8 @@ impl<'a> Resolution<'a> {
             denials: Vec::new(),
             policy,
             trusted: Vec::new(),
+            probe: Probe::None,
+            local_root_answered: false,
         }
     }
 
@@ -718,6 +733,8 @@ pub struct Resolver {
     upstream: Upstream,
     tap: Option<ExchangeTap>,
     dot: Option<dot::DotClients>,
+    /// A stub zone at `.` (RFC 8806, `TODO.md` #177).
+    local_root: Option<LocalRoot>,
 }
 
 impl Resolver {
@@ -735,7 +752,15 @@ impl Resolver {
         let rtt = RttStore::new(config.delegation_cache_size);
         let nsids = NsidStore::new(config.delegation_cache_size);
         let keys = KeyCache::new(config.delegation_cache_size, clock.clone());
-        let dot = config.dot.clone().map(dot::DotClients::new);
+        let dot = config
+            .dot
+            .clone()
+            .map(|d| dot::DotClients::new(d, config.metrics.clone()));
+        let local_root = config
+            .routes
+            .iter()
+            .find(|r| r.name.as_ref().is_root() && r.kind == RouteKind::Stub)
+            .map(|r| LocalRoot::new(r.servers.clone(), config.metrics.clone()));
         Resolver {
             config,
             delegations,
@@ -746,6 +771,7 @@ impl Resolver {
             upstream: Upstream::Network,
             tap: None,
             dot,
+            local_root,
         }
     }
 
@@ -873,7 +899,8 @@ impl Resolver {
     ) -> Result<(DnsMessage, ValidationState), ResolveError> {
         // Cancelled, not checked between sends, so an exchange in progress
         // cannot overrun it as PowerDNS's summed `max-total-msec` can.
-        self.resolve_timed(query, policy, Ntas::Honoured).await
+        self.resolve_timed(query, policy, Ntas::Honoured, Probe::None)
+            .await
     }
 
     /// As [`Resolver::resolve_validated`], validating as if no negative trust
@@ -883,7 +910,8 @@ impl Resolver {
         &self,
         query: &QuerySection,
     ) -> Result<(DnsMessage, ValidationState), ResolveError> {
-        self.resolve_timed(query, None, Ntas::Ignored).await
+        self.resolve_timed(query, None, Ntas::Ignored, Probe::None)
+            .await
     }
 
     async fn resolve_timed(
@@ -891,10 +919,14 @@ impl Resolver {
         query: &QuerySection,
         policy: Option<&dyn NameserverPolicy>,
         ntas: Ntas,
+        probe: Probe,
     ) -> Result<(DnsMessage, ValidationState), ResolveError> {
         let timer = self.config.resolution_timer;
-        match tokio::time::timeout(timer.duration(), self.resolve_untimed(query, policy, ntas))
-            .await
+        match tokio::time::timeout(
+            timer.duration(),
+            self.resolve_untimed(query, policy, ntas, probe),
+        )
+        .await
         {
             Ok(resolved) => resolved,
             // Not `?`: `From<Elapsed>` reads a timeout as one exchange's
@@ -908,8 +940,10 @@ impl Resolver {
         query: &QuerySection,
         policy: Option<&dyn NameserverPolicy>,
         ntas: Ntas,
+        probe: Probe,
     ) -> Result<(DnsMessage, ValidationState), ResolveError> {
         let mut state = Resolution::new(self.config.query_budget, policy);
+        state.probe = probe;
         let mut response = self.recurse(query, &mut state).await?;
         // Past both modes, because `recurse` did this and `forward` relayed
         // the upstream's header verbatim (`TODO.md` #78b). The question is the
@@ -973,6 +1007,17 @@ impl Resolver {
             }
         }
         let mut verdict = self.validate(query, &response, &mut state, &anchors).await;
+        // RFC 8806 §1: the local root is validated "just as it would validate
+        // all responses from a remote root server", and one that serves what
+        // does not validate is not used (#177).
+        if let (ValidationState::Bogus(bogus), Some(local), true) =
+            (&verdict, &self.local_root, state.local_root_answered)
+        {
+            local.down(&format!(
+                "an answer from it failed validation: {}",
+                bogus.why
+            ));
+        }
         // The failure is the one place the instance behind an anycast address
         // is worth more than a DEBUG line (`TODO.md` #189).
         if let (ValidationState::Bogus(bogus), Some(nsid)) = (
@@ -3220,6 +3265,26 @@ this line has no record and is skipped
         // so the closures below need only clone — the keys themselves never
         // cross a thread boundary.
         let root_keys = root.dnskey_records();
+        // The root's own SOA, signed: what a local root probe asks (#177).
+        let root_soa = {
+            let soa = ResourceRecord {
+                name: nm("."),
+                class: Class::IN,
+                ttl: Ttl::from_secs(86400),
+                rdata: RecordData::from_parsed(&ParsedRecord::SOA {
+                    mname: nm("a.root-servers.net."),
+                    rname: nm("nstld.verisign-grs.com."),
+                    serial: Serial::new(2026100700),
+                    refresh: 1800,
+                    retry: 900,
+                    expire: 604800,
+                    minimum: 86400,
+                })
+                .unwrap(),
+            };
+            let sig = root.sign_records(std::slice::from_ref(&soa));
+            vec![soa, sig]
+        };
         let tld_keys = tld.dnskey_records();
         let auth_keys = auth.dnskey_records();
         let tld_ds = signed_ds(&root, &tld);
@@ -3360,6 +3425,8 @@ this line has no record and is skipped
                 .unwrap_or(Qtype::of(Rtype::new(0)));
             if name == "." && qtype == Qtype::of(rt::DNSKEY) {
                 authoritative(q, root_keys.clone())
+            } else if name == "." && qtype == Qtype::of(rt::SOA) {
+                authoritative(q, root_soa.clone())
             } else {
                 signed_referral(q, "test.", "ns.test.", tld_addr, &tld_ds)
             }
@@ -5138,6 +5205,211 @@ this line has no record and is skipped
                 types,
                 vec![MessageType::ForwarderQuery, MessageType::ForwarderResponse]
             );
+        }
+    }
+
+    /// RFC 8806 by composition (`TODO.md` #177): a stub zone at `.` is the
+    /// local root, and the hints stand in while it cannot be used.
+    mod local_root {
+        use super::*;
+        use std::sync::atomic::AtomicU8;
+
+        const LOCAL: u8 = 9;
+        const NORMAL: u8 = 0;
+        const REFUSING: u8 = 1;
+        const FORGING: u8 = 2;
+
+        struct Rig {
+            h: SignedHierarchy,
+            resolver: Arc<Resolver>,
+            metrics: crate::metrics::DnsMetrics,
+            mode: Arc<AtomicU8>,
+            local_asked: Arc<AtomicUsize>,
+            hints_asked: Arc<AtomicUsize>,
+        }
+
+        /// The signed hierarchy, its root served twice: at the hints, and at
+        /// a local root whose behaviour the test switches. No delegation
+        /// cache, so every lookup starts at one root or the other.
+        fn rig() -> Rig {
+            let h = signed_hierarchy(signed_ds, signed_answer);
+            let root = h.net.0.lock().unwrap()[&h.root_addr].clone();
+            let (local_asked, hints_asked) =
+                (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+            let mode = Arc::new(AtomicU8::new(NORMAL));
+            let impostor_keys = crate::dnssec_test_util::TestZone::new(".").dnskey_records();
+            {
+                let (root, asked, mode) = (root.clone(), local_asked.clone(), mode.clone());
+                h.net.serve(fake(LOCAL), move |q| {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    match mode.load(Ordering::SeqCst) {
+                        REFUSING => {
+                            let mut refused = response_to(q);
+                            refused.rcode = ResponseCode::Refused;
+                            refused
+                        }
+                        FORGING if qname_of(q) == "." => authoritative(q, impostor_keys.clone()),
+                        _ => root(q),
+                    }
+                });
+            }
+            {
+                let asked = hints_asked.clone();
+                h.net.serve(h.root_addr, move |q| {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    root(q)
+                });
+            }
+            let metrics = crate::metrics::DnsMetrics::new();
+            let config = ResolverConfig {
+                routes: vec![Route::stub(Name::root(), vec![fake(LOCAL)])],
+                delegation_cache_size: 0,
+                metrics: metrics.clone(),
+                ..validating_config(&h)
+            };
+            let resolver = Arc::new(h.net.resolver(config));
+            Rig {
+                h,
+                resolver,
+                metrics,
+                mode,
+                local_asked,
+                hints_asked,
+            }
+        }
+
+        impl Rig {
+            async fn www(&self) -> ValidationState {
+                self.resolver
+                    .resolve_validated(
+                        &QuerySection {
+                            qname: nm("www.example.test."),
+                            qtype: Qtype::of(rt::A),
+                            qclass: QueryClass::IN,
+                        },
+                        None,
+                    )
+                    .await
+                    .expect("resolved")
+                    .1
+            }
+
+            fn in_use(&self) -> bool {
+                self.metrics
+                    .to_prometheus_format()
+                    .lines()
+                    .any(|line| line == "dns_local_root_in_use 1")
+            }
+
+            fn asked(&self) -> (usize, usize) {
+                (
+                    self.local_asked.load(Ordering::SeqCst),
+                    self.hints_asked.load(Ordering::SeqCst),
+                )
+            }
+        }
+
+        #[tokio::test]
+        async fn a_lookup_walks_from_the_local_root_and_never_the_hints() {
+            let rig = rig();
+            assert_eq!(rig.www().await, ValidationState::Secure);
+            assert_eq!(rig.www().await, ValidationState::Secure);
+            let (local, hints) = rig.asked();
+            assert!(local > 0);
+            assert_eq!(hints, 0, "the hints saw nothing");
+            assert!(rig.in_use());
+        }
+
+        /// REFUSED, what `rdnsd` answers past EXPIRE: this lookup and the next
+        /// go to the hints, and the local root is not asked again.
+        #[tokio::test]
+        async fn a_refusing_local_root_is_set_aside_for_the_hints() {
+            let rig = rig();
+            rig.mode.store(REFUSING, Ordering::SeqCst);
+            assert_eq!(
+                rig.www().await,
+                ValidationState::Secure,
+                "answered via the hints"
+            );
+            assert!(!rig.in_use(), "the gauge flipped");
+            let (local, hints) = rig.asked();
+            assert!(hints > 0);
+            assert_eq!(rig.www().await, ValidationState::Secure);
+            assert_eq!(
+                rig.asked().0,
+                local,
+                "the local root is not asked while down"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unreachable_local_root_is_set_aside_for_the_hints() {
+            let rig = rig();
+            rig.h.net.0.lock().unwrap().remove(&fake(LOCAL));
+            assert_eq!(rig.www().await, ValidationState::Secure);
+            assert!(!rig.in_use());
+            assert!(rig.asked().1 > 0);
+        }
+
+        /// A root DNSKEY RRset the anchor does not vouch for: the lookup is
+        /// Bogus, and the local root is not used for the next.
+        #[tokio::test]
+        async fn a_local_root_serving_what_does_not_validate_is_set_aside() {
+            let rig = rig();
+            rig.mode.store(FORGING, Ordering::SeqCst);
+            assert!(rig.www().await.is_bogus());
+            assert!(!rig.in_use());
+            assert_eq!(rig.www().await, ValidationState::Secure, "via the hints");
+            assert!(rig.asked().1 > 0);
+        }
+
+        /// The probe puts it back within one interval, on a paused clock.
+        #[tokio::test(start_paused = true)]
+        async fn a_restored_local_root_is_used_again_within_one_probe() {
+            let rig = rig();
+            rig.mode.store(REFUSING, Ordering::SeqCst);
+            rig.www().await;
+            assert!(!rig.in_use());
+
+            let shutdown = crate::shutdown::Shutdown::new();
+            let probe = tokio::spawn(rig.resolver.clone().keep_local_root(shutdown.stop_handle()));
+            tokio::time::sleep(LOCAL_ROOT_PROBE_INTERVAL + Duration::from_secs(1)).await;
+            assert!(!rig.in_use(), "still refusing, so still down");
+
+            rig.mode.store(NORMAL, Ordering::SeqCst);
+            tokio::time::sleep(LOCAL_ROOT_PROBE_INTERVAL).await;
+            assert!(rig.in_use(), "restored by the probe");
+            let hints = rig.asked().1;
+            assert_eq!(rig.www().await, ValidationState::Secure);
+            assert_eq!(rig.asked().1, hints, "local again, the hints not asked");
+
+            shutdown.begin();
+            probe.await.expect("the probe ends on stop");
+        }
+
+        /// #172's rule below the root: a stub zone whose server is down is
+        /// SERVFAIL, and nothing goes to the hints.
+        #[tokio::test]
+        async fn a_stub_zone_below_the_root_still_has_no_fallback() {
+            let rig = rig();
+            let config = ResolverConfig {
+                routes: vec![Route::stub(nm("corp.test."), vec![fake(10)])],
+                ..validating_config(&rig.h)
+            };
+            let resolver = rig.h.net.resolver(config);
+            let err = resolver
+                .resolve(&QuerySection {
+                    qname: nm("x.corp.test."),
+                    qtype: Qtype::of(rt::A),
+                    qclass: QueryClass::IN,
+                })
+                .await
+                .expect_err("no server for corp.test.");
+            assert_eq!(
+                err.extended_error().info_code(),
+                crate::InfoCode::NO_REACHABLE_AUTHORITY
+            );
+            assert_eq!(rig.asked().1, 0, "the hints were not asked");
         }
     }
 }

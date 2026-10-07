@@ -44,8 +44,6 @@ pub struct DotConfig {
     /// Keyed by address: TLS is a property of a server, which every route
     /// naming it shares — the caller refuses one address written both ways.
     pub servers: HashMap<SocketAddr, AuthName>,
-    /// Where handshake failures and unmatched responses are counted.
-    pub metrics: DnsMetrics,
 }
 
 impl std::fmt::Debug for DotConfig {
@@ -88,7 +86,7 @@ struct Server {
 }
 
 impl DotClients {
-    pub(super) fn new(config: DotConfig) -> DotClients {
+    pub(super) fn new(config: DotConfig, metrics: DnsMetrics) -> DotClients {
         DotClients {
             trust: config.trust,
             servers: config
@@ -99,7 +97,7 @@ impl DotClients {
                     (addr, Server { name, slot })
                 })
                 .collect(),
-            metrics: config.metrics,
+            metrics,
         }
     }
 
@@ -627,8 +625,8 @@ mod tests {
                     .iter()
                     .map(|(addr, name)| (*addr, AuthName::parse(name).expect("a name")))
                     .collect(),
-                metrics: metrics.clone(),
             }),
+            metrics: metrics.clone(),
             timeout_ms: 2000,
             ..Default::default()
         };

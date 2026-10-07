@@ -225,6 +225,17 @@ pub(crate) fn build(
         }
         route.validate = false;
     }
+    // RFC 8806 §1: the resolver "validates all responses from the root
+    // service on the same host" (`TODO.md` #177).
+    if routes
+        .iter()
+        .any(|r| r.name.as_ref().is_root() && r.kind == RouteKind::Stub && !r.validate)
+    {
+        bail!(
+            "--no-validate-zone .: a stub zone at the root is a local root, which RFC 8806 \
+             §1 requires be validated"
+        );
+    }
     if root_hints && routes.iter().any(|r| r.name.as_ref().is_root()) {
         bail!("--root-hints says where recursion starts, and `.` is routed, so nothing recurses");
     }
@@ -381,6 +392,10 @@ mod tests {
                 "--upstream",
             ),
             (refused(&[], &[], &[], &[up], true), "--root-hints"),
+            (
+                refused(&[], &[".=127.0.0.1:5353"], &["."], &[], false),
+                "RFC 8806",
+            ),
             (
                 refused(
                     &[],

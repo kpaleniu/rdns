@@ -855,9 +855,10 @@ async fn main() -> anyhow::Result<()> {
         cli.root_hints.is_some(),
     )?;
     config.routes = routes;
-    // Made here rather than with the shell: the TLS forwarders count their
-    // handshake failures into it (`TODO.md` #175).
+    // Made here rather than with the shell: the resolver counts TLS handshake
+    // failures (#175) and reports the local root (#177) into it.
     let metrics = DnsMetrics::new();
+    config.metrics = metrics.clone();
     // Above the dry run: a CA that does not load is a startup failure.
     let upstream_tls = match (&cli.upstream_tls_ca, tls.is_empty()) {
         (Some(path), false) => {
@@ -866,7 +867,6 @@ async fn main() -> anyhow::Result<()> {
             config.dot = Some(rdns::resolver::DotConfig {
                 trust,
                 servers: tls.clone(),
-                metrics: metrics.clone(),
             });
             format!(
                 "{} server(s) over TLS, {anchors} anchor(s) from {}",
@@ -1533,6 +1533,13 @@ async fn main() -> anyhow::Result<()> {
     //
     // Not in the `JoinSet` below: that set's rule is "the first task to end ends
     // the process", and this one ends on the stop signal by design.
+    // A no-op without a stub zone at `.` (RFC 8806, `TODO.md` #177).
+    tokio::spawn(
+        serving
+            .resolver
+            .clone()
+            .keep_local_root(shutdown.stop_handle()),
+    );
     let nta_file = cli.negative_trust_anchors.clone().map(nta::NtaFile);
     if nta_file.is_some() {
         serving

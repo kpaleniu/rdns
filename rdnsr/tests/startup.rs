@@ -753,3 +753,23 @@ fn the_dry_run_checks_the_upstream_tls_settings() {
         stdout(&out)
     );
 }
+
+/// RFC 8806 §1 makes validating the local root a MUST, so a stub zone at `.`
+/// with validation off is refused before the dry run answers (`TODO.md`
+/// #177). The validated one is accepted.
+#[test]
+fn an_unvalidated_local_root_is_refused() {
+    let out = rdnsr(&[
+        "--check-config",
+        "--stub-zone",
+        ".=127.0.0.1:5353",
+        "--no-validate-zone",
+        ".",
+    ]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("RFC 8806"), "{}", stderr(&out));
+
+    let out = rdnsr(&["--check-config", "--stub-zone", ".=127.0.0.1:5353"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(stdout(&out).contains("stub zone . -> 127.0.0.1:5353"));
+}

@@ -88,6 +88,36 @@ keepalive and are padded to a multiple of 128 (RFC 8467 §4.1(1)). Idle close
 after 10 s or the server's keepalive; connections close after the shutdown
 drain. One timeout covers connect, handshake and reply.
 
+**A local root** (RFC 8806, `TODO.md` #177) is a stub zone at `.`, by
+composition: `rdnsd` holds the root as a loopback secondary, `rdnsr` stubs `.`
+to it.
+
+```sh
+rdnsd --secondary .@<transfer source> --zone-dir /var/lib/rdns/root \
+      --host 127.0.0.1 --port 5353
+rdnsr --stub-zone .=127.0.0.1:5353 --dnssec-validate
+```
+
+Transfer sources are listed in RFC 8806 Appendix B; they change, so none is
+copied here. Binding `rdnsd` to loopback is what satisfies §1's "only answer
+queries from resolvers on the same host". `rdnsd`'s secondary refreshes on the
+SOA timers and answers REFUSED past EXPIRE, which is §3's "MUST NOT serve stale
+data for the root zone". Both commands pass `--check-config`; a transfer of the
+real root through them has not been run.
+
+The one thing a stub zone at `.` does that no other does is fall back (§3: "the
+resolver MUST immediately switch to using non-local root servers"). The local
+root is set aside on an unreachable server, a REFUSED, or an answer for the
+root zone that fails validation — the lookup that saw it goes to the root hints
+at once, and so does every walk after. Every 60 s
+(`LOCAL_ROOT_PROBE_INTERVAL`, no flag) the stub's servers are asked for the
+root SOA, validated; an answer puts the local root back. Each transition is
+logged once with its reason, and `dns_local_root_in_use` is 1 or 0. Below the
+root, #172's no-fallback rule stands. A stub zone at `.` with validation off is
+refused at startup (§1). A Bogus answer below the root — a TLD whose DS the
+local root served wrongly, say — is not laid at the local root's door: only
+data for the root zone itself is.
+
 Refused at startup: `+tls=` without `--upstream-tls-ca`, the CA flag with no
 `+tls=` server, an anchor file with no certificate, `+tls=` on a stub zone (its
 servers are authorities; RFC 9539 is not done), a `#key` on any forwarder, and

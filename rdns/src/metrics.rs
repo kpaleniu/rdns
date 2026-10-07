@@ -215,6 +215,12 @@ struct ZoneGauge {
 #[derive(Clone)]
 pub struct DnsMetrics(Arc<Counters>);
 
+impl std::fmt::Debug for DnsMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DnsMetrics")
+    }
+}
+
 impl std::ops::Deref for DnsMetrics {
     type Target = Counters;
 
@@ -378,6 +384,9 @@ pub struct Counters {
     /// this server reads a file of them at all — absent is not zero.
     ntas: AtomicU64,
     ntas_configured: AtomicBool,
+    /// Whether the local root (RFC 8806) is in use; absent without one.
+    local_root_in_use: AtomicU64,
+    local_root_configured: AtomicBool,
 
     // Cumulative buckets plus count and sum: what `histogram_quantile()` needs.
     //
@@ -457,6 +466,8 @@ impl DnsMetrics {
             validating: AtomicBool::new(false),
             ntas: AtomicU64::new(0),
             ntas_configured: AtomicBool::new(false),
+            local_root_in_use: AtomicU64::new(0),
+            local_root_configured: AtomicBool::new(false),
             zones: RwLock::new(BTreeMap::new()),
             catalogs: RwLock::new(BTreeMap::new()),
             latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -489,6 +500,14 @@ impl DnsMetrics {
     pub fn negative_trust_anchors(&self, count: usize) {
         self.ntas_configured.store(true, Ordering::Relaxed);
         self.ntas.store(count as u64, Ordering::Relaxed);
+    }
+
+    /// Whether the local root (RFC 8806 §3) is in use or the root hints are,
+    /// written at each transition (`TODO.md` #177).
+    pub fn local_root_in_use(&self, in_use: bool) {
+        self.local_root_configured.store(true, Ordering::Relaxed);
+        self.local_root_in_use
+            .store(u64::from(in_use), Ordering::Relaxed);
     }
 
     /// One answer sent to a client, by what validation concluded about it.
@@ -920,6 +939,20 @@ impl DnsMetrics {
             self.latency_sum_us.load(Ordering::Relaxed) as f64 / 1_000_000.0
         );
         let _ = writeln!(out, "dns_answer_latency_seconds_count {count}");
+
+        if self.local_root_configured.load(Ordering::Relaxed) {
+            declare(
+                &mut out,
+                "dns_local_root_in_use",
+                "gauge",
+                "1 while the local root (RFC 8806) is used, 0 while the root hints are",
+            );
+            let _ = writeln!(
+                out,
+                "dns_local_root_in_use {}",
+                self.local_root_in_use.load(Ordering::Relaxed)
+            );
+        }
 
         if self.ntas_configured.load(Ordering::Relaxed) {
             declare(
