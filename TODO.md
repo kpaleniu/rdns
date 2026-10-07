@@ -40,10 +40,10 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Four items. #171-#185 were filed 2026-10-05 from a comparison against
+Five items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
-#173. #181 was closed wontfix in triage; #171-#174, #176, #179, #183, #184, #186,
+#173, #194 out of re-reading #190 and #192. #181 was closed wontfix in triage; #171-#174, #176, #179, #183, #184, #186,
 #187, #189, #191, #178, #188, #175, #177, #180 and #182 closed 2026-10-07:
 
 - #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
@@ -52,6 +52,7 @@ filing; #186-#192 came out of triaging the first batch, #193 out of closing
   elevated session to run.
 - #192 no Windows Event Log sink.
 - #193 six RFC 6303 zones are not empty zones (needs triage).
+- #194 no Windows installer (needs triage; blocked on a release artifact).
 
 The history this section accumulated — how each review's items were found and
 closed, the push and CI record, the stale-preamble lesson and the five claims
