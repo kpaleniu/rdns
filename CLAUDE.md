@@ -447,8 +447,16 @@ Cheap to re-check, expensive to rediscover.
 
 Terse. Facts, not essays. Say why, in as few words as it takes, then stop.
 
-- A comment records why, or why not: the rejected alternative, the bug hit, the
-  RFC that forbids the obvious thing. One or two lines. Never restate the code.
+- A comment records why, or why not: the rejected alternative, the bug the
+  obvious version would have, the RFC that forbids it. One or two lines. Never
+  restate the code.
+- A comment describes the code as it is, never how it got there. "Used to",
+  "until #N", "was #N", "watched failing against", a struck-through claim, a
+  list of past bugs: all of it belongs in the commit message, which is where
+  `git blame` leads and which travels with the change. A comment that cites a
+  closed item as its reason has not stated the reason; state it. Cite an open
+  item only to name a limitation that is still true. Measurements that settled
+  a choice go in the commit; the comment states the choice.
 - No comment where the code is plain. Deleting a redundant comment is a fix.
 - Commit messages: imperative subject line, then reasoning, RFC citations, and
   how it was verified. Terse bullets. Do not narrate the diff, and do not

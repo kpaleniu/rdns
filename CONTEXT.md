@@ -12,6 +12,16 @@ with the DNSSEC records that reply owes.
 _Avoid_: authoritative answer (a referral is a zone answer with AA clear,
 RFC 1035 §4.1.1)
 
+**Zone file**:
+The operator's text for a zone: unsigned, on the operator's serial, and where
+an UPDATE is written back.
+_Avoid_: source, master file
+
+**Served version**:
+The zone as `rdnsd` currently answers from it. May carry signatures and a
+served serial the zone file does not.
+_Avoid_: previous, current zone, snapshot
+
 **Source**:
 The address block a per-client limit counts as one client: an IPv4 address,
 or an IPv6 /56, of a peer.

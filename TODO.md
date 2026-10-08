@@ -40,16 +40,22 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Five items. #171-#185 were filed 2026-10-05 from a comparison against
+Nine items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
-#173, #194 out of re-reading #190 and #192. #181 was closed wontfix in
+#173, #194 out of re-reading #190 and #192, #195-#198 out of a review on
+2026-10-08. #181 was closed wontfix in
 triage; #171-#174, #176, #179, #183, #184, #186, #187, #189, #191, #178,
 #188, #175, #177, #180 and #182 closed 2026-10-07:
 
 - #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
   closed, 185c and 185d wontfix.
 - #193 six RFC 6303 zones are not empty zones (needs triage).
+- #195 concurrent UPDATEs lose acknowledged changes; 195a reload, 195b
+  folded in (bug, ready for agent).
+- #196 raw control bytes in two test literals (needs triage).
+- #197 comments narrate history (needs triage).
+- #198 the journal is fsynced under the zone map's write guard (needs triage).
 
 Deferred 2026-10-08 by the owner, not needed now; each file's "Deferred"
 section holds what was found before parking:
