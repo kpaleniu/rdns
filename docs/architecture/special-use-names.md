@@ -22,9 +22,10 @@ else would already mean a query going out.
 - **`invalid.`** is reserved to be unresolvable (§6.4).
 - **The loopback reverse zones** (RFC 6303 §4.2, §4.3): `127.in-addr.arpa` with
   `1.0.0.127` answering `localhost.`, and the `::1` reverse.
-- **The empty zones** (RFC 6303 §4), the private-address reverse zones,
-  including the sixteen separate zones that 172.16/12 actually is —
-  `in-addr.arpa` splits on octet boundaries and that block does not.
+- **The empty zones** (RFC 6303 §4): the reverse zones of private,
+  link-local, documentation and other reserved address space, including the
+  sixteen separate zones that 172.16/12 actually is — `in-addr.arpa` splits
+  on octet boundaries and that block does not.
 
 The last group is the only one an operator may switch off, singly or all at
 once: RFC 6303 §3 says an implementation MUST allow it, because a site with its

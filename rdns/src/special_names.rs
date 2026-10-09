@@ -45,10 +45,9 @@ pub struct LocalAnswer {
 const LOCAL_TTL: Ttl = Ttl::from_secs(3600);
 
 /// Reverse zones for address space that is not globally unique, so a name in
-/// one has no globally meaningful answer: RFC 6303 §4.1 (RFC 1918), two of
-/// §4.2's, §4.4 and §4.5. 172.16/12 is sixteen zones, split on octets. The
-/// loopback reverses (§4.2, §4.3) are special-use names instead; the rest of
-/// RFC 6303 is `TODO.md` #193.
+/// one has no globally meaningful answer: every zone RFC 6303 §4 lists, as
+/// BIND and Unbound serve them. 172.16/12 is sixteen zones, split on octets.
+/// The loopback reverses (§4.2, §4.3) are special-use names instead.
 pub const EMPTY_ZONES: &[&str] = &[
     // RFC 1918 private space.
     "10.in-addr.arpa.",
@@ -69,17 +68,26 @@ pub const EMPTY_ZONES: &[&str] = &[
     "30.172.in-addr.arpa.",
     "31.172.in-addr.arpa.",
     "168.192.in-addr.arpa.",
-    // RFC 6303 §4.2: link-local (RFC 3927) 169.254/16, and 0/8.
+    // RFC 6303 §4.2: link-local (RFC 3927) 169.254/16, 0/8, the three
+    // documentation nets (RFC 5737) and limited broadcast.
     "254.169.in-addr.arpa.",
     "0.in-addr.arpa.",
-    // §4.5 link-local (fe80::/10); §4.4 locally assigned ULA (fd00::/8), and
-    // fc00::/8 beside it, which §5 holds in reserve; in nibble form.
+    "2.0.192.in-addr.arpa.",
+    "100.51.198.in-addr.arpa.",
+    "113.0.203.in-addr.arpa.",
+    "255.255.255.255.in-addr.arpa.",
+    // §4.3: `::`, the unspecified address, one name deep.
+    "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.",
+    // §4.5 fe80::/10; §4.4 fd00::/8, and fc00::/8, §5's reserve that BIND and
+    // Unbound omit: undelegated, so its PTR has no answer upstream either.
     "8.e.f.ip6.arpa.",
     "9.e.f.ip6.arpa.",
     "a.e.f.ip6.arpa.",
     "b.e.f.ip6.arpa.",
     "c.f.ip6.arpa.",
     "d.f.ip6.arpa.",
+    // §4.6: the documentation prefix 2001:db8::/32 (RFC 3849).
+    "8.b.d.0.1.0.0.2.ip6.arpa.",
 ];
 
 /// The IPv6 loopback's reverse zone (RFC 6303 §4.3), one name deep.
@@ -673,6 +681,43 @@ mod tests {
             super::lookup(loopback.as_ref(), ptr, &on, Some(route.as_ref())).is_some(),
             "a special-use name is not an empty zone and is not overridden"
         );
+    }
+
+    /// Every zone RFC 6303 §4 lists is answered here by default, as BIND's
+    /// `empty_zones[]` and Unbound's default local zones both do.
+    #[test]
+    fn every_rfc_6303_zone_is_answered_locally() {
+        let zones = EmptyZones::default();
+        for zone in [
+            // §4.1
+            "10.in-addr.arpa.",
+            "16.172.in-addr.arpa.",
+            "31.172.in-addr.arpa.",
+            "168.192.in-addr.arpa.",
+            // §4.2
+            "0.in-addr.arpa.",
+            "127.in-addr.arpa.",
+            "254.169.in-addr.arpa.",
+            "2.0.192.in-addr.arpa.",
+            "100.51.198.in-addr.arpa.",
+            "113.0.203.in-addr.arpa.",
+            "255.255.255.255.in-addr.arpa.",
+            // §4.3
+            "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.",
+            "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa.",
+            // §4.4
+            "d.f.ip6.arpa.",
+            // §4.5
+            "8.e.f.ip6.arpa.",
+            "b.e.f.ip6.arpa.",
+            // §4.6
+            "8.b.d.0.1.0.0.2.ip6.arpa.",
+        ] {
+            assert!(
+                super::lookup(nm(zone).as_ref(), Qtype::of(rt::PTR), &zones, None).is_some(),
+                "{zone}"
+            );
+        }
     }
 
     /// All off leaves every special-use name where it was.

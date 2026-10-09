@@ -130,7 +130,8 @@ _Avoid_: mirror zone (a copy the resolver itself fetches; not built),
 hyperlocal
 
 **Empty zone**:
-A reverse zone for address space that is not globally unique, which `rdnsr`
+A reverse zone for reserved address space, whose names have no globally
+meaningful answer (private, link-local, documentation), which `rdnsr`
 answers itself as holding nothing but its SOA and NS (RFC 6303 §4). Each can
 be switched off; a routed domain at the same name or below overrides it.
 _Avoid_: local zone (the operator's data), locally served zone
