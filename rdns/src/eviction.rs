@@ -27,21 +27,16 @@ pub(crate) struct Halving {
 }
 
 impl Halving {
-    /// Plan a pass leaving `target` of `expiries` alive, soonest to expire going
-    /// first. `None` when nothing has to go. Any `u64` rank works, lowest going
-    /// first; the resolver's RTT map ranks by speed.
-    ///
-    /// `expiries` is consumed: [`slice::select_nth_unstable`] partitions in O(n)
-    /// average, in place, without sorting.
+    /// Plan a pass leaving `target` of `expiries` alive, lowest rank going
+    /// first; `None` when nothing has to go. [`slice::select_nth_unstable`]
+    /// partitions in O(n), in place.
     pub(crate) fn plan(mut expiries: Vec<u64>, target: usize) -> Option<Self> {
         if expiries.len() <= target {
             return None;
         }
         if target == 0 {
-            // `select_nth_unstable(len)` panics — and would panic holding the
-            // cache lock, which poisons it and stops the cache for the life of
-            // the process (§6). Reachable: `rdnsr --cache-size 1` halves to a
-            // target of zero on its second answer.
+            // `select_nth_unstable(len)` would panic under the lock, poisoning
+            // the cache for good (§6); `--cache-size 1` gets here.
             return Some(Halving {
                 cutoff: u64::MAX,
                 ties_to_keep: 0,

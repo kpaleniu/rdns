@@ -121,9 +121,8 @@ fn main() {
     println!("{:<44} {:>5} {:>7}", "request", "plain", "+TSIG");
     println!("{}", "-".repeat(68));
 
-    // A DHCP server registering one lease, which is the ordinary automated
-    // UPDATE: the forward name, with the "does not exist" prerequisite
-    // nsupdate's `prereq nxdomain` writes.
+    // A DHCP lease registration, the ordinary automated UPDATE, with nsupdate's
+    // `prereq nxdomain`.
     let lease = update(
         "dyn.example.com.",
         vec![rr(
@@ -177,10 +176,8 @@ fn main() {
         .len(),
     );
 
-    // An ACME dns-01 challenge: a TXT of a 43-character base64url digest at
-    // `_acme-challenge`, which is the most common UPDATE a small site ever
-    // sends. Two of them, because a certificate with a SAN needs one per name
-    // and they are answered together.
+    // Two ACME dns-01 challenges, a 43-character digest each at
+    // `_acme-challenge`: one per SAN, answered together.
     let token = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
     let acme = update(
         "example.com.",
@@ -243,10 +240,8 @@ fn main() {
         signed(&mail, "ops.example.com.", TsigAlgorithm::HmacSha256).len(),
     );
 
-    // A DKIM key (RFC 6376 §3.6.1): a 2048-bit RSA public key is ~392 octets of
-    // base64, which a TXT record carries as three character-strings because one
-    // is capped at 255 (RFC 1035 §3.3.14). Rotating a DKIM selector is an
-    // ordinary automated UPDATE, and this is the first one that does not fit.
+    // A 2048-bit DKIM key (RFC 6376 §3.6.1), ~392 octets of base64 in three
+    // character-strings (RFC 1035 §3.3.14).
     let dkim_key: String = std::iter::repeat_n('A', 392).collect();
     let dkim_txt: Vec<Vec<u8>> = {
         let value = format!("v=DKIM1; k=rsa; p={dkim_key}");

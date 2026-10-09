@@ -96,9 +96,8 @@ impl Nat64Prefix {
             )));
         }
         let octets = addr.octets();
-        // Everything past the prefix belongs to the embedded address and the
-        // zero suffix; a prefix carrying bits there is one the operator has
-        // mistyped, and embedding would silently discard them.
+        // Bits past the prefix belong to the embedded address; a prefix with
+        // any is mistyped, and embedding would drop them.
         let tail = (len as usize).div_ceil(8);
         if octets[tail..].iter().any(|&b| b != 0) {
             return Err(ConfigError::new(format!(
@@ -200,16 +199,12 @@ impl Dns64 {
         self.exclude.contains(IpAddr::V6(addr))
     }
 
-    /// The AAAA records to answer with, built from an A answer (RFC 6147 §5.1.7).
+    /// The AAAA records to answer with, built from an A answer (RFC 6147
+    /// §5.1.7).
     ///
-    /// A CNAME in the A answer is kept as it stands (§5.1.5: the chain is
-    /// followed to the terminating A), and everything else is dropped: only an
-    /// address record has an IPv6 representation to give.
-    ///
-    /// `ttl_cap` is the SOA's TTL from the empty AAAA answer, because §5.1.7
-    /// sets the synthesized TTL to "the minimum of the TTL of the original A RR
-    /// and the SOA RR for the queried domain" — the name has no AAAA, so the
-    /// negative answer's own lifetime bounds how long the invention may live.
+    /// A CNAME is kept (§5.1.5); anything else but A is dropped. `ttl_cap` is
+    /// the empty AAAA answer's SOA TTL: §5.1.7 takes "the minimum of the TTL of
+    /// the original A RR and the SOA RR".
     pub fn synthesize(
         &self,
         a_answer: &[ResourceRecord],

@@ -33,15 +33,10 @@ pub enum TransferError {
     Malformed(String),
     /// The master answered an error rcode rather than a transfer.
     ///
-    /// Carries the code, because the caller branches on *which* (§2): a REFUSED
-    /// to the SOA probe means the probe is not allowed and says nothing about
-    /// the transfer, which BIND has handled since forever — "Perhaps AXFR/IXFR
-    /// is allowed even if SOA queries aren't" (`lib/dns/zone.c`). Every other
-    /// code, and a REFUSED to the transfer itself, is an ordinary failure.
-    ///
-    /// Not [`TransferError::Malformed`]: a well-formed refusal is not a
-    /// malformed message, and calling it one sent an operator after a parser
-    /// bug that does not exist.
+    /// The code, because REFUSED to the SOA probe says nothing about the
+    /// transfer, as BIND has long held ("Perhaps AXFR/IXFR is allowed even if
+    /// SOA queries aren't"). Not [`TransferError::Malformed`]: a refusal is
+    /// well-formed.
     #[error("master answered {0:?}")]
     Rcode(ResponseCode),
     /// A TSIG that is absent, unknown, or does not verify. Distinct because it
@@ -131,18 +126,9 @@ impl DnssecError {
 
 /// A zone that is not the catalog zone it was configured as (RFC 9432).
 ///
-/// The variants are the RFC's own list of what makes a catalog "broken" — §4.1
-/// for the member nodes, §4.2.1 for the version property, §4.3.1 for `coo` —
-/// and no consumer branches on them: §5.1 gives one answer for all of them,
-/// which is to keep the membership already in force and say so. They are
-/// separate anyway because the operator has to fix a specific record, and
-/// because a test asserting on the variant is a test that survives rewording
-/// (`CLAUDE.md` §3).
-///
-/// Not a reason to reject the *zone*: §5.1 says a name server "MAY allow
-/// loading and transfer of broken zones with incorrect catalog zone syntax (as
-/// they are treated as regular zones)", so this describes the catalog reading
-/// and nothing else.
+/// RFC 9432's list of what breaks a catalog (§4.1, §4.2.1, §4.3.1): no consumer
+/// branches, as §5.1 gives one answer, but the operator fixes a specific record
+/// (`CLAUDE.md` §3). The zone itself still loads (§5.1).
 #[derive(Debug, thiserror::Error)]
 pub enum BrokenCatalog {
     #[error(

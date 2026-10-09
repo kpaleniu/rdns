@@ -52,15 +52,11 @@ struct ZoneProofs {
     /// (RFC 2308 §2.1), and its MINIMUM bounds how long the answer may live.
     soa: Option<CachedSoa>,
     /// Validated RRsets that came from a wildcard, keyed by (wildcard owner,
-    /// type) — the name asked for is the one part that is not reusable.
+    /// type); the name asked for is the one part not reusable.
     ///
-    /// `Name` rather than [`rdns_core::name_keys::NameTypeKey`], which the answer
-    /// and negative caches use, because the probe has to *build* this key:
-    /// `*.<parent>` appears nowhere in the query, so [`wildcard_for_parent_of`]
-    /// constructs it. The allocation is the key's shape, not its type, and a
-    /// folded key would add a fold and a `dyn` call on top of it. `Name`'s `Hash`
-    /// and `Eq` fold ASCII, so the two are equally right about case
-    /// (`TODO.md` #40b).
+    /// `Name`, not [`rdns_core::name_keys::NameTypeKey`]: the probe must build
+    /// `*.<parent>` ([`wildcard_for_parent_of`]) anyway, and `Name`'s `Hash`
+    /// and `Eq` fold ASCII.
     wildcards: HashMap<(Name, Qtype), CachedWildcard>,
 }
 
@@ -259,9 +255,8 @@ impl NsecCache {
                     if !nsec3.zone.as_ref().is_at_or_under(zone.as_ref()) {
                         continue;
                     }
-                    // RFC 8198 §5.2: an opt-out span may hold delegations the
-                    // zone never named, so it denies nothing. Refused at insert,
-                    // so no lookup path can reach one.
+                    // RFC 8198 §5.2: an opt-out span denies nothing; refused at
+                    // insert, so unreachable here.
                     if nsec3.opt_out() {
                         continue;
                     }
@@ -285,16 +280,10 @@ impl NsecCache {
         }
     }
 
-    /// Store the wildcard RRset that answered `response`, and the denial that
-    /// came with it.
-    ///
-    /// Only for an answer that validated as Secure, on the same terms as
-    /// [`NsecCache::insert_validated`].
-    ///
-    /// RFC 8198 §5.3: a validated wildcard answer covers every name the wildcard
-    /// reaches. The zone comes from the RRSIG's signer name, since a positive
-    /// answer has no SOA. Its authority NSECs are stored too — validated denial
-    /// material on a path `insert_validated` never sees.
+    /// Store the wildcard RRset that answered a Secure `response`, and its
+    /// denial, as [`NsecCache::insert_validated`] does. It covers every name
+    /// the wildcard reaches (RFC 8198 §5.3); the zone is the RRSIG's signer, as
+    /// a positive answer has no SOA, and its NSECs are kept too.
     pub fn insert_validated_wildcard(&self, response: &DnsMessage) {
         if self.max_zones == 0 {
             return;
@@ -308,16 +297,14 @@ impl NsecCache {
             let Some(rrsig) = Rrsig::from_record(rr) else {
                 continue;
             };
-            // `None` covers both "signed at the name itself" and a name that
-            // cannot be built, and skipping is the safe direction for a cache:
-            // nothing is stored and the next query asks upstream.
+            // `None` is "signed at the name itself" or unbuildable; skipping is
+            // safe, as the next query asks upstream.
             let Some(wildcard) = wildcard_for_expansion(rr.name.as_ref(), rrsig.labels) else {
                 continue;
             };
             let zone = rrsig.signer_name;
-            // A signature made outside the zone it claims to sign is not this
-            // zone's to keep. A consistency check, not the security boundary:
-            // the chain validator already established the signer.
+            // Not this zone's to keep; a consistency check, as the chain
+            // validator established the signer.
             if !wildcard.as_ref().is_at_or_under(zone.as_ref()) {
                 continue;
             }
@@ -411,17 +398,12 @@ impl NsecCache {
         }
     }
 
-    /// Answer `qname`/`qtype` positively from a cached wildcard (RFC 8198 §5.3).
+    /// Answer `qname`/`qtype` positively from a cached wildcard (RFC 8198
+    /// §5.3).
     ///
-    /// Two things must hold. A cached NSEC must cover the name, or a wildcard
-    /// would answer for a name with records of its own that shadow it
-    /// (RFC 1034 §4.3.3). And the wildcard must be `*.<immediate parent>` and
-    /// nothing shallower: `*.example.com.` may answer for `a.b.example.com.`
-    /// only if `b.example.com.` does not exist, which a covering NSEC cannot
-    /// establish — a name sorts before everything beneath it, so
-    /// `b.example.com.`'s own NSEC covers `a.b.example.com.` either way.
-    /// Deriving the wildcard from the queried name makes that unavailable, at
-    /// the cost of a missed synthesis.
+    /// A cached NSEC must cover the name, or its own records would shadow the
+    /// wildcard (RFC 1034 §4.3.3). The wildcard must be `*.<immediate parent>`:
+    /// a shallower one needs the parent absent, which no covering NSEC proves.
     pub fn synthesize_wildcard(
         &self,
         qname: NameRef<'_>,
@@ -504,9 +486,8 @@ impl NsecCache {
             return None;
         }
 
-        // The shortest-lived thing the answer rests on: the proofs, the SOA's
-        // negative TTL (RFC 2308 §5), and what is left of the SOA. Applied to
-        // every record going out, or a client re-caches it past our own hold.
+        // The shortest-lived thing the answer rests on (RFC 2308 §5), on every
+        // record, or a client keeps it past our hold.
         let ttl = gathered.ttl.min(soa_ttl);
         if ttl == 0 {
             return None;
@@ -530,14 +511,9 @@ impl NsecCache {
         self.len() == 0
     }
 
-    /// Drop every zone's proofs at or below `node`, returning how many went.
-    ///
-    /// For a validation decision that changed under them — a negative trust
-    /// anchor added, lifted or expired (RFC 7646 §4, `TODO.md` #176). A scan,
-    /// which is fine for an operator's action and would not be per query.
-    ///
-    /// A zone above `node` keeps its proofs: they were validated in that
-    /// zone, which the anchor does not reach.
+    /// Drop every zone's proofs at or below `node`, returning how many went: an
+    /// NTA changed their validation (RFC 7646 §4). A scan, fine for an
+    /// operator's action. Zones above `node` keep theirs.
     pub fn forget_at_or_below(&self, node: NameRef<'_>) -> usize {
         let Ok(mut zones) = self.zones.lock() else {
             return 0;
@@ -555,15 +531,11 @@ impl NsecCache {
 }
 
 impl ZoneProofs {
-    /// The cached NSEC whose range could contain `name`, if any.
+    /// The cached NSEC whose range could contain `name`, if any: the greatest
+    /// owner at or below `name`, or the last record, which wraps to the apex.
     ///
-    /// The greatest owner at or below `name`, or failing that the last record in
-    /// the chain, which is the one that wraps around to the apex.
-    ///
-    /// A gap says nothing exists *in this zone*. If its lower endpoint is a
-    /// delegation — NS set, SOA clear — everything beneath it lives in the child
-    /// zone and sorts inside the gap, so the gap swallows the whole subtree.
-    /// Denying there denies a zone we were never authoritative for.
+    /// A gap from a delegation (NS set, SOA clear) swallows the child's
+    /// subtree; denying there denies a zone we never served.
     fn covering_nsec(&self, name: NameRef<'_>, now: u64) -> Option<&CachedProof<Nsec>> {
         let key = canonical_sort_key(name);
         let candidate = self
@@ -640,12 +612,8 @@ impl ZoneProofs {
 
     /// NODATA: the name exists, but not with this type.
     ///
-    /// Only the record *at* the name is consulted, so `proves_nodata`'s wildcard
-    /// case never applies: that would mean synthesizing from a wildcard here.
-    ///
-    /// `Some` says a record sits at the name, not that it proves anything. It
-    /// also settles NXDOMAIN — the name exists — so the caller does not fall
-    /// through to [`ZoneProofs::gather_nxdomain`].
+    /// Only the record at the name, so no wildcard case. `Some` means a record
+    /// sits there, which also settles NXDOMAIN.
     fn gather_nodata(&self, qname: NameRef<'_>, qtype: Qtype, now: u64) -> Option<Gathered> {
         if let Some(cached) = self.matching_nsec(qname, now) {
             // At a delegation the parent holds only the DS; the real reply for
@@ -696,9 +664,8 @@ impl ZoneProofs {
         } else {
             return None;
         }
-        // The wildcard that could have answered sits at some ancestor, so gather
-        // every ancestor's; `proves_nxdomain` picks the one that matters. Each
-        // ancestor is a suffix of `qname` rather than a name of its own.
+        // Gather every ancestor's wildcard; `proves_nxdomain` picks the one
+        // that matters. Each is a suffix of `qname`.
         for depth in zone.label_count()..qname.label_count() {
             let Ok(wildcard) = Name::prefixed(b"*", qname.suffix(depth)) else {
                 continue;
@@ -742,15 +709,11 @@ impl ZoneProofs {
             .find_map(|params| self.gather_nxdomain_under(qname, zone, params, now))
     }
 
-    /// One chain's attempt at that proof: three names hashed, one map lookup
-    /// each. The client picks both the label count and the number of cached
-    /// records, so the hash must not be re-derived per record.
+    /// One chain's attempt at that proof: three names hashed, one lookup each,
+    /// as the client picks both the label count and the cached record count.
     ///
-    /// The walk starts at the QNAME and stops at the first ancestor with a
-    /// record (RFC 5155 §8.3): a responder sends the encloser's record and none
-    /// of its ancestors', so walking down from the apex would stop at the first
-    /// name nobody had asked about. `qname` is canonical — [`NsecCache`]'s entry
-    /// points make it so — hence each ancestor is a slice of it.
+    /// Walked up from the QNAME to the first ancestor with a record (RFC 5155
+    /// §8.3), where responders put the encloser's. `qname` is canonical.
     fn gather_nxdomain_under(
         &self,
         qname: NameRef<'_>,
@@ -918,13 +881,8 @@ fn with_ttl(records: &[ResourceRecord], ttl: u32) -> Vec<ResourceRecord> {
         .collect()
 }
 
-/// The bound for the wildcard store: drop what has expired first, and
-/// otherwise the entry closest to expiring. A zone can hold a wildcard per type
-/// at every level, and this is bounded for the same reason everything else here
-/// is — the alternative is unbounded.
-///
-/// One victim, for [`insert_bounded`]'s reason: the bound is a per-zone
-/// constant, 64.
+/// The bound for the wildcard store: expired entries first, then the one
+/// closest to expiring; one victim per insert, the bound a per-zone 64.
 fn insert_bounded_map(
     map: &mut HashMap<(Name, Qtype), CachedWildcard>,
     key: (Name, Qtype),

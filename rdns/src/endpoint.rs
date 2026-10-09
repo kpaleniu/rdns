@@ -100,14 +100,9 @@ pub(crate) struct Endpoint {
 
 /// Split `addr[:port][#keyname][+tls=name]` into its parts.
 ///
-/// `spec` is the whole original text and is only used in error messages, so
-/// that a bad `--secondary` complains about what the operator typed rather than
-/// about the fragment left after the zone was split off.
-///
-/// The suffixes come off in the order they are written, last first. A key name
-/// is a domain name and a `+` in one would be perverse, so splitting there
-/// cannot take a bite out of the key — and `addr+tls=n#key`, the other order,
-/// is refused rather than guessed at.
+/// `spec`, the operator's whole text, is for error messages. Suffixes come off
+/// last first; a key name with `+` is perverse, and `addr+tls=n#key` is
+/// refused, not guessed.
 pub(crate) fn parse_endpoint(text: &str, spec: &str) -> ConfigResult<Endpoint> {
     let (rest, tls) = match text.split_once("+tls=") {
         Some((rest, name)) => {
@@ -136,9 +131,8 @@ pub(crate) fn parse_endpoint(text: &str, spec: &str) -> ConfigResult<Endpoint> {
         }
         None => (rest, None),
     };
-    // RFC 9103 §7.3: "The connection for XoT SHOULD be established using port
-    // 853". A stated port still wins — §7.3 allows "mutual agreement between
-    // the primary and secondary to use a port other than port 853".
+    // RFC 9103 §7.3: XoT "SHOULD" use port 853, unless the two sides agree
+    // otherwise, so a stated port wins.
     let default_port = if tls.is_some() { DOT_PORT } else { 53 };
     Ok(Endpoint {
         addr: parse_address(addr.trim(), spec, default_port)?,

@@ -182,9 +182,8 @@ impl AxfrAssembler {
             )));
         }
         let mut zone = Zone::new(self.zone.clone());
-        // The records came off the wire, so there is no base to take an index
-        // count from: `reserve`'s estimate rather than `reserve_like`'s exact
-        // pair. 1 450 ms to 1 134 at a million records (`TODO.md` #71c).
+        // No base to count from, so `reserve`'s estimate, not `reserve_like`
+        // (`TODO.md` #71c).
         zone.reserve(self.records.len());
         for rr in self.records {
             zone.add_record(ZoneRecord {
@@ -296,9 +295,8 @@ impl IxfrAssembler {
             }
         }
 
-        // A lone SOA is "you are already current" (RFC 1995 §2). It has no
-        // terminator of its own, so it is recognised by being the whole of the
-        // first message; a server with sequences packs them into that message.
+        // A lone SOA is "already current" (RFC 1995 §2), recognized as the
+        // whole first message.
         if self.state == IxfrState::BetweenSequences && self.records_seen == 1 {
             self.state = IxfrState::Complete;
             return Ok(Progress::Complete);
@@ -396,9 +394,7 @@ impl IxfrAssembler {
         }
         if !self.sequences.is_empty() {
             let steps = self.sequences.len();
-            // Staged and applied once. Rebuilding per step was a zone-sized
-            // copy per version the client was behind — and `base.clone()` to
-            // start it, which the first step then threw away.
+            // Staged and applied once, not a zone copy per version behind.
             let mut patch = crate::ixfr::Patch::new();
             let mut last_soa = None;
             for sequence in self.sequences {
@@ -428,10 +424,7 @@ impl IxfrAssembler {
 }
 
 /// What every envelope of a transfer has to be before its records are read:
-/// arriving before the closing SOA, carrying NOERROR, and authoritative — AA is
-/// how the master says the zone is its to hand out.
-///
-/// Both assemblers open with these three.
+/// before the closing SOA, NOERROR, and AA, the master's claim to the zone.
 fn check_envelope(msg: &DnsMessage, closed: bool) -> TransferResult<()> {
     if closed {
         return Err(TransferError::malformed(
@@ -452,12 +445,8 @@ fn check_envelope(msg: &DnsMessage, closed: bool) -> TransferResult<()> {
 /// The two things a record has to be before a transfer keeps it: in this zone,
 /// and in a class this server can hold. Returns the absolute owner name.
 ///
-/// The class check matters because `zone_writer` spells CH and HS happily while
-/// `zone::parse` refuses them, so a CH record accepted here would be served,
-/// written to disk, and then fail to load on the next start.
-///
-/// Malformed rather than a timeout: a secondary retries a timeout and gives up
-/// on a malformed transfer, and neither fault clears by waiting.
+/// A CH record would be served and written, then fail the next load. Malformed,
+/// not a timeout, which a secondary retries.
 fn belongs_here(rr: &ResourceRecord, zone: NameRef<'_>) -> TransferResult<Name> {
     let name = rr.name.clone();
     if !name.as_ref().is_at_or_under(zone) {
@@ -783,17 +772,11 @@ impl Fetched {
     }
 }
 
-/// One refresh: ask the master what it has, and fetch only if it moved —
+/// One refresh: ask the master what it has, and fetch only if it moved,
 /// incrementally when we hold a version to move from.
 ///
-/// The SOA probe is what makes an unchanged zone cost a round trip instead of a
-/// transfer, and it is why a secondary may be configured with a short REFRESH.
-/// IXFR is a preference and not a demand: the master may answer either request
-/// with the whole zone (RFC 1995 §4).
-///
-/// Shared because both daemons are secondaries of something — `rdnsd` of a zone
-/// it serves, `rdnsr` of a policy feed it enforces — and the second copy is
-/// where the bug lives (`CLAUDE.md` §7).
+/// The SOA probe makes an unchanged zone a round trip; IXFR may be answered
+/// whole (RFC 1995 §4). Shared by both daemons (`CLAUDE.md` §7).
 pub async fn refresh_zone(
     master: &Master,
     zone: NameRef<'_>,
@@ -802,18 +785,8 @@ pub async fn refresh_zone(
 ) -> TransferResult<Refresh> {
     let held = base.and_then(Zone::serial);
 
-    // A refused probe is not an unreachable master. RFC 1034 §4.3.5's probe is
-    // an ordinary query, and `allow-query` and `allow-transfer` are separate
-    // ACLs in BIND, Knot and NSD — so "answer queries to my own clients, allow
-    // transfers to my secondaries" is a posture somebody writes on purpose, and
-    // a secondary that treats the refusal as a failure takes the zone off the
-    // air at EXPIRE over a master that would have handed it over. BIND does the
-    // same thing for the same reason and says so: "Perhaps AXFR/IXFR is allowed
-    // even if SOA queries aren't" (`lib/dns/zone.c`, `refresh_callback`).
-    //
-    // Only a refusal. A timeout or a malformed reply is a master that is not
-    // answering, and opening a second connection to ask it something larger is
-    // the wrong move (`TODO.md` #96).
+    // A refused probe is not an unreachable master: `allow-query` and
+    // `allow-transfer` differ on purpose, as BIND also holds (`TODO.md` #96).
     let remote = match fetch_soa(master, zone, key).await {
         Ok(serial) => Some(serial),
         Err(e) if e.is_refusal() => None,
@@ -934,9 +907,8 @@ async fn read_reply<S: AsyncRead + Unpin + ?Sized>(
         match tsig::check_response(&packet, key, previous_mac, first, tsig::now()) {
             Ok(next) => mac = Some(next),
             Err(TsigError::FormErr) if !first => {
-                // RFC 8945 §5.3.1 lets an intermediate envelope go unsigned, but
-                // it still enters the next signed digest, which `check_response`
-                // cannot see. Refused rather than accepted unauthenticated.
+                // An unsigned envelope (RFC 8945 §5.3.1) enters the next digest
+                // `check_response` cannot see, so refused.
                 return Err(TransferError::tsig(
                     "an envelope of the transfer carried no TSIG, and a key was configured",
                 ));

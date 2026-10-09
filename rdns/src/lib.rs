@@ -7,13 +7,8 @@
 //! defines is re-exported here, so `rdns::DnsMessage` still names what it
 //! always did and nothing downstream has two spellings to choose between.
 
-// `TODO.md` #82b's ratchet. #38's sweep asked "is this item *named* from
-// outside" and had no compiler behind it, so it did not hold: `pub` in this
-// crate went 694 → 889 over the 168 commits after #38 was filed, `pub(crate)`
-// 17 → 21. This lint asks the weaker question rustc can answer — is the item
-// reachable from outside at all — which is what caught `xfr.rs`'s five `pub fn`
-// on two private assemblers. It does not answer #38's question; that sweep has
-// to be re-run by hand.
+// `TODO.md` #82b's ratchet: rustc answers whether an item is reachable from
+// outside, not whether it is named there (#38), which is re-run by hand.
 #![warn(unreachable_pub)]
 // `push_str(&format!(..))` allocates a `String` to copy it; `write!` into the
 // target does not. Off by default (restriction group).
@@ -29,13 +24,11 @@ pub use rdns_core::*;
 #[global_allocator]
 static ALLOC: testutil::Counting<std::alloc::System> = testutil::Counting(std::alloc::System);
 
-// The presentation format is its own crate, so that a client can render a
-// record without linking a server. Re-exported here, because 11 modules name
-// them and none of them cares which crate the encodings live in.
+// Its own crate, so a client renders records without a server; re-exported for
+// this crate's modules.
 pub use rdns_present::record_text;
-// `persist` is `rdns-core`'s (`TODO.md` #66c): writing a file a reader cannot
-// catch half-written, and refusing to read a secret anyone can, are things a
-// *client* needs too. Re-exported here.
+// `rdns-core`'s, as atomic writes and private secrets are a client's need too;
+// re-exported.
 pub use rdns_core::persist;
 pub use rdns_present::{denial_wire, svcb};
 pub use rdns_tsig as tsig;

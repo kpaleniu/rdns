@@ -140,14 +140,11 @@ impl NegativeCache {
         }
     }
 
-    /// Store the "no" in `response`, if that is what it is and it may be cached.
+    /// Store the "no" in `response`, if that is what it is and it may be
+    /// cached.
     ///
-    /// `outcome` must be what validation concluded, and a bogus answer must not
-    /// be offered here at all: a cache is where a mistake outlives its query.
-    ///
-    /// A response with answer records is skipped: a CNAME chain ending in NODATA
-    /// is negative in RFC 2308's terms, but the chain is data with nowhere to go
-    /// here.
+    /// `outcome` is validation's verdict, never bogus. Answer records skip it:
+    /// a CNAME chain's data has nowhere to go here.
     pub fn insert(
         &self,
         qname: NameRef<'_>,
@@ -227,9 +224,8 @@ impl NegativeCache {
         let name = qname.folded_in(&mut fold_buf);
         let entries = self.entries.lock().ok()?;
 
-        // A cached NXDOMAIN denies every name beneath it too (RFC 8020), so the
-        // walk up the ancestors *is* the lookup, deepest first. Every suffix of
-        // a wire name at a label boundary is a name, so each ancestor borrows.
+        // A cached NXDOMAIN denies its subtree (RFC 8020), so the lookup walks
+        // the ancestors, deepest first.
         for ancestor in name.ancestors() {
             if let Some(entry) = entries
                 .nxdomain
@@ -286,16 +282,11 @@ impl NegativeCache {
             .map(|entry| entry.stale_answer(now, refreshing))
     }
 
-    /// Forget what an answer for this question has just proved wrong: the
-    /// NODATA for it, and an NXDOMAIN at the name or any ancestor, since a name
-    /// with data exists and so do the names above it (RFC 8020 reads the
-    /// ancestors the same way).
+    /// Forget what an answer for this question has just proved wrong: its
+    /// NODATA, and NXDOMAIN at the name or an ancestor (RFC 8020).
     ///
-    /// For the answer's writer to call as it stores. [`NegativeCache::get`]
-    /// is asked before the answer cache, so a "no" left here would go on
-    /// answering over the newer "yes" until its TTL ran out (`TODO.md` #133).
-    /// Retired rather than compared at every reader, and cheap in this
-    /// direction: one probe per label of the name being stored.
+    /// Called by the answer's writer: this cache is asked first, so a stale
+    /// "no" would beat the newer "yes" (`TODO.md` #133). One probe per label.
     pub fn forget_refuted(&self, qname: NameRef<'_>, qtype: Qtype) {
         let mut fold_buf = Vec::new();
         let name = qname.folded_in(&mut fold_buf);
@@ -410,8 +401,7 @@ impl Entry {
 fn make_room(entries: &mut Entries, max_entries: usize, now: u64, stale: StalePolicy) {
     let before = entries.len();
     // Usable, not live: with serve-stale on, an expired "no" is still the last
-    // thing known, and dropping it here would make the window a lie under any
-    // load that fills the cache.
+    // thing known.
     entries
         .nxdomain
         .retain(|_, e| stale.keeps(e.expires_at, now));

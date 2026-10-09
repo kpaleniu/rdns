@@ -61,9 +61,8 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-// The name and the port are `endpoint`'s, which parses them and needs no TLS
-// stack to do it; re-exported because this module is where a reader looks for
-// them.
+// `endpoint` parses these without a TLS stack; re-exported where a reader
+// looks.
 pub use crate::endpoint::{AuthName, DOT_PORT};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;
@@ -76,13 +75,9 @@ use crate::tls_identity::TlsIdentity;
 /// The ALPN token RFC 9103 §7.1 requires be selected.
 const ALPN_DOT: &[u8] = b"dot";
 
-/// The trust anchors an outgoing TLS connection is verified against, and the
-/// settings RFC 9103 fixes: TLS 1.3 only, ALPN `dot`. XoT's, and the
-/// resolver's for DoT forwarding (RFC 7858, `TODO.md` #175), where RFC 8310's
-/// strict profile asks the same.
-///
-/// One per use: the anchors are an operator's decision about who issues
-/// certificates, not about one server. Clone is an `Arc`.
+/// The trust anchors an outgoing TLS connection is verified against, and RFC
+/// 9103's fixed settings: TLS 1.3, ALPN `dot`. For XoT and DoT forwarding (RFC
+/// 8310's strict profile). One per use; `Clone` is an `Arc`.
 #[derive(Clone, Debug)]
 pub struct TlsClientTrust {
     config: Arc<ClientConfig>,
@@ -100,13 +95,9 @@ impl TlsClientTrust {
     /// Read a PEM bundle of certificate authorities and build the client
     /// configuration from it.
     ///
-    /// `identity` is the certificate this server presents when a master asks
-    /// for one (§7.5's mTLS); `None` is the ordinary case and means the master
-    /// authorizes by address and TSIG.
-    ///
-    /// An empty file is refused rather than loaded: a `RootCertStore` with
-    /// nothing in it verifies nothing, so it would start, and then fail every
-    /// handshake with a message about the master (`CLAUDE.md` §4).
+    /// `identity` is presented when a master asks (§7.5's mTLS). An empty file
+    /// is refused: it would verify nothing and fail every handshake
+    /// (`CLAUDE.md` §4).
     pub fn from_ca_file(path: &Path, identity: Option<TlsIdentity>) -> ConfigResult<Self> {
         Self::load(path, identity, "the transfer trust anchors")
     }
@@ -118,9 +109,7 @@ impl TlsClientTrust {
     }
 
     fn load(path: &Path, identity: Option<TlsIdentity>, what: &str) -> ConfigResult<Self> {
-        // One loader for both ends of the transfer (`CLAUDE.md` §7): the
-        // client's anchors here, the primary's client-certificate anchors in
-        // `TODO.md` #59.
+        // One loader for both ends (`CLAUDE.md` §7).
         let roots = crate::tls_identity::TrustAnchors::from_ca_file(path, what)?;
         let anchors = roots.len();
         let presenting = identity.is_some();
@@ -158,17 +147,13 @@ fn client_config(
     roots: Arc<RootCertStore>,
     identity: Option<TlsIdentity>,
 ) -> ConfigResult<ClientConfig> {
-    // `builder_with_protocol_versions` rather than `builder`: the workspace
-    // turns rustls's `tls12` feature on for the DoT *listener*, where RFC 7858
-    // still allows 1.2 and a stub resolver in the field may offer nothing else.
-    // A transfer is the other case, and §7.2 is a MUST.
+    // TLS 1.3 only: rustls's `tls12` is on for the DoT listener, but §7.2 is a
+    // MUST for transfers.
     let builder = ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .with_root_certificates(roots);
     let mut config = match identity {
-        // Fallible, and the failures are worth catching at startup: rustls
-        // loads the key here and runs `keys_match` against the chain, so a pair
-        // that does not go together, or a key this build cannot sign with, is a
-        // sentence on stderr rather than every transfer failing on a timer.
+        // rustls checks key against chain here, so a bad pair fails at startup,
+        // not on every transfer.
         Some(identity) => {
             let (chain, key) = identity.into_parts();
             builder.with_client_auth_cert(chain, key).map_err(|e| {
@@ -177,9 +162,7 @@ fn client_config(
                 ))
             })?
         }
-        // §7.5's other authorization method is mTLS; a master that does not ask
-        // for a certificate authorizes by the IP ACL and TSIG it names beside
-        // it. See the module docs.
+        // Without mTLS a master authorizes by IP ACL and TSIG (§7.5).
         None => builder.with_no_client_auth(),
     };
     config.alpn_protocols = vec![ALPN_DOT.to_vec()];
@@ -206,13 +189,8 @@ impl XotClient {
 
     /// Connect and complete the handshake.
     ///
-    /// The failure is an [`io::Error`], which is what `tokio-rustls` returns
-    /// and what a caller of this already handles. Not its own
-    /// [`TransferError`] variant: nothing branches on one, and §3's rule is
-    /// that a variant nobody matches on is a `String` with extra syntax. What
-    /// is added is the context — which master, and which name it failed to
-    /// present — because "invalid peer certificate: UnknownIssuer" on its own
-    /// names neither.
+    /// An [`io::Error`] with context added, which master and which name:
+    /// nothing branches on a [`TransferError`] variant (`CLAUDE.md` §3).
     pub(crate) async fn connect(&self, addr: SocketAddr) -> TransferResult<TlsStream<TcpStream>> {
         let tcp = TcpStream::connect(addr).await.map_err(|e| {
             TransferError::Io(io::Error::new(

@@ -31,10 +31,8 @@ impl Resolver {
     ) -> ValidationState {
         let now = self.clock.now();
 
-        // "Negative" is not `answers.is_empty()`: a CNAME chain ending without
-        // the queried type is a negative answer with a non-empty answer section.
-        // RFC 4035 §5.4 keys the proof to the name actually denied, which after a
-        // chain is the end of the chain, not the name asked about.
+        // Negative is not an empty answer section: a chain ending without the
+        // type is one, and the proof is about the chain's end (RFC 4035 §5.4).
         let shape = cname_chain_shape(query.qname.as_ref(), query.qtype, &response.answers);
         let denied_name = match &shape {
             ChainShape::Intact { final_name } => final_name.clone(),
@@ -102,9 +100,8 @@ impl Resolver {
             return verdict.state;
         }
 
-        // A signature over a denial says the records are authentic, not that
-        // they deny what was asked; without this check a valid NSEC from
-        // elsewhere in the zone stands in for a proof it does not make.
+        // A signed denial is authentic, not necessarily relevant: an NSEC from
+        // elsewhere must not stand in for the proof.
         if negative {
             // A chain that is not a chain must not be laundered into a denial:
             // its "final name" is not one we asked about.
@@ -114,17 +111,14 @@ impl Resolver {
             return self.check_denial(query, denied_name.as_ref(), response);
         }
 
-        // Shape, independently of signatures: a genuine CNAME beside a genuine A
-        // for an unrelated name is two valid RRsets and no chain. Checked here
-        // rather than in `recurse`'s per-hop filter so it also covers an answer
-        // that arrived whole from a forwarder.
+        // Shape, apart from signatures: a CNAME beside an unrelated A is no
+        // chain. Here, so a forwarder's whole answer is covered.
         if let ChainShape::Broken(why) = shape {
             return ValidationState::Bogus(Bogus::new(InfoCode::DNSSEC_BOGUS, why));
         }
 
-        // A wildcard's signature verifies at every name it could expand to, so a
-        // verified answer is not yet an answer *about* the name asked. The denial
-        // that makes it one may have arrived on an earlier hop of a CNAME chase.
+        // A wildcard signature verifies at any expansion, so the denial is
+        // needed; it may have come on an earlier hop.
         if !verdict.wildcards.is_empty() {
             let mut proofs = response.authorities.clone();
             proofs.extend(state.denials.iter().cloned());

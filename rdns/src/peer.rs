@@ -17,24 +17,12 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// The address a message or connection came from, with an IPv4-mapped IPv6
-/// address read as the IPv4 address it maps (`TODO.md` #158).
+/// address read as the IPv4 address it maps.
 ///
-/// On a dual-stack `[::]` socket every IPv4 client arrives as
-/// `::ffff:a.b.c.d`, so a check comparing the raw address missed every IPv4
-/// rule: `--allow-transfer`, `--query-rate-exempt`, `--rpz-notify-from` and
-/// `rdnsd`'s NOTIFY master match. The only constructor canonicalizes, and every
-/// check takes this type, so no check can be handed the mapped form.
-///
-/// Refusing mapped peers as "a way around the list" is wrong for a stream:
-/// Linux drops incoming TCPv6 with a mapped source, and a peer that completed a
-/// handshake is the IPv4 host it names. For UDP the drop does not apply, so a
-/// datagram claiming `::ffff:a.b.c.d` from an IPv6 network passes an IPv4 rule.
-/// What that grants is query-limit exemption, with the reply going to the real
-/// IPv4 host and `ResponseLimiter` still bounding it — the grant plain IPv4
-/// spoofing has wherever BCP 38 is not applied. A transfer is stream-only.
-///
-/// Not for a reply: a datagram back to an IPv4 client on a dual-stack socket
-/// goes to the mapped form the socket reported, so the caller keeps that.
+/// A dual-stack socket reports IPv4 clients as `::ffff:a.b.c.d`, which every
+/// IPv4 rule missed. A spoofed mapped UDP source gains only query-limit
+/// exemption, as plain IPv4 spoofing does. Not for a reply, which goes to the
+/// mapped form the socket reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Peer(IpAddr);
 

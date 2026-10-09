@@ -140,18 +140,8 @@ impl Default for Shutdown {
 
 /// A SIGHUP stream, or `None` if one could not be registered.
 ///
-/// Here rather than in a daemon because both of them want it and the second was
-/// about to be a copy of the first (`CLAUDE.md` §7). `rdnsd` reloads its zones
-/// on this; `rdnsr` has no zones and re-reads its TLS certificate, which is the
-/// half neither can do without a restart otherwise (`TODO.md` #42a).
-///
-/// `None` rather than an error: losing the signal costs a reload trigger, and
-/// `rdnsd` still has its re-signing timer and its control socket. It is logged
-/// because the difference is invisible until somebody sends one.
-///
-/// `tokio`'s own signal support rather than `signal-hook-tokio`, for the same
-/// reason [`stop_signal`] uses it: it is already here, it needs no dependency,
-/// and one mechanism for every signal this process handles beats two.
+/// Shared by both daemons (`CLAUDE.md` §7). `None`, logged, not an error: other
+/// reload triggers remain. `tokio`'s signals, as [`stop_signal`] uses.
 #[cfg(unix)]
 pub fn reload_signal() -> Option<tokio::signal::unix::Signal> {
     use tokio::signal::unix::{signal, SignalKind};
@@ -233,9 +223,8 @@ pub async fn stop_signal() -> &'static str {
     let mut term = match signal(SignalKind::terminate()) {
         Ok(stream) => stream,
         Err(e) => {
-            // Must not stop the server running: Ctrl-C still works, and a
-            // SIGTERM will kill rather than drain. Say so, since the
-            // difference is invisible until it matters.
+            // Not fatal: Ctrl-C still works and SIGTERM kills rather than
+            // drains; said, as it is otherwise invisible.
             tracing::error!("could not listen for SIGTERM ({e}); shutdown will not be graceful");
             std::future::pending().await
         }
@@ -246,16 +235,11 @@ pub async fn stop_signal() -> &'static str {
     }
 }
 
-/// Windows has no SIGTERM, and `ctrl_c` alone is not enough: it registers for
-/// `CTRL_C_EVENT` only, so an unlistened `CTRL_BREAK_EVENT` reaches the default
-/// handler and kills the process with `0xC000013A`. Each console control event
-/// needs its own listener.
+/// Windows has no SIGTERM; each console control event needs its own listener,
+/// or `CTRL_BREAK_EVENT` kills with `0xC000013A`.
 ///
-/// `CTRL_CLOSE_EVENT` allows about five seconds before terminating regardless —
-/// the same order as the drain budget, so a long transfer may still be cut.
-///
-/// A Windows *service* stop is none of these; it arrives through the service
-/// control manager's handler, which calls [`service_stop`] (`TODO.md` #190).
+/// `CTRL_CLOSE_EVENT` allows about five seconds, as the drain does. A service
+/// stop arrives through [`service_stop`].
 #[cfg(not(unix))]
 pub async fn stop_signal() -> &'static str {
     use tokio::signal::windows;

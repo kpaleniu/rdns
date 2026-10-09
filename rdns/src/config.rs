@@ -109,11 +109,8 @@ pub fn show_nsid(nsid: &[u8]) -> String {
 /// The `defaults` block is this daemon's own fields only — the shared ones are
 /// filled from the crate root's `default_*` functions, so the file and the flag
 /// cannot take different numbers (§15).
-// `crate::` here is the *calling* crate's root, which is the contract this
-// macro exists to state: each daemon's own `default_*` functions, so a flag and
-// a key cannot take different numbers. `$crate` would name `rdns`, where none
-// of them lives. Clippy warns because that is usually the bug rather than the
-// intent.
+// `crate::` is the calling crate's root: each daemon's own `default_*`, so flag
+// and key agree. Clippy warns because that is usually a bug.
 #[allow(clippy::crate_in_macro_def)]
 #[macro_export]
 macro_rules! server_table {
@@ -197,16 +194,11 @@ macro_rules! server_table {
             #[serde(default = "crate::default_dnstap_max_bytes")]
             dnstap_max_bytes: u64,
             /// Where to answer DNS over TLS (RFC 7858), QUIC (RFC 9250) and
-            /// HTTPS (RFC 8484), and with what. A listener with no certificate
-            /// is refused — in code, because a config file has no equivalent of
-            /// clap's `requires` and "either listener needs the pair" is not an
-            /// `or` `requires` can express.
+            /// HTTPS (RFC 8484), and with what.
             ///
-            /// `rdnsr` refuses it in `check`; `rdnsd` in `main`, where the
-            /// flags and the file have already been merged into one `Cli` and
-            /// the certificate is about to be loaded. One check over both
-            /// sources rather than two, at the cost of a file error without a
-            /// line number — `--check-config` still reaches it.
+            /// A listener without a certificate is refused in code, as the file
+            /// has no clap `requires`: `rdnsr` in `check`, `rdnsd` in `main`
+            /// over the merged `Cli`, which `--check-config` still reaches.
             tls_listen: Option<String>,
             quic_listen: Option<String>,
             https_listen: Option<String>,
@@ -229,17 +221,9 @@ macro_rules! server_table {
         impl $name {
             /// Write every `[server]` key onto `cli`.
             ///
-            /// Generated from the declarations above, so a key that parses is a
-            /// key the daemon reads. Written by hand, a field with no
-            /// assignment parses, passes `deny_unknown_fields` and then does
-            /// nothing — the failure `deny_unknown_fields` exists to prevent,
-            /// reached by the other door. The defaults do not have that hole,
-            /// because a missing one is a struct literal missing a field.
-            ///
-            /// The contract of the module header, plus one name: the calling
-            /// crate's root defines `Cli`, with a field of the same name and
-            /// type per key. A missing or mistyped one is a compile error
-            /// naming the key and pointing at its declaration.
+            /// Generated from the declarations, so a key that parses is read,
+            /// and a `Cli` field missing or mistyped is a compile error naming
+            /// the key.
             fn apply_to(&self, cli: &mut crate::Cli) {
                 cli.host = $crate::config::taken(&self.host);
                 cli.port = $crate::config::taken(&self.port);
@@ -275,10 +259,8 @@ macro_rules! server_table {
                 cli.tls_key = $crate::config::taken(&self.tls_key);
                 cli.control_socket = $crate::config::taken(&self.control_socket);
                 cli.log_file = $crate::config::taken(&self.log_file);
-                // The one key whose flag has a default, so an absent key means
-                // "keep it" rather than "clear it" — the `Option` here is the
-                // override and not the value (§15). The exception lives with
-                // the declaration rather than in each daemon.
+                // The one key whose flag has a default: absent keeps it, as the
+                // `Option` is the override, not the value (§15).
                 if let Some(https_path) = &self.https_path {
                     cli.https_path = $crate::config::taken(https_path);
                 }

@@ -19,27 +19,10 @@ use crate::ResponseCode;
 
 /// Upper bounds, in whole microseconds, of the latency histogram's buckets.
 ///
-/// Integers, because the write path compares against them on every answer and a
-/// float comparison buys nothing: the sum is already stored in integer
-/// microseconds, and the `le` labels are divided into seconds once, at scrape.
-///
-/// The bottom of the range is measured, not guessed. One whole answer — parse,
-/// look up, build, serialize — is 0.84 µs for a lower-case QNAME and 0.94 µs
-/// with the case randomized (`TODO.md` #27), so a healthy server lives between
-/// 1 and 10 µs. These bounds ran 50 µs to 100 ms before, which put every
-/// answer a healthy server gives into the first bucket — the same defect §14
-/// records at one decimal higher, where the floor was 5 ms.
-///
-/// The top of the range is the same defect from the other end, and one
-/// histogram serves both daemons. It stopped at 50 ms, so every answer `rdnsr`
-/// gives that cost a recursion — a walk from the root is tens to hundreds of
-/// milliseconds before anything goes wrong — was `+Inf` and the tail had no
-/// shape at all. The three added bounds are each a number something already
-/// decides on: 0.5 s is a slow recursion that still finished, **1.8 s is
-/// RFC 8767 §5's recommended client response timer**, so `le="1.8"` against
-/// `+Inf` is how often that timer would fire (`TODO.md` #58), and 5 s is
-/// [`crate::resolver::ResolverConfig::timeout_ms`]'s default, so past it at
-/// least one upstream round trip has already timed out.
+/// Integers, compared per answer, converted to seconds at scrape. The bottom is
+/// where a healthy authoritative answer lands (`TODO.md` #27). Above it: 0.5 s,
+/// a slow recursion; 1.8 s, RFC 8767 §5's client response timer; 5 s,
+/// [`crate::resolver::ResolverConfig::timeout_ms`]'s default.
 const LATENCY_BUCKETS_US: [u64; 11] = [
     1, 2, 5, 10, 50, 500, 5_000, 50_000, 500_000, 1_800_000, 5_000_000,
 ];
@@ -205,13 +188,8 @@ struct ZoneGauge {
 
 /// Prometheus-compatible metrics for DNS server.
 ///
-/// A handle: every task that reports anything holds a clone, so cloning is one
-/// refcount operation. It was an `Arc` *per counter* — 26 allocations to build
-/// and 26 refcount operations to clone, for something whose fields are only ever
-/// read and written together (`TODO.md` #25c-bis).
-///
-/// `Deref` rather than 24 accessors, so `metrics.count(&metrics.rate_limited)`
-/// still reads the same at all 31 call sites.
+/// A handle: one `Arc` for all counters, as they are read and written together.
+/// `Deref`, so call sites read `metrics.count(&metrics.x)`.
 #[derive(Clone)]
 pub struct DnsMetrics(Arc<Counters>);
 
@@ -322,24 +300,11 @@ pub struct Counters {
     pub upstream_tls_unmatched: AtomicU64,
 
     /// Resolutions that ran past RFC 8767 §5's client response timer, by what
-    /// they did next (`TODO.md` #58).
+    /// they did next.
     ///
-    /// The pair, not the sum, because the two say different things about
-    /// whether answering stale first is worth turning on. **`completed`** is a
-    /// client that waited over [`crate::cache::CLIENT_RESPONSE_TIMER`] for an
-    /// answer this resolver could have had from the stale window immediately;
-    /// those are what `--serve-stale-first` saves. **`failed`** is a resolution
-    /// that was going to serve stale anyway, so answering first buys only the
-    /// seconds of the failure, and summing the pair would credit the switch
-    /// with work it does not do (`CLAUDE.md` §19).
-    ///
-    /// A completed resolution whose answer was refused as bogus counts as
-    /// completed: what this measures is whether the walk would have finished
-    /// into the cache behind an early reply, which it would.
-    ///
-    /// Only the answer path counts. A prefetch and DNS64's A query resolve with
-    /// no client waiting, and a timer about what a client waits for has nothing
-    /// to say about them.
+    /// `completed` waited for what the stale window held, which
+    /// `--serve-stale-first` saves; `failed` would have served stale anyway, so
+    /// summing them overstates the switch (`CLAUDE.md` §19). Answer path only.
     pub slow_resolutions_completed: AtomicU64,
     pub slow_resolutions_failed: AtomicU64,
 
@@ -387,22 +352,16 @@ pub struct Counters {
     local_root_in_use: AtomicU64,
     local_root_configured: AtomicBool,
 
-    // Cumulative buckets plus count and sum: what `histogram_quantile()` needs.
-    //
-    // Length from the bounds, not repeated: the two were `8` twice, and a bound
-    // added without the counter is a scrape that silently stops at the old top
-    // (`CLAUDE.md` §17).
+    // Cumulative buckets, count and sum for `histogram_quantile()`; the length
+    // from the bounds, so they cannot disagree (`CLAUDE.md` §17).
     latency_buckets: [AtomicU64; LATENCY_BUCKETS_US.len()],
     latency_count: AtomicU64,
     /// Microseconds, integer, so the sum needs no float atomic.
     latency_sum_us: AtomicU64,
 
     /// Per-zone facts, written where the fact changes rather than sampled at
-    /// scrape time: sampling would put the scrape behind the zone-map lock and
-    /// the value would still be only as fresh as the last scrape.
-    ///
-    /// Unbounded is safe here — the keys are configured zone names, not
-    /// anything a client puts on the wire.
+    /// scrape behind the zone-map lock. Unbounded is safe: the keys are
+    /// configured zones.
     zones: RwLock<BTreeMap<NameKeyBuf, ZoneGauge>>,
     /// How many member zones each consumed catalog has this server serving
     /// (RFC 9432). Separate from `zones` because a catalog is not a zone fact:
@@ -548,9 +507,8 @@ impl DnsMetrics {
     /// which is what every Prometheus client library does and renders
     /// byte-for-byte the same.
     pub fn observe_latency_us(&self, us: u64) {
-        // The first bound at or above the sample: `le` is inclusive, so a sample
-        // exactly on a bound belongs to that bound's bucket. Past the last bound
-        // there is no bucket to touch — `+Inf` is `latency_count`.
+        // The first bound at or above: `le` is inclusive. Past the last, `+Inf`
+        // is `latency_count`.
         let index = LATENCY_BUCKETS_US.partition_point(|&bound| bound < us);
         if let Some(bucket) = self.latency_buckets.get(index) {
             bucket.fetch_add(1, Ordering::Relaxed);
@@ -665,27 +623,10 @@ impl DnsMetrics {
 
     /// The Prometheus text for one scrape.
     ///
-    /// Three rules that are not obvious:
-    ///
-    /// - **Omit, do not zero, a gauge with no answer.** A zone we are primary
-    ///   for has no last-transfer time and neither has a secondary that has
-    ///   never fetched; zero is 1970 and fires every staleness alert there is.
-    ///   `absent()` is a question the query language can ask. A *counter* is
-    ///   the opposite case and is always emitted: zero handshakes is a fact.
-    /// - **Escape every label value.** Zone names come from a file an operator
-    ///   wrote and RFC 1035 §5.1 allows escapes, so one stray quote makes the
-    ///   rest of the scrape unparseable. The `labelled` helper does not do it
-    ///   for its caller — only the caller knows whether the string came from an
-    ///   operator's file or from a `match` arm in this crate.
-    /// - **Seconds, not microseconds.** Prometheus convention is base units,
-    ///   and the histogram stores integer microseconds.
-    ///
-    /// The tables are the point rather than the length: a series' name, its
-    /// help text and the field it reads sit on one line, so the disagreement
-    /// that `every_encrypted_transport_counter_reaches_the_scrape` exists to
-    /// catch — a counter declared in [`Counters`], incremented, and rendered
-    /// nowhere — is a missing row rather than a missing block among thirty
-    /// identical ones.
+    /// - A gauge with no answer is omitted, not zeroed, which reads as 1970;
+    ///   counters are always emitted.
+    /// - Every label value is escaped: zone names come from operators' files.
+    /// - Seconds, not microseconds.
     pub fn to_prometheus_format(&self) -> String {
         let mut out = String::new();
 
@@ -799,12 +740,8 @@ impl DnsMetrics {
             );
         }
 
-        // The four handshake counters and the two dnstap ones are emitted even
-        // at zero, on a server with no DoT listener and no collector. A series
-        // that appears only once something has happened cannot be alerted on
-        // before it does, and `absent()` is the wrong question for them: zero
-        // handshakes is a fact, not a missing measurement. Contrast the
-        // per-zone gauges at the bottom, which are omitted on purpose.
+        // Emitted at zero without listeners, so they can be alerted on before
+        // anything happens; unlike per-zone gauges.
         for (name, help, value) in [
             (
                 "dns_policy_rewrites_total",
@@ -914,9 +851,8 @@ impl DnsMetrics {
             "histogram",
             "Time to build one answer",
         );
-        // Cumulated here rather than on the write path. Buckets are read one at
-        // a time, so a scrape racing an answer can see a total an instant old —
-        // true of every counter in this file, and what Prometheus expects.
+        // Cumulated here: a scrape racing an answer sees a total an instant
+        // old, as Prometheus expects.
         let mut cumulative = 0u64;
         for (bound, bucket) in LATENCY_BUCKETS_US.iter().zip(self.latency_buckets.iter()) {
             cumulative += bucket.load(Ordering::Relaxed);
@@ -1053,13 +989,8 @@ impl DnsMetrics {
             }
         }
 
-        // Read *through* a poisoned lock rather than past it. Every writer here
-        // already decided that a poisoned lock costs a stale gauge and keeps the
-        // server answering; dropping the series instead makes every zone on the
-        // server look withdrawn at once, which is the condition the staleness
-        // alert exists to catch (`CLAUDE.md` §14). A writer that panicked left a
-        // valid, possibly out-of-date map — these hold `Copy` values, so nothing
-        // is half-written.
+        // Through a poisoned lock: writers keep `Copy` values, so the map is
+        // valid; dropping it would show every zone withdrawn (§14).
         let zones = self.zones.read().unwrap_or_else(PoisonError::into_inner);
         declare(
             &mut out,
@@ -1077,10 +1008,8 @@ impl DnsMetrics {
             );
         }
 
-        // An instant, not a "seconds since": `time() - x` is the query
-        // language's job, and a duration computed here is stale on arrival.
-        //
-        // A zone with no transfer is omitted, not zeroed — zero reads as 1970.
+        // An instant, not an age, which the query language computes; a zone
+        // never transferred is omitted.
         declare(
             &mut out,
             "dns_zone_last_refresh_timestamp_seconds",
@@ -1130,12 +1059,9 @@ impl Default for DnsMetrics {
     }
 }
 
-/// Timer for one query, in the units a latency histogram wants.
-///
-/// `Instant`: this measures an interval, and the wall clock steps backwards.
-///
-/// `Copy`, because an answer path that offers one reply and then falls through
-/// to build another needs the same start instant twice.
+/// Timer for one query, in the units a latency histogram wants: `Instant`, as
+/// the wall clock steps backwards; `Copy`, as a fall-through needs the start
+/// twice.
 #[derive(Clone, Copy)]
 pub struct LatencyTimer {
     start: Instant,

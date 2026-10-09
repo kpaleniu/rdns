@@ -45,18 +45,10 @@ pub struct LocalAnswer {
 const LOCAL_TTL: Ttl = Ttl::from_secs(3600);
 
 /// Reverse zones for address space that is not globally unique, so a name in
-/// one cannot have a globally meaningful answer: RFC 6303 §4.1 (RFC 1918),
-/// two of §4.2's, §4.4 and §4.5.
-///
-/// 172.16/12 is sixteen zones: `in-addr.arpa` splits on octet boundaries and
-/// the block does not. Not `127.in-addr.arpa.` or the `::1` reverse, which
-/// RFC 6303 lists too (§4.2, §4.3) but which describe `localhost`, so they are
-/// special-use names and cannot be switched off.
-///
-/// The table was written citing §4.3–§4.6 and §4.8, which hold none of the
-/// RFC 1918 zones and do not exist past §4.6. `c.f.ip6.arpa.` is not in
-/// RFC 6303 at all: §5 says it "will need to be added" only if fc00::/8 is
-/// never delegated. RFC 6303's other zones are not here (`TODO.md` #193).
+/// one has no globally meaningful answer: RFC 6303 §4.1 (RFC 1918), two of
+/// §4.2's, §4.4 and §4.5. 172.16/12 is sixteen zones, split on octets. The
+/// loopback reverses (§4.2, §4.3) are special-use names instead; the rest of
+/// RFC 6303 is `TODO.md` #193.
 pub const EMPTY_ZONES: &[&str] = &[
     // RFC 1918 private space.
     "10.in-addr.arpa.",
@@ -350,9 +342,7 @@ fn in_zone(qname: NameRef<'_>, qtype: Qtype, zone: NameRef<'_>, why: &'static st
             authority: Vec::new(),
             why,
         },
-        // §3: "It is RECOMMENDED that the NS record defaults to the name of
-        // the zone and the SOA MNAME defaults to the name of the only NS RR's
-        // (Resource Record's) target."
+        // §3 RECOMMENDS the zone's own name as NS and as the SOA MNAME.
         rt::NS => match RecordData::from_parsed(&ParsedRecord::NS(zone.to_owned())) {
             Ok(rdata) => positive(qname, rdata, why),
             Err(_) => nodata(zone, why),

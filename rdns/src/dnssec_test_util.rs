@@ -214,12 +214,9 @@ impl TestZone {
         out
     }
 
-    /// Sign as a server answering from a wildcard does: over `wildcard`, the
-    /// name really in the zone, but published at the expanded owner with the
-    /// wildcard's shorter label count.
-    ///
-    /// The same signature verifies at every name the wildcard could reach, so a
-    /// test may re-own the result onto any of them.
+    /// Sign as a server answering from a wildcard does: over `wildcard`,
+    /// published at the expanded owner with the wildcard's label count, so a
+    /// test may re-own it onto any name the wildcard reaches.
     pub(crate) fn sign_as_wildcard(
         &self,
         records: &[ResourceRecord],
@@ -370,14 +367,12 @@ pub(crate) fn one_tag_two_algorithms(origin: &str) -> [SigningKey; 2] {
     })
 }
 
-/// A 2048-bit RSA private key as PKCS#8 DER, base64, made once with
-/// `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | openssl pkcs8 -topk8 -nocrypt -outform DER`.
-/// Not `genpkey -outform DER` alone, which writes PKCS#1 for RSA and which
-/// `ring` refuses.
+/// A 2048-bit RSA test key as PKCS#8 DER, base64. PKCS#8, as `ring` refuses
+/// `genpkey`'s PKCS#1; stored, as `ring` cannot generate RSA. Made once with:
 ///
-/// Stored, not generated: `ring` cannot generate RSA keys, which is why
-/// `SigningKey::generate` refuses them and an operator imports one. A test
-/// key, signing nothing outside this crate's tests.
+/// ```text
+/// openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | openssl pkcs8 -topk8 -nocrypt -outform DER
+/// ```
 pub(crate) const RSA_2048_PKCS8: &str = concat!(
     "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQD6/28NHovUsFD50WivmmUHiswphwYP",
     "ZMyW1hJvxE+V0tIuN4IMVYLAFgZbgg2JnXjVMnne4nctQQfCn0Ob1Penj9RWkiXzaQ4mj8vxS6bqbrIG",

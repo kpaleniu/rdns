@@ -397,15 +397,11 @@ pub trait Replica: Send {
     fn expired(&mut self, timers: RefreshTimers) -> impl Future<Output = ()> + Send;
 }
 
-/// Keep one zone in step with one master until the stop.
-///
-/// RFC 1035 §4.3.5: ask, then sleep on REFRESH, or RETRY after a failure, with
-/// a NOTIFY cutting the wait short. Out of contact past EXPIRE the replica is
-/// told once.
-///
-/// The [`Busy`](crate::shutdown::Busy) claim covers a refresh and what follows
-/// it, never the sleep, which is hours long (`CLAUDE.md` §9). Written once for
-/// both daemons (`CLAUDE.md` §7).
+/// Keep one zone in step with one master until the stop: ask, then sleep on
+/// REFRESH, or RETRY after a failure, a NOTIFY cutting it short (RFC 1035
+/// §4.3.5); past EXPIRE the replica is told once. The
+/// [`Busy`](crate::shutdown::Busy) claim covers a refresh, never the sleep
+/// (`CLAUDE.md` §9). Shared by both daemons (§7).
 pub async fn refresh_cycle<R: Replica>(
     mut replica: R,
     wake: &Notify,

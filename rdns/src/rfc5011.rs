@@ -162,9 +162,8 @@ impl ManagedAnchors {
     /// Everything currently usable as a trust anchor, as DS records — the form
     /// the chain validator already takes.
     pub fn trust_anchors(&self) -> crate::dnssec_chain::TrustAnchors {
-        // A revocation outranks a configured DS, or a static anchor (the
-        // built-in ICANN root among them) could never be retired by the
-        // mechanism designed to retire it.
+        // A revocation outranks a configured DS, or a static anchor could never
+        // be retired by RFC 5011.
         let revoked: Vec<&TrackedKey> = self
             .keys
             .iter()
@@ -249,9 +248,8 @@ impl ManagedAnchors {
                 if tracked.state != KeyState::Revoked {
                     tracked.state = KeyState::Revoked;
                     tracked.since = now;
-                    // Kept in its pre-revocation form, and reported under the
-                    // tracked tag: a DS digest covers the flags, and setting
-                    // REVOKE changes the tag.
+                    // Kept unrevoked, under the tracked tag: REVOKE changes the
+                    // flags a DS digest covers, and the tag.
                     changes.push(AnchorChange::Revoked {
                         zone: zone_lc.clone(),
                         key_tag: tracked.key.key_tag(),
@@ -368,19 +366,16 @@ impl ManagedAnchors {
         changes
     }
 
-    /// Parse a managed anchor file.
-    ///
-    /// Lines are DS or DNSKEY records in presentation format, with the state
-    /// carried in a `;;` annotation after the record:
+    /// Parse a managed anchor file: DS or DNSKEY lines in presentation format,
+    /// the state in a `;;` annotation.
     ///
     /// ```text
     /// . IN DS 20326 8 2 E06D44B8...            ; a configured anchor
     /// . 172800 IN DNSKEY 257 3 8 AwEAA...  ;;state=VALID ;;since=1700000000
     /// ```
     ///
-    /// A DNSKEY line with no annotation is read as VALID from now: an operator
-    /// wrote down a key they trust. A line that does not parse is an error, not
-    /// a skip.
+    /// An unannotated DNSKEY is VALID from now; an unparseable line is an
+    /// error.
     pub fn parse(text: &str, now: u64) -> DnssecResult<Self> {
         let mut ds = Vec::new();
         let mut keys = Vec::new();

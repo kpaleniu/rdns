@@ -111,9 +111,8 @@ impl Journal {
             deltas.push(delta);
         }
 
-        // A gap would send a secondary a version that never existed, and no
-        // serial comparison afterwards could detect it. A journal is a file an
-        // operator can edit, so check here as well as in `chain_from`.
+        // A gap would serve a version that never existed; a journal can be
+        // edited, so check here and in `chain_from`.
         for pair in deltas.windows(2) {
             if pair[0].to_serial != pair[1].from_serial {
                 return Err(ZoneError::invalid(format!(
@@ -138,16 +137,9 @@ impl Journal {
 
     /// Every zone with a journal in this directory.
     ///
-    /// Read from the directory rather than from the zone list, because what
-    /// this answers is which journals belong to no zone at all: one left by a
-    /// zone removed while the process was down is invisible to a walk of the
-    /// zone list, and stays on disk until it resurfaces under a zone of the
-    /// same name.
-    ///
-    /// A file whose name is not a domain name is somebody else's and is left
-    /// out. So is the root zone's `.journal`, which `Path` reads as a name with
-    /// no extension — never enumerated is never deleted, which is the safe way
-    /// round for a caller whose next step is `forget`.
+    /// From the directory, to find journals no zone owns. A file whose name is
+    /// no domain name is left out, and so is the root's `.journal`: never
+    /// enumerated is never deleted.
     pub fn journalled_zones(&self) -> std::io::Result<Vec<Name>> {
         let mut zones = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {

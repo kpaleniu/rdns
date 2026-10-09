@@ -52,15 +52,10 @@ pub struct LoadNotes {
 }
 
 impl NegativeTrustAnchors {
-    /// Parse the file's text: one `NAME UNTIL [norecheck]` per line, `UNTIL`
-    /// as an RRSIG writes a time (`YYYYMMDDHHmmSS`, UTC) or Unix seconds.
-    /// Blank lines and `;` comments are skipped.
-    ///
-    /// All or nothing (`CLAUDE.md` §4): a line that does not parse, or one
-    /// more than a week ahead of `now`, fails the file, and the caller keeps
-    /// the set it had. A line already past is skipped with a warning — it is
-    /// what the file will say for a while after it lapses, and refusing it
-    /// would make a SIGHUP fail on a file nobody edited.
+    /// Parse the file's text: one `NAME UNTIL [norecheck]` per line, `UNTIL` as
+    /// an RRSIG writes it or Unix seconds, `;` comments skipped. All or nothing
+    /// (`CLAUDE.md` §4): a bad line or one over a week ahead fails the file; a
+    /// line already past is skipped with a warning.
     pub fn parse(
         text: &str,
         now: u64,

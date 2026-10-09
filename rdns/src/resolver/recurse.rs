@@ -66,12 +66,11 @@ impl Resolver {
                 state.record_denials(&response.authorities);
             }
 
-            // Keep only records on the chain asked about. Records volunteered
-            // for unrelated names are cache-poisoning attempts, and `rdnsr`
-            // caches whatever is returned here.
+            // Only records on the chain asked about: anything else is a
+            // poisoning attempt, and `rdnsr` caches what comes back.
             for rr in &response.answers {
-                // No copy per record any more: the set is keyed on the name
-                // itself, whose `Hash` folds ASCII.
+                // No copy per record: the set is keyed on the name itself,
+                // whose `Hash` folds ASCII.
                 let owner = rr.name.as_ref();
                 if chain.contains(&rr.name) {
                     answers.push(rr.clone());
@@ -82,16 +81,8 @@ impl Resolver {
                     }
                     continue;
                 }
-                // A DNAME never owns the name asked about — it owns an
-                // *ancestor* of it (RFC 6672 §2.2) — so the test above cannot
-                // ever accept one, and dropping it loses the only signed half
-                // of the redirection: "the CNAME will never be signed" (§5.3.1),
-                // so a validating client that gets the CNAME without the DNAME
-                // has nothing to check.
-                //
-                // Bailiwick is the whole of the guard. Without it a server for
-                // `example.com.` answers with `com. DNAME evil.test.` and
-                // redirects every name under `com.` in this cache.
+                // A DNAME owns an ancestor (RFC 6672 §2.2), so kept separately,
+                // and in bailiwick only: its CNAME is never signed (§5.3.1).
                 if rr.rdata.rtype() == rt::DNAME
                     && owner.is_at_or_under(zone.as_ref())
                     && chain
@@ -102,12 +93,8 @@ impl Resolver {
                 }
             }
 
-            // Done if we got the type we asked for at the end of the chain, or
-            // if there is no CNAME to follow (an empty answer is NODATA or
-            // NXDOMAIN, which is an answer). The end is followed through the
-            // CNAMEs this response already carried: a forwarder resolves the
-            // chain and hands it over whole, and asking for its target again
-            // duplicated every record after the CNAME (`TODO.md` #172).
+            // Done at the type asked for or with no CNAME to follow; the end is
+            // found through carried CNAMEs, as a forwarder sends them all.
             let cname = chain_end(&answers, qname.as_ref(), self.config.max_cname_hops)?;
             let end = cname.as_ref().unwrap_or(&qname);
             let got_type = response
@@ -115,11 +102,8 @@ impl Resolver {
                 .iter()
                 .any(|rr| query.qtype.matches(rr.rdata.rtype()) && &rr.name == end);
 
-            // RFC 6672 §3.4: "Recursive caching name servers MUST perform
-            // CNAME synthesis on behalf of clients." A conforming authoritative
-            // server sends the CNAME itself (§3.1), but it is not obliged to be
-            // conforming and a cache may hold the DNAME alone, so when no CNAME
-            // arrived the substitution is ours to make.
+            // RFC 6672 §3.4: we "MUST perform CNAME synthesis": an authority
+            // may omit the CNAME, a cache may hold the DNAME alone.
             let next = match cname {
                 Some(target) => Some(target),
                 None if got_type || query.qtype.is(rt::CNAME) => None,
@@ -165,9 +149,8 @@ impl Resolver {
             )));
         }
 
-        // A routed domain beats every cached delegation at or above it, and
-        // has no fallback to the root (`TODO.md` #172) — except a local root
-        // marked down, which the root hints stand in for (#177).
+        // A route beats every cached delegation at or above it, with no
+        // fallback to the root, unless a local root is down.
         let route = self
             .route_for(query.qname.as_ref())
             .filter(|route| {
@@ -205,20 +188,16 @@ impl Resolver {
             }
         }
 
-        // Start as far down the tree as already known. Validating narrows that:
-        // a shortcut past a zone cut skips its DS records, so only zones whose
-        // keys are already validated may be jumped to. Under a stub route only
-        // a delegation strictly below it is a shortcut.
+        // Start as deep as known; when validating, only at zones whose keys are
+        // validated. Under a stub route, only strictly below it.
         let shortcut = self.best_start(query.qname.as_ref()).filter(|(start, _)| {
             route.as_ref().is_none_or(|route| {
                 start.zone != route.name && start.zone.as_ref().is_at_or_under(route.name.as_ref())
             })
         });
         if let Some((start, keys)) = shortcut {
-            // The referral that named these servers is the one being skipped,
-            // so the policy is asked here instead — otherwise a nameserver rule
-            // holds for the client that walked the delegation and for nobody
-            // after.
+            // The skipped referral named these servers, so the policy is asked
+            // here, or a nameserver rule holds for one client only.
             state.allows(&start.ns_names, &start.servers)?;
             if let Some(keys) = keys {
                 state.record_trusted_start(start.zone.clone(), keys);
@@ -229,9 +208,8 @@ impl Resolver {
                 .await
             {
                 Ok(response) => return Ok(response),
-                // A refusal is the policy's answer, not our bookkeeping going
-                // stale: restarting from the root would walk to the same
-                // delegation and refuse it again, one root round trip later.
+                // A refusal is the policy's answer: restarting from the root
+                // would reach and refuse it again.
                 Err(ResolveError::PolicyStopped) => return Err(ResolveError::PolicyStopped),
                 Err(_) => {
                     // Cached delegations go stale; restart from the root rather
@@ -260,9 +238,8 @@ impl Resolver {
                         state.local_root_answered |= answered.zone.as_ref().is_root();
                         Ok(answered)
                     }
-                    // Marked down on the way: this lookup goes to the hints
-                    // now rather than failing, as §3's "immediately" asks. Not
-                    // the probe, whose question is the local root alone.
+                    // Marked down on the way: to the hints, as §3's
+                    // "immediately" asks; the probe asks the local root only.
                     Err(e)
                         if state.probe == Probe::None
                             && !matches!(e, ResolveError::PolicyStopped)
@@ -346,9 +323,8 @@ impl Resolver {
         let qname = query.qname.clone();
         let qname_labels = qname.as_ref().label_count();
 
-        // The zone whose servers we are talking to; bailiwick is judged against
-        // it. A server for `com.` may delegate `example.com.` but may not
-        // answer for `example.org.`.
+        // The zone whose servers we ask, for bailiwick: `com.` may delegate
+        // `example.com.`, not answer for `example.org.`.
         let mut zone = start_zone;
         let mut servers = start_servers;
 
@@ -356,13 +332,11 @@ impl Resolver {
         // starting zone, deepening a label at a time.
         let mut sent_labels = zone.as_ref().label_count() + 1;
 
-        // The budget is the real limit; this only bounds a pathological spin.
-        // Minimization can add a probe per empty-non-terminal label, hence
-        // `+ qname_labels`.
+        // The budget is the limit; this bounds a spin, plus a minimization
+        // probe per label.
         let max_steps = self.config.max_delegations + qname_labels + 1;
-        // Counted rather than derived from `sent_labels`: a referral can move
-        // `zone` several labels at once, and MAX_MINIMISE_COUNT bounds round
-        // trips spent minimizing.
+        // Counted: a referral can skip labels, and MAX_MINIMISE_COUNT bounds
+        // minimizing round trips.
         let mut minimized_probes = 0usize;
         for _ in 0..max_steps {
             let minimizing = first.is_none()
@@ -381,9 +355,8 @@ impl Resolver {
                 minimized_probes += 1;
             }
 
-            // A zone cut answers the A probe with a referral, a plain in-zone
-            // name with NODATA — telling the two apart without disclosing the
-            // leaf.
+            // A cut answers the A probe with a referral, an in-zone name with
+            // NODATA, without disclosing the leaf.
             let step = QuerySection {
                 qname: sname.to_owned(),
                 qtype: if is_final {
@@ -453,9 +426,8 @@ impl Resolver {
                         "no reachable nameserver for {child_zone}"
                     )));
                 }
-                // After the glueless lookup, so an address rule sees what the
-                // NS names resolve to; before the insert, so a refused
-                // delegation is not cached for the next query to start from.
+                // After the glueless lookup, so addresses are real; before the
+                // insert, so a refused delegation is not cached.
                 state.allows(&ns_names, &servers)?;
                 self.delegations
                     .insert(child_zone.as_ref(), servers.clone(), ns_names, ttl);
@@ -466,9 +438,8 @@ impl Resolver {
             }
 
             if is_final {
-                // No answer, not authoritative and no referral is a lame
-                // delegation: an empty NOERROR would read as a definitive "no
-                // such record", so fail into SERVFAIL instead.
+                // No answer, no AA, no referral: lame, so SERVFAIL rather than
+                // an empty NOERROR read as "no such record".
                 if !response.answers.is_empty() || response.authoritive {
                     return Ok(Answered { response, zone });
                 }
@@ -550,10 +521,8 @@ impl Resolver {
             }
             let owner = rr.name.as_ref();
 
-            // Bailiwick, the rule that keeps a hostile server in its lane: a
-            // referral must be *below* the zone we asked (otherwise `com.` could
-            // hand us the servers for `bank.example.`) and must be *at or above*
-            // the name we are chasing (otherwise it is not progress toward it).
+            // Bailiwick: a referral must be below the zone asked, or `com.`
+            // could hand over `bank.example.`, and at or above the target.
             if !owner.is_at_or_under(zone) || owner == zone {
                 continue;
             }
@@ -576,10 +545,8 @@ impl Resolver {
             return Ok(None);
         };
 
-        // Glue is trusted only where the responder has standing: names under
-        // the zone *it* serves, not the zone it delegates to. The root's `com.`
-        // referral carries glue for `a.gtld-servers.net.`, which is under
-        // neither `com.` nor resolvable without it.
+        // Glue only under the responder's own zone: the root's `com.` referral
+        // glues `a.gtld-servers.net.`, under neither.
         let mut glue = Vec::new();
         for rr in &response.additionals {
             let owner = rr.name.as_ref();
@@ -611,11 +578,8 @@ impl Resolver {
     }
 
     /// Resolve nameserver names to addresses, for delegations that came without
-    /// usable glue. Stops at the first name that yields an address; each lookup
-    /// is charged to the budget.
-    ///
-    /// A first, then AAAA only if A found nothing: a dual-stacked nameserver
-    /// costs one query, and an IPv6-only glueless delegation still resolves.
+    /// usable glue, stopping at the first name with one; each lookup is
+    /// charged. A first, AAAA only if A found nothing.
     async fn resolve_nameserver_addresses(
         &self,
         ns_names: &[Name],
@@ -885,20 +849,9 @@ fn chain_end(
 /// RFC 6672 §3.4.1 step 4D: apply a DNAME in the response to the name being
 /// sought, and synthesize the CNAME the server did not send.
 ///
-/// Called only when no CNAME arrived for `qname`. A conforming authoritative
-/// server sends one (§3.1) and this does nothing; §3.4 makes the synthesis a
-/// recursive server's obligation anyway, because a cache may hold the DNAME
-/// alone.
-///
-/// The first applicable DNAME is the only one: "there will be at most one
-/// ancestor with a DNAME as described in step 4 unless some zone's data is in
-/// violation of the no-descendants limitation" (§3.2).
-///
-/// `Err` for an overflow, which is step 4D's "return an implementation-
-/// dependent error to the application" — the authoritative server's YXDOMAIN
-/// (§2.2) has no resolver-side spelling, and answering NOERROR with a partial
-/// chain would say the name resolved to nothing rather than that it could not
-/// be built.
+/// Only when no CNAME arrived; the first DNAME is the only one (§3.2). `Err`
+/// for an overflow, step 4D's "implementation-dependent error": a partial chain
+/// under NOERROR would claim the name resolved.
 fn synthesize_from_dname(
     response: &DnsMessage,
     zone: NameRef<'_>,
@@ -922,10 +875,8 @@ fn synthesize_from_dname(
                 )))
             }
             Redirect::To(next) => {
-                // "A CNAME RR with Time to Live (TTL) equal to the
-                // corresponding DNAME RR is synthesized" (§3.1) — and for a
-                // cache, "equal to the decremented TTL of the cached DNAME",
-                // which is what arrived on the wire.
+                // A CNAME with the DNAME's TTL (§3.1), for a cache "the
+                // decremented TTL", which is what arrived.
                 let rdata = RecordData::from_parsed(&ParsedRecord::CNAME(next.clone()))
                     .map_err(|e| ResolveError::no_response(format!("synthesizing a CNAME: {e}")))?;
                 answers.push(ResourceRecord {

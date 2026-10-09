@@ -241,18 +241,9 @@ pub fn diff(old: &Zone, new: &Zone) -> Option<ZoneDelta> {
 
 /// A record's identity for comparison: everything about it that can change.
 ///
-/// The TTL is part of it — a secondary caches and re-serves that number, so a
-/// TTL change is a deletion plus an addition, as BIND's
-/// `ixfr-from-differences` produces. Names compare case-insensitively
-/// (RFC 4343), so the key holds the down-cased form and the original beside it.
-///
-/// It carries the whole [`RecordData`] so [`RecordKey::into_record`] hands back
-/// the record it was given rather than re-parsing it through the checked
-/// constructor.
-///
-/// `Ord` is written out rather than derived because it must compare TYPE before
-/// class and TTL: that order decides how records come out of the diff and
-/// therefore how they go onto the wire.
+/// The TTL included, as BIND's `ixfr-from-differences`; names folded (RFC
+/// 4343), the original kept. The whole [`RecordData`], so no re-parse. `Ord` by
+/// hand, TYPE before class and TTL, which sets the wire order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordKey {
     lowercase_name: Vec<u8>,
@@ -307,15 +298,9 @@ fn record_key(_zone: &Zone, record: ZoneRecordRef<'_>) -> RecordKey {
 
 /// A chain of difference sequences, staged so the zone is rebuilt once.
 ///
-/// RFC 1995 §4 sends one sequence per version step, and applying them one at a
-/// time means one O(zone) rebuild per step: 32 of them for a client at the end
-/// of a full chain, which is what `MAX_DELTAS_PER_ZONE` bounds it at. The steps
-/// are staged against the base instead — deletions as a multiset to withhold,
-/// additions as a list to append — which is the same arithmetic in one pass,
-/// because an intermediate version is never looked at. Its SOA is not looked at either: the framing
-/// carries one per step and only the last one survives.
-///
-/// The bound is the delta, not the zone: nothing here is sized by the base.
+/// RFC 1995 §4 sends a sequence per step; staged against the base, deletions
+/// withheld and additions appended, they apply in one pass. Only the last SOA
+/// survives. Bounded by the delta, not the base.
 #[derive(Debug, Default)]
 pub struct Patch {
     /// What to withhold from the base, bucketed by folded owner name so a base
@@ -430,34 +415,21 @@ impl Patch {
 
     /// Apply the staged steps to a copy of `base`, with `new_soa` at the apex.
     ///
-    /// Returns the zone and the deletions no record answered — not an error:
-    /// the record is meant to be gone either way, and refusing would strand a
-    /// secondary on a version it can never leave.
-    ///
-    /// **A copy and then an edit, not a rebuild** (`TODO.md` #71a). Nothing
-    /// here walks a record the difference sequence did not name: the copy is a
-    /// memcpy of two vectors and an allocation per record, where a rebuild
-    /// re-hashes every name of the base and walks its ancestors. 386.9 ms
-    /// against 146.3 for a forty-record change at a million records, of which
-    /// 139.3 is the copy — so what is left to take is
-    /// [`crate::zone::ZoneRecord`]'s two allocations (#71e) and not this.
-    ///
-    /// The record *order* is not the base's, because a removal fills its hole
-    /// from the end; `Zone::remove_record` says why nothing reads one.
+    /// Returns the zone and the deletions nothing matched: not an error, or a
+    /// secondary is stranded. A copy then an edit, not a rebuild (`TODO.md`
+    /// #71a); the order is not the base's (see `Zone::remove_record`).
     pub fn apply(mut self, base: &Zone, new_soa: &ResourceRecord) -> (Zone, usize) {
         let mut zone = base.clone();
         let mut removed = self.cancelled;
 
-        // First, as `apply` skips it before offering anything to the
-        // deletions: the patch's own SOA replaces the base's, the framing
-        // carries one per step, and it is never among the deletions.
+        // First: the patch's SOA replaces the base's and is never among the
+        // deletions.
         if let Some(at) = zone.apex_soa_position() {
             zone.remove_record(at);
         }
 
-        // One name at a time, and its positions read *after* the previous
-        // name's removals: a `swap_remove` moves the last record, so a position
-        // taken before one is a position about the zone as it was.
+        // A name at a time, positions read after the previous removals, which
+        // `swap_remove` moves.
         let mut doomed: Vec<usize> = Vec::new();
         for (key, bucket) in &mut self.withhold {
             doomed.clear();

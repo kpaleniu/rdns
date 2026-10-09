@@ -79,9 +79,8 @@ fn main() {
     for t in 0..threads {
         let (answered, stop, barrier) = (answered.clone(), stop.clone(), barrier.clone());
         handles.push(std::thread::spawn(move || {
-            // A distinct source address per thread. All of them sharing one
-            // would put the whole load in a single token bucket, so the run
-            // would measure the rate limiter's *policy* instead of its cost.
+            // A source address per thread: one shared bucket would measure the
+            // rate limiter's policy, not its cost.
             let socket = UdpSocket::bind(format!("127.0.0.{}:0", t + 1))
                 .unwrap_or_else(|e| panic!("bind 127.0.0.{}: {e}", t + 1));
             socket

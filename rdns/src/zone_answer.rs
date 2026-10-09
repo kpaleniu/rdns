@@ -236,8 +236,8 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome
             return Outcome::Negative { chain, name, kind };
         };
         chain.push(Hop::Cname(name.into_owned()));
-        // `visited` compares as names, which fold as they go — so there is no
-        // folded copy of each hop to keep any more.
+        // `visited` compares as names, which fold as they go, so no hop keeps
+        // a folded copy.
         if !in_zone(zone, target.as_ref()) || visited.contains(&target) {
             return Outcome::ChainLeftZone { chain };
         }
@@ -333,7 +333,7 @@ fn add_chain(
     const _: () = assert!(MAX_REDIRECTS <= u32::BITS as usize, "one bit per hop");
     let mut owed = 0u32;
     for (i, hop) in chain.iter().enumerate() {
-        // No fold here any more: `Zone::locate` folds what its index needs,
+        // No fold here: `Zone::locate` folds what its index needs,
         // and the hop's own name is what the answer echoes.
         let qtype = match hop {
             Hop::Cname(_) => Qtype::of(record_types::CNAME),

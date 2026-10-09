@@ -78,10 +78,8 @@ impl DelegationCache {
         let now = self.clock.now();
         let mut entries = self.entries.lock().ok()?;
 
-        // Keys are folded, so the *walk* is over the folded name; folding once
-        // costs at most one copy for the whole walk, where a lowercased copy
-        // per label costs one each. Case folding moves no length octet, so the
-        // two walks step together.
+        // Keys are folded, so walk the folded name: one copy for the walk, and
+        // folding moves no length octet.
         let mut buf = Vec::new();
         let folded = qname.folded_in(&mut buf);
         for (candidate, key) in qname.ancestors().zip(folded.ancestors()) {
@@ -280,9 +278,8 @@ impl RttStore {
         match m.get_mut(server) {
             Some(srtt) => *srtt = (1.0 - RTT_ALPHA) * *srtt + RTT_ALPHA * sample_ms,
             None => {
-                // At capacity, slowest first: least lost by re-learning it as
-                // unknown. For a non-negative `f64` the bit pattern orders as
-                // the value does, so its complement puts the slowest lowest.
+                // At capacity, slowest first; a non-negative `f64`'s bits order
+                // as its value, so the complement puts the slowest lowest.
                 if m.len() >= self.capacity {
                     halve(&mut m, self.capacity, |srtt| !srtt.max(0.0).to_bits());
                 }

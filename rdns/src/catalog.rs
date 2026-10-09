@@ -80,16 +80,9 @@ impl CatalogMember {
         self.zone.as_ref()
     }
 
-    /// The group values (§4.3.2), each one TXT record's whole RDATA.
-    ///
-    /// Octets rather than `String`, for the reason [`ParsedRecord::TXT`] holds
-    /// bytes: a character-string is arbitrary octets, and a lossy conversion
-    /// merges two group values that differ. A consumer matching these against
-    /// operator configuration compares bytes.
-    ///
-    /// More than one is legal and means whatever producer and consumer agreed
-    /// (§4.3.2: "The producer MAY assign more than one group property to one
-    /// member zone").
+    /// The group values (§4.3.2), each one TXT record's whole RDATA, as octets:
+    /// a lossy conversion would merge two that differ. Several are legal ("MAY
+    /// assign more than one").
     pub fn groups(&self) -> &[Vec<u8>] {
         &self.groups
     }
@@ -108,17 +101,9 @@ impl CatalogMember {
 impl Catalog {
     /// Read a zone as a catalog, or say why it is not one.
     ///
-    /// Every error is a condition RFC 9432 names as breaking the catalog:
-    /// §4.2.1 for the version property, §4.1 for the member nodes, §4.3.1 for
-    /// `coo`. Records this build has no processing for are ignored rather than
-    /// refused — §3 requires that, and it is what lets a producer publish
-    /// properties and custom `*.ext` nodes (§4.4) an older consumer has never
-    /// heard of.
-    ///
-    /// The TTL and the class are not checked. §4.1 says the TTL "has no meaning
-    /// in this context and SHOULD be ignored", and the class cannot be anything
-    /// but IN because [`crate::zone::parse_zone_file`] refuses a record of
-    /// another class outright.
+    /// Each error is a condition RFC 9432 says breaks the catalog (§4.2.1,
+    /// §4.1, §4.3.1). Unknown records are ignored (§3), so producers can extend
+    /// (§4.4). TTL is ignored (§4.1); the class can only be IN.
     pub fn from_zone(zone: &Zone) -> Result<Catalog, BrokenCatalog> {
         let origin = zone.origin();
         let depth = origin.label_count();
@@ -135,9 +120,8 @@ impl Catalog {
                 continue;
             }
             let below = name.label_count() - depth;
-            // Nothing processed here is deeper than
-            // `<property>.<unique-N>.zones.$CATZ`. A custom property (§4.4) can
-            // be, and is ignored by the same rule as anything else unrecognized.
+            // Nothing deeper than `<property>.<unique-N>.zones.$CATZ` is
+            // processed; custom properties (§4.4) are ignored.
             if below == 0 || below > 3 {
                 continue;
             }
@@ -168,20 +152,17 @@ impl Catalog {
             }
         }
 
-        // First, because §4.2.1's conditions are about whether this is a
-        // catalog at all: a zone with no version property is somebody else's
-        // zone that happens to have a `zones` subtree.
+        // First: without a version property (§4.2.1) this is no catalog, only a
+        // zone with a `zones` subtree.
         check_version(&version)?;
 
         let mut members: Vec<CatalogMember> = Vec::new();
-        // §4.1's "different <unique-N> labels hold the same PTR value" check,
-        // as a lookup: a scan per member would be quadratic in a catalog whose
-        // whole point is holding thousands of them.
+        // §4.1's duplicate-PTR check as a lookup; a scan per member would be
+        // quadratic.
         let mut by_zone: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
         for (_, node) in nodes {
-            // No PTR under the node: a `group` or `coo` property naming a
-            // `<unique-N>` that is not a member. There is nothing to apply it
-            // to, and §3 says to ignore what has no processing specified.
+            // A property under a `<unique-N>` with no PTR applies to nothing;
+            // ignored (§3).
             let Some(member) = node.into_member()? else {
                 continue;
             };
@@ -266,9 +247,8 @@ impl Node {
             groups,
             coo,
         } = self;
-        // §4.1: "This PTR record MUST be the only record in the PTR RRset with
-        // the same name. The presence of more than one record in the RRset
-        // indicates a broken catalog zone."
+        // §4.1: "This PTR record MUST be the only record in the PTR RRset";
+        // more "indicates a broken catalog zone".
         let zone = match at_most_one(ptr) {
             Ok(Some(zone)) => zone,
             Ok(None) => return Ok(None),
@@ -301,9 +281,8 @@ impl Node {
 /// The member node a property RR at `<property>.<unique-N>.zones.$CATZ` belongs
 /// to.
 fn node_of(property: NameRef<'_>) -> NameRef<'_> {
-    // The caller matched a three-label suffix, so there is a parent; `unwrap_or`
-    // rather than `expect` because this is reached from a transferred zone and a
-    // parser that panics on what a peer sent is `CLAUDE.md` §2's rule.
+    // `unwrap_or`, not `expect`: this is reached from a transferred zone
+    // (`CLAUDE.md` §2).
     property.parent().unwrap_or(property)
 }
 
@@ -311,9 +290,8 @@ fn node_of(property: NameRef<'_>) -> NameRef<'_> {
 fn target(record: ZoneRecordRef<'_>) -> Result<Name, BrokenCatalog> {
     match record.rdata.parse() {
         Ok(ParsedRecord::PTR(name)) => Ok(name),
-        // `RecordData::parse` dispatches on the same rtype this was matched on,
-        // so the second arm is unreachable — and is two lines rather than an
-        // `unreachable!`, for the reason `node_of` gives.
+        // Unreachable, as the rtype was matched; an error, not `unreachable!`,
+        // as for `node_of`.
         Ok(_) => Err(undecodable(
             record,
             WireError::malformed("PTR", "the RDATA is not a domain name"),
@@ -349,15 +327,11 @@ fn folded(label: &[u8]) -> Vec<u8> {
     label.to_ascii_lowercase()
 }
 
-/// A member's node label in a catalog this server generates (`TODO.md`
-/// #182): the first 16 hex digits of SHA-256 over the member's lowercased
-/// wire-format name.
+/// A member's node label in a catalog this server generates: the first 16 hex
+/// digits of SHA-256 over the member's lowercased wire-format name.
 ///
-/// Stable with no state: §5.4 and §5.6 have a consumer treat a changed label
-/// as a removal and an addition, resetting the zone, so the label must come
-/// from the name alone. 64 bits makes a collision among real zone sets a
-/// curiosity, and [`generate`] refuses one rather than publish two members
-/// under one label (§4.1).
+/// From the name alone, as a changed label resets the zone (§5.4, §5.6).
+/// [`generate`] refuses a collision (§4.1).
 pub fn member_label(member: NameRef<'_>) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
@@ -370,11 +344,10 @@ pub fn member_label(member: NameRef<'_>) -> String {
         })
 }
 
-/// A version 2 catalog (RFC 9432 §4) at `catalog` listing `members`: SOA,
-/// `NS invalid.`, `version TXT "2"`, and one PTR per member at
-/// `<member_label>.zones`. Nothing else: no groups, no `coo`, no extensions.
-///
-/// Refused: two members under one label, which §4.1 makes a broken catalog.
+/// A version 2 catalog (RFC 9432 §4) at `catalog` listing `members`: SOA, `NS
+/// invalid.`, `version TXT "2"`, and one PTR per member at
+/// `<member_label>.zones`, nothing else. Two members under one label are
+/// refused (§4.1).
 pub fn generate(
     catalog: NameRef<'_>,
     members: &[Name],
@@ -409,9 +382,8 @@ pub fn generate(
             serial,
             refresh: 3600,
             retry: 600,
-            // Long: §6's failure is a catalog gone empty or expired taking
-            // every member off every consumer, and NOTIFY is what carries a
-            // change, not the timers.
+            // Long: §6 warns of a catalog expiring every member away; NOTIFY
+            // carries changes.
             expire: 2_419_200,
             minimum: 0,
         },

@@ -282,18 +282,11 @@ pub fn canonical_name(name: &str) -> String {
     }
 }
 
-/// The owner name a signature was actually computed over (RFC 4035 §5.3.2), as
-/// wire octets — which is what goes into the digest.
+/// The owner name a signature was computed over (RFC 4035 §5.3.2), as wire
+/// octets: the RRset's name, or the wildcard for a smaller label count.
 ///
-/// Normally the RRset's own name. When the RRSIG's label count is smaller, the
-/// records were synthesized from a wildcard, and what was signed is that
-/// wildcard — `*.example.com.` — not the expanded name the client asked for.
-///
-/// Not the text form re-encoded, and the only spelling: RFC 1035 §5.1 lets a
-/// label contain a `.`, so counting dots makes `a\.b.example.com.` four labels
-/// against the three its RRSIG correctly claims, and a plain answer at it comes
-/// back reported as expanded from `*.b.example.com.` — a wildcard that does not
-/// exist, owing a denial no signer writes.
+/// From wire labels, not text: RFC 1035 §5.1's `\.` would make dot-counting see
+/// an expansion from a wildcard that does not exist.
 pub fn signed_owner_name(owner: NameRef<'_>, rrsig_labels: u8) -> DnssecResult<Name> {
     let folded = owner.to_folded();
     let have = folded.as_ref().label_count();
@@ -394,18 +387,12 @@ fn canonical_rdata(record: RecordDataRef<'_>) -> DnssecResult<Vec<u8>> {
     }
 }
 
-/// The exact byte sequence an RRSIG's signature was computed over
-/// (RFC 4035 §5.3.2).
+/// The exact byte sequence an RRSIG's signature was computed over (RFC 4035
+/// §5.3.2).
 ///
-/// `owner` is the RRset's name as received, `class` its class, and `rdatas` the
-/// RDATA of every record in the RRset — which must be the complete RRset, since
-/// a signature covers all of it or none of it.
-///
-/// Four parts, each of which silently breaks every signature if left out: the
-/// RRSIG's own RDATA goes in front, minus the signature field; the TTL is the
-/// RRSIG's *original* TTL, not the received one; the owner is down-cased and,
-/// for a wildcard-expanded answer, replaced by the wildcard really signed; and
-/// the records are sorted by canonical RDATA with duplicates removed.
+/// `rdatas` must be the whole RRset. Four parts each break every signature if
+/// missed: the RRSIG RDATA without the signature first, the original TTL, the
+/// owner folded and un-expanded, and the records sorted and deduplicated.
 pub fn signed_data<R: AsRdata>(
     rrsig: &Rrsig,
     owner: NameRef<'_>,
@@ -427,10 +414,8 @@ pub fn signed_data<R: AsRdata>(
     data.extend_from_slice(&rrsig.expiration.to_be_bytes());
     data.extend_from_slice(&rrsig.inception.to_be_bytes());
     data.extend_from_slice(&rrsig.key_tag.to_be_bytes());
-    // Folded here rather than trusted: canonical form is down-cased
-    // (RFC 4034 §6.2) and `Rrsig` is a public struct anyone can fill in. The
-    // `Cow` borrows for a name that is already lower case, which every one that
-    // came off the wire through `from_record` is.
+    // Folded here: canonical form is down-cased (RFC 4034 §6.2) and `Rrsig` is
+    // public; a name already lower case borrows.
     data.extend_from_slice(&rrsig.signer_name.as_ref().folded());
 
     let signed_at = signed_owner_name(owner, rrsig.labels)?;
@@ -543,11 +528,8 @@ pub fn verify(
         5 | 7 | 8 | 10 => {
             let (exponent, modulus) = rsa_key_parts(public_key)?;
             let params: &signature::RsaParameters = match algorithm {
-                // RSA/SHA-1 is NOT RECOMMENDED for validation (RFC 8624 §3.1)
-                // but is still what a long tail of zones is signed with, and
-                // refusing it would mark those zones bogus rather than let
-                // their signatures speak. Ring gates it behind an explicit
-                // legacy name, which is the right amount of friction.
+                // RSA/SHA-1 is NOT RECOMMENDED to validate (RFC 8624 §3.1) but
+                // still common; refusing it would make those zones bogus.
                 5 | 7 => &signature::RSA_PKCS1_2048_8192_SHA1_FOR_LEGACY_USE_ONLY,
                 8 => &signature::RSA_PKCS1_2048_8192_SHA256,
                 _ => &signature::RSA_PKCS1_2048_8192_SHA512,
@@ -558,9 +540,8 @@ pub fn verify(
             };
             Ok(key.verify(params, data, sig).is_ok())
         }
-        // ECDSA (RFC 6605). The DNSKEY carries the bare x||y coordinates; the
-        // SEC1 uncompressed-point encoding ring wants is those prefixed with
-        // 0x04. Handing over the raw coordinates fails every time.
+        // ECDSA (RFC 6605): the DNSKEY holds bare x||y, and ring wants SEC1's
+        // 0x04 prefix.
         13 | 14 => {
             let (alg, expected): (&dyn signature::VerificationAlgorithm, usize) = match algorithm {
                 13 => (&signature::ECDSA_P256_SHA256_FIXED, 64),
@@ -655,19 +636,13 @@ pub enum RrsetProof {
     Unsupported(String),
 }
 
-/// Why something did not verify: the sentence an operator reads, and the
-/// RFC 8914 INFO-CODE the client is owed beside it.
+/// Why something did not verify: the sentence an operator reads, and the RFC
+/// 8914 INFO-CODE the client is owed beside it.
 ///
 /// One type for [`RrsetProof::Bogus`] and
-/// [`ValidationState::Bogus`](crate::dnssec_chain::ValidationState::Bogus), so a
-/// reason keeps its code as it is carried up the chain. Deriving the code from
-/// the text at the top instead is `CLAUDE.md` §3's "assert on the variant, not
-/// the message" seen from the other end — a SERVFAIL that says *expired* has
-/// to be told so by the check that found the expiry.
-///
-/// The text stays here and never reaches the wire: [`crate::ExtendedError`]
-/// carries a `&'static str`, because a name the client sent must not be
-/// reflected back to it.
+/// [`ValidationState::Bogus`](crate::dnssec_chain::ValidationState::Bogus), so
+/// the code travels with its reason (`CLAUDE.md` §3). The text never reaches
+/// the wire, which carries a `&'static str`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bogus {
     pub code: InfoCode,
@@ -691,15 +666,9 @@ impl std::fmt::Display for Bogus {
 
 /// One RRset: every record sharing an owner name, type and class.
 ///
-/// A signature covers an RRset as a unit, never an individual record, so this
-/// is the granularity everything in DNSSEC works at — including the attacks,
-/// which are mostly about adding a record to a set or removing one from it.
-/// `R` is what holds one record's RDATA: `RecordData` for a caller that owns
-/// the set, [`RecordDataRef`] for one reading it out of a zone's arena. The
-/// zone signer is the second — grouping a million-record zone into RRsets cost
-/// a clone per record, which was 944 ms of an 8 s incremental sign (`TODO.md`
-/// #64g) — and a default type parameter is what keeps that off the 40 call
-/// sites that do own their RDATA.
+/// The unit a signature covers. `R` holds the RDATA: `RecordData` when owned,
+/// [`RecordDataRef`] when read from a zone's arena by the signer (`TODO.md`
+/// #64g); a default type parameter keeps the owning callers unchanged.
 #[derive(Debug)]
 pub struct Rrset<'a, R = RecordData> {
     pub owner: NameRef<'a>,
@@ -731,14 +700,9 @@ impl<'a, R> Rrset<'a, R> {
 
 /// Check an RRset against its RRSIGs using an already-trusted set of DNSKEYs.
 ///
-/// `rrsigs` are the signatures found at the same owner name, and `keys` are the
-/// keys of `zone` — which must already have been established as trustworthy by
-/// the caller; this function does not walk any chain.
-///
-/// Every gate here is one an attacker would otherwise walk through: the signer
-/// must be the zone we think we are talking to (or any name could sign for any
-/// other), the key must be a zone key at that name, the signature must be
-/// current, and the label count must not claim more labels than the name has.
+/// `keys` are `zone`'s and already trusted; no chain is walked. Each gate stops
+/// an attack: the signer is the zone, the key a zone key there, the signature
+/// current, the label count possible.
 pub fn verify_rrset<R: AsRdata>(
     rrset: &Rrset<'_, R>,
     rrsigs: &[Rrsig],
@@ -764,16 +728,14 @@ pub fn verify_rrset<R: AsRdata>(
         return RrsetProof::Unsigned;
     }
 
-    // The reason, and the INFO-CODE RFC 8914 gives it: "signature expired" is
-    // the answer an operator can act on, and only the check that found the
-    // expiry knows it.
+    // The reason with its RFC 8914 code: only the failing check knows it was,
+    // say, expiry.
     let mut last_failure: Option<Bogus> = None;
     let mut unsupported: Option<String> = None;
 
     for rrsig in covering {
-        // The signer has to be the zone whose keys we hold. Without this a
-        // signature from anyone at all would do, as long as we happened to have
-        // their key.
+        // The signer must be the zone whose keys we hold, or anyone whose key
+        // we had could sign.
         if rrsig.signer_name != zone {
             last_failure = Some(Bogus::new(
                 InfoCode::DNSSEC_BOGUS,
@@ -784,9 +746,8 @@ pub fn verify_rrset<R: AsRdata>(
             ));
             continue;
         }
-        // A label count larger than the name has is nonsense, and one smaller
-        // is a wildcard — legitimate, but it must not claim to have been signed
-        // at a name above the zone apex.
+        // More labels than the name has is nonsense; fewer is a wildcard, but
+        // never above the apex.
         if rrsig.labels as usize > owner_labels || (rrsig.labels as usize) < zone_labels {
             last_failure = Some(Bogus::new(
                 InfoCode::DNSSEC_BOGUS,
@@ -798,9 +759,8 @@ pub fn verify_rrset<R: AsRdata>(
             continue;
         }
         if !rrsig.is_current(now) {
-            // The two halves of "not current" are two INFO-CODEs and two
-            // different operator problems: a lapsed re-signing run, and a
-            // clock or a signature published early (RFC 8914 §4.8, §4.9).
+            // Expired and not-yet-valid are two codes and two problems (RFC
+            // 8914 §4.8, §4.9).
             let code = if now > rrsig.expiration as u64 {
                 InfoCode::SIGNATURE_EXPIRED
             } else {
@@ -818,10 +778,8 @@ pub fn verify_rrset<R: AsRdata>(
 
         let wildcard = if (rrsig.labels as usize) < owner_labels {
             match signed_owner_name(rrset.owner, rrsig.labels) {
-                // The labels field never counts a leading `*` (RFC 4034
-                // §3.1.3), so an RRset sitting *at* a wildcard has one label
-                // more than its RRSIG claims. It is an expansion only where the
-                // signed name is not the name served.
+                // A leading `*` is never counted (RFC 4034 §3.1.3): an
+                // expansion only where the signed name is not the served.
                 Ok(signed) => (signed.as_ref() != rrset.owner).then_some(signed),
                 Err(e) => {
                     last_failure = Some(Bogus::new(

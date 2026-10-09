@@ -121,23 +121,10 @@ impl SigningAlgorithm {
 
 /// When a key is published in the DNSKEY RRset, and when it signs.
 ///
-/// RFC 6781 §4.1.1.1's Pre-Publish ZSK rollover is four moments and nothing
-/// else: publish the successor, wait out the DNSKEY RRset's TTL, start signing
-/// with it and stop signing with the predecessor, wait out the RRSIG TTL, and
-/// withdraw the predecessor. Written down per key, a signing run reads them and
-/// the rollover happens on its own — there is no state machine, nothing to
-/// persist beyond the key files, and no step that can be half-done because a
-/// process restarted in the middle of it. `dnssec-settime` is the same idea.
-///
-/// **Absent means no boundary on that side**, which is what makes a key file
-/// written before this existed go on working: no `Publish` is "published since
-/// always", no `Delete` is "until somebody removes the file". The four fields
-/// are Unix seconds and unknown fields have always been ignored on read, so a
-/// file moves between versions in both directions.
-///
-/// The signer never removes a key file. `Delete` withdraws the DNSKEY from the
-/// zone, which is the reversible half; taking the private key off the disk is
-/// the operator's, and RFC 6781 §4.1.1 is worth reading before doing it early.
+/// RFC 6781 §4.1.1.1's rollover as per-key moments a signing run reads, with no
+/// state to persist, as `dnssec-settime`. Absent means no boundary, so old key
+/// files work. The signer never deletes a key file: `Delete` only withdraws the
+/// DNSKEY (§4.1.1).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KeyTiming {
     /// In the DNSKEY RRset from here. Before it the key is loaded and invisible.
@@ -150,13 +137,8 @@ pub struct KeyTiming {
     pub inactive: Option<u64>,
     /// Leaves the DNSKEY RRset here.
     pub delete: Option<u64>,
-    /// A CDS and CDNSKEY asking the parent to publish a DS for this key appear
-    /// from here (RFC 7344). Absent means never: publishing one is a request to
-    /// change the *parent's* DS RRset, which no schedule of this zone's own can
-    /// be allowed to infer.
-    ///
-    /// `SyncPublish` in the file, which is `dnssec-settime -P sync`'s field, so
-    /// an operator who has run a BIND rollover writes the same word.
+    /// A CDS and CDNSKEY asking for a DS appear from here (RFC 7344); absent is
+    /// never. `SyncPublish` in the file, as `dnssec-settime -P sync`.
     pub sync_publish: Option<u64>,
     /// Those records go away here. `SyncDelete`, `dnssec-settime -D sync`.
     ///
@@ -172,16 +154,12 @@ impl KeyTiming {
         self.publish.is_none_or(|t| now >= t) && self.delete.is_none_or(|t| now < t)
     }
 
-    /// Whether a CDS and CDNSKEY for this key belong in the zone at `now`
-    /// (RFC 7344 §4.1).
+    /// Whether a CDS and CDNSKEY for this key belong in the zone at `now` (RFC
+    /// 7344 §4.1).
     ///
-    /// Independent of [`KeyTiming::is_published`], deliberately. The two
-    /// windows overlap in an ordinary rollover and are not the same window:
-    /// §4.1 has the child publish what it wants the parent's DS to *become*,
-    /// which is the incoming key — published locally before the parent knows
-    /// about it — and stop once the parent has acted, which is long before the
-    /// key is withdrawn. Tying this to `Publish`/`Delete` would ask the parent
-    /// to change its DS on every rollover step.
+    /// Independent of [`KeyTiming::is_published`]: the child asks for the
+    /// incoming key before the parent knows it and stops once the parent acts,
+    /// long before withdrawal.
     pub fn is_sync_published(&self, now: u64) -> bool {
         self.sync_publish.is_some_and(|t| now >= t) && self.sync_delete.is_none_or(|t| now < t)
     }
@@ -206,9 +184,8 @@ impl KeyTiming {
     /// validity — ten days, by default, for a step whose whole purpose is to
     /// land at a TTL boundary.
     pub fn next_change(&self, now: u64) -> Option<u64> {
-        // The two sync moments are here as well: a `SyncPublish` at noon has to
-        // reach the zone at noon, and the ordinary tick is a third of the
-        // signature validity. Same reason as the other four.
+        // The sync moments too: a `SyncPublish` at noon must land at noon, not
+        // at the next ordinary tick.
         [
             self.publish,
             self.activate,
@@ -559,14 +536,9 @@ impl SigningKey {
     }
 
     /// Whether the two cannot be told apart by tag, now or once either is
-    /// revoked: same owner, same algorithm, and a tag of one equal to either
-    /// tag of the other. BIND's `key_collision` (`dnssectool.c`) draws the
-    /// line in the same place, and `dnssec-keygen` generates again when it is
-    /// crossed.
-    ///
-    /// Not a correctness question for the signer, which tells keys apart by
-    /// DNSKEY. It is one for [`SigningKey::write_to_dir`], which names the file
-    /// by tag (`TODO.md` #125).
+    /// revoked: same owner and algorithm, and a shared tag, as BIND's
+    /// `key_collision`. It matters for [`SigningKey::write_to_dir`], which
+    /// names files by tag (`TODO.md` #125).
     fn tag_collides_with(&self, other: &SigningKey) -> bool {
         if self.owner != other.owner || self.algorithm != other.algorithm {
             return false;
@@ -576,13 +548,9 @@ impl SigningKey {
         tag == other_tag || tag == other.revoked_key_tag() || self.revoked_key_tag() == other_tag
     }
 
-    /// The first key out of `generate` whose tag, now or once either is
-    /// revoked, is none of `others`' of its owner and algorithm; `generate` is
-    /// [`SigningKey::generate`] outside a test.
-    ///
-    /// Bounded, where `dnssec-keygen` loops forever. Beside a thousand keys of
-    /// one zone and algorithm one attempt in 22 collides, so a hundred in a
-    /// row is not chance.
+    /// The first key out of `generate` whose tag, now or revoked, is none of
+    /// `others`' of its owner and algorithm. Bounded, unlike `dnssec-keygen`: a
+    /// hundred collisions in a row is not chance.
     pub fn distinct_from(
         others: &[&SigningKey],
         mut generate: impl FnMut() -> Result<SigningKey>,
@@ -645,13 +613,8 @@ impl SigningKey {
 
     /// A genuine RRSIG over `rrset`, valid from `inception` until `expiration`.
     ///
-    /// `original_ttl` is the TTL the records are published with, not one a cache
-    /// counted down: a validator restores it before hashing, so a signature
-    /// keeps verifying as the records age (RFC 4034 §3.1.3).
-    ///
-    /// The signer name is this key's owner and cannot be passed in — a signature
-    /// naming another zone is rejected by [`crate::dnssec::verify_rrset`] before
-    /// the bytes are looked at.
+    /// `original_ttl` is the published TTL, which a validator restores (RFC
+    /// 4034 §3.1.3). The signer name is this key's owner, not a parameter.
     pub fn sign_rrset<R: crate::AsRdata>(
         &self,
         rrset: &Rrset<'_, R>,
@@ -745,9 +708,8 @@ impl SigningKey {
                             .map_err(|e| DnssecError::key(format!("the PrivateKey: {e}")))?,
                     )
                 }
-                // The four rollover moments. Absent is no boundary on that
-                // side, which is why each is an `Option` rather than a
-                // defaulted number.
+                // The four rollover moments, each `Option`, since absent means
+                // no boundary.
                 "publish" => timing.publish = Some(timestamp(value, "Publish")?),
                 "activate" => timing.activate = Some(timestamp(value, "Activate")?),
                 "inactive" => timing.inactive = Some(timestamp(value, "Inactive")?),
@@ -778,16 +740,9 @@ impl SigningKey {
     /// Write the key into `dir` under [`SigningKey::file_name`], returning the
     /// path.
     ///
-    /// Readable by its owner alone where the platform can say so. Windows has no
-    /// mode bits, so there it is the directory's permissions or nothing.
-    ///
-    /// The restriction is applied before the file reaches its final name, and
-    /// failing to apply it fails the write — see
-    /// [`crate::persist::create_atomically_private`].
-    ///
-    /// An existing file of that name is an error, never replaced: it holds a
-    /// key with this key's tag, and the file is its only private half
-    /// (`TODO.md` #125).
+    /// Owner-only where the platform has modes, restricted before the final
+    /// name ([`crate::persist::create_atomically_private`]). An existing file
+    /// is an error: it holds another key with this tag.
     pub fn write_to_dir(&self, dir: &Path) -> Result<PathBuf> {
         let path = dir.join(self.file_name());
         crate::persist::create_atomically_private(&path, &self.to_key_file())
@@ -838,9 +793,8 @@ impl SigningKey {
             if path.extension().and_then(|e| e.to_str()) != Some(KEY_FILE_EXTENSION) {
                 continue;
             }
-            // Checked on the way in, not only set on the way out: a backup
-            // restore or a `chmod -R` is the ordinary way a private key stops
-            // being private, and whoever can read this can sign the zone.
+            // Checked on the way in too: a restore or `chmod -R` exposes a key,
+            // and whoever reads it can sign.
             crate::persist::ensure_private(&path, "a DNSSEC private key")
                 .map_err(|e| DnssecError::key(e.to_string()))?;
             let text = std::fs::read_to_string(&path)
@@ -849,10 +803,8 @@ impl SigningKey {
                 .map_err(|e| DnssecError::key(format!("in {}: {e}", path.display(),)))?;
             keys.push(key);
         }
-        // A directory listing has no reliable order. Canonical sorting makes it
-        // irrelevant to a signature, but the order signatures are *generated*
-        // in shows up in the written zone file, and a zone that reshuffles on
-        // every reload makes a diff useless.
+        // Sorted: directory order is arbitrary, and signature order shows in
+        // the written zone, which should not reshuffle.
         keys.sort_by_key(|k| (k.owner.to_string(), k.algorithm.code(), k.key_tag()));
         Ok(keys)
     }

@@ -31,11 +31,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
-// The two types below are here rather than in `crate::error` because
-// `From<tokio::time::error::Elapsed>` can only be written where the error type
-// is defined, and that one impl would hold a `tokio` dependency in a module
-// almost every other one imports. `crate::error` does not re-export them: a
-// `pub use` would put the edge straight back.
+// These two types live here: `From<tokio::time::error::Elapsed>` must sit
+// beside them, and `crate::error` must not depend on `tokio`.
 
 /// This module's `Result` alias, matching core's.
 pub type ResolveResult<T> = std::result::Result<T, ResolveError>;
@@ -86,8 +83,7 @@ impl ResolveError {
     pub fn extended_error(&self) -> ExtendedError {
         match self {
             // §4.23: "could not reach any of the authoritative name servers (or
-            // they potentially refused to reply)". A lame delegation is the
-            // second half of that sentence.
+            // they potentially refused to reply)": a lame delegation too.
             ResolveError::NoResponse(_) => {
                 ExtendedError::new(InfoCode::NO_REACHABLE_AUTHORITY, "no authority answered")
             }
@@ -106,9 +102,8 @@ impl ResolveError {
                 InfoCode::NO_REACHABLE_AUTHORITY,
                 "the resolution timer expired",
             ),
-            // §4.16 Blocked: "blocked for administrative reasons". Only read by
-            // a caller that set a policy and then discarded what it recorded;
-            // the rewrite carries its own code through `apply_policy`.
+            // §4.16 Blocked, read only by a caller that discarded what its
+            // policy recorded; a rewrite carries its own code.
             ResolveError::PolicyStopped => ExtendedError::new(
                 InfoCode::BLOCKED,
                 "this answer is the resolver operator's policy",
@@ -119,9 +114,8 @@ impl ResolveError {
             ResolveError::Wire(_) => {
                 ExtendedError::new(InfoCode::OTHER, "the upstream answer did not parse")
             }
-            // A `DnssecError` reaching here is a key or a digest we could not
-            // read rather than a chain that failed; the chain walk reports its
-            // own code through `ValidationState::Bogus`.
+            // An unreadable key or digest; a failed chain reports its own code
+            // through `ValidationState::Bogus`.
             ResolveError::Dnssec(_) => {
                 ExtendedError::new(InfoCode::DNSSEC_BOGUS, "this answer did not validate")
             }
@@ -220,9 +214,8 @@ pub fn parse_root_hints(text: &str) -> Vec<SocketAddr> {
     let mut hints = Vec::new();
     for line in text.lines() {
         let line = line.split(';').next().unwrap_or("");
-        // Layout is NAME TTL [CLASS] TYPE RDATA. Scanning for the type token
-        // tolerates the optional class and any spacing. The owner name
-        // "A.ROOT-SERVERS.NET." does not equal the bare type "A".
+        // NAME TTL [CLASS] TYPE RDATA: scanning for the type token tolerates
+        // the class and spacing; "A.ROOT-SERVERS.NET." is not "A".
         let mut tokens = line.split_whitespace();
         while let Some(tok) = tokens.next() {
             if tok.eq_ignore_ascii_case("A") || tok.eq_ignore_ascii_case("AAAA") {
@@ -237,11 +230,8 @@ pub fn parse_root_hints(text: &str) -> Vec<SocketAddr> {
 }
 
 /// RFC 8767 §5's query resolution timer: how long one resolution may take,
-/// waiting included, before it is abandoned. "Commonly around 10 to 30
-/// seconds."
-///
-/// Seconds, 1 to 30: BIND's `resolver-query-timeout` ceiling, and §5's range
-/// at the top. The one check, so the flag and the config file cannot disagree.
+/// waiting included, before it is abandoned ("Commonly around 10 to 30
+/// seconds"). 1 to 30 seconds, checked once for flag and file alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolutionTimer(Duration);
 
@@ -414,13 +404,10 @@ pub struct ResolverConfig {
     /// counts queries and not time, so without this a referral to dozens of
     /// silent nameservers spends the whole budget at `timeout_ms` a query.
     pub resolution_timer: ResolutionTimer,
-    /// EDNS0 UDP payload size to advertise upstream (RFC 6891 §6.2.3): what
-    /// this host can reassemble, which is the same claim `rdnsr` makes to its
-    /// own clients and is set from the same flag.
-    ///
-    /// Not the size of the buffer an answer is read into, so lowering this
-    /// narrows nothing this resolver can read. See
-    /// `upstream::UPSTREAM_RECEIVE_BUFFER`.
+    /// EDNS0 UDP payload size to advertise upstream (RFC 6891 §6.2.3), the
+    /// claim `rdnsr` makes to its clients too. Not the receive buffer
+    /// (`upstream::UPSTREAM_RECEIVE_BUFFER`), so lowering it narrows nothing
+    /// read.
     pub udp_payload_size: u16,
     /// How many zone delegations to remember. 0 disables the cache, which makes
     /// every query restart at the root — correct, but only acceptable in tests.
@@ -509,9 +496,8 @@ impl Default for ResolverConfig {
             max_cname_hops: 8,
             query_budget: 64,
             resolution_timer: ResolutionTimer::DEFAULT,
-            // DNS Flag Day 2020, as BIND's `edns-udp-size` and Unbound's
-            // `edns-buffer-size` default: above it an answer fragments, and a
-            // fragment is what middleboxes drop.
+            // DNS Flag Day 2020, BIND's and Unbound's default: above it answers
+            // fragment, and middleboxes drop fragments.
             udp_payload_size: crate::FLAG_DAY_UDP_SIZE,
             delegation_cache_size: 10_000,
             qname_minimization: true,
@@ -575,22 +561,13 @@ impl Budget {
 /// Consulted before a resolution follows a delegation, so a policy about the
 /// *nameservers* a name is resolved through can act on one.
 ///
-/// A callback rather than a second return value, because the delegation chain
-/// is walked and discarded: handing it back means every caller pays for a
-/// `Vec<Name>` it does not want, and only this shape can *stop* the resolution,
-/// which is what `rdns::rpz`'s NSDNAME and NSIP triggers are for. Nothing is
-/// asked and nothing is allocated when no policy is set.
-///
-/// `Sync`, because the reference is held across the walk's awaits and the
-/// resolution is spawned.
+/// A callback, not a returned chain, so it can stop the walk (`rdns::rpz`'s
+/// NSDNAME and NSIP) and costs nothing unset. `Sync`, as the walk holds it
+/// across awaits in a spawned task.
 pub trait NameserverPolicy: Sync {
-    /// Whether the walk may follow this delegation. `false` fails the
-    /// resolution with [`ResolveError::PolicyStopped`]; what to answer instead
-    /// is the implementation's to remember, since only it knows what matched.
-    ///
-    /// `servers` is what will be asked — glue, or the addresses a glueless
-    /// delegation's names resolved to — so an address rule sees what an NS name
-    /// actually points at rather than what it claims.
+    /// Whether the walk may follow this delegation; `false` fails it with
+    /// [`ResolveError::PolicyStopped`], and the implementation remembers why.
+    /// `servers` is what will be asked, so an address rule sees real addresses.
     fn allows(&self, ns_names: &[Name], servers: &[SocketAddr]) -> bool;
 }
 
@@ -697,12 +674,9 @@ impl<'a> Resolution<'a> {
     }
 }
 
-/// Told about every upstream exchange, for dnstap (`TODO.md` #191): one
-/// `RESOLVER_*` or `FORWARDER_*` entry as the query leaves and one as the reply
-/// arrives, with the identity and version left empty for the sink to fill.
-///
-/// A callback rather than a queue: the library queues nothing, and with none
-/// set an exchange costs one branch.
+/// Told about every upstream exchange, for dnstap: a `RESOLVER_*` or
+/// `FORWARDER_*` entry out and back, identity and version left to the sink. A
+/// callback, so the library queues nothing and costs one branch unset.
 pub type ExchangeTap = Arc<dyn Fn(&crate::dnstap::Entry<'_>) + Send + Sync>;
 
 /// Which zone a query was asked about, and whether the server asked is a
@@ -884,13 +858,9 @@ impl Resolver {
 
     /// Resolve a query and say how much the answer can be trusted.
     ///
-    /// With no trust anchors the state is [`ValidationState::Indeterminate`],
-    /// not `Insecure`: nothing established that anything is unsigned.
-    ///
-    /// `policy` sees each delegation on the way down and may stop the walk; see
-    /// [`NameserverPolicy`]. `None` is the ordinary case and costs nothing.
-    ///
-    /// Abandoned at [`ResolverConfig::resolution_timer`], validation included.
+    /// Without trust anchors the state is [`ValidationState::Indeterminate`].
+    /// `policy` may stop the walk ([`NameserverPolicy`]). Abandoned at
+    /// [`ResolverConfig::resolution_timer`], validation included.
     pub async fn resolve_validated(
         &self,
         query: &QuerySection,
@@ -944,17 +914,11 @@ impl Resolver {
         let mut state = Resolution::new(self.config.query_budget, policy);
         state.probe = probe;
         let mut response = self.recurse(query, &mut state).await?;
-        // Past both modes, so neither relays the upstream's header verbatim.
-        // The question is the client's byte for byte: 0x20 sent a different
-        // case upstream, and a downstream resolver checks the echoed question
-        // case-sensitively (RFC 5452 §9.1 — `response_matches` below is that
-        // check). And this resolver is authoritative for nothing (RFC 1035
-        // §4.1.1); with AA set, RFC 8020 reads an NXDOMAIN as a claim about the
-        // whole subtree.
+        // Neither mode relays the upstream header: the question is the client's
+        // (RFC 5452 §9.1, 0x20), and AA is clear (RFC 1035 §4.1.1).
         response.queries = vec![query.clone()];
-        // AA stays on an answer from a local zone, which this resolver *is*
-        // authoritative for (#174); `zone_answer` already cleared it on a
-        // referral.
+        // AA stays on a local zone's answer, which we are authoritative for;
+        // `zone_answer` cleared it on a referral.
         let local = self
             .route_for(query.qname.as_ref())
             .is_some_and(|route| matches!(route.kind, RouteKind::Local(_)));
@@ -969,14 +933,8 @@ impl Resolver {
         // Taken once for the whole resolve: anchors changing mid-walk would
         // trust a key for one step and not the next.
         let anchors = anchors.get();
-        // RFC 7646 §1.1: under an NTA the answer is treated "as if the zone is
-        // unsigned", AD clear. Indeterminate and not Insecure: nothing proved
-        // it unsigned, an operator said to stop asking. No EDE — RFC 8914 has
-        // no code for it.
-        // A routed domain not validated — set so, or a local zone — the same
-        // answer an NTA gives, reached by configuration. The question's own
-        // route, or any route an answer record lies in: a chain through an
-        // unvalidated domain has nothing to validate it with (#174).
+        // Under an NTA, "as if the zone is unsigned" (RFC 7646 §1.1), no EDE;
+        // likewise for a route on the chain configured unvalidated.
         if let Some(route) = std::iter::once(&query.qname)
             .chain(response.answers.iter().map(|rr| &rr.name))
             .filter_map(|name| self.route_for(name.as_ref()))
@@ -1006,9 +964,8 @@ impl Resolver {
             }
         }
         let mut verdict = self.validate(query, &response, &mut state, &anchors).await;
-        // RFC 8806 §1: the local root is validated "just as it would validate
-        // all responses from a remote root server", and one that serves what
-        // does not validate is not used (#177).
+        // RFC 8806 §1: the local root is validated like a remote one, and not
+        // used when it serves what does not validate.
         if let (ValidationState::Bogus(bogus), Some(local), true) =
             (&verdict, &self.local_root, state.local_root_answered)
         {
@@ -1071,11 +1028,8 @@ impl Resolver {
             additionals: Vec::new(),
             edns: None,
         };
-        // EDNS0 to exceed 512 bytes, DO to get signatures. CD goes with DO: we
-        // do the checking, so the upstream must not withhold what it judged
-        // bogus.
-        // RFC 5001 §2.1: "The resolver MUST NOT include any NSID payload data
-        // in the query message", so the option is empty.
+        // EDNS0 for size, DO for signatures, CD with DO as we validate; the
+        // NSID option is empty (RFC 5001 §2.1).
         let mut edns = if self.config.request_nsid {
             Edns::with_options(
                 self.config.udp_payload_size,
@@ -1105,12 +1059,9 @@ impl Resolver {
         })
     }
 
-    /// Whether a reply answers the query sent (RFC 5452 §9.1). With 0x20 on, the
-    /// name compare is case-sensitive, which is what makes the random casing an
-    /// anti-spoofing signal. A mismatch counts as no answer.
-    ///
-    /// Shared with `rdnsc`, whose copy had the type and class compare this one
-    /// was missing (`TODO.md` #30o).
+    /// Whether a reply answers the query sent (RFC 5452 §9.1): with 0x20 the
+    /// name compare is case-sensitive, the anti-spoofing signal. A mismatch is
+    /// no answer. Shared with `rdnsc` (`answers_query`).
     fn response_matches(&self, response: &DnsMessage, sent: &OutgoingQuery) -> bool {
         answers_query(response, &sent.sent(self.config.zero_x20)).is_ok()
     }

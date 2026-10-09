@@ -40,9 +40,8 @@ pub const MAX_NSEC3_ITERATIONS: u16 = 150;
 /// `format!("{}.{origin}", base32hex_encode(h).to_lowercase())` — three
 /// allocations where one does, and a Unicode fold over ASCII (CLAUDE.md §8).
 pub fn nsec3_owner_name_at(hash: Nsec3Hash, origin: NameRef<'_>) -> WireResult<Name> {
-    // The label is base32hex of a 20-octet SHA-1 digest — 32 characters, so it
-    // fits a label and needs no heap of its own. Building the name directly
-    // skips a `String` and a re-parse of text this already knows the shape of.
+    // Base32hex of a 20-octet SHA-1 is 32 characters, a label on the stack,
+    // built without text.
     let mut label = [0u8; 32];
     let len = encode_base32hex_in(hash.as_bytes(), BASE32HEX_LOWER, &mut label);
     Name::prefixed(&label[..len], origin)
@@ -69,9 +68,7 @@ pub fn nsec3_hash(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Nsec
 /// closest-encloser walk hashes a name per label of the QNAME, so a fresh `Vec`
 /// per iteration is a cost per label.
 fn nsec3_hash_in(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Nsec3Hash> {
-    // Into the stack: §8.3's walk hashes a name per label of the QNAME and
-    // keeps none of them, so this is the one place presentation text is read
-    // without building a `Name`.
+    // On the stack: §8.3's walk hashes a name per QNAME label and keeps none.
     let mut buf = [0u8; MAX_NAME_LEN];
     let len = crate::name::presentation_wire_in(name, &mut buf)?;
     hash_wire(&mut buf[..len], salt, iterations)
@@ -220,9 +217,8 @@ impl Nsec3 {
         if rr.rdata.rtype() != rt::NSEC3 {
             return None;
         }
-        // The first label and the rest, taken on the wire: the hash label is
-        // base32hex, but the zone below it can hold RFC 1035 §5.1's `\.`, which
-        // splitting the text on a dot would cut in the wrong place.
+        // Split on the wire: the zone below the hash label may hold RFC 1035
+        // §5.1's `\.`.
         let owner = rr.name.as_ref().to_folded();
         let first = owner.as_ref().labels().next()?;
         let zone = owner.as_ref().parent()?.to_owned();
@@ -244,9 +240,8 @@ impl Nsec3 {
                 flags,
                 iterations,
                 salt,
-                // RFC 5155 §3.1.7 gives this an explicit length octet, so a
-                // record can name a length the algorithm does not produce. It
-                // is refused here rather than kept and never matched.
+                // RFC 5155 §3.1.7 carries the length, so a wrong one is refused
+                // here, not kept and never matched.
                 next_hashed_owner: Nsec3Hash::from_wire(&next_hashed_owner)?,
                 type_bitmap,
             }),
@@ -386,12 +381,8 @@ impl Denial {
     }
 }
 
-/// Whether these records prove `zone` has no DS — that the delegation is really
-/// unsigned rather than having had its DS stripped (RFC 4035 §5.2,
-/// RFC 5155 §8.9).
-///
-/// Without it, stripping the DS from a referral makes every signed zone below
-/// look unsigned.
+/// Whether these records prove `zone` has no DS, so the delegation is really
+/// unsigned rather than stripped (RFC 4035 §5.2, RFC 5155 §8.9).
 pub fn proves_no_ds(zone: NameRef<'_>, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Denial {
     for nsec in nsecs {
         if !nsec.matches(zone) {
@@ -400,9 +391,8 @@ pub fn proves_no_ds(zone: NameRef<'_>, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Deni
         if nsec.has_type(rt::DS) {
             return Denial::NotProved(format!("the NSEC at {zone} says a DS does exist"));
         }
-        // An NSEC at the delegation point must show NS and must not show SOA;
-        // otherwise it is the child's own apex NSEC, which the child could have
-        // made say anything about its own DS.
+        // At the delegation: NS and no SOA, or it is the child's apex NSEC,
+        // which the child controls.
         if !nsec.has_type(rt::NS) {
             return Denial::NotProved(format!("the NSEC at {zone} is not at a delegation"));
         }
@@ -414,10 +404,8 @@ pub fn proves_no_ds(zone: NameRef<'_>, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Deni
         return Denial::Proved;
     }
 
-    // RFC 5155 §8.1: ignore records we cannot hash; only a set of *nothing but*
-    // those is bogus. So skip rather than return, and report the reason below
-    // only if nothing matched — the RFC 9276 iteration cap is the likeliest
-    // cause and an operator needs it named.
+    // RFC 5155 §8.1: skip unhashable records, bogus only if all are; the
+    // reason, often the RFC 9276 cap, is reported if nothing matched.
     let mut unusable: Option<String> = None;
     let mut hash = NameHash::new(zone);
     for nsec3 in nsec3s {
@@ -438,10 +426,8 @@ pub fn proves_no_ds(zone: NameRef<'_>, nsecs: &[Nsec], nsec3s: &[Nsec3]) -> Deni
         }
     }
 
-    // No NSEC3 names the delegation. A covering record with Opt-Out set
-    // (RFC 5155 §6) claims there may be insecure delegations in the span, which
-    // is the claim needed here. Without the flag it claims the name does not
-    // exist at all, contradicting the referral we just followed.
+    // No NSEC3 names it; one covering with Opt-Out (RFC 5155 §6) allows
+    // insecure delegations, which is the claim needed.
     for nsec3 in nsec3s {
         if nsec3.opt_out() && hash.covers(nsec3).unwrap_or(false) {
             return Denial::Proved;
@@ -470,9 +456,8 @@ pub fn proves_nxdomain(
         let Some(covering) = nsecs.iter().find(|n| n.covers(qname)) else {
             return Denial::NotProved(format!("no NSEC covers {qname}"));
         };
-        // The wildcard to disprove sits at the closest encloser, which for an
-        // NSEC proof is the longest suffix of qname shared with either end of
-        // the covering record.
+        // The wildcard sits at the closest encloser: the longest suffix shared
+        // with either end of the covering NSEC.
         let encloser = closest_encloser_nsec(qname, covering);
         let Ok(wildcard) = Name::prefixed(b"*", encloser) else {
             return Denial::NotProved(format!("{encloser} is too long to carry a wildcard label"));
@@ -514,9 +499,8 @@ pub fn proves_nodata(
         return nodata_bitmap(qtype, qname, |t| nsec.has_type(t));
     }
 
-    // As in `proves_no_ds`: skip an unusable record rather than return on it, so
-    // it cannot poison a set a later record — or the wildcard path below — would
-    // have answered from.
+    // Skip an unusable record, as in `proves_no_ds`, so it cannot poison a set
+    // a later record answers.
     let mut unusable: Option<String> = None;
     let mut hash = NameHash::new(qname);
     for nsec3 in nsec3s {
@@ -533,11 +517,8 @@ pub fn proves_nodata(
         return nsec_wildcard_nodata(qname, qtype, nsecs);
     }
     if !nsec3s.is_empty() {
-        // Report a skipped record's reason only if the wildcard proof also
-        // failed; checking above this branch would re-introduce the
-        // short-circuit. `nsec3_closest_encloser` swallows the same failure with
-        // `unwrap_or(false)`, so without this the RFC 9276 iteration cap reaches
-        // the operator as "no closest encloser".
+        // A skipped record's reason only if the wildcard proof also fails, or
+        // the RFC 9276 cap reads as "no closest encloser".
         return match (nsec3_wildcard_nodata(qname, zone, qtype, nsec3s), unusable) {
             (Denial::NotProved(_), Some(why)) => {
                 Denial::NotProved(format!("NSEC3 for {qname} unusable: {why}"))
@@ -627,20 +608,12 @@ pub enum WildcardVerdict {
     NotProved(String),
 }
 
-/// Whether these records prove that `owner` — a name answered out of the
-/// wildcard `wildcard` — had nothing of its own, so expanding that wildcard was
-/// correct (RFC 4035 §5.3.4, RFC 5155 §8.8).
+/// Whether these records prove that `owner`, answered out of the wildcard
+/// `wildcard`, had nothing of its own (RFC 4035 §5.3.4, RFC 5155 §8.8).
 ///
-/// A wildcard signature verifies at every name the wildcard could expand to, so
-/// a genuine RRset can be re-owned onto any name under the encloser. Two things
-/// rule that substitution out:
-///
-/// - The name asked about has no records of its own.
-/// - The wildcard is the one that name's closest encloser publishes, not one
-///   further up the tree: if an ancestor of `owner` below `wildcard`'s parent
-///   exists, RFC 4592 §3.3.1 says the wildcard at *that* name governs. NSEC gets
-///   this from the closest encloser the covering record implies; NSEC3 gets it
-///   from the "next closer" name, which is derived from where the wildcard sits.
+/// A wildcard signature verifies anywhere below, so: the name has no records,
+/// and the wildcard is its closest encloser's (RFC 4592 §3.3.1), from the
+/// covering NSEC or NSEC3's next closer name.
 pub fn proves_wildcard_expansion(
     owner: NameRef<'_>,
     wildcard: NameRef<'_>,
@@ -662,9 +635,8 @@ pub fn proves_wildcard_expansion(
                 "no NSEC covers {owner}, so nothing rules out records of its own"
             ));
         };
-        // Both ends of a covering NSEC exist, so the longest suffix shared with
-        // either is the deepest ancestor of `owner` known to exist. Deeper than
-        // the wildcard's own parent means this wildcard never applied.
+        // Both ends of a covering NSEC exist, so the shared suffix is the
+        // deepest known ancestor; deeper means another wildcard.
         let found = closest_encloser_nsec(owner, covering);
         if found != encloser {
             return WildcardVerdict::NotProved(format!(
@@ -676,9 +648,8 @@ pub fn proves_wildcard_expansion(
     }
 
     if !nsec3s.is_empty() {
-        // RFC 5155 §8.8: show the "next closer" name — one label below the
-        // encloser, towards `owner` — absent. Naming it from the wildcard's own
-        // position pins the expansion to the right depth.
+        // RFC 5155 §8.8: the next closer name, one label below the encloser,
+        // absent, which pins the depth.
         let next_closer = owner.suffix(encloser.label_count() + 1);
         let mut hash = NameHash::new(next_closer);
         if nsec3s
@@ -687,9 +658,8 @@ pub fn proves_wildcard_expansion(
         {
             return WildcardVerdict::Proved;
         }
-        // Opt-out (RFC 5155 §6): if the next closer name is one of the
-        // delegations the span never named, `owner` lives in a child zone and a
-        // referral was the honest answer. Proves nothing, accuses nothing.
+        // Opt-out (RFC 5155 §6): `owner` may be in an unnamed child zone, so
+        // this proves and accuses nothing.
         if hash.covered_by(nsec3s) {
             return WildcardVerdict::Unjudgeable(format!(
                 "the NSEC3 covering the next closer name {next_closer} has Opt-Out set"
@@ -752,14 +722,10 @@ fn nsec3_closest_encloser_proof(qname: NameRef<'_>, zone: NameRef<'_>, nsec3s: &
 }
 
 /// The closest encloser of `qname` these NSEC3 records prove (RFC 5155 §8.3):
-/// the deepest ancestor one of them matches, provided the "next closer" name one
-/// label below it is covered. That pair makes `qname` impossible and names the
-/// only wildcard that could have applied.
+/// the deepest matched ancestor whose next closer name is covered.
 ///
-/// `Err` carries why the proof does not stand — including a record matching
-/// `qname` itself, which says the name exists.
-/// Each ancestor is a suffix of `qname` rather than a name of its own, and the
-/// next closer name is the candidate visited one step before.
+/// `Err` says why not, a match on `qname` itself included. Ancestors are
+/// suffixes of `qname`.
 fn nsec3_closest_encloser<'n>(
     qname: NameRef<'n>,
     zone: NameRef<'_>,
@@ -824,7 +790,7 @@ mod tests {
 
     /// The longest shared suffix is a suffix of the first name — a borrow, not
     /// a name built label by label, which is why this exists. Case is not folded
-    /// here any more and does not need to be: `NameRef`'s equality folds ASCII
+    /// here and need not be: `NameRef`'s equality folds ASCII
     /// as it compares (RFC 4343).
     #[test]
     fn test_common_suffix_is_the_shared_labels_folded() {

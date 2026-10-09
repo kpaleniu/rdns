@@ -48,15 +48,9 @@ const MAX_CACHE_TTL: u64 = 86_400;
 /// How long past its TTL an answer may still be served, and with what TTL on it
 /// (RFC 8767, "Serving Stale Data to Improve DNS Resiliency").
 ///
-/// One type for both caches, because the window and the TTL are one policy and
-/// two copies of it would disagree (`CLAUDE.md` §7). `Copy` and eight bytes: it
-/// is passed, not shared.
-///
-/// Off by default, which is what `max_stale` of zero means. Serving stale is a
-/// deliberate decision to answer with something known to be out of date, and
-/// RFC 8767 §6 is explicit that it can keep a withdrawn name alive for as long
-/// as the window — so it is the operator's to turn on. BIND and Unbound both
-/// default it off for the same reason.
+/// One type for both caches (`CLAUDE.md` §7). Off by default (`max_stale`
+/// zero), as BIND and Unbound: it can keep a withdrawn name alive for the whole
+/// window (RFC 8767 §6).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StalePolicy {
     max_stale: u64,
@@ -72,24 +66,16 @@ pub const STALE_ANSWER_TTL: u32 = 30;
 /// RFC 8767 §5's *client response timer*, recommended 1.8 seconds: how long a
 /// client waits before the resolver answers stale while the resolution runs on.
 ///
-/// Not implemented, and declined (`TODO.md` #58): BIND removed its non-zero
-/// form after two CVEs, and `rdnsr --serve-stale-first` is the zero form
-/// instead. Kept as a threshold: the bound of one latency bucket
-/// ([`crate::metrics`]) and the comparison behind
-/// `dns_slow_resolutions_total`, which is how an operator tells whether
-/// clients wait long enough for `--serve-stale-first` to be worth it; and the
-/// age past which `rdnsr`, every UDP place held, abandons a query for a newer
-/// one (`TODO.md` #169).
+/// Not implemented (`docs/adr/0005`). Kept as a threshold: a latency bucket's
+/// bound, `dns_slow_resolutions_total`'s comparison, and the age past which
+/// `rdnsr` drops a UDP query for a newer one.
 pub const CLIENT_RESPONSE_TIMER: Duration = Duration::from_millis(1800);
 
 /// How often an expired entry may hand out a refresh when it is being answered
-/// stale (RFC 8767 §5's failure recheck timer: refreshes from failing
-/// authorities "no more frequently than every 30 seconds").
+/// stale (RFC 8767 §5: "no more frequently than every 30 seconds").
 ///
-/// A period and not a flag set once, as `CacheEntry::refreshing` is for a
-/// prefetch: a prefetch that fails leaves the entry to expire and the next
-/// client resolves it, but a stale entry is answered without resolving, so a
-/// refresh that failed once would never be tried again for the whole window.
+/// A period, not a once-only flag: a stale answer resolves nothing, so a failed
+/// refresh would otherwise never be retried.
 pub const STALE_REFRESH_INTERVAL: u64 = 30;
 
 impl StalePolicy {
@@ -175,11 +161,9 @@ pub struct Cached {
     /// What validation concluded when this was stored — the AD bit surviving
     /// the cache, and the outcome a hit is counted under.
     pub outcome: Outcome,
-    /// The entry is in the last tenth of its TTL and no refresh has been handed
-    /// out for it yet, so this caller is the one to re-resolve the name once its
-    /// own answer is on its way (Unbound's `prefetch`).
-    ///
-    /// True at most once per entry: whoever is told carries the obligation.
+    /// In the last tenth of its TTL with no refresh handed out yet, so this
+    /// caller re-resolves the name after answering (Unbound's `prefetch`); true
+    /// at most once per entry.
     pub refresh: bool,
     /// When this was stored. Stale, it is weighed against a negative answer
     /// for the same question, and the later one is what the resolver last
@@ -265,9 +249,8 @@ impl DnsCache {
     /// false nothing is ever marked and `refresh` is always false.
     pub fn lookup(&self, name: NameRef<'_>, qtype: Qtype, prefetching: bool) -> Option<Cached> {
         let now = self.clock.now();
-        // A poisoned lock reads as a cache miss. Poisoning is permanent, so
-        // `.lock().unwrap()` on `rdnsr`'s query path would take the resolver off
-        // the air for good after one panic; a miss costs a round trip.
+        // A poisoned lock is a miss: poisoning is permanent, and a panic would
+        // take the resolver down for good.
         let Ok(mut cache) = self.cache.lock() else {
             return None;
         };
@@ -301,16 +284,12 @@ impl DnsCache {
         None
     }
 
-    /// An answer that has expired but is still inside the stale window
-    /// (RFC 8767), with [`STALE_ANSWER_TTL`] on every record.
+    /// An answer that has expired but is still inside the stale window (RFC
+    /// 8767), with [`STALE_ANSWER_TTL`] on every record.
     ///
-    /// §4 has the resolver try the authoritative servers first and serve this
-    /// when that does not work, so a cache that can answer normally must not
-    /// come here. The one exception is `rdnsr --serve-stale-first`, which
-    /// answers this before trying and passes `refreshing`: the hit's `refresh`
-    /// is then set at most once per [`STALE_REFRESH_INTERVAL`], and the caller
-    /// told is the caller that queues it. `None` when the policy is off, so the
-    /// check is this function's and not every call site's.
+    /// Only after the servers failed (§4), or under `--serve-stale-first` with
+    /// `refreshing`, which hands out a refresh once per
+    /// [`STALE_REFRESH_INTERVAL`]. `None` when the policy is off.
     pub fn get_stale(&self, name: NameRef<'_>, qtype: Qtype, refreshing: bool) -> Option<Cached> {
         if !self.stale.is_on() {
             return None;
@@ -364,9 +343,8 @@ impl DnsCache {
 
         let now = self.clock.now();
 
-        // An RRset is cached for the shortest TTL in it. No clamp here: `Ttl`
-        // clamps at the parse boundary (RFC 2181 §8), so a negative wire TTL
-        // cannot widen to `u64::MAX` and win the `min`.
+        // Cached for the RRset's shortest TTL; `Ttl` is clamped at parse (RFC
+        // 2181 §8), so no negative TTL wins the `min`.
         let min_ttl = records
             .iter()
             .map(|r| r.ttl.capped_at(MAX_CACHE_TTL as u32).as_u64())
@@ -409,8 +387,7 @@ impl DnsCache {
         let now = self.clock.now();
 
         // Usable, not fresh: with serve-stale on, an expired entry is still the
-        // last thing known and dropping it here would make the window a lie
-        // under any load that fills the cache.
+        // last thing known.
         cache.retain(|_, entry| self.stale.keeps(entry.expires_at, now));
 
         let expiries = cache

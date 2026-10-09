@@ -11,23 +11,10 @@ use std::pin::Pin;
 
 /// What one upstream answer is read into, whatever this resolver advertised.
 ///
-/// Not [`ResolverConfig::udp_payload_size`], which is what we told the server
-/// we could reassemble: were they one number, lowering the advertisement to DNS
-/// Flag Day's 1232 would also narrow the doorway a server that ignores the
-/// advertisement has to fit through — and a datagram larger than the buffer is
-/// not truncated into a parse error, it is lost, since the receive itself fails
-/// on Windows (WSAEMSGSIZE) and silently drops the tail elsewhere.
-///
-/// Why not 65,535, which is Unbound's `msg-buffer-size` ("Default is 65552
-/// bytes, enough for 64 Kb packets, the maximum DNS message size") and the size
-/// a peer could in principle send: one of these exists per query in flight, and
-/// `rdnsr`'s `--max-inflight-udp` allows 1024 of those. At 64 KiB that ceiling
-/// costs 64 MB rather than the ~1.5 MB its own documentation claims — the
-/// multiplier is the point (`CLAUDE.md` §5), and Unbound reuses one buffer per
-/// thread where this allocates per query. 4,096 is the advertisement before
-/// `TODO.md` #41 lowered it, so no answer a server sized for that is lost; it
-/// is three times the advertisement, which is the slack a non-conforming server
-/// gets.
+/// Not [`ResolverConfig::udp_payload_size`]: an oversized datagram is lost, not
+/// truncated, so a server ignoring the advertisement needs room. Not 65,535:
+/// one exists per query in flight, and 1024 of them would be 64 MB (`CLAUDE.md`
+/// §5). 4,096 is three times the advertisement.
 const UPSTREAM_RECEIVE_BUFFER: usize = 4096;
 
 /// Which transport one exchange goes over.

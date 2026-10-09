@@ -53,12 +53,9 @@ pub fn axfr_messages(request: &DnsMessage, zone: &Zone) -> TransferResult<Vec<Dn
     Ok(axfr_envelopes(request, zone)?.collect())
 }
 
-/// The records of an AXFR in wire order: the apex SOA, the zone's own order
-/// without that SOA, then the apex SOA again (RFC 5936 §2.2), which puts no
-/// constraint on the middle.
-///
-/// Skipping the middle one keeps the count at two; a client that saw the closing
-/// SOA early would stop reading there.
+/// The records of an AXFR in wire order: the apex SOA, the rest without it,
+/// then the apex SOA again (RFC 5936 §2.2). Skipping the middle SOA, or a
+/// client would stop reading there.
 struct AxfrRecords<'a> {
     zone: &'a Zone,
     soa: ResourceRecord,
@@ -162,18 +159,8 @@ impl<I: Iterator<Item = ResourceRecord>> Iterator for Envelopes<'_, I> {
         }
 
         let mut message = transfer_message(self.request, current);
-        // Mirror the client's OPT on the first message only — RFC 5936 §2.2.5:
-        // "it SHOULD include one OPT RR in the first response message and MAY do
-        // so in subsequent response messages". Before any TSIG, which must be
-        // last in the additional section (RFC 8945 §5.1) and is appended by the
-        // signer.
-        //
-        // Through [`ClientEdns`] rather than `has_edns()` plus a fresh `Edns`,
-        // which is what dropped DO here: RFC 3225 §3's "the DO bit of the query
-        // MUST be copied in the response" is not about queries only, and this
-        // was the fourth site to read it that way (`TODO.md` #38, #47). The two
-        // agree on *whether* to mirror — they differ only for an option list
-        // that does not parse, which never reaches a transfer.
+        // The client's OPT on the first message only (RFC 5936 §2.2.5), before
+        // TSIG, which is last (RFC 8945 §5.1); [`ClientEdns`] copies DO.
         if std::mem::take(&mut self.first) {
             // The client's own size, echoed: a transfer is framed by the TCP
             // length prefix, so ours says nothing useful here.

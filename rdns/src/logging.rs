@@ -77,14 +77,9 @@ impl QueryStats {
 
 /// What the periodic check warns about, and the numbers an operator sets.
 ///
-/// Every threshold is per interval, because that is what
-/// [`QueryLogger::take_stats`] hands it. **Zero disables that one warning** —
-/// each has its own off switch, since "tell me about heavy sources but not
-/// about the error rate" is an ordinary thing to want, and a threshold nobody
-/// can turn off gets silenced by turning the whole check off instead.
-///
-/// The defaults: 50 q/s, a tenth of queries failing, a hundred queries from one
-/// source, five refusals of one source.
+/// Per interval, as [`QueryLogger::take_stats`] counts. Zero disables that
+/// warning alone. Defaults: 50 q/s, a tenth failing, a hundred queries or five
+/// refusals from one source.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnomalyThresholds {
     /// Queries per second, averaged over the interval.
@@ -179,16 +174,11 @@ pub fn anomalies(stats: &QueryStats, limits: &AnomalyThresholds) -> Vec<Anomaly>
     found
 }
 
-/// Warn every `interval` until told to stop.
+/// Warn every `interval` until told to stop: without it the counters are
+/// write-only.
 ///
-/// The caller that owns the counters never reads them, so without this they are
-/// write-only. No [`crate::shutdown::Busy`] claim: the task sleeps almost all
-/// of the time, and holding the drain open across a sleep waits out the
-/// shutdown budget every time (`CLAUDE.md` §9). The work between sleeps is a
-/// lock and a walk of two bounded maps.
-///
-/// `interval` of zero is the caller's off switch and this returns at once, so
-/// the flag that disables the check does not also have to skip the spawn.
+/// No [`crate::shutdown::Busy`]: it sleeps, and a claim across a sleep waits
+/// out the shutdown (`CLAUDE.md` §9). A zero `interval` returns at once.
 pub async fn watch_anomalies(
     logger: Arc<QueryLogger>,
     limits: AnomalyThresholds,
@@ -360,18 +350,9 @@ impl QueryLogger {
 
     /// The counts since the last take, and the interval they cover.
     ///
-    /// Reading *and* resetting, under one lock: the per-source counts are
-    /// cumulative, so a threshold on them read without a reset fires once and
-    /// then every interval afterwards, for a client that has done nothing
-    /// since. A count per interval is also the number an operator can put a
-    /// threshold on — "a hundred queries a minute from one address" — where "a
-    /// hundred since the process started" is not.
-    ///
-    /// `qps` is recomputed here for the same reason: [`Self::log_query`]'s
-    /// tumbling window only advances when a query arrives, so a server that
-    /// went quiet keeps publishing the rate it had when it stopped. The elapsed
-    /// time is floored at one second, so a take within the same second reports
-    /// the count rather than a multiple of it.
+    /// Read and reset under one lock, so a threshold is per interval and does
+    /// not fire forever after. `qps` is recomputed, as the window advances only
+    /// on a query; elapsed time is floored at a second.
     pub fn take_stats(&self, now: u64) -> QueryStats {
         let Some(mut inner) = self.locked() else {
             return QueryStats::empty();

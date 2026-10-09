@@ -99,22 +99,10 @@ struct TokenBucket {
 
 /// Rate limiter using token bucket algorithm, one bucket per [`Source`].
 ///
-/// The table is attacker-keyed: a bucket is created before anything validates the
-/// packet. Above `max_tracked` no new bucket is created and the packet is
-/// *allowed*, because failing closed lets one flood deny service to everybody —
-/// and [`Judged`]'s `untracked` says so, since an admission with no bucket is one
-/// nothing limits. Keyed on the source rather than the peer, so filling the
-/// table costs a /56 per entry and not an address of a /64 (`TODO.md` #157).
-///
-/// `current_unix_timestamp` is wall-clock, so all time arithmetic here saturates:
-/// a backwards NTP step would otherwise underflow and refill every bucket.
-///
-/// **One mutex, and it is the ceiling.** Every UDP worker takes `buckets` for
-/// every datagram, so the limiter serializes what the pool parallelizes. At
-/// ~4 µs of syscall per query it is nowhere near the bottleneck and sharding it
-/// would be premature — but it is the first thing to shard if a query ever gets
-/// cheap enough to notice, and that is worth saying here rather than leaving to
-/// be rediscovered under load (`TODO.md` #25f).
+/// Attacker-keyed: past `max_tracked` a packet is allowed, not refused, and
+/// [`Judged`]'s `untracked` says so; failing closed lets one flood deny
+/// everyone. Per /56, not per address. Times saturate across clock steps. One
+/// mutex, the first thing to shard if queries get cheap (`TODO.md` #25f).
 pub struct RateLimiter {
     config: RateLimitConfig,
     buckets: Arc<Mutex<HashMap<Source, TokenBucket>>>,
@@ -218,9 +206,8 @@ impl RateLimiter {
         if now.saturating_sub(last) < self.config.cleanup_interval_secs {
             return;
         }
-        // Exactly one caller sweeps: whoever wins the swap. The losers return
-        // without touching the bucket lock, where a `Mutex` here made every
-        // worker that arrived in the same second queue behind the sweep.
+        // One caller sweeps, whoever wins the swap; the rest skip the bucket
+        // lock rather than queue.
         if self
             .last_cleanup
             .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
@@ -301,19 +288,12 @@ pub enum ResponseVerdict {
     Drop,
 }
 
-/// A per-client budget on response *bytes*, not queries — the reflected traffic
-/// is what amplification is measured in (RFC 5358; Response Rate Limiting).
+/// A per-client budget on response *bytes*, not queries, as amplification is
+/// measured in bytes (RFC 5358).
 ///
-/// A client is a [`ResponseTarget`], an IPv4 /24 or IPv6 /56, because the
-/// address a reply goes to is the victim's for a spoofed query, and a spoofer
-/// spreading over a victim's network would otherwise get one budget per
-/// address (`TODO.md` #157).
-///
-/// Above `max_tracked` the table stops growing and every response is truncated:
-/// a spoofed flood arrives from every address there is, so the table would
-/// otherwise be the next amplification vector.
-///
-/// UDP only. A TCP query completed a handshake, so there is nobody to reflect at.
+/// Per [`ResponseTarget`], a /24 or /56, as the victim owns the reply address.
+/// Past `max_tracked` every response truncates, or the table would amplify. UDP
+/// only.
 pub struct ResponseLimiter {
     /// Sustained bytes per second per client. Zero disables the limiter.
     bytes_per_sec: u32,
@@ -346,15 +326,9 @@ impl ResponseLimiter {
         }
     }
 
-    /// A budget from the one number an operator sets: `bytes_per_sec`
-    /// sustained, four seconds' worth of it as burst — so a page load's dozen
-    /// names is never touched — and BIND's own slip default of 2, truncating
-    /// every second response over budget.
-    ///
-    /// Zero disables, because `new(0, ..)` *is* [`disabled`](Self::disabled):
-    /// `is_enabled` is `bytes_per_sec > 0` and `admit` sends when it is false.
-    /// One constructor, so neither binary writes the branch and the arithmetic
-    /// out by hand (`CLAUDE.md` §7).
+    /// A budget from the one number an operator sets: `bytes_per_sec`, four
+    /// seconds of burst, and BIND's slip of 2. Zero disables, as `new(0, ..)`
+    /// is [`disabled`](Self::disabled); one constructor (`CLAUDE.md` §7).
     pub fn per_second(bytes_per_sec: u32) -> Self {
         Self::new(bytes_per_sec, bytes_per_sec.saturating_mul(4), 2)
     }
@@ -456,28 +430,12 @@ impl ResponseLimiter {
     }
 }
 
-/// Which client certificates may transfer which zones — RFC 9103 §7.5's mTLS,
-/// as this server answers it (`TODO.md` #59).
+/// Which client certificates may transfer which zones: RFC 9103 §7.5's mTLS,
+/// which it prefers to an IP ACL plus TSIG ([`TransferAcl`]).
 ///
-/// §7.5 gives a primary two ways to decide a transfer client is allowed:
-/// "mutual TLS (mTLS)" or "an IP-based ACL ... combined with a valid TSIG/SIG(0)
-/// signature on the XFR request", and adds "If only one method is selected, then
-/// mTLS is preferred". [`TransferAcl`] plus `TsigKey` is the second; this is the
-/// first, and the two are additive — an operator who wants only mTLS lists no
-/// addresses and defines no keys.
-///
-/// **A verified certificate answers "who", and this list answers "what"**
-/// (`CLAUDE.md` §16). rustls has already decided the chain is trustworthy by
-/// the time anything here is asked; what is left is which of the names the
-/// operator wrote down this certificate is, and that is a question about the
-/// certificate's subject alternative names rather than about its issuer. A
-/// second certificate from the same CA therefore transfers nothing until it is
-/// listed, which is the property #16 was filed for.
-///
-/// The name check is `webpki`'s, the same code that verified the chain: it
-/// costs no package — rustls links it already — and a hand-rolled SAN reader
-/// would be a second X.509 parser in a tree that deliberately has none
-/// (`TODO.md` #42a).
+/// The verified certificate says who and this list what (`CLAUDE.md` §16), so
+/// another certificate from the same CA transfers nothing until listed. Names
+/// are matched by `webpki`, which verified the chain: no second X.509 parser.
 #[derive(Debug, Default)]
 pub struct TransferCertificates {
     clients: Vec<TransferCertificate>,
@@ -510,14 +468,9 @@ impl TransferCertificate {
 }
 
 impl TransferCertificates {
-    /// Parse `name[:zone[,zone]]` rules — `partner.example.` for a client that
-    /// may transfer anything, `partner.example.:example.com.` for one that may
-    /// not.
-    ///
-    /// The separator is the one `TsigKey::parse` uses for the same field, so an
-    /// operator writing both lists writes them the same way. A rule that does
-    /// not parse is an error rather than a skip: a typo must stop the server,
-    /// not leave a client authorized for more than the operator believes.
+    /// Parse `name[:zone[,zone]]` rules, with `TsigKey::parse`'s separator. A
+    /// rule that does not parse stops the server rather than authorize more
+    /// than meant.
     pub fn parse(specs: &[String]) -> ConfigResult<TransferCertificates> {
         let mut clients = Vec::new();
         for spec in specs {
@@ -538,10 +491,8 @@ impl TransferCertificates {
                 )));
             }
             let zones: Vec<&str> = zones.split(',').filter(|z| !z.trim().is_empty()).collect();
-            // Every field refused rather than trimmed to a name: a rule written
-            // with a scheme, a user or a path is one the operator believes
-            // matches something, and a zone that cannot be an apex would
-            // silently authorize nothing (`CLAUDE.md` §15).
+            // Every field refused, not trimmed: a scheme, user or path matches
+            // nothing the operator meant (`CLAUDE.md` §15).
             for field in std::iter::once(&name).chain(zones.iter()) {
                 if field.contains('/') || field.contains('@') || field.trim().is_empty() {
                     return Err(ConfigError::new(format!(
@@ -570,23 +521,16 @@ impl TransferCertificates {
 
     /// Which listed identity this certificate is, if it is one of them.
     ///
-    /// `None` when nothing was presented, when no rule names a name the
-    /// certificate carries, or when the DER will not parse — the last because
-    /// rustls verified the chain and this is a second look at the same bytes,
-    /// so a failure here is a mismatch rather than a reason to answer
-    /// differently.
-    ///
-    /// The certificate's *own* validity is not re-checked: the handshake did
-    /// that against the configured anchors, and re-deciding it here would be
-    /// two policies to keep in step (`CLAUDE.md` §7).
+    /// `None` with no certificate, no listed name, or unparseable DER, which
+    /// here is a mismatch. Validity is not re-checked: the handshake did that
+    /// (§7).
     pub fn identify(&self, presented: &PeerCertificate) -> Option<&TransferCertificate> {
         let der = presented.der()?;
         let der = CertificateDer::from(der);
         let cert = webpki::EndEntityCert::try_from(&der).ok()?;
         self.clients.iter().find(|client| {
-            // `ServerName` is the type webpki matches SANs against, whatever
-            // end of the connection presented them; a trailing dot is not part
-            // of a DNS-ID (RFC 6125 §6.4.1), so it comes off here.
+            // webpki matches SANs against `ServerName`; a DNS-ID has no
+            // trailing dot (RFC 6125 §6.4.1).
             let name = client.name.trim_end_matches('.');
             match ServerName::try_from(name) {
                 Ok(name) => cert.verify_is_valid_for_subject_name(&name).is_ok(),
@@ -597,16 +541,10 @@ impl TransferCertificates {
 }
 
 /// Who may ask for a zone transfer. Empty means nobody, and empty is the
-/// default — an AXFR is the whole database, so it is allowed by list only.
+/// default: an AXFR is the whole database.
 ///
-/// A rule is a bare address or a CIDR prefix. Address families do not mix, and
-/// a peer is matched as a [`Peer`], so an IPv4-mapped IPv6 address is the IPv4
-/// address it maps before any rule sees it.
-///
-/// Not refused outright as "a way around the list". That reason holds for half
-/// the traffic and refuses every IPv4 client of a dual-stack socket (`TODO.md`
-/// #158): a stream peer completed a handshake and is the IPv4 host it names,
-/// and what a spoofed UDP datagram gains is in [`Peer`]'s doc comment.
+/// Addresses or CIDR prefixes, families unmixed, matched as a [`Peer`], so a
+/// mapped address is its IPv4 one; [`Peer`] says why that is safe.
 #[derive(Debug, Clone, Default)]
 pub struct TransferAcl {
     rules: Vec<AclRule>,
@@ -686,13 +624,9 @@ impl TransferAcl {
         self.rules.len()
     }
 
-    /// The first rule of `self` that no rule of `outer` wholly contains, as
-    /// written in prefix form, or `None` when every address `self` allows
-    /// `outer` allows too.
-    ///
-    /// Rule by rule, so two outer rules that only together cover an inner one
-    /// do not count: `rdnsr` uses this to refuse a startup it would otherwise
-    /// complete, and naming one rule to widen is the useful answer there.
+    /// The first rule of `self` that no single rule of `outer` contains, in
+    /// prefix form, or `None`: one rule to widen is what `rdnsr`'s refusal
+    /// names.
     pub fn first_not_within(&self, outer: &TransferAcl) -> Option<String> {
         self.rules
             .iter()

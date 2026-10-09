@@ -242,13 +242,9 @@ struct Span {
 
 /// The address triggers of one kind, indexed for longest-prefix match.
 ///
-/// Overlapping rules are flattened once, at index time, into disjoint spans in
-/// address order with the winning rule already chosen, so a query is one
-/// binary search. It was a scan of every rule, under a comment calling these
-/// lists "tens of entries": nothing enforced that, and an IP blocklist
-/// delivered as RPZ is all `rpz-ip`. On the miss path every ordinary query
-/// pays, 50 000 rules cost the scan 144.6 µs and cost this 7 ns — against
-/// 522 ns for a whole answer (`TODO.md` #62a).
+/// Overlapping rules flattened at index time into disjoint spans with the
+/// winner chosen, so a query is one binary search, whatever the list's size
+/// (`TODO.md` #62a).
 #[derive(Debug, Default)]
 struct IpIndex {
     /// The families never mix, as in [`crate::security::TransferAcl`]: a v4
@@ -271,10 +267,8 @@ impl IpIndex {
                 IpAddr::V4(a) => (32u8, u128::from(u32::from(a)), &mut v4),
                 IpAddr::V6(a) => (128u8, u128::from(a), &mut v6),
             };
-            // The host bits the prefix leaves free. Saturating because a
-            // prefix longer than its family's address is not a rule —
-            // `parse_ip_trigger` refuses one — and if one arrived anyway it
-            // must cover a single address rather than all of them.
+            // The free host bits, saturating: an over-long prefix is refused by
+            // `parse_ip_trigger`, and covers one address at worst.
             let free = match bits.saturating_sub(rule.prefix) {
                 0 => 0,
                 // `1 << 128` is not representable, which is why the mask is
@@ -318,13 +312,10 @@ impl IpIndex {
 }
 
 /// Flatten overlapping rules into disjoint spans in address order, each
-/// carrying the rule that wins it: the longest prefix, and at equal prefixes
-/// the one that came first in the zone — which is what the scan this replaced
-/// gave, by sorting on the prefix with a stable sort and taking the first hit.
+/// carrying the winner: the longest prefix, then the first in the zone.
 ///
-/// A stack sweep, because prefixes nest: two of them are either disjoint or
-/// one contains the other, so the innermost rule still open is always the most
-/// specific one covering the cursor.
+/// A stack sweep: prefixes nest, so the innermost open rule is the most
+/// specific at the cursor.
 fn flatten(mut spans: Vec<Span>) -> Vec<Span> {
     // A containing span sorts before what it contains, and of two identical
     // ranges the *later* rule is pushed first so the earlier one ends on top.
@@ -488,10 +479,8 @@ impl PolicyZone {
         let mut response_ip = Vec::new();
         let mut ns_ip = Vec::new();
         let mut nsdname = 0;
-        // A set, not a `Vec` scanned per record: an IP blocklist delivered as
-        // RPZ is all `rpz-ip` rules and the scan was quadratic in them — 400 ms
-        // to index 16k, four times that per doubling (`TODO.md` #62b). `Name`'s
-        // `Hash` is the ASCII fold (RFC 4343), the comparison the scan made.
+        // A set, as a scan was quadratic in `rpz-ip` rules (`TODO.md` #62b);
+        // `Name`'s `Hash` is the ASCII fold (RFC 4343).
         let mut seen: HashSet<Name> = HashSet::new();
         for record in zone.records() {
             let owner = record.name;
@@ -502,9 +491,8 @@ impl PolicyZone {
             if !seen.insert(record.name.to_owned()) {
                 continue;
             }
-            // An NSDNAME trigger's labels are a name, not an address; the
-            // lookup that matches one is the zone's own, so nothing is indexed
-            // here beyond knowing whether to try it at all.
+            // An NSDNAME trigger is a name, matched by the zone's own lookup;
+            // only whether to try one is recorded.
             if kind == b"rpz-nsdname" {
                 nsdname += 1;
                 continue;
@@ -607,9 +595,8 @@ impl PolicyZone {
 
     /// The action for a query name, or `None` if this zone says nothing.
     fn qname_action(&self, qname: NameRef<'_>, qtype: Qtype) -> Option<Action> {
-        // `something.rpz-ip.` as a query name would otherwise land on an
-        // address rule. `None` at the root, whose trigger name is the apex —
-        // where the SOA is, not a rule.
+        // `x.rpz-ip.` as a query name must not hit an address rule; the root's
+        // trigger is the apex, a SOA.
         if special_label(qname.labels().last()?).is_some() {
             return None;
         }
@@ -832,13 +819,9 @@ fn text(label: &[u8]) -> Result<&str, String> {
 
 /// The policy zones in force, in the order they are consulted.
 ///
-/// Empty is the ordinary case and costs one `is_empty` per query:
-/// [`PolicyZones::before_query`] returns before touching the name.
-///
-/// `Arc` per zone so that a reload can hand a feed nobody touched straight back
-/// (`TODO.md` #71b). The zones are immutable once indexed — [`PolicyZone::zone`]
-/// says why — so sharing one between the old set and the new one is sharing a
-/// value neither can change.
+/// Empty costs one `is_empty` per query ([`PolicyZones::before_query`]). An
+/// `Arc` per zone, so a reload hands an unchanged feed back; zones are
+/// immutable once indexed ([`PolicyZone::zone`]).
 #[derive(Debug, Default)]
 pub struct PolicyZones {
     zones: Vec<Arc<PolicyZone>>,
@@ -854,26 +837,12 @@ impl PolicyZones {
     }
 
     /// The same, keeping every feed whose file has not moved since `held` read
-    /// it — `TODO.md` #71b. Three million-rule feeds with one publisher cost
-    /// **781 ms** where the whole set cost **2 200**, and a SIGHUP over a quiet
-    /// set **62 ms** (`rdns/tests/rpz_install.rs`, release, the development
-    /// machine).
+    /// it (`TODO.md` #71b).
     ///
-    /// All-or-nothing: every feed is read and parsed before any of the set is
-    /// built, so a half-written file leaves the previous set whole. The test is
-    /// per feed rather than per set — one feed publishing does not re-parse the
-    /// others.
-    ///
-    /// The bytes are read either way and the digest is taken over them rather
-    /// than a `stat` — [`FileDigest`] says why, for all three callers of it
-    /// (#104). Measured at a million rules: read and digest 21 ms per feed
-    /// against ~720 for the parse and index it saves, where `rdnsd`'s reload
-    /// path measured 1.8% (#64f).
-    ///
-    /// `offered` is what this process wrote and did not throw away
-    /// (`TODO.md` #71f): a zone from there is taken only when its digest is the
-    /// digest of the bytes just read, so a file somebody else rewrote in the
-    /// meantime is parsed as it would have been.
+    /// All or nothing: every feed is parsed before the set is built. Decided
+    /// per feed, by [`FileDigest`] over the bytes. `offered` is what this
+    /// process wrote (`TODO.md` #71f), taken only if the digest matches the
+    /// file now.
     pub fn reload(
         feeds: &[Feed],
         held: &PolicyZones,
@@ -1010,12 +979,8 @@ impl PolicyZones {
     }
 
     /// The rewrite that applies to a delegation the resolver is about to
-    /// follow: the names it was referred to, then the addresses those names
-    /// stand for.
-    ///
-    /// NSDNAME before NSIP, which is the order `draft-vixie-dns-rpz-04` §2.2
-    /// gives the two, and both after everything in [`PolicyZones::before_query`]
-    /// because that pass runs before any resolution starts.
+    /// follow: the names it was referred to, then their addresses. NSDNAME
+    /// before NSIP, as `draft-vixie-dns-rpz-04` §2.2 orders them.
     pub fn on_delegation(
         &self,
         ns_names: &[Name],
@@ -1062,17 +1027,9 @@ impl PolicyZones {
 
 /// The policy zones in force, and the files they came from.
 ///
-/// A feed is rewritten under a running resolver — by a cron job, or by an
-/// `rdnsd` writing what it transferred — and until a reload re-reads it the
-/// answer is a restart (`TODO.md` #57). The shape is the certificate store's
-/// (`rdns_transport::tls::CertificateStore`): the paths, a current value behind
-/// a lock, and a `reload` that leaves the old one in force if the new one does
-/// not parse.
-///
-/// One query reads [`PolicyStore::in_force`] once and decides by that snapshot,
-/// which is why an `Arc` is handed out rather than a guard: the nameserver
-/// triggers are consulted across a resolution a dozen round trips long, and no
-/// lock may be held over it (`CLAUDE.md` §9).
+/// Reloadable like `rdns_transport::tls::CertificateStore`: paths, a value
+/// behind a lock, and a `reload` that keeps the old one on failure. Handed out
+/// as an `Arc` snapshot, held across a resolution (`CLAUDE.md` §9).
 #[derive(Debug)]
 pub struct PolicyStore {
     feeds: Vec<Feed>,
@@ -1103,34 +1060,17 @@ impl PolicyStore {
         })
     }
 
-    /// Index a zone this process just wrote, and keep it for the next reload
-    /// to install without parsing the file back — `TODO.md` #71f.
+    /// Index a zone this process just wrote, and keep it for the next reload to
+    /// install without parsing the file back (`TODO.md` #71f).
     ///
-    /// The [`Written`] is the write: only
-    /// [`crate::zone_writer::write_zone_text`] makes one, so a caller cannot
-    /// offer bytes it did not put on disk or offer them before it did — a type,
-    /// where a doc comment could only ask (`TODO.md` #104, `CLAUDE.md` §17).
-    ///
-    /// A reload still reads every file, and takes this zone only if the file's
-    /// bytes are still the bytes written here, so a feed somebody else rewrote
-    /// in between is parsed as it would have been: the digest is the whole
-    /// test and it is the same one `rdnsd`'s UPDATE path applies to a zone it
-    /// wrote (`TODO.md` #64b, `CLAUDE.md` §7).
-    ///
-    /// **Blocking**: indexing a million-rule feed is ~40 ms, so this belongs
-    /// where the write does, off the workers (`CLAUDE.md` §9).
-    ///
-    /// The feed's policy comes from the configured list rather than from the
-    /// caller — a zone offered under the wrong override would answer a query
-    /// differently than the same file read back (§15's rule about two sources
-    /// for one setting).
+    /// [`Written`] proves the write (`CLAUDE.md` §17), and the reload takes
+    /// this zone only if the file's digest still matches. Blocking: index off
+    /// the workers (§9). The policy is the configured one (§15).
     pub fn offer(&self, written: &Written, zone: Zone) -> ConfigResult<()> {
         let path = written.path();
         let Some(feed) = self.feeds.iter().find(|feed| feed.path == path) else {
-            // Refused rather than dropped: writing a policy zone to a path no
-            // feed reads is a configuration nobody gets an answer from, and a
-            // silent `Ok` here is the reload quietly costing what this exists
-            // to save (`CLAUDE.md` §4).
+            // Refused, not dropped: a zone written where no feed reads is never
+            // in force, and a silent `Ok` hides that (`CLAUDE.md` §4).
             return Err(ConfigError::new(format!(
                 "no policy feed reads {}, so a zone written there is never in force",
                 path.display()
@@ -1160,11 +1100,8 @@ impl PolicyStore {
 
     /// The set to decide one query by.
     pub fn in_force(&self) -> Arc<PolicyZones> {
-        // A poisoned lock still holds a whole, valid set: the only thing done
-        // under this lock is one `Arc` assignment, which cannot leave a torn
-        // value behind. Recovering keeps the policy in force, where `unwrap`
-        // would take the resolver off the air and a default would silently lift
-        // every block (`CLAUDE.md` §4, §6).
+        // A poisoned lock still holds a whole set, as only an `Arc` is assigned
+        // under it; recovering keeps every block in force (`CLAUDE.md` §4, §6).
         self.current
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1177,16 +1114,11 @@ impl PolicyStore {
     /// the resolver enforcing a policy shorter than the one configured, so the
     /// previous set stays in force and the caller is told which file was wrong.
     pub fn reload(&self) -> ConfigResult<Reloaded> {
-        // The set in force, read out before the work and not under a guard: a
-        // feed is seconds to parse and no lock may be held over that
-        // (`CLAUDE.md` §9). Two reloads at once would both read it and the
-        // second to finish would win, which is what happens today as well; the
-        // resolver's reload task runs one at a time.
+        // Read out, not held: parsing takes seconds (`CLAUDE.md` §9). The
+        // resolver's reload task runs reloads one at a time.
         let held = self.in_force();
-        // Taken, not borrowed: a zone offered for a file that has since changed
-        // is a zone nothing can use, and holding a million-rule feed against
-        // the chance of a later match is the memory this saves. A reload that
-        // fails costs the next one a parse.
+        // Taken: an offer for a since-changed file is useless, and holding a
+        // feed for a later match is the memory saved.
         let offered = self.take_offered();
         let zones = Arc::new(PolicyZones::reload(&self.feeds, &held, &offered)?);
         let new: Vec<&Arc<PolicyZone>> = zones
@@ -1275,17 +1207,14 @@ impl NameserverPolicy for DelegationPolicy<'_> {
         else {
             return true;
         };
-        // A passthru is a match that changes nothing, so the resolution is
-        // exactly what it would have been — including its cache entry. Stopping
-        // for one would turn the exception into the block it exists to carve
-        // out of.
+        // A passthru changes nothing, cache entry included; stopping would make
+        // the exception a block.
         if rewrite.action == Action::Passthru {
             return true;
         }
         let Ok(mut hit) = self.hit.lock() else {
-            // A poisoned lock means a panic already happened here. Refuse: the
-            // policy said no and the caller will find nothing recorded, which
-            // is a SERVFAIL rather than an answer the operator meant to block.
+            // Poisoned: refuse, which with nothing recorded is a SERVFAIL, not
+            // an answer the operator meant to block.
             return false;
         };
         *hit = Some(rewrite);

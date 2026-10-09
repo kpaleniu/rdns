@@ -56,11 +56,8 @@ impl TlsIdentity {
             )));
         }
 
-        // The same check the DNSSEC key loader and a TSIG `secret-file` get
-        // (`CLAUDE.md` §15): a key restored from backup as 0644, or `chmod -R`'d
-        // by a deploy script, is the ordinary way a private key stops being
-        // private. Unix only, and `ensure_private` says so rather than letting
-        // "the permissions were checked" be a claim true on one platform.
+        // As for DNSSEC keys and TSIG secrets (`CLAUDE.md` §15): a restore or
+        // `chmod -R` exposes keys. `ensure_private` says where it cannot check.
         crate::persist::ensure_private(key_path, "a TLS private key")
             .map_err(|e| ConfigError::new(format!("{}: {e}", key_path.display())))?;
         let key = PrivateKeyDer::from_pem_file(key_path).map_err(|e| {

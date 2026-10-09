@@ -179,9 +179,8 @@ impl DnssecValidator {
 
         match proof {
             RrsetProof::Verified { .. } => Verdict::Valid,
-            // An unsigned RRset in a signed zone is a broken zone; AD would be
-            // a lie either way. The three say different things to an operator,
-            // which is the whole reason the verdict carries one.
+            // Unsigned in a signed zone is broken; AD would lie either way. The
+            // three verdicts tell an operator different things.
             RrsetProof::Unsigned => {
                 Verdict::Invalid("no signature covers it, in a signed zone".to_string())
             }

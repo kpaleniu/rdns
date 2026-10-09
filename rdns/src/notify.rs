@@ -22,13 +22,9 @@ use crate::{
 
 /// A secondary to tell, and the key to tell it with: `addr[:port][#keyname]`.
 ///
-/// The key half exists because a secondary's notify ACL can demand one, and two
-/// of the three this tree is tested against do when asked: NSD's
-/// `allow-notify: <addr> <key>` answers REFUSED to an unsigned NOTIFY and
-/// Knot's `acl: { key: ..., action: notify }` answers NOTAUTH. BIND does not,
-/// because it accepts a NOTIFY from anything in the zone's `primaries` list
-/// whatever `allow-notify` says — which is worth knowing before concluding from
-/// a BIND secondary that unsigned is good enough (`TODO.md` #46).
+/// A notify ACL can demand a key: NSD answers an unsigned NOTIFY REFUSED and
+/// Knot NOTAUTH. BIND accepts one from its primaries regardless, so a BIND test
+/// proves nothing (`TODO.md` #46).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotifyTarget {
     pub addr: SocketAddr,
@@ -41,11 +37,8 @@ impl NotifyTarget {
     pub fn parse(spec: &str) -> ConfigResult<Self> {
         let spec = spec.trim();
         let parsed = crate::endpoint::parse_endpoint(spec, spec)?;
-        // The endpoint syntax carries `+tls=` for `--secondary`. RFC 9103 is
-        // about the transfer and says nothing about NOTIFY, and this server has
-        // no TLS client for one, so accepting the suffix here would be a flag
-        // that changes nothing — which is the shape `CLAUDE.md` §15 refuses in
-        // a config key.
+        // RFC 9103 is about transfers, and there is no NOTIFY-over-TLS client,
+        // so `+tls=` would change nothing (`CLAUDE.md` §15).
         if parsed.tls.is_some() {
             return Err(ConfigError::new(format!(
                 "--also-notify {spec:?}: '+tls=' is for --secondary, where it is \
@@ -113,16 +106,9 @@ impl std::fmt::Display for NotifyPeer {
 
 /// Who is told about which zone.
 ///
-/// Two settings feed this: `--also-notify` / `[server].also-notify`, which
-/// applies to every zone, and `[zones."x"].also-notify`, which *adds* to it for
-/// one zone — "in addition to", which is what `ZoneConfig::also_notify`'s doc
-/// comment says it means. Both are read here, so neither is a setting a
-/// `deny_unknown_fields` config accepts and silently drops (`CLAUDE.md` §4: the
-/// operator believes it is in force and it is not).
-///
-/// The union is built once, at startup, so a zone's list is a slice rather than
-/// something allocated per announcement — and deduplicated, because naming the
-/// same secondary globally and again per zone should not send it two NOTIFYs.
+/// `--also-notify` applies to all zones, `[zones."x"].also-notify` adds to it,
+/// both read here (`CLAUDE.md` §4). Built once at startup and deduplicated, so
+/// a secondary named twice hears once.
 #[derive(Debug, Clone, Default)]
 pub struct NotifyPolicy {
     global: Vec<NotifyPeer>,
@@ -224,23 +210,12 @@ pub fn notify_request(zone: NameRef<'_>, soa: Option<ResourceRecord>, id: u16) -
     }
 }
 
-/// The reply to a NOTIFY: same opcode, question echoed, no data (RFC 1996 §4.7),
-/// and the sender's OPT mirrored.
+/// The reply to a NOTIFY: same opcode, question echoed, no data (RFC 1996
+/// §4.7), and the sender's OPT mirrored.
 ///
-/// The mirror is not optional and not about queries: RFC 6891 §6.1.1 is "if an
-/// OPT record is present in a received request, compliant responders MUST
-/// include an OPT record in their respective responses", and §6.2.2 is the
-/// converse MUST NOT — both about a *request*, which a NOTIFY is. This function
-/// attached nothing for a year because it predates the consolidation that made
-/// every other reply here go through [`ClientEdns`] (`TODO.md` #38, #47), and a
-/// sender that remembers a missing OPT as a downgrade stops offering EDNS.
-///
-/// `why` is RFC 8914's reason for the RCODE. §2 describes the option in "any
-/// response ... to a query that includes an OPT pseudo-RR" and a NOTIFY is not a
-/// query, so this is a reading rather than a quotation: an EDNS option a peer
-/// does not recognize is ignored, and the alternative is two refusals an
-/// operator cannot tell apart on the wire — "you are not one of my masters" and
-/// "I am that zone's primary" are different problems with the same RCODE.
+/// RFC 6891 §6.1.1 requires the OPT in a response to any request. `why` rides
+/// in it too, a reading of RFC 8914 §2, which says "query": it tells apart two
+/// refusals with one RCODE.
 pub fn notify_response(
     request: &DnsMessage,
     rcode: ResponseCode,
@@ -282,16 +257,11 @@ pub enum NotifyOutcome {
     Rejected(ResponseCode),
 }
 
-/// What a reply to the NOTIFY sent with `id` says, or `None` if it is not one.
+/// What a reply to the NOTIFY sent with `id` says, or `None` if it is not one,
+/// so an off-path reply cannot silence it.
 ///
-/// `None` for anything that is not this message's answer, so an off-path reply
-/// cannot silence a notification by arriving first.
-///
-/// Not a bare `bool` for "any rcode counts, because the secondary received it
-/// either way". That is true and not the whole answer: a secondary whose notify
-/// ACL names a key refuses every unsigned NOTIFY, which a bool reports as
-/// `acknowledged (Refused)` at INFO — a permanently broken notification path
-/// with nothing in a failed state (`CLAUDE.md` §4).
+/// Not a `bool`: a keyed ACL refuses every unsigned NOTIFY, which "any rcode
+/// counts" would log as acknowledged (`CLAUDE.md` §4).
 pub fn outcome(reply: &DnsMessage, id: u16) -> Option<NotifyOutcome> {
     if !(reply.response && reply.id == id && reply.opcode == OpCode::Notify) {
         return None;

@@ -315,9 +315,8 @@ pub fn check_prerequisites(zone: &Zone, prerequisites: &[Prerequisite]) -> Resul
                     ));
                 }
             }
-            // §2.4.4 asks whether records exist *at* the name, so `holds_name`
-            // and not `name_exists`, which is also true for a wildcard match and
-            // for an empty non-terminal.
+            // §2.4.4: records at the name, so `holds_name`; `name_exists` is
+            // true for a wildcard or empty non-terminal.
             Prerequisite::NameInUse { name } => {
                 if !zone.holds_name(name.as_ref()) {
                     return Err(Rejected::new(
@@ -417,13 +416,9 @@ pub struct Applied {
     pub ignored: Vec<Ignored>,
 }
 
-/// Apply an UPDATE's changes to a zone (RFC 2136 §3.4.2), returning the result.
-///
-/// Prerequisites must pass first. Changes apply in order, each to the result of
-/// the last (§3.4.2.7); nothing here fails.
-///
-/// For the unsigned source zone — signatures over anything this touches are
-/// stale by definition.
+/// Apply an UPDATE's changes to a zone (RFC 2136 §3.4.2), returning the result:
+/// after the prerequisites, in order (§3.4.2.7), infallible. To the unsigned
+/// source zone, as touched signatures are stale.
 pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
     let mut work = Working::new(zone);
     let mut ignored = Vec::new();
@@ -437,17 +432,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 let name = record.name.clone();
                 let rtype = record.rdata.rtype();
 
-                // §3.4.2.7: a CNAME may not be added where other data lives, nor
-                // other data where a CNAME lives (RFC 1034 §3.6.2).
-                //
-                // Both halves cover DNAME without a case of their own, and
-                // RFC 6672 §5.2 asks for exactly that: "if a dynamic update
-                // message attempts to add a DNAME... but a CNAME is associated
-                // with that name, then the server MUST ignore the DNAME", and
-                // "if a CNAME is added... but a DNAME is associated with that
-                // name, then the CNAME MUST be ignored" — a DNAME is other
-                // data beside a CNAME, and a CNAME is what the second branch
-                // looks for.
+                // §3.4.2.7: no CNAME beside other data, none beside a CNAME
+                // (RFC 1034 §3.6.2), which covers RFC 6672 §5.2's DNAME rules.
                 if rtype == rt::CNAME {
                     if work.has_other_data_beside_a_cname(name.as_ref()) {
                         ignored.push(Ignored {
@@ -468,14 +454,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                     continue;
                 }
 
-                // §3.4.2.2: strictly newer, or ignored. §3.4.2.7's pseudocode
-                // says `zone.serial > rr.serial`, which accepts an equal serial
-                // and lets an UPDATE rewrite MNAME or the timers while leaving
-                // the version where it was; the prose is normative.
-                //
-                // `is_newer_than` is RFC 1982 §3.2, not `>`, and is false for
-                // two serials half the space apart, where §3.2 leaves the
-                // answer undefined — ignoring is the safe direction.
+                // §3.4.2.2: strictly newer or ignored, prose over pseudocode;
+                // `is_newer_than` (RFC 1982 §3.2) ignores the undefined.
                 if rtype == rt::SOA {
                     let current = work.soa_serial_at(name.as_ref());
                     let offered = serial_of(record.rdata.as_ref());
@@ -501,14 +481,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                     rdata: record.rdata.clone(),
                 };
 
-                // §3.4.2.7's inner loop: a CNAME, an SOA or a DNAME replaces
-                // whatever is there — all three are singletons — and anything
-                // else replaces only an exact RDATA match, which is how an
-                // UPDATE changes a TTL.
-                //
-                // §3.4.2.2's third rule, matching WKS on ADDRESS and PROTOCOL,
-                // is not implementable: WKS has no decoder, so its RDATA is
-                // opaque RFC 3597 bytes and two such records sit side by side.
+                // §3.4.2.7: CNAME, SOA and DNAME are singletons and replace;
+                // others replace exact RDATA. WKS has no decoder, so no rule.
                 match work.position_to_replace(name.as_ref(), rtype, record.rdata.as_ref()) {
                     Some(position) => {
                         if !same_record(work.records[position].as_ref(), &replacement) {
@@ -565,9 +539,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                 }
             }
 
-            // §3.4.2.4: the RR matching on NAME, TYPE, RDATA and RDLENGTH is
-            // deleted, except the apex SOA and the last apex NS. One
-            // [`RecordData`] comparison covers type, bytes and length at once.
+            // §3.4.2.4: delete on NAME, TYPE and RDATA, never the apex SOA or
+            // last apex NS; one [`RecordData`] comparison.
             Change::DeleteRecord { name, rtype, rdata } => {
                 let name = name.clone();
                 if work.is_apex(name.as_ref()) && *rtype == rt::SOA {
@@ -578,9 +551,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
                     });
                     continue;
                 }
-                // "the only NS remaining": whether this deletion would empty the
-                // apex NS RRset, not whether the RRset is a singleton now. A
-                // deletion matching nothing empties nothing.
+                // "The only NS remaining": would this deletion empty the apex
+                // NS RRset; one matching nothing empties nothing.
                 if work.is_apex(name.as_ref()) && *rtype == rt::NS {
                     let held = work.count(name.as_ref(), rt::NS);
                     let matching = work.count_matching(name.as_ref(), rdata.as_ref());
@@ -599,10 +571,8 @@ pub fn apply(zone: &Zone, changes: &[Change]) -> Applied {
         }
     }
 
-    // RFC 2136 §3.6: the serial has to move for the change to be visible, since
-    // a secondary decides whether to transfer by comparing it. Only when
-    // something changed — bumping for a retried no-op costs a re-signing run
-    // and an IXFR to every secondary.
+    // RFC 2136 §3.6: the serial moves for a secondary to see the change; not
+    // for a no-op, which would re-sign and send IXFRs.
     if changed > 0 && !serial_moved_by_update {
         work.bump_serial();
     }

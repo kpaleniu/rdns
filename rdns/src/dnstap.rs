@@ -168,9 +168,8 @@ impl Timestamp {
                 secs: d.as_secs(),
                 nanos: d.subsec_nanos(),
             },
-            // Before 1970. A zero timestamp is wrong and a panic on the answer
-            // path is worse; a reader shows it as the epoch, which is visibly
-            // not a real time.
+            // Before 1970: the epoch is visibly wrong, and a panic on the
+            // answer path is worse.
             Err(_) => Timestamp::default(),
         }
     }
@@ -217,13 +216,9 @@ fn put_bytes_field(out: &mut Vec<u8>, field: u32, value: &[u8]) {
 impl Entry<'_> {
     /// The `Dnstap` message, encoded.
     ///
-    /// Field numbers are `dnstap.proto`'s and the order is ascending, which
-    /// protobuf does not require and every generator does: a reader that
-    /// hand-parses rather than using the schema is likelier to work.
-    ///
-    /// An empty `identity` or `version` is *omitted* rather than encoded as a
-    /// zero-length string. The fields are `optional`, and a reader prints an
-    /// empty one as an empty identity rather than as none.
+    /// `dnstap.proto`'s field numbers in ascending order, which hand-written
+    /// readers prefer. An empty `identity` or `version` is omitted, not encoded
+    /// empty, so a reader shows none.
     pub fn encode(&self) -> Vec<u8> {
         let message = self.encode_message();
         let mut out = Vec::with_capacity(message.len() + 32);
@@ -265,10 +260,8 @@ impl Entry<'_> {
         if let Some(responder) = self.responder {
             put_varint_field(&mut out, 7, u64::from(responder.port()));
         }
-        // 8/9 is always the *query*'s time, even on a response entry, so a
-        // reader can subtract 8 from 12 and get the latency. An entry carrying
-        // both messages is one frame instead of two, which is why this server
-        // emits one per exchange.
+        // 8/9 is the query's time even on a response entry, so 12 minus 8 is
+        // the latency; one frame carries the whole exchange.
         put_varint_field(&mut out, 8, self.query_time.secs);
         put_fixed32_field(&mut out, 9, self.query_time.nanos);
         if let Some(query) = self.query {
@@ -379,13 +372,9 @@ pub enum ControlFrame {
 /// Read one control frame from the front of `bytes`, returning it and how many
 /// octets it used.
 ///
-/// `None` means "not yet": a short read, not a malformed stream. The caller is
-/// reading from a socket and has to be able to ask again.
-///
-/// `Err` is a stream that cannot be resynchronized — a data frame where a
-/// control frame belongs, or a length past the maximum — because the escape is
-/// the only framing there is and a writer that guessed past a bad length would
-/// be reading payload as lengths.
+/// `None` is a short read, to ask again. `Err` is a stream that cannot be
+/// resynchronized, a data frame or an oversized length, as the escape is the
+/// only framing.
 pub fn read_control_frame(bytes: &[u8]) -> Result<Option<(ControlFrame, usize)>, &'static str> {
     if bytes.len() < 8 {
         return Ok(None);

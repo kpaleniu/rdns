@@ -49,12 +49,8 @@ pub enum ValidationState {
 }
 
 /// What validation concluded, without the reason: what a cache keeps beside an
-/// answer and what a counter counts.
-///
-/// Not a `secure: bool`, which keeps the AD bit and loses the rest: a cache hit
-/// could not say whether it was provably unsigned or never in scope.
-///
-/// The discriminants index [`Outcome::ALL`], which the metrics rely on.
+/// answer and what a counter counts. Not a `secure: bool`, which loses unsigned
+/// versus out of scope. Discriminants index [`Outcome::ALL`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Secure = 0,
@@ -466,9 +462,8 @@ impl<'a> ChainValidator<'a> {
             // Signed with something we cannot read: no opinion, so the chain
             // ends here rather than condemning the zone.
             RrsetProof::Unsupported(_) => Err(ValidationState::Insecure),
-            // The proof's own code, not a fresh one: what went wrong was found
-            // by the check that looked, and an expired DNSKEY signature is
-            // EDE 7 wherever it is met.
+            // The proof's own code: an expired DNSKEY signature is EDE 7
+            // wherever it is met.
             RrsetProof::Bogus(bogus) => Err(ValidationState::Bogus(Bogus::new(
                 bogus.code,
                 format!(
@@ -508,9 +503,8 @@ impl<'a> ChainValidator<'a> {
                 Err(ValidationState::Insecure) => {
                     DelegationVerdict::Insecure(format!("{} could not be judged", evidence.zone))
                 }
-                // `verify_denial_records` reports a `ValidationState`, whose
-                // Bogus arm already carries the code the check that failed
-                // chose; anything else here is not a code we can name.
+                // A Bogus already carries the failing check's code; anything
+                // else has no code to name.
                 Err(other) => DelegationVerdict::Bogus(match other {
                     ValidationState::Bogus(bogus) => bogus,
                     other => Bogus::new(InfoCode::DNSSEC_BOGUS, other.reason()),
@@ -795,13 +789,10 @@ pub(crate) enum ChainNeed {
 }
 
 /// RFC 4033 §2's authentication chain from an anchor, or from a trusted start
-/// below it, down to one target zone (RFC 4035 §5), with no I/O in it: it says
-/// what it needs, the resolver fetches it, and it ends in a
-/// [`ValidationState`].
+/// below it, down to one target zone (RFC 4035 §5), with no I/O.
 ///
-/// The start, the resume from a trusted start, the step cap and the delegation
-/// verdicts are here, so a synchronous test reaches them; the resolver keeps
-/// the fetch, the key cache and the referral evidence it gathered.
+/// It says what it needs and the resolver fetches, so a synchronous test
+/// reaches the start, resume, step cap and delegation verdicts.
 pub(crate) struct ChainWalk<'a> {
     validator: ChainValidator<'a>,
     target: Name,
@@ -1031,17 +1022,9 @@ pub(crate) enum ChainShape {
 
 /// Whether an answer section really is the CNAME chain the query asked for.
 ///
-/// Verifying each RRset is not verifying the chain: two authentically signed
-/// RRsets can still answer a different question, and a consumer taking "the A
-/// record in the answer" gets an address for a name nobody asked about.
-///
-/// So the shape is checked independently of the signatures: walk from the queried
-/// name following each CNAME, and require every record to be either a link in
-/// that walk or an RRset of the queried type at the name it ends on.
-///
-/// Not the resolver's hop-by-hop `chain` filter, which decides what to *accept*
-/// while fetching. This decides whether what arrived is coherent, wherever it
-/// came from.
+/// Signed RRsets can still answer another question, so the shape is checked
+/// apart from signatures: every record a link from the queried name, or the
+/// queried type at the chain's end. Not the resolver's acceptance filter.
 pub(crate) fn cname_chain_shape(
     qname: NameRef<'_>,
     qtype: Qtype,
@@ -1049,11 +1032,8 @@ pub(crate) fn cname_chain_shape(
 ) -> ChainShape {
     let queried = qname.to_owned();
 
-    // A CNAME is the only record at its owner (RFC 1034 §3.6.2), so two of them
-    // cannot both be followed.
-    //
-    // No canonicalizing pass: `Name` compares case-insensitively, so `==`
-    // already means what DNS means without a copy per record.
+    // One CNAME per owner (RFC 1034 §3.6.2); `Name` compares
+    // case-insensitively, so no canonicalizing copy.
     let mut cnames: Vec<(Name, Name)> = Vec::new();
     for rr in answers.iter().filter(|rr| rr.rdata.rtype() == rt::CNAME) {
         let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() else {

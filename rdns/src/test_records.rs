@@ -11,14 +11,9 @@ use crate::zone::{parse_zone_file, Zone};
 use crate::{Class, Name, ParsedRecord, RecordData, ResourceRecord, Rtype, Serial, Ttl};
 use std::net::Ipv4Addr;
 
-/// A name from a literal, for tests only: `Name` is fallible to build and a test
-/// that writes a bad one should fail loudly at that line, rather than threading
-/// a `Result` through a fixture.
-///
-/// One per crate, not one per module — and `rdns-core` has the same three lines
-/// in `name.rs`. The copies left are in the standalone binaries, `tests/`,
-/// `benches/` and `examples/`, which cannot see a `#[cfg(test)]` item in the
-/// library; making it public API to spare them would be the worse trade.
+/// A name from a literal, for tests only: a bad one fails loudly at that line.
+/// One per crate; `tests/`, `benches/` and `examples/` cannot see a
+/// `#[cfg(test)]` item and keep their own.
 pub(crate) fn nm(text: &str) -> Name {
     text.parse().expect("a test name parses")
 }
