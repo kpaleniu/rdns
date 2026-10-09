@@ -9,3 +9,4 @@ dhat-heap.json
 # file describing a laptop goes wrong silently for anyone else and tells a reader
 # nothing about the project.
 CLAUDE.local.md
+__pycache__/
