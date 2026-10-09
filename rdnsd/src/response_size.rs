@@ -1,13 +1,13 @@
 //! What a signed answer off this server weighs, against the ceilings a UDP
 //! response could be given.
 //!
-//! `TODO.md` #41b, and the response-side sibling of
-//! `rdns/examples/request_size_probe.rs`. Before #41 a UDP reply's only ceiling
-//! was the client's own EDNS advertisement, so a client asking for 65,535 got
-//! whatever the answer weighed and the IP layer fragmented it. Choosing a
-//! ceiling of our own means knowing what this server's answers actually weigh,
-//! which is what this measures — through `write_response`, not through a second
-//! serializer that would agree with nothing (`CLAUDE.md` §1).
+//! The response-side sibling of `rdns/examples/request_size_probe.rs`
+//! (`TODO.md` #41). With the client's own EDNS advertisement as a UDP reply's
+//! only ceiling, a client asking for 65,535 gets whatever the answer weighs and
+//! the IP layer fragments it. Choosing a ceiling of our own means knowing what
+//! this server's answers actually weigh, which is what this measures — through
+//! `write_response`, not through a second serializer that would agree with
+//! nothing (`CLAUDE.md` §1).
 //!
 //! ```sh
 //! cargo test -p rdnsd response_size -- --nocapture
@@ -358,10 +358,10 @@ fn what_a_signed_answer_weighs() {
     }
 
     // The one assertion, and it is about the *other* default an operator might
-    // reach for: `--max-udp-response 4096` is "the old behaviour, bounded", and
-    // it is only that if nothing this zone can answer exceeds it. A row that
-    // grows past 4096 is a row that starts forcing TCP at a setting whose whole
-    // point is not to — file what moved it rather than raising the number
+    // reach for: `--max-udp-response 4096` is "the client's number, bounded",
+    // and it is only that if nothing this zone can answer exceeds it. A row
+    // that grows past 4096 is a row that starts forcing TCP at a setting whose
+    // whole point is not to — file what moved it rather than raising the number
     // (`CLAUDE.md` §10).
     assert!(
         worst <= 4096,

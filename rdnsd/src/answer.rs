@@ -4,7 +4,7 @@
 //! The opcode, EDNS, the class, AXFR and IXFR over UDP, which zone is asked
 //! (`Zones::for_query`), and REFUSED when none is. What one zone then says to
 //! the question — RFC 1034 §4.3.2's four cases and the DNSSEC records each owes
-//! — is [`rdns::zone_answer`]'s (`TODO.md` #150).
+//! — is [`rdns::zone_answer`]'s.
 //!
 //! Everything here is a synchronous function of the message, the zone map and
 //! the metrics — no sockets, no lock guards, nothing `async`.
@@ -12,7 +12,7 @@
 //! The answer is written to the wire as it is found, through a
 //! [`ResponseWriter`], rather than built as a `DnsMessage` and serialized
 //! afterwards: an owner `String`, a cloned RDATA and a `Vec` push per record
-//! were three of the twelve allocations a query cost (`TODO.md` #27b).
+//! are three of the twelve allocations such a query costs (`TODO.md` #27b).
 
 use rdns::ede::InfoCode;
 use rdns::error::WireError;
@@ -48,9 +48,9 @@ pub(crate) fn write_response(
 
     // EDNS-level rejections take precedence over any zone lookup: a malformed
     // option list is FORMERR, an EDNS version we don't implement is BADVERS.
-    // Both replies carry a bare version-0 OPT — BADVERS is an extended RCODE, so
-    // the OPT record is what carries its high bits. `rdnsr` reads the same
-    // decision out of `client_edns` (`TODO.md` #30h).
+    // Both replies carry a bare version-0 OPT — BADVERS is an extended RCODE,
+    // so the OPT record is what carries its high bits. `rdnsr` reads the same
+    // decision out of `client_edns`.
     let client_edns = match rdns::response::client_edns(msg) {
         Ok(edns) => edns,
         Err(rcode) => {
@@ -91,15 +91,15 @@ pub(crate) fn write_response(
     // message" — one RCODE, one AA bit and one set of sections cannot describe
     // two lookups.
     //
-    // QDCOUNT = 0 was NOERROR here until `TODO.md` #78c, on the strength of
-    // §4's other sentence — which binds *firewalls* ("Such firewalls MUST NOT
-    // treat messages with OPCODE = 0 and QDCOUNT = 0 as malformed"), not
-    // responders, and left AA set over a question section naming nothing to be
-    // authoritative for. RFC 7873 §5.4 is what such a query is for and extends
-    // the QUERY opcode to it only "for servers with DNS Cookies enabled";
-    // without cookies it says such a server "will normally send FORMERR".
-    // Measured: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all
-    // answer FORMERR to one carrying no OPT, and none of them sets AA.
+    // QDCOUNT = 0 too (`TODO.md` #78c). §4's other sentence binds *firewalls*
+    // ("Such firewalls MUST NOT treat messages with OPCODE = 0 and QDCOUNT = 0
+    // as malformed"), not responders, and a NOERROR would set AA over a
+    // question section naming nothing to be authoritative for. RFC 7873 §5.4 is
+    // what such a query is for and extends the QUERY opcode to it only "for
+    // servers with DNS Cookies enabled"; without cookies it says such a server
+    // "will normally send FORMERR". Measured: BIND 9.20.27, Knot 3.6.0, NSD
+    // 4.12.0 and Unbound 1.23.1 all answer FORMERR to one carrying no OPT, and
+    // none of them sets AA.
     match msg.queries.as_slice() {
         [query] => answer_question(query, zones, dnssec_ok, &mut w)?,
         _ => {
@@ -202,10 +202,8 @@ fn answer_question(
         return Ok(());
     }
 
-    // ~~One fold for the whole question, into the caller's buffer~~ (#27a,
-    // #27d): the fold moved into `zone_answer` at #38, and the buffer was
-    // passed to nothing until #160 deleted it. `for_query` and `zone_answer`
-    // each fold onto the stack, so neither allocates.
+    // `for_query` and `zone_answer` each fold onto the stack, so neither
+    // allocates.
     let Some(zone) = zones.for_query(query.qname.as_ref()) else {
         // A zone we do not serve is REFUSED, not NXDOMAIN. NXDOMAIN asserts
         // the name exists nowhere, which we have no standing to say, and a
@@ -223,9 +221,9 @@ fn answer_question(
 
 /// RFC 1034 §4.3.2: the four cases an authoritative answer can be.
 ///
-/// Three of the four were missing here, and the suite was green the whole time
-/// because it asserted what the code did — `CLAUDE.md` §1's opening example.
-/// Each test below names the wire shape that used to go out.
+/// A suite that asserts what the code does stays green with three of the four
+/// missing (`CLAUDE.md` §1). Each test below names the wire shape it fails
+/// with.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,8 +292,8 @@ x.sub2   IN A   192.0.2.30
     /// a CNAME the server synthesizes from it, and the chain then continues at
     /// the substituted name.
     ///
-    /// The wire shape that used to go out for every such name: NXDOMAIN, from
-    /// a zone that holds the redirection and never applied it.
+    /// Fails with NXDOMAIN, from a zone that holds the redirection and never
+    /// applies it.
     #[test]
     fn a_name_below_a_dname_is_redirected_through_a_synthesized_cname() {
         let response = ask("a.redir.example.com.", Qtype::of(record_types::A));
@@ -470,10 +468,9 @@ x.sub2   IN A   192.0.2.30
     /// zone or the lookup key spells it (RFC 1034 §4.3.3, RFC 4343 on why the
     /// lookup may fold and the echo may not).
     ///
-    /// Nothing tested this until #27a made the folded key a separate value from
-    /// the echoed name — the two had been one string, so no test could tell them
-    /// apart. Every other test here asks in lower case, where a regression is
-    /// invisible.
+    /// The folded key and the echoed name are separate values, and only a
+    /// mixed-case question can tell them apart: every other test here asks in
+    /// lower case, where a regression is invisible.
     #[test]
     fn a_case_randomized_qname_is_echoed_exactly_as_asked() {
         // `host` is a plain A: `www` in this zone is a CNAME, whose answer
@@ -502,10 +499,9 @@ x.sub2   IN A   192.0.2.30
         }
     }
 
-    /// The wire shape that used to go out for every CNAME in every zone this
-    /// server loaded: an empty NOERROR with the SOA — "this name has no A
-    /// record". `getaddrinfo` fails on it, and BIND and Unbound cache the
-    /// NODATA and never follow the alias.
+    /// Fails with an empty NOERROR with the SOA — "this name has no A record".
+    /// `getaddrinfo` fails on it, and BIND and Unbound cache the NODATA and
+    /// never follow the alias.
     #[test]
     fn a_cname_is_followed_to_its_target_in_the_same_zone() {
         let response = ask("www.example.com.", Qtype::of(record_types::A));
@@ -544,9 +540,9 @@ x.sub2   IN A   192.0.2.30
         assert_eq!(response.answers[0].rdata.rtype(), record_types::CNAME);
     }
 
-    /// The referral, and the header bit that makes it one. This used to be an
-    /// NXDOMAIN with AA=1, so per RFC 8020 every resolver cached "the
-    /// whole subtree does not exist" and the child zone was off the internet
+    /// The referral, and the header bit that makes it one. Fails with an
+    /// NXDOMAIN with AA=1, which per RFC 8020 every resolver caches as "the
+    /// whole subtree does not exist", taking the child zone off the internet
     /// for the negative TTL.
     #[test]
     fn a_name_below_a_delegation_gets_a_referral_not_an_nxdomain() {
@@ -588,14 +584,13 @@ x.sub2   IN A   192.0.2.30
     ///
     /// `dnssec_answer::deny_the_name_and_its_wildcard` needs
     /// `*.<closest encloser>` to be absent, or its `nsec_covering` search
-    /// yields the record before a name that is in the chain and proves
-    /// nothing. It said `Zone::name_kind` guaranteed that; of that function's
-    /// six `NotFound` returns the delegation one does not — it returns
-    /// `NotFound` because RFC 4592 §2.2.1 forbids synthesis below a cut, which
-    /// says nothing about the index (`TODO.md` #79e). The guarantor is
-    /// `rdns::zone_answer`'s `resolve_in_zone`, which asks `delegation_for`
-    /// before anything else (RFC 1034 §4.3.2's first case), so a name under a
-    /// cut never reaches a negative proof at all. This holds it end to end.
+    /// yields the record before a name that is in the chain and proves nothing.
+    /// `Zone::name_kind` does not guarantee it: its delegation `NotFound` is
+    /// because RFC 4592 §2.2.1 forbids synthesis below a cut, which says
+    /// nothing about the index. The guarantor is `rdns::zone_answer`'s
+    /// `resolve_in_zone`, which asks `delegation_for` before anything else
+    /// (RFC 1034 §4.3.2's first case), so a name under a cut never reaches a
+    /// negative proof at all. This holds it end to end.
     #[test]
     fn a_wildcard_below_a_cut_is_still_a_referral() {
         let mut text = ZONE.to_string();
@@ -721,10 +716,9 @@ x.sub2   IN A   192.0.2.30
         }
     }
 
-    /// The same rule the other way round, which the zone above cannot show:
-    /// its `$TTL` is the larger of the two, so a cap computed from MINIMUM
-    /// alone gives the right number there and the direction #73 got wrong goes
-    /// untested. Watched failing against `Ttl::negative_answer` returning
+    /// The same rule the other way round, which the zone above cannot show: its
+    /// `$TTL` is the larger of the two, so a cap computed from MINIMUM alone
+    /// gives the right number there. Fails if `Ttl::negative_answer` returns
     /// `minimum` (`CLAUDE.md` §1).
     #[test]
     fn a_negative_answer_caps_minimum_at_the_soa_ttl() {
@@ -845,21 +839,18 @@ ns1 IN A   192.0.2.1
 
     /// Two questions is FORMERR (RFC 9619 §4), not two answers.
     ///
-    /// This server used to loop over the question section and pile every
-    /// answer into one message, which has no meaning: there is one RCODE, one
-    /// AA bit and one set of sections, so a NOERROR answer and an NXDOMAIN in
-    /// the same reply are indistinguishable from an answer and a NODATA. The
-    /// last question's outcome simply won. §4 makes it explicit — "A DNS
-    /// message with OPCODE = 0 MUST NOT include a QDCOUNT parameter whose
-    /// value is greater than 1", to "be treated as an incorrectly formatted
-    /// message" — and BIND, NSD, Knot and Unbound all did this already.
+    /// Every answer piled into one message has no meaning: there is one RCODE,
+    /// one AA bit and one set of sections, so a NOERROR answer and an NXDOMAIN
+    /// in the same reply are indistinguishable from an answer and a NODATA. §4
+    /// makes it explicit — "A DNS message with OPCODE = 0 MUST NOT include a
+    /// QDCOUNT parameter whose value is greater than 1", to "be treated as an
+    /// incorrectly formatted message" — and BIND, NSD, Knot and Unbound all do
+    /// this.
     ///
-    /// So is no question at all, and that is the half this test had wrong
-    /// (`TODO.md` #78c). It asserted an empty NOERROR on the strength of §4's
-    /// other sentence — "Such firewalls MUST NOT treat messages with
-    /// OPCODE = 0 and QDCOUNT = 0 as malformed" — which is addressed to
-    /// middleboxes deciding what to forward, not to responders deciding what to
-    /// answer, and which said nothing about the AA bit this server was setting
+    /// So is no question at all (`TODO.md` #78c). §4's other sentence — "Such
+    /// firewalls MUST NOT treat messages with OPCODE = 0 and QDCOUNT = 0 as
+    /// malformed" — is addressed to middleboxes deciding what to forward, not
+    /// to responders deciding what to answer, and says nothing about an AA bit
     /// over an empty question section.
     #[test]
     fn two_questions_in_one_query_are_a_format_error() {
@@ -1576,8 +1567,7 @@ ns.plain  IN A   192.0.2.30
                 .expect("the zone we just signed verifies");
 
             // And the same zones again, without re-signing: the run is the same
-            // and the keys have not moved, so nothing is checked a second time
-            // (`TODO.md` #53).
+            // and the keys have not moved, so nothing is checked a second time.
             assert_eq!(
                 verify_zones(&zones, &validator, &run, &proved).expect("verifies"),
                 crate::zones::Checked {

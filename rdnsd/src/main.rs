@@ -3,13 +3,13 @@
 //! One process because anything that writes state — a fetched zone, a refresh
 //! timestamp, a journal — needs a single owner.
 //!
-//! What stays in this root is the shell around the answering: the CLI, startup's
-//! order (config, secrets, zones, signing, verification, then a socket), the two
-//! socket loops, the reload and maintenance timers, and NOTIFY going *out*. What
-//! #20 and #38d lifted out of it, one seam per commit, is [`zones`] (where a zone
-//! comes from and how it is swapped in), [`replication`] (being a secondary),
-//! [`dispatch`] (one request in, its reply on the wire), [`answer`] (what a name
-//! deserves, with no sockets in it), [`config`] and [`control`].
+//! What stays in this root is the shell around the answering: the CLI,
+//! startup's order (config, secrets, zones, signing, verification, then a
+//! socket), the two socket loops, the reload and maintenance timers, and NOTIFY
+//! going *out*. Elsewhere, on `TODO.md` #38d's criterion: [`zones`] (where a
+//! zone comes from and how it is swapped in), [`replication`] (being a
+//! secondary), [`dispatch`] (one request in, its reply on the wire), [`answer`]
+//! (what a name deserves, with no sockets in it), [`config`] and [`control`].
 //!
 //! Every listening socket this binary binds is bound here or in `control`, and
 //! nothing below them decides to exit. A change about *what an answer is* belongs
@@ -17,8 +17,8 @@
 
 // `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
 #![warn(unreachable_pub)]
-// `TODO.md` #143: `push_str(&format!(..))` allocates a `String` to copy it;
-// `write!` into the target does not. Off by default (restriction group).
+// `push_str(&format!(..))` allocates a `String` to copy it; `write!` into the
+// target does not. Off by default (restriction group).
 #![warn(clippy::format_push_string)]
 
 mod answer;
@@ -103,9 +103,8 @@ fn admission_limits(udp: UdpSizes, max_udp: u16, max_tcp: u16) -> AdmissionLimit
 
 // The daemon's defaults, in one place because each is spelled twice: `Cli`
 // takes them through `default_value_t` and the config file's `[server]` and
-// `[signing]` tables through `#[serde(default = "crate::...")]`. Sixteen had a
-// literal on each side and nothing comparing them (`TODO.md` #63e);
-// `default_udp_workers` is the one that did not, and is the shape.
+// `[signing]` tables through `#[serde(default = "crate::...")]`, and a literal
+// on each side has nothing comparing them.
 //
 // Here and not in `config`, because a flag's default is the daemon's and the
 // file inherits it — and an item private in the crate root is visible to every
@@ -187,9 +186,9 @@ use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 
 // Both macros are re-exported with `pub(crate) use` rather than left to
-// `macro_rules!`'s textual scoping, which would force `mod dispatch;` below this
-// point; `#[macro_export]` would widen them to the crate's public surface
-// instead (`TODO.md` #39d).
+// `macro_rules!`'s textual scoping, which would force `mod dispatch;` below
+// this point; `#[macro_export]` would widen them to the crate's public surface
+// instead.
 
 /// A peer sent something we could not use: a malformed packet, a truncated TCP
 /// message, a response arriving at a listening socket.
@@ -410,12 +409,11 @@ struct Cli {
     /// Largest UDP reply this server will send, in octets.
     ///
     /// The client's own advertisement is honoured only down to this — a client
-    /// asking for 65,535 got exactly that before `TODO.md` #41b, so a large
-    /// signed answer left as ~45 IP fragments. Over it the reply is an empty
-    /// TC=1 and the client asks again over TCP, which is never capped. What a
-    /// signed answer off these zones weighs is measured in
-    /// `rdnsd/src/response_size.rs`. 65535 is "whatever the client asked for";
-    /// floored at 512.
+    /// asking for 65,535 given exactly that gets a large signed answer as ~45
+    /// IP fragments. Over it the reply is an empty TC=1 and the client asks
+    /// again over TCP, which is never capped. What a signed answer off these
+    /// zones weighs is measured in `rdnsd/src/response_size.rs`. 65535 is
+    /// "whatever the client asked for"; floored at 512.
     #[arg(
         long,
         value_name = "OCTETS",
@@ -785,13 +783,11 @@ struct Cli {
     /// Reads the config, the TSIG secrets and the signing keys, and checks
     /// everything knowable without the network. Exit 0 means it would start.
     ///
-    /// ~~`requires = "config"`~~ removed at `TODO.md` #90: everything this
-    /// checks is flag-settable too, so the requirement was inert where it
-    /// mattered — `--zone-file` conflicts with `--config`, so clap never
-    /// enforced it there — and misleading where it fired, telling an operator
-    /// running a flags-only server to write a TOML file. `rdnsr`'s own
-    /// `check_config` carries that argument and has never had the attribute
-    /// (§7: the copy with the reason on it was the right one).
+    /// No `requires = "config"`: everything this checks is flag-settable too,
+    /// so the requirement would be inert where it matters — `--zone-file`
+    /// conflicts with `--config`, so clap never enforces it there — and
+    /// misleading where it fires, telling an operator running a flags-only
+    /// server to write a TOML file. `rdnsr`'s `check_config` is the same.
     #[arg(long)]
     check_config: bool,
     /// How much to say: error, warn, info, debug or trace.
@@ -865,12 +861,11 @@ struct ControlPolicy {
     /// Zones this server replicates, so `status` says `secondary` from what is
     /// being replicated rather than guessing from an absent timestamp, which a
     /// primary also has. The live registry, because a catalog's members are
-    /// replicated and arrive after startup (`TODO.md` #44a).
+    /// replicated and arrive after startup.
     secondaries: Arc<Secondaries>,
     /// The catalogs this server consumes, so `status` can name the catalog a
     /// zone came from and `catalog` can report what one holds — refusals
-    /// included, which have no zone and so no row in `status`
-    /// (`TODO.md` #49).
+    /// included, which have no zone and so no row in `status`.
     catalogs: Arc<crate::catalog::Catalogs>,
     /// For `status`'s uptime. Taken in `main`, not here: loading and signing
     /// every zone happens before `serve` and is the bulk of a big start.
@@ -1226,10 +1221,9 @@ async fn udp_loop(
         let peer = rdns::peer::canonical(from);
 
         // One clock read per datagram, shared by the limiter, the logger, the
-        // TSIG check and the response budget — each used to fetch its own, at
-        // 24-26 ns a call (`TODO.md` #28a). Through `ctx`, because a
-        // `Clock::fixed` that reaches only the accept loops reaches nothing a
-        // UDP query touches (`TODO.md` #87).
+        // TSIG check and the response budget, where one each costs 24-26 ns a
+        // call (`TODO.md` #28a). Through `ctx`, because a `Clock::fixed` that
+        // reaches only the accept loops reaches nothing a UDP query touches.
         let now = server.ctx().clock.now();
 
         // Both are decisions to do nothing, so they run on `&buf[..size]` with
@@ -1263,11 +1257,10 @@ async fn udp_loop(
 /// What one UDP worker reuses from datagram to datagram.
 ///
 /// Per-message state that a task-per-datagram server pays for every time and a
-/// fixed pool pays for once: the reply buffer, which settles at the largest EDNS
-/// payload size this worker has been asked for, and the name compressor, whose
-/// two allocations are per message (`TODO.md` #27b). ~~And the folded lookup
-/// key (#27a)~~: unused since #38 and removed at #160, the folds being on the
-/// stack.
+/// fixed pool pays for once: the reply buffer, which settles at the largest
+/// EDNS payload size this worker has been asked for, and the name compressor,
+/// whose two allocations are per message (`TODO.md` #27b). No folded lookup
+/// key: the folds are on the stack.
 ///
 /// One struct because they are one thing — the scratch space — and because
 /// more parameters on `answer_datagram` is what clippy's argument limit is for
@@ -1294,15 +1287,14 @@ struct Reloading {
     ///
     /// The live registry rather than the `--secondary` specs: a catalog's
     /// members are replicated zones whose files are in the same directory, and
-    /// a list fixed at startup would let a reload serve one of those with AA set
-    /// however long its master had been unreachable (`TODO.md` #44a).
+    /// a list fixed at startup would let a reload serve one of those with AA
+    /// set however long its master had been unreachable.
     secondaries: Arc<Secondaries>,
     zone_dir: Option<PathBuf>,
     signing: Option<Arc<ZoneSigning>>,
     validator: Arc<DnssecValidator>,
-    /// Shared with the startup pass, which is the run that proves most of it:
-    /// a reload that re-signs a zone with the same keys has nothing new to
-    /// check (`TODO.md` #53).
+    /// Shared with the startup pass, which is the run that proves most of it: a
+    /// reload that re-signs a zone with the same keys has nothing new to check.
     proved: ProvenSigning,
     /// The catalog to rebuild from the zones each reload loads (`TODO.md`
     /// #182).
@@ -1422,8 +1414,7 @@ impl ReloadTrigger {
     /// not carry a signature forward — everything it would carry is what it
     /// woke up to replace. SIGHUP and the control socket are an operator or a
     /// catalog saying the files moved, and there the served version is a
-    /// previous version in exactly the sense `sign_zone_incrementally` means
-    /// (`TODO.md` #65a).
+    /// previous version in exactly the sense `sign_zone_incrementally` means.
     fn refreshes_signatures(&self) -> bool {
         matches!(self, ReloadTrigger::Timer)
     }
@@ -1603,7 +1594,7 @@ fn spawn_zone_maintenance(
                 // Asked each time round rather than once at startup: the
                 // interval follows the nearest key rollover step when one is
                 // closer than the ordinary tick, and that moment moves as the
-                // steps are taken (`TODO.md` #44f).
+                // steps are taken.
                 _ = sleep_for(ctx.reloading.signing.as_ref().map(|s| s.resign_interval().every))
                     => ReloadTrigger::Timer,
                 _ = stop.wait() => break,
@@ -1708,8 +1699,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
     }
 
     validate_cli_args(&cli.host, cli.port)?;
-    // Refused *here* so `--check-config` says so too: on Windows a path that
-    // is not a pipe name (`TODO.md` #188).
+    // Refused *here* so `--check-config` says so too: on Windows a path that is
+    // not a pipe name.
     if let Some(path) = &cli.control_socket {
         rdns_transport::control::check(path)?;
     }
@@ -2034,9 +2025,9 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         ));
     }
 
-    // Parsed here and not in `serve`'s argument list: an argument expression
-    // is evaluated below the dry-run exit, which made this the one flag
-    // `--check-config` accepted and the real start refused (`TODO.md` #99).
+    // Parsed here and not in `serve`'s argument list: an argument expression is
+    // evaluated below the dry-run exit, where a bad value is accepted by
+    // `--check-config` and refused by the real start (`CLAUDE.md` §15).
     let dnstap = match &cli.dnstap {
         Some(spec) => Some((
             spec.parse::<rdns_transport::dnstap::Target>()?,
@@ -2140,9 +2131,9 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
     let mut readiness = Readiness::ready();
     let secondaries = Arc::new(Secondaries::default());
     // Hoisted out of the block below so the control socket can report what each
-    // catalog holds (`TODO.md` #49). A server with no `--secondary` and no
-    // `--catalog` never enters that block, and this stays the empty consumer —
-    // which `rdnsctl catalog` answers as "this server consumes no catalogs".
+    // catalog holds. A server with no `--secondary` and no `--catalog` never
+    // enters that block, and this stays the empty consumer — which
+    // `rdnsctl catalog` answers as "this server consumes no catalogs".
     let mut control_catalogs: Option<Arc<Catalogs>> = None;
     if !secondary_specs.is_empty() {
         let ZoneSource::Directory(dir) = &source else {
@@ -2450,7 +2441,7 @@ fn write_key_pair(
         Ok(written) => written,
         // All or nothing: a key left behind has no timing, so the server
         // publishes and signs with it, and a KSK the operator never saw a DS
-        // for is the result (`TODO.md` #126).
+        // for is the result.
         Err(e) => return Err(remove_key_pair(dir, pair, e.into())),
     };
     for path in written {
@@ -2544,9 +2535,8 @@ mod tests {
     }
 
     /// A ZSK that cannot be written takes the KSK written before it back out,
-    /// and leaves the file that stopped it (`TODO.md` #126). The generator
-    /// takes the ZSK's name after `load_dir` has looked, as a second writer
-    /// would.
+    /// and leaves the file that stopped it. The generator takes the ZSK's name
+    /// after `load_dir` has looked, as a second writer would.
     #[test]
     fn a_key_pair_that_fails_halfway_leaves_nothing_behind() {
         let dir = ScratchDir::new("key-pair-halfway");
@@ -2759,14 +2749,13 @@ mod tests {
         }
 
         /// The client's EDNS advertisement is a ceiling this server may lower,
-        /// not one it has to honour (`TODO.md` #41b).
+        /// not one it has to honour.
         ///
-        /// Before: `max_len` was `request.udp_payload_size()` alone, so a client
-        /// advertising 65,535 was given 65,535 and a large answer left as ~45 IP
-        /// fragments — which middleboxes drop and which is what every other
-        /// implementation's `max-udp-size` exists to prevent. Watched failing
-        /// against that: the reply comes back whole, over 1232 octets, with TC
-        /// clear.
+        /// With `max_len` at `request.udp_payload_size()` alone, a client
+        /// advertising 65,535 is given 65,535 and a large answer leaves as ~45
+        /// IP fragments — which middleboxes drop and which is what every other
+        /// implementation's `max-udp-size` exists to prevent. Fails that way:
+        /// the reply comes back whole, over 1232 octets, with TC clear.
         ///
         /// The cap is the datagram's alone. The same question over TCP is
         /// answered in full, which is where a truncated client is sent.
@@ -2828,17 +2817,16 @@ mod tests {
             assert_eq!(over_tcp.answers.len(), 128);
         }
 
-        /// The TSIG comes out of the reply's ceiling, not on top of it
-        /// (`TODO.md` #41d).
+        /// The TSIG comes out of the reply's ceiling, not on top of it.
         ///
         /// `TsigSession::sign` appends its record to bytes already serialized
-        /// to `max_len`, so before this the signed datagram went out at the cap
-        /// *plus* 85 octets — a cap exceeded by a fixed amount is not a cap.
-        /// RFC 8945 §5.3 says what to do instead: "If addition of the TSIG
-        /// record will cause the message to be truncated, the server MUST alter
-        /// the response so that a TSIG can be included. This response contains
-        /// only the question and a TSIG record, has the TC bit set, and has an
-        /// RCODE of 0 (NOERROR)."
+        /// to `max_len`, so without the reservation the signed datagram goes
+        /// out at the cap *plus* 85 octets — a cap exceeded by a fixed amount
+        /// is not a cap. RFC 8945 §5.3 says what to do instead: "If addition of
+        /// the TSIG record will cause the message to be truncated, the server
+        /// MUST alter the response so that a TSIG can be included. This
+        /// response contains only the question and a TSIG record, has the TC
+        /// bit set, and has an RCODE of 0 (NOERROR)."
         ///
         /// The zone is sized so the answer lands in the window where the
         /// question is live: it fits the cap and does not fit the cap with a
@@ -2846,8 +2834,8 @@ mod tests {
         /// drifts out of it fails loudly rather than passing for the wrong
         /// reason (`CLAUDE.md` §1).
         ///
-        /// Watched failing against the unreserved ceiling: 1,250 octets out of
-        /// a 1,232-octet cap, TC clear.
+        /// Fails with the unreserved ceiling: 1,250 octets out of a 1,232-octet
+        /// cap, TC clear.
         #[tokio::test]
         async fn a_signed_reply_reserves_its_signature_out_of_the_ceiling() {
             let key = TsigKey::new("transfer.key.", TsigAlgorithm::HmacSha256, vec![0x0b; 32]);
@@ -2937,22 +2925,19 @@ mod tests {
             );
         }
 
-        /// A transfer asked for over UDP is not streamed, and that is now a
-        /// branch rather than a position.
+        /// A transfer asked for over UDP is not streamed, and that is a branch
+        /// rather than a position.
         ///
-        /// Until one dispatcher replaced two (`TODO.md` #39b), "AXFR never
-        /// reaches `write_response` over TCP" was true because the TCP function
-        /// answered it earlier — `answer.rs`'s comment says exactly that, "so
-        /// this is the UDP path speaking". One function for both transports makes
-        /// the streaming branch reachable from a datagram, so the rule is a
-        /// `match` on `Wire` and this is what holds it: AXFR is FORMERR because
-        /// it is defined over TCP alone (RFC 5936 §4.2), and an IXFR is answered
-        /// with a single SOA of the current version, which tells the client to
-        /// come back over TCP (RFC 1995 §2).
+        /// One dispatcher for both transports (`TODO.md` #39b) makes the
+        /// streaming branch reachable from a datagram, so the rule is a `match`
+        /// on `Wire` and this is what holds it: AXFR is FORMERR because it is
+        /// defined over TCP alone (RFC 5936 §4.2), and an IXFR is answered with
+        /// a single SOA of the current version, which tells the client to come
+        /// back over TCP (RFC 1995 §2).
         ///
-        /// Nothing covered either rule before. Watched failing against a gate
-        /// that trusts the caller: dropping the `Wire::Framed` guard streams the
-        /// zone into the datagram path, and both assertions go.
+        /// Fails with a gate that trusts the caller: dropping the
+        /// `Wire::Framed` guard streams the zone into the datagram path, and
+        /// both assertions go.
         #[tokio::test]
         async fn a_transfer_over_udp_is_answered_rather_than_streamed() {
             let server = server_with(one_record_zone());
@@ -2990,18 +2975,15 @@ mod tests {
 
         /// A request that fails its TSIG check is still a request that arrived.
         ///
-        /// The two dispatchers had drifted (`TODO.md` #39a): the TCP path counts
-        /// `queries_received` and the query type before the TSIG check and this
-        /// one counted them after, so a rejected request was a received query on
-        /// one transport and not on the other. The exported name is
-        /// `dns_queries_received_total`, "Total DNS queries received", and a
-        /// request whose MAC does not verify arrived (`CLAUDE.md` §14: a
-        /// counter's name is a claim about what it counts).
+        /// Counted before the TSIG check on both transports, or a rejected
+        /// request is a received query on one transport and not on the other.
+        /// The exported name is `dns_queries_received_total`, "Total DNS
+        /// queries received", and a request whose MAC does not verify arrived
+        /// (`CLAUDE.md` §14: a counter's name is a claim about what it counts).
         ///
         /// Both transports in one test, because the claim is that they agree —
-        /// which is what makes it a test of the *counter* and not of the copy
-        /// #39b will delete. Watched failing against the old order: the UDP half
-        /// read 0.
+        /// which is what makes it a test of the *counter*. Fails with the count
+        /// after the check on UDP: the UDP half reads 0.
         #[tokio::test]
         async fn a_rejected_tsig_is_a_received_query_on_both_transports() {
             use std::sync::atomic::Ordering;
@@ -3099,9 +3081,7 @@ mod tests {
         /// window, and a server reading the wall clock answers BADTIME while
         /// one reading `ctx.clock` answers the question.
         ///
-        /// Fails against the old `let now = tsig::now()` with
-        /// `rcode: NotAuthorized` (`TODO.md` #87). Checked by reverting that
-        /// one line.
+        /// Fails with `let now = tsig::now()`: `rcode: NotAuthorized`.
         #[tokio::test]
         async fn the_udp_loop_signs_and_checks_against_the_context_clock() {
             // 2023-11-14, far past any fudge from the real now, and fixed so
@@ -3184,12 +3164,9 @@ mod tests {
 
         /// The response buffer is the worker's, not the datagram's.
         ///
-        /// What this is a regression for, since it cannot fail against the
-        /// old code — the old code had no buffer to reuse, because a task per
-        /// datagram has nowhere to keep one between datagrams. It fails against
-        /// anyone putting `to_bytes_within` back in `answer_datagram`: swapping
-        /// the two lines makes the second answer allocate afresh and the pointer
-        /// move. Confirmed by doing exactly that.
+        /// Fails if `answer_datagram` calls `to_bytes_within` rather than
+        /// writing into the worker's buffer: the second answer allocates afresh
+        /// and the pointer moves.
         ///
         /// Asserted on the pointer and the capacity rather than on a timing,
         /// which is the same reason `a_small_response_does_not_carry_a_64k_buffer`
@@ -3273,14 +3250,14 @@ mod tests {
     /// this server advertises it can reassemble.
     ///
     /// `TODO.md` #40f, and the defect rather than the knob: every reply's OPT
-    /// says 4,096 (RFC 6891 §6.2.4) while admission refused over 512 and did it
-    /// in silence — no FORMERR, nothing on the wire. A 2,048-bit DKIM key
-    /// rotation is the ordinary request that falls in the gap, and the TSIG this
-    /// server *requires* is what pushes it over: 470 octets unsigned, 566 signed
+    /// says 4,096 (RFC 6891 §6.2.4), so admission refusing over 512 does it in
+    /// silence — no FORMERR, nothing on the wire. A 2,048-bit DKIM key rotation
+    /// is the ordinary request that falls in the gap, and the TSIG this server
+    /// *requires* is what pushes it over: 470 octets unsigned, 566 signed
     /// (`rdns/examples/request_size_probe.rs`).
     ///
-    /// Watched failing with `max_udp_size` back at 512: the signed message was
-    /// refused and the unsigned one, being smaller, was not.
+    /// Fails with `max_udp_size` at 512: the signed message is refused and the
+    /// unsigned one, being smaller, is not.
     #[test]
     fn a_signed_dkim_sized_update_is_admitted_on_udp() {
         let key = update_key(rdns::tsig::UpdatePolicy::Any);
@@ -3495,12 +3472,11 @@ mod tests {
             dir
         }
 
-        /// One bad file out of three used to be a line on stderr, exit code 0, and
-        /// that zone answering REFUSED — indistinguishable from a zone nobody
-        /// configured. It also defeated the all-or-nothing invariant
-        /// `Reloading::load`'s own doc comment claims, because `install_all_zones`
-        /// then installed the survivors wholesale: a broken file plus a deploy
-        /// SIGHUP took a *previously working* zone off the air.
+        /// Fails if one bad file out of three is a line on stderr, exit code 0,
+        /// and that zone answering REFUSED — indistinguishable from a zone
+        /// nobody configured. Installing the survivors wholesale defeats
+        /// `Reloading::load`'s all-or-nothing invariant: a broken file plus a
+        /// deploy SIGHUP takes a *previously working* zone off the air.
         #[tokio::test]
         async fn a_zone_file_that_fails_to_parse_fails_the_load() {
             let dir = dir_with(
@@ -3663,12 +3639,12 @@ mod tests {
         /// The other half: no record of contact at all.
         ///
         /// `StateFile::load` returns empty rather than failing — right for a
-        /// cache, wrong for expiry, because forgetting the last-contact time *is*
-        /// the difference between withdrawn and served. A missing or unreadable
-        /// sidecar used to mean the stale copy on disk was served authoritatively
-        /// from a cold start. Unknown age has to read as "do not serve": the zone
-        /// comes back at the first successful transfer, which is what makes it
-        /// ours to answer for in the first place.
+        /// cache, wrong for expiry, because forgetting the last-contact time
+        /// *is* the difference between withdrawn and served. Read as empty, a
+        /// missing or unreadable sidecar serves the stale copy on disk
+        /// authoritatively from a cold start. Unknown age has to read as "do
+        /// not serve": the zone comes back at the first successful transfer,
+        /// which is what makes it ours to answer for in the first place.
         #[tokio::test]
         async fn a_zone_with_no_record_of_transfer_is_not_served() {
             let Replica {
@@ -3716,10 +3692,10 @@ mod tests {
             assert_eq!(zone_map.read().await.len(), 1);
         }
 
-        /// A directory that cannot be read is fatal either way — this is the
-        /// original #9c finding, and `--allow-partial-load` must not weaken it.
-        /// "Some files failed to parse" and "the directory is not there" are
-        /// different questions, and only the first one has a flag.
+        /// A directory that cannot be read is fatal either way, and
+        /// `--allow-partial-load` must not weaken it. "Some files failed to
+        /// parse" and "the directory is not there" are different questions, and
+        /// only the first one has a flag.
         #[tokio::test]
         async fn an_unreadable_directory_is_fatal_even_with_partial_load() {
             let missing = ZoneSource::Directory("no-such-directory-anywhere".to_string());
@@ -3816,10 +3792,10 @@ mod tests {
 
     /// A reload keeps the signatures it can, and the re-signing timer does not.
     ///
-    /// `TODO.md` #65a. `ZoneSigning::apply` signed every zone from scratch at
-    /// every load, so a SIGHUP or an `rdnsctl reload` cost a full sign — 27.6 s
-    /// at a million records against 9.7 s (#65b) — and moved the RDATA of every
-    /// RRSIG in the zone, which is the whole zone in the next IXFR delta.
+    /// Signing every zone from scratch at every load makes a SIGHUP or an
+    /// `rdnsctl reload` cost a full sign — 27.6 s at a million records against
+    /// 9.7 s (`TODO.md` #65b) — and moves the RDATA of every RRSIG in the zone,
+    /// which is the whole zone in the next IXFR delta.
     ///
     /// The timer is the exception and has to stay one: it reloads *in order to*
     /// refresh (`ZoneSigning::resign_interval`), so everything it would carry
@@ -3973,10 +3949,9 @@ mod tests {
         }
     }
 
-    /// `spawn_zone_maintenance` had no test (`TODO.md` #112). Two requests sent
-    /// back to back both get an answer — the second waits for the depth-1
-    /// channel's slot rather than being dropped — and a stop ends the task and
-    /// lets the drain finish.
+    /// Two requests sent back to back both get an answer — the second waits for
+    /// the depth-1 channel's slot rather than being dropped — and a stop ends
+    /// the task and lets the drain finish.
     #[tokio::test]
     async fn zone_maintenance_answers_every_control_reload_and_ends_on_stop() {
         let dir = ScratchDir::new("maintenance-control");

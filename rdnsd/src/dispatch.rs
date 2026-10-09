@@ -7,11 +7,9 @@
 //!
 //! `main.rs` reaches [`Wire`], which the UDP loop names to say where a reply
 //! goes, [`Server`]'s constructor and three readers, [`UpdateHandling::new`],
-//! and [`Server::answer`]. Everything else is private to this module, which is
-//! the whole of `TODO.md` #38d and #109: the transfer and UPDATE answering used
-//! to be `impl Server` blocks in the crate root, and then the fields they read
-//! were, where private means visible to the root and every descendant
-//! (`CLAUDE.md` §17).
+//! and [`Server::answer`]. Everything else is private to this module, on
+//! `TODO.md` #38d's criterion: in the crate root, private means visible to the
+//! root and every descendant (`CLAUDE.md` §17).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -108,9 +106,8 @@ impl Wire<'_> {
 
     /// What a dnstap reader calls this transport.
     ///
-    /// All five, since `TODO.md` #54 gave the dispatcher an [`Arrival`] rather
-    /// than a [`Privacy`]: the three encrypted ones were one value before, and
-    /// the field was left absent rather than guessed at.
+    /// All five, because the dispatcher is given an [`Arrival`] rather than a
+    /// [`Privacy`], under which the three encrypted ones are one value.
     fn socket_protocol(&self) -> dnstap::SocketProtocol {
         match self {
             Wire::Datagram(..) => dnstap::SocketProtocol::Udp,
@@ -152,14 +149,14 @@ impl Wire<'_> {
 /// because it switched transport, and the metrics are one server's.
 ///
 /// Here rather than in the crate root, with every field private, so that what
-/// the root may do with one is build it and read three things (`TODO.md` #109).
-/// [`Server::new`] refuses everything it is not told otherwise about.
+/// the root may do with one is build it and read three things. [`Server::new`]
+/// refuses everything it is not told otherwise about.
 pub(crate) struct Server {
     zone_map: Arc<RwLock<Zones>>,
     /// The limiter, the response budget, the validator, the logger and the
     /// metrics — the five handles serving a request needs that are not the
-    /// answer. `rdnsr` held the same five as its `Shell`, which is how the
-    /// admission sequence came to be written twice (`TODO.md` #30e, #32).
+    /// answer. One type for both daemons, because two is how an admission
+    /// sequence comes to be written twice (`TODO.md` #30e).
     ctx: ServeContext,
     /// Who may ask for a zone transfer. Empty by default, which refuses everyone.
     transfer_acl: Arc<TransferAcl>,
@@ -311,7 +308,7 @@ pub(crate) struct UpdateHandling {
     /// So the installed version is signed the way a loaded one would be.
     signing: Option<Arc<ZoneSigning>>,
     /// And checked the way a loaded one is: the same validator `verify_zones`
-    /// is given, so `--require-signed` means one thing (`TODO.md` #100).
+    /// is given, so `--require-signed` means one thing.
     validator: Arc<DnssecValidator>,
     /// Serializes the read-modify-write, which RFC 2136 §3.7 requires.
     ///
@@ -358,7 +355,7 @@ impl UpdateHandling {
 ///
 /// The sink shape is this daemon's requirement: an AXFR is a *sequence* of
 /// messages (RFC 5936 §2.2), so a slow client back-pressures the next envelope
-/// rather than having the whole zone built ahead of it (`TODO.md` #30a).
+/// rather than having the whole zone built ahead of it.
 impl tcp::Handler for Server {
     fn context(&self) -> &ServeContext {
         &self.ctx
@@ -395,7 +392,7 @@ impl tcp::Handler for Server {
 /// nine. A struct rather than four parameters because clippy says so at seven
 /// (`CLAUDE.md` §14) — and because one of the four is `now`, the instant that
 /// verified the request. Carrying it here is what stops a thirteenth site
-/// reading the clock a second time, which is what `TODO.md` #87 was.
+/// reading the clock a second time.
 #[derive(Clone, Copy)]
 struct Refused<'a> {
     msg: &'a DnsMessage,
@@ -501,7 +498,7 @@ impl Server {
         let qtype = msg.queries.first().map(|q| q.qtype);
         self.ctx.logger.log_query(ip, qtype, now);
         // Counted before any policy can return, so a request refused later is
-        // still a request received (`TODO.md` #39a).
+        // still a request received.
         self.ctx.metrics.count(&self.ctx.metrics.queries_received);
         if let Some(qtype) = qtype {
             self.ctx.metrics.track_query_type(qtype);
@@ -509,7 +506,7 @@ impl Server {
 
         // One ceiling for every reply this request can produce, read once from
         // the transport that will carry it and from this server's own limit —
-        // not from the client's advertisement alone (`TODO.md` #41b).
+        // not from the client's advertisement alone.
         let ceiling = self.ctx.udp.reply_ceiling(&msg, wire.transport());
         let advertised = self.ctx.server_opt();
 
@@ -594,11 +591,11 @@ impl Server {
     /// Answer a request whose TSIG has been settled: the three ordinary ways,
     /// and the bytes each of them put on the wire.
     ///
-    /// Split out of `answer` so a TSIG refusal and an ordinary answer are two
-    /// arms of one `match` producing the same value, rather than one of them
-    /// returning past the dnstap tail (`TODO.md` #101). The parameters are a
-    /// struct because the alternative is nine, four of them a `u16` or a `u64`
-    /// next to each other (`CLAUDE.md` §14).
+    /// Apart from `answer` so a TSIG refusal and an ordinary answer are two
+    /// arms of one `match` producing the same value, and neither can return
+    /// past the dnstap tail (`CLAUDE.md` §7). The parameters are a struct
+    /// because the alternative is nine, four of them a `u16` or a `u64` next to
+    /// each other (`CLAUDE.md` §14).
     async fn answer_admitted<'s>(
         &self,
         admitted: &Admitted<'_>,
@@ -617,21 +614,15 @@ impl Server {
         let ip = Peer::from(peer);
         // The record the signer appends comes out of the ceiling, not on top of
         // it: RFC 8945 §5.3 says a TSIG that would not fit means altering the
-        // response, not sending it oversized (`TODO.md` #41d). Signing is the
-        // one thing here that grows finished bytes.
+        // response, not sending it oversized. Signing is the one thing here
+        // that grows finished bytes.
         let max_len = match &session {
             Some(session) => reserve(ceiling, session.reply_overhead()),
             None => ceiling,
         };
 
-        // Four ways to answer and one tail, because three of them used to
-        // `return` past it: `record_dnstap` was reachable only through
-        // `finish`, so a capture held no UPDATE and no transfer while
-        // `--dnstap` says "every answered request" and `MessageType` carried
-        // `UpdateQuery` for nobody (`CLAUDE.md` §7's early return over a shared
-        // epilogue). The fourth was a TSIG that did not verify, which answered
-        // NOTAUTH and returned sixty lines above the tail (`TODO.md` #101); it
-        // now leaves through the caller's `match`, which has to produce a value.
+        // Every branch yields the bytes sent, so `answer` records dnstap once
+        // for all, the TSIG refusal included (`CLAUDE.md` §7).
         let transfer = matches!(qtype, Some(Qtype::AXFR) | Some(Qtype::IXFR));
         let sent = if let (true, Wire::Framed(out, arrival)) = (transfer, wire) {
             // A sequence of messages, gated on an ACL, and the answer can be
@@ -808,10 +799,9 @@ impl Server {
     ///
     /// `socket_protocol` names the transport exactly, DoT, DoH and DoQ
     /// included, because the dispatcher is told [`Arrival`] — which protocol
-    /// carried the message as well as what it hid (`TODO.md` #54). It was
-    /// omitted for every encrypted connection until then: [`Privacy`] alone
-    /// cannot tell the three apart, and DOT for a DoH query is a wrong value
-    /// where an absent one is a reader showing nothing (`CLAUDE.md` §14).
+    /// carried the message as well as what it hid. [`Privacy`] alone cannot
+    /// tell the three apart, and DOT for a DoH query is a wrong value where an
+    /// absent one is a reader showing nothing (`CLAUDE.md` §14).
     fn record_dnstap(
         &self,
         wire: &Wire<'_>,
@@ -883,11 +873,10 @@ impl Server {
         // Before anything about who is asking, and before this one too: the
         // answer cannot leave by the door it arrived at, whoever is asking and
         // whatever the policy. Checked here rather than at the dispatch that
-        // chose to stream, because this is where a refusal is logged and
-        // signed — an authenticated refusal is still signed (RFC 8945 §5.3,
+        // chose to stream, because this is where a refusal is logged and signed
+        // — an authenticated refusal is still signed (RFC 8945 §5.3,
         // `CLAUDE.md` §16) — and because it is before the zone is looked up,
-        // which is the whole point of refusing rather than building
-        // (`TODO.md` #106).
+        // which is the whole point of refusing rather than building.
         if !arrival.carries_a_sequence() {
             serving_error!(
                 self.ctx.logger,
@@ -923,7 +912,7 @@ impl Server {
         // REFUSED, not NOTAUTH: the zone exists and the answer is policy. The
         // reply says which policy, because "REFUSED" alone over a working TLS
         // connection is the sort of thing an operator debugs for an afternoon
-        // (RFC 8914, `TODO.md` #44b).
+        // (RFC 8914).
         if self.transfer_tls_only && !privacy.is_xot() {
             serving_error!(
                 self.ctx.logger,
@@ -1242,7 +1231,7 @@ impl Server {
     /// `now` is the instant that verified the request, not a second read of the
     /// clock: [`Server::finish`] already signs with it, and a reply signed off
     /// a clock the request was not checked against is the one thing here that
-    /// can disagree with itself (`TODO.md` #87).
+    /// can disagree with itself.
     fn signed_error(
         &self,
         refused: Refused,
@@ -1591,10 +1580,10 @@ const NOT_OVER_TLS: ExtendedError = ExtendedError::new(
     "zone transfers here are over TLS 1.3 only (RFC 9103)",
 );
 
-/// A transfer asked for over a transport that carries one message. Not a
-/// policy and not the client's fault, so OTHER again, and the sentence names
-/// the transport rather than the server's configuration — there is nothing an
-/// operator could turn on (`TODO.md` #106).
+/// A transfer asked for over a transport that carries one message. Not a policy
+/// and not the client's fault, so OTHER again, and the sentence names the
+/// transport rather than the server's configuration — there is nothing an
+/// operator could turn on.
 const ONE_MESSAGE_TRANSPORT: ExtendedError = ExtendedError::new(
     InfoCode::OTHER,
     "a zone transfer is a sequence of messages and DoH carries one (RFC 8484 §4.2)",
@@ -1686,9 +1675,7 @@ fn reserve(ceiling: usize, signature: usize) -> usize {
 
 /// An empty reply to `request` carrying `rcode`, serialized within `max_len`.
 ///
-/// The ceiling is [`rdns::UdpSizes::reply_ceiling`]'s, and it is the only thing
-/// the UDP TSIG rejection's own copy of this used to differ in
-/// (`TODO.md` #30g).
+/// The ceiling is [`rdns::UdpSizes::reply_ceiling`]'s.
 fn error_reply(
     request: &DnsMessage,
     rcode: ResponseCode,
@@ -1815,13 +1802,11 @@ fn apply_update_to_file(
     // Signed as a load would sign it, from the file's now-bumped serial, so the
     // served number moves too. Incrementally against the version being served:
     // a full re-sign would reinception every RRSIG and put the whole zone into
-    // the next IXFR delta.
-    // Verified before it is installed, which until `TODO.md` #100 no path did
-    // for an UPDATE: `main.rs`'s two calls to `verify_zones` cover loading and
-    // reloading, and this is the third way a zone reaches the map. The signing
-    // call hands back something the zone cannot be got out of without asking,
-    // so the check is the value's obligation rather than this function's memory
-    // of it (`CLAUDE.md` §17).
+    // the next IXFR delta. Verified before it is installed: `main.rs`'s two
+    // calls to `verify_zones` cover loading and reloading, and this is the
+    // third way a zone reaches the map. The signing call hands back something
+    // the zone cannot be got out of without asking, so the check is the value's
+    // obligation rather than this function's memory of it (`CLAUDE.md` §17).
     let installed = match check.signing {
         Some(signing) => signing
             .sign_one_incrementally(previous, zone)
@@ -1834,10 +1819,8 @@ fn apply_update_to_file(
 
 /// How an UPDATE's result is signed and checked before it is installed.
 ///
-/// One parameter rather than two. Signing without verifying is the shape
-/// `TODO.md` #100 found, and what let it happen is that the check was
-/// something a call site had to remember rather than something the signing
-/// arrived with (`CLAUDE.md` §17).
+/// One parameter rather than two, so the check is something the signing arrives
+/// with rather than something a call site has to remember (`CLAUDE.md` §17).
 struct SigningCheck<'a> {
     signing: Option<&'a ZoneSigning>,
     validator: &'a DnssecValidator,
@@ -1938,9 +1921,8 @@ fn notify_reply(
     // `Name` does it; `str::to_lowercase` would fold U+212A KELVIN SIGN onto `k`
     // and merge two names that differ on the wire.
     let ours = zone_map.contains_key(zone.as_ref().folded().as_ref());
-    // The same distinction on the wire and in the log since #47. It used to be
-    // the log alone, which is the half an operator on the *sending* side cannot
-    // read.
+    // The same distinction on the wire and in the log: the log alone is the
+    // half an operator on the *sending* side cannot read (`TODO.md` #47).
     let why = if ours { NOT_A_SECONDARY } else { NO_SUCH_ZONE };
     tracing::info!(%peer, "NOTIFY for {zone}: NOTAUTH ({})", why.extra_text());
     notify::notify_response(msg, ResponseCode::NotAuthorized, advertised, Some(why))
@@ -2032,14 +2014,13 @@ pub(crate) mod tests {
     /// O(zone) steps for a one-record change**. The re-read is 26% of it and
     /// not the dominant term — `zone_to_string` is, at 37%.
     ///
-    /// A fifth step, a `Zone::clone` nothing read, was 150.7 ms before #64a:
-    /// `apply_update_to_file` returned the installed zone beside an
-    /// `update::Applied` that owned another copy of it. [`UpdateReport`] has
-    /// no zone, so there is no column to time.
+    /// No fifth column for a `Zone::clone` of the installed zone:
+    /// [`UpdateReport`] has none, and one costs 150.7 ms at a million records
+    /// (`TODO.md` #64a).
     ///
     /// The total is printed in milliseconds because `{:.1?}` past a second is
-    /// one significant figure, and both sides of that fix read "1.8s". Putting
-    /// the `clone()` back separates them: **1907–1947 ms against 1694–1731**,
+    /// one significant figure: with and without that clone both read "1.8s",
+    /// where milliseconds separate them, **1907–1947 ms against 1694–1731**,
     /// six warm runs against five. Discard the first run after a rebuild — one
     /// read 1983.9 ms, 270 ms above the five that followed it.
     ///
@@ -2282,16 +2263,12 @@ pub(crate) mod tests {
     /// 64c — 68% of the unsigned 1.33 s — is **9% of what a signed update
     /// costs**. `full-sign` reproduces #44c's 28 s by a different route.
     ///
-    /// `verify` is what `TODO.md` #100 added: the RRsets this run signed, plus
-    /// every signed RRset at a name the update named. **21 ms at a million
-    /// records, 0.2% of the signed update** — against the 76 s a whole-zone
-    /// `verify_zones` pass costs at that size (#53), which is why it is the
-    /// change and not the pass.
+    /// `verify`: the RRsets this run signed, plus every signed RRset at a name
+    /// the update named. **21 ms at a million records, 0.2% of the signed
+    /// update** — against the 76 s a whole-zone `verify_zones` pass costs at
+    /// that size, which is why it is the change and not the pass.
     ///
-    /// Re-measured 2026-09-21 on the development machine, all columns, when
-    /// #100 added the fifth. The four that existed before read 20.7 / 87.0 /
-    /// 55.8 / 245.7 at ten thousand and 1952.1 / 11801.0 / 10314.9 / 26939.1
-    /// at a million; the shape is the same and the machine was not.
+    /// Measured 2026-09-21 on the development machine, all columns.
     ///
     /// A real [`ZoneSigning`] rather than a bare `sign_zone_incrementally`, so
     /// the column is the whole path an operator pays. The row filed this as
@@ -2427,8 +2404,8 @@ pub(crate) mod tests {
             // The signing step alone, from the same inputs the call above fed
             // it, so `signed` minus this and `verify` is the four unsigned
             // steps. Timed apart because they are different questions: one is
-            // the ECDSA and the carry-forward, the other is what `TODO.md`
-            // #100 added.
+            // the ECDSA and the carry-forward, the other the check of what was
+            // signed.
             std::fs::write(&path, &text).expect("restore the fixture");
             let reparsed = parse_zone_file_at(&path, "example.com.").expect("parses");
             let applied = update::apply(&reparsed, std::slice::from_ref(&change));
@@ -2577,25 +2554,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// Every encrypted transport gets its own dnstap label.
-    ///
-    /// `TODO.md` #54: the dispatcher was told [`Privacy`], which is `Clear`,
-    /// `Tls13` or `TlsOlder`, so DoT, DoH and DoQ were one value and the field
-    /// was left *absent* rather than guessed at — a reader showing nothing
-    /// where it should show three different things. Against the old code the
-    /// last three rows here read `None`.
-    ///
-    /// A table rather than a live exchange: the mapping is what changed, and
-    /// `record_dnstap` needs a sink, a socket and a parsed message to reach.
-    /// The rule the re-read exists for, kept while the re-read is skipped:
-    /// an edit made under a running server is not silently reverted
+    /// The rule the re-read exists for, kept while the re-read is skipped: an
+    /// edit made under a running server is not silently reverted
     /// (`TODO.md` #64b).
     ///
     /// Three updates against one file. The first has no remembered digest and
     /// parses. The second is handed the digest the first returned and must
     /// still produce the same zone — that is the fast path. The third is handed
     /// that same digest after the file has been *edited* underneath, and must
-    /// see the edit: the digest no longer matches, so the parse happens.
+    /// see the edit: the digest does not match, so the parse happens.
     ///
     /// Fails against a `stat`-based test on the third case whenever the edit
     /// preserves length and timestamp, and fails against reusing the served
@@ -2604,7 +2571,7 @@ pub(crate) mod tests {
     fn an_edit_under_a_running_server_is_seen_even_when_the_re_read_is_skipped() {
         let dir = rdns::testutil::ScratchDir::new("update-digest");
         // Column zero: a leading space makes the parser read the owner name as
-        // omitted (`TODO.md` #60, in a fixture).
+        // omitted.
         let text = concat!(
             "$TTL 3600\n",
             "@ IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 3600\n",
@@ -2697,12 +2664,10 @@ pub(crate) mod tests {
     /// A signed UPDATE's own signatures are checked before the zone is
     /// installed.
     ///
-    /// The whole of `TODO.md` #100 through the door an UPDATE comes in at, and
-    /// the first test of the signed path that is not one of the `#[ignore]`d
+    /// Through the door an UPDATE comes in at, and not one of the `#[ignore]`d
     /// benchmarks above. The assertion is that the RRsets the update moved —
     /// the added A, the SOA, the NSECs the insertion shifts — verify against
-    /// the zone's own keys after the install, which is what the call now
-    /// refuses to skip.
+    /// the zone's own keys after the install.
     #[test]
     fn a_signed_update_verifies_what_it_signed() {
         use clap::Parser;
@@ -2793,6 +2758,15 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every encrypted transport gets its own dnstap label.
+    ///
+    /// Under [`Privacy`] — `Clear`, `Tls13` or `TlsOlder` — DoT, DoH and DoQ
+    /// are one value, and the field is left *absent* rather than guessed at: a
+    /// reader showing nothing where it should show three different things.
+    /// Fails that way with the last three rows reading `None`.
+    ///
+    /// A table rather than a live exchange: the mapping is the point, and
+    /// `record_dnstap` needs a sink, a socket and a parsed message to reach.
     #[test]
     fn a_dnstap_entry_names_the_transport_including_the_encrypted_three() {
         use rdns::validation::{PeerCertificate, TlsVersion};
@@ -2831,11 +2805,11 @@ pub(crate) mod tests {
     /// same way that file does — RFC 6891 §6.1.1 for the record, RFC 3225 §3
     /// for the DO bit inside it.
     ///
-    /// `truncated_reply` and what is now `error_reply` each set an OPT of their
-    /// own with DO clear, so a validating client asking over UDP and getting
-    /// TC=1 read the answer as coming from a server that had dropped DNSSEC
-    /// (`CLAUDE.md` §7). Both go through [`empty_reply`] since #39c, so this
-    /// covers both: a mirror written a third time is the way this comes back.
+    /// A reply that sets an OPT of its own with DO clear tells a validating
+    /// client asking over UDP and getting TC=1 that the server dropped DNSSEC
+    /// (`CLAUDE.md` §7). `truncated_reply` and `error_reply` both go through
+    /// [`empty_reply`], so this covers both: a mirror written a third time is
+    /// the way this comes back.
     #[test]
     fn every_empty_reply_mirrors_the_clients_opt() {
         let udp = UdpSizes::default();
@@ -3070,10 +3044,10 @@ pub(crate) mod tests {
             stream.write_all(&framed).await.expect("send the request");
         }
 
-        /// The harm the whole item is about: `systemctl stop` used to cut an
-        /// in-flight AXFR mid-stream, and the client cannot tell a truncated
-        /// transfer from a complete one — it sees records, then silence, and a
-        /// secondary that believes it holds a zone it holds half of.
+        /// The harm: a `systemctl stop` that cuts an in-flight AXFR mid-stream,
+        /// where the client cannot tell a truncated transfer from a complete
+        /// one — it sees records, then silence, and a secondary that believes
+        /// it holds a zone it holds half of.
         ///
         /// Drives the real `tcp_loop` and the real `serve_connection`, and stops
         /// the server after the first message of a multi-message transfer has
@@ -3227,14 +3201,13 @@ pub(crate) mod tests {
         use super::*;
         /// A transfer is a sequence of messages, and DoH carries one.
         ///
-        /// `TODO.md` #106. `Server::answer` decided to stream from the QTYPE
-        /// and `Wire::Framed` alone, so a DoH request reached
-        /// `answer_transfer` and the whole zone was serialized one envelope at
-        /// a time into a channel `https::answer` drains and discards — the
-        /// client waiting on the producer to finish before it is handed the
-        /// first envelope. RFC 8484 defines no framing that would carry the
-        /// rest and RFC 9103 §7.1 puts DoH outside zone transfer, so the
-        /// answer is a refusal rather than a stream nothing can read.
+        /// Deciding to stream from the QTYPE and `Wire::Framed` alone sends a
+        /// DoH request to `answer_transfer`, and the whole zone is serialized
+        /// one envelope at a time into a channel `https::answer` drains and
+        /// discards — the client waiting on the producer to finish before it is
+        /// handed the first envelope. RFC 8484 defines no framing that would
+        /// carry the rest and RFC 9103 §7.1 puts DoH outside zone transfer, so
+        /// the answer is a refusal rather than a stream nothing can read.
         ///
         /// The arrival is the whole of what this drives, so the socket is a
         /// plain one — the same shape `transfer_by_certificate` uses to test
@@ -3679,8 +3652,8 @@ pub(crate) mod tests {
         DnsMessage::try_from_bytes(&buf).expect("a reply")
     }
 
-    /// Watched failing against a handler that installed the new zone without
-    /// writing the file: the map assertion passed, the file assertion did not.
+    /// Fails with a handler that installs the new zone without writing the
+    /// file: the map assertion passes, the file assertion does not.
     #[tokio::test]
     async fn an_update_is_applied_persisted_and_served() {
         let dir = ScratchDir::new("update-applied");
@@ -3769,13 +3742,11 @@ pub(crate) mod tests {
     /// All four answering paths reach the query stream, not just the ordinary
     /// one.
     ///
-    /// `TODO.md` #77b, the test #75 landed without. `record_dnstap` used to sit
-    /// behind `finish`, which the transfer and UPDATE branches returned above,
-    /// so a capture held neither — while `--dnstap` says "every answered
-    /// request" and `MessageType::UpdateQuery` was an arm nothing could reach.
-    /// Watched failing against that shape: one data frame, not three — and
-    /// again at three against the TSIG-rejection branch, which #75 left
-    /// returning past the tail and #101 took out.
+    /// With `record_dnstap` behind `finish` and a branch returning above it, a
+    /// capture holds no UPDATE and no transfer — while `--dnstap` says "every
+    /// answered request". Fails that way with one data frame, not three, and at
+    /// three if the TSIG-rejection branch returns past the tail
+    /// (`TODO.md` #77b).
     ///
     /// The transfer is refused, because this server has no ACL. That is the
     /// case worth capturing anyway — `answer_transfer` logs every attempt for
@@ -3835,10 +3806,9 @@ pub(crate) mod tests {
             "an empty ACL refuses everyone"
         );
 
-        // The fourth door (`TODO.md` #101). A key the server does not hold is
-        // *answered* — NOTAUTH, signed per RFC 8945 §5.3 — and the branch used
-        // to `return` sixty lines above the tail, so the one capture an
-        // operator wants during a key-guessing probe held nothing.
+        // The fourth door. A key the server does not hold is *answered* —
+        // NOTAUTH, signed per RFC 8945 §5.3 — and it is the one capture an
+        // operator wants during a key-guessing probe.
         let stranger = TsigKey::new("stranger.key.", TsigAlgorithm::HmacSha256, vec![9u8; 32]);
         let probe = update_message(
             "example.com.",
@@ -3852,10 +3822,10 @@ pub(crate) mod tests {
             "a key this server does not hold"
         );
 
-        // Polled rather than slept, twice, because a loaded machine decided
-        // the result (`TODO.md` #68a). A frame is recorded after its reply is
-        // sent, so the client can hold the fourth reply before the server has
-        // queued the fourth frame; stopping then left three.
+        // Polled rather than slept, twice, because a loaded machine decides a
+        // sleep. A frame is recorded after its reply is sent, so the client can
+        // hold the fourth reply before the server has queued the fourth frame;
+        // stopping then leaves three.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while data_frames(&std::fs::read(&capture).expect("the capture file")) < 4 {
             assert!(
@@ -3890,14 +3860,13 @@ pub(crate) mod tests {
 
     /// A refused UPDATE is signed at the instant that verified it.
     ///
-    /// `signed_error` used to read the wall clock itself, 464 lines below the
-    /// `finish` that signs with the `now` the request was checked against
-    /// (`TODO.md` #87). Latent, because `Clock::System` *is* that read — which
-    /// is why it takes a fixed clock to see, and why the fix is a type
-    /// (`Refused`) rather than a thirteenth careful call site.
+    /// Not a second read of the wall clock, which differs from the `now` the
+    /// request was checked against — invisible under `Clock::System`, so it
+    /// takes a fixed clock to see, and the guard is a type (`Refused`) rather
+    /// than a thirteenth careful call site.
     ///
-    /// Fails against the old `session.sign(bytes, current_unix_timestamp())`
-    /// with `TsigError::BadTime`. Checked by reverting that one call.
+    /// Fails with `session.sign(bytes, current_unix_timestamp())`:
+    /// `TsigError::BadTime`.
     #[tokio::test]
     async fn a_refused_update_is_signed_at_the_instant_that_verified_it() {
         // Fixed, and far outside RFC 8945 §5.2.3's 300-second fudge from any
@@ -4047,7 +4016,8 @@ pub(crate) mod tests {
         );
 
         // NOTAUTH whatever the credential: the zone is checked first, or the
-        // rcode no longer says which of server and key to change (#118).
+        // rcode does not say which of server and key to change
+        // (`TODO.md` #118).
         let unsigned_elsewhere = update_message(
             "nowhere.test.",
             vec![a_record("new.nowhere.test.", "192.0.2.50")],
@@ -4179,7 +4149,7 @@ pub(crate) mod tests {
 
     /// The `$INCLUDE` refusal as the client sees it. The unit test on
     /// `apply_update_to_file` stops at the `UpdateFailure`; this is the rcode
-    /// and EDE the handler turns it into (`TODO.md` #130).
+    /// and EDE the handler turns it into.
     #[tokio::test]
     async fn an_update_to_a_zone_file_that_includes_another_says_so() {
         let dir = ScratchDir::new("update-include-answer");
@@ -4205,9 +4175,9 @@ pub(crate) mod tests {
     /// acts on the difference: SERVFAIL sends it to the next server, anything
     /// else ends the update (§4.5, §4.6).
     ///
-    /// Removed rather than chmod'ed: a mode does not stop root, and Windows
-    /// has none. Watched failing against `file_for`'s `read_dir(dir).ok()?`,
-    /// which answered REFUSED with `NOT_WRITABLE` (`TODO.md` #119).
+    /// Removed rather than chmod'ed: a mode does not stop root, and Windows has
+    /// none. Fails with `file_for` reading `read_dir(dir).ok()?`, which answers
+    /// REFUSED with `NOT_WRITABLE`.
     #[tokio::test]
     async fn an_update_when_the_zone_directory_cannot_be_read_is_servfail() {
         let dir = ScratchDir::new("update-no-dir");
@@ -4257,10 +4227,9 @@ pub(crate) mod tests {
     /// secondary held beforehand. Anything less is a file that exists rather
     /// than a history that works.
     ///
-    /// Watched failing with the journal write removed from `install_zone`:
-    /// the update still applied and was still served, and `Journal::load` came
-    /// back empty, so `chain_from` had nothing to answer with — which is
-    /// precisely the pre-journal behaviour it is meant to replace.
+    /// Fails with the journal write removed from `install_zone`: the update
+    /// still applies and is still served, and `Journal::load` comes back empty,
+    /// so `chain_from` has nothing to answer with.
     #[tokio::test]
     async fn an_update_leaves_a_journal_that_survives_the_process() {
         let dir = ScratchDir::new("update-journal");
@@ -4342,10 +4311,10 @@ pub(crate) mod tests {
     }
 
     /// And the refusal says which policy refused it, because "REFUSED" over a
-    /// working TLS connection is otherwise an afternoon's debugging
-    /// (RFC 8914, `TODO.md` #44b). Read off the wire rather than from the
-    /// constant: the reply's OPT is where it has to be (RFC 8914 §2), and an
-    /// EDE that never reaches it is the same as none.
+    /// working TLS connection is otherwise an afternoon's debugging (RFC 8914).
+    /// Read off the wire rather than from the constant: the reply's OPT is
+    /// where it has to be (RFC 8914 §2), and an EDE that never reaches it is
+    /// the same as none.
     #[tokio::test]
     async fn the_refusal_says_the_transfer_must_be_encrypted() {
         let zone = rdns::zone::parse_zone_file(&zone_at_serial(7), "example.com.").expect("zone");
@@ -4517,9 +4486,9 @@ pub(crate) mod tests {
                 .map(|o| o.data)
         }
 
-        /// RFC 7830 §4's MUST over an encrypted transport, a Padding option
-        /// of any content asking (§3); none unasked; none over plain TCP,
-        /// which §6 forbids. Watched failing with `pads` returning `false`.
+        /// RFC 7830 §4's MUST over an encrypted transport, a Padding option of
+        /// any content asking (§3); none unasked; none over plain TCP, which §6
+        /// forbids. Fails with `pads` returning `false`.
         #[tokio::test]
         async fn a_padded_query_over_dot_gets_a_padded_reply() {
             let dot = primary(dot()).await;
@@ -4548,8 +4517,8 @@ pub(crate) mod tests {
         }
 
         /// Every envelope of a signed AXFR over DoT is padded and its MAC,
-        /// which covers the padding, chains and verifies. Watched failing with
-        /// the transfer loop's padding removed: envelope 0 carried none.
+        /// which covers the padding, chains and verifies. Fails with the
+        /// transfer loop's padding removed: envelope 0 carries none.
         #[tokio::test]
         async fn every_envelope_of_a_signed_transfer_is_padded_and_verifies() {
             let addr = primary(dot()).await;
@@ -4659,8 +4628,8 @@ pub(crate) mod tests {
 
         /// Asked over either transport, with or without a payload in the
         /// request (§2.2: "MUST ignore any NSID payload data"), the answer is
-        /// the configured value; unasked, or unconfigured, there is none.
-        /// Watched failing with `mirror` ignoring `server.nsid`.
+        /// the configured value; unasked, or unconfigured, there is none. Fails
+        /// with `mirror` ignoring `server.nsid`.
         #[tokio::test]
         async fn an_nsid_request_gets_the_configured_identifier() {
             let on = server(Some(b"edge-7"));

@@ -1,9 +1,9 @@
 //! Fixtures shared by more than one module's tests: message builders, a
 //! scratch directory, a `Server` to call, and primaries on loopback ports.
 //!
-//! Here rather than in the crate root's test module, where they were until
-//! `TODO.md` #116: a fixture there is reachable from the root's tests alone,
-//! which is what kept a module's tests out of that module.
+//! Here rather than in the crate root's test module: a fixture there is
+//! reachable from the root's tests alone, which keeps a module's tests out of
+//! that module.
 //!
 //! Builders only. A helper that asserts, or that knows what a correct answer
 //! looks like, belongs beside the tests that care — that knowledge is what a

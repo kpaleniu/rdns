@@ -50,8 +50,8 @@ use crate::replication::{
 struct CatalogSpec {
     /// The catalog zone as `--catalog` named it. Kept whole rather than
     /// unpacked into three fields, because a member inherits it whole: the
-    /// unpacked copy is what silently drops a field added later, and the field
-    /// added later was `tls` (`TODO.md` #44d, `CLAUDE.md` §7).
+    /// unpacked copy is what silently drops a field added later, such as `tls`
+    /// (`CLAUDE.md` §7).
     spec: MasterSpec,
     /// Resolved once at startup, so a member added at three in the morning
     /// cannot fail on a key name that was already known to be missing.
@@ -234,9 +234,9 @@ struct CatalogState {
     membership: Membership,
     /// What each catalog declined at its last reconcile, by catalog zone.
     ///
-    /// §5.2's clash is "an error SHOULD be logged" and was logged and nowhere
-    /// else, so the one question `rdnsctl status` could never answer was about
-    /// a zone that has no row in it (`TODO.md` #49).
+    /// §5.2's clash is "an error SHOULD be logged", and logged alone it is the
+    /// one question `rdnsctl status` cannot answer: a zone that has no row in
+    /// it.
     refused: HashMap<NameKeyBuf, Refusals>,
     /// The serial of each catalog as last reconciled, so an hourly refresh that
     /// changed nothing costs a lookup instead of a parse of every member. A
@@ -525,12 +525,12 @@ impl Catalogs {
     ) {
         let mine: Vec<MemberRow> = state.membership.members_of(spec.spec.zone.as_ref());
         // Rebuilt from scratch: a member refused last time and accepted now
-        // must stop being reported (`TODO.md` #49).
+        // must stop being reported.
         let mut refused = Refusals::default();
 
         for member in catalog.members() {
             // Which group's configuration this member now falls under, and
-            // whether the answer is a conflict (§4.3.2, `TODO.md` #48).
+            // whether the answer is a conflict (§4.3.2).
             let fetch = spec.fetch(member);
             if let Fetch::Ambiguous(why) = &fetch {
                 // Refused, and *left alone* if it is already ours: §5.1's rule
@@ -929,7 +929,7 @@ struct MemberRow {
     /// `<unique-N>.zones.$CATZ`, which carries the catalog too.
     node: Name,
     /// The group whose configuration fetched it, or `None` for the catalog's
-    /// own master (§4.3.2, `TODO.md` #48).
+    /// own master (§4.3.2).
     ///
     /// Recorded rather than re-derived, because §5.4's reset is about the
     /// member *node* label: a group changing under an unchanged label means the
@@ -947,11 +947,11 @@ struct MemberRow {
 /// each other. Both names are written in presentation form, which escapes
 /// whatever octets a producer chose for `<unique-N>`.
 ///
-/// The third field arrived with `TODO.md` #48 and a row may still have two: a
-/// file an older build wrote reads as "no group", which is what that build
-/// meant. The reverse is not true — an older build reading a three-field row
-/// skips it and loses that member's provenance — so a downgrade costs one
-/// reconcile's worth of removals going unnoticed, and the file says so.
+/// A row may have two fields: a file written without groups reads as "no
+/// group", which is what it meant. The reverse is not true — an older build
+/// reading a three-field row skips it and loses that member's provenance — so a
+/// downgrade costs one reconcile's worth of removals going unnoticed, and the
+/// file says so.
 struct Membership {
     path: PathBuf,
     rows: Vec<MemberRow>,
@@ -1090,8 +1090,7 @@ fn catalog_of(node: NameRef<'_>) -> NameRef<'_> {
     node.suffix(node.label_count().saturating_sub(2))
 }
 
-/// Two fields or three: the third arrived with `TODO.md` #48, and a file an
-/// older build wrote means "no group", which is what that build did.
+/// Two fields or three: a two-field row means "no group".
 fn parse_row(line: &str) -> Result<MemberRow> {
     let mut fields = line.split_whitespace();
     let (Some(zone), Some(node), group, None) =
@@ -1195,7 +1194,7 @@ mod tests {
         }
 
         /// One catalog with a group table, as a config file's
-        /// `[zones."…".groups."…"]` supplies it (`TODO.md` #48).
+        /// `[zones."…".groups."…"]` supplies it.
         fn grouped(tag: &str, catalog: &str, groups: &[(&str, &[&str])]) -> Harness {
             Harness::seeded(tag, &[catalog], &[], &[], groups)
         }
@@ -1667,11 +1666,11 @@ mod tests {
         catalog_zone("catalog.invalid.", serial, &[(id, zone)], &extra)
     }
 
-    /// RFC 9432 §4.3.2, the point of #48: a group value the operator mapped
-    /// fetches the member from somewhere else than the catalog's own master.
+    /// RFC 9432 §4.3.2: a group value the operator mapped fetches the member
+    /// from somewhere else than the catalog's own master.
     ///
-    /// Watched failing with the group table empty: the member came from
-    /// 192.0.2.1, the catalog's master.
+    /// Fails with the group table empty: the member comes from 192.0.2.1, the
+    /// catalog's master.
     #[tokio::test]
     async fn a_mapped_group_fetches_the_member_from_its_own_master() {
         let h = Harness::grouped(
@@ -1787,8 +1786,8 @@ mod tests {
     /// unchanged label is the same zone fetched from somewhere else, so the
     /// refresh task is replaced and the data is not.
     ///
-    /// Watched failing without the group in the sidecar row: the reconcile saw
-    /// an unchanged node, did nothing, and the member kept coming from the old
+    /// Fails without the group in the sidecar row: the reconcile sees an
+    /// unchanged node, does nothing, and the member keeps coming from the old
     /// master.
     #[tokio::test]
     async fn a_changed_group_re_points_the_member_without_resetting_it() {
@@ -1839,9 +1838,9 @@ mod tests {
         );
     }
 
-    /// RFC 9432 §6, the point of #49: the refusals §5.2 says to log are also
-    /// reported, because a member this server declined has no zone and so no
-    /// row in `rdnsctl status`.
+    /// RFC 9432 §6: the refusals §5.2 says to log are also reported, because a
+    /// member this server declined has no zone and so no row in
+    /// `rdnsctl status`.
     ///
     /// Rebuilt every reconcile, so a member refused once and accepted later
     /// stops being reported — which the second half asserts.
@@ -1944,8 +1943,7 @@ mod tests {
         }
     }
 
-    /// A file a build older than #48 wrote has two fields, and meant "no
-    /// group", which is what that build did.
+    /// A two-field row, written without groups, means "no group".
     #[test]
     fn a_two_field_sidecar_row_reads_as_no_group() {
         let row = parse_row("example.com. nj2xg5b.zones.catalog.invalid.").expect("two fields");

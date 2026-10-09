@@ -1,8 +1,7 @@
 //! Telling the secondaries, and who they are (RFC 1996).
 //!
-//! Split out of `main.rs` by `TODO.md` #83, on #38d's criterion rather than on
-//! line count: the cluster has an owner and a lifetime, and its one reach-back
-//! into `main` was `build_notify_policy` taking `&Cli` to read one field.
+//! Not in `main.rs`, on `TODO.md` #38d's criterion rather than on line count
+//! (#83): the cluster has an owner and a lifetime.
 
 use anyhow::{anyhow, Result};
 use std::collections::BTreeMap;
@@ -41,10 +40,9 @@ fn parse_notify_peers(specs: &[String], keys: &TsigKeyring) -> Result<Vec<Notify
 
 /// The global list plus whatever `[zones."x"].also-notify` adds per zone.
 ///
-/// The per-zone half is #46c: it was parsed into `PerZone::notify` and read by
-/// nothing, so a config that named extra secondaries for one zone was accepted
-/// and silently ignored, with `docs/spec/03-authoritative-server.md` and
-/// `06-operations.md` both documenting it as working.
+/// The per-zone half is read here from `PerZone::notify`; parsed and read by
+/// nothing, a config naming extra secondaries for one zone would be accepted
+/// and silently ignored.
 pub(crate) fn build_notify_policy(
     global: &[String],
     per_zone: &BTreeMap<String, Vec<String>>,
@@ -95,7 +93,7 @@ pub(crate) async fn announce_zones(
     }
     for (zone, serial, soa) in pending {
         // Per zone, not once for the whole run: `[zones."x"].also-notify` adds
-        // to the global list for that zone alone (#46c).
+        // to the global list for that zone alone.
         for peer in notify.targets_for(zone.as_ref()) {
             let peer = peer.clone();
             let zone = zone.clone();
@@ -155,7 +153,7 @@ pub(crate) fn announce_transfer(
 /// Every rcode ends the retries, because the secondary has the message and
 /// repeating it would not change its mind — but only NOERROR means it will
 /// refresh, and the difference is logged rather than flattened into
-/// "acknowledged" (#46b).
+/// "acknowledged".
 ///
 /// Giving up after [`notify::NOTIFY_ATTEMPTS`] is safe because the secondary's
 /// refresh timer is the backstop this is an optimisation over.
@@ -282,11 +280,9 @@ mod tests {
     /// A refusal ends the sending: it arrived, and repeating it would not change
     /// the secondary's mind.
     ///
-    /// **Not a regression test for #46b**, and saying so is the point (§10).
-    /// The old code stopped here too — what it did wrong was call it
-    /// `acknowledged` at INFO. That distinction lives in `notify::outcome`'s
-    /// return type and is tested beside it; this only holds the retry behaviour
-    /// that the rewording must not have changed.
+    /// **Not a test of how the refusal is reported**, and saying so is the
+    /// point (§10). That distinction lives in `notify::outcome`'s return type
+    /// and is tested beside it; this only holds the retry behaviour.
     #[tokio::test]
     async fn test_a_refused_notify_is_not_retried() {
         let downstream = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
@@ -380,11 +376,11 @@ mod tests {
         sender.await.expect("the sender finishes");
     }
 
-    /// #46c: `[zones."x"].also-notify` adds to the global list for that zone
-    /// and leaves every other zone's alone.
+    /// `[zones."x"].also-notify` adds to the global list for that zone and
+    /// leaves every other zone's alone.
     ///
-    /// There is no old behaviour for this to fail against, which is the finding:
-    /// the per-zone list was parsed into `PerZone::notify` and read by nothing.
+    /// Fails if the per-zone list is parsed into `PerZone::notify` and read by
+    /// nothing.
     #[test]
     fn test_per_zone_notify_targets_add_to_the_global_list() {
         let peer = |s: &str| NotifyPeer {

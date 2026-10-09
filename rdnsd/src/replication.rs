@@ -81,19 +81,18 @@ pub(crate) struct ReplicatedZone {
 
 /// Replicated zones by origin.
 ///
-/// [`NameKeyBuf`] rather than the `Vec<u8>` it was until `TODO.md` #40d: the
-/// insertion here and the probe in [`Secondaries::notified`] each folded by
-/// hand, under two comments pointing at each other to say they agreed
-/// (`CLAUDE.md` §17). The constructor folds, so they cannot now disagree, and
-/// `Borrow<[u8]>` keeps the probe free of an allocation.
+/// [`NameKeyBuf`] rather than `Vec<u8>`, which leaves the insertion here and
+/// the probe in [`Secondaries::notified`] each folding by hand (`CLAUDE.md`
+/// §17). The constructor folds, so they cannot disagree, and `Borrow<[u8]>`
+/// keeps the probe free of an allocation.
 ///
-/// Mutable behind a lock since `TODO.md` #44a, because catalog zones make
-/// membership a thing that changes while the process runs (RFC 9432 §5.1:
-/// "when a name server that supports catalog zones completes a zone transfer
-/// for a catalog zone, it SHOULD apply changes ... without any manual
-/// intervention"). A `std::sync::RwLock` and not tokio's: every section below
-/// is a map probe, `notified` is called from a `fn` on the answering path, and
-/// nothing here awaits.
+/// Mutable behind a lock, because catalog zones make membership a thing that
+/// changes while the process runs (RFC 9432 §5.1: "when a name server that
+/// supports catalog zones completes a zone transfer for a catalog zone, it
+/// SHOULD apply changes ... without any manual intervention"). A
+/// `std::sync::RwLock` and not tokio's: every section below is a map probe,
+/// `notified` is called from a `fn` on the answering path, and nothing here
+/// awaits.
 #[derive(Default)]
 pub(crate) struct Secondaries {
     by_zone: std::sync::RwLock<HashMap<NameKeyBuf, ReplicatedZone>>,
@@ -277,7 +276,7 @@ pub(crate) struct ReplicationContext {
     /// peer is in [`MasterSpec::tls`].
     pub(crate) xot: Option<TlsClientTrust>,
     /// What contact and EXPIRE are measured on, so a test can move past an
-    /// EXPIRE without waiting it out (`TODO.md` #128).
+    /// EXPIRE without waiting it out.
     pub(crate) clock: Clock,
 }
 
@@ -351,8 +350,8 @@ pub(crate) fn resolve_key(
 /// Start one refresh task and register it, so a NOTIFY can reach it.
 ///
 /// The one way a refresh task comes into being: `--secondary` at startup and a
-/// catalog adding a member (`TODO.md` #44a) go through here, so the two cannot
-/// register a zone differently.
+/// catalog adding a member go through here, so the two cannot register a zone
+/// differently.
 pub(crate) fn spawn_secondary(
     spec: MasterSpec,
     key: Option<TsigKey>,
@@ -656,9 +655,9 @@ pub(crate) async fn withdraw_expired(
 // Stop serving a zone, and forget everything derived from holding it.
 ///
 /// Three callers — EXPIRE, an unvouched copy at startup, a catalog dropping a
-/// member — and three copies of it until `TODO.md` #44a, which is how the
-/// metrics half came to be missing from one of them once already
-/// (`CLAUDE.md` §7, §14). Returns whether the zone was there to withdraw.
+/// member — and one copy, because three is how the metrics half goes missing
+/// from one of them (`CLAUDE.md` §7, §14). Returns whether the zone was there
+/// to withdraw.
 pub(crate) async fn withdraw(served: &ZoneContext, zone: NameRef<'_>) -> bool {
     let ZoneContext {
         zone_map,
@@ -1167,8 +1166,8 @@ mod tests {
     /// One master in contact keeps a zone served, however long the other has
     /// been silent. RFC 1034 §4.3.5 discards a copy only when "the secondary
     /// finds it impossible to perform a serial check for the EXPIRE interval"
-    /// (`TODO.md` #131). Watched failing with contact looked up per master:
-    /// the zone was withdrawn.
+    /// (`TODO.md` #131). Fails with contact looked up per master: the zone is
+    /// withdrawn.
     #[tokio::test]
     async fn one_dead_master_of_two_does_not_expire_the_zone() {
         let t = two_masters("two-masters-expire");
@@ -1190,8 +1189,7 @@ mod tests {
 
     /// The same at startup and on every reload: a master with no line in the
     /// sidecar does not unvouch a zone another master has one for
-    /// (`TODO.md` #131). Watched failing against the per-spec loop: the zone
-    /// was withdrawn.
+    /// (`TODO.md` #131). Fails with a per-spec loop: the zone is withdrawn.
     #[tokio::test]
     async fn one_unreached_master_of_two_does_not_unvouch_the_zone() {
         let t = two_masters("two-masters-unvouched");
@@ -1375,7 +1373,7 @@ mod tests {
 
         // The first transfer announces; answer it. Unanswered, it is resent
         // after `NOTIFY_RETRY_SECS` (RFC 1996 §3.6), and under load that resend
-        // landed in the silence window below (`TODO.md` #68b).
+        // lands in the silence window below.
         refresh_once(&spec, None, &r, &test_shutdown().busy())
             .await
             .expect("transfer");
@@ -1618,8 +1616,7 @@ mod tests {
     /// looking at it. `check_request` is the same function the answering path
     /// runs on an inbound message, so this is the check a real secondary makes.
     ///
-    /// Against the old code this fails at `TsigCheck::Unsigned`: `notify.rs`
-    /// mentioned TSIG nowhere and `--also-notify` had no way to name a key.
+    /// Fails at `TsigCheck::Unsigned` if the NOTIFY goes out unsigned.
     #[tokio::test]
     async fn test_a_notify_can_be_signed_and_verifies_as_a_request() {
         let dir = ScratchDir::new("announce-signed");

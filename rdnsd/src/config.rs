@@ -8,15 +8,13 @@
 //!
 //! A file and the flags are mutually exclusive — `--config` with `--port` is an
 //! error, not a precedence rule, because both values are valid and the failure
-//! would be silent. ~~`--check-config`, `--generate-keys` and `--config` itself
-//! are exempt~~ — **six are, not three** (`TODO.md` #79f): those, plus
-//! `--key-algorithm`, which is `--generate-keys`' parameter, and `--log-level`
-//! and `--quiet`, which the file has no key for. Every other flag carries
-//! `conflicts_with = "config"`, and the authority for that is
+//! would be silent. Six flags are exempt: `--check-config`, `--generate-keys`,
+//! `--config` itself, `--key-algorithm`, which is `--generate-keys`' parameter,
+//! and `--log-level` and `--quiet`, which the file has no key for. Every other
+//! flag carries `conflicts_with = "config"`, and the authority for that is
 //! `a_setting_the_file_can_write_is_refused_beside_config` below: it walks
-//! `Cli::command()` and requires a flag not refused beside `--config` to have no
-//! key in the file, so clap owns one half and serde the other. This sentence
-//! named two counts instead, and both went stale (`TODO.md` #115).
+//! `Cli::command()` and requires a flag not refused beside `--config` to have
+//! no key in the file, so clap owns one half and serde the other.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -286,7 +284,7 @@ pub(crate) struct PerZone {
 pub(crate) struct GroupRule {
     /// The group value as it appears in the catalog: octets, because that is
     /// what a TXT record's character-string is. The config key's UTF-8 encoding
-    /// is the needle (`TODO.md` #48).
+    /// is the needle.
     pub(crate) value: Vec<u8>,
     /// The config key as written, for the log line and the error message.
     pub(crate) name: String,
@@ -417,11 +415,11 @@ impl Config {
         // and finds it is not has no way to see that from the outside.
         //
         // Through `MasterSpec::parse` rather than a `split_once('#')` here,
-        // which is what this was until `TODO.md` #44d and is exactly the shape
-        // `CLAUDE.md` §7 warns about: the endpoint syntax grew a `+tls=` suffix
-        // and this copy read `k.+tls=ns1.example.net.` as the key name. The
-        // flag's parser is the only thing that knows the syntax, so it is what
-        // has to be asked — and asking it validates the address here too.
+        // which is the shape `CLAUDE.md` §7 warns about: the endpoint syntax
+        // has a `+tls=` suffix, and a copy reads `k.+tls=ns1.example.net.` as
+        // the key name. The flag's parser is the only thing that knows the
+        // syntax, so it is what has to be asked — and asking it validates the
+        // address here too.
         for (zone, settings) in &self.zones {
             for master in &settings.masters {
                 let spec = rdns::secondary::MasterSpec::parse(&format!("{zone}@{master}"))
@@ -570,15 +568,14 @@ impl Config {
     /// apart (`CLAUDE.md` §7). It is sound because the two are mutually exclusive
     /// — nothing in `cli` can be an operator's explicit choice here.
     ///
-    /// `[server]` is `apply_to`'s, generated beside the declarations: the
-    /// thirty-six keys used to be assigned by hand here and in `rdnsr`, where
-    /// a key with no assignment parsed and did nothing (`TODO.md` #103). What
-    /// is left below is what is not a `[server]` key.
+    /// `[server]` is `apply_to`'s, generated beside the declarations, so a key
+    /// cannot parse and do nothing. What is left below is what is not a
+    /// `[server]` key.
     ///
     /// The rest is destructured without `..`, so a key added to a declaration
     /// does not compile until this names it, and one named and not used is
-    /// `unused_variables`. `dead_code` covered only a key nothing read; one
-    /// `check` validates and this forgot passed silently (`TODO.md` #113).
+    /// `unused_variables`. `dead_code` covers only a key nothing reads; one
+    /// `check` validates and this forgot would pass silently.
     pub(crate) fn apply(&self, cli: &mut Cli) -> Result<PerZone> {
         let Config {
             server,
@@ -790,16 +787,15 @@ allow-partial-load = true
 
     /// Every `[server]` key reaches the flag of the same name, with its value.
     ///
-    /// The guard `TODO.md` #103 found missing. `deny_unknown_fields` refuses a
-    /// key the struct does not declare; nothing refused a key the struct
-    /// declared and `apply` never read, so it parsed and did nothing. The
-    /// projection is generated from the declarations now (`server_table!`), and
-    /// this is the behavioural half: it asserts the *value*, so a key wired to
-    /// the wrong flag fails too, which a comparison against the default cannot
-    /// see.
+    /// `deny_unknown_fields` refuses a key the struct does not declare; this
+    /// refuses one the struct declares and `apply` never reads, which parses
+    /// and does nothing. The projection is generated from the declarations
+    /// (`server_table!`), and this is the behavioural half: it asserts the
+    /// *value*, so a key wired to the wrong flag fails too, which a comparison
+    /// against the default cannot see.
     ///
-    /// Run against the hand-written projection with one line deleted, it names
-    /// that key.
+    /// Against a hand-written projection with one line deleted, it names that
+    /// key.
     #[test]
     fn every_server_key_reaches_its_flag() {
         let mut cli = Cli::parse_from(["rdnsd"]);
@@ -860,22 +856,17 @@ allow-partial-load = true
         }
     }
 
-    /// A config file that sets only what it must changes no default
-    /// (`TODO.md` #63e).
+    /// A config file that sets only what it must changes no default.
     ///
     /// The two spellings of one setting are a flag and a `[server]` or
     /// `[signing]` key, and `Config::apply` overwrites `cli` field by field —
     /// so they are never both in force and a pair that disagreed would look
-    /// correct from either side. Sixteen of them had a literal on each side
-    /// and nothing comparing them; both sides now read one function in the
-    /// crate root, which is what makes this pass by construction rather than
-    /// by luck.
+    /// correct from either side. Both sides read one function in the crate
+    /// root, which is what makes this pass by construction rather than by luck.
     ///
-    /// **A tripwire, not a regression test** (`CLAUDE.md` §10). Nothing here
-    /// was wrong: all sixteen pairs agreed when they were counted. What it
-    /// catches is the seventeenth, added with a fresh literal on each side —
-    /// run against a `default_query_burst` of 201, it fails naming
-    /// `query-burst`.
+    /// **A tripwire, not a regression test** (`CLAUDE.md` §10). What it catches
+    /// is a new pair added with a fresh literal on each side — run against a
+    /// `default_query_burst` of 201, it fails naming `query-burst`.
     #[test]
     fn a_minimal_config_changes_no_flag_default() {
         let mut cli = Cli::parse_from(["rdnsd"]);
@@ -1148,9 +1139,9 @@ masters = ["192.0.2.1#missing.key."]
     }
 
     /// A master's `#key` matches a `[keys.*]` entry as the keyring matches it:
-    /// as a domain name, so the trailing dot and the case are not the key. The
-    /// check compared text, refusing `#partner.key` for `partner.key.`, which
-    /// the flags accept (`TODO.md` #141).
+    /// as a domain name, so the trailing dot and the case are not the key.
+    /// Fails if the check compares text, refusing `#partner.key` for
+    /// `partner.key.`, which the flags accept.
     #[test]
     fn a_key_reference_matches_as_the_keyring_does() {
         for (defined, named) in [
@@ -1269,7 +1260,7 @@ secret = "AAECAwQFBgcICQoLDA0ODw=="
 
     /// A group table reaches `PerZone` keyed by the absolute zone, with the
     /// TOML key's octets as the value to match a catalog's group property
-    /// against (RFC 9432 §4.3.2, `TODO.md` #48).
+    /// against (RFC 9432 §4.3.2).
     #[test]
     fn a_catalog_group_reaches_per_zone_as_octets() {
         let config = parse(
@@ -1604,9 +1595,9 @@ zone-dir = \"./zones\"
         assert_eq!(off.server.dnstap, None, "and absent is off");
     }
 
-    /// RFC 8901 Model 1 is one key in one zone's table (`TODO.md` #44e). Model 2
-    /// is not here on purpose: it needs no setting, only the co-providers' ZSKs
-    /// in the zone file.
+    /// RFC 8901 Model 1 is one key in one zone's table. Model 2 is not here on
+    /// purpose: it needs no setting, only the co-providers' ZSKs in the zone
+    /// file.
     #[test]
     fn a_zone_can_say_its_dnskey_rrsig_is_signed_elsewhere() {
         let config = parse(

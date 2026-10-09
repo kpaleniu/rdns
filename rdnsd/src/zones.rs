@@ -36,9 +36,8 @@ use crate::{absolute_name, Cli};
 
 /// Every zone this server holds, keyed by its origin.
 ///
-/// [`NameKeyBuf`] rather than the `Box<[u8]>` it was until `TODO.md` #40d, which
-/// is where the doc comment here asserted "keyed by its origin in `NameKeyBuf`
-/// form" about a type that could hold any octets at all (`CLAUDE.md` §17). The
+/// [`NameKeyBuf`] rather than `Box<[u8]>`, which could hold any octets at all
+/// and leave "folded origin" a claim in a doc comment (`CLAUDE.md` §17). The
 /// key is folded so [`Zones::for_query`] can hash the QNAME's ancestors against
 /// it — bounded by the name's label count rather than by how many zones are
 /// served — and `Borrow<[u8]>` is what keeps that probe allocation-free.
@@ -50,10 +49,10 @@ pub(crate) type ZoneMap = HashMap<NameKeyBuf, Arc<Zone>>;
 /// The key a zone is held under: its own origin, folded.
 ///
 /// One definition, so no call site keys on `origin().to_string()` in whatever
-/// case its file used. The type now says the same thing, which is what makes
-/// reading a key back as a name infallible: six sites re-derived it with
-/// `NameRef::from_wire_slice`, and every one of them skipped the zone in silence
-/// on an `Err` that could not happen (`CLAUDE.md` §4).
+/// case its file used. The type says the same thing, which is what makes
+/// reading a key back as a name infallible, where re-deriving it with
+/// `NameRef::from_wire_slice` is an `Err` that cannot happen and a site that
+/// skips the zone in silence on it (`CLAUDE.md` §4).
 pub(crate) fn zone_key(zone: &Zone) -> NameKeyBuf {
     NameKeyBuf::new(zone.origin())
 }
@@ -178,7 +177,7 @@ pub(crate) enum ZoneSource {
 impl ZoneSource {
     /// The file a zone's records live in, or `None` if this source has none for
     /// it. `Err` is a directory that could not be read, which is a server
-    /// failure rather than an absence (`TODO.md` #119).
+    /// failure rather than an absence.
     ///
     /// Derived by the same function the loader uses, not reconstructed at the
     /// call site: a write landing anywhere but where the next load reads from is
@@ -396,11 +395,11 @@ pub(crate) async fn restore_journals(
 
 /// Delete the journals of zones this server does not hold.
 ///
-/// The gap [`restore_journals`] cannot see: it walks the zone list, so a journal
-/// left behind by a zone removed from the configuration *while the process was
-/// down* is never looked at. A reload deletes the journal of a zone it
-/// withdraws, and this is the same rule for the withdrawal nobody was running
-/// for (`TODO.md` #38b).
+/// The gap [`restore_journals`] cannot see: it walks the zone list, so a
+/// journal left behind by a zone removed from the configuration *while the
+/// process was down* is never looked at. A reload deletes the journal of a zone
+/// it withdraws, and this is the same rule for the withdrawal nobody was
+/// running for.
 ///
 /// Litter is the smaller half. The larger is that the file resurfaces if a zone
 /// of that name is ever added back: `journal::usable_against` refuses a history
@@ -716,7 +715,7 @@ pub(crate) fn validate_zone_source(
 ///
 /// The startup line names the rule, so the rule travels with the interval
 /// rather than being recomputed beside it: two copies of the formula is a log
-/// line that names the wrong reason after either changes (`TODO.md` #152).
+/// line that names the wrong reason after either changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Resign {
     pub(crate) every: Duration,
@@ -727,7 +726,7 @@ pub(crate) struct Resign {
 pub(crate) enum ResignReason {
     /// [`resign_after`] of the shortest validity, in seconds.
     Validity(u64),
-    /// A key timing step (#44f) is nearer than that.
+    /// A key timing step is nearer than that.
     KeyTransition,
 }
 
@@ -898,12 +897,12 @@ impl ZoneSigning {
     /// Floored at a minute so a tiny `--signature-validity` cannot make this a
     /// spin loop.
     ///
-    /// **Shortened to the next key transition when one is nearer** (`TODO.md`
-    /// #44f). A rollover moment is read by a signing *run*, so a key that
-    /// activates at noon takes effect at the next run — and the ordinary
-    /// interval is a third of the validity, ten days by default, for a step
-    /// whose entire purpose is to land at a TTL boundary. The timer has to know
-    /// what the keys are waiting for.
+    /// **Shortened to the next key transition when one is nearer.** A rollover
+    /// moment is read by a signing *run*, so a key that activates at noon takes
+    /// effect at the next run — and the ordinary interval is a third of the
+    /// validity, ten days by default, for a step whose entire purpose is to
+    /// land at a TTL boundary. The timer has to know what the keys are waiting
+    /// for.
     pub(crate) fn resign_interval(&self) -> Resign {
         self.resign_interval_at(current_unix_timestamp())
     }
@@ -973,7 +972,7 @@ impl ZoneSigning {
     ///
     /// The zone comes back inside a [`FreshlySigned`], which is the only way
     /// out of this function and has only one way out of itself: nothing this
-    /// run signed reaches the map without being checked (`TODO.md` #100).
+    /// run signed reaches the map without being checked.
     pub(crate) fn sign_one_incrementally(
         &self,
         previous: &Zone,
@@ -1007,7 +1006,7 @@ impl ZoneSigning {
     /// even when a tenth of the zone changed (`TODO.md` #65b). `None` at
     /// startup, where there is nothing to carry from, and on the re-signing
     /// timer, whose whole job is to make the signatures new — see
-    /// [`ZoneSigning::resign_interval`] and #65a.
+    /// [`ZoneSigning::resign_interval`].
     pub(crate) fn apply(
         &self,
         zones: &mut ZoneMap,
@@ -1056,7 +1055,7 @@ impl ZoneSigning {
                         .with_context(|| format!("re-signing {origin}"))?;
                     // What this run signed rather than carried, so
                     // `verify_zones` checks it even for a zone whose whole-zone
-                    // pass #53 lets it skip (`TODO.md` #100).
+                    // pass `ProvenSigning` lets it skip.
                     run.fresh.insert(apex, signed.fresh);
                     signed.zone
                 }
@@ -1093,9 +1092,9 @@ impl ZoneSigning {
 /// Handed to [`verify_zones`] so it can tell a zone this process signed a
 /// moment ago from a pre-signed one an operator dropped in. Key tags rather
 /// than a bare set of origins, because *which* keys sign moves without the zone
-/// file moving: a key crossing its Activate changes the output on the next tick
-/// (`TODO.md` #44f), and signatures no run has ever checked are exactly what
-/// the pass is for.
+/// file moving: a key crossing its Activate changes the output on the next
+/// tick, and signatures no run has ever checked are exactly what the pass is
+/// for.
 #[derive(Debug, Default)]
 pub(crate) struct SigningRun {
     roles: HashMap<Name, KeyRoles>,
@@ -1103,8 +1102,8 @@ pub(crate) struct SigningRun {
     ///
     /// Only the incremental path fills it, and it is what [`verify_zones`]
     /// checks in a zone [`ProvenSigning`] otherwise skips: "already proved" is
-    /// about the whole-zone pass #53 removed, and a run that re-signed
-    /// something still made signatures nothing has read (`TODO.md` #100).
+    /// about the whole-zone pass, and a run that re-signed something still made
+    /// signatures nothing has read.
     fresh: HashMap<Name, Vec<(Name, Rtype)>>,
 }
 
@@ -1164,8 +1163,7 @@ impl SigningRun {
 /// server signed, with the keys it has already been checked for, that is
 /// proving what it did a moment ago — and it is the expensive half: a
 /// million-record zone signs in 28 s and verifies in 76 s, paid at every
-/// startup, every SIGHUP, every `rdnsctl reload` and every re-signing tick
-/// (`TODO.md` #53).
+/// startup, every SIGHUP, every `rdnsctl reload` and every re-signing tick.
 ///
 /// Not "skip whatever we signed". Verifying our own output is the one place a
 /// canonicalization bug in the signer shows up, so the rule is **once per zone
@@ -1223,7 +1221,7 @@ pub(crate) struct Checked {
     /// Zones this run signed whose output had already been proved.
     pub(crate) skipped: usize,
     /// RRsets checked inside those zones: what the run re-signed, which no
-    /// earlier pass can have seen (`TODO.md` #100).
+    /// earlier pass can have seen.
     pub(crate) resigned: usize,
 }
 
@@ -1345,12 +1343,11 @@ pub(crate) fn verify_zones(
         let origin = key.as_name().to_presentation();
         if proved.already_proved(&apex, run) {
             done.skipped += 1;
-            // Skipped is not nothing. What #53 removed is the *whole-zone*
-            // pass; a run that re-signed this zone incrementally still made
+            // Skipped is not nothing. What is skipped is the *whole-zone* pass;
+            // a run that re-signed this zone incrementally still made
             // signatures no pass has read, and those are exactly the ones a
-            // canonicalization bug would be in (`TODO.md` #100). Empty for a
-            // zone this run did not sign, and for a full re-sign, which is the
-            // case #53 measured.
+            // canonicalization bug would be in. Empty for a zone this run did
+            // not sign, and for a full re-sign.
             let fresh = run.fresh_for(&apex);
             if !fresh.is_empty() {
                 let keys = ZoneKeys::of(zone);
@@ -1424,11 +1421,9 @@ fn verify_rrsets(
 /// A zone an incremental signing run has just produced, and the RRsets whose
 /// signatures that run made rather than carried forward.
 ///
-/// The zone cannot be had except through [`FreshlySigned::verify`]. That is the
-/// whole point: the dynamic-UPDATE path signed and installed, and the
-/// verification the startup pass does was a step at a call site rather than
-/// something the value owed, so it was never written (`TODO.md` #100,
-/// `CLAUDE.md` §17).
+/// The zone cannot be had except through [`FreshlySigned::verify`]: the
+/// verification is something the value owes, not a step a call site such as the
+/// dynamic-UPDATE path has to remember (`CLAUDE.md` §17).
 pub(crate) struct FreshlySigned {
     zone: Zone,
     fresh: Vec<(Name, Rtype)>,
@@ -1571,10 +1566,9 @@ pub(crate) fn load_zones(
                 zones: ZoneMap::new(),
                 kept: Default::default(),
             };
-            // Named, because the two sibling branches below name theirs and
-            // this one did not: a `--zone-file` that will not parse reported
-            // `line 2: ...` and nothing else, which is §7's second copy — the
-            // one place the shared reasoning was not applied (`TODO.md` #90).
+            // Named, as the two sibling branches below name theirs: a
+            // `--zone-file` that will not parse otherwise reports `line 2: ...`
+            // and nothing else (`CLAUDE.md` §7).
             let (key, zone, was_kept) = load_one(Path::new(path), &zone_origin, keep)
                 .map_err(|e| anyhow!("{path}: {e}"))?;
             if was_kept {
@@ -1758,7 +1752,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     /// The re-signing timer follows the nearest key rollover step when one is
-    /// closer than the ordinary tick (`TODO.md` #44f).
+    /// closer than the ordinary tick.
     ///
     /// Without it a key that activates at noon waits for the ordinary interval
     /// — ten days, by default — for a step whose entire purpose is to land at a
@@ -1793,7 +1787,7 @@ mod tests {
             }
         };
 
-        // No timing at all: the ordinary interval, exactly as before #44f.
+        // No timing at all: the ordinary interval.
         assert_eq!(
             with(KeyTiming::default()).resign_interval_at(NOW),
             ordinary,
@@ -1903,9 +1897,9 @@ mod tests {
     /// The key type is what upholds it: a `String` key carries whatever case
     /// the zone file used, so a plain `insert` would leave both entries and the
     /// server would answer from whichever the iteration order reached first.
-    /// Literally the key type since `TODO.md` #40d — [`NameKeyBuf::new`] folds and
-    /// is the only constructor, where `Box<[u8]>` left the folding to whichever
-    /// call site built the key.
+    /// Literally the key type: [`NameKeyBuf::new`] folds and is the only
+    /// constructor, where `Box<[u8]>` leaves the folding to whichever call site
+    /// builds the key.
     #[test]
     fn one_origin_in_two_cases_is_one_zone() {
         let mut zones = Zones::default();
@@ -1927,10 +1921,10 @@ mod tests {
     ///
     /// The withdrawal nobody was running for: a reload deletes the journal of a
     /// zone it drops, so the only way to leave one behind is to remove the zone
-    /// while the process is down (`TODO.md` #38b). Nothing swept them, and the
-    /// file then resurfaced under a zone of the same name.
+    /// while the process is down, and the file then resurfaces under a zone of
+    /// the same name.
     ///
-    /// Watched failing without the sweep: both journals were still there.
+    /// Fails without the sweep: both journals are still there.
     #[tokio::test]
     async fn a_journal_no_zone_claims_is_discarded_at_startup() {
         let dir = ScratchDir::new("orphan-journal");
@@ -2033,10 +2027,10 @@ mod tests {
 
     /// Choosing a zone must cost the same however many zones are served.
     ///
-    /// A ratio, not a floor: the same lookups timed against one zone and against
-    /// a thousand, on whatever machine runs it. A scan reads 10.3 ns at one zone
-    /// and 4.1 µs at a thousand; the walk reads 30 ns and 32. Watched failing at
-    /// 554×.
+    /// A ratio, not a floor: the same lookups timed against one zone and
+    /// against a thousand, on whatever machine runs it. A scan reads 10.3 ns at
+    /// one zone and 4.1 µs at a thousand; the walk reads 30 ns and 32. Fails
+    /// against the scan at 554×.
     ///
     /// The two loops do identical work per query; only the map size differs.
     #[test]
@@ -2186,9 +2180,9 @@ mod tests {
 
     /// A zone this server signed is proved once, not at every reload.
     ///
-    /// `TODO.md` #53: re-signing is a reload, and a reload re-verified
-    /// everything — 76 s of a million-record zone to prove what the 28 s above
-    /// it had just produced with the same keys.
+    /// Re-signing is a reload, and a reload that re-verifies everything spends
+    /// 76 s of a million-record zone proving what the 28 s above it has just
+    /// produced with the same keys.
     ///
     /// Counts, not a clock (`CLAUDE.md` §10): the claim is that the second pass
     /// checks nothing, which is an equality.
@@ -2249,11 +2243,11 @@ mod tests {
 
     /// A key crossing its `SyncPublish` makes its zone verified again.
     ///
-    /// The hole #55 opened in #53's rule and the reason `SigningRun` records
-    /// two lists: the signing key set does not move when a CDS appears, so
-    /// "once per zone per set of signing keys" would skip the one load whose
-    /// output is new. The CDS and CDNSKEY RRsets are signed by the SEP key
-    /// (RFC 7344 §4.1) and nothing would have checked those signatures.
+    /// The reason `SigningRun` records two lists (`TODO.md` #55): the signing
+    /// key set does not move when a CDS appears, so "once per zone per set of
+    /// signing keys" would skip the one load whose output is new. The CDS and
+    /// CDNSKEY RRsets are signed by the SEP key (RFC 7344 §4.1) and nothing
+    /// would have checked those signatures.
     #[test]
     fn a_key_entering_its_sync_window_is_verified_again() {
         let dir = ScratchDir::new("sync-window");
@@ -2335,12 +2329,10 @@ mod tests {
 
     /// A reload that re-signed a zone checks what it signed, proved or not.
     ///
-    /// #53's skip is about the *whole-zone* pass. The zone is already proved
-    /// for these keys, so nothing is verified a second time — and the RRsets
-    /// this run made are not a second time, they are a first
-    /// (`TODO.md` #100). Two instances of one shape: the UPDATE path had no
-    /// verification at all, and here it had one that skipped exactly the runs
-    /// that signed something new.
+    /// `ProvenSigning`'s skip is about the *whole-zone* pass. The zone is
+    /// already proved for these keys, so nothing is verified a second time —
+    /// and the RRsets this run made are not a second time, they are a first.
+    /// Fails if the skip covers exactly the runs that signed something new.
     ///
     /// Counts, not a clock (`CLAUDE.md` §10).
     #[test]
@@ -2382,9 +2374,8 @@ mod tests {
     ///
     /// The invariant `main.rs`'s startup pass states, at the one door no pass
     /// stood at: a dynamic UPDATE signs and installs, and `verify_zones` has
-    /// only the load and reload callers (`TODO.md` #100). Watched failing with
-    /// [`FreshlySigned::verify`] cut down to `Ok(self.zone)`, which is what the
-    /// UPDATE path did.
+    /// only the load and reload callers. Fails with [`FreshlySigned::verify`]
+    /// cut down to `Ok(self.zone)`.
     #[test]
     fn a_fresh_signature_that_does_not_cover_its_rrset_does_not_install() {
         let validator = DnssecValidator::new(true);
@@ -2634,7 +2625,7 @@ ns1 IN A 192.0.2.1
     }
 
     /// A key crossing its Activate changes the output with the file unchanged,
-    /// so it also has to stop the file being skipped (`TODO.md` #44f, #55).
+    /// so it also has to stop the file being skipped (`TODO.md` #55).
     ///
     /// The condition is `ProvenSigning`'s, which is not a coincidence: a reload
     /// that may skip verifying because nothing about the signing moved is a
@@ -2941,7 +2932,7 @@ ns1 IN A 192.0.2.1
         // it, and the reload is a little longer than one diff. Halving leaves
         // room for the diff inside the reload to run slower than the unlocked
         // baseline — it is competing with this sampler, after all — without
-        // leaving room for the old behaviour to pass.
+        // leaving room for a reload without the split to pass.
         assert!(
             longest * 2 > baseline,
             "over {attempts} samples the longest window in which a reader could be \

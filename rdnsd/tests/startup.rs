@@ -1,4 +1,4 @@
-//! The startup sequence, run as a process (`TODO.md` #90).
+//! The startup sequence, run as a process.
 //!
 //! Everything else in this workspace calls into the process it is already
 //! running in. That is right for the answer path — it goes over real sockets —
@@ -7,19 +7,19 @@
 //! when a change is about what happens to a process, the test has to involve a
 //! process.
 //!
-//! **The refuting check the row asked for was taken first**, and it came back
-//! the other way. Lifting the startup sequence out of `main` into a testable
-//! function is possible — there is nothing in it that needs a process — but it
-//! is not cheaper: `main` holds **28** top-level bindings before the dry-run
-//! exit and about twenty are still live after it, so the lifted function hands
-//! back a struct built in one place and destructured in another. That is #83's
-//! reload cluster exactly, measured there at 18 items and fields and declined
-//! on it. `CARGO_BIN_EXE_rdnsd` needs no container, works on both platforms,
-//! and tests the artefact an operator runs.
+//! Lifting the startup sequence out of `main` into a testable function is
+//! possible — there is nothing in it that needs a process — but it is not
+//! cheaper: `main` holds **28** top-level bindings before the dry-run exit and
+//! about twenty are still live after it, so the lifted function hands back a
+//! struct built in one place and destructured in another. That is
+//! `TODO.md` #83's reload cluster exactly, measured there at 18 items and
+//! fields and declined on it. `CARGO_BIN_EXE_rdnsd` needs no container, works
+//! on both platforms, and tests the artefact an operator runs.
 //!
 //! What this does *not* cover, said rather than implied (§18): binding sockets
-//! (one test since #155, to time an idle close), the drain, and signals. CI's `image` job covers those for `rdnsd` and is the
-//! one job no local `cargo` invocation stands in for.
+//! (one test, to time an idle close), the drain, and signals. CI's `image` job
+//! covers those for `rdnsd` and is the one job no local `cargo` invocation
+//! stands in for.
 
 use std::path::Path;
 use std::process::{Child, Command, Output};
@@ -38,8 +38,7 @@ ns1 IN A   192.0.2.1
 
 /// Held while a listener exists only to name a free port, and around every
 /// spawn: a child forked meanwhile inherits the listener until its `exec`, and
-/// a connect in that window is accepted there and reset when the child execs
-/// (`TODO.md` #167).
+/// a connect in that window is accepted there and reset when the child execs.
 static FORKING: Mutex<()> = Mutex::new(());
 
 fn forking() -> MutexGuard<'static, ()> {
@@ -140,10 +139,10 @@ fn check_config_refuses_a_zone_that_does_not_parse() {
 
 /// A flag whose *value* is malformed has to fail the dry run, not the start.
 ///
-/// `--dnstap` was parsed inside `serve`'s argument list, which is evaluated
-/// below the dry-run exit, so `--check-config` accepted a target the real start
-/// refused (`TODO.md` #99). Put the parse back in the argument list and this
-/// fails with a zero status and "configuration is valid" on stdout.
+/// Parsed inside `serve`'s argument list, which is evaluated below the dry-run
+/// exit, `--dnstap` passes `--check-config` with a target the real start
+/// refuses. Fails that way with a zero status and "configuration is valid" on
+/// stdout.
 #[test]
 fn check_config_refuses_a_malformed_dnstap_target() {
     let dir = ScratchDir::new("check-config-dnstap");
@@ -182,9 +181,9 @@ fn quiet_does_not_silence_the_dry_runs_answer() {
 }
 
 /// §15's "two sources for one setting is an error". `rdnsd/src/config.rs`
-/// already asks clap for the *set* of flags this applies to (#63i); this asks
-/// whether the refusal reaches the operator as a non-zero exit and a message
-/// naming both, which is a property of the process and not of the parser.
+/// already asks clap for the *set* of flags this applies to; this asks whether
+/// the refusal reaches the operator as a non-zero exit and a message naming
+/// both, which is a property of the process and not of the parser.
 #[test]
 fn a_flag_beside_config_is_refused_by_the_process() {
     let dir = ScratchDir::new("conflict");
@@ -268,15 +267,12 @@ fn a_server_with_no_zone_source_says_which_flag_it_wants() {
 }
 
 /// A bare dry run is refused the same way a bare start is, and says the same
-/// thing (`TODO.md` #90).
+/// thing.
 ///
-/// It used to demand `--config`: `#[arg(long, requires = "config")]` made
-/// `rdnsd --check-config` ask for a TOML file while `--check-config
-/// --zone-file x` ran happily, because `--zone-file` conflicts with `--config`
-/// so the requirement never fired where it would bite. Inert where it mattered
-/// and misleading where it fired. `rdnsr`'s `check_config` had the argument
-/// against it written on it and no attribute; `rdnsd` had the attribute and no
-/// argument (§7).
+/// Fails with `#[arg(long, requires = "config")]`: `rdnsd --check-config` asks
+/// for a TOML file while `--check-config --zone-file x` runs happily, because
+/// `--zone-file` conflicts with `--config` so the requirement never fires where
+/// it would bite.
 #[test]
 fn a_bare_dry_run_wants_a_zone_source_not_a_config_file() {
     let out = rdnsd(&["--check-config"]);
@@ -440,7 +436,7 @@ fn a_malformed_nsid_is_refused_and_hex_is_octets() {
 }
 
 /// On Windows `--control-socket` takes a pipe name and nothing else, refused
-/// before the dry run answers (`TODO.md` #188).
+/// before the dry run answers.
 #[cfg(windows)]
 #[test]
 fn a_control_socket_that_is_not_a_pipe_is_refused_on_windows() {
@@ -459,7 +455,7 @@ fn a_control_socket_that_is_not_a_pipe_is_refused_on_windows() {
 
 /// The control channel on Windows, against the process: `status`, `reload`
 /// re-reading a changed zone file, `dump` showing it, and a second server on
-/// the same pipe refused (`TODO.md` #188).
+/// the same pipe refused.
 #[cfg(windows)]
 #[test]
 fn the_control_pipe_reloads_a_changed_zone() {

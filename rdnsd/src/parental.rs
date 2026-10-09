@@ -1,12 +1,11 @@
 //! Holding a key-signing key's retirement until the parent's DS shows its
 //! successor (`TODO.md` #180).
 //!
-//! `KeyTiming` makes a rollover four timestamps and no state (#44f). For a
-//! ZSK that is the whole story; for a SEP key it is not, because the step
-//! that matters happens at the parent: if its DS still names only the old
-//! key when that key stops signing the DNSKEY RRset, the zone is bogus at
-//! every validator. So a SEP key past `Inactive` or `Delete` keeps signing
-//! and stays published until
+//! `KeyTiming` makes a rollover four timestamps and no state. For a ZSK that is
+//! the whole story; for a SEP key it is not, because the step that matters
+//! happens at the parent: if its DS still names only the old key when that key
+//! stops signing the DNSKEY RRset, the zone is bogus at every validator. So a
+//! SEP key past `Inactive` or `Delete` keeps signing and stays published until
 //!
 //! 1. every parental agent's DS RRset holds a DS for another SEP key that is
 //!    active and not itself retiring, and

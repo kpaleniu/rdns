@@ -3,9 +3,8 @@
 //! `rdns_transport::control`, shared with `rdnsr` (`TODO.md` #178).
 //!
 //! A Unix socket, or a named pipe on Windows, and no TCP; see
-//! [`rdns::control`]. ~~Unix-only: neither `std` nor `tokio` exposes AF_UNIX
-//! on Windows.~~ True, and taken as the reason without weighing `tokio`'s
-//! named pipes, which is what Windows now uses (`TODO.md` #188).
+//! [`rdns::control`]. Neither `std` nor `tokio` exposes AF_UNIX on Windows, so
+//! Windows uses `tokio`'s named pipes.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -38,8 +37,7 @@ pub(crate) struct Control {
     pub(crate) secondaries: Arc<crate::replication::Secondaries>,
     /// The catalogs this server consumes, so `status` can say where a zone came
     /// from and `catalog` can say what a catalog holds — including the members
-    /// it declined, which have no row anywhere else (RFC 9432 §6,
-    /// `TODO.md` #49).
+    /// it declined, which have no row anywhere else (RFC 9432 §6).
     pub(crate) catalogs: Arc<crate::catalog::Catalogs>,
     /// Where a `reload` request goes: the same loop SIGHUP and the re-signing
     /// timer feed, so two reloads cannot install two snapshots of one file set.
@@ -486,9 +484,9 @@ mod tests {
         parse_reply(&run(Request::parse(line), control).await)
     }
 
-    /// RFC 9432 §6, the point of #49: `status` says which catalog a zone came
-    /// from, and `catalog` lists what each one provisioned. Neither question had
-    /// an answer anywhere but the sidecar on disk.
+    /// RFC 9432 §6: `status` says which catalog a zone came from, and `catalog`
+    /// lists what each one provisioned. Otherwise neither question has an
+    /// answer anywhere but the sidecar on disk.
     #[tokio::test]
     async fn status_and_catalog_say_where_a_member_came_from() {
         let dir = crate::testutil::ScratchDir::new("control-catalog");
