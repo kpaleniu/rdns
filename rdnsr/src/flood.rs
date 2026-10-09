@@ -96,13 +96,9 @@ fn question(id: u16, name: &str) -> Vec<u8> {
         .expect("serialize")
 }
 
-/// 128 places and the default 10 s resolution timer fill at 12.8 queries a
-/// second; the attack is ten times that. Full, the client response timer
-/// frees a place 128 / 1.8 s = 71 times a second, shared between the attack's
-/// 128 and the client's 10: about half at best.
-///
-/// 17 and 18 of 40 answered here. Fails with a plain semaphore: 0 of 40, since
-/// nothing frees inside the timer's first 10 s.
+/// 128 places fill at 12.8 queries a second against a tenfold attack; full, the
+/// client response timer frees 71 a second, about half for the client at best.
+/// Fails with a plain semaphore: none of 40 answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_flood_of_silent_zones_leaves_room_for_a_client_that_is_waiting() {
     const PLACES: usize = 128;

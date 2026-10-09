@@ -39,9 +39,8 @@ pub(crate) async fn udp_main(
     let ctx = &serving.ctx;
     // Floored, not refused: nobody means "answer nothing".
     let in_flight = InFlight::new(max_inflight.max(1));
-    // Sized for any datagram a client may send, not the payload size we
-    // advertise: on Windows an oversized one fails the receive rather than
-    // truncating, and a failed receive ends this loop.
+    // Any datagram a client may send: on Windows an oversized one fails the
+    // receive, ending this loop.
     let mut buf = vec![0u8; UDP_RECEIVE_BUFFER];
     loop {
         // Stop receiving on shutdown. `recv_from` is cancel-safe, so a datagram
@@ -52,20 +51,16 @@ pub(crate) async fn udp_main(
         };
         let (n, from) = match received {
             Ok(received) => received,
-            // An ICMP report about a datagram already sent, or one that did
-            // not fit: neither says anything about this socket. Shared with
-            // `rdnsd` — see `recv_error_is_transient`.
+            // ICMP about a datagram sent, or one too big: nothing about this
+            // socket (`recv_error_is_transient`).
             Err(e) if recv_error_is_transient(&e) => continue,
             Err(e) => return Err(e),
         };
-        // Canonical for every check and record (`TODO.md` #158); the reply
-        // goes to `from`, which on a dual-stack socket is the mapped form the
-        // socket can send to.
+        // Canonical for every check and record; the reply goes to `from`, the
+        // form a dual-stack socket sends to.
         let peer = Peer::from(from);
-        // The query ACL before the rate limiter, so a peer it refuses gets no
-        // bucket (`CLAUDE.md` §5). Answered REFUSED rather than dropped, as
-        // BIND and Unbound answer one, but only a well-formed question and only
-        // within the response budget: the source is unproven.
+        // The ACL before the rate limiter, so a refused peer gets no bucket
+        // (`CLAUDE.md` §5); REFUSED only for a question within the budget.
         if !ctx.acl.admits(peer) {
             ctx.metrics.count(&ctx.metrics.acl_refused);
             if !ctx.accept_packet(peer, &buf[..n], Transport::Udp) {
@@ -76,14 +71,8 @@ pub(crate) async fn udp_main(
             }
             continue;
         }
-        // First, because it is the cheapest rejection and the one a flood
-        // should hit: a hash lookup and a token, before the packet is looked
-        // at. Dropping is silent, which is why the policy is printed at startup
-        // and counted here.
-        //
-        // One read for the limiter and the query log, which happen within
-        // microseconds of each other; the response budget reads its own, since a
-        // recursion sits in between (`TODO.md` #28a).
+        // First: the cheapest rejection. Silent, so printed at startup and
+        // counted; one clock read serves the limiter and the log.
         let now = ctx.clock.now();
         if !ctx.allow_source(peer, now) {
             continue;
@@ -181,9 +170,8 @@ impl tcp::Handler for Resolving {
         packet: Vec<u8>,
         peer: SocketAddr,
         now: u64,
-        // A resolver answers a query the same way whatever hid it from the
-        // path; what the arrival decides here is only whether the reply may be
-        // padded (RFC 7830 §6).
+        // The arrival decides only whether the reply may be padded (RFC 7830
+        // §6).
         arrival: Arrival,
         out: mpsc::Sender<tcp::Reply>,
     ) {

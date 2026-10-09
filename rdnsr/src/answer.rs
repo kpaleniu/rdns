@@ -127,15 +127,11 @@ pub(crate) async fn handle_query(
         dnstap: _,
         ctx,
     } = serving;
-    // One snapshot for one query: a SIGHUP can install a new set part-way
-    // through, and a query decided half by each is a rule nobody wrote. The
-    // `Arc` also outlives the resolution that the nameserver triggers are
-    // borrowed across, where a lock guard could not go (`CLAUDE.md` §9).
+    // One snapshot per query, so a SIGHUP cannot split one; an `Arc` because it
+    // outlives borrows a lock guard could not (`CLAUDE.md` §9).
     let policy = policy.in_force();
-    // Refuse a *response*: a reply parsed as a question and answered with
-    // another reply is a packet loop between two servers pointed at each other.
-    // `None` is the whole reply, because the peer did not ask anything. The type
-    // is what makes the check unskippable — see `rdns::validation::Request`.
+    // Refuse a response: answering one loops two servers pointed at each other.
+    // `None` is the reply; see `rdns::validation::Request`.
     let msg = match Request::from_bytes(&data) {
         Ok(msg) => msg,
         Err(_) => {
@@ -145,18 +141,16 @@ pub(crate) async fn handle_query(
     };
     let timer = LatencyTimer::new();
     ctx.metrics.count(&ctx.metrics.queries_received);
-    // Per source and per type, for the periodic anomaly warnings, as `rdnsd`
-    // counts them. `now` is the caller's: on UDP it is the instant the rate
-    // limiter already used.
+    // Per source and type for the anomaly warnings; `now` is the instant the
+    // rate limiter used.
     ctx.logger
         .log_query(peer, msg.queries.first().map(|q| q.qtype), now);
     if let Some(q) = msg.queries.first() {
         ctx.metrics.track_query_type(q.qtype);
     }
 
-    // The smaller of what the client said it can take and what this resolver
-    // will send, which on TCP is neither (`rdns::UdpSizes::reply_ceiling`).
-    // Before the opcode check, because a NOTIMP reply is bounded by it too.
+    // The smaller of the client's limit and ours, before the opcode check: it
+    // bounds NOTIMP too (`rdns::UdpSizes::reply_ceiling`).
     let client_max = ctx.udp.reply_ceiling(&msg, transport);
 
     // A NOTIFY is how a policy feed says it has changed, for a resolver told
@@ -187,10 +181,8 @@ pub(crate) async fn handle_query(
     let id = msg.id;
     let recursion = msg.recursion;
 
-    // Before any work on the client's behalf: a malformed option list is
-    // FORMERR, an unimplemented EDNS version is BADVERS (RFC 6891 §6.1.3), and
-    // both replies carry a bare version-0 OPT. `rdnsd` reads the same decision
-    // out of the same function.
+    // Before any work: a bad option list is FORMERR, an unknown EDNS version
+    // BADVERS (RFC 6891 §6.1.3). `rdnsd` uses the same function.
     let client_edns = match rdns::response::client_edns(&msg) {
         Ok(edns) => edns,
         Err(rcode) => {
@@ -198,22 +190,8 @@ pub(crate) async fn handle_query(
             return edns_error(&msg, rcode, client_max, ctx.udp.advertised());
         }
     };
-    // Exactly one question, or FORMERR — after the EDNS-level rejections above,
-    // which is the order `rdnsd` answers these two in.
-    //
-    // RFC 9619 §4: "A DNS message with OPCODE = 0 MUST NOT include a QDCOUNT
-    // parameter whose value is greater than 1", and one that does "MUST be
-    // treated as an incorrectly formatted message" — one RCODE and one set of
-    // sections cannot describe two lookups, and answering the first question
-    // and echoing one is a reply that does not match the request either.
-    //
-    // QDCOUNT = 0 too, as `rdnsd` answers it (`TODO.md` #78c): one packet, one
-    // behaviour across the two daemons. §4's QDCOUNT = 0 sentence settles
-    // neither, since it binds firewalls rather than responders. RFC 7873 §5.4
-    // is what such a query is for, extends the QUERY opcode to it only "for
-    // servers with DNS Cookies enabled", and says a server without them "will
-    // normally send FORMERR". Measured: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0
-    // and Unbound 1.23.1 all answer it and none drops it.
+    // Exactly one question, else FORMERR (RFC 9619 §4), QDCOUNT = 0 included,
+    // as `rdnsd` answers; `TODO.md` #78c compares other servers.
     let [query] = msg.queries.as_slice() else {
         ctx.record_answer(ResponseCode::FormatError, timer);
         return empty_error(
@@ -226,9 +204,8 @@ pub(crate) async fn handle_query(
     };
     let query = query.clone();
 
-    // DO means "send me the signatures", AD "tell me whether you checked"; CD
-    // means "don't withhold anything on my behalf, I validate myself", which is
-    // the message's own bit.
+    // CD means the client validates for itself, so nothing is withheld on its
+    // behalf.
     let checking_disabled = msg.cd;
     let client = Client {
         wants_ad: client_edns.do_bit() || msg.ad,
@@ -239,13 +216,8 @@ pub(crate) async fn handle_query(
         max_len: client_max,
     };
 
-    // Names that must not leave this machine (RFC 6761, 6762, 6303), and the
-    // empty zones the operator left on. Before every cache: the table *is* the
-    // answer, and consulting anything else means a query going out.
-    //
-    // Not skipped for CD, unlike the denial cache: CD is a statement about
-    // DNSSEC, not a request to be told what a public server thinks `localhost`
-    // is.
+    // Special-use names and enabled empty zones, before every cache: the table
+    // is the answer. Not skipped for CD, which is about DNSSEC.
     let routed = resolver
         .route_for(query.qname.as_ref())
         .map(|route| route.name.as_ref());
@@ -254,9 +226,8 @@ pub(crate) async fn handle_query(
     {
         let mut resp = build_response(&msg, local.answers, local.rcode);
         resp.authorities = local.authority;
-        // AA=1, unlike everything resolved (`Resolver::resolve_validated`
-        // clears it): RFC 6303 §3 asks for it, and these zones are defined to
-        // be empty, so the subtree claim RFC 8020 reads into AA is intended.
+        // AA=1, unlike resolved answers: RFC 6303 §3 asks for it, and these
+        // zones are empty by definition.
         resp.authoritive = true;
         // DEBUG: one line per query, with the name on it. Logging every query
         // is the operator's decision, not the default's.
@@ -266,16 +237,8 @@ pub(crate) async fn handle_query(
         return finish(resp, false, None, &client, &query, ctx, timer);
     }
 
-    // The operator's policy, before every cache and before any resolution: a
-    // blocked name must cost no upstream query, and an answer held from before
-    // the rule was written must not outlive it.
-    //
-    // After `special_names` and not before. For a special-use name that is
-    // because the table is a protocol requirement rather than a preference —
-    // RFC 6761 §6.3's `localhost` is the loopback address whatever a feed says
-    // about it. Not for an empty zone, which RFC 6303 §3 says the operator
-    // MUST be able to switch off (`TODO.md` #173); one that is on still
-    // answers first, and switching it off is how a feed reaches inside it.
+    // Policy before every cache: a block costs no upstream query. After
+    // special-use names (RFC 6761 §6.3) and enabled empty zones (RFC 6303 §3).
     if !policy.is_empty() {
         if let Some(rewrite) = policy.before_query(peer, query.qname.as_ref(), query.qtype) {
             if let Applied::Replied(reply) =
@@ -286,14 +249,8 @@ pub(crate) async fn handle_query(
         }
     }
 
-    // RFC 6147 §5.3.1: a PTR under `ip6.arpa` for an address inside the NAT64
-    // prefix is really a question about the IPv4 address embedded in it. Of the
-    // two answers §5.3.1 offers, this is the second — a CNAME into
-    // `in-addr.arpa` — because the first means inventing PTR data for a
-    // translator this resolver knows nothing about.
-    //
-    // Before the caches because the question is rewritten, not answered: what is
-    // cached is the `in-addr.arpa` name, under its own key.
+    // RFC 6147 §5.3.1's second answer, a CNAME into `in-addr.arpa`, not
+    // invented PTR data. Before the caches, which hold the rewritten name.
     if query.qtype.is(record_types::PTR) {
         if let Some(target) = serving
             .dns64
@@ -305,13 +262,8 @@ pub(crate) async fn handle_query(
         }
     }
 
-    // Build the response: from cache if we have it, else by resolving. The
-    // third is RFC 8914's reason, which only the two failing arms have.
-    //
-    // RFC 8198 synthesis is skipped for CD, which asks us not to filter on the
-    // client's behalf, and under a negative trust anchor: a proof validated in
-    // the zone above would answer the exempted names as secure, and that
-    // zone's proofs cannot be flushed by subtree (`TODO.md` #176).
+    // RFC 8198 synthesis is off for CD, and under an NTA, where the parent
+    // zone's proofs would answer exempted names as secure.
     let prefetching = refreshes.as_ref().is_some_and(Refreshes::prefetching);
     let under_nta = !resolver.ntas().is_empty()
         && resolver.trust_anchors().is_some_and(|anchors| {
@@ -350,19 +302,15 @@ pub(crate) async fn handle_query(
         }
         None => None,
     };
-    // The cache said this entry is in the last tenth of its TTL and nobody has
-    // been asked to refresh it yet. Offered here, at the lookup, so no exit
-    // below can drop it, and to a queue, so nothing runs in this task after the
-    // reply.
+    // Last tenth of its TTL and not yet queued: offered here so no exit drops
+    // it, and to a queue so nothing runs after the reply.
     if let (Some(refreshes), Some(hit)) = (refreshes, &hit) {
         if hit.refresh {
             refreshes.offer(query.clone(), Why::Prefetch, &ctx.metrics);
         }
     }
-    // `--serve-stale-first`: what this resolver last knew, now, and the
-    // resolution queued behind it — BIND's `stale-answer-client-timeout 0`.
-    // A deviation from RFC 8767 §4, which serves stale only once a refresh
-    // has failed; see `TODO.md` #58 for why not §5's 1.8 s timer instead.
+    // `--serve-stale-first`: the stale answer now and the resolution behind it,
+    // a deviation from RFC 8767 §4 (`docs/adr/0005`).
     let first = refreshes
         .as_ref()
         .filter(|r| r.stale_first())
@@ -384,29 +332,24 @@ pub(crate) async fn handle_query(
         ctx.metrics.count(&ctx.metrics.cache_hits);
         stale
     } else {
-        // Everything above answered from something held; from here the
-        // query costs a recursion. This is the line a cache hit rate is
+        // From here the query costs a recursion: the line a cache hit rate is
         // drawn on.
         ctx.metrics.count(&ctx.metrics.cache_misses);
         ctx.metrics.count(&ctx.metrics.queries_recursive);
-        // The nameserver triggers, which can only be asked while the delegation
-        // chain is being walked (`rdns::rpz`). Built only when some zone has
-        // one: a feed of QNAME rules pays nothing here.
+        // Nameserver triggers, asked only during the delegation walk; built
+        // only when some zone has one.
         let watch = policy
             .watches_delegations()
             .then(|| policy.at_delegations(query.qname.as_ref(), query.qtype));
-        // Not `timer`: that one started at the datagram and this has to
-        // measure the recursion alone, which is the only part RFC 8767 §5's
-        // client response timer could cut short.
+        // Not `timer`: this measures the recursion alone, the part RFC 8767
+        // §5's client response timer could cut.
         let walk = LatencyTimer::new();
         // Async: each upstream round trip is an await, so this yields the
         // task rather than holding a thread.
         let resolved = resolver
             .resolve_validated(&query, watch.as_ref().map(|w| w as &dyn NameserverPolicy))
             .await;
-        // Here and not at either arm's end: the arms build replies, apply
-        // policy and return early, so a count at the end of one is a count the
-        // other loses (`CLAUDE.md` §7).
+        // Here, not at an arm's end: the arms return early (`CLAUDE.md` §7).
         if u128::from(walk.elapsed_us()) > rdns::cache::CLIENT_RESPONSE_TIMER.as_micros() {
             let m = &ctx.metrics;
             m.count(if resolved.is_ok() {
@@ -432,11 +375,8 @@ pub(crate) async fn handle_query(
                         qtype = %query.qtype,
                         "DNSSEC validation failed: {bogus}"
                     );
-                    // Fail closed: the client cannot tell unauthenticated
-                    // data from checked data, so serving it launders an
-                    // attack into an ordinary reply. CD says the client
-                    // checks for itself, and RFC 4035 §3.2.2 requires the
-                    // data unfiltered.
+                    // Fail closed: the client cannot tell bogus from checked.
+                    // CD gets the data unfiltered (RFC 4035 §3.2.2).
                     if !checking_disabled {
                         ctx.metrics.count_outcome(Outcome::Bogus);
                         let resp = build_response(&msg, Vec::new(), ResponseCode::ServerFailure);
@@ -457,10 +397,8 @@ pub(crate) async fn handle_query(
                 }
                 (upstream, Some(state.outcome()), None)
             }
-            // A nameserver trigger matched, so the walk stopped and the
-            // policy has the answer. Nothing was cached: the resolution
-            // never finished, which is what makes the block hold for the
-            // next client as well as this one.
+            // A nameserver trigger stopped the walk; nothing was cached, so the
+            // block holds for the next client too.
             Err(ResolveError::PolicyStopped) => {
                 match watch.as_ref().and_then(DelegationPolicy::matched) {
                     Some(rewrite) => {
@@ -473,10 +411,8 @@ pub(crate) async fn handle_query(
                         // actions all reply. Unreachable rather than ignorable.
                         unreachable!("a stopped resolution has a reply")
                     }
-                    // The policy refused and recorded nothing, which
-                    // `DelegationPolicy::allows` does only on a poisoned
-                    // lock. SERVFAIL is the honest answer to "blocked, and
-                    // the reason was lost".
+                    // No record only on a poisoned lock
+                    // (`DelegationPolicy::allows`): SERVFAIL.
                     None => (
                         build_response(&msg, Vec::new(), ResponseCode::ServerFailure),
                         None,
@@ -495,10 +431,8 @@ pub(crate) async fn handle_query(
                     "resolve failed: {:#}",
                     e
                 );
-                // Only here, and only now: RFC 8767 §4 has the resolver try
-                // the authoritative servers and serve what it last knew when
-                // that does not work. Everything above answered from something
-                // still valid, so this is the one place stale data is right.
+                // Stale data only here, after the servers failed (RFC 8767 §4);
+                // everything above was still valid.
                 match stale_answer(&msg, caches, &query, ctx, StaleBecause::Failed) {
                     Some(stale) => stale,
                     None => (
@@ -519,11 +453,8 @@ pub(crate) async fn handle_query(
     }
     let secure = outcome.is_some_and(Outcome::is_secure);
 
-    // The address in an answer is a trigger too (`rpz-ip`): a name nobody
-    // blocked that resolves into blocked space. After a cache hit as well as
-    // after a recursion — the cache holds what the internet said, and the
-    // policy is applied to what leaves.
-    //
+    // `rpz-ip` triggers on the answer's addresses, after a cache hit as after a
+    // recursion: policy applies to what leaves.
     let rewritten = if !policy.is_empty() && !resp.answers.is_empty() {
         match policy.on_answer(&resp.answers, query.qname.as_ref(), query.qtype) {
             Some(rewrite) => {
@@ -546,15 +477,9 @@ pub(crate) async fn handle_query(
 
 /// [`finish`], with RFC 6147's synthesis in front of it.
 ///
-/// **Every path that can produce an empty AAAA answer ends here**, and the two
-/// that must not synthesize end at `finish` instead: a name RFC 6761 answers
-/// from the table is not an IPv4 name behind a translator, and a name a policy
-/// zone blocked is blocked. `CLAUDE.md` §7 is about the opposite mistake — an
-/// early return jumping over a shared epilogue — so the split is deliberate and
-/// the reason is written at both ends.
-///
-/// `client.dns64` carries everything about the request that decides this, so
-/// nothing here re-derives it.
+/// Every path that can produce an empty AAAA answer ends here; special-use
+/// names and policy blocks end at `finish` instead, deliberately.
+/// `client.dns64` carries all that decides this.
 async fn finish_dns64(
     resp: DnsMessage,
     authenticated: bool,
@@ -565,10 +490,8 @@ async fn finish_dns64(
     timer: LatencyTimer,
 ) -> Option<Vec<u8>> {
     match synthesized_aaaa(&resp, client, query, serving).await {
-        // Never authenticated: these records are this resolver's invention, so
-        // AD stays clear whatever the AAAA denial validated as. No Extended DNS
-        // Error either — RFC 8914 has no code for a DNS64 answer, and 4
-        // (Forged Answer) says "for policy reasons", which this is not.
+        // Never AD: these records are ours. No EDE: RFC 8914 has none for
+        // DNS64, and 4 (Forged Answer) means policy.
         Some(synthesized) => finish(synthesized, false, None, client, query, &serving.ctx, timer),
         None => finish(resp, authenticated, why, client, query, &serving.ctx, timer),
     }
@@ -695,18 +618,11 @@ async fn resolve_and_store(
     Some(answer.answers)
 }
 
-/// [`resolve_and_store`] with the cache tried first — the shape a caller that
-/// wants an answer rather than a fresh one needs.
+/// [`resolve_and_store`] with the cache tried first.
 ///
-/// A cached negative counts: an A query that found nothing is a name with no
-/// address of either family, and asking the internet again on every AAAA query
-/// for it is how a DNS64 resolver doubles its own traffic.
-///
-/// Not the denial cache: it saves at most one upstream query per AAAA, and the
-/// query path skips it under CD, so this would need the bit passed in to agree.
-///
-/// [`Caches::lookup`] rather than the caches one at a time: asked "yes" first,
-/// this would synthesize from an A that a newer "no" has replaced.
+/// A cached negative counts, or a DNS64 resolver doubles its own traffic. Not
+/// the denial cache, which the query path skips under CD. [`Caches::lookup`]
+/// rather than each cache, so a newer "no" wins over an older A.
 async fn cached_or_resolve(
     serving: &Resolving,
     query: &QuerySection,
@@ -735,9 +651,8 @@ pub(crate) async fn refresh(serving: &Resolving, Refresh { query, why }: Refresh
         Why::Stale => &m.stale_refreshes,
     });
     if resolve_and_store(serving, &query).await.is_none() {
-        // DEBUG: nobody is waiting. A failed prefetch costs the next client a
-        // resolution it would have paid for anyway; a failed stale refresh
-        // leaves the name answered stale until the recheck interval.
+        // DEBUG: nobody waits; a failed refresh costs the next client what it
+        // would have paid anyway.
         tracing::debug!(qname = %query.qname, qtype = %query.qtype, ?why, "refresh failed");
     }
 }
@@ -754,18 +669,11 @@ enum StaleBecause<'a> {
     First(&'a Refreshes),
 }
 
-/// The last thing this resolver knew about `query`: for a resolution that has
-/// just failed (RFC 8767), or before one under `--serve-stale-first`.
+/// The last thing this resolver knew about `query`: after a failed resolution
+/// (RFC 8767), or before one under `--serve-stale-first`.
 ///
-/// Returns what the answer path's own arms return — the response, whether it is
-/// authenticated, and the reason to put in the OPT — so the caller has nothing
-/// to assemble. `None` when serve-stale is off or nothing usable is held, which
-/// is SERVFAIL as before.
-///
-/// AD survives: `secure` is what validation concluded when the answer was
-/// stored, and an expired signature is a validity period rather than a
-/// verdict. RFC 8767 §6 notes that a validating stub may reject the answer for
-/// exactly that reason, which is its right and not ours to pre-empt.
+/// `None` when serve-stale is off or nothing usable is held. AD survives: an
+/// expired signature is a validity period, not a verdict (RFC 8767 §6).
 fn stale_answer(
     request: &DnsMessage,
     caches: &Caches,
@@ -792,15 +700,13 @@ fn stale_answer(
             refreshes.offer(query.clone(), Why::Stale, &ctx.metrics);
         }
         match because {
-            // INFO: serving data known to be out of date is a decision the
-            // operator turned on, and the line beside the counter is how the
-            // decision is seen taking effect.
+            // INFO: the operator turned this on, and the line shows it taking
+            // effect.
             StaleBecause::Failed => {
                 tracing::info!(qname = %query.qname, qtype = %query.qtype, "answered from expired cache")
             }
-            // DEBUG: here it happens at the query rate for every expired
-            // name, which is what the switch asks for; the counter is the
-            // signal.
+            // DEBUG: at the query rate for every expired name; the counter is
+            // the signal.
             StaleBecause::First(_) => {
                 tracing::debug!(qname = %query.qname, qtype = %query.qtype, "answered from expired cache first")
             }
@@ -854,30 +760,16 @@ pub(crate) fn log_policy(zones: &PolicyZones) {
 
 /// Re-read every `--rpz` file, and tell the caches what arrived.
 ///
-/// A feed is rewritten under a running resolver — by a cron job, or by an
-/// `rdnsd` writing what it transferred — and until this the answer was a
-/// restart (`TODO.md` #57).
-///
-/// Neither line below names SIGHUP any more: [`crate::reload`] coalesces its
-/// triggers, so a message naming one of them would be a guess. Which trigger
-/// asked is logged where it arrives.
-///
-/// Returns the line a `reload` command reports (`TODO.md` #178), or none when
-/// no policy is configured.
+/// Returns the line a `reload` command reports, or none when no policy is
+/// configured. The lines name no trigger: [`crate::reload`] coalesces them.
 pub(crate) fn reload_policy(serving: &Resolving) -> Option<String> {
     if !serving.policy.is_configured() {
         return None;
     }
     Some(match serving.policy.reload() {
         Ok(reloaded) => {
-            // The count, not just "re-read": a feed whose file has not moved is
-            // kept whole (`TODO.md` #71b), so an operator whose edit did not
-            // register sees "0 of 3" here rather than a line that reads the
-            // same either way.
-            // Both counts, because they differ only in cost: a feed this
-            // process transferred and wrote is installed from the copy it
-            // already held (`TODO.md` #71f), and reporting that as "0 changed"
-            // would send an operator to look at a file that is in force.
+            // Both counts: unchanged files are kept, transferred ones installed
+            // from memory; one number misleads.
             let line = format!(
                 "policy zones re-read: {} of {} feeds had changed, {} installed from a transfer",
                 reloaded.reread,
@@ -886,13 +778,8 @@ pub(crate) fn reload_policy(serving: &Resolving) -> Option<String> {
             );
             tracing::info!("{line}");
             log_policy(&reloaded.zones);
-            // The one thing a new rule cannot reach on its own. A QNAME or
-            // client-IP rule is consulted before every cache and a response-IP
-            // rule is applied to what leaves, so both bind the next query
-            // whatever is held; a nameserver rule is only asked while a
-            // delegation is walked, which a cache hit never does. Conditional,
-            // because a reload that emptied the cache every hour would be its
-            // own outage.
+            // Only nameserver rules miss cache hits; clearing on every reload
+            // would be its own outage.
             if reloaded.delegation_rules_changed {
                 serving.caches.clear();
                 tracing::info!(
@@ -938,10 +825,8 @@ fn apply_policy(
     timer: LatencyTimer,
     transport: Transport,
 ) -> Applied {
-    // RFC 8914 §4.5 draws the line: Forged Answer (4) "should be used when an
-    // answer is still provided, not when failure codes are returned instead.
-    // See Blocked (15), Censored (16), and Filtered (17) for use when returning
-    // other response codes."
+    // RFC 8914 §4.5: Forged Answer only when an answer is still provided;
+    // Blocked (15) otherwise.
     const WHY_DENIED: ExtendedError = ExtendedError::new(
         InfoCode::BLOCKED,
         "this answer is the resolver operator's policy",
@@ -950,9 +835,8 @@ fn apply_policy(
         InfoCode::FORGED_ANSWER,
         "this answer is the resolver operator's policy",
     );
-    // INFO, not DEBUG: a name that does not resolve is a support call, and this
-    // line is the answer to it. One per rewrite, which is bounded by how much
-    // of the traffic the policy covers rather than by the traffic.
+    // INFO: a name that does not resolve is a support call, and this answers
+    // it; bounded by policy coverage, not traffic.
     tracing::info!(
         qname = %query.qname,
         qtype = %query.qtype,
@@ -992,9 +876,8 @@ fn apply_policy(
     };
     ctx.metrics.count(&ctx.metrics.policy_rewrites);
     let mut resp = build_response(request, answers, rcode);
-    // The policy zone's own SOA, so a negative answer can be cached at all
-    // (RFC 2308 §5). Its MINIMUM and its TTL are the two numbers the client
-    // needs; which of them wins is §3's rule and the client's to apply.
+    // The policy zone's SOA, so the negative answer can be cached (RFC 2308
+    // §5).
     if resp.answers.is_empty() {
         resp.authorities = soa;
     }
@@ -1047,14 +930,8 @@ fn finish(
             .retain(|rr| rr.rdata.rtype() == OPT_RECORD_TYPE || keep(rr));
     }
 
-    // Only include an OPT record when the client used EDNS (RFC 6891 §6.1.1);
-    // otherwise strip any OPT the upstream added so we don't reply with
-    // unsolicited EDNS. DO is mirrored, since the signatures the client sees
-    // were deliberate.
-    //
-    // `why` rides in that OPT and nowhere else (RFC 8914 §2), which is why it
-    // is `mirror_with`'s business rather than a check here — and so is what
-    // happens to a reason too long to encode.
+    // OPT only if the client used EDNS (RFC 6891 §6.1.1), DO mirrored; `why`
+    // rides in it (RFC 8914 §2), so `mirror_with` owns it.
     if let Some(edns) = client.edns.mirror_with(ctx.server_opt(), why) {
         resp.set_edns(edns);
     } else {
@@ -1082,17 +959,12 @@ fn edns_error(
     resp.to_bytes_within(client_max).ok()
 }
 
-/// An empty reply carrying `rcode` and `why`, for the rejections decided before
+/// An empty reply carrying `rcode` and `why`, for rejections decided before
 /// anything is resolved.
 ///
-/// The opcode is echoed, not replaced with QUERY (RFC 1035 §4.1.1): a NOTIFY
-/// answered with `opcode = QUERY` is a reply its sender cannot match. Same
-/// reason [`build_response`] takes one rather than assuming.
-///
-/// The question is echoed and the OPT record mirrored if the client used EDNS
-/// (RFC 6891 §6.1.1) — a reply with no OPT may get us cached as a server that
-/// does not do EDNS. Unlike [`edns_error`], which answers a *broken* OPT and so
-/// must send one of its own whatever the client sent.
+/// Opcode and question echoed (RFC 1035 §4.1.1), OPT mirrored if the client
+/// used EDNS (RFC 6891 §6.1.1), unlike [`edns_error`], which answers a broken
+/// OPT with its own.
 fn empty_error(
     msg: &DnsMessage,
     rcode: ResponseCode,
@@ -1107,14 +979,11 @@ fn empty_error(
     resp.to_bytes_within(max_len).ok()
 }
 
-/// REFUSED for a datagram from a peer the query ACL does not list
-/// (`TODO.md` #171), or `None` for one that is not a question at all — a QR=1
-/// datagram gets nothing from anybody (`CLAUDE.md` §8).
+/// REFUSED for a datagram from a peer the query ACL does not list, or `None`
+/// for one that is not a question (`CLAUDE.md` §8).
 ///
-/// The question echoed and the client's OPT mirrored with RFC 8914 §4.19's
-/// code, which names this case: "a query from an 'unauthorized' client". No
-/// EXTRA-TEXT, because the reply goes to an address nothing has proved and
-/// every octet of it is somebody else's amplification.
+/// RFC 8914 §4.19's code, "a query from an 'unauthorized' client", with no
+/// EXTRA-TEXT: the address is unproven, so every octet amplifies.
 pub(crate) fn refused_by_acl(data: &[u8], ctx: &ServeContext) -> Option<Vec<u8>> {
     const NOT_LISTED: ExtendedError = ExtendedError::new(InfoCode::PROHIBITED, "");
     let msg = Request::from_bytes(data).ok()?;
@@ -1141,31 +1010,13 @@ fn unsupported_opcode(msg: &DnsMessage, advertised: ServerOpt, max_len: usize) -
     )
 }
 
-/// Answer a NOTIFY about a policy zone, and queue the re-read it asks for
-/// (RFC 1996).
+/// Answer a NOTIFY about a policy zone, and queue the re-read it asks for (RFC
+/// 1996).
 ///
-/// Three outcomes, in this order:
-///
-/// - From an address `--rpz-notify-from` does not list: REFUSED. The check is
-///   first because a NOTIFY costs its recipient a re-read of the feed it names —
-///   ~720 ms for a million-rule one, and that feed's memory twice over while
-///   both versions are live — so the work is never started for a sender that
-///   may not ask for it (`CLAUDE.md` §16). `rdnsd` refuses one the same way and
-///   says so with the same EDE code. It was a re-read of *every* feed until
-///   `TODO.md` #71b, which is why the ACL was worth putting first even then.
-/// - Naming a zone no `--rpz` file carries: NOTAUTH. Distinguished from the
-///   refusal on the wire and not only in the log, because the operator who can
-///   see this is on the sending side.
-/// - Otherwise NOERROR, and a reload is *queued*. §4.7 wants the reply before
-///   the work, and here the work is seconds long; [`PolicyReload`] bounds how
-///   much of it a burst can ask for.
-///
-/// The serial in the message is not read, though RFC 1996 §3.7 allows it. It is
-/// unauthenticated, and the only thing it could do here is let a reload be
-/// *skipped* — so a spoofed one would suppress a real update, which is the
-/// failure this path exists to prevent. `rdnsd` ignores it for the same reason
-/// and settles the question against the master; here the file is the master, so
-/// the re-read settles it.
+/// REFUSED from an address `--rpz-notify-from` does not list, before any work
+/// (`CLAUDE.md` §16); NOTAUTH for a zone no `--rpz` file carries; else NOERROR
+/// and a queued reload (§4.7). The serial is not read: unauthenticated, it
+/// could only let a spoofed NOTIFY suppress a real update.
 fn policy_notify(
     msg: &DnsMessage,
     peer: Peer,
@@ -1181,9 +1032,8 @@ fn policy_notify(
         InfoCode::PROHIBITED,
         "--rpz-notify-from does not list this address",
     );
-    // Not §4.21's Not Authoritative, which is about a query with RD clear and
-    // would be a false statement besides: this server holds policy zones, just
-    // not that one. OTHER carries the sentence (§4.1).
+    // Not §4.21's Not Authoritative, which is about RD clear; OTHER carries the
+    // sentence (§4.1).
     const NOT_A_POLICY_ZONE: ExtendedError =
         ExtendedError::new(InfoCode::OTHER, "no --rpz file carries that zone");
 
@@ -1196,11 +1046,8 @@ fn policy_notify(
         (ResponseCode::Refused, Some(NOT_LISTED))
     } else {
         match rdns::notify::notified_zone(msg) {
-            // A transferred feed refreshes by asking its master, so the NOTIFY
-            // wakes that feed's task and nobody else's — one publisher must not
-            // be able to make this resolver re-read another operator's files
-            // (`TODO.md` #57d shape A). The re-read still happens: the task
-            // asks for one once the file is written.
+            // A transferred feed's NOTIFY wakes only its own task, which asks
+            // its master: one publisher must not trigger another's re-read.
             Some(zone)
                 if feed_wakes
                     .iter()
@@ -1221,10 +1068,8 @@ fn policy_notify(
                 (ResponseCode::Ok, None)
             }
             named => {
-                // `notified_zone` is `None` for a NOTIFY whose question is not
-                // for SOA as well as for one with no question at all; the root
-                // stands in, as it does in `rdnsd`, and the rcode is the same
-                // either way.
+                // `None` for a non-SOA question or none at all; the root stands
+                // in, as in `rdnsd`.
                 let zone = named.unwrap_or_default();
                 tracing::info!(%peer, "NOTIFY for {zone}: NOTAUTH, no --rpz file carries it");
                 (ResponseCode::NotAuthorized, Some(NOT_A_POLICY_ZONE))
@@ -1239,13 +1084,8 @@ fn policy_notify(
 
 /// A reply to `request` carrying `answers`, from whatever produced them.
 ///
-/// The echoed fields are [`DnsMessage::reply_to`]'s, which is where the id, the
-/// opcode and the question come from — the opcode because it is the client's,
-/// not ours (RFC 1035 §4.1.1). RA is set here because this is a recursive
-/// resolver; that is the one policy field every caller agrees on.
-///
-/// CD is the client's: RFC 4035 §3.2.2, "the name server side MUST copy the
-/// setting of the CD bit from a query to the corresponding response".
+/// Id, opcode and question from [`DnsMessage::reply_to`] (RFC 1035 §4.1.1); RA
+/// set, as a recursive resolver; CD copied (RFC 4035 §3.2.2).
 fn build_response(
     request: &DnsMessage,
     answers: Vec<ResourceRecord>,
@@ -1259,25 +1099,18 @@ fn build_response(
 }
 
 /// The same answer with TC=1 and no records: what a client over its response
-/// budget gets instead of the answer.
+/// budget gets instead.
 ///
-/// Smaller than the query that asked for it, so useless for amplification, and
-/// RFC 1035 §4.2.1 has the client retry over TCP where the handshake proves the
-/// source and the budget does not apply. Silence would leave a legitimate
-/// client with a timeout and no idea TCP would work.
-///
-/// Built by reading our own reply back rather than editing its header in place:
-/// one parse, on a path taken only when a source is over budget, and the flags,
-/// the echoed question and the OPT record are whatever `to_bytes_within` wrote.
+/// Smaller than the query, so useless for amplification, and the client retries
+/// over TCP (RFC 1035 §4.2.1). Built by parsing our own reply, so flags,
+/// question and OPT are what `to_bytes_within` wrote.
 pub(crate) fn truncate_reply(reply: &[u8]) -> Option<Vec<u8>> {
     let mut msg = DnsMessage::try_from_bytes(reply).ok()?;
     msg.truncation = true;
     msg.answers.clear();
     msg.authorities.clear();
     msg.additionals.clear();
-    // `to_bytes_within` needs a ceiling; the reply carries no records now, so
-    // the classic 512 is more than enough and does not depend on what the
-    // client advertised.
+    // No records, so the classic 512 suffices whatever the client advertised.
     msg.to_bytes_within(rdns::CLASSIC_UDP_SIZE as usize).ok()
 }
 

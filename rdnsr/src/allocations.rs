@@ -63,31 +63,11 @@ fn query_bytes(name: &rdns::Name) -> Vec<u8> {
         .expect("serialize the query")
 }
 
-/// One cache hit, from the datagram to the reply bytes.
-///
-/// Exact, and attributed rather than merely recorded: an exact count that is
-/// not understood is worse than a timing, because it looks trustworthy
-/// (`CLAUDE.md` §10). Two of the twelve are the parse and three are the
-/// serialization, which are the same two numbers `rdns/tests/allocations.rs`
-/// asserts for the authoritative path, so **seven** are what the resolver does
-/// in between: the cache lookup, the records copied out of it, and the reply
-/// message they are assembled into.
-///
-/// RFC 8198 synthesis is behind the answer cache, so a hit builds no
-/// `*.<parent>` name for `NsecCache::synthesize_wildcard` (`TODO.md` #134).
-///
-/// That seven is #88's real answer, and it says **decline**. `rdnsd` writes its
-/// answer straight into a held buffer with `ResponseWriter` — `rdns`'s "write a
-/// one-record response" is **0**, and **3** with neither buffer nor compressor
-/// in hand, which is what it pays per message on TCP. `rdnsr` clones the
-/// records out of the cache into a `DnsMessage` and serializes that, for 3. So
-/// the two shapes differ by the *cache lookup and the copy out of it*, not by
-/// the writing, and the difference is a constant rather than a per-record cost
-/// — which the ratio test below is the other half of. The number does not argue
-/// for a rewrite.
-///
-/// What it does **not** measure: the resolution behind a miss, which is a
-/// network round trip and not an allocation question.
+/// One cache hit, from the datagram to the reply bytes, attributed: two
+/// allocations parse, three serialize, and seven are the lookup, the copy out
+/// of the cache and the reply message (`CLAUDE.md` §10). The seven are a
+/// constant, not a per-record cost, which is why `TODO.md` #88 declined a
+/// rewrite. A miss's resolution is a round trip, not an allocation question.
 #[test]
 fn a_cached_answer_costs_what_it_costs() {
     let serving = context();
@@ -133,9 +113,8 @@ fn a_cached_answer_costs_what_it_costs() {
     assert!(answered.is_some(), "still a cache hit");
     within("answer one query from the cache", count, 12..=12);
 
-    // The two ends of it, priced separately so the total is attributed. Both
-    // are `rdns`'s own numbers for the authoritative path, measured here
-    // against the same message rather than quoted.
+    // The two ends priced separately, measured here rather than quoted from
+    // `rdns`.
     let wire = query_bytes(&name);
     let (parsed, parse_count) = allocations(|| {
         rdns::validation::Request::from_bytes(&wire).expect("the query is a question")

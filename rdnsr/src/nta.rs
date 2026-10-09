@@ -41,10 +41,8 @@ pub(crate) fn load(
 }
 
 /// Re-read the file and put it in force, or keep the set in force if it does
-/// not load (§4's "the old set"). Called from the SIGHUP reload, off the
-/// worker threads.
-///
-/// Returns the line a `reload` command reports (`TODO.md` #178).
+/// not load (§4's "the old set"), off the worker threads. Returns the line a
+/// `reload` command reports.
 pub(crate) fn reload(serving: &Resolving, path: &Path) -> String {
     let now = serving.ctx.clock.now();
     let anchors = serving.resolver.trust_anchors();

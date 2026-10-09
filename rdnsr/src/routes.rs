@@ -64,10 +64,8 @@ fn read_local(name: &Name, path: &Path) -> anyhow::Result<(Zone, Vec<u8>)> {
 }
 
 /// Re-read every local zone file, all or nothing (`CLAUDE.md` §4): one that
-/// does not parse keeps the whole old set in force. Logs each serial that
-/// moved.
-///
-/// Returns the line a `reload` command reports (`TODO.md` #178).
+/// does not parse keeps the old set. Logs each serial that moved; returns the
+/// line a `reload` command reports.
 pub(crate) fn reload_local(files: &[LocalFile]) -> String {
     let mut fresh = Vec::new();
     for file in files {

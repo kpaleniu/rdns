@@ -78,17 +78,9 @@ impl PolicyReload {
 
 /// Re-read on SIGHUP or on request, one at a time, off the worker threads.
 ///
-/// SIGHUP re-reads the certificate as well; a request does not. A NOTIFY is the
-/// only thing that asks, it is about a policy zone, and a stranger's packet has
-/// no business making this process re-open its key material — nor leaving a
-/// "could not re-read the TLS certificate" line behind to be diagnosed by
-/// somebody who did not touch it.
-///
-/// The negative trust anchors are SIGHUP's too, for the certificate's reason:
-/// a NOTIFY is about a policy zone.
-///
-/// A control socket's `reload` is SIGHUP's, through the same loop so two
-/// reloads never overlap, with the report sent back (`TODO.md` #178).
+/// The certificate and negative trust anchors only on SIGHUP or a control
+/// socket's `reload`: a request comes from a NOTIFY about a policy zone, and a
+/// stranger's packet must not re-open key material.
 pub(crate) async fn reload_task(
     certificate: Option<Arc<CertificateStore>>,
     ntas: Option<NtaFile>,
@@ -161,10 +153,8 @@ async fn reload_now(
         Ok(lines) if lines.is_empty() => vec!["nothing configured to re-read".to_string()],
         Ok(lines) => lines,
         Err(e) => {
-            // The task must survive it: what panicked did not install anything,
-            // so the previous set is still in force and the next request can
-            // still be served. Ending the loop here would leave a resolver that
-            // looks healthy and never reloads again (`CLAUDE.md` §4).
+            // The task survives: nothing was installed, and a dead loop would
+            // look healthy but never reload (`CLAUDE.md` §4).
             tracing::error!("the reload panicked and nothing was re-read: {e}");
             vec![format!("the reload panicked and nothing was re-read: {e}")]
         }

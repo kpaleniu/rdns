@@ -248,9 +248,8 @@ fn act_on_expiry(
              stay in force — on-expire is enforce"
         ),
         OnExpire::Lift => {
-            // A failure to remove is not a failure to report: the WARN below is
-            // the operator's signal either way, and the next transfer rewrites
-            // the file regardless.
+            // Not reported: the WARN below is the signal, and the next transfer
+            // rewrites the file.
             if let Err(e) = std::fs::remove_file(&feed.file) {
                 tracing::warn!(
                     "policy zone {zone}: could not remove {}: {e}",
@@ -261,10 +260,8 @@ fn act_on_expiry(
                 "policy zone {zone}: EXPIRE ({expire}s) passed with no contact. Its rules \
                  are no longer enforced — on-expire is lift"
             );
-            // Forgotten, not frozen: the feed is no longer enforced, and a
-            // gauge left at its last value shows a policy nobody applies as
-            // perfectly healthy (§14). Under `enforce` the series deliberately
-            // stays and goes stale — that staleness *is* the alert.
+            // Forgotten, not frozen: a stale gauge shows an unapplied policy
+            // healthy (§14). Under `enforce` staleness is the alert.
             metrics.forget_zone(feed.spec.zone.as_ref());
             reload.request();
         }
@@ -291,10 +288,8 @@ async fn fetch_and_write(
 
     let fetched =
         match xfr::refresh_zone(master, feed.spec.zone.as_ref(), feed.key.as_ref(), base).await? {
-            // Nothing to write and nothing to re-read: an unchanged million-rule
-            // feed costs one round trip here and 2.5 s of serialize-write-reparse
-            // if this probe is skipped (`TODO.md` #57e). The contact still counts,
-            // because EXPIRE runs on contact and not on transfers.
+            // Unchanged: no write, no re-read. The contact still counts, as
+            // EXPIRE runs on contact.
             xfr::Refresh::Current { serial, .. } => {
                 tracing::info!(
                     "policy zone {}: serial {serial} is current, nothing transferred",
@@ -305,11 +300,8 @@ async fn fetch_and_write(
             xfr::Refresh::Fetched(fetched) => fetched,
         };
     if fetched.missing_deletions > 0 {
-        // Our file and the master's zone had already diverged at the serial we
-        // asked from: the increments applied, but rules the master dropped are
-        // still being enforced here. Not fatal and not fixable from this side —
-        // the next full transfer settles it — so it is said out loud with the
-        // count.
+        // Diverged before our serial: dropped rules stay enforced until the
+        // next full transfer, so warn with the count.
         tracing::warn!(
             "policy zone {}: {} deletion(s) named records this feed did not hold",
             feed.spec.zone,
@@ -321,24 +313,15 @@ async fn fetch_and_write(
     let timers = RefreshTimers::from_zone(&zone).unwrap_or_default();
     let records = zone.records().len();
 
-    // Serializing and writing is blocking — the write especially, which is an
-    // fsync and a rename (`rdns::persist`) — and so is the indexing that
-    // follows. Off the workers, as the reload itself is (`TODO.md` #57b).
-    //
-    // The zone goes to the store as well as to the file: the reload below reads
-    // the file either way, but with the digest of what was written in hand it
-    // installs this zone instead of parsing 38 MB back into the one it already
-    // has (`TODO.md` #71f).
+    // Off the workers: serialize, fsync, rename and indexing block. The store
+    // gets the zone too, so the reload need not parse it.
     let path = feed.file.clone();
     let store = policy.clone();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let text = zone_to_string(&zone)?;
         let written = write_zone_text(&text, &path)?;
-        // Warned and not propagated: the transfer's job was to get the zone on
-        // disk and it is done, so a store that cannot place the zone costs the
-        // reload a parse rather than a failed refresh and a retry. Only a feed
-        // nobody reads gets here, which the configuration makes unreachable:
-        // `[[rpz.feeds]]` builds both lists.
+        // Warned, not propagated: the zone is on disk, and the reload parses it
+        // instead. `[[rpz.feeds]]` makes this unreachable.
         if let Err(e) = store.offer(&written, zone) {
             tracing::warn!(
                 "the transferred zone will be parsed back from {}: {e}",
@@ -354,10 +337,8 @@ async fn fetch_and_write(
         feed.spec.zone,
         feed.file.display()
     );
-    // The file is on disk; the rules are not in force until somebody reads it.
-    // `PolicyReload` coalesces, so several feeds refreshing at once ask for one
-    // re-read of all of them — which is also the shape's cost, since a feed
-    // that did not change is re-read anyway.
+    // Not in force until read; `PolicyReload` coalesces concurrent feeds into
+    // one re-read of all.
     reload.request();
     Ok(timers)
 }

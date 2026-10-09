@@ -32,14 +32,10 @@ pub(crate) enum Stale {
 
 /// Three caches with three shapes, which is why they are not one.
 ///
-/// - `answers` maps a question to the records that answered it.
-/// - `negatives` maps a question to the *absence* of records (RFC 2308): a
-///   different thing, because there are no records to key on and the TTL comes
-///   from the SOA rather than from an answer.
-/// - `denials` maps a *range* of names to the signed statement that none exist —
-///   a lookup neither of the others can express (RFC 8198). Validated material
-///   only, so it is empty without `--dnssec-validate`, which is why `negatives`
-///   is not redundant with it.
+/// - `answers`: a question to the records that answered it.
+/// - `negatives`: a question to an absence; TTL from the SOA (RFC 2308).
+/// - `denials`: a range of names to a signed denial (RFC 8198); validated
+///   only, so empty without `--dnssec-validate`.
 pub(crate) struct Caches {
     answers: DnsCache,
     negatives: NegativeCache,
@@ -47,17 +43,12 @@ pub(crate) struct Caches {
 }
 
 impl Caches {
-    /// `answers` at 0 is a cache that holds nothing (`DnsCache::put` is a
-    /// no-op), which is what `--no-cache` means. `denial_zones` is separately 0
-    /// without validation: aggressive use rests on the proofs having been
-    /// checked.
+    /// `answers` at 0 holds nothing, which is `--no-cache`; `denial_zones` is 0
+    /// without validation, as aggressive use needs checked proofs.
     ///
-    /// `stale` reaches the first two and not `denials`: a denial is served
-    /// because its signature proves it, and an expired proof proves nothing —
-    /// RFC 8198 §5 rests on the validity period the signer chose, which
-    /// RFC 8767 has no standing to extend. `clock` is the daemon's, the one
-    /// `ServeContext` reads: one process, one idea of the time, and a test that
-    /// can move it. All three caches take it.
+    /// `stale` reaches the first two only: an expired proof proves nothing, and
+    /// RFC 8767 cannot extend RFC 8198 §5's validity period. `clock` is the
+    /// daemon's, so one process has one time and a test can move it.
     pub(crate) fn new(
         capacity: usize,
         denial_zones: usize,
@@ -94,39 +85,31 @@ impl Caches {
         if !response.answers.is_empty() {
             self.answers
                 .put_validated(name, qtype, response.answers.clone(), outcome);
-            // The lookups ask `negatives` first, so an older "no" left there
-            // outranks this until it expires (`TODO.md` #133). No trust check,
-            // as BIND's has: an answer contradicting a signed denial that does
-            // not itself validate is bogus, and returned above.
+            // Lookups ask `negatives` first, so retire the "no" this refutes; a
+            // bogus contradiction was returned above.
             self.negatives.forget_refuted(name, qtype);
         }
-        // A "no" is an answer; re-resolving it makes a typo storm cost one
-        // upstream walk per repeat. The SOA in the authority section says how
-        // long it is good for (RFC 2308).
+        // A "no" is an answer, so a typo storm costs one walk; the SOA says for
+        // how long (RFC 2308).
         self.negatives.insert(name, qtype, response, outcome);
-        // A *validated* "no" covers a whole range of names, so it also goes in
-        // the denial cache. Only when Secure: an unvalidated NSEC is an
-        // attacker's claim about which names do not exist.
+        // A validated "no" covers a range, so it goes in the denial cache too;
+        // an unvalidated NSEC is an attacker's claim.
         if !secure {
             return;
         }
         if response.answers.is_empty() {
             self.denials.insert_validated(response);
         } else {
-            // A validated wildcard answer is the same kind of statement about
-            // a range (RFC 8198 §5.3), so it is kept under the wildcard rather
-            // than the name asked for.
+            // A validated wildcard answer is a statement about a range too (RFC
+            // 8198 §5.3), kept under the wildcard.
             self.denials.insert_validated_wildcard(response);
         }
     }
 
     /// What is held for this question, unexpired.
     ///
-    /// The order is the caches' business rather than the caller's, because
-    /// whether it is right depends on what `store` retires (`TODO.md` #132).
-    ///
-    /// `synthesize` false skips the RFC 8198 arms; the caller decides, since it
-    /// is the client's CD bit.
+    /// The order is the caches' business: whether it is right depends on what
+    /// `store` retires. `synthesize` false skips the RFC 8198 arms, for CD.
     pub(crate) fn lookup(
         &self,
         name: NameRef<'_>,
@@ -134,10 +117,8 @@ impl Caches {
         synthesize: bool,
         prefetching: bool,
     ) -> Option<Held> {
-        // A newer "no" outranks an older "yes" with no retiring on store;
-        // `store` retires only the "no" an answer refutes (`TODO.md` #133).
-        // Nothing is synthesized — this is the answer this question got — so a
-        // CD client may have it too.
+        // A newer "no" outranks an older "yes"; nothing is synthesized, so a CD
+        // client may have it.
         if let Some(negative) = self.negatives.get(name, qtype) {
             return Some(Held::Reply {
                 rcode: negative.rcode,
@@ -149,21 +130,13 @@ impl Caches {
         if let Some(hit) = self.answers.lookup(name, qtype, prefetching) {
             return Some(Held::Answer(hit));
         }
-        // Synthesis only once the question itself missed: a gap or a wildcard
-        // stored before an answer for this name would otherwise outrank it
-        // (`TODO.md` #134). RFC 8198 Appendix A checks "if the answer is in
-        // its cache" first, and so do Unbound, BIND and Knot Resolver. A random
-        // name misses both caches above, so a flood still costs no upstream
-        // query.
+        // Synthesis only once the question missed, as RFC 8198 Appendix A
+        // orders it; a random name still costs no upstream query.
         if !synthesize {
             return None;
         }
-        // The positive half (RFC 8198 §5.3) first: a cached NXDOMAIN needs the
-        // wildcard *denied*, so the two are mutually exclusive and trying the
-        // more specific one first costs nothing.
-        //
-        // A wildcard signature verifies at this name unchanged, so the client
-        // can check this for itself.
+        // The positive half (RFC 8198 §5.3) first; it and a denied wildcard
+        // exclude each other. The signature verifies unchanged.
         if let Some(wildcard) = self.denials.synthesize_wildcard(name, qtype) {
             return Some(Held::Reply {
                 rcode: ResponseCode::Ok,
@@ -218,22 +191,12 @@ impl Caches {
         self.denials.synthesize(name, qtype)
     }
 
-    /// The last thing learned about this question, expired but inside the
-    /// stale window (RFC 8767).
+    /// The last thing learned about this question, expired but inside the stale
+    /// window (RFC 8767).
     ///
-    /// Both caches can hold the question at once: `store` retires neither, and
-    /// an NXDOMAIN is keyed by name, so one learned for AAAA covers an A held
-    /// from before. The later one wins, because RFC 8767 §4 has an NXDomain
-    /// answer "considered to have refreshed the data at the resolver"; serving
-    /// the older "yes" hands out an address its zone has since denied
-    /// (`TODO.md` #132). BIND, Unbound and Knot Resolver hold one entry per
-    /// question and get this by overwriting.
-    ///
-    /// Stored in the same second is a tie, and the "no" takes it: a name taken
-    /// down is the case this ordering exists for.
-    ///
-    /// Both lookups spend their entry's refresh, which is right: they are one
-    /// question, and one refresh answers it.
+    /// If both caches hold it the later wins, a tie going to the "no": an
+    /// NXDomain has "refreshed the data at the resolver" (RFC 8767 §4), and a
+    /// taken-down name is the case. Both lookups spend their entry's refresh.
     pub(crate) fn stale(&self, name: NameRef<'_>, qtype: Qtype, refreshing: bool) -> Option<Stale> {
         let answer = self.answers.get_stale(name, qtype, refreshing);
         let negative = self.negatives.get_stale(name, qtype, refreshing);
@@ -261,21 +224,19 @@ impl Caches {
         self.answers.put(name, qtype, records);
     }
 
-    /// Forget everything held, positive and negative.
-    ///
-    /// All three, because all three answer without walking a delegation, and
-    /// the walk is where a nameserver trigger is asked — a synthesized
-    /// NXDOMAIN (RFC 8198) skips it exactly as a cache hit does. The one
-    /// caller is the policy reload (`TODO.md` #57); there is no index from a
-    /// nameserver to the names it served, so the sweep is the whole cache.
     /// Forget what any cache holds at or below `node`: a negative trust
-    /// anchor changed how that subtree validates (`TODO.md` #176).
+    /// anchor changed how that subtree validates.
     pub(crate) fn forget_at_or_below(&self, node: NameRef<'_>) -> usize {
         self.answers.forget_at_or_below(node)
             + self.negatives.forget_at_or_below(node)
             + self.denials.forget_at_or_below(node)
     }
 
+    /// Forget everything held, positive and negative.
+    ///
+    /// All three skip the delegation walk where nameserver triggers are asked,
+    /// a synthesized NXDOMAIN (RFC 8198) as much as a hit, and nothing indexes
+    /// a nameserver to the names it served.
     pub(crate) fn clear(&self) {
         self.answers.clear();
         self.negatives.clear();

@@ -99,12 +99,8 @@ impl Refreshes {
 
 /// Resolve queued questions on `workers` tasks until the stop.
 ///
-/// Holds no `Busy`: nobody is waiting on a prefetch, and the cache it would
-/// fill goes with the process, so shutdown aborts one part-way (dropping the
-/// `JoinSet`) instead of waiting out an upstream's timeout for it.
-///
-/// In `main`'s listener set, where "the first to end ends the process" is
-/// right: this ends only on the stop, as the listeners do.
+/// Holds no `Busy`: nobody waits on a prefetch, so shutdown aborts one. In
+/// `main`'s listener set, as it ends only on the stop.
 pub(crate) async fn run(
     queue: Queue,
     serving: Arc<Resolving>,
@@ -117,10 +113,8 @@ pub(crate) async fn run(
         let (queue, serving) = (queue.clone(), serving.clone());
         pool.spawn(async move {
             loop {
-                // The lock is held across the wait on purpose: one idle worker
-                // waits on the queue, the rest wait on the lock. A statement of
-                // its own, not a `while let`, whose scrutinee's guard would live
-                // through the refresh and leave one worker doing all of them.
+                // One worker waits on the queue, the rest on the lock; a `while
+                // let` would hold the guard through the refresh.
                 let next = queue.lock().await.recv().await;
                 // `None` cannot happen while `serving` holds the sender.
                 let Some(next) = next else { return };

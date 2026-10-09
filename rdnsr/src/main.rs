@@ -77,17 +77,11 @@ use crate::reload::PolicyReload;
 use crate::rpz_transfer::{refresh_task, FeedWake, TransferredFeed};
 use crate::serve::udp_main;
 
-/// UDP queries this resolver will have in flight at once, when nothing says
-/// otherwise.
+/// UDP queries this resolver will have in flight at once, by default.
 ///
-/// Not `rdnsd`'s worker count. There, answering is microseconds out of memory;
-/// here one query is a recursion — several round trips, seconds of it, almost
-/// all spent waiting. So it stays a task per datagram, and this bounds how many
-/// may exist.
-///
-/// 1024 because a task waiting on the network is ~1.5 KB, so the ceiling costs
-/// ~1.5 MB fully occupied, and a resolver with a thousand queries outstanding is
-/// either very busy or under attack — shedding answers both.
+/// A task per datagram, unlike `rdnsd`'s workers: a recursion is seconds of
+/// waiting. 1024 tasks cost ~1.5 MB, and a thousand outstanding queries is load
+/// or an attack; shedding answers both.
 const MAX_INFLIGHT_UDP: usize = 1024;
 
 /// Zones whose validated denial proofs we keep for aggressive use (RFC 8198).
@@ -96,14 +90,8 @@ const MAX_INFLIGHT_UDP: usize = 1024;
 /// name in it. `NsecCache` bounds the records within each zone separately.
 const NSEC_CACHE_ZONES: usize = 1000;
 
-// The resolver's defaults, in one place because each is spelled twice: `Cli`
-// takes them through `default_value_t` and the config file's tables through
-// `#[serde(default = "crate::...")]`, and a literal on each side has nothing
-// comparing them. `rdnsd` has the same block for the same reason.
-//
-// Here and not in `config`, because a flag's default is the daemon's and the
-// file inherits it — and an item private in the crate root is visible to every
-// module under it, which is all `config` needs (`CLAUDE.md` §17).
+// Defaults in one place, which `Cli` and the config file both take; in the
+// crate root, so `config` sees them (`CLAUDE.md` §17).
 
 fn default_host() -> String {
     "127.0.0.1".to_string()
@@ -185,14 +173,9 @@ fn default_rpz_policy() -> rdns::rpz::PolicyOverride {
 
 /// Recursive DNS resolver with caching.
 ///
-/// Unlike the authoritative server (`rdnsd`), `rdnsr` answers by resolving:
-/// walking the delegation chain from the root and caching what it learns.
-/// Passing `--upstream` switches it to forwarding instead, for every name, as
-/// BIND's global `forwarders` does — not per domain, as `forward-zone` is
-/// (`TODO.md` #172).
-///
-/// Binds to localhost by default so it is not accidentally exposed as an open
-/// resolver (an amplification vector).
+/// Resolves from the root, caching what it learns; `--upstream` forwards every
+/// name instead, as BIND's global `forwarders`. Binds to localhost by default
+/// so it is not an open resolver.
 #[derive(Parser)]
 #[command(version = rdns::VERSION, about, long_about = None)]
 // The two uses of the refresh pool: its sizes mean something with either.
@@ -208,34 +191,24 @@ struct Cli {
     host: String,
     #[arg(long, default_value_t = default_port(), conflicts_with = "config")]
     port: u16,
-    /// An address or CIDR prefix that may be answered, repeatable. Anybody
-    /// else gets REFUSED over UDP and a closed connection on a stream
-    /// listener.
-    ///
-    /// Required once any listener binds off loopback, `0.0.0.0` and `::`
-    /// included; an open resolver is written `0.0.0.0/0` and `::/0`. Once
-    /// given, nothing is allowed that it does not list, loopback included
+    /// An address or CIDR prefix that may be answered, repeatable; anyone else
+    /// gets REFUSED over UDP and a closed stream. Required once a listener
+    /// binds off loopback; an open resolver is `0.0.0.0/0` and `::/0`. Once
+    /// given, only what it lists is answered, loopback included
     /// (`docs/adr/0007`).
     #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     allow_query: Vec<String>,
-    /// Forward to this resolver instead of recursing, e.g. 8.8.8.8:53
-    /// (repeatable). Passing any `--upstream` switches the resolver from
-    /// recursion to forwarding for every name, as BIND's global `forwarders`
-    /// does.
-    ///
-    /// `ADDR[:PORT][+tls=NAME]`: with `+tls=` asked over DNS over TLS only
-    /// (RFC 7858), port 853 by default, the certificate checked against NAME
-    /// and --upstream-tls-ca. Never in clear, and no fallback.
+    /// Forward to this resolver instead of recursing, for every name, e.g.
+    /// 8.8.8.8:53 (repeatable). `ADDR[:PORT][+tls=NAME]`: with `+tls=`, DNS
+    /// over TLS only (RFC 7858), port 853 by default, the certificate checked
+    /// against NAME and --upstream-tls-ca; never in clear.
     #[arg(long, conflicts_with = "config")]
     upstream: Vec<String>,
-    /// Send one domain to these servers with RD=1 and take their answers:
-    /// `NAME=ADDR[,ADDR...]`, `ADDR` as `ip`, `ip:port` or `[v6]:port`.
-    /// Repeatable.
-    ///
-    /// The most specific routed domain covering a name decides it, ahead of
-    /// any cached delegation, and there is no fallback to recursion when its
-    /// servers fail: SERVFAIL, with EDE 22, rather than an internal name sent
-    /// to the public tree. Validated unless `--no-validate-zone` names it.
+    /// Send one domain to these servers with RD=1: `NAME=ADDR[,ADDR...]`,
+    /// `ADDR` as `ip`, `ip:port` or `[v6]:port`. Repeatable. The most specific
+    /// covering domain wins over any cached delegation; if its servers fail,
+    /// SERVFAIL with EDE 22, never the public tree. Validated unless
+    /// `--no-validate-zone` names it.
     #[arg(long, value_name = "NAME=ADDR[,ADDR]", conflicts_with = "config")]
     forward_zone: Vec<String>,
     /// Walk one domain's delegations starting from these servers, with RD=0:
@@ -282,48 +255,33 @@ struct Cli {
     /// binary compiled before the roll is wrong until it is rebuilt.
     #[arg(long, conflicts_with = "config")]
     trust_anchor: Option<std::path::PathBuf>,
-    /// A *managed* trust anchor file, followed and rewritten as keys roll
-    /// (RFC 5011). Only used with --dnssec-validate.
+    /// A *managed* trust anchor file, followed and rewritten as keys roll (RFC
+    /// 5011). Only used with --dnssec-validate.
     ///
-    /// Who owns the file is the difference from `--trust-anchor`, which is read
-    /// and never touched. This one is read *and written*: the resolver watches
-    /// the zone's signed DNSKEY RRset, adopts a key published continuously for
-    /// 30 days, and drops one the zone revokes with a signature from that same
-    /// key.
-    ///
-    /// Created from the anchors in force when it does not exist, so pointing at
-    /// a new path is enough to start.
+    /// Unlike `--trust-anchor`, read and written: a key published 30 days is
+    /// adopted, a self-revoked one dropped. Created from the anchors in force
+    /// if missing.
     #[arg(long, conflicts_with = "config")]
     auto_trust_anchor: Option<std::path::PathBuf>,
-    /// PEM certificate authorities a `+tls=` forwarder's certificate is
-    /// checked against. Required with any `+tls=` server, refused without
-    /// one.
-    ///
-    /// No system trust store is read. For a public resolver, point this at
-    /// the system bundle: `/etc/ssl/certs/ca-certificates.crt` and the like
-    /// on Unix; on Windows export the roots to PEM, e.g. with PowerShell's
-    /// `Get-ChildItem Cert:\LocalMachine\Root` and `Export-Certificate`
-    /// then `certutil -encode`.
+    /// PEM certificate authorities a `+tls=` forwarder's certificate is checked
+    /// against; required with any `+tls=` server, refused without one. No
+    /// system store is read: point this at the system bundle, e.g.
+    /// `/etc/ssl/certs/ca-certificates.crt`; on Windows export the roots to PEM
+    /// (`Export-Certificate`, then `certutil -encode`).
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     upstream_tls_ca: Option<PathBuf>,
-    /// A file of negative trust anchors (RFC 7646): subtrees answered without
-    /// validation until a set time, for a zone whose DNSSEC its owner broke.
-    /// Needs --dnssec-validate.
-    ///
-    /// One per line, `NAME UNTIL [norecheck]`, `UNTIL` in UTC as
-    /// `YYYYMMDDHHmmSS` or Unix seconds, at most a week ahead (§4). Re-read on
-    /// SIGHUP; a file that does not load keeps the set in force. Each zone is
-    /// asked every five minutes whether it validates again, and its anchor
-    /// lifted when it does, unless `norecheck`.
+    /// A file of negative trust anchors (RFC 7646): subtrees answered
+    /// unvalidated until a set time. Needs --dnssec-validate. One per line,
+    /// `NAME UNTIL [norecheck]`, `UNTIL` in UTC as `YYYYMMDDHHmmSS` or Unix
+    /// seconds, at most a week ahead (§4). Re-read on SIGHUP, keeping the old
+    /// set if the file fails; each zone is rechecked every five minutes unless
+    /// `norecheck`.
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     negative_trust_anchors: Option<PathBuf>,
-    /// Answer `rdnsctl -s PATH` on this Unix socket: flush and dump the
-    /// caches, list the negative trust anchors, reload. `help` on the socket
-    /// lists the commands.
-    ///
-    /// Mode 0600, so the server's user and root; that is the authentication. On
-    /// Windows a named pipe, `\\.\pipe\NAME`, which only the owner,
-    /// administrators and SYSTEM may write to.
+    /// Answer `rdnsctl -s PATH` on this Unix socket (`help` lists the
+    /// commands). Mode 0600, so the server's user and root; that is the
+    /// authentication. On Windows a named pipe, `\\.\pipe\NAME`, writable by
+    /// the owner, administrators and SYSTEM.
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     control_socket: Option<PathBuf>,
     /// Write log lines to this file instead of standard error, appended,
@@ -347,17 +305,10 @@ struct Cli {
     /// Errors only. The same as `--log-level error`, and refused with it.
     #[arg(long, conflicts_with = "log_level")]
     quiet: bool,
-    /// How many UDP queries may be in flight at once. Over the ceiling, the
-    /// oldest gives way if its client has stopped waiting — past RFC 8767 §5's
-    /// 1.8 s client response timer — and otherwise the newcomer is dropped.
-    ///
-    /// No off switch, unlike `--query-rate 0`: a recursion holds its task for
-    /// seconds, so unbounded means a flood of one-datagram queries spawns tasks
-    /// faster than they retire. 0 is floored to 1, so a mistyped flag is wrong
-    /// and not fatal.
-    ///
-    /// Dropping is silent: a reply to a spoofed source is what an amplifier
-    /// sends.
+    /// How many UDP queries may be in flight at once. Over it, the oldest gives
+    /// way if its client stopped waiting (RFC 8767 §5's 1.8 s), else the
+    /// newcomer is dropped, silently. No off switch: a recursion holds its task
+    /// for seconds. 0 is floored to 1.
     #[arg(long, value_name = "QUERIES", default_value_t = default_max_inflight_udp(), conflicts_with = "config")]
     max_inflight_udp: usize,
     /// Queries per second, per source: an IPv4 address or an IPv6 /56.
@@ -441,16 +392,11 @@ struct Cli {
     max_connections_per_source_exempt: Vec<String>,
     /// UDP payload size advertised to clients in every reply's OPT, in octets.
     ///
-    /// What this resolver says it can reassemble (RFC 6891 §6.2.3), in both
-    /// directions: to its clients in every reply's OPT, and to the authoritative
-    /// servers it asks. One number because it is a fact about this host's stack
-    /// rather than about who is being told, which is how Unbound's
-    /// `edns-buffer-size` reads. It also floors `--max-udp-request`.
-    ///
-    /// [`rdns::FLAG_DAY_UDP_SIZE`] is the default of BIND's `edns-udp-size`,
-    /// Knot's `udp-max-payload`, NSD's `ipv4-edns-size` and Unbound's
-    /// `edns-buffer-size` after DNS Flag Day 2020. Not the size an upstream
-    /// answer is read into, which is separate. Floored at 512.
+    /// What this host can reassemble (RFC 6891 §6.2.3), told to clients and to
+    /// the servers it asks, as Unbound's `edns-buffer-size`; it floors
+    /// `--max-udp-request`. The default, [`rdns::FLAG_DAY_UDP_SIZE`], is
+    /// BIND's, Knot's, NSD's and Unbound's since DNS Flag Day 2020. Floored at
+    /// 512.
     #[arg(long, value_name = "OCTETS", default_value_t = default_udp_payload_size(), conflicts_with = "config")]
     udp_payload_size: u16,
     /// Largest UDP reply this resolver will send, in octets.
@@ -507,11 +453,8 @@ struct Cli {
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     metrics_listen: Option<String>,
     /// Answer an NSID request (RFC 5001) with this identifier: text, or `0x`
-    /// and hex for raw bytes. Off unless given — RFC 5001 §5 counts what it
-    /// says about the server as "security sensitive".
-    ///
-    /// Only a query that carries an NSID option gets one back, whatever it
-    /// put in it (§2.2).
+    /// and hex. Off unless given, as §5 calls it "security sensitive"; only a
+    /// query carrying the option gets one (§2.2).
     #[arg(long, value_name = "TEXT|0xHEX", conflicts_with = "config")]
     nsid: Option<String>,
     /// Stream traffic to dnstap: `tcp:<addr:port>` for a collector,
@@ -566,23 +509,16 @@ struct Cli {
     /// Synthesize AAAA records from A records under this NAT64 prefix, so an
     /// IPv6-only client can reach an IPv4-only name (RFC 6147).
     ///
-    /// Given without a value it is the Well-Known Prefix, 64:ff9b::/96
-    /// (RFC 6052 §2.1); otherwise `2001:db8::/96`, with a length of 32, 40, 48,
-    /// 56, 64 or 96 — the six RFC 6052 §2.2 has a place for the address in.
-    ///
-    /// Off unless given. A synthesized AAAA is an address that exists in no
-    /// zone and is only reachable through a translator this resolver does not
-    /// operate, so turning it on says one is there.
+    /// Without a value, the Well-Known Prefix 64:ff9b::/96 (RFC 6052 §2.1);
+    /// else a prefix of length 32, 40, 48, 56, 64 or 96 (§2.2). Off unless
+    /// given: it asserts a translator exists.
     #[arg(long, value_name = "PREFIX", num_args = 0..=1,
           default_missing_value = rdns::dns64::WELL_KNOWN_PREFIX, conflicts_with = "config")]
     dns64: Option<String>,
     /// Resolve this RFC 6303 empty zone instead of answering it locally,
-    /// repeatable: `10.in-addr.arpa.`, `168.192.in-addr.arpa.` and the rest
-    /// of the private-address reverse zones.
-    ///
-    /// For a site whose own DNS holds the reverse zone for its private space.
-    /// `localhost` and its reverse names, `local.` and `invalid.` are not
-    /// empty zones and cannot be switched off.
+    /// repeatable: `10.in-addr.arpa.`, `168.192.in-addr.arpa.` and the rest,
+    /// for a site serving its own private reverse zones. `localhost`, `local.`
+    /// and `invalid.` cannot be switched off.
     #[arg(long, value_name = "ZONE", conflicts_with = "config")]
     disable_empty_zone: Vec<String>,
     /// Resolve every RFC 6303 empty zone instead of answering it locally.
@@ -599,28 +535,16 @@ struct Cli {
     /// A Response Policy Zone file, repeatable and consulted in the order
     /// given: the first zone with a rule for a query decides it.
     ///
-    /// An RPZ is how blocking is delivered — a court order, a police list, a
-    /// malware feed — and it is an ordinary DNS zone, so a feed is a zone file
-    /// here. The zone's origin comes from its `$ORIGIN` line, or from the file
-    /// name if it has none.
-    ///
-    /// Not naming one is the off switch, and costs nothing per query.
+    /// The origin is the `$ORIGIN` line, or the file name. Not naming one is
+    /// the off switch and costs nothing per query.
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     rpz: Vec<PathBuf>,
-    /// Serve an expired answer for this many seconds past its TTL when the
-    /// authoritative servers cannot be reached (RFC 8767). 0 turns it off, and
-    /// off is the default.
+    /// Serve an expired answer this many seconds past its TTL when no
+    /// authoritative server answers (RFC 8767); 0, the default, is off.
     ///
-    /// One number rather than a switch and a ceiling: the window *is* the
-    /// feature, and a switch that needs a second flag to mean anything is two
-    /// ways to get one policy wrong. RFC 8767 §4 recommends between one and
-    /// three days — long enough to cover an outage nobody is awake for, short
-    /// enough that a name really withdrawn stops being answered.
-    ///
-    /// Off by default because this answers with data known to be out of date:
-    /// §6 is explicit that a withdrawn name stays alive for the whole window.
-    /// The stale answer carries a 30-second TTL (§4), says so with an Extended
-    /// DNS Error (RFC 8914 §4.4), and is counted.
+    /// The window is the feature, so one number; RFC 8767 §4 suggests one to
+    /// three days. Off by default: a withdrawn name lives the whole window
+    /// (§6). A stale answer carries a 30 s TTL and an EDE (RFC 8914 §4.4).
     #[arg(long, value_name = "SECONDS", default_value_t = default_serve_stale(), conflicts_with = "config")]
     serve_stale: u64,
     /// Abandon a resolution, and answer SERVFAIL, after this many seconds:
@@ -634,33 +558,19 @@ struct Cli {
     #[arg(long, value_name = "SECONDS", default_value_t = rdns::resolver::ResolutionTimer::DEFAULT, conflicts_with = "config")]
     resolution_timer: rdns::resolver::ResolutionTimer,
     /// Answer an expired name from the `--serve-stale` window at once, and
-    /// re-resolve it behind the answer — BIND's
-    /// `stale-answer-client-timeout 0`.
+    /// re-resolve it behind the answer: BIND's `stale-answer-client-timeout 0`.
     ///
-    /// A deviation from RFC 8767 §4, which serves stale data only once a
-    /// refresh has failed: here nothing has been tried. What it buys is that a
-    /// slow authoritative server costs the client nothing, where without it
-    /// the client waits for the resolution. The stale answer carries the same
-    /// 30-second TTL and an Extended DNS Error saying it is being refreshed;
-    /// the refresh goes to the `--prefetch-workers` pool, one per name per 30
-    /// seconds (§5's failure recheck timer).
-    ///
-    /// Not §5's 1.8-second client response timer, which answers stale only
-    /// once the resolution has run that long: BIND removed it after two CVEs,
-    /// and it needs a resolution that outlives the query that started it
-    /// (`TODO.md` #58).
+    /// A deviation from RFC 8767 §4, which serves stale only after a failed
+    /// refresh (`docs/adr/0005`). The refresh goes to the `--prefetch-workers`
+    /// pool, one per name per 30 seconds.
     #[arg(long, conflicts_with = "config", group = "refreshing")]
     serve_stale_first: bool,
-    /// Re-resolve a cached name in the last tenth of its TTL, so a popular
-    /// name never makes a client wait for the walk (Unbound's `prefetch`).
+    /// Re-resolve a cached name in the last tenth of its TTL, so a popular name
+    /// never makes a client wait (Unbound's `prefetch`).
     ///
-    /// The refresh is queued for a pool of its own, and at most one is started
-    /// per cache entry — a popular name in its last tenth costs one upstream
-    /// query and not one per client.
-    ///
-    /// Off by default: it turns a client's query into two, for a name nobody
-    /// may ask for again, and `dns_prefetches_total` against
-    /// `dns_cache_hits_total` is how an operator decides whether that pays.
+    /// One refresh per entry, on its own pool. Off by default: it doubles a
+    /// query for a name nobody may ask again; compare `dns_prefetches_total`
+    /// with `dns_cache_hits_total`.
     #[arg(long, conflicts_with = "config", group = "refreshing")]
     prefetch: bool,
     /// How many refreshes may resolve at once, for `--prefetch` and
@@ -677,28 +587,17 @@ struct Cli {
     /// What a policy zone's rules mean, when it should not be taken at its
     /// word: given, disabled, passthru, drop, nxdomain, nodata or tcp-only.
     ///
-    /// `given` — the default — does what each rule says. `passthru` matches and
-    /// changes nothing, which is how a new feed is measured before it is
-    /// enforced; `disabled` keeps the configuration and matches nothing.
-    ///
-    /// Applies to every `--rpz` zone, which is the wrong shape for the one use
-    /// `passthru` has: measuring a new feed here means measuring every feed at
-    /// once. `--config`'s `[[rpz.feeds]]` is where a policy per feed is
-    /// written, and this is its default there.
+    /// `given`, the default, does what each rule says; `passthru` matches and
+    /// changes nothing, to measure a feed; `disabled` matches nothing. Applies
+    /// to every zone; `[[rpz.feeds]]` in `--config` sets one per feed.
     #[arg(long, value_name = "POLICY", default_value_t = default_rpz_policy(), conflicts_with = "config")]
     rpz_policy: rdns::rpz::PolicyOverride,
     /// Addresses that may send a NOTIFY asking for the `--rpz` files to be
     /// re-read: `192.0.2.1`, `10.0.0.0/8`, `2001:db8::/32`. Repeatable.
     ///
-    /// An RPZ is a DNS zone, so the thing that maintains one already announces
-    /// a change this way — an `rdnsd` replicating the feed announces it to its
-    /// `--also-notify` targets after every transfer, with no new code on that
-    /// side. This is the ear for it.
-    ///
-    /// A list rather than a default, because a NOTIFY costs its recipient a
-    /// re-read of the feed it names: ~720 ms for a million-rule one, and that
-    /// feed's memory twice over while both versions are live (`TODO.md` #71b).
-    /// Naming nobody leaves a NOTIFY answered NOTIMP.
+    /// An `rdnsd` replicating a feed announces changes this way. A list, not a
+    /// default: a NOTIFY costs a re-read of the feed (`TODO.md` #71b measures
+    /// it). Naming nobody leaves a NOTIFY answered NOTIMP.
     #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     rpz_notify_from: Vec<String>,
     /// Read the settings from this file instead of the command line.
@@ -710,13 +609,9 @@ struct Cli {
     config: Option<PathBuf>,
     /// Validate the configuration and exit without binding a socket.
     ///
-    /// Reads and indexes every policy feed, loads the trust anchors, parses
-    /// every ACL and the NAT64 prefix, and reads the certificate. Exit 0 means
-    /// it would start.
-    ///
-    /// Not `requires = "config"`, which is where this differs from `rdnsd`'s:
-    /// everything it checks here is flag-settable too, and a dry run that
-    /// refuses the flag form checks the deployments that need it least.
+    /// Reads every policy feed, the trust anchors, every ACL, the NAT64 prefix
+    /// and the certificate; exit 0 means it would start. Works with flags,
+    /// unlike `rdnsd`'s, since all of it is flag-settable.
     #[arg(long)]
     check_config: bool,
     /// The feeds with a policy each, which only a config file can express.
@@ -813,9 +708,8 @@ fn main() -> std::process::ExitCode {
 }
 
 async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
-    // The same settings the flags carry, in a file. It *replaces* the flags
-    // rather than layering over them; see `config` for why that is an error
-    // rather than a precedence rule.
+    // The file replaces the flags rather than layering over them; `config` says
+    // why.
     if let Some(path) = cli.config.clone() {
         config::Config::load(&path)?.apply(&mut cli);
         tracing::info!("configured from {}", path.display());
@@ -858,10 +752,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
     // writes.
     let shutdown = Shutdown::new();
 
-    // What this host can reassemble and the largest datagram it will send. One
-    // advertisement, in both directions: the number is a fact about this stack,
-    // not about who is being told, which is how Unbound's `edns-buffer-size`
-    // reads too.
+    // One advertisement both ways: what this stack reassembles, as Unbound's
+    // `edns-buffer-size` reads.
     let udp = UdpSizes::new(cli.udp_payload_size, cli.max_udp_response);
 
     // Recursion is the default; naming an upstream is what selects forwarding.
@@ -953,12 +845,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
             Some(path) => {
                 let anchors =
                     ManagedAnchors::load_or_seed(path, &anchors, current_unix_timestamp())?;
-                // Now rather than at the first change, so an operator who
-                // points at a new path can see what is trusted without waiting
-                // a month for something to happen. Not under `--check-config`:
-                // a dry run that creates the file leaves it owned by whoever
-                // ran the check, which the daemon may then not be able to
-                // write.
+                // Saved now, to show what is trusted; not by a dry run, which
+                // may leave it owned by someone else.
                 if !path.exists() && !cli.check_config {
                     anchors.save(path)?;
                     tracing::info!(
@@ -1046,9 +934,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         );
     }
 
-    // Above the dry run, with the other settings that can be wrong: without a
-    // window there is nothing to answer first from, so the switch would be a
-    // policy the operator believes is in force and is not (`CLAUDE.md` §15).
+    // Above the dry run: without a window the switch is a policy believed in
+    // force and not (`CLAUDE.md` §15).
     if cli.serve_stale_first && (cli.serve_stale == 0 || cli.no_cache) {
         return Err(anyhow!(
             "--serve-stale-first answers from the --serve-stale window, and \
@@ -1073,23 +960,20 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         clock.clone(),
     );
 
-    // Before anything binds, like the certificate and the metrics listener: a
-    // policy file that will not parse is a block that is not in force, and
-    // starting without it is the failure worth avoiding most here.
+    // Before anything binds: a feed that will not parse is a block not in
+    // force.
     let feeds = cli.feeds();
     let policy = PolicyStore::load(&feeds)?;
 
-    // With the policy, and before anything binds, for the same reason: a typo
-    // in the list is an announcement that will be refused, and an operator
-    // finds that out when the feed goes stale rather than at startup.
+    // With the policy, before anything binds: a typo here would otherwise
+    // surface as a stale feed.
     let reload = PolicyReload::default();
     let rpz_notify = if cli.rpz_notify_from.is_empty() {
         None
     } else {
         if feeds.is_empty() {
-            // Not a warning. There is nothing for a NOTIFY to re-read, so the
-            // list is a policy the operator believes is in force and is not
-            // (`CLAUDE.md` §15).
+            // Not a warning: with nothing to re-read, the list is a policy not
+            // in force (`CLAUDE.md` §15).
             return Err(anyhow!(
                 "--rpz-notify-from names who may ask for the --rpz files to be \
                  re-read, and no --rpz names one"
@@ -1101,9 +985,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         })
     };
 
-    // Above the dry run, as every setting is (`CLAUDE.md` §15). Leaked once:
-    // it is read on every reply for the life of the process, and `'static`
-    // keeps `ServerOpt` `Copy`.
+    // Above the dry run (`CLAUDE.md` §15). Leaked once: read on every reply,
+    // and `'static` keeps `ServerOpt` `Copy`.
     let nsid: Option<&'static [u8]> = cli
         .nsid
         .as_deref()
@@ -1132,10 +1015,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         }
     };
 
-    // Read before anything binds: a certificate that will not load is a DoT
-    // listener that answers nothing, and `--check-config` has to reach it. Over
-    // the merged view, once, so the file and the flags cannot each have their
-    // own check of the pair rule.
+    // Before anything binds, so `--check-config` reaches it; over the merged
+    // view, so file and flags share one pair check.
     let encrypted = Encrypted::configure(cli.encrypted_flags(), None)?;
 
     // Here for the same reason, and it was below the binds too: a typo in the
@@ -1150,14 +1031,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         )?,
     );
 
-    // The keys a transferred policy feed may be signed with. Parsed through
-    // `TsigKey::parse`, so this daemon and `rdnsd` cannot disagree about what a
-    // key means (`CLAUDE.md` §7).
-    //
-    // Above the exit, and not beside the feed tasks that use it: down there it
-    // is parsed after both sockets are bound and the anomaly watcher is
-    // spawned, so a secret that is not base64 passes the dry run and kills a
-    // started process (`CLAUDE.md` §15).
+    // Through `TsigKey::parse`, as `rdnsd` (`CLAUDE.md` §7), and above the
+    // exit, so a bad secret fails the dry run (§15).
     let policy_keys: Vec<rdns::tsig::TsigKey> = cli
         .tsig_key
         .iter()
@@ -1165,15 +1040,11 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         .collect::<Result<_, _>>()
         .context("a TSIG key in [keys]")?;
 
-    // The dry run exits here, and *here* specifically: everything above is
-    // everything knowable without binding a socket. The config parsed, every
-    // feed was read and indexed, the trust anchors loaded, every ACL and the
-    // NAT64 prefix parsed, and the certificate read against its key. What is
-    // left is binding sockets and starting timers.
+    // The dry run exits here: everything above is knowable without binding;
+    // what is left binds sockets and starts timers.
     if cli.check_config {
-        // `println!`, not `tracing`: this is the answer on stdout, and
-        // `--quiet` must not take away the output of a command whose whole job
-        // is to produce it. `rdnsd --check-config` says it the same way.
+        // `println!`: the answer goes to stdout, and `--quiet` must not hide
+        // it, as in `rdnsd --check-config`.
         let in_force = policy.in_force();
         let overridden = in_force
             .zones()
@@ -1185,9 +1056,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
              encrypted transports {}, upstream TLS {}, query ACL {}, empty zones {}, NSID {}",
             source,
             in_force.zones().len(),
-            // Said out loud because a feed at `passthru` or `disabled` blocks
-            // nothing, and that is the policy mistake that looks exactly like a
-            // working server.
+            // Said out loud: a feed at `passthru` or `disabled` blocks nothing
+            // and looks like a working server.
             match overridden {
                 0 => String::new(),
                 n => format!(" ({n} not taken at their word)"),
@@ -1326,10 +1196,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         refusals_per_source: cli.anomaly_source_refusals,
     };
     log_policy(&policy.in_force());
-    // What a NOTIFY may do here, printed for the same reason the rate limit is:
-    // silence is a legitimate answer to one and an operator watching a feed go
-    // stale cannot tell a refused announcement from one nobody sent
-    // (`CLAUDE.md` §14).
+    // Printed like the rate limit: a refused NOTIFY is silent, and a stale feed
+    // looks the same either way (`CLAUDE.md` §14).
     if let Some(acl) = rpz_notify.as_ref() {
         tracing::info!(
             "a NOTIFY from {} address(es) queues a re-read of the --rpz file it \
@@ -1342,9 +1210,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         );
     }
 
-    // Printed because a private PTR that leaves the host is the leak RFC 6303
-    // exists to stop, and one answered here is a name an internal zone cannot
-    // serve.
+    // Printed because a private PTR leaving the host is the leak RFC 6303
+    // stops.
     tracing::info!("empty zones (RFC 6303): {}", empty_zones.describe());
     // Printed because every name under one is answered unvalidated.
     if let Some(path) = &cli.negative_trust_anchors {
@@ -1407,14 +1274,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         },
     );
 
-    // A `JoinSet` rather than two `JoinHandle`s in a `select!`: dropping the
-    // loser detaches the task rather than cancelling it, so `main` returns with
-    // the other transport still reading
-    // and replies still queued in a per-connection `mpsc`. `join_next` is
-    // cancel-safe, so first-one-wins keeps both tasks owned and joinable.
-    // Outside the `JoinSet`: that set ends the process when its first task ends,
-    // and this one ends on the stop signal by design. Joined after the drain, so
-    // it is not a detached task (`CLAUDE.md` §9).
+    // Outside the `JoinSet`, as it ends on the stop signal by design; joined
+    // after the drain, so not detached (`CLAUDE.md` §9).
     let anomalies = tokio::spawn(watch_anomalies(
         ctx.logger.clone(),
         anomaly_thresholds,
@@ -1422,31 +1283,24 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         shutdown.stop_handle(),
     ));
 
-    // Built before `Resolving` because the answer path holds them: a NOTIFY
-    // naming a transferred feed wakes that feed's task, where one naming a file
-    // feed queues the process-wide re-read. One zone, one wake.
+    // Before `Resolving`, which holds them: a NOTIFY wakes a transferred feed's
+    // task, or queues the re-read for a file feed.
     let feed_wakes: Vec<FeedWake> = cli
         .rpz_masters
         .iter()
         .map(|feed| FeedWake::new(feed.spec.zone.clone()))
         .collect();
 
-    // One task per transferred feed, outside the `JoinSet` for the reason the
-    // anomaly watcher is: the set ends the process when its first member ends,
-    // and these end on the stop signal by design.
+    // Outside the `JoinSet`, like the anomaly watcher: these end on the stop
+    // signal by design.
     let mut transfers = Vec::new();
     for (feed, wake) in cli.rpz_masters.iter().zip(&feed_wakes) {
-        // Resolved here rather than in the task: a key name that defines
-        // nothing must stop the process, not send one unsigned request per
-        // refresh forever. `Config::check` refuses it first for the file path;
-        // this is the second door, and the one that holds if a key's secret
-        // file could not be read.
+        // Resolved here so an unknown key stops the process, not every refresh;
+        // it holds when `Config::check` could not read a secret.
         let mut feed = feed.clone();
         if let Some(name) = &feed.spec.key_name {
-            // By name alone, not through `TsigKeyring::get`: that takes an
-            // algorithm too, because a *server* reads both off the arriving
-            // record. A client knows only the name it was configured with, and
-            // the algorithm is whatever `[keys]` said.
+            // By name, not `TsigKeyring::get`: a client knows only the name,
+            // and `[keys]` gives the algorithm.
             let Some(key) = policy_keys
                 .iter()
                 .find(|key: &&rdns::tsig::TsigKey| key.name.eq_ignore_ascii_case(name))
@@ -1471,9 +1325,7 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         )));
     }
 
-    // One handle for every listener: the four encrypted ones each built their
-    // own copy of the same three fields, and a fourth field to add is a fourth
-    // place to forget it (`CLAUDE.md` §7).
+    // One handle for every listener (`CLAUDE.md` §7).
     let (refreshes, refresh_queue) = if cli.prefetch || cli.serve_stale_first {
         let (refreshes, queue) = prefetch::channel(
             cli.prefetch_queue,
@@ -1529,6 +1381,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         ctx: ctx.clone(),
     });
 
+    // Not `JoinHandle`s in a `select!`: dropping the loser detaches it, where
+    // `join_next` is cancel-safe and keeps every task owned (`CLAUDE.md` §9).
     let mut loops = JoinSet::new();
     loops.spawn(udp_main(
         socket,
@@ -1554,16 +1408,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         &shutdown,
         &mut loops,
     );
-    // Two things pass through the one reload this daemon has: the certificate a
-    // renewal rewrote, and every `--rpz` file. `rdnsd` folds the same
-    // certificate call into the reload every trigger passes through; here there
-    // are no zones, so a reload means these and only these. One certificate
-    // store serves all three encrypted listeners, so one reload reaches them
-    // all.
-    //
-    // Not in the `JoinSet` below: that set's rule is "the first task to end ends
-    // the process", and this one ends on the stop signal by design.
-    // A no-op without a stub zone at `.` (RFC 8806, `TODO.md` #177).
+    // A no-op without a stub zone at `.` (RFC 8806). Outside the `JoinSet`:
+    // it ends on the stop signal by design.
     tokio::spawn(
         serving
             .resolver
@@ -1618,11 +1464,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
     // A listener like the others: if it dies, the process does. Metrics that
     // silently stopped are worse than a resolver that is plainly down.
     if let Some(metrics_listener) = metrics_listener {
-        // Both handles taken *here*, not before the `if`: a `Busy` clone that
-        // nothing moves into a task is one `main` holds for the life of the
-        // process, so the drain never reaches zero and every shutdown waits out
-        // its whole budget before exiting — which is what this daemon did with
-        // no `--metrics-listen`, which is the default.
+        // Taken here, not before the `if`: an unmoved `Busy` clone held by
+        // `main` keeps the drain from reaching zero.
         let (stop, busy) = (shutdown.stop_handle(), shutdown.busy());
         loops.spawn(async move {
             metrics_server::serve(
@@ -1638,10 +1481,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         });
     }
 
-    // Whichever listener ends first ends the process rather than leaving one
-    // transport served; what the drain then waits for here is a resolution a
-    // client is waiting on, or the RFC 5011 manager part-way through rewriting
-    // the anchor file.
+    // The first listener to end ends the process; the drain waits for
+    // resolutions clients await and an RFC 5011 anchor rewrite.
     let stopped = rdns_transport::serve_until_stopped(loops, anomalies, shutdown).await;
     serving.resolver.close_upstream_connections().await;
     stopped

@@ -103,10 +103,8 @@ fn default_tsig_algorithm() -> String {
     rdns::tsig::TsigAlgorithm::DEFAULT.config_name().to_string()
 }
 
-// `[server]`: the keys both daemons have, from `rdns::server_table!`, then
-// `max-inflight-udp`, which is a resolver's shape of `rdnsd`'s `udp-workers`,
-// and `allow-query`.
-// The macro writes `Default` too, so the shared half is spelled once.
+// `[server]`: the keys both daemons share, from `rdns::server_table!`, which
+// writes `Default` too, then `max-inflight-udp` and `allow-query`.
 rdns::server_table! {
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -272,16 +270,11 @@ struct FeedEntry {
 
 impl Config {
     /// The TSIG keys this config defines, in the `[alg:]name:secret` form
-    /// `rdns::tsig::TsigKey::parse` takes.
+    /// `rdns::tsig::TsigKey::parse` takes, so all three binaries agree (§7).
     ///
-    /// Through the parser rather than building keys directly, so this daemon,
-    /// `rdnsd` and `rdnsc` cannot disagree about what a key means (§7). No zone
-    /// list: the fourth field is a *server's* transfer scope, and a resolver
-    /// only ever presents a key.
-    ///
-    /// A secret that will not read is a key that is left out, and `serve` says
-    /// so — the alternative is failing the whole config for a file that may
-    /// belong to a feed nobody uses this run.
+    /// No zone list: a resolver only presents a key. An unreadable secret
+    /// leaves its key out and `serve` says so, rather than failing for an
+    /// unused feed.
     fn tsig_specs(&self) -> Vec<String> {
         let mut specs = Vec::new();
         for (
@@ -339,11 +332,8 @@ impl Config {
                  a bucket starts full, and a full bucket of nothing has no token to spend"
             );
         }
-        // The flag floors this at 1 instead, which is not an inconsistency: a
-        // mistyped flag should be wrong rather than fatal, and a config file is
-        // the one place a wrong value can be reported with a line number to the
-        // operator who is editing the whole policy at once. `query-burst` above
-        // splits the same way for the same reason.
+        // Unlike the flag, which floors to 1: a file can report the line.
+        // `query-burst` splits the same way.
         if self.server.max_inflight_udp == 0 {
             bail!(
                 "server.max-inflight-udp 0 binds the UDP socket and answers nothing on \
@@ -402,9 +392,8 @@ impl Config {
                 })
                 .transpose()?;
             if let Some(key) = spec.and_then(|spec| spec.key_name) {
-                // A key name that names nothing is a transfer the operator
-                // believes is signed and is not (§15) — `rdnsd` refuses the
-                // same way for `[zones.*].masters`.
+                // A key name naming nothing is a transfer believed signed and
+                // not (§15); `rdnsd` refuses the same.
                 if !self.keys.keys().any(|k| rdns::tsig::same_key_name(k, &key)) {
                     bail!(
                         "rpz.feeds {} transfers with key {key:?}, and no [keys.{key:?}] \
@@ -436,17 +425,9 @@ impl Config {
 
     /// Fold this config into `cli`.
     ///
-    /// Overwriting `cli` rather than threading a second settings type through
-    /// the daemon keeps every downstream caller untouched: the flags and the
-    /// file produce the same shape, so there is one code path and not two to
-    /// drift apart (`CLAUDE.md` §7). It is sound because the two are mutually
-    /// exclusive — nothing in `cli` can be an operator's explicit choice here.
-    ///
-    /// Every table is destructured without `..`, so a key added to a
-    /// declaration does not compile until this names it, and one named and not
-    /// used is `unused_variables`. `dead_code` covers only a key nothing reads;
-    /// one `check` validates and this forgot would pass silently. `[server]`'s
-    /// projection is `server_table!`'s.
+    /// One shape from flags and file, so one code path (`CLAUDE.md` §7); sound
+    /// because the two are exclusive. Every table is destructured without `..`,
+    /// so a key added and not handled fails to compile.
     pub(crate) fn apply(&self, cli: &mut Cli) {
         let Config {
             server,
