@@ -627,9 +627,8 @@ mod tests {
         let server = Server::start(TransportLimits::default(), Duration::ZERO).await;
         let connection = server.connect(quinn::TransportConfig::default()).await;
 
-        // Two queries on two streams, because "one query per stream" is the
-        // mapping and a second one on the same connection is what proves the
-        // loop keeps accepting rather than answering once.
+        // Two queries on two streams: the second proves the loop keeps
+        // accepting.
         for id in [0x0000u16, 0x1234] {
             let question = query(id);
             let answered = ask(&connection, id).await.expect("read");
@@ -666,12 +665,9 @@ mod tests {
     }
 
     /// Each way a stream can fail to frame one query is a §4.3.3 protocol
-    /// error, answered by closing the connection with `DOQ_PROTOCOL_ERROR`:
-    /// "It SHOULD forcibly abort the connection using QUIC's CONNECTION_CLOSE
-    /// mechanism".
+    /// error, closing the connection with `DOQ_PROTOCOL_ERROR`.
     ///
-    /// Fails if only the stream is reset: every case reads a stream reset, and
-    /// a second query after the first is answered (`TODO.md` #165).
+    /// Fails if only the stream is reset: a second query is then answered.
     #[tokio::test]
     async fn a_stream_framed_wrongly_closes_the_connection() {
         let server = Server::start(TransportLimits::default(), Duration::ZERO).await;
@@ -732,9 +728,8 @@ mod tests {
         let _ = server.task.await;
     }
 
-    /// A client that cancels its query is answered with RESET_STREAM (§4.3.1:
-    /// "The server MUST issue a RESET_STREAM"), coded `DOQ_NO_ERROR`, and the
-    /// connection goes on.
+    /// A client that cancels its query gets RESET_STREAM (§4.3.1) coded
+    /// `DOQ_NO_ERROR`, and the connection goes on.
     ///
     /// Fails if the reset carries `DOQ_PROTOCOL_ERROR`.
     #[tokio::test]
@@ -758,10 +753,8 @@ mod tests {
         let _ = server.task.await;
     }
 
-    /// A query admission refuses is framed right and wrong in itself, so its
-    /// stream is reset, not the connection — as TCP skips the message — and
-    /// with a reset rather than a FIN, which reads as a complete answer of
-    /// nothing.
+    /// A refused query resets its stream, not the connection, as TCP skips the
+    /// message; a FIN would read as an empty answer.
     ///
     /// Fails if the stream ends with a FIN.
     #[tokio::test]
@@ -881,13 +874,11 @@ mod tests {
         let _ = server.task.await;
     }
 
-    /// A reply the client never reads, with or without PINGs, does not hold
-    /// the connection past about twice the idle timeout: one for no new
-    /// stream, one for the drain. `read_timeout` is left at its 5 s so the
-    /// stall reset is not what ends it.
+    /// A reply the client never reads, with or without PINGs, holds the
+    /// connection at most about twice the idle timeout.
     ///
     /// Fails without the idle deadline: with PINGs the connection is open at
-    /// the bound. Without PINGs QUIC's own timer closes it.
+    /// the bound. `read_timeout` stays 5 s so the stall reset does not end it.
     #[tokio::test]
     async fn a_reply_never_read_does_not_hold_the_connection() {
         for pings in [false, true] {
@@ -972,9 +963,8 @@ mod tests {
         let _ = server.task.await;
     }
 
-    /// A query stream with no FIN is "dangling" (RFC 9250 §4.2), and a missing
-    /// FIN is a protocol error that "SHOULD forcibly abort the connection"
-    /// with `DOQ_PROTOCOL_ERROR` (§4.3.3).
+    /// A query stream with no FIN (RFC 9250 §4.2) aborts the connection with
+    /// `DOQ_PROTOCOL_ERROR` (§4.3.3).
     ///
     /// Fails without the read deadline: the connection is still open at the
     /// bound.
@@ -1003,16 +993,11 @@ mod tests {
         let _ = server.task.await;
     }
 
-    /// A reply starved of stream credit is reset with `DOQ_UNSPECIFIED_ERROR`
-    /// after `read_timeout` without progress, and only that stream: credit is
-    /// per stream, so another on the same connection is still answered.
-    ///
-    /// And the transfer answering it stops, rather than blocking on a reply
-    /// channel nobody drains.
+    /// A reply starved of stream credit for `read_timeout` resets only its
+    /// stream, and the transfer answering it stops.
     ///
     /// Fails without the progress deadline: the starved stream is never reset.
-    /// Without dropping the channel before awaiting the handler, the handler
-    /// never returns.
+    /// Without dropping the channel first, the handler never returns.
     #[tokio::test]
     async fn a_reply_starved_of_credit_resets_only_its_stream() {
         let limits = TransportLimits {

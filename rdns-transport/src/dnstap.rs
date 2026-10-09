@@ -368,9 +368,8 @@ mod tests {
     #[tokio::test]
     async fn a_sink_that_cannot_keep_up_drops_and_counts_rather_than_blocking() {
         let metrics = DnsMetrics::new();
-        // A queue of one, and nothing reading it: the second payload has
-        // nowhere to go. The receiver is held so the channel stays open — a
-        // closed one would be the other half of the same branch.
+        // A queue of one with no reader: the second payload has nowhere to go.
+        // `_queue` keeps the channel open; closed is the other branch.
         let (frames, _queue) = mpsc::channel(1);
         let sink = Sink {
             frames,

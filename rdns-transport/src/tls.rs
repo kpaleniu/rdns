@@ -404,11 +404,8 @@ pub(crate) mod testing {
     }
 
     pub(crate) fn write_pem(tag: &str, name: &str) -> Pem {
-        // A counter as well as the pid, and it is not belt-and-braces: three DoH
-        // tests reused one tag, so they shared a directory, wrote cert.pem and
-        // key.pem over each other and loaded a mismatched pair. The `Drop` below
-        // then deleted a directory another test was still using. Unique per
-        // call, so reusing a tag cannot do that again.
+        // A counter as well as the pid: tests sharing a tag share a directory,
+        // overwrite each other's key pair and delete it under each other.
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =
@@ -532,13 +529,10 @@ mod tests {
             .expect("anchors load")
     }
 
-    /// What a client proved reaches the handler, which is the whole of #59's
-    /// plumbing half: a transfer's authorization is decided from
-    /// [`Arrival::peer_certificate`] and nothing else can supply it.
-    ///
-    /// Fails against a listener built `with_no_client_auth`, which is what this
-    /// one is without anchors: rustls never asks, so `peer_certificates()` is
-    /// empty however many certificates the client holds.
+    /// A client certificate reaches the handler as
+    /// [`Arrival::peer_certificate`], the only source of a transfer's
+    /// authorization. Fails against a listener built `with_no_client_auth`:
+    /// rustls never asks.
     #[tokio::test]
     async fn a_client_certificate_reaches_the_handler() {
         let server_pem = write_pem("mtls-server", "localhost");
@@ -591,13 +585,11 @@ mod tests {
         let _ = server.await;
     }
 
-    /// And a client with no certificate is served anyway, which is why the
-    /// verifier allows an unauthenticated one: the same listener answers stub
-    /// resolvers, and RFC 8310 §8.2's mTLS is a different relationship from
-    /// RFC 9103 §7.5's.
+    /// A client with no certificate is still served: the listener also answers
+    /// stub resolvers (RFC 8310 §8.2, not RFC 9103 §7.5).
     ///
-    /// Fails against `WebPkiClientVerifier::builder(..).build()` without
-    /// `allow_unauthenticated`, where this handshake is refused outright.
+    /// Fails against a verifier without `allow_unauthenticated`, which refuses
+    /// the handshake.
     #[tokio::test]
     async fn a_stub_resolver_with_no_certificate_is_still_served() {
         let server_pem = write_pem("mtls-optional", "localhost");
@@ -746,11 +738,8 @@ mod tests {
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
         );
-        // What the handler was told the connection was, read off the finished
-        // handshake rather than assumed from the listener. `rdnsd` refuses a
-        // zone transfer that is not this (RFC 9103 §7.2, §11), so a listener
-        // reporting the wrong thing would refuse every transfer or accept every
-        // one.
+        // Read off the handshake, not assumed: `rdnsd` refuses a transfer that
+        // is not this (RFC 9103 §7.2, §11).
         assert_eq!(
             seen.seen(),
             Some(Arrival::Dot(TlsVersion::Tls13, PeerCertificate::none())),

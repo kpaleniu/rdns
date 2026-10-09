@@ -83,14 +83,10 @@ pub fn recv_error_is_transient(e: &std::io::Error) -> bool {
 }
 
 /// Descriptor and buffer exhaustion, which `accept` reports with no portable
-/// [`std::io::ErrorKind`] — `EMFILE` arrives as `Uncategorized`, exactly as
-/// WSAEMSGSIZE does above, so the raw code is again the only way to see it.
+/// [`std::io::ErrorKind`]: `EMFILE` arrives as `Uncategorized`.
 ///
-/// Linux and Windows, because those are the two this is built and tested on;
-/// another Unix falls through to the kinds below, which is a smaller set and
-/// not a wrong one. Only the Linux numbers are measured: `EMFILE` is what an
-/// `accept` returns at `ulimit -n`, and a Windows process could not be made to
-/// run out of handles at all (100 000 opened, no failure).
+/// Linux and Windows only; another Unix falls through to the kinds below, a
+/// smaller set and not a wrong one.
 #[cfg(target_os = "linux")]
 const ACCEPT_EXHAUSTION: &[i32] = &[
     24,  // EMFILE — this process is at its descriptor limit
@@ -116,19 +112,10 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// What an accept loop does with an `accept` error: `Ok` to carry on, `Err` for
 /// one worth ending the process over.
 ///
-/// Both daemons run their accept loops in a `JoinSet` whose first finished task
-/// ends the process, so an `accepted?` in these four loops makes *any* accept
-/// error a whole-server outage — every transport, not just the one that failed.
-/// Measured on Linux: at the descriptor limit `accept` returns `EMFILE`, and
-/// the condition clears by itself as connections close. That is `CLAUDE.md`
-/// §4's receive-loop rule, which [`recv_error_is_transient`] answers for UDP
-/// and no accept loop had asked.
-///
-/// The other half of that rule — what a *remote* party can provoke — was
-/// measured and is nothing: a connection reset with `SO_LINGER 0` before the
-/// accept is handed back as an ordinary `Ok` on both platforms, and shows up
-/// later on the read. The aborted-connection kinds are recognized anyway
-/// because they are what BSD would return for it.
+/// A loop's end ends the process, so an error that clears by itself, such as
+/// `EMFILE` as connections close, must not end it (`CLAUDE.md` §4; UDP's is
+/// [`recv_error_is_transient`]). The aborted-connection kinds are what BSD
+/// returns for a peer reset before the accept.
 pub async fn survive_accept_error(
     e: std::io::Error,
     transport: &str,
@@ -234,15 +221,10 @@ impl ServeContext {
 
     /// Whether this source may be answered at all.
     ///
-    /// Silent when it may not: replying to a source that may be spoofed is what
-    /// an amplifier does, which is why the effective policy is printed at
-    /// startup and the refusal is counted here (`CLAUDE.md` §14).
-    ///
-    /// `now` is the caller's. `rdnsd` reads the clock once for the limiter, the
-    /// logger and the TSIG check; `rdnsr` reads it again after a recursion,
-    /// because charging a response against the query's instant would deny the
-    /// bucket the refill the wait earned it. A pipeline that read the clock
-    /// itself would silently pick the first of those (`TODO.md` #28a, #30e).
+    /// Silent when it may not: answering a spoofed source is what an amplifier
+    /// does. The refusal is counted (`CLAUDE.md` §14). `now` is the caller's:
+    /// `rdnsr` reads it again after a recursion, so the wait's refill is not
+    /// lost.
     pub fn allow_source(&self, peer: Peer, now: u64) -> bool {
         let judged = self.limiter.judge(peer, now);
         if judged.untracked {
@@ -259,22 +241,17 @@ impl ServeContext {
     /// Whether this packet is worth parsing: the size cap for its transport and
     /// the per-section counts, on bytes nothing has trusted yet.
     ///
-    /// Not validation — a packet that passes is not known to be well formed.
-    /// [`rdns::DnsMessage::try_from_bytes`] decides that, afterwards, and
-    /// [`rdns::validation::Request`] decides whether it is a question at all.
-    ///
-    /// The failure is logged at DEBUG and counted: this is the path a flood
-    /// takes, so the message must not be built unless somebody asked for it,
-    /// and the counter is the signal in either case.
+    /// Not validation: [`rdns::DnsMessage::try_from_bytes`] and
+    /// [`rdns::validation::Request`] decide that. A failure is counted, and
+    /// logged at DEBUG only if something listens: this is the flood path.
     pub fn accept_packet(&self, peer: Peer, packet: &[u8], transport: Transport) -> bool {
         let verdict = self.admission.validate_packet(packet, transport);
         if verdict.is_valid() {
             return true;
         }
         self.logger.count_error(peer);
-        // The `to_string` is inside the macro's arguments on purpose: `tracing`
-        // only evaluates those when something is listening, so a flood costs no
-        // formatting at the default level.
+        // `to_string` inside the macro's arguments: `tracing` evaluates them
+        // only when something listens.
         tracing::debug!(
             peer = %peer,
             "invalid query: {}",
@@ -289,15 +266,9 @@ impl ServeContext {
     /// Whether the answer already built may be sent, and the counting either
     /// refusal owes.
     ///
-    /// The third refusal path, beside [`ServeContext::allow_source`] and
-    /// [`ServeContext::accept_packet`]. The verdict comes back rather than the
-    /// reply: what a truncated answer looks like is each daemon's — `rdnsd`
-    /// rebuilds one from the question it parsed, `rdnsr` shortens the bytes it
-    /// already has — and #30j settled that those stay two.
-    ///
-    /// `now` is the caller's, for the reason [`ServeContext::allow_source`]
-    /// gives: `rdnsr` reads the clock again here because a recursion sat
-    /// between the two reads.
+    /// The verdict, not the reply: `rdnsd` rebuilds a truncated answer from the
+    /// question, `rdnsr` shortens its bytes (`TODO.md` #30j). `now` is the
+    /// caller's, as for [`ServeContext::allow_source`].
     pub fn admit_response(&self, peer: Peer, len: usize, now: u64) -> ResponseVerdict {
         let judged = self.responses.judge(peer, len, now);
         if judged.untracked {
@@ -358,18 +329,13 @@ impl QueryAcl {
     }
 }
 
-/// How many connections one source may hold open on each stream listener
-/// (`TODO.md` #156): `--max-connections-per-source`, and who is exempt.
+/// How many connections one source may hold open on each stream listener:
+/// `--max-connections-per-source`, and who is exempt.
 ///
-/// Without it one peer could hold every slot of a listener, keeping each
-/// connection alive with a query inside the idle timeout — #155 made that
-/// visible, this makes it a limit. A source is a [`rdns::peer::Source`], so
-/// rotating within an IPv6 /56 gains nothing; exemption is matched against
-/// the peer, as `--query-rate-exempt` is. Its own list rather than that one,
-/// so the two policies do not move together.
-///
-/// The default is off, which is what a test context wants; both daemons set
-/// it from their flag, whose default is 32.
+/// Without it one peer could hold every slot with queries inside the idle
+/// timeout. A source is a [`rdns::peer::Source`], so rotating within an IPv6
+/// /56 gains nothing. Its own exempt list, apart from `--query-rate-exempt`.
+/// Off by default; both daemons set it from their flag.
 #[derive(Clone, Default)]
 pub struct SourceConnections {
     /// 0 is off.
@@ -408,28 +374,19 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(10).unwrap();
 
 /// What a connection may cost, per listener.
 ///
-/// A struct rather than shared `const`s: one constant would force an
-/// authoritative server and a recursive resolver to hold the same connection
-/// ceiling forever, and they have no reason to (`TODO.md` #30b). The defaults
-/// are what both daemons ran with, and each may take the field it disagrees
-/// about without either editing the other's.
-///
-/// The connection ceiling and the idle timeout are settings (`TODO.md` #155),
-/// the two BIND, NSD, Unbound and Knot all expose. The other two stay
-/// constants: of those four only Knot offers either (`tcp-io-timeout`).
+/// A struct, not shared `const`s, so the two daemons may differ. The connection
+/// ceiling and the idle timeout are settings, as in BIND, NSD, Unbound and
+/// Knot; the other two stay constants, which only Knot offers (`TODO.md` #155).
 #[derive(Debug, Clone, Copy)]
 pub struct TransportLimits {
     /// How long a connection may sit idle between messages. RFC 7766 §6.2.3
     /// wants connections reused rather than reopened; an idle one still costs a
     /// socket, so this is the compromise the RFC asks for.
     pub idle_timeout: Duration,
-    /// How long the rest of a message may take once its length prefix arrived.
-    /// Mid-message the peer has committed to `len` bytes, so a stall gets a much
-    /// shorter leash than an idle connection.
-    ///
-    /// Also how long a reply may go without any of it being written
-    /// (`write_progressing`): one value for both directions, as Knot's
-    /// `tcp-io-timeout` is (`TODO.md` #163).
+    /// How long the rest of a message may take once its length prefix arrived:
+    /// mid-message the peer has committed to `len` bytes, so a stall gets a
+    /// shorter leash than idle. Also how long a reply may go without progress
+    /// (`write_progressing`), as Knot's `tcp-io-timeout` covers both.
     pub read_timeout: Duration,
     /// Concurrent connections. Without a ceiling, an accept loop that spawns per
     /// connection is a free file-descriptor exhaustion vector.
@@ -503,15 +460,9 @@ where
 
 /// Serve until a listener stops or the operator does, then drain.
 ///
-/// The epilogue both daemons share: whichever listener ends first ends the
-/// process, because answering on one transport and not the other is worse than
-/// being plainly down; a signal is an orderly stop.
-///
-/// `background` is the task that is *not* a listener — the periodic anomaly
-/// warnings — and is awaited rather than dropped, because dropping a
-/// `JoinHandle` detaches the task instead of cancelling it (`CLAUDE.md` §9). It
-/// is not in the `JoinSet` for a sharper reason: that set's rule is "the first
-/// task to end ends the process", and `--anomaly-interval 0` returns at once.
+/// The first listener to end ends the process: half a server is worse than
+/// none. `background` is awaited, not dropped (`CLAUDE.md` §9), and kept out of
+/// the `JoinSet`, where `--anomaly-interval 0` returning at once would end it.
 pub async fn serve_until_stopped(
     mut loops: tokio::task::JoinSet<Result<(), std::io::Error>>,
     background: tokio::task::JoinHandle<()>,
@@ -537,9 +488,8 @@ pub async fn serve_until_stopped(
     }
     let _ = background.await;
 
-    // Wait for work accepted before the stop. A client cannot tell a truncated
-    // AXFR from a complete one, so cutting one mid-stream is the case this is
-    // for.
+    // Wait for work accepted before the stop: a client cannot tell a truncated
+    // AXFR from a complete one.
     shutdown.drain_reporting().await;
 
     match failure {

@@ -552,16 +552,11 @@ mod tests {
         );
     }
 
-    /// Half of the claim in `serve_one`'s own doc comment, which is a claim to
-    /// verify (`CLAUDE.md` §4): on shutdown, reading stops but a message
-    /// already accepted finishes and reaches the wire. The stop lands while the
-    /// handler is still sleeping, which is what makes this the in-flight case
-    /// rather than a race with the reply.
+    /// On shutdown, reading stops but a message already accepted reaches the
+    /// wire; the stop lands while the handler sleeps.
     ///
-    /// It is not a regression test for the epilogue that drops `tx` and awaits
-    /// the writer: the handler and writer tasks are detached, so the reply
-    /// arrives even if `serve_one` returns at the stop instead of breaking to
-    /// it. What that epilogue is for is the *drain*, which is the test below.
+    /// Not a regression test for the epilogue: handler and writer are detached,
+    /// so the reply arrives either way. The drain test below is.
     #[tokio::test]
     async fn a_stop_ends_the_reading_but_not_the_reply_already_in_flight() {
         let shutdown = Shutdown::new();
@@ -589,14 +584,11 @@ mod tests {
         let _ = task.await;
     }
 
-    /// The drain waits for a reply still being written, which is what holding
-    /// the `Busy` claim for a connection's whole life is for: a client cannot
-    /// tell a truncated AXFR from a complete one, so a process that exits with
-    /// one half-written has served a lie.
+    /// The drain waits for a reply still being written: a client cannot tell a
+    /// truncated AXFR from a complete one.
     ///
-    /// Fails with `serve_one`'s stop arm returning instead of breaking to the
-    /// epilogue: the connection task ends at once, its `Busy` goes with it, and
-    /// the drain finishes ~180 ms before the reply reaches the client.
+    /// Fails if `serve_one`'s stop arm returns instead of breaking to the
+    /// epilogue: `Busy` goes with the task and the drain ends first.
     #[tokio::test]
     async fn the_drain_waits_for_a_reply_still_being_written() {
         let shutdown = Shutdown::new();
@@ -629,9 +621,8 @@ mod tests {
 
         let reply = next_reply(&mut client).await.expect("the answer");
         assert_eq!(id_of(&reply), 0x00c8);
-        // Not a performance floor (`CLAUDE.md` §10): the two outcomes are "did
-        // not wait at all" and "waited out the ~200ms the handler had left", so
-        // anything between them cannot happen.
+        // Not a performance floor (`CLAUDE.md` §10): the outcomes are "no wait"
+        // and "the ~200 ms left", nothing between.
         let waited = waited.await.expect("the drain task");
         assert!(
             waited >= Duration::from_millis(100),
@@ -904,11 +895,9 @@ mod tests {
     }
 
     /// A client that pipelines and reads nothing stalls the writer; the
-    /// connection then ends one `read_timeout` after the last byte moved
-    /// rather than never, freeing its slot and the drain (`TODO.md` #163).
-    ///
-    /// Fails without the progress deadline and the read loop's `tx.closed()`
-    /// arms: `serve_one` is still running at the bound.
+    /// connection ends one `read_timeout` after the last byte moved, freeing
+    /// its slot and the drain. Fails without the progress deadline and the read
+    /// loop's `tx.closed()` arms: `serve_one` is still running at the bound.
     #[tokio::test]
     async fn a_client_that_reads_nothing_does_not_hold_the_connection() {
         let shutdown = Shutdown::new();
@@ -987,9 +976,8 @@ mod tests {
         let _ = task.await;
     }
 
-    /// Once a reply cannot be written, nothing else asked on the connection
-    /// can be answered, so the read loop ends too rather than admitting and
-    /// answering into a closed channel until the client gives up.
+    /// Once a reply cannot be written, the read loop ends too rather than
+    /// answering into a closed channel.
     ///
     /// Fails without the read loop's `tx.closed()` arm: it sits out the 10 s
     /// idle timeout.
@@ -1043,16 +1031,12 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Reply::Frame(_))));
     }
 
-    /// Where the query rate applies is the caller's, and the two daemons
-    /// disagree on purpose (`TODO.md` #30e). Per connection: a burst of one
-    /// admits one connection, the messages on it are not charged again, and the
-    /// next connection waits for the refill.
+    /// Per connection, a burst of one admits one connection, its messages
+    /// uncharged, and the next waits for the refill.
     ///
-    /// The clock is the test's. `RateLimiter::should_allow` refills by whole
-    /// seconds, so against `SystemTime` the refusal below is decided by whether
-    /// two connects straddle a second boundary — about one run in thirty serves
-    /// the second connection instead. A longer window would only make the coin
-    /// heavier; a clock nothing else moves takes it out of the assertion.
+    /// The clock is the test's: the limiter refills by whole seconds, so
+    /// against `SystemTime` the outcome depends on two connects straddling a
+    /// second.
     #[tokio::test]
     async fn the_query_rate_can_be_per_connection_instead_of_per_message() {
         let shutdown = Shutdown::new();
@@ -1060,9 +1044,8 @@ mod tests {
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
-        // Before `RateLimiter`'s own `last_cleanup`, which it takes from the
-        // real clock: the sweep is then never due and cannot evict the bucket
-        // this test is about.
+        // Earlier than the real-clock `last_cleanup` `RateLimiter` takes, so
+        // its sweep is never due to evict this bucket.
         let clock = Clock::fixed(1_000_000_000);
         let handler = Echo::on_clock(Answer::AfterIdMillis, 1, clock.clone());
         let server = tokio::spawn(serve(
@@ -1090,9 +1073,8 @@ mod tests {
             "refused before the connection was served"
         );
 
-        // One second buys exactly one token back. This half is what says the
-        // connection was *charged* rather than never admitted: a refusal that
-        // no refill undoes would pass the assertion above on its own.
+        // One second buys one token back, proving the connection was charged,
+        // not refused outright.
         clock.advance(1);
         let mut third = TcpStream::connect(addr).await.expect("connect");
         send(&mut third, &query(0x0004)).await;

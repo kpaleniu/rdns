@@ -273,9 +273,8 @@ mod tests {
         assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
         assert!(body.contains("dns_queries_received_total 1"), "{body}");
         assert!(body.contains("dns_responses_refused_total 1"), "{body}");
-        // A 200 µs answer is at or below the 500 µs bucket, above the 50 µs one.
-        // Both bounds moved when the buckets were rescaled to where an answer
-        // actually lands (`TODO.md` #25c); the shape asserted here did not.
+        // A 200 µs answer lands at or below the 500 µs bucket and above the 50
+        // µs one.
         assert!(
             body.contains("dns_answer_latency_seconds_bucket{le=\"0.0005\"} 1"),
             "{body}"
@@ -376,9 +375,8 @@ mod tests {
             );
         }
 
-        // §3.2 is about HTTP/1.1, and the exemption is what keeps a hand-typed
-        // probe working: `printf 'GET /metrics HTTP/1.0\r\n\r\n' | nc` is the
-        // spelling the 400's body points at.
+        // §3.2 binds HTTP/1.1 only; the exemption keeps working the hand-typed
+        // HTTP/1.0 probe the 400's body names.
         let body = scrape(addr, "GET /metrics HTTP/1.0\r\n\r\n").await;
         assert!(body.starts_with("HTTP/1.0 200 OK"), "{body}");
     }

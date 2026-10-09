@@ -688,13 +688,10 @@ mod tests {
         h2_frame(0x1, 0x5, stream, &block)
     }
 
-    /// A client that ignores the server's SETTINGS and opens a seventeenth
-    /// stream while sixteen are being answered gets that stream refused, as a
-    /// TCP connection's seventeenth message waits and DoQ's is never credited.
-    /// Frames by hand, because a conforming client would queue the seventeenth
-    /// itself and test nothing.
+    /// Fails unless a seventeenth stream, opened while sixteen are answered, is
+    /// refused; hyper's default of 200 admits it.
     ///
-    /// Fails without the limit: no refusal, hyper's 200 admits it.
+    /// Frames by hand: a conforming client would queue the seventeenth itself.
     #[tokio::test]
     async fn a_seventeenth_http2_stream_is_refused() {
         let (addr, der, shutdown, task) = started_limited(
@@ -897,16 +894,10 @@ mod tests {
 
     /// A DoH client is charged one token for its connection, not two.
     ///
-    /// `serve` charges `allow_source` at accept when the caller asked for
-    /// `PerConnection`. Fails if `answer` charges again for every request: the
-    /// *first* request of every connection pays twice — and `--query-rate`
-    /// means something different over DoH than over DoT, which is the one thing
-    /// a shared parameter is for.
-    ///
-    /// A burst of one, so the double charge is the whole difference between 200
-    /// and 429. The clock is the test's because the limiter refills by whole
-    /// seconds, and against `SystemTime` this would be decided by whether the
-    /// two charges straddled a boundary.
+    /// Fails if `answer` charges again after `serve` charged at accept under
+    /// `PerConnection`. A burst of one makes the double charge the difference
+    /// between 200 and 429; the clock is the test's, as the limiter refills by
+    /// whole seconds.
     #[tokio::test]
     async fn a_doh_connection_is_charged_once_and_not_once_per_request() {
         let clock = Clock::fixed(1_000_000_000);
@@ -930,11 +921,8 @@ mod tests {
         );
         assert_eq!(body, question);
 
-        // And the token really was spent at accept: the next connection has
-        // nothing to pay with. Under `PerConnection` the refusal lands before
-        // the TLS handshake, so there is no HTTP to carry a 429 and the tell
-        // is a dropped connection — which is also where the refusal is
-        // cheapest.
+        // The token was spent at accept: the next connection is refused before
+        // TLS, so the tell is a dropped connection, not a 429.
         assert!(
             try_request(addr, &der, &head(&question), &question)
                 .await
@@ -985,9 +973,8 @@ mod tests {
     #[tokio::test]
     async fn a_get_takes_base64url_and_the_answer_carries_its_ttl() {
         let (addr, der, shutdown, task) = started().await;
-        // One A record at TTL 60, so `max-age` has something to be. The handler
-        // echoes, so what is sent is what comes back and is what gets parsed
-        // for its TTL.
+        // One A record at TTL 60; the handler echoes, so its TTL is what
+        // `max-age` reflects.
         let wire = crate::testutil::answer_with_ttl(0x2222, 60);
 
         let encoded = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(&wire);
