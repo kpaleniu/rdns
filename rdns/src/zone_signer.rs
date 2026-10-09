@@ -40,18 +40,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Where the apex DNSKEY RRset's signature comes from.
 ///
-/// [`DnskeySignature::Imported`] is RFC 8901 §2.1.1's Model 1, where "the zone
-/// owner holds the KSK set, manages the DS record set, and is responsible for
-/// signing the DNSKEY RRset and distributing it to the providers". A provider
-/// running that model has a ZSK and no KSK, so the RRSIG over the DNSKEY RRset
-/// is not one it can make — it arrives in the zone file and has to survive a
-/// signing run rather than being replaced by one this server cannot produce.
-///
-/// Model 2 (§2.1.2) needs none of this and needed no code: each provider has
-/// its own KSK, signs the DNSKEY RRset with it, and publishes the other
-/// providers' ZSKs alongside. Putting those in the zone file is enough — see
-/// `rfc_8901_model_2_needs_only_the_zone_file`, which is the test the row that
-/// filed this had instead of a reading of `publish_dnskeys`.
+/// [`DnskeySignature::Imported`] is RFC 8901 §2.1.1's Model 1: the owner signs
+/// the DNSKEY RRset, so its RRSIG arrives in the zone file and survives
+/// signing. Model 2 (§2.1.2) needs only the zone file
+/// (`rfc_8901_model_2_needs_only_the_zone_file`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DnskeySignature {
     /// Made here, by the SEP keys — or by all of them when no key is a SEP.
@@ -200,11 +192,8 @@ impl SigningPolicy {
     /// The expiry for one RRset's signature: the window's end, pulled back by a
     /// deterministic amount derived from the owner name and type.
     ///
-    /// Deterministic, not random: a reload re-signs, and random jitter would
-    /// reshuffle the slope every time, so no two servers holding the zone would
-    /// agree about it.
-    ///
-    /// Never later than [`Self::expiration`] — 30 days means at most 30.
+    /// Deterministic, so every reload and every server agrees; never later than
+    /// [`Self::expiration`].
     fn expiry_for(&self, name: NameRef<'_>, rtype: Rtype) -> u32 {
         let spread = self.validity / EXPIRY_JITTER_FRACTION;
         if spread == 0 {
@@ -230,29 +219,14 @@ impl SigningPolicy {
     }
 }
 
-/// The serial to serve for a zone we signed ourselves.
+/// The serial to serve for a zone we signed ourselves: the file's serial plus
+/// hours since the epoch.
 ///
-/// Re-signing is a new version of the zone as far as a secondary is concerned,
-/// and a secondary decides whether to transfer by comparing serials. Without a
-/// bump the replica keeps signatures that then expire underneath it.
-///
-/// BIND's inline-signing serves a serial diverging from the file's; Knot takes
-/// the field from the operator. Both persist the divergence in a journal, and
-/// without persistence a restart goes backwards — which a secondary reads as
-/// older and declines to transfer, keeping signatures about to expire.
-///
-/// So the time is the counter: hours since the epoch, added to the file's
-/// serial. Monotone by construction, nothing to persist, and an operator's `+1`
-/// still shows up as `+1`.
-///
-/// Added rather than `max`ed, because a date-style serial like `2026073001` is
-/// larger than any current Unix timestamp and a `max` would never bump — which
-/// is what PowerDNS's `INCEPTION-EPOCH` means by "requiring epoch-based backend
-/// serials".
-///
-/// Hours, not seconds, so the term stays small and does not crowd a date-style
-/// serial toward the 32-bit ceiling. Since the *epoch* rather than a fraction of
-/// the validity, so changing `--signature-validity` cannot move it backwards.
+/// Re-signing is a new version, or a secondary keeps signatures that expire
+/// under it. Time is the counter: monotone with nothing to persist, unlike
+/// BIND's and Knot's journals. Added, not `max`ed, so a date-style serial still
+/// bumps; hours keep the term small, and the epoch makes it immune to
+/// `--signature-validity`.
 pub fn signed_serial(file_serial: Serial, signed_at: u64) -> Serial {
     const HOUR: u64 = 3600;
     // RFC 1982 §3.1 defines addition in the sequence space as wrapping, so
@@ -262,27 +236,16 @@ pub fn signed_serial(file_serial: Serial, signed_at: u64) -> Serial {
 
 /// Sign `zone` with `keys`, returning the signed zone.
 ///
-/// The input is left alone. What comes back is the same records — with their
-/// TTLs normalized per RRset, see below — plus the DNSKEY RRset, an RRSIG over
-/// everything the zone is authoritative for, and an NSEC or NSEC3 chain.
-///
-/// The signer's own previous output (RRSIG, NSEC, NSEC3, NSEC3PARAM) is dropped
-/// first, so signing a signed zone gives a freshly signed zone and not one with
-/// two chains. DNSKEY records are *not* dropped: a key published without its
-/// private half is how every rollover starts.
+/// The same records, TTLs normalized per RRset, plus DNSKEY, RRSIGs and a
+/// chain. Previous signer output is dropped first; DNSKEY records are not, as a
+/// key published without its private half starts every rollover.
 pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Result<Zone> {
     Ok(sign_zone_inner(zone, keys, policy, None)?.0)
 }
 
-/// The keys that sign at `now`, which is not the keys that are published.
-///
-/// A key inside its pre-publish window is in the DNSKEY RRset and does not
-/// sign; a retired one is still in the RRset so the signatures it made go on
-/// verifying. That is the whole of RFC 6781 §4.1.1.1's ordering.
-///
-/// `pub` because a caller deciding whether a signing run still needs checking
-/// has to key that decision on this exact set, and a second copy of the
-/// predicate is what `CLAUDE.md` §7 is about.
+/// The keys that sign at `now`, which is not the keys that are published (RFC
+/// 6781 §4.1.1.1): pre-published keys do not sign, retired ones stay published.
+/// `pub` so a caller keys its decisions on this exact set (§7).
 pub fn active_signing_keys(keys: &[SigningKey], now: u64) -> Vec<&SigningKey> {
     keys.iter().filter(|k| k.is_active(now)).collect()
 }
@@ -290,20 +253,10 @@ pub fn active_signing_keys(keys: &[SigningKey], now: u64) -> Vec<&SigningKey> {
 /// Sign `zone`, carrying forward any signature from `previous` that still
 /// covers exactly what it covered before.
 ///
-/// For applying a dynamic UPDATE, where re-signing everything is harmful and not
-/// merely expensive. Every RRSIG's inception and expiration derive from the run's
-/// `signed_at`, so a full re-sign changes the RDATA of *every* signature, and
-/// `ixfr::diff` compares whole records — a one-record UPDATE to a 53-record zone
-/// produced a 52-record delta, a full transfer wearing an incremental's framing.
-///
-/// The chain is still built in full, deliberately. An NSEC's bitmap lists every
-/// type at its name and its `next` names its successor (RFC 4034 §4.1.2,
-/// RFC 5155 §7.1), so adding one name changes the record at that name *and* at
-/// its predecessor. Computing "changed names plus chain neighbours" gets that
-/// wrong and yields a chain that validates against itself while denying a name
-/// that exists. Building the chain and then asking which records came out
-/// identical never computes a neighbour set at all. What is saved is the
-/// signing, which is the expensive half.
+/// For UPDATE: a full re-sign changes every RRSIG, so the IXFR delta is the
+/// whole zone. The chain is still built in full, as one new name changes its
+/// predecessor's NSEC too (RFC 4034 §4.1.2, RFC 5155 §7.1); only signing is
+/// saved.
 pub fn sign_zone_incrementally(
     previous: &Zone,
     zone: &Zone,
@@ -317,15 +270,9 @@ pub fn sign_zone_incrementally(
 
 /// An incrementally signed zone, and which of its RRsets this run signed.
 ///
-/// The second half is the whole reason the type exists: the signatures a run
-/// carried forward were checked when they were made, and the ones it made now
-/// are the ones nothing has looked at. A caller that verifies its own output
-/// needs the difference, and deriving it by diffing the two zones is the
-/// O(zone) pass the incremental path exists to avoid.
-///
-/// Collected only on this path. A full [`sign_zone`] signs everything, so the
-/// list would be a `Name` clone per RRset — a million of them on a
-/// million-record zone (`TODO.md` #64e) — answering a question with no caller.
+/// The new signatures are what nothing has checked, and diffing the zones to
+/// find them is the O(zone) pass this path avoids. A full [`sign_zone`] does
+/// not collect them (`TODO.md` #64e).
 pub struct Resigned {
     pub zone: Zone,
     /// The `(owner, type)` pairs whose RRSIGs came out of this run.
@@ -370,12 +317,8 @@ fn sign_zone_inner(
         &mut signed,
     )?;
 
-    // Before `Layout::of`, which snapshots which types are at which name. Every
-    // NSEC3 bitmap "MUST indicate the presence of all types present at the
-    // original owner name" (RFC 5155 §7.1), so adding NSEC3PARAM after the
-    // snapshot leaves the apex NSEC3 signing a denial of a type that is there —
-    // and an RFC 8198 aggressive-NSEC resolver then synthesizes that false
-    // NODATA for other clients out of its cache.
+    // Before `Layout::of` snapshots the types: an NSEC3 bitmap lists every type
+    // present (RFC 5155 §7.1), NSEC3PARAM included.
     if let DenialChain::Nsec3 {
         salt, iterations, ..
     } = &policy.chain
@@ -424,15 +367,9 @@ fn sign_zone_inner(
 /// A previous signed version of a zone, indexed so that an RRset which has not
 /// moved can keep the signature it already had.
 ///
-/// Both halves are needed: the RRsets answer "is this exactly what was signed",
-/// the signatures "and what was the answer". Keeping a signature because the
-/// *name* still exists is how a zone serves a signature over data it no longer
-/// holds.
-///
-/// Borrowed from `previous`, which outlives every use: an owned copy was a
-/// `RecordData` clone per record, two million allocations to build and two
-/// million frees, which measured as 20% and 13% of an incremental sign
-/// (`TODO.md` #64e).
+/// Both the RRsets and the signatures: a name that merely still exists would
+/// keep a signature over data it no longer holds. Borrowed from `previous`, not
+/// copied (`TODO.md` #64e).
 struct PreviousSignatures<'a> {
     /// folded owner -> type -> the RRset as it was signed: its TTL, and its
     /// RDATA in the order the previous run saw them.
@@ -476,9 +413,8 @@ impl<'a> PreviousSignatures<'a> {
         let mut signatures: ByName<'a, Vec<CarriedSignature<'a>>> = BTreeMap::new();
 
         for record in previous.records() {
-            // A `Cow`, so a name already folded — which every name a previous
-            // run wrote is, `carry_over_records` having normalized it — costs
-            // nothing.
+            // A `Cow`, so a name already folded, as every previous run's is,
+            // costs nothing.
             let name = record.name.folded();
             if record.rdata.rtype() == rt::RRSIG {
                 // Not offered for reuse; the RRset gets a fresh signature.
@@ -513,22 +449,12 @@ impl<'a> PreviousSignatures<'a> {
     /// The signatures to carry forward for this RRset, or `None` to sign it
     /// afresh.
     ///
-    /// Four conditions, each a way the reuse would otherwise be wrong:
-    ///
-    /// 1. The RRset is identical as a *set* — same TTL, same RDATA. As a set,
-    ///    because an RRset has no order (RFC 2181 §5) and an update rebuilds the
-    ///    record vector the two runs walk.
-    /// 2. At least one signature, so an unsigned RRset does not stay unsigned by
-    ///    being copied.
-    /// 3. The signing keys are unchanged, by key tag as a set. A key added is a
-    ///    rollover starting; a key removed must not leave its signature behind.
-    ///    Sound only for tags [`PreviousSignatures::tags_naming`] vouched for.
-    /// 4. No carried signature has already expired.
-    ///
-    /// Nearness to expiry is deliberately not a condition: refreshing here would
-    /// re-sign every stale RRset on any single UPDATE — the whole-zone delta this
-    /// exists to avoid — and would let update traffic stand in for the re-signing
-    /// timer. Expiry is [`resign_after`]'s business.
+    /// 1. The RRset is identical as a set (RFC 2181 §5): same TTL and RDATA.
+    /// 2. It has at least one signature.
+    /// 3. The signing key tags are unchanged as a set, and vouched for by
+    ///    [`PreviousSignatures::tags_naming`].
+    /// 4. No carried signature has expired. Nearness is [`resign_after`]'s, or
+    ///    one UPDATE would re-sign every stale RRset.
     fn reuse(
         &self,
         name: NameRef<'_>,
@@ -538,16 +464,8 @@ impl<'a> PreviousSignatures<'a> {
         key_tags: &[u16],
         signed_at: u64,
     ) -> Option<&[CarriedSignature<'a>]> {
-        // One folded key for both maps rather than two: this runs once per
-        // RRset, so the second allocation was two million of them. The signing
-        // loop went 2 318 ms -> 2 235 ms at that size, three runs each side
-        // (`TODO.md` #64e).
-        // `Cow<[u8]>: Borrow<[u8]>`, so the outer map is probed with the folded
-        // name itself and a name already folded costs nothing. The tuple key it
-        // replaced could not be: a `Cow<'a, _>` cannot be built from a shorter
-        // borrow, so every probe was an owned copy — two million of them
-        // (`TODO.md` #64e, `rdns-core::name_keys`'s argument one map further
-        // in).
+        // One folded key probes both maps (`Cow<[u8]>: Borrow<[u8]>`), so a
+        // folded name costs nothing (`TODO.md` #64e).
         let folded = name.folded();
         let (was_ttl, was) = &self
             .rrsets
@@ -652,10 +570,8 @@ fn carry_over_records(
     signed: &mut Zone,
 ) -> Result<(Ttl, u32)> {
     let mut soa: Option<(Ttl, u32)> = None;
-    // An RRset signs with one TTL (RFC 4034 §3.1.3 stores it in the RRSIG), and
-    // RFC 2181 §5.2 requires the records to agree anyway. Where they do not, the
-    // smallest wins: the largest would publish data past the point some record
-    // of it was meant to expire.
+    // An RRset signs with one TTL (RFC 4034 §3.1.3; RFC 2181 §5.2); the
+    // smallest wins, so no record outlives its own TTL.
     let mut ttls: HashMap<(Name, Rtype), Ttl> = HashMap::new();
     let mut carried: Vec<ZoneRecord> = Vec::new();
 
@@ -765,22 +681,9 @@ fn has_dnskey_rrsig(zone: &Zone, origin: NameRef<'_>) -> bool {
 /// The DNSSEC algorithms in `zone`'s apex DNSKEY RRset that no RRSIG in the
 /// zone was made with, in the order they first appear.
 ///
-/// RFC 6840 §5.11 restating RFC 4035 §2.2: "the zone MUST also be signed with
-/// each algorithm (though not each key) present in the DNSKEY RRset", and "this
-/// requirement applies to servers, not validators". So a non-empty answer here
-/// is a conformance failure of *ours* that no resolver will notice — §5.11 also
-/// says validators "MUST NOT insist that all algorithms signaled in the DNSKEY
-/// RRset work" — which is exactly why it needs saying out loud somewhere.
-///
-/// The case that produces it deliberately is RFC 8901 §4: "DNS providers
-/// participating in multi-signer models need to use a common DNSSEC signing
-/// algorithm". Import another operator's ZSK on an algorithm this server holds
-/// no key for and the zone is published one algorithm short, silently. The
-/// undeliberate case is a half-finished algorithm rollover, which has the same
-/// shape.
-///
-/// Takes the *signed* zone, so it reads what was published rather than what was
-/// intended — a key that failed to sign for any other reason counts here too.
+/// RFC 6840 §5.11: each algorithm in the DNSKEY RRset must sign, which binds
+/// servers, so no validator will notice. RFC 8901 §4 imports and half-done
+/// rollovers get here. Reads the signed zone: what was published.
 pub fn algorithms_missing_signatures(zone: &Zone) -> Vec<u8> {
     let origin = zone.origin();
     let signed_with: BTreeSet<u8> = zone
@@ -834,9 +737,8 @@ fn publish_dnskeys(
     let ttl = published.first().map_or(soa_ttl, |r| r.ttl);
 
     for key in keys {
-        // A key before its `Publish` or past its `Delete` is loaded and not
-        // published, which is RFC 6781 §4.1.1.1's pre-publish window at one end
-        // and its withdrawal at the other.
+        // Before `Publish` or past `Delete`: loaded, not published (RFC 6781
+        // §4.1.1.1).
         if !key.is_published(now) {
             continue;
         }
@@ -854,31 +756,13 @@ fn publish_dnskeys(
     ttl
 }
 
-/// Ask the parent to publish a DS for every key inside its sync window
-/// (RFC 7344).
+/// Ask the parent to publish a DS for every key inside its sync window (RFC
+/// 7344): a CDS and a CDNSKEY per key, at the apex (§4.1).
 ///
-/// A CDS and a CDNSKEY per key, at the apex, saying what the child wants the
-/// parent's DS RRset to *become* — "the CDS RRset expresses what the child
-/// would like the DS RRset to look like" (§4.1). Both types, because §4.1 has
-/// the child publish both and lets the parent use whichever it prefers.
-///
-/// **The window is its own two fields and is not derived from the rollover
-/// schedule.** `SyncPublish`/`SyncDelete` (BIND's `dnssec-settime -P sync` /
-/// `-D sync`) rather than "the keys whose `Delete` is not soon": publishing a
-/// CDS is a request to change the *parent's* zone, and inferring it from a
-/// local schedule means every rollover step asks a registrar to act. Absent is
-/// never, so a key file written before this existed publishes nothing.
-///
-/// **SHA-256 only** (digest type 2). RFC 8624 §3.3 makes it the one digest that
-/// is MUST for both signing and validation; SHA-1 is MUST NOT sign, and SHA-384
-/// is optional either way. Offering the operator a choice would be a knob whose
-/// wrong setting is a DS the parent rejects.
-///
-/// **RFC 8078 §4's "delete" CDS is deliberately not produced here.** A CDS with
-/// algorithm 0 tells the parent to withdraw the DS and take the zone insecure,
-/// which no timing field should be able to reach by accident; an operator who
-/// means it writes `CDS 0 0 0 00` in the zone file, which this tree parses
-/// (`TODO.md` #55).
+/// The window is `SyncPublish`/`SyncDelete`, not the rollover schedule: asking
+/// a registrar to act is a deliberate step. SHA-256 only (RFC 8624 §3.3). RFC
+/// 8078 §4's "delete" CDS is never produced; an operator writes it in the zone
+/// file (`TODO.md` #55).
 fn publish_sync_records(
     keys: &[SigningKey],
     origin: NameRef<'_>,
@@ -904,11 +788,8 @@ fn publish_sync_records(
         return Ok(());
     }
 
-    // RFC 8078 §4 gives algorithm 0 the meaning "withdraw the DS and go
-    // insecure". A zone that says that *and* asks for a DS at the same time is
-    // telling the parent two things, and which one the parent acts on is its
-    // choice — so this is a failed run rather than a zone served with both
-    // (`CLAUDE.md` §4). The operator resolves it by clearing one side.
+    // RFC 8078 §4's algorithm 0 says "go insecure"; with a DS request beside it
+    // the parent picks, so fail the run (`CLAUDE.md` §4).
     if existing.iter().any(|rdata| is_go_insecure(rdata.as_ref())) {
         return Err(DnssecError::signing(format!(
             "{origin} carries a CDS or CDNSKEY with algorithm 0, which asks the parent to \
@@ -1042,21 +923,8 @@ impl Layout {
             entry.is_delegation = name.as_ref() != origin && entry.types.contains(&rt::NS);
         }
 
-        // The two ways a name can be in the file and not in the zone, which
-        // RFC 2136 §7.18 calls occlusion and names together: below a delegation
-        // (glue and the rest, RFC 4035 §2.2) and below a DNAME owner
-        // ("resource records MUST NOT exist at any subdomain of the owner of a
-        // DNAME RR... those names below the DNAME RR will be occluded",
-        // RFC 6672 §2.4).
-        //
-        // A DNAME's own owner is not occluded: it is not redirected by its own
-        // DNAME (§2.3), and its NSEC has to list DNAME or a validator cannot
-        // tell a real NXDOMAIN below it from one that skipped the redirection
-        // (§5.3.2).
-        //
-        // `check_dname_rules` refuses a zone file with anything below a DNAME,
-        // so this covers a zone that arrived by transfer or was built by UPDATE
-        // — which §5.2 has adding a DNAME over existing names on purpose.
+        // Occluded (RFC 2136 §7.18): below a delegation (RFC 4035 §2.2) or
+        // below a DNAME owner (RFC 6672 §2.4), not the owner (§2.3, §5.3.2).
         let occluders: BTreeSet<CanonicalKey> = names
             .values()
             .filter(|(_, e)| e.is_delegation || e.types.contains(&rt::DNAME))
@@ -1194,10 +1062,8 @@ fn build_nsec3_chain(
         let next = hashed[(index + 1) % hashed.len()].0;
         let entry = layout.entry(name.as_ref());
         let mut types = entry.published_types();
-        // Unlike NSEC the record does not sit at the name it describes, so it
-        // does not list itself, and RRSIG appears only if something at the
-        // original name is signed — an insecure delegation's NSEC3 says NS
-        // alone.
+        // Not at the name it describes, so no NSEC3 in its own bitmap; RRSIG
+        // only if something there is signed.
         if entry.has_signed_data() {
             types.insert(rt::RRSIG);
         }
@@ -1247,27 +1113,12 @@ type Rrsets<'a> = BTreeMap<(CanonicalKey, Rtype), (NameRef<'a>, Ttl, Vec<RecordD
 
 /// The RRsets of `signed`, in RFC 4034 §6.1 order.
 ///
-/// Its own function because it is an O(zone) pass and it was inside the one
-/// that looked like the signing step (`TODO.md` #64e). A `BTreeMap` rather
-/// than a sort at the end: the key is already [`canonical_sort_key`], and the
-/// chain built above it is in that order too.
-///
-/// **The map borrows from `signed`, and that buys less than it should**
-/// (`TODO.md` #64g). Owning it costs a `Name` and a `RecordData` clone per
-/// record; borrowing takes this pass from 891-944 ms to 689-718 at a million
-/// records and 27 allocations off signing an eight-record zone — and the total
-/// does not move, because `sign-rrsets` rises 5% and `file-sigs` 11%. The clone
-/// buys locality: it lays the RDATA out in the order the signing loop reads it,
-/// where a borrow leaves that loop chasing a pointer into the zone's record
-/// vector per record. Kept because the allocations are real and the wall clock
-/// is a wash, not because it is faster.
+/// A `BTreeMap` on [`canonical_sort_key`], the chain's order. It borrows from
+/// `signed`, which saves allocations but not wall time: a clone gave the
+/// signing loop locality (`TODO.md` #64g).
 fn rrsets_of(signed: &Zone) -> Rrsets<'_> {
-    // (owner, type) -> the RDATA of that RRset, in the order they were added.
-    // Borrowed from `signed`, which outlives every use of the map: owning it is
-    // a `Name` and a `RecordData` clone per record, 944 ms of an 8 s
-    // incremental sign at a million records and two million allocations to free
-    // afterwards (`TODO.md` #64g). `Rrset` is generic over what holds the RDATA
-    // for this.
+    // (owner, type) -> the RDATA of that RRset, in insertion order, borrowed
+    // from `signed`.
     let mut rrsets: Rrsets<'_> = BTreeMap::new();
     for record in signed.records() {
         let key = canonical_sort_key(record.name);
@@ -1300,30 +1151,21 @@ fn signatures_for(
     let dnskey_tags = previous.and_then(|p| p.tags_naming(origin, dnskey_signers));
     let data_tags = previous.and_then(|p| p.tags_naming(origin, data_signers));
     for ((key, rtype), (name, ttl, rdatas)) in rrsets {
-        // The key the map is already keyed by, rather than `Layout::entry`
-        // deriving it again and cloning the entry to read two bools: two
-        // allocations per RRset, four million on a million-record zone
-        // (`TODO.md` #64e).
+        // The map's own key, rather than `Layout::entry` deriving and cloning
+        // it (`TODO.md` #64e).
         if !signable(layout.at(&key), name, rtype, origin) {
             continue;
         }
         let (signers, tags) = if rtype == rt::DNSKEY {
-            // Model 1's signature is already in `signed`, carried through by
-            // `carry_over_records`; signing again would publish a second RRSIG
-            // from a key the parent's DS does not name.
+            // Model 1's signature is carried in `signed`; signing again would
+            // add one from a key the DS does not name.
             if policy.dnskey_signature == DnskeySignature::Imported {
                 continue;
             }
             (dnskey_signers, &dnskey_tags)
         } else if rtype == rt::CDS || rtype == rt::CDNSKEY {
-            // RFC 7344 §4.1: the CDS/CDNSKEY RRset "MUST be signed with a key
-            // that is represented in both the current DNSKEY and DS RRsets".
-            // The data key is in the first and not the second, so signing these
-            // as ordinary data publishes a rollover instruction the parent
-            // cannot verify — and none of `verify_rrset`, dnspython or a
-            // validating resolver would say so, because the RRset *does* verify
-            // against the zone's own keys. The SEP keys are the ones a DS
-            // names.
+            // RFC 7344 §4.1: signed "with a key" in both DNSKEY and DS, the SEP
+            // keys; every check here would pass a ZSK signature.
             (dnskey_signers, &dnskey_tags)
         } else {
             (data_signers, &data_tags)
@@ -1392,9 +1234,8 @@ fn sign_everything(
     previous: Option<&PreviousSignatures>,
     signed: &mut Zone,
 ) -> Result<FreshRrsets> {
-    // The key the parent's DS points at signs only the DNSKEY RRset; a separate
-    // key signs the data. Not required — one key does both when only one is
-    // present — but it lets the data key roll without involving the parent.
+    // The DS's key signs only DNSKEY and another the data, so the data key
+    // rolls without the parent; one key may do both.
     let now = policy.signed_at;
     let active = active_signing_keys(keys, now);
     let sep: Vec<&SigningKey> = active.iter().copied().filter(|k| k.is_sep()).collect();
@@ -1403,11 +1244,8 @@ fn sign_everything(
     let dnskey_signers = if sep.is_empty() { &all } else { &sep };
     let data_signers = if rest.is_empty() { &all } else { &rest };
     if data_signers.is_empty() {
-        // Every key inactive at once. Publishing a zone whose DNSKEY RRset
-        // promises DNSSEC and whose data carries no signature is bogus at every
-        // validator, so this is a failed run and not a zone served bare
-        // (`CLAUDE.md` §4). The usual cause is an `Inactive` in the past with no
-        // successor activated.
+        // No active key: unsigned data under a DNSKEY RRset is bogus, so fail
+        // (`CLAUDE.md` §4). Usually a past `Inactive`, no successor.
         return Err(DnssecError::signing(format!(
             "no key is active at {now} to sign {} with — every key this zone has is \
              before its Activate or past its Inactive (RFC 6781 §4.1.1.1)",
@@ -1458,9 +1296,8 @@ fn signable(
         return true;
     }
     if entry.is_delegation && name != origin {
-        // Authority ends here: the NS RRset is the child's and the glue is a
-        // hint. What is left is the DS — this zone's statement about the child
-        // — and the NSEC that can deny it.
+        // Authority ends at the cut: NS and glue are the child's; the DS and
+        // its NSEC are ours.
         return matches!(rtype, rt::DS | rt::NSEC);
     }
     true

@@ -32,18 +32,12 @@ pub(super) fn is_signed(zone: &Zone) -> bool {
     zone.locate(zone.origin()).has_type(Qtype::of(rt::DNSKEY))
 }
 
-/// Write the RRSIGs covering the answer to `qname`/`qtype`.
+/// Write the RRSIGs covering the answer to `qname`/`qtype`; true when a
+/// wildcard answered, which still owes [`push_proof_of_absence`].
 ///
-/// True when the answer was synthesized from a wildcard, which means it is not
-/// finished: it still owes [`push_proof_of_absence`] for the name asked about.
-///
-/// A wildcard's signature is re-owned onto the queried name with its label count
-/// left alone: that is what lets a validator reconstruct the name really signed
-/// (RFC 4035 §5.3.2).
-///
-/// `at` is the answer's own lookup, handed in rather than repeated: the caller
-/// has just read the records out of it (`TODO.md` #25a). `qname` is the name it
-/// was located with, canonical, and is what the signatures are echoed under.
+/// A wildcard's signature is re-owned onto `qname` with its label count kept,
+/// so a validator reconstructs the signed name (RFC 4035 §5.3.2). `at` is the
+/// answer's own lookup, handed in.
 pub(super) fn push_answer_signatures(
     at: &Located,
     qname: NameRef<'_>,
@@ -58,9 +52,8 @@ pub(super) fn push_answer_signatures(
         let Some(type_covered) = record.rdata.rrsig_type_covered() else {
             continue;
         };
-        // `Qtype::matches`, not `== qtype`: no RRSIG covers a QTYPE, so ANY
-        // (255) would match nothing and hand back a signed name's data unsigned.
-        // The same rule excludes the DNSSEC meta types (RFC 4035 §3.1.1).
+        // `Qtype::matches`: no RRSIG covers ANY, and the meta types are
+        // excluded (RFC 4035 §3.1.1).
         if !qtype.matches(type_covered) {
             continue;
         }
@@ -95,13 +88,9 @@ pub(super) fn push_proof_of_absence(
     absence(zone, qname.as_ref(), &mut Written::for_zone(zone), w)
 }
 
-/// Write the authority records a negative answer needs beyond the SOA.
-///
-/// Each case of `kind` owes something different; see the match below.
-///
-/// A [`NameKind`] rather than a bool because the wildcard has to come from the
-/// zone: "the first label replaced by `*`" is wrong for anything a wildcard
-/// reaches more than one label down, and denies a name that does not exist.
+/// Write the authority records a negative answer needs beyond the SOA; each
+/// case of `kind` owes something different. A [`NameKind`], as the wildcard
+/// must come from the zone: it may be several labels up.
 pub(super) fn push_negative_proof(
     zone: &Zone,
     qname: NameRef<'_>,
@@ -122,12 +111,8 @@ pub(super) fn push_negative_proof(
         NameKind::Exact | NameKind::EmptyNonTerminal => {
             match_at_name(zone, qname.as_ref(), written, w).map(drop)
         }
-        // NODATA through a wildcard owes both halves: the wildcard's record for
-        // the missing type, and the denial of the queried name, without which
-        // this reads as a NODATA about the wildcard name itself.
-        //
-        // `NameKind::Wildcard` carries the name absolute and down-cased, so it
-        // needs no folding of its own.
+        // Wildcard NODATA owes the wildcard's record and the denial of the
+        // queried name; `NameKind::Wildcard` is already folded.
         NameKind::Wildcard(wildcard) => {
             match_at_name(zone, wildcard.as_ref(), written, w)?;
             absence(zone, qname.as_ref(), written, w)
@@ -137,11 +122,8 @@ pub(super) fn push_negative_proof(
 
 /// Write what a referral owes a validating client: the DS RRset with its
 /// signature, or the authenticated denial that there is one (RFC 4035 §3.1.4).
-///
-/// Neither present, and a referral is indistinguishable from one an attacker
-/// stripped the DS out of.
-///
-/// The NS RRset gets no signature: it is the child's data (RFC 4035 §2.2).
+/// Without it the DS could have been stripped. The NS RRset is unsigned: it is
+/// the child's (§2.2).
 pub(super) fn push_delegation_proof(
     zone: &Zone,
     cut: NameRef<'_>,
@@ -193,23 +175,9 @@ fn absence<'z>(
 /// An NXDOMAIN's two halves: `qname` does not exist, and neither does the
 /// wildcard that could have answered it (RFC 4035 §5.4).
 ///
-/// One function rather than two calls, because under NSEC3 both proofs hang off
-/// the closest encloser and finding it is a hash per label of the QNAME
-/// (RFC 5155 §7.2.1) — asked per proof, the walk runs twice for one answer.
-///
-/// `*.<closest encloser>` has to be absent here, and that is load-bearing:
-/// `nsec_covering` searches strictly below its argument, so a name in the chain
-/// yields the record before it, which proves nothing.
-///
-/// [`Zone::name_kind`] does not guarantee it: its delegation `NotFound` is
-/// because RFC 4592 §2.2.1 forbids synthesis below a cut, which says nothing
-/// about whether `*.sub` is in the index. The guarantor is the *caller*:
-/// [`super::resolve_in_zone`] asks `delegation_for` before anything else — RFC
-/// 1034 §4.3.2's first case — so a name under a cut is a referral and never
-/// reaches a negative proof. `rdnsd`'s
-/// `a_wildcard_below_a_cut_is_still_a_referral` holds it end to end, and
-/// `zone_answer`'s own test of the same name holds it here, where the ordering
-/// lives.
+/// One function, as under NSEC3 both hang off one closest-encloser walk (RFC
+/// 5155 §7.2.1). `*.<closest encloser>` must be absent, guaranteed by
+/// [`super::resolve_in_zone`] taking delegations first (RFC 1034 §4.3.2).
 fn deny_the_name_and_its_wildcard<'z>(
     zone: &'z Zone,
     qname: NameRef<'_>,
@@ -275,17 +243,11 @@ fn push_soa_signatures(
     push_signatures_at(zone, zone.origin(), rt::SOA, cap, w)
 }
 
-/// The ceiling every record in a negative answer takes: [`Ttl::negative_answer`]
-/// over this zone's apex SOA.
+/// The ceiling every record in a negative answer takes:
+/// [`Ttl::negative_answer`] over this zone's apex SOA.
 ///
-/// RFC 9077 §§3.1-3.3 put the requirement on what is *returned*, so it belongs
-/// here as well as in the signer — a zone whose signatures arrived from
-/// somewhere else is answered from this path too, and its chain was built by a
-/// signer this server does not control (`TODO.md` #77a).
-///
-/// `None` for a zone with no apex SOA, which is no cap rather than a cap of
-/// zero: such a zone owes no negative answer either, and a ceiling of zero
-/// would be a wrong number where an absent one is right (`CLAUDE.md` §14).
+/// Applied on return too (RFC 9077 §3), as signatures may come from another
+/// signer. `None` with no apex SOA: no cap, not zero (`CLAUDE.md` §14).
 fn negative_ttl_cap(zone: &Zone) -> Option<Ttl> {
     let soa = zone
         .locate(zone.origin())
@@ -333,9 +295,8 @@ fn push_with_signatures<'z>(
     if !written.claim(record) {
         return Ok(false);
     }
-    // RFC 9077 §3: capped as the SOA beside it is. Under RFC 8198 this TTL is
-    // how long a resolver may go on synthesizing this "no" from its cache, so a
-    // denial outliving the SOA outlives the negative answer it belongs to.
+    // RFC 9077 §3: capped like the SOA, as RFC 8198 caches synthesize from this
+    // TTL.
     let ttl = written.cap.map_or(record.ttl, |cap| record.ttl.min(cap));
     w.push(
         Section::Authority,
@@ -348,16 +309,12 @@ fn push_with_signatures<'z>(
     Ok(true)
 }
 
-/// The denial records already written, so one that answers two questions does
-/// not go out twice — an NSEC3 covering the next closer name often covers
-/// `*.<encloser>` as well, and the second copy is bytes on an amplification
-/// path.
+/// The denial records already written, so one answering two questions goes out
+/// once.
 ///
-/// By identity, because these are the zone's own records and "the same record"
-/// is the question. Three is what a proof owes at most: RFC 5155 §7.2.1's pair
-/// plus the wildcard's. Past that it stops recording rather than growing, so an
-/// unforeseen fourth costs bytes and not correctness — hence a `debug_assert`
-/// and not a panic on a query path.
+/// By identity: these are the zone's records. At most three (RFC 5155 §7.2.1's
+/// pair plus the wildcard's); a fourth is dropped from tracking, costing bytes,
+/// so a `debug_assert`.
 struct Written<'z> {
     seen: [Option<ZoneRecordRef<'z>>; 3],
     filled: usize,
@@ -407,13 +364,9 @@ struct Nsec3Chain<'a> {
 }
 
 impl<'a> Nsec3Chain<'a> {
-    /// Read off the chain itself, not NSEC3PARAM: this server holds one chain
-    /// rather than choosing between rollover chains (RFC 5155 §4.1), and an
-    /// NSEC3PARAM left from a previous signing hashes every denial to nothing.
-    ///
-    /// Read at its offset rather than parsed: the record is the zone's, so the
-    /// salt is borrowed, and a full decode copies the next hashed owner and the
-    /// type bitmap that nothing here looks at.
+    /// Read off the chain, not NSEC3PARAM, which a previous signing may have
+    /// left (RFC 5155 §4.1). Read at its offset, borrowing the salt, rather
+    /// than decoded whole.
     fn of(zone: &'a Zone) -> Option<Self> {
         let (iterations, salt) = zone.any_nsec3()?.rdata.nsec3_parameters()?;
         Some(Nsec3Chain { salt, iterations })
@@ -502,14 +455,9 @@ impl<'a> Nsec3Chain<'a> {
         push_with_signatures(zone, record, written, w).map(drop)
     }
 
-    /// The deepest ancestor of `qname` that the chain has a record for.
-    ///
-    /// Walked rather than looked up by name: under NSEC3 an empty non-terminal
-    /// has an NSEC3 and no records, so the index would miss it and the proof
-    /// would name the wrong encloser.
-    ///
-    /// `qname` must be absolute, which every caller here has already made it —
-    /// each ancestor is then a suffix of it rather than a new `String`.
+    /// The deepest ancestor of `qname` that the chain has a record for: walked,
+    /// since an NSEC3 empty non-terminal has no records to index. `qname` is
+    /// absolute, so each ancestor is a suffix.
     fn closest_encloser<'n>(&self, zone: &Zone, qname: NameRef<'n>) -> Option<NameRef<'n>> {
         for name in qname.ancestors() {
             if self

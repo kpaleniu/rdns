@@ -32,13 +32,8 @@ use crate::{NameRef, Rtype};
 /// RFC 1034 §3.6.2: a CNAME must be the only type at its owner name. Refused at
 /// load, because there is no correct answer to give at query time.
 ///
-/// RRSIG, NSEC and NSEC3 are excepted — they describe the name rather than name
-/// it (RFC 4035 §2.5).
-///
-/// Asked of `Zone::groups`, the owner-name grouping the index already is: a
-/// second `HashMap<Name, _>` built here cost a `Name` clone and a `Vec` per
-/// record and was a third of a million-rule RPZ load (`CLAUDE.md` §13, "a scan
-/// beside the index that would have answered it").
+/// RRSIG, NSEC and NSEC3 are excepted (RFC 4035 §2.5). Asked of `Zone::groups`,
+/// the grouping the index already is (`CLAUDE.md` §13).
 pub(super) fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
     for positions in zone.groups() {
         // One record cannot be a CNAME *and* another type, and an empty
@@ -73,21 +68,10 @@ pub(super) fn check_cname_exclusivity(zone: &Zone) -> Result<(), ZoneError> {
     Ok(())
 }
 
-/// What RFC 6672 says a zone holding a DNAME may not do. Refused at load, for
-/// the reason [`check_cname_exclusivity`] is: each of these is a name with two
-/// answers and no rule for choosing between them.
-///
-/// The RFC hedges — "ought to refuse" for the singleton rule (§2.4), "MAY
-/// refuse" for data below a DNAME (§2.4) and for a wildcard DNAME (§3.3). All
-/// three are refused here, because the alternative is a zone that loads and
-/// then cannot serve what it holds: a name below a DNAME is occluded
-/// (RFC 2136 §7.18) whatever the file says.
-///
-/// This is the *loader's* check, so a zone that arrives by transfer or is built
-/// by dynamic update never meets it — §5.2 has dynamic update adding a DNAME
-/// over existing names on purpose. That is why the answer path occludes rather
-/// than trusting this: [`Zone::dname_above`] decides the answer for any zone,
-/// however it got here.
+/// What RFC 6672 says a zone holding a DNAME may not do, each a name with two
+/// answers and no rule to choose: refused at load, all three hedged rules
+/// (§2.4, §3.3). A transfer or UPDATE never meets this check, so the answer
+/// path occludes too ([`Zone::dname_above`]).
 pub(super) fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
     let apex = zone.origin();
     let mut owners: Vec<NameRef<'_>> = Vec::new();
@@ -100,10 +84,8 @@ pub(super) fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
         // Only for the message: comparisons below are the name's own.
         let shown = key.to_presentation();
 
-        // §3.3: "records of the form `*.example.com DNAME example.net` SHOULD
-        // NOT be used", because "the interaction between the expansion of the
-        // wildcard and the redirection of the DNAME is non-deterministic".
-        // Non-deterministic is not a thing a server can be asked to serve.
+        // §3.3: a wildcard DNAME's interaction "is non-deterministic", which a
+        // server cannot serve.
         if key.labels().next() == Some(b"*") {
             return Err(ZoneError::invalid(format!(
                 "{shown} is a wildcard DNAME — RFC 6672 §3.3 says the interaction between \
@@ -112,12 +94,8 @@ pub(super) fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
             )));
         }
 
-        // §2.4: "The owner name of a DNAME can only have one DNAME RR, and no
-        // CNAME RRs can exist at that name." Only the first half is here: a
-        // CNAME sharing its owner with anything at all is already refused by
-        // `check_cname_exclusivity` citing RFC 1034 §3.6.2, the older statement
-        // of the same rule. A second check would be a second message for one
-        // condition, and the two would drift (`CLAUDE.md` §7).
+        // §2.4's one DNAME per owner; the no-CNAME half is
+        // `check_cname_exclusivity`'s (`CLAUDE.md` §7).
         if owners.contains(&key) {
             return Err(ZoneError::invalid(format!(
                 "{shown} has two DNAME records — RFC 6672 §2.4 makes DNAME a singleton type, \
@@ -125,11 +103,8 @@ pub(super) fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
             )));
         }
 
-        // §2.3: "DNAME RRs MUST NOT appear at the same owner name as an NS RR
-        // unless the owner name is the zone apex; if it is not the zone apex,
-        // then the NS RR signifies a delegation point, and the DNAME RR must in
-        // that case appear below the zone cut at the zone apex of the child
-        // zone."
+        // §2.3: a DNAME beside NS only at the apex; elsewhere NS is a
+        // delegation, and the DNAME belongs in the child.
         if key != apex && zone.has_type(key, rt::NS) {
             return Err(ZoneError::invalid(format!(
                 "{shown} has both a DNAME and an NS RRset below the apex — RFC 6672 §2.3 \
@@ -145,14 +120,8 @@ pub(super) fn check_dname_rules(zone: &Zone) -> Result<(), ZoneError> {
         return Ok(());
     }
 
-    // §2.4: "Resource records MUST NOT exist at any subdomain of the owner of a
-    // DNAME RR."
-    //
-    // The denial types are exempt. They describe the zone's shape rather than
-    // being names it answers for, and a DNAME at the apex — which §2.3 allows
-    // outright, SOA and NS beside it — puts every NSEC3 record in the zone
-    // below a DNAME owner, so counting them would refuse a zone the RFC spells
-    // out as legal.
+    // §2.4: nothing below a DNAME owner. Denial types are exempt: an apex
+    // DNAME, which §2.3 allows, puts every NSEC3 below it.
     for record in zone.records() {
         let rtype = record.rdata.rtype();
         if matches!(rtype, rt::RRSIG | rt::NSEC | rt::NSEC3 | rt::NSEC3PARAM) {

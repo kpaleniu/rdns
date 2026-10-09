@@ -123,14 +123,10 @@ fn one_name(
 }
 
 /// The RDATA half of a zone-file line: everything after the owner name, TTL,
-/// class and type have been read off it. Pure, unlike `super::parse`'s
-/// `parse_into`, which
-/// mutates parser state.
+/// class and type. Pure, unlike `super::parse`'s `parse_into`.
 ///
-/// Two views of one list: `rdata` is the fields joined by a space, which is
-/// what every type but TXT wants, and `fields` is them separate — a TXT RR is a
-/// sequence of character-strings and a field boundary is where each ends (RFC
-/// 1035 §3.3.14). Neither keeps its quotes — `tokenize` consumes them.
+/// `rdata` is the fields joined by a space; `fields` keeps them apart for TXT,
+/// whose field boundaries end character-strings (RFC 1035 §3.3.14).
 pub(super) fn rdata_from_fields(
     record_type: &str,
     rdata: Cow<'_, str>,
@@ -172,9 +168,8 @@ pub(super) fn rdata_from_fields(
             }
         }
         "TXT" => {
-            // Every field after the type is one `<character-string>`
-            // (RFC 1035 §3.3.14): `"a b" c` is two, `a b c` is three. The
-            // 255-byte ceiling is the encoder's, for every caller.
+            // Each field is one `<character-string>` (RFC 1035 §3.3.14); the
+            // encoder holds the 255-octet ceiling.
             let strings: Vec<Vec<u8>> = fields
                 .iter()
                 .map(|t| crate::codecs::char_string_decode(t))
@@ -187,17 +182,14 @@ pub(super) fn rdata_from_fields(
         }
         "PTR" => ParsedRecord::PTR(one_name(record_type, fields, origin, ln)?),
         "DNAME" => ParsedRecord::DNAME(one_name(record_type, fields, origin, ln)?),
-        // One arm for two type codes: "the same encoding, format, and
-        // high-level semantics" (RFC 9460 §6). Only the owner name differs
-        // between them, and that is the caller's (§9.1).
+        // One arm for both: "the same encoding" (RFC 9460 §6); the owner name
+        // is the caller's (§9.1).
         "SVCB" | "HTTPS" => {
             let (priority, target, rest) = split_svcb_head(record_type, fields, ln)?;
             let target = name_at(&target, origin, ln)?;
             let params = crate::svcb::parse_params(rest, ln)?;
-            // "In AliasMode, recipients MUST ignore any SvcParams that are
-            // present. Zone-file parsers MAY emit a warning" (§2.4.2). Refused
-            // rather than warned: a parameter that is ignored is a setting the
-            // operator believes is in force and is not (`CLAUDE.md` §15).
+            // AliasMode SvcParams are ignored by recipients (§2.4.2), so
+            // refused: a policy not in force (`CLAUDE.md` §15).
             if priority == 0 && !params.is_empty() {
                 return Err(ZoneError::syntax(
                     ln,
@@ -448,9 +440,8 @@ pub(super) fn rdata_from_fields(
                     ZoneError::syntax(ln, format!("invalid NSEC3 salt {:?}: {e}", salt_str))
                 })?
             };
-            // `denial_wire`'s decoder, not a second one (`CLAUDE.md` §7): a
-            // copy folding case with `str::to_uppercase` uses the Unicode fold
-            // RFC 4343 forbids.
+            // `denial_wire`'s decoder (`CLAUDE.md` §7): a copy might fold with
+            // Unicode, which RFC 4343 forbids.
             let next_hashed_owner = base32hex_decode(nsec3_parts[4].as_ref()).map_err(|e| {
                 ZoneError::syntax(
                     ln,

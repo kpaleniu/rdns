@@ -22,11 +22,8 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 /// A zone-file owner name in absolute form, resolved against `origin`: `@` and
-/// the empty name are the origin itself, a name ending in `.` is already
-/// absolute, and anything else is relative to it.
-///
-/// Only the relative case allocates, and it is the zone parser's; a name off
-/// the wire is absolute, and a query takes four of these.
+/// the empty name are the origin, a name ending in `.` is absolute, anything
+/// else relative. Only the relative case allocates.
 pub(super) fn absolutize(name: &str, origin: NameRef<'_>) -> Result<Name, WireError> {
     let mut buf = [0u8; MAX_NAME_LEN];
     Ok(Name::absolutized_in(name, origin, &mut buf)?.to_owned())
@@ -142,9 +139,8 @@ fn logical_lines(content: &str) -> Result<Vec<LogicalLine<'_>>, ZoneError> {
                 }
             }
             None => {
-                // A blank line outside a group is nothing at all. Inside one —
-                // a lone `(` on its own line — it still starts the record, so
-                // the line number and indentation come from there.
+                // A blank line outside a group is nothing; inside one it still
+                // starts the record.
                 if text.trim().is_empty() && depth == 0 {
                     continue;
                 }
@@ -174,13 +170,8 @@ fn logical_lines(content: &str) -> Result<Vec<LogicalLine<'_>>, ZoneError> {
 
 /// Split an assembled line into fields, keeping a quoted string whole.
 ///
-/// Quotes are what say where one `<character-string>` ends, and an empty one
-/// (`""`) is legal — neither survives `split_whitespace`. Escapes are resolved
-/// inside quotes only: a bare `a\.b` is a name, and names are not this
-/// function's business.
-///
-/// Borrowed unless a quote or an escape means the token is not a contiguous
-/// run of the input: a `String` per token was 240 ms of a million-rule load.
+/// Quotes end a `<character-string>`, and `""` is legal. Escapes resolve inside
+/// quotes only. Borrowed unless a quote or escape breaks the run.
 fn tokenize_into<'a>(text: &'a str, out: &mut Vec<Cow<'a, str>>) {
     out.clear();
     if !text.bytes().any(|b| matches!(b, b'"' | b'\\')) {
@@ -199,11 +190,8 @@ fn tokenize_into<'a>(text: &'a str, out: &mut Vec<Cow<'a, str>>) {
             continue;
         }
         match c {
-            // Kept, not consumed: RFC 1035 §5.1's escapes are resolved by the
-            // value that needs them (`codecs::char_string_decode`), because only
-            // that value knows whether `\\120` is three characters or one
-            // octet. Eating it here made `\\DDD` unspellable and silently
-            // turned a quoted `"a\\.b"` into two labels.
+            // Kept: RFC 1035 §5.1's escapes are resolved by the value, which
+            // alone knows what `\\120` means (`codecs::char_string_decode`).
             '\\' => {
                 current.push(c);
                 escaped = true;
@@ -335,9 +323,7 @@ fn parse_into(
     // An upper bound on the records this file adds, and the only cheap one
     // there is: directives and blank lines are the slack.
     zone.reserve(lines.len());
-    // Refilled per line rather than rebuilt, which is one `Vec` for the file
-    // and not one per record. Nothing else borrows from it across lines, which
-    // a second vector of `&str` over it would.
+    // Refilled per line: one `Vec` for the file.
     let mut tokens: Vec<Cow<'_, str>> = Vec::new();
     for logical in &lines {
         let ln = logical.line_no;
@@ -358,12 +344,8 @@ fn parse_into(
                         zone.set_origin(state.origin.clone());
                         *moved_apex = None;
                     } else {
-                        // `set_origin` rebuilds the index over every record so
-                        // far, so one `$ORIGIN` per section was
-                        // O(sections x records) — 13.6 s for 16 000 records
-                        // with one before each (`TODO.md` #62c). Only the last
-                        // decides the apex and the rebuild is a clean sweep, so
-                        // the caller does it once at the end instead.
+                        // `set_origin` reindexes everything: move the apex
+                        // once, to the last `$ORIGIN` (`TODO.md` #62c).
                         *moved_apex = Some(state.origin.clone());
                     }
                 }
@@ -399,9 +381,8 @@ fn parse_into(
             let included = std::fs::read_to_string(&path)
                 .map_err(|e| ZoneError::syntax(ln, format!("$INCLUDE {}: {e}", path.display())))?;
 
-            // RFC 1035 §5.1: the origin is for the included file only, so the
-            // state goes in as a copy and none of it comes back. The owner name
-            // does not carry across either.
+            // RFC 1035 §5.1: the origin is the included file's alone, so state
+            // goes in as a copy and nothing comes back.
             let mut inner = ParseState {
                 origin: match tokens.get(2) {
                     Some(o) => name_at(o, state.origin.as_ref(), ln)?,
@@ -422,18 +403,12 @@ fn parse_into(
             continue;
         }
 
-        // `[name] [ttl] [class] type rdata...` — position tells the owner name
-        // from a TTL/class/type, not the token's shape: `ns IN A …` is a host
-        // called `ns`, not an NS record.
-        //
-        // Resolved against the origin in force here, which is what makes
-        // `$ORIGIN` apply to the lines below it only.
+        // Position, not shape, tells the owner (`ns IN A` is a host `ns`),
+        // resolved against the origin in force here.
         let mut idx = 0;
         if !logical.omits_owner {
-            // RFC 1035 §5.1's escapes are resolved here, `a\.b` included —
-            // one label of three octets. This was refused at load until names
-            // became wire form, because presentation storage with `.` as the
-            // separator could not tell that name from two labels (D-1).
+            // RFC 1035 §5.1's escapes resolve here: `a\.b` is one label of
+            // three octets.
             let mut buf = [0u8; MAX_NAME_LEN];
             let len = Name::absolutized_in(first, state.origin.as_ref(), &mut buf)
                 .map_err(|e| not_a_name(first, ln, e))?
@@ -451,10 +426,8 @@ fn parse_into(
         }
 
         let mut ttl = state.ttl;
-        // Always IN: the branch below refuses any other class outright. A zone
-        // is single-class by construction, which is what makes the class-blind
-        // index correct rather than merely untested. A CH zone needs its own
-        // apex and its own place in the zone map.
+        // Always IN: other classes are refused below, so a zone is single-class
+        // and the class-blind index correct.
         let mut class = Class::IN;
 
         while idx < tokens.len() {
@@ -487,9 +460,8 @@ fn parse_into(
             continue;
         }
 
-        // Upper-cased on the stack: a `String` per record for a token that is
-        // almost always one or two octets. A token too long or not ASCII is no
-        // type name either way, so it goes on unchanged to the same error.
+        // Upper-cased on the stack; a token too long or not ASCII is no type
+        // name and reaches the same error.
         let mut type_buf = [0u8; 32];
         let record_type: &str = upper_into(&tokens[idx], &mut type_buf).unwrap_or(&tokens[idx]);
         idx += 1;
@@ -500,10 +472,8 @@ fn parse_into(
             rest => Cow::Owned(rest.join(" ")),
         };
 
-        // RFC 3597 §5's generic form, `\# <length> <hex>`: the only way to write
-        // a type with no parser here, and what the zone writer emits when the
-        // type-specific spelling would not read back as the same bytes. §5
-        // permits it for known types too, so it is accepted for them.
+        // RFC 3597 §5's `\# <length> <hex>`, for types with no parser and for
+        // known types, as §5 permits.
         if tokens.get(idx).is_some_and(|token| token == "\\#") {
             let rdata = parse_generic_rdata(record_type, &tokens[idx + 1..])
                 .map_err(|e| ZoneError::syntax(ln, format!("{record_type} record: {e}")))?;
@@ -524,10 +494,8 @@ fn parse_into(
             ln,
         )?;
 
-        // Encoded into the zone's own arena: a `RecordData` here would be a
-        // heap allocation and a free per record for octets the zone copies
-        // either way (`TODO.md` #72b), and the line number is what the encode's
-        // own error has no way to carry.
+        // Into the zone's arena, not via a `RecordData` (`TODO.md` #72b); the
+        // line number is what the encode error lacks.
         zone.add_parsed(state.owner().expect("an owner name"), ttl, class, &parsed)
             .map_err(|e| ZoneError::syntax(ln, format!("{record_type} record: {e}")))?;
     }

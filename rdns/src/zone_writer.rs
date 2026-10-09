@@ -28,10 +28,8 @@ use crate::ParsedRecord;
 /// practice that is an owner name needing escapes.
 pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
     use std::fmt::Write as _;
-    // A zone file runs to tens of megabytes and this grew from empty, so a
-    // million-record zone was ~25 reallocations copying up to the whole file
-    // each time. The estimate need not be right — being wrong costs one
-    // `realloc` (`TODO.md` #64c).
+    // Sized up front, as a zone file is tens of megabytes; a wrong estimate
+    // costs one `realloc` (`TODO.md` #64c).
     let mut out = String::with_capacity(zone.records().len() * 64 + 256);
 
     out.push_str("; ");
@@ -41,14 +39,8 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
     let _ = writeln!(out, "$ORIGIN {}", zone.origin().to_presentation());
     let _ = writeln!(out, "$TTL {}\n", default_ttl(zone));
 
-    // The SOA first, as a transfer sends it. The rest in the order the zone
-    // holds them, so rewriting an unchanged zone produces an unchanged file —
-    // a zone a delta has been applied to holds a permutation of its old order
-    // (`Zone::remove_record`), which is a different file for the same records
-    // and not a reason to sort a million of them.
-    //
-    // Through `Zone::is_apex_soa` rather than comparing `record.name`: one
-    // answer to a question several places ask (`CLAUDE.md` §7).
+    // The SOA first, then the zone's order, so an unchanged zone writes an
+    // unchanged file. `Zone::is_apex_soa` decides (`CLAUDE.md` §7).
     for record in zone.records().iter().filter(|r| zone.is_apex_soa(*r)) {
         record_into(&mut out, record)?;
     }
@@ -70,14 +62,9 @@ pub fn write_zone_file(zone: &Zone, path: &Path) -> Result<(), ZoneError> {
 
 /// The same, for a caller that needs the text as well as the file.
 ///
-/// A digest of what was written is how the next reader knows it need not parse
-/// the file back (`TODO.md` #71f, `rdns::rpz::PolicyStore::offer`), and
-/// serializing a million-record zone twice to get it is 249 ms
-/// (`rdns/tests/record_storage.rs`).
-///
-/// It hands back a [`Written`] rather than `()` because the next reader's whole
-/// test is that those bytes are the bytes on disk, and a type says that where a
-/// doc comment can only ask (`TODO.md` #104).
+/// The digest tells the next reader it need not parse the file back
+/// (`rdns::rpz::PolicyStore::offer`). [`Written`] is the type that says these
+/// are the bytes on disk (`TODO.md` #104).
 pub fn write_zone_text(text: &str, path: &Path) -> Result<Written, ZoneError> {
     crate::persist::write_atomically_str(path, text).map_err(|source| ZoneError::Io {
         path: path.display().to_string(),
@@ -92,13 +79,9 @@ pub fn write_zone_text(text: &str, path: &Path) -> Result<Written, ZoneError> {
 /// What [`write_zone_text`] put where, for a caller that will offer the same
 /// zone to something holding a digest cache.
 ///
-/// Only this module makes one, so holding it is the evidence that the write
-/// happened and that these are the bytes it wrote (`TODO.md` #104, `CLAUDE.md`
-/// §17).
-///
-/// `digest` is `None` for text that `$INCLUDE`s another file, which a
-/// serialized zone never does and a caller must not have to know: see
-/// [`crate::zone::FileDigest::of_self_contained`].
+/// Only this module makes one: holding it proves the write (`CLAUDE.md` §17).
+/// `digest` is `None` for text with `$INCLUDE`, which a serialized zone never
+/// has ([`crate::zone::FileDigest::of_self_contained`]).
 #[derive(Debug, Clone)]
 pub struct Written {
     path: std::path::PathBuf,

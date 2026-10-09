@@ -27,11 +27,8 @@ use crate::{Class, Name, NameRef, ParsedRecord, Qtype, RecordData, ResponseCode,
 /// Write what `zone` says to `qname`/`qtype` into `w`: the answer, authority
 /// and additional sections, NXDOMAIN or YXDOMAIN where they apply, AA cleared
 /// on a referral, and every DNSSEC record the reply owes when `dnssec_ok` and
-/// the zone is signed.
-///
-/// `qname` is as asked, and its case is what the answer echoes
-/// (RFC 1034 §4.3.3). The zone is the caller's choice; the header, opcode and
-/// EDNS are the caller's too.
+/// the zone is signed. `qname` is as asked, and its case is echoed (RFC 1034
+/// §4.3.3); the header, opcode and EDNS are the caller's.
 pub fn write(
     zone: &Zone,
     qname: &Name,
@@ -149,14 +146,9 @@ enum Outcome<'a> {
     },
 }
 
-/// How many redirections — CNAME and DNAME alike — we follow inside one zone.
-/// The second bound: the visited set below stops a cycle, this stops a chain
-/// that grows without repeating.
-///
-/// RFC 6672 §2.2 warns both ways: "fairly long chains of DNAMEs may be valid",
-/// and "resolvers and servers should be cautious in devoting resources to a
-/// query". One ceiling for both kinds, because they chain together — "DNAMEs
-/// and CNAMEs can chain together to form loops".
+/// How many redirections, CNAME and DNAME alike, we follow inside one zone: the
+/// visited set stops a cycle, this a chain that never repeats. One ceiling for
+/// both, as they chain together (RFC 6672 §2.2).
 const MAX_REDIRECTS: usize = 16;
 
 /// Walk RFC 1034 §4.3.2 for one question.
@@ -173,42 +165,28 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome
     let mut fold = [0u8; crate::dname::MAX_NAME_LEN];
 
     for _ in 0..MAX_REDIRECTS {
-        // Folded once per name, not once per lookup. Every `Zone` entry point
-        // folds its argument and `NameRef::folded_into` borrows when there is
-        // nothing left to fold, so the three lookups below see a name already
-        // lower-case and copy nothing. A case-randomized query — ordinary
-        // traffic, not an attack — would fold its name three times without
-        // this. `name` keeps the case it was asked in, which is what goes back
-        // out.
+        // Folded once per name: every `Zone` entry point folds, and an already
+        // folded name copies nothing. `name` keeps the asked case for the echo.
         let key = name.as_ref().as_ref().folded_into(&mut fold);
 
-        // The DNAME that redirects this name, if any: RFC 6672 §2.2, and
-        // strictly above it, because a DNAME does not redirect its own owner
-        // (§2.3). Asked before the name is looked up, not after: a name below a
-        // DNAME owner is occluded (RFC 2136 §7.18), so whether the zone happens
-        // to hold records there cannot change the answer.
+        // The DNAME strictly above (RFC 6672 §2.2, §2.3), asked before the
+        // lookup: names below it are occluded (RFC 2136 §7.18).
         let redirect = zone.dname_above(key);
 
         // A delegation is a referral whatever the type, with two exceptions.
         if let Some(cut) = zone.delegation_for(key) {
-            // A DNAME above the cut occludes it. Whichever of the two is
-            // shallower is the one RFC 1034 §4.3.2's "start matching down,
-            // label by label" reaches first. `check_dname_rules` refuses a zone
-            // with both on one path — an NS below a DNAME owner is a record at
-            // a subdomain of it (RFC 6672 §2.4) — so this decides only for a
-            // zone that arrived by transfer or was built by UPDATE (§5.2).
+            // A DNAME above the cut occludes it, met first (RFC 1034 §4.3.2);
+            // only a transferred or updated zone holds both.
             let occluded = redirect.is_some_and(|dname| cut.as_ref().is_at_or_under(dname.name));
-            // The DS *at* the cut is the parent's own statement about the
-            // child, which the child does not hold and could not be asked
-            // (RFC 4035 §3.1.4.1).
+            // The DS at the cut is the parent's statement, which the child
+            // lacks (RFC 4035 §3.1.4.1).
             let ds_at_the_cut = qtype.is(record_types::DS) && cut == *name;
             if !(occluded || ds_at_the_cut) {
                 return if chain.is_empty() {
                     Outcome::Referral { cut }
                 } else {
-                    // Mid-chain the target is the child's name to answer for.
-                    // Answering from the glue below the cut would serve occluded
-                    // data as authoritative.
+                    // Mid-chain the target is the child's; glue below the cut
+                    // is not authoritative.
                     Outcome::ChainLeftZone { chain }
                 };
             }
@@ -228,10 +206,8 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome
             }
         }
 
-        // One walk for both questions: `locate` works the kind out to decide
-        // whether a wildcard may answer, and asking `name_kind` separately
-        // would walk the ancestors and fold the name again. The records are not
-        // collected — this asks only whether there are any.
+        // One walk for both questions: `locate` already works out the kind, and
+        // only whether records exist is asked.
         let located = zone.locate(key);
         if located.has_type(qtype) {
             return Outcome::Answer {
@@ -246,12 +222,8 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome
             return Outcome::Negative { chain, name, kind };
         }
 
-        // From the same `located`: following the alias is a question about the
-        // records already found here, not a reason to walk the zone again.
-        //
-        // Only the first is read: RFC 1034 §3.6.2 allows exactly one CNAME at an
-        // owner name, and the parser refuses to load a second, so this is belt
-        // to that braces.
+        // From the same `located`; only the first CNAME, as RFC 1034 §3.6.2
+        // allows one and the loader refuses two.
         let target = located
             .of_type(Qtype::of(record_types::CNAME))
             .next()
@@ -286,20 +258,15 @@ fn redirect_through(
     chain: &mut Vec<Hop>,
 ) -> Result<Name, ResponseCode> {
     let Ok(ParsedRecord::DNAME(target)) = dname.rdata.parse() else {
-        // A DNAME whose RDATA will not read still occludes everything below it,
-        // so falling through to the name underneath would serve data this zone
-        // does not hold. SERVFAIL says the zone is wrong, which it is — and a
-        // zone that loaded here cannot be in this state, because
-        // `RecordData::parse` is what built it.
+        // An unreadable DNAME still occludes, so SERVFAIL rather than answer
+        // from below; unreachable for a loaded zone.
         return Err(ResponseCode::ServerFailure);
     };
     let to = match dname_redirect(from.as_ref(), dname.name, target.as_ref()) {
         Redirect::To(next) => Some(next),
         Redirect::TooLong => None,
-        // `Zone::dname_above` found this DNAME strictly above the name, so the
-        // two disagree about the shape of the tree. Not reachable, and not
-        // silently ignorable either: falling through would answer from a name
-        // the DNAME occludes.
+        // Unreachable: `Zone::dname_above` found it strictly above. Falling
+        // through would answer from occluded data.
         Redirect::NoMatch => return Err(ResponseCode::ServerFailure),
     };
     chain.push(Hop::Dname {
@@ -309,10 +276,8 @@ fn redirect_through(
         ttl: dname.ttl,
         class: dname.class,
     });
-    // "The domain name can get too long during substitution... If this occurs,
-    // the server returns an RCODE of YXDOMAIN" (§2.2) — with the DNAME, now in
-    // the chain, as the proof for it. RFC 2136's YXDOMAIN is 6, which this enum
-    // spells `DomainExistsForSomeReason`.
+    // Too long after substitution is YXDOMAIN (RFC 6672 §2.2), the DNAME as
+    // proof; this enum spells 6 `DomainExistsForSomeReason`.
     to.ok_or(ResponseCode::DomainExistsForSomeReason)
 }
 
@@ -325,16 +290,9 @@ fn in_zone(zone: &Zone, name: NameRef<'_>) -> bool {
 /// Put the records of `qtype` at `name` into the answer section, with their
 /// signatures.
 ///
-/// Echoes the name asked about, not the stored owner, which may be `@`, relative
-/// or a wildcard — the client must see the queried name (RFC 1034 §4.3.3).
-/// `name` is echoed and `key` is looked up with: they are the same name, and a
-/// DNS-0x20 client compares the echo byte for byte, so the folded form must not
-/// reach the wire.
-/// Returns whether the answer came through a wildcard and so still owes a
-/// denial of the name asked for — an authority record, which the caller writes
-/// once every answer record is out (RFC 4035 §3.1.3: the same signature verifies
-/// at every name the wildcard reaches, so without the denial one captured answer
-/// serves for all).
+/// Echoes `name`, as asked (RFC 1034 §4.3.3), and looks up by `key`; DNS-0x20
+/// clients compare the echo. Returns whether a wildcard answered, which still
+/// owes a denial of `name` (RFC 4035 §3.1.3), written by the caller.
 fn add_answer(
     at: &Located,
     name: NameRef<'_>,
@@ -385,15 +343,8 @@ fn add_chain(
             owed |= 1 << i;
         }
 
-        // "A CNAME RR with Time to Live (TTL) equal to the corresponding DNAME
-        // RR is synthesized and included in the answer section when the DNAME
-        // is employed as a substitution instruction. The owner name of the
-        // CNAME is the QNAME of the query" (RFC 6672 §3.1).
-        //
-        // It carries no signature, and that is the design rather than an
-        // omission: "the CNAME will never be signed" (§5.3.1). A validator
-        // verifies the DNAME's RRSIG and checks that the CNAME follows from it,
-        // so signing this would mean signing online, once per query.
+        // RFC 6672 §3.1: a CNAME with the DNAME's TTL, owned by the QNAME.
+        // Never signed (§5.3.1): a validator derives it from the DNAME's RRSIG.
         if let Hop::Dname {
             from,
             to: Some(to),
@@ -441,11 +392,8 @@ fn add_negative(
         w.set_rcode(ResponseCode::NoSuchDomain);
     }
 
-    // Both kinds of "no" carry the zone's SOA in the authority section
-    // (RFC 2308 §2.1 and §2.2). It is not decoration: it is what tells the
-    // client, and every resolver in between, how long the answer may be cached.
-    // Without it a negative answer is uncacheable, so each repeat of a failing
-    // lookup comes back to us.
+    // Both kinds of "no" carry the SOA (RFC 2308 §2.1, §2.2), which says how
+    // long it may be cached; without it every repeat comes back.
     for soa in zone.query(zone.origin(), Qtype::of(record_types::SOA)) {
         w.push(
             Section::Authority,
@@ -456,10 +404,8 @@ fn add_negative(
         )?;
     }
 
-    // An unsigned "no" is a "no" a resolver has to take on trust, which for a
-    // signed zone is the one thing DNSSEC exists to avoid: the proof is what
-    // stops a forged NXDOMAIN taking a name off the internet for as long as it
-    // stays cached.
+    // A signed zone's "no" carries its proof, or a forged NXDOMAIN takes a name
+    // away for as long as it is cached.
     if dnssec_ok {
         dnssec_answer::push_negative_proof(zone, name, kind, w)?;
     }
@@ -469,20 +415,13 @@ fn add_negative(
 /// How long a negative answer may be cached: `min(SOA MINIMUM, the SOA record's
 /// own TTL)` (RFC 2308 §3).
 ///
-/// The record's own TTL alone is wrong, and wrong in the expensive direction.
-/// For the zone shape this repo's own tests use — `$TTL 3600`, `minimum 300` —
-/// sending it verbatim advertises every NXDOMAIN and NODATA at 3600 where the
-/// RFC says 300, so a record added to fix a typo takes an hour to appear instead
-/// of five minutes. It was also internally inconsistent: the signer already caps
-/// the NSEC/NSEC3 TTL at MINIMUM (`zone_signer::sign_zone`), so the SOA and the
-/// proof beside it in the same section disagreed about how long the "no" was
-/// good for.
+/// The record's TTL alone overstates it, and would disagree with the NSEC TTL
+/// the signer caps at MINIMUM beside it.
 fn negative_ttl(soa: ZoneRecordRef<'_>) -> Ttl {
     match soa.rdata.soa_minimum() {
         Some(minimum) => Ttl::negative_answer(soa.ttl, minimum),
-        // An apex SOA that will not parse is a zone that should not have loaded.
-        // Capping at nothing is the conservative direction: the client asks
-        // again rather than caching a "no" we cannot bound.
+        // An unparseable apex SOA: zero, so the client asks again rather than
+        // caching an unbounded "no".
         None => Ttl::ZERO,
     }
 }
@@ -510,18 +449,14 @@ fn refer_to_child(
         w.push(Section::Authority, cut, ns.class, ns.ttl, ns.rdata)?;
     }
 
-    // Written here rather than after the glue: both are the same section
-    // contents as before, but the additional section cannot be reopened once a
-    // record has gone into it.
+    // Before the glue: the additional section cannot be reopened once written
+    // to.
     if dnssec_ok {
         dnssec_answer::push_delegation_proof(zone, cut, w)?;
     }
 
-    // Glue, and only in-bailiwick glue: an address we hold for a nameserver
-    // under this zone is a hint we are entitled to give, while one for a name in
-    // somebody else's zone is an assertion about their data. A resolver worth
-    // anything discards the latter, and sending it is how cache-poisoning
-    // attempts look (RFC 1034 §4.2.1).
+    // In-bailiwick glue only: an address for another zone's name asserts their
+    // data, which is what poisoning looks like (RFC 1034 §4.2.1).
     for target in targets {
         if !in_zone(zone, target.as_ref()) {
             continue;

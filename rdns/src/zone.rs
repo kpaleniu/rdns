@@ -69,24 +69,10 @@ pub fn origin_from_path(path: &str) -> String {
 /// What a zone file held when this process last parsed it, for telling a file
 /// that moved from one that did not.
 ///
-/// Not a cryptographic digest: the question is whether the bytes changed, and
-/// anybody who can rewrite a zone file already owns the process.
-/// `DefaultHasher` is not stable across Rust releases, which does not matter —
-/// every comparison is against a value this same process computed, and a
-/// restart re-reads anyway.
-///
-/// One copy for three callers — `rdnsd`'s UPDATE path (`TODO.md` #64b) and its
-/// reload path (#64f), and the resolver's policy reload (#71b) — because two
-/// implementations of "did these bytes change" is how the two answers come to
-/// differ (`CLAUDE.md` §7).
-///
-/// **Why the bytes and not a `stat`.** The argument is the same at all three
-/// (`TODO.md` #104): `stat` cannot see an edit that preserves length and
-/// timestamp, and a missed edit is the operator's change silently reverted —
-/// the failure the re-read exists to prevent (`CLAUDE.md` §4). Each caller
-/// keeps its own *measurement* of what the read costs against the parse it
-/// saves, because those are different numbers about different files; the reason
-/// they are willing to pay it is this one.
+/// Not cryptographic: whoever rewrites a zone file owns the process anyway, and
+/// every comparison is within one process. The bytes, not a `stat`, which
+/// misses an edit keeping length and timestamp (`TODO.md` #104). One type for
+/// all three callers (`CLAUDE.md` §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileDigest(u64);
 
@@ -103,19 +89,12 @@ impl FileDigest {
     /// The digest of a file read from disk, or `None` when it `$INCLUDE`s
     /// another.
     ///
-    /// A digest of the parent says nothing about the included file, so an edit
-    /// to that one would be invisible — the exact failure a re-read exists to
-    /// prevent (`CLAUDE.md` §4, `TODO.md` #64f). `None` rather than a digest
-    /// that would compare equal, so a caller cannot skip work on the strength
-    /// of it: the omission is the rule.
-    ///
-    /// A textual test rather than a report from the parser: it cannot miss one,
-    /// because an `$INCLUDE` the parser acts on is by definition in the text,
-    /// and a false positive inside a TXT record costs one re-parse.
+    /// A parent's digest cannot see an edit to the included file, so `None`
+    /// rather than a value that compares equal. Textual, so it cannot miss one;
+    /// a false positive inside a TXT record costs one re-parse.
     pub fn of_self_contained(bytes: &[u8]) -> Option<FileDigest> {
-        // `eq_ignore_ascii_case` rather than uppercasing the line:
-        // `to_ascii_uppercase` allocates a copy of every line, and a feed is a
-        // line per rule.
+        // `eq_ignore_ascii_case`: uppercasing would copy every line, and a feed
+        // is a line per rule.
         const DIRECTIVE: &[u8] = b"$INCLUDE";
         let included = bytes.split(|b| *b == b'\n').any(|line| {
             let head = line.trim_ascii_start();
@@ -128,32 +107,11 @@ impl FileDigest {
 /// Positions in [`Zone::records`], by the folded wire form of the owner name:
 /// every name in one arena, and a table whose entries do not own their key.
 ///
-/// A name that exists only because something below it does — an empty
-/// non-terminal (RFC 4592 §2.2.2) — is an entry with **no positions**, not a
-/// member of a second set: that would make every level of a miss walk hash the
-/// name twice to ask two halves of one question (`TODO.md` #22): "is this a
-/// node of the zone, and does it have records". An ENT costs no arena bytes
-/// either: it is a suffix of a name already interned, so it is a range into
-/// that one.
-///
-/// **Why not a `HashMap`** (`TODO.md` #71d). A `HashMap` reaches its key only
-/// through `Borrow`, so the key must own and hash its own bytes — `Box<[u8]>`
-/// here, because `Name` cannot borrow to `NameRef` without the `unsafe` cast
-/// `str` uses (`rdns_core::name_keys` makes the same argument for the same
-/// reason). That is a `Box` per name, which is a heap allocation per name to
-/// load and another per name to copy: cloning a million-record zone's index is
-/// two million of them, 244 ms where the same table keyed on a `u64` takes 6.
-///
-/// [`hashbrown::HashTable`] takes the hash and an equality closure from the
-/// caller, so an entry can be a range into the arena and nothing here allocates
-/// per name. It is the API `std` keeps behind the unstable `hash_raw_entry`,
-/// and hashbrown is what `std::collections::HashMap` is built on — already in
-/// `Cargo.lock` through `toml`, and already linked into both daemons, so
-/// naming it costs no package.
-///
-/// A hash collision is hashbrown's business rather than this type's: the
-/// closure compares the arena bytes, so two names that hash alike stay two
-/// names. See `an_index_keeps_two_names_that_hash_alike_apart`.
+/// An empty non-terminal (RFC 4592 §2.2.2) is an entry with no positions, so a
+/// miss walk hashes each level once; it is a range into a name already
+/// interned. [`hashbrown::HashTable`] takes the hash and equality from the
+/// caller, so no key owns a `Box` (`TODO.md` #71d); collisions compare arena
+/// bytes.
 #[derive(Debug, Clone, Default)]
 struct NameIndex {
     names: Vec<u8>,
@@ -163,19 +121,9 @@ struct NameIndex {
 /// One name in the index: where its bytes are, what is at it, and how many
 /// names directly below it the index holds.
 ///
-/// `children` is what makes a record removable. A name is in the index either
-/// because it owns records or because something below it does (RFC 4592
-/// §2.2.2), and dropping the last record at a name may not drop the name while
-/// a descendant still needs it to exist — an empty non-terminal that vanishes
-/// turns a NODATA into an NXDOMAIN, which an RFC 8020 resolver then extends
-/// over the whole subtree (`CLAUDE.md` §8).
-///
-/// Direct children rather than all descendants, because that is the count an
-/// insertion can keep in O(1): a new name credits its parent, and only a parent
-/// that was itself new walks on up. Counting descendants would make every
-/// insertion walk to the apex, which is the cost
-/// [`Zone::note_non_terminals`] exists to avoid. It fits in `len`'s padding, so
-/// the table is the same size it was.
+/// `children` makes removal safe: a name needed by a descendant stays, or a
+/// NODATA turns NXDOMAIN, which RFC 8020 extends to the subtree (`CLAUDE.md`
+/// §8). Direct children only, which an insertion keeps in O(1).
 #[derive(Debug, Clone, Copy)]
 struct Interned {
     off: usize,
@@ -186,18 +134,9 @@ struct Interned {
 
 /// FxHash, as rustc uses, over the folded name.
 ///
-/// **Not collision-resistant, and that is a decision rather than an oversight.**
-/// A weak hash is dangerous where an attacker can *insert*, because they choose
-/// what shares a bucket; here every key is one of the operator's own zone names,
-/// and a query only probes. So a chosen QNAME reaches at worst the longest
-/// collision cluster among names already loaded — a load-time property of the
-/// zone, which no packet can grow. Measured over a million-rule feed, where Fx
-/// collides on 2.5% of names, that cluster is 2.
-///
-/// The names are the reason it is not the default hasher: SipHash over ~38
-/// octets, twice per label of an ancestor walk, is the single largest thing a
-/// miss pays. 114 ns against 82 for a miss on a million-record zone
-/// (`TODO.md` #71d).
+/// Not collision-resistant, on purpose: every key is the operator's, and a
+/// query only probes, so no packet can grow a collision cluster. SipHash was
+/// the largest cost of a miss (`TODO.md` #71d).
 fn name_hash(key: &[u8]) -> u64 {
     const K: u64 = 0x517c_c1b7_2722_0a95;
     let mut h: u64 = 0;
@@ -263,13 +202,8 @@ impl NameIndex {
     /// The entry at `key`, inserting an empty non-terminal with no children if
     /// the name is new, and saying which of the two happened.
     ///
-    /// One probe for a caller that wants to read the slot and write it back —
-    /// [`Zone::file`] spent two or three doing that through the `&mut Slot`
-    /// this replaced.
-    ///
-    /// `bytes` is where `key` already lives in the arena, for a caller that has
-    /// just interned it or knows it is a suffix of something interned; `None`
-    /// appends a copy.
+    /// One probe to read and write back. `bytes` is where `key` already lives
+    /// in the arena, if it does; `None` appends a copy.
     fn node_mut(&mut self, key: &[u8], bytes: Option<(usize, u32)>) -> (&mut Interned, bool) {
         // Destructured, so the closures can borrow the arena while the table is
         // borrowed mutably beside it.
@@ -392,16 +326,11 @@ pub struct ZoneRecord {
     pub rdata: RecordData,
 }
 
-/// One record of a zone, borrowed from its arenas.
+/// One record of a zone, borrowed from its arenas: [`ZoneRecord`]'s fields
+/// borrowed, `Copy` as two slices and two scalars.
 ///
-/// The same four fields as [`ZoneRecord`] in the borrowed forms, so a reader
-/// writes `record.name` and `record.rdata` as it always did. `Copy`, because it
-/// is two slices and two scalars.
-///
-/// Equality is the four fields, the owner name case-insensitively (RFC 4343) as
-/// [`NameRef`]'s own is. Not pointer identity: a record is a pair of spans, so
-/// there is no `&ZoneRecord` to compare addresses of, and two records that
-/// agree on all four fields are the same record for every purpose a reader has.
+/// Equality is the four fields, the owner name case-insensitively (RFC 4343);
+/// there is no address to compare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ZoneRecordRef<'a> {
     pub name: NameRef<'a>,
@@ -445,16 +374,8 @@ struct Stored {
     rdata: RdataSpan,
 }
 
-/// A zone's records, in the order it holds them.
-///
-/// A view rather than a slice, because the records are spans into two arenas
-/// and a `&[ZoneRecord]` would mean materializing them. It answers what a slice
-/// answered — [`len`], [`is_empty`], [`iter`], and `for record in ..` — so a
-/// reader that only counted or walked reads the same.
-///
-/// [`len`]: Records::len
-/// [`is_empty`]: Records::is_empty
-/// [`iter`]: Records::iter
+/// A zone's records, in the order it holds them: a view over two arenas,
+/// answering what a slice did ([`Records::len`], [`Records::iter`]).
 #[derive(Debug, Clone, Copy)]
 pub struct Records<'a> {
     zone: &'a Zone,
@@ -530,14 +451,9 @@ impl DoubleEndedIterator for RecordIter<'_> {
 
 /// In-memory DNS zone storage.
 ///
-/// Records live in one vector, reached through an index keyed by owner name
-/// only. Keying on (name, type) would answer "which records of this type are
-/// here" but not "does this name exist at all" — the question that tells
-/// NXDOMAIN from NODATA — without probing 65535 types.
-///
-/// `origin` and `records` are private because the index is derived from both:
-/// a record appended behind its back leaves the zone answering NXDOMAIN for
-/// data it holds.
+/// Records in one vector, indexed by owner name only, which answers both "does
+/// this name exist" and "what is here"; a (name, type) key could not tell
+/// NXDOMAIN from NODATA. Fields private: the index is derived from them.
 #[derive(Debug, Clone)]
 pub struct Zone {
     origin: Name,
@@ -548,17 +464,8 @@ pub struct Zone {
     /// what it held behind and `removed_since_rebuild` is what reclaims it.
     names: NameArena,
     rdata: RdataArena,
-    /// Positions in `records`, by the folded wire form of the owner name.
-    ///
-    /// A name that exists only because something below it does — an empty
-    /// non-terminal (RFC 4592 §2.2.2) — is a key with **no positions**, not a
-    /// member of a second set, which would make every level of a miss walk hash
-    /// the name twice to ask two halves of one question (`TODO.md` #22): "is
-    /// this a node of the zone, and does it have records". Keyed on the
-    /// *folded* wire form, because a `HashMap` probe needs a borrowed key and
-    /// `Name`'s own case-insensitive `Hash` cannot be reached through `Borrow`
-    /// without the `unsafe` cast `str` uses. `Box<[u8]>` borrows as `[u8]`, so
-    /// a lookup costs a fold only when the name arrived in mixed case.
+    /// Positions in `records`, by the folded wire form of the owner name; an
+    /// empty non-terminal (RFC 4592 §2.2.2) is a key with no positions.
     index: NameIndex,
     /// The position lists of the names that own more than one record. See
     /// [`Slot`]; a name that owns one keeps its position in the table.
@@ -566,21 +473,10 @@ pub struct Zone {
     /// Removals since the index was last built, which is when what they left
     /// behind is worth rebuilding it for.
     ///
-    /// Everything under `index` is append-only. A name removed and added again
-    /// — which is what a *changed* record is, since a difference sequence
-    /// spells one as a deletion and an addition (RFC 1995 §2) — appends a
-    /// second copy of its octets to the arena, and a name that falls back to
-    /// one record leaves its position list behind. Measured: 4 000 changes to
-    /// a 1 000-name zone took the arena from 24 031 octets to 120 031 and the
-    /// spill list from 1 entry to 101, with the entry count, the record count
-    /// and every answer unchanged. Unbounded in a process that refreshes a
-    /// feed for a year without restarting (`TODO.md` #71a).
-    ///
-    /// One counter and not one per vector, because [`Zone::reindex`] rebuilds
-    /// both and a removal can only ever add to either — and because it is the
-    /// *rebuild* that has to be paid for. Against `records`, which is what a
-    /// rebuild costs: against the entry count instead, a zone of one name with
-    /// a million records would rebuild all of them on every removal.
+    /// The index is append-only, so a changed record (RFC 1995 §2: a deletion
+    /// and an addition) leaves octets behind, unbounded over a year of deltas
+    /// (`TODO.md` #71a). One counter, against `records`, as both are rebuilt
+    /// together and a rebuild costs the records.
     removed_since_rebuild: u32,
     /// The NSEC chain, keyed by canonical sort order, and the NSEC3 chain,
     /// keyed by hash — both empty for an unsigned zone.
@@ -596,19 +492,9 @@ pub struct Zone {
 /// Which of the per-query ancestor walks a zone never needs, because it holds
 /// nothing that could answer one.
 ///
-/// Each is false for the ordinary zone and saves a hash lookup per label of a
-/// name the client chose — and, for two of them, the fold that builds the key.
-///
-/// One value rather than three `bool` fields, because two places maintain them:
-/// [`Zone::add_record`] as records arrive and [`Zone::reindex`] when the origin
-/// moves. Adding `dnames` as a fourth field went to `reindex` alone, so a zone
-/// built a record at a time held a DNAME that [`Zone::dname_above`] could not
-/// find — caught by its own test, and the reason this is one value
-/// (`CLAUDE.md` §7).
-///
-/// Stale in the false direction each one serves a wrong answer: no wildcard
-/// synthesis, no referral — which answers authoritatively for a child's names,
-/// the defect `CLAUDE.md` §8 opens with — and no redirection.
+/// One value, as [`Zone::add_record`] and [`Zone::reindex`] both maintain it
+/// (`CLAUDE.md` §7). Stale in the false direction each is a wrong answer: no
+/// wildcard, no referral, no redirection.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Shortcuts {
     /// Any record owned by a wildcard name. 23% of a miss in a 10k-record zone
@@ -767,14 +653,9 @@ impl Zone {
 
     /// Move the zone's apex, as a top-level `$ORIGIN` does.
     ///
-    /// No record moves: a [`Name`] is absolute, so an owner name means the same
-    /// thing before and after. What the reindex rebuilds is the bookkeeping that
-    /// is *about* the apex — an NS RRset at the old apex becomes a zone cut
-    /// under the new one.
-    ///
-    /// **Costs a pass over every record already loaded**, so a loader that moves
-    /// the apex while filling a zone moves it once, at one end or the other, and
-    /// not per `$ORIGIN` line (`TODO.md` #62c).
+    /// No record moves, as names are absolute; the reindex rebuilds what is
+    /// about the apex, such as cuts. A pass over every record, so a loader
+    /// moves it once (`TODO.md` #62c).
     pub fn set_origin(&mut self, origin: Name) {
         self.origin = origin;
         self.reindex();
@@ -782,13 +663,8 @@ impl Zone {
 
     /// Room for `records` more records, and for the index entries they bring.
     ///
-    /// A loader that knows how many records are coming should say so: growing
-    /// the index from empty rehashes every key already in it at each doubling,
-    /// which was 320 ms of a million-rule RPZ load. Twice `records` because an
-    /// owner name below the apex also enters its ancestors
-    /// ([`Zone::note_non_terminals`]) — right for a feed of `<name>.<origin>`
-    /// rules, and one doubling of the table too many for a zone whose names are
-    /// all children of the apex.
+    /// Saves rehashing at each doubling. Twice `records`, as a name below the
+    /// apex also enters its ancestors ([`Zone::note_non_terminals`]).
     pub(crate) fn reserve(&mut self, records: usize) {
         self.records.reserve(records);
         // A name is ~25 octets and an RPZ rule's CNAME RDATA one; both arenas
@@ -802,17 +678,9 @@ impl Zone {
 
     /// Room for a rebuild of `base`, plus `extra` records it will gain.
     ///
-    /// [`Zone::reserve`] for a caller that holds the zone it is rebuilding, and
-    /// so knows the two counts instead of estimating one from the other. The
-    /// index gets `base`'s own entry count, which is right for every zone
-    /// shape: `reserve`'s `2 * records` is the ratio a feed of
-    /// `<name>.<origin>` rules has, and twice the table a zone whose names are
-    /// all apex children needs. On such a feed, where the two agree on size,
-    /// the exact form still measured 386 ms against 401 at a million records.
-    ///
-    /// One caller, `update`'s rebuild: `ixfr::Patch::apply` copies the base
-    /// instead of rebuilding it (`TODO.md` #71a), and `xfr::AxfrAccumulator`
-    /// has no base to be like.
+    /// [`Zone::reserve`] for a caller holding the zone it rebuilds: the index
+    /// gets `base`'s own entry count, right for every shape. One caller,
+    /// `update`'s rebuild.
     pub(crate) fn reserve_like(&mut self, base: &Zone, extra: usize) {
         self.records.reserve(base.records.len() + extra);
         self.names.reserve(base.names.len());
@@ -861,9 +729,8 @@ impl Zone {
     /// Take in a record whose RDATA is already in the arena: the name, the
     /// index and the chains, which all three doors share.
     fn take_in(&mut self, name: NameRef<'_>, ttl: Ttl, class: Class, rdata: RdataSpan) {
-        // Folded onto the stack, not into an allocation: `into_owned` here was
-        // one heap allocation and one free per record for a copy nothing keeps
-        // — `intern` copies the octets into the index's own arena.
+        // Folded onto the stack: `intern` copies the octets into the index's
+        // arena, so a heap copy would be thrown away.
         let mut fold = [0u8; rdns_core::dname::MAX_NAME_LEN];
         let key = name.folded_into(&mut fold);
         let key = key.as_wire();
@@ -874,9 +741,8 @@ impl Zone {
         let at_apex = key == &*origin_key;
         self.shortcuts.note(key, rdata.rtype(), at_apex);
         let at = self.index.intern(key);
-        // Ancestors only when the name is new to the index: one name notes them
-        // and every later record at it would find them present. The probe is
-        // the insertion's answer rather than a second lookup.
+        // Ancestors only for a name new to the index, as later records find
+        // them; the insertion's answer says which.
         if Zone::file(&mut self.index, &mut self.spills, key, at, position) {
             Zone::note_non_terminals(&mut self.index, key, at, &origin_key);
         }
@@ -913,25 +779,10 @@ impl Zone {
 
     /// Take the record at `position` out of the zone and give it back.
     ///
-    /// **O(the name's labels), not O(the zone)**, which is what lets a delta be
-    /// applied to a copy rather than rebuilt from one (`TODO.md` #71a). The
-    /// index holds positions into `records`, so a removal that shifted them
-    /// would invalidate every later one; `swap_remove` shifts exactly one — the
-    /// record that was last — and the index reaches that one entry by that
-    /// record's own owner name.
-    ///
-    /// **What it costs is the record order.** `records()` is not load order
-    /// once anything has been removed. Nothing reads it as one: the serializer
-    /// writes the apex SOA itself and then the rest ([`crate::zone_writer`]),
-    /// and an AXFR brackets its own SOA (RFC 5936 §2.2, [`crate::transfer`]).
-    /// The alternative that keeps order is a tombstone per removed record, and
-    /// it was not built: it buys an order nothing reads, and costs `records()`
-    /// its slice — which is the blast radius `TODO.md` #71e counted at 98
-    /// compiler errors.
-    ///
-    /// [`Zone::shortcuts`] is not recomputed. Each one stale in the *true*
-    /// direction costs a walk that finds nothing; stale in the false direction
-    /// would serve a wrong answer, and removal cannot move one that way.
+    /// O(the name's labels), so a delta applies to a copy (`TODO.md` #71a):
+    /// `swap_remove` moves only the last record, reached by its owner name. The
+    /// record order is lost, which nothing reads. [`Zone::shortcuts`] is not
+    /// recomputed: removal can only make one stale in the harmless direction.
     pub(crate) fn remove_record(&mut self, position: usize) -> ZoneRecord {
         let record = self.record(position).to_owned();
         let key = self.record(position).name.folded().into_owned();
@@ -969,12 +820,8 @@ impl Zone {
         if !records_left {
             self.prune(&key);
         }
-        // Nothing under this type gives an octet back on its own — not the
-        // two record arenas, not the index's, not the spill lists — so a
-        // long-lived process applying deltas grows whatever its zone does. A
-        // rebuild reclaims all of them, and it re-shares the index arena's
-        // suffixes an empty non-terminal borrows, which a compaction written
-        // for the purpose would not. See `removed_since_rebuild`.
+        // Nothing here gives octets back on its own; a rebuild reclaims all of
+        // them (see `removed_since_rebuild`).
         self.removed_since_rebuild = self.removed_since_rebuild.saturating_add(1);
         if self.removed_since_rebuild as usize * 2 >= self.records.len() {
             self.rebuild();
@@ -985,21 +832,11 @@ impl Zone {
     /// Drop `key` from the index if nothing needs it, and its ancestors after
     /// it.
     ///
-    /// A name is in the index because it owns records or because something
-    /// below it does (RFC 4592 §2.2.2). The first is gone by the time this is
-    /// called; the second is [`Interned::children`], and a name that loses its
-    /// last child may be the last child of its own parent, so the walk carries
-    /// on up.
-    ///
-    /// Leaving the name behind instead would answer NODATA where the zone has
-    /// nothing at all, which is a different answer with a different proof
-    /// (`CLAUDE.md` §8) — and leaving an ancestor behind after a subtree is
-    /// deleted leaves an empty non-terminal over nothing.
+    /// A name stays while it owns records or has [`Interned::children`]. A
+    /// stale name answers NODATA where the zone has nothing (`CLAUDE.md` §8).
     fn prune(&mut self, key: &[u8]) {
-        // Through the field, so the borrow is of `self.origin` alone and
-        // `self.index` can be taken mutably beside it — `add_record` does the
-        // same and for the same reason. `origin_key()` would borrow all of
-        // `self`, and owning a copy is an allocation per removal.
+        // Through the field, so `self.index` can be borrowed mutably beside it;
+        // `origin_key()` would borrow all of `self`.
         let origin_key = self.origin.as_ref().folded();
         let mut name = key;
         loop {
@@ -1025,9 +862,8 @@ impl Zone {
     /// does *not* exist (RFC 4035 §3.1.3). [`Zone::name_exists`] is the other
     /// question.
     pub fn holds_name(&self, name: NameRef<'_>) -> bool {
-        // Records, not merely a node: an empty non-terminal is in `index` with
-        // no positions, and it is exactly the name a wildcard answer has to
-        // prove does not exist.
+        // Records, not merely a node: an empty non-terminal is the name a
+        // wildcard answer must prove absent.
         let mut buf = Vec::new();
         self.index
             .get(name.folded_in(&mut buf).as_wire())
@@ -1085,9 +921,8 @@ impl Zone {
         match rtype {
             crate::record_types::NSEC => Some(ChainKey::Nsec(canonical_sort_key(name))),
             crate::record_types::NSEC3 => {
-                // The hash is the first label, and a label is octets — so it is
-                // taken as octets rather than by splitting text on a `.` that
-                // may be inside one.
+                // The hash is the first label, taken as octets, not by
+                // splitting text on a `.` that may be inside one.
                 let label = name.labels().next()?;
                 let decoded = base32hex_decode(std::str::from_utf8(label).ok()?).ok()?;
                 Some(ChainKey::Nsec3(Nsec3Hash::from_wire(&decoded)?))
@@ -1238,9 +1073,8 @@ impl Zone {
             if !self.node_exists(encloser) {
                 continue;
             }
-            // The closest encloser. A wildcard below a zone cut is the child's
-            // data, not ours (RFC 4592 §2.2.1), so a delegation between here
-            // and the apex means a referral rather than synthesis.
+            // A wildcard below a cut is the child's (RFC 4592 §2.2.1): a
+            // delegation between here and the apex means a referral.
             if !self.shortcuts.wildcards {
                 return NameKind::NotFound;
             }
@@ -1305,22 +1139,10 @@ impl Zone {
     /// The DNAME that redirects `name`: the shallowest **strict** ancestor
     /// owning one (RFC 6672 §2.2).
     ///
-    /// Strict, because "a DNAME RR redirects DNS names subordinate to its owner
-    /// name; the owner name of a DNAME is not redirected itself" (§2.3). Table
-    /// 1's second row is the case: QNAME `example.com.` against owner
-    /// `example.com.` is `<no match>` unless QTYPE is DNAME, and then the DNAME
-    /// is an ordinary record at the name rather than a redirection.
-    ///
-    /// Shallowest rather than deepest, which is the order RFC 1034 §4.3.2's
-    /// "start matching down, label by label" meets them in. It can only differ
-    /// in a zone `checks::check_dname_rules` refuses, since a second DNAME below
-    /// the first is a record at a subdomain of a DNAME owner (§2.4) — but a zone
-    /// that arrived by transfer never met that check, and occluding from the
-    /// top is the answer that does not depend on how deep the violation goes.
-    ///
-    /// Returns the record, not the name: the caller needs its owner to echo,
-    /// its target to substitute and its TTL for the synthesized CNAME (§3.1),
-    /// and looking any of them up again is the repeat `TODO.md` #25a removed.
+    /// Strict: "the owner name of a DNAME is not redirected itself" (§2.3).
+    /// Shallowest, as RFC 1034 §4.3.2 meets them; it differs only in a zone the
+    /// loader refuses but a transfer can bring. The record, for the caller's
+    /// owner, target and TTL (§3.1).
     pub fn dname_above(&self, name: NameRef<'_>) -> Option<ZoneRecordRef<'_>> {
         // Before the fold, as `delegation_for` does it: with no DNAME in the
         // zone the folded copy is made for nothing.
@@ -1373,17 +1195,9 @@ impl Zone {
             .find(|r| r.rdata.rtype() == rtype)
     }
 
-    /// File `position` under `key`, spilling at the *second* record. Says
-    /// whether `key` was new to the index, which is what tells the caller its
-    /// ancestors have yet to be noted.
-    ///
-    /// An owner name with one record keeps its position in the table; the names
-    /// that hold an RRset of several, or several types, get a list. Which way a
-    /// zone leans decides the cost, and a policy feed leans entirely one way.
-    ///
-    /// The two fields rather than `&mut self`, as [`Zone::note_non_terminals`]
-    /// takes them and for the same reason: the caller holds the folded origin,
-    /// which borrows `self.origin`.
+    /// File `position` under `key`, spilling at the *second* record; returns
+    /// whether `key` was new, so the caller notes its ancestors. Two fields,
+    /// not `&mut self`: the caller's folded origin borrows `self.origin`.
     fn file(
         index: &mut NameIndex,
         spills: &mut Vec<Vec<usize>>,
@@ -1439,9 +1253,8 @@ impl Zone {
                     1 => Slot::One(positions[0]),
                     _ => return true,
                 };
-                // Nothing names this list now. The buffer goes back at once;
-                // the header waits for the rebuild, which is what renumbers
-                // every `Slot::Spilled`.
+                // Nothing names this list now: the buffer goes back at once;
+                // the header waits for the rebuild.
                 positions.clear();
                 positions.shrink_to_fit();
                 *self
@@ -1506,30 +1319,14 @@ impl Zone {
     /// Record every ancestor of `key`, up to the apex, as a name that exists,
     /// and credit each one with the child below it.
     ///
-    /// Called only for a `key` the index did not already hold, since an
-    /// ancestor is noted by the first name under it and by nobody else.
-    ///
-    /// Stops at the first ancestor already known, and credits that one for the
-    /// new name below it: ancestors are always noted all the way to the apex,
-    /// so one present means the rest are, and one present means *its* own
-    /// parent has already counted it. Keeps index construction linear in the
-    /// zone rather than in names × labels.
-    ///
-    /// "Known" includes an ancestor that has records of its own, which is the
-    /// same guarantee for the same reason — a record's own insertion noted
-    /// *its* ancestors.
-    ///
-    /// A free function taking the two fields it needs rather than `&mut self`,
-    /// so the walk can slice `key` in place: owning each ancestor to satisfy one
-    /// `&mut self` cost four allocations per record and 0.65 s of a million-rule
-    /// load.
+    /// Only for a new `key`. Stops at the first ancestor known, which credits
+    /// the new child: all above it are known. Linear in the zone. Two fields,
+    /// not `&mut self`, so `key` is sliced in place, not owned per ancestor.
     fn note_non_terminals(index: &mut NameIndex, key: &[u8], at: (usize, u32), origin: &[u8]) {
         let (off, len) = at;
         let mut name = key;
         while let Some(parent) = Zone::parent_in_zone(name, origin) {
-            // A suffix of a name already in the arena, so it stores no bytes of
-            // its own — which is half the arena for a feed whose every rule
-            // brings one ancestor with it.
+            // A suffix already in the arena, storing no bytes of its own.
             let skipped = len as usize - parent.len();
             let (node, fresh) = index.node_mut(parent, Some((off + skipped, len - skipped as u32)));
             node.children += 1;
@@ -1598,12 +1395,8 @@ impl Zone {
             }
         }
 
-        // The chains are not rebuilt. [`Zone::chain_key`] reads the record's own
-        // owner name and nothing else, and a `Name` is absolute, so every key
-        // and every position is the one already filed: the rebuild here was a
-        // base32 decode per NSEC3 and an n-element `Vec` to arrive at the map
-        // it started from. Its comment said the chains move with the origin
-        // (`CLAUDE.md` §4 — a claim to verify).
+        // The chains are not rebuilt: [`Zone::chain_key`] reads only the
+        // absolute owner name, so every key stays as filed.
     }
 
     /// Whether `record_name` answers `query_name`, wildcards included. The
@@ -1613,9 +1406,8 @@ impl Zone {
         if record_name == query_name {
             return true;
         }
-        // Which wildcard reaches a name is a question about the whole zone —
-        // the closest encloser decides it — so ask `name_kind` rather than
-        // re-deriving it here.
+        // The closest encloser decides which wildcard applies, so `name_kind`
+        // answers.
         let mut buf = Vec::new();
         matches!(
             self.name_kind_of_key(query_name.folded_in(&mut buf)),
