@@ -22,6 +22,17 @@ The zone as `rdnsd` currently answers from it. May carry signatures and a
 served serial the zone file does not.
 _Avoid_: previous, current zone, snapshot
 
+**Delta log**:
+The recent version steps of each served zone, held in memory, from which an
+incremental transfer is answered.
+_Avoid_: journal (that is the copy on disk), history
+
+**Journal**:
+The delta log as last written to disk, read only at startup so incremental
+transfers continue across a restart. May be a step behind the delta log; one
+that does not reach the loaded serial is discarded.
+_Avoid_: delta log, IXFR log
+
 **Source**:
 The address block a per-client limit counts as one client: an IPv4 address,
 or an IPv6 /56, of a peer.

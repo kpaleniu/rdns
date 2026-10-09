@@ -51,7 +51,8 @@ and #199 2026-10-09:
 
 - #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
   closed, 185c and 185d wontfix.
-- #198 the journal is fsynced under the zone map's write guard (needs triage).
+- #198 the journal is fsynced under the zone map's write guard (bug, ready
+  for agent).
 - #200 `CLAUDE.md` is written in the register it forbids in comments; split
   into rules and `docs/LESSONS.md` (enhancement, ready for human).
 
