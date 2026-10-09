@@ -40,14 +40,9 @@ pub enum ParsedRecord {
     /// A service binding: how to reach a service rather than only where its
     /// name points (RFC 9460 §2).
     ///
-    /// One arm for two type codes. The HTTPS RR "shares the same encoding,
-    /// format, and high-level semantics" (§6) and differs only in how its owner
-    /// name is built (§9.1), which is not this layer's business — so `rtype`
-    /// says which of the two it is. It cannot disagree with the enclosing
-    /// [`RecordData`]: `ParsedRecord::decode` is handed that rtype and
-    /// [`RecordData::from_parsed`] takes this one back. Not a link: `decode` is
-    /// `pub(crate)`, and rustdoc refuses one from a public page to a private
-    /// item.
+    /// One arm for SVCB and HTTPS, which share the encoding (§6); `rtype` says
+    /// which, and `ParsedRecord::decode` and [`RecordData::from_parsed`] keep
+    /// it equal to the enclosing [`RecordData`]'s.
     SVCB {
         rtype: Rtype,
         /// 0 is AliasMode, anything else ServiceMode; lower is preferred
@@ -60,13 +55,9 @@ pub enum ParsedRecord {
         /// The SvcParams, as `(key, wire value)` in strictly increasing key
         /// order (§2.2).
         ///
-        /// Values stay as wire octets rather than becoming a typed enum per
-        /// key. Three reasons: an unregistered key has to round-trip, which is
-        /// the same argument RFC 3597 makes for whole records; the registered
-        /// values are already length-prefixed lists or fixed-width fields, so
-        /// there is nothing a decode would simplify here; and the presentation
-        /// layer is the only place that has to know a key's shape, so knowing
-        /// it twice is the duplication `CLAUDE.md` §7 is about.
+        /// Wire octets, not a typed enum: an unregistered key must round-trip,
+        /// and only the presentation layer needs a key's shape (`CLAUDE.md`
+        /// §7).
         params: Vec<(u16, Vec<u8>)>,
     },
     MX {
@@ -211,14 +202,8 @@ impl ParsedRecord {
         rdata: &'a [u8],
         unpacker: &DNameUnpacker<'a>,
     ) -> Result<Self, WireError> {
-        // RDLENGTH=0 is legal and means the record is a specifier, not data:
-        // RFC 2136 §2.4.1/§2.4.2 and §2.5.2/§2.5.3 spell the RRset prerequisites
-        // and deletions that way. Without this the arms below reject it and a
-        // legal UPDATE is FORMERR before `update.rs` sees it.
-        //
-        // The cost is that an A with RDLENGTH 0 in an answer is relayed rather
-        // than refused; RFC 3597 §5 already requires carrying RDATA we cannot
-        // interpret.
+        // RDLENGTH=0 is a specifier, not data, in UPDATE (RFC 2136 §2.4, §2.5);
+        // an empty A in an answer is relayed, as RFC 3597 §5 allows.
         if rdata.is_empty() {
             return Ok(ParsedRecord::Unknown(record_type));
         }
@@ -259,10 +244,8 @@ impl ParsedRecord {
                 let (ptrdname, _) = Name::from_wire_in(rdata, unpacker)?;
                 Ok(ParsedRecord::PTR(ptrdname))
             }
-            // Read through the unpacker like any other name even though
-            // RFC 6672 §2.5 forbids sending <target> compressed: refusing a
-            // pointer here would make us unable to read what a
-            // non-conforming server sent, and the rule is on the writer.
+            // Through the unpacker: RFC 6672 §2.5's ban on a compressed target
+            // binds the writer, not us.
             record_types::DNAME => {
                 let (target, _) = Name::from_wire_in(rdata, unpacker)?;
                 Ok(ParsedRecord::DNAME(target))
@@ -329,9 +312,8 @@ impl ParsedRecord {
                 })
             }
             record_types::RRSIG => {
-                // RRSIG (RFC 4034 §3.1). Expiration precedes inception on the
-                // wire; the other order makes an expired signature look current
-                // and round-trips cleanly against ourselves.
+                // RRSIG (RFC 4034 §3.1): expiration precedes inception on the
+                // wire.
                 let (type_covered, rest) = read_be!(u16, rdata);
                 if rest.len() < 2 {
                     return Err(WireError::Truncated {
@@ -447,15 +429,11 @@ impl ParsedRecord {
         Ok((rtype, out))
     }
 
-    /// The same, appended to `out`, which is how a zone writes RDATA straight
-    /// into its arena rather than into a `Box` it then copies and frees
-    /// (`TODO.md` #72b). Whatever `out` already holds is left alone; this
-    /// record is what gets appended.
+    /// The same, appended to `out`, so a zone writes RDATA straight into its
+    /// arena.
     ///
-    /// An error leaves what it had appended behind — TXT's length ceiling and
-    /// SVCB's parameters are the two arms that can fail — so a caller writing
-    /// into a buffer it shares truncates back to where it started.
-    /// [`crate::RdataArena::push_parsed`] does.
+    /// An error leaves what it appended (TXT and SVCB can fail), so a sharing
+    /// caller truncates back, as [`crate::RdataArena::push_parsed`] does.
     pub(crate) fn encode_into(&self, out: &mut Vec<u8>) -> Result<Rtype, WireError> {
         let rtype = match self {
             ParsedRecord::A(addr) => {
@@ -649,20 +627,11 @@ pub struct ResourceRecord {
     pub rdata: RecordData,
 }
 
-/// The fields of one resource record, read straight off the wire.
+/// The fields of one resource record, read straight off the wire, once.
 ///
-/// Read once and branched on afterwards: the additional section has to know a
-/// record's TYPE before it knows whether the record is a resource record at all
-/// — an OPT is not — and reading the owner name twice to find out means walking
-/// its labels again.
-///
-/// `ttl_bits` is raw. An OPT record's TTL field is not a TTL — it packs the
-/// extended RCODE, the version and the DO bit — so RFC 2181 §8's clamp belongs
-/// to whichever branch knows it is holding a real record.
-///
-/// `name` is the name as it sits on the wire, not its text: the OPT branch
-/// throws the owner away (RFC 6891 §6.1.2 makes it the root), and decoding it
-/// was a `Vec` and a `String` on every EDNS query.
+/// `ttl_bits` is raw: an OPT's TTL is flags, so RFC 2181 §8's clamp is the real
+/// record's branch. `name` stays wire form, as the OPT branch discards it (RFC
+/// 6891 §6.1.2).
 struct RecordParts<'a> {
     name: DName<'a>,
     rtype: Rtype,
@@ -677,9 +646,8 @@ fn read_record_parts(data: &[u8]) -> Result<(RecordParts<'_>, &[u8]), WireError>
     let (class, rest) = read_be!(u16, rest);
     let (ttl_bits, rest) = read_be!(i32, rest);
     let (rdatalen, rest) = read_be!(u16, rest);
-    // RDLENGTH is attacker-chosen: check before slicing, or a record declaring
-    // more RDATA than the message carries panics the parser. Reachable
-    // pre-authentication on both transports.
+    // RDLENGTH is attacker-chosen: check before slicing, reachable
+    // pre-authentication.
     let rdatalen = rdatalen as usize;
     if rest.len() < rdatalen {
         return Err(WireError::Truncated {
@@ -758,9 +726,8 @@ impl Additional {
                 rest,
             ));
         }
-        // CLASS is the requestor's UDP payload size and TTL is a flags word
-        // (RFC 6891 §6.1.3). Neither goes through `Class` or `Ttl`, because
-        // neither is one.
+        // CLASS is the payload size and TTL a flags word (RFC 6891 §6.1.3), so
+        // neither is a `Class` or `Ttl`.
         let flags = parts.ttl_bits as u32;
         Ok((
             Additional::Opt(Edns::from_opt(parts.class, flags, parts.rdata), flags),

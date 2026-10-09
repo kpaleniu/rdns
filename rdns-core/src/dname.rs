@@ -105,9 +105,7 @@ impl<'a> TryFromBytes<'a> for Label<'a> {
                         return Err(WireError::Truncated {
                             what: "a label",
                             need: len,
-                            // Cannot underflow: `data.first()` above returned
-                            // early on an empty slice, so the length byte being
-                            // subtracted here is present.
+                            // Cannot underflow: an empty slice returned above.
                             have: data.len() - 1,
                         });
                     }
@@ -207,10 +205,8 @@ impl UnpackedDName<'_> {
     /// §2.3.4's limit, and `unpack_internal` strips the trailing `Root`, which
     /// is why the terminator is added back here.
     fn to_wire(&self) -> Result<Vec<u8>, WireError> {
-        // Exact, not `MAX_NAME_LEN`: `Name` keeps a boxed slice, and shrinking
-        // an over-sized `Vec` reallocates — one copy per compressed name in
-        // every message parsed (`rdns/tests/allocations.rs` read 18 for 15).
-        // `new` has already held this sum to §2.3.4's limit.
+        // Exact: `Name` keeps a boxed slice, and shrinking an over-sized `Vec`
+        // copies. `new` held this to §2.3.4's limit.
         let len = self.labels.iter().map(Label::len).sum::<usize>() + 1;
         let mut out = Vec::with_capacity(len);
         for label in &self.labels {
@@ -235,12 +231,8 @@ impl UnpackedDName<'_> {
     }
 }
 
-// RFC 1035 §2.3.1's LDH "preferred name syntax" is advice to whoever chooses a
-// hostname, not a rule about what the protocol carries: RFC 2181 §11 says "any
-// binary string whatever can be used as the label of any resource record", and
-// enforcing LDH would refuse `_dmarc`, every `_tcp` SRV owner and `*` itself.
-// Only §2.3.4's lengths are enforced — `MAX_LABEL_LEN` here, `MAX_NAME_LEN` in
-// `UnpackedDName::new`.
+// LDH syntax is not enforced (`docs/adr/0001`); only §2.3.4's lengths are:
+// `MAX_LABEL_LEN` here, `MAX_NAME_LEN` in `UnpackedDName::new`.
 impl<'a> TryFromBytes<'a> for DName<'a> {
     type Output = (DName<'a>, &'a [u8]);
     type Error = WireError;
@@ -289,9 +281,8 @@ impl<'a> DNameUnpacker<'a> {
         depth: usize,
         prev_target: usize,
     ) -> Result<UnpackedDName<'a>, WireError> {
-        // Bounds the work, not the correctness: strictly decreasing targets
-        // already terminate, but a 14-bit offset leaves ~16k hops per name, each
-        // a recursive call and so a stack depth the sender would choose.
+        // Bounds the work: decreasing targets terminate, but 14 bits allow ~16k
+        // hops, each a recursive call.
         const MAX_DEPTH: usize = 50;
 
         if depth > MAX_DEPTH {
@@ -302,13 +293,8 @@ impl<'a> DNameUnpacker<'a> {
             });
         }
 
-        // A name with no pointer is already unpacked; only a pointer target
-        // reaches here that way, since [`DNameUnpacker::decode`] assembles the
-        // uncompressed case straight into its `String`.
-        //
-        // The trailing `Root` comes off because an `UnpackedDName`'s labels are
-        // the name's content: the `extend` below would otherwise splice one into
-        // the middle of the name that pointed here.
+        // Only a pointer target arrives uncompressed; the trailing `Root` comes
+        // off so the `extend` below does not splice it mid-name.
         if !name.compressed {
             let mut labels = name.labels().collect::<Result<Vec<_>, _>>()?;
             if matches!(labels.last(), Some(Label::Root)) {
@@ -334,19 +320,8 @@ impl<'a> DNameUnpacker<'a> {
                         ));
                     }
 
-                    // A pointer must point backwards (RFC 1035 §4.1.4: "to a
-                    // prior occurance of the same name"), and that comparison is
-                    // the whole of cycle prevention — a strictly decreasing
-                    // sequence of `usize` cannot repeat, so a cycle is
-                    // unreachable rather than detected. Cheaper than the visited
-                    // set it replaces, which allocated per compressed name on
-                    // the pre-authentication parse path.
-                    //
-                    // The first hop is unconstrained: a name is parsed from a
-                    // suffix slice that does not know its own offset, and
-                    // recovering it would mean pointer arithmetic valid only if
-                    // every caller passes a slice of the message — an invariant
-                    // no type states. One free step does not cost termination.
+                    // Strictly backwards after the first hop, which ends any
+                    // chain (`docs/adr/0002`).
                     if offset >= prev_target {
                         return Err(WireError::malformed(
                             "a compression pointer",
@@ -404,15 +379,11 @@ pub(crate) struct UnpackedDName<'a> {
 
 impl<'a> UnpackedDName<'a> {
     /// The only way to build one, so a name over RFC 1035 §2.3.4's limit is
-    /// unrepresentable rather than merely unwelcome.
+    /// unrepresentable.
     ///
-    /// Both label-assembling paths meet here, and every intermediate hop of a
-    /// pointer chain is built through it too, so a chain is cut off as it grows.
-    ///
-    /// Measured on the *encoded* length, which is what §2.3.4 limits:
-    /// `Label::len` includes each label's length octet, and the root's
-    /// terminating zero is added back here since `unpack_internal` has stripped
-    /// the trailing `Root`.
+    /// Every hop of a pointer chain passes here, so a chain is cut off as it
+    /// grows. Measured encoded: `Label::len` counts length octets, and the
+    /// root's zero is added back.
     fn new(labels: Vec<Label<'a>>) -> Result<UnpackedDName<'a>, WireError> {
         check_name_len(labels.iter().map(Label::len).sum::<usize>() + 1)?;
         Ok(UnpackedDName { labels })
@@ -462,14 +433,9 @@ pub(crate) fn name_wire_from_bytes_in<'a>(
 
 /// Past the name at the start of `data`, returning what follows it.
 ///
-/// For stored RDATA, which [`crate::RecordData`] keeps uncompressed: a pointer
-/// here is a malformed record rather than something to follow, since there is no
-/// message to resolve it against. [`name_wire_from_bytes`] is the reading form; this
-/// exists for a caller that wants a field *after* a name and would otherwise
-/// allocate the name to get past it.
-///
-/// Not `rdns::tsig`'s `skip_name`, which walks a whole message and so stops
-/// at a pointer instead of refusing one.
+/// For stored RDATA, uncompressed: a pointer is malformed, with no message to
+/// resolve it against. Not `rdns::tsig`'s `skip_name`, which stops at a
+/// pointer.
 pub(crate) fn skip_uncompressed_name(data: &[u8]) -> Option<&[u8]> {
     let mut pos = 0;
     loop {

@@ -37,15 +37,9 @@ pub fn write_atomically_str(path: &Path, contents: &str) -> io::Result<()> {
 
 /// Read a secret out of a file nobody but the owner may read.
 ///
-/// The mode check first, then the read: a secret anyone can read is refused
-/// rather than used, which is the only thing that makes a file better than
-/// `argv` (`CLAUDE.md` §15). Empty is refused too — a file somebody meant to
-/// fill and did not is a key that would fail every handshake with a message
-/// about base64.
-///
-/// Here because it is the third caller: `rdnsd`'s config, `rdnsc`'s `--tsig-file`
-/// and `rdnsr`'s policy keys all want exactly this, and a second copy of a
-/// security check is where the next bug goes (§7).
+/// A readable secret is refused, as only privacy makes a file better than
+/// `argv` (`CLAUDE.md` §15); so is an empty one. Shared by `rdnsd`, `rdnsc` and
+/// `rdnsr` (§7).
 pub fn read_secret(path: &Path, what: &str) -> io::Result<String> {
     ensure_private(path, what)?;
     let secret = fs::read_to_string(path)?.trim().to_string();
@@ -58,20 +52,13 @@ pub fn read_secret(path: &Path, what: &str) -> io::Result<String> {
     Ok(secret)
 }
 
-/// Create `path`, which must not exist, holding something nobody but the
-/// owner may read: a private key.
+/// Create `path`, which must not exist, holding something nobody but the owner
+/// may read: a private key.
 ///
-/// Never replaces. The one caller is `SigningKey::write_to_dir`, whose file
-/// name is the key tag, so an existing file is a tag collision and replacing
-/// it destroys the other key's private half (`TODO.md` #125). Published by
-/// `hard_link`, which fails on an existing target on Unix and Windows alike and
-/// is as atomic as the rename; std's `rename` has no no-replace form. The cost
-/// is a filesystem without hard links (FAT), where this always fails.
-///
-/// The restriction goes on the temporary, before the link: setting the mode on
-/// the target afterwards leaves a window at whatever the umask allowed. A
-/// failure to restrict is a failure to write — reporting success would hand back
-/// a path the caller believes is private and is not.
+/// Never replaces: an existing file is a key-tag collision. Published by
+/// `hard_link`, which fails on an existing target and is atomic; without hard
+/// links (FAT) this always fails. Restricted before the link, and a failure to
+/// restrict fails the write.
 pub fn create_atomically_private(path: &Path, contents: &str) -> io::Result<()> {
     let temp = temp_path_for(path)?;
 

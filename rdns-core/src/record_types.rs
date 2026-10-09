@@ -95,14 +95,11 @@ pub fn record_type_name_to_code(kind: &str) -> Option<Rtype> {
     }
 }
 
-/// The QTYPE a presentation name asks for — the *question* space, which holds
-/// values no record can have: ANY (`*` is the same question, RFC 1035 §3.2.3),
-/// AXFR (RFC 5936) and IXFR (RFC 1995).
+/// The QTYPE a presentation name asks for, in the question space: ANY (`*` too,
+/// RFC 1035 §3.2.3), AXFR (RFC 5936) and IXFR (RFC 1995).
 ///
-/// Separate from [`record_type_name_to_code`] rather than folded into it,
-/// because that one answers with an `Rtype` and these three are not types any
-/// record is. MAILB and MAILA are absent for the opposite reason to obscurity —
-/// they are obsolete (RFC 1035 §3.2.3) — and `TYPE253` still reaches them.
+/// Not in [`record_type_name_to_code`], which answers an `Rtype`. MAILB and
+/// MAILA are obsolete; `TYPE253` still reaches them.
 pub fn qtype_name_to_code(name: &str) -> Option<Qtype> {
     match name {
         "ANY" | "*" => Some(Qtype::ANY),

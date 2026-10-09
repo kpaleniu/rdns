@@ -28,27 +28,17 @@ pub const EDNS_OPTION_EXTENDED_ERROR: u16 = 15;
 
 /// The longest EXTRA-TEXT this codebase will send.
 ///
-/// Not a protocol limit — the field is bounded by OPTION-LENGTH alone. It is
-/// here because [`ResponseWriter::finish`](crate::response::ResponseWriter::finish)
-/// writes the OPT of an over-long reply without re-checking the caller's
-/// ceiling, leaning on the 512-octet floor
-/// [`ResponseWriter::start`](crate::response::ResponseWriter::start) sizes the
-/// buffer to. The arithmetic that floor has to cover is 12 octets of header,
-/// 259 of the longest possible question, 11 of OPT and 6 of option header plus
-/// INFO-CODE, which leaves 224; 128 keeps the claim true with room to spare.
+/// Not a protocol limit:
+/// [`ResponseWriter::finish`](crate::response::ResponseWriter::finish) writes
+/// an over-long reply's OPT unchecked inside the 512-octet floor, where header,
+/// longest question, OPT and option header leave 224.
 pub const MAX_EXTRA_TEXT: usize = 128;
 
-/// An INFO-CODE: an index into IANA's "Extended DNS Error Codes" registry
-/// (RFC 8914 §2).
+/// An INFO-CODE: an index into IANA's "Extended DNS Error Codes" registry (RFC
+/// 8914 §2).
 ///
-/// A newtype over the whole 16-bit space rather than an enum. §5.2 gives
-/// 0-49151 to First Come First Served and 49152-65535 to Private Use, so a code
-/// we have no name for is ordinary and has to relay as itself; there is no
-/// value free to be a sentinel (`CLAUDE.md` §2).
-///
-/// Only the codes this tree emits are named. An option code that exists and
-/// that nothing reads or writes is the shape `TODO.md` #45e filed as a finding,
-/// so the registry is cited rather than transcribed.
+/// A newtype over all 16 bits: §5.2 assigns the whole space, so an unnamed code
+/// relays as itself (`CLAUDE.md` §2). Only codes this tree emits are named.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct InfoCode(u16);
@@ -126,16 +116,9 @@ impl std::fmt::Display for InfoCode {
 
 /// One Extended DNS Error: an INFO-CODE and the text beside it (RFC 8914 §2).
 ///
-/// EXTRA-TEXT is `&'static str` on purpose. A refusal is the one reply a
-/// stranger can ask for in a flood, so the text may not cost an allocation per
-/// query; and §2's "care should be taken to not leak private information" is
-/// easiest to hold when nothing the client sent, and nothing about this
-/// server's state, can reach it. The INFO-CODE carries the diagnosis; the text
-/// only says which of the sites sharing that code this was.
-///
-/// The fields are private because [`ExtendedError::new`] checks one — a `pub`
-/// field beside a checking constructor is a value nothing objects to until
-/// something reads it (`CLAUDE.md` §17).
+/// EXTRA-TEXT is `&'static str`: a refusal is what a flood asks for, so no
+/// allocation, and nothing the client sent can leak into it (§2). Fields are
+/// private behind [`ExtendedError::new`]'s check (`CLAUDE.md` §17).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtendedError {
     info_code: InfoCode,
@@ -207,17 +190,12 @@ impl ExtendedError {
         String::from_utf8_lossy(data.get(2..).unwrap_or(&[]))
     }
 
-    /// Every Extended DNS Error `edns` carries, in the order they appear.
+    /// Every Extended DNS Error `edns` carries, in order; §2 lets a sender
+    /// include more than one.
     ///
-    /// A list rather than a lookup: §2 says "Senders MAY include more than one
-    /// EDE option and receivers MUST be able to accept (but not necessarily
-    /// process or act on) multiple EDE options in a DNS message".
-    ///
-    /// `Err` is a malformed *option list*, which is FORMERR for the message as
-    /// a whole. An individual EDE too short to hold its INFO-CODE is skipped
-    /// instead — §3 is explicit that an EDE changes nothing about how the
-    /// RCODE beside it is processed, so discarding an unreadable annotation
-    /// discards no answer.
+    /// `Err` is a malformed option list, FORMERR for the message. An EDE too
+    /// short for its INFO-CODE is skipped: it changes nothing about the RCODE
+    /// (§3).
     pub fn all_in(edns: &Edns) -> Result<Vec<(InfoCode, String)>, WireError> {
         Ok(edns
             .options()?

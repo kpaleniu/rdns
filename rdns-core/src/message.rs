@@ -59,20 +59,17 @@ fn section_count(len: usize, what: &'static str) -> Result<u16, WireError> {
     })
 }
 
-/// A message with its RFC 1035 §4.2.2 two-octet length prefix, in one buffer so
-/// a writer emits both in a single call.
-///
-/// The length is checked rather than cast: a wrapped prefix is 0 at exactly
-/// 65,536, which every read loop here treats as a broken peer, and above that
-/// desynchronises the stream. `rdns::tsig` appends to the *finished* bytes
-/// and is the one path that can grow a message past the size it was serialized
-/// to.
 /// A random DNS transaction id. The one implementation: an id is not a security
 /// boundary here, but that is no reason to make it predictable.
 pub fn rand_id() -> u16 {
     rand::random()
 }
 
+/// A message with its RFC 1035 §4.2.2 two-octet length prefix, in one buffer so
+/// a writer emits both in a single call.
+///
+/// Checked, not cast: a wrapped prefix reads as 0 or desynchronises the
+/// stream, and `rdns::tsig` can grow a message past its serialized size.
 pub fn framed(bytes: &[u8]) -> Result<Vec<u8>, WireError> {
     let len: u16 = bytes.len().try_into().map_err(|_| WireError::TooLong {
         what: "a TCP message",
@@ -133,9 +130,8 @@ impl DnsMessage {
         let (auth_len, rest) = read_be!(u16, rest);
         let (add_len, mut rest) = read_be!(u16, rest);
 
-        // The opcode is bits 3..6 of the flags' high byte, so it is shifted
-        // down, not masked in place. Total, and it has to be: an opcode we have
-        // no name for is echoed back unchanged (RFC 1035 §4.1.1).
+        // Opcode is bits 3..6 of the high byte; total, so an unnamed opcode
+        // echoes unchanged (RFC 1035 §4.1.1).
         let opcode = OpCode::from_u8(hi >> 3);
 
         let mut queries: Vec<QuerySection> = Vec::new();
@@ -183,10 +179,8 @@ impl DnsMessage {
             rest = r;
         }
 
-        // RCODE is 12 bits (RFC 6891 §6.1.3): the low 4 in the header, the high
-        // 8 in the OPT record's flags word. The option list is *not* read here —
-        // a malformed one must not fail the parse, or the FORMERR that answers
-        // it could not be built (see [`Edns`]).
+        // RCODE is 12 bits (RFC 6891 §6.1.3): 4 in the header, 8 in the OPT
+        // flags. The option list is not read, so FORMERR stays answerable.
         let rcode = ResponseCode::from_u16((ext_rcode << 4) | (lo & 0x0f) as u16);
 
         Ok(Self {
@@ -208,23 +202,12 @@ impl DnsMessage {
         })
     }
 
-    /// Serialize the message into `output`, with domain-name compression
-    /// (RFC 1035 §4.1.4). Returns the number of bytes written; errors if the
-    /// message does not fit rather than writing a silently truncated one.
     /// An empty reply to `request`, carrying only what a reply must echo.
     ///
-    /// The id, the opcode and RD are the client's and are copied back
-    /// (RFC 1035 §4.1.1), and so is the question. CD is copied because
-    /// RFC 4035 §3.2.2 says so in one line — "The name server side MUST copy
-    /// the setting of the CD bit from a query to the corresponding response".
-    ///
-    /// AA, RA, AD, the RCODE and the OPT record are *policy*, where the callers
-    /// differ, so they are left neutral for the caller to set. This is
-    /// deliberately not a finished message; a function that returned one would
-    /// fit none of the callers.
-    ///
-    /// [`response::ResponseWriter::start`] is the same constructor for the path
-    /// that writes straight into the send buffer.
+    /// Id, opcode, RD and question copied (RFC 1035 §4.1.1), and CD
+    /// (RFC 4035 §3.2.2). AA, RA, AD, the RCODE and the OPT are policy, left
+    /// neutral for each caller. [`response::ResponseWriter::start`] is the
+    /// same constructor for the path that writes into the send buffer.
     pub fn reply_to(request: &DnsMessage) -> DnsMessage {
         DnsMessage {
             id: request.id,
@@ -245,6 +228,9 @@ impl DnsMessage {
         }
     }
 
+    /// Serialize the message into `output`, with domain-name compression
+    /// (RFC 1035 §4.1.4). Returns the number of bytes written; errors if the
+    /// message does not fit rather than writing a silently truncated one.
     pub fn to_bytes(&self, output: &mut [u8]) -> Result<usize, WireError> {
         self.to_bytes_with(output, &mut NameCompressor::new())
     }
@@ -262,9 +248,8 @@ impl DnsMessage {
     ) -> Result<usize, WireError> {
         compressor.clear();
 
-        // RCODE is 12 bits, split across the header (low 4) and the OPT record's
-        // TTL (high 8). A value past the ceiling is a caller bug, not something
-        // to paper over with a success code.
+        // RCODE spans header and OPT TTL; a value past the ceiling is a caller
+        // bug, not a success code.
         let rcode = response::wire_rcode(self.rcode, self.edns.is_some())?;
 
         // ARCOUNT counts the OPT record, which is a field here rather than a
@@ -421,17 +406,14 @@ impl DnsMessage {
         out: &mut Vec<u8>,
         compressor: &mut NameCompressor,
     ) -> Result<(), WireError> {
-        // Sized to what this message can need, not to the ceiling: the TCP and
-        // transfer paths pass `u16::MAX`, which would make a 43-byte reply a 64
-        // KiB allocation and a 64 KiB memset (`TODO.md` #25b).
+        // Sized to this message, not the ceiling: TCP passes `u16::MAX`, a 64
+        // KiB allocation and memset for 43 bytes.
         let scratch = self.wire_size_bound().min(max_len);
         out.clear();
         out.resize(scratch, 0);
         let mut wrote = self.to_bytes_with(out, compressor);
-        // The bound is an upper bound (see it), so this cannot fire — but a
-        // wrong bound would truncate a message that fits, silently and only on
-        // the shapes nobody tests. Growing to the limit and writing again makes
-        // it a hint rather than an invariant (§4).
+        // Cannot fire while the bound holds; if it were wrong, growing and
+        // rewriting beats truncating silently (§4).
         if scratch < max_len
             && matches!(
                 wrote,
@@ -457,9 +439,8 @@ impl DnsMessage {
             // Fits the buffer but not the limit — only reachable when a caller
             // passes a `max_len` above what it means to send, which none do.
             Ok(_) => {}
-            // Sizing the scratch to `max_len` turns "too long" from a comparison
-            // into this error, so it is caught rather than propagated; every
-            // other `WireError` is a real failure to encode.
+            // The buffer is the limit, so "too long" arrives as this error
+            // (`CLAUDE.md` §13); others are real failures.
             Err(WireError::Truncated {
                 what: "the output buffer",
                 ..

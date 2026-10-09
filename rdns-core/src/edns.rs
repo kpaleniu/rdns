@@ -23,29 +23,11 @@ pub const EDNS_VERSION: u8 = 0;
 /// The two UDP sizes a server chooses, and the one rule that relates them to
 /// the size the *client* chose.
 ///
-/// [`UdpSizes::advertised`] is what goes in every reply's OPT: what this host
-/// can reassemble on receive (RFC 6891 §6.2.4), which is why it also floors the
-/// request admission cap. [`UdpSizes::max_response`] is the largest datagram
-/// this host will send, which is a different question:
-/// [`DnsMessage::udp_payload_size`] alone is the client's number, floored at
-/// 512 and ceilinged at nothing, and a client advertising 65,535 honoured in
-/// full gets a large signed answer as ~45 IP fragments.
-///
-/// A type rather than two `u16`s at each call site, because the min is what
-/// gets forgotten: [`UdpSizes::reply_ceiling`] is the only way to a UDP reply's
-/// size and it cannot be asked without it (`CLAUDE.md` §17). One transport
-/// match for both daemons: two copies of it are how a UDP ceiling reaches TCP
-/// (`TODO.md` #39b).
-///
-/// The split is Unbound's and BIND's, read rather than assumed. Unbound's
-/// `max-udp-size` is "Maximum UDP response size (not applied to TCP response).
-/// 65536 disables the UDP response size maximum, and uses the choice from the
-/// client, always", beside `edns-buffer-size`, "the EDNS reassembly buffer size
-/// … put into datagrams over UDP towards peers". BIND's `max-udp-size` "applies
-/// to responses sent by a server; to set the advertised buffer size in queries,
-/// see edns-udp-size", and caps at 4096 where this type caps at 65,535. Knot
-/// has `udp-max-payload` and NSD `ipv4-edns-size`/`ipv6-edns-size`, both being
-/// the advertisement alone.
+/// [`UdpSizes::advertised`] goes in every reply's OPT (RFC 6891 §6.2.4) and
+/// floors request admission; [`UdpSizes::max_response`] caps what this host
+/// sends, where the client's number alone would fragment. The only way to a
+/// reply's size is [`UdpSizes::reply_ceiling`], so the min cannot be forgotten
+/// (`CLAUDE.md` §17). The split is Unbound's and BIND's `max-udp-size`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UdpSizes {
     advertised: u16,
@@ -53,13 +35,9 @@ pub struct UdpSizes {
 }
 
 impl UdpSizes {
-    /// Both floored at [`CLASSIC_UDP_SIZE`]: a ceiling under it refuses the
-    /// plainest reply RFC 1035 allows room for, and a truncated reply has to
-    /// fit somewhere. A mistyped flag should be wrong, not fatal
-    /// (`CLAUDE.md` §14).
-    ///
-    /// There is no "off" and none is needed: `u16::MAX` is every datagram there
-    /// can be, which is what `max_response` at the top of its range means.
+    /// Both floored at [`CLASSIC_UDP_SIZE`], where a truncated reply must fit;
+    /// a mistyped flag is wrong, not fatal (`CLAUDE.md` §14). `u16::MAX` is
+    /// every datagram, so there is no off.
     pub fn new(advertised: u16, max_response: u16) -> UdpSizes {
         UdpSizes {
             advertised: advertised.max(CLASSIC_UDP_SIZE),
@@ -80,20 +58,9 @@ impl UdpSizes {
 
     /// What a reply to `request` may weigh on `transport`.
     ///
-    /// `min(what the client said it can take, what we will send)` on UDP. The
-    /// client's half is RFC 6891 §6.2.3, "the largest UDP payload that can be
-    /// reassembled and delivered in the requestor's network stack", with its
-    /// "values lower than 512 MUST be treated as equal to 512". Ours is
-    /// permitted rather than required: RFC 7766 §4 says a server "**may** send
-    /// UDP packets up to that client's announced buffer size", and goes on to
-    /// why one would not — "transport of UDP packets that exceed the size of
-    /// the path MTU causes IP packet fragmentation, which has been found to be
-    /// unreliable in many circumstances".
-    ///
-    /// Over TCP the RFC 1035 §4.2.2 length prefix is the only limit, so neither
-    /// number applies — the parameter is here so that answering "how big may
-    /// this reply be" is one call rather than a transport match each daemon
-    /// writes for itself.
+    /// On UDP the smaller of the client's size (RFC 6891 §6.2.3, floored at
+    /// 512) and ours, which RFC 7766 §4 permits for fragmentation's sake. On
+    /// TCP only the RFC 1035 §4.2.2 prefix limits it.
     pub fn reply_ceiling(&self, request: &DnsMessage, transport: Transport) -> usize {
         match transport {
             Transport::Tcp => u16::MAX as usize,
@@ -122,32 +89,16 @@ impl Default for UdpSizes {
 /// Poisonous" (draft-ietf-dnsop-fragmentation-poisoned) is about.
 pub const FLAG_DAY_UDP_SIZE: u16 = 1232;
 
-// EDNS option codes (IANA "DNS EDNS0 Option Codes"). The codec carries any
-// option as opaque bytes; what a reply does with one is `ClientEdns`'s, which
-// reads Padding and builds every other option fresh.
+// EDNS option codes (IANA). Any option is carried as opaque bytes; a reply
+// reads Padding and builds the rest fresh (`ClientEdns`).
 /// Name Server Identifier (RFC 5001).
 pub const EDNS_OPTION_NSID: u16 = 3;
-/// Client Subnet (RFC 7871).
+/// Client Subnet (RFC 7871), which this tree never sends or echoes.
 ///
-/// **This tree answers no to it, and the reason is worth more than the code.**
-/// Forwarding a client's network to every authoritative server in a resolution
-/// is what lets one of them steer the client to a near replica, and RFC 7871
-/// §11 is plain about the cost: "the network address of the client ... becomes
-/// visible to all servers involved in the resolution process". The RFC also
-/// says the feature "SHOULD be disabled in all default configurations",
-/// because of the cache pressure — an answer tied to a network is an answer per
-/// network.
-///
-/// So `rdnsr` never sends one and never echoes one, and that is a property of
-/// two functions rather than of a flag: [`crate::response::ClientEdns::mirror`]
-/// builds a *fresh* OPT carrying the payload size and DO and nothing else, and
-/// the resolver's upstream query carries no options at all. Both are pinned by
-/// tests, because the absence of a behaviour is the kind that comes back.
-///
-/// The constant stays for the reason its three neighbours do: a query carrying
-/// the option is well formed and parses, and naming the code is how a caller
-/// reading an option list says which one it is looking at. What a reply carries
-/// is a separate question, and the answer is nothing (`TODO.md` #45e).
+/// RFC 7871 §11: the client's network "becomes visible to all servers involved
+/// in the resolution process", and it "SHOULD be disabled in all default
+/// configurations". [`crate::response::ClientEdns::mirror`] builds a fresh OPT
+/// and the resolver's query carries no options; tests pin both.
 pub const EDNS_OPTION_CLIENT_SUBNET: u16 = 8;
 /// DNS Cookie (RFC 7873).
 pub const EDNS_OPTION_COOKIE: u16 = 10;
@@ -186,18 +137,12 @@ impl EdnsOption {
     }
 }
 
-/// EDNS0 OPT pseudo-record (RFC 6891).
+/// EDNS0 OPT pseudo-record (RFC 6891). CLASS is the requestor's UDP payload
+/// size, TTL the extended RCODE, version and flags.
 ///
-/// OPT repurposes the usual RR fields: NAME is root, CLASS is the requestor's
-/// UDP payload size, TTL packs the extended-RCODE / version / flags (including
-/// DNSSEC-OK).
-///
-/// The extended RCODE is not a field here — it belongs to the message, so it
-/// lives in [`DnsMessage::rcode`](crate::DnsMessage::rcode) and is split across the header and the OPT TTL
-/// only in [`DnsMessage::to_bytes`](crate::DnsMessage::to_bytes). The option list is held unparsed because it
-/// is the only fallible part: parsing it with the message would make a bad list
-/// fail `DnsMessage::try_from_bytes`, leaving no parsed message for
-/// `error_bytes` to answer FORMERR from.
+/// The extended RCODE belongs to the message
+/// ([`DnsMessage::rcode`](crate::DnsMessage::rcode)). The option list is held
+/// unparsed, so a bad one leaves a parsed message to answer FORMERR from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Edns {
     /// Requestor's/responder's advertised UDP payload size (OPT CLASS field).
@@ -238,16 +183,12 @@ impl Edns {
         }
     }
 
-    /// The OPT record read off the wire: the CLASS field, the TTL flags word and
-    /// the RDATA exactly as they arrived.
+    /// The OPT record read off the wire: CLASS, the TTL flags word and the
+    /// RDATA as they arrived.
     ///
-    /// The option list is not walked here — a malformed one must not fail the
-    /// message parse (see the note above) — so this is the one constructor that
-    /// takes RDATA it has not encoded itself.
-    ///
-    /// The extended RCODE's high byte lives in the top of `flags` and is *not*
-    /// kept: it is a property of the message, so `DnsMessage` reassembles it
-    /// into `rcode` from the same word.
+    /// The option list is not walked, so a malformed one cannot fail the parse.
+    /// The extended RCODE's high byte is not kept: `DnsMessage` reassembles
+    /// `rcode` from it.
     pub(crate) fn from_opt(udp_payload_size: u16, flags: u32, rdata: &[u8]) -> Self {
         Edns {
             udp_payload_size,
@@ -289,14 +230,9 @@ impl Edns {
         })
     }
 
-    /// The same OPT with `error` appended to its option list (RFC 8914 §2).
-    ///
-    /// Appended rather than replacing: §2 says "Senders MAY include more than
-    /// one EDE option", so a second call means two errors and not a correction.
-    ///
-    /// `Result` for the same reason [`Edns::with_options`] has one, though
-    /// [`ExtendedError`]'s own bound on EXTRA-TEXT is what keeps this one from
-    /// firing.
+    /// The same OPT with `error` appended to its option list (RFC 8914 §2,
+    /// which allows several). `Result` as for [`Edns::with_options`], though
+    /// [`ExtendedError`]'s bound keeps it from firing.
     pub fn with_extended_error(self, error: ExtendedError) -> Result<Self, WireError> {
         let mut rdata = self.rdata.into_vec();
         error.to_option().append_to(&mut rdata)?;
@@ -357,9 +293,8 @@ impl Edns {
     /// arithmetic that decides whether a packet is FORMERR exists once.
     fn walk_options(mut rdata: &[u8], mut each: impl FnMut(u16, &[u8])) -> Result<(), WireError> {
         while !rdata.is_empty() {
-            // Ahead of `read_be!`, not instead of it: the macro reports the
-            // type it failed to read, so its two returns here are unreachable
-            // and this names the field (`message.rs`'s header does the same).
+            // Before `read_be!`, whose error names a type, so this one names
+            // the field.
             if rdata.len() < 4 {
                 return Err(WireError::Truncated {
                     what: "an EDNS option header",

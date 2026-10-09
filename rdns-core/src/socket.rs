@@ -7,13 +7,8 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// The wildcard address to bind before talking to `target`.
 ///
-/// The family has to match: a v4 socket cannot reach a v6 peer, and binding
-/// `0.0.0.0` then connecting to a v6 address fails outright. Port 0, because a
-/// random source port is half of RFC 5452 §9.2's off-path resistance — the
-/// other half is the id.
-///
-/// Pure and free of I/O, so `rdnsc`'s blocking socket and the resolver's and
-/// `rdnsd`'s async ones share it.
+/// Same family as the target, port 0: a random source port is half of RFC 5452
+/// §9.2's off-path resistance. Pure, so blocking and async sockets share it.
 pub fn bind_addr_for(target: SocketAddr) -> SocketAddr {
     if target.is_ipv6() {
         SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))

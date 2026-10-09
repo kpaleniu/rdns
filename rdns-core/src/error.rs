@@ -67,15 +67,9 @@ pub enum RequestError {
 
 /// Why a reply is not an answer to the query that was sent.
 ///
-/// RFC 5452 §9.1's list, minus the parts the socket already enforces: with a
-/// `connect`ed socket the kernel checks both addresses and both ports, so what
-/// is left for a caller is "Query ID", "Query name" and "Query class and type".
-///
-/// Every caller drops the packet, so the variants are for the operator, not for
-/// branching: `rdnsc` prints the reason and the resolver counts a non-answer.
-/// They stay separate anyway because a test asserts on the variant rather than
-/// on a message (`CLAUDE.md` §3), and because "the id was wrong" and "the
-/// question was somebody else's" are different things to see in a log.
+/// RFC 5452 §9.1 less what a `connect`ed socket enforces: id, name, class and
+/// type. Every caller drops the packet; separate variants serve the log and
+/// tests (`CLAUDE.md` §3).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AnswerMismatch {
     /// QR is clear. Not on RFC 5452's list, which assumes a response; a query

@@ -65,20 +65,9 @@ impl Drop for ScratchDir {
 /// The smallest of `samples` timings of each of `a` and `b`, for a ratio test
 /// (`CLAUDE.md` §10).
 ///
-/// Contention only ever adds time, so the minimum is the sample the machine was
-/// least busy for. One sample a side is how three ratio tests failed under a
-/// loaded suite while their bounds held with room at rest — 4.14× against a
-/// bound of 4, where 30 quiet runs read 1.24× to 2.17× (`TODO.md` #120b). A
-/// real regression reads as its multiplier in every sample, so the smallest
-/// cannot hide it.
-///
-/// The two sides take turns, `a` first. Five of `a` and then five of `b` is
-/// ~150 ms of one side and then the other, so a stretch of contention that
-/// long lands on one side only. Under a loaded suite `zone.rs`'s ratio test
-/// failed 5 times in 900 that way and 0 in 900 taking turns (#122).
-///
-/// Each closure rebuilds whatever its timed work changes: timing one object
-/// twice measures a fuller cache, or a deeper window, the second time.
+/// Contention only adds time, and a real regression shows in every sample. The
+/// sides take turns, so a stretch of contention cannot land on one; each
+/// closure rebuilds what its work changes (`TODO.md` #120b, #122).
 pub fn fastest_of_each(
     samples: usize,
     mut a: impl FnMut() -> std::time::Duration,
@@ -121,18 +110,9 @@ fn collect_rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// The `#[ignore]`d benchmarks in one test binary take turns.
-///
-/// libtest runs what a filter selects in parallel, and a benchmark's own
-/// recipe is usually a filter that selects more than one of them — so the
-/// documented command times two million-record runs against each other. That
-/// is how `TODO.md` #64b came to record a 1-5% saving for a change that saves
-/// 38%, and `rdns/tests/rpz_install.rs` read 3 123 ms for a load that takes
-/// 2 198 when it had the binary to itself.
-///
-/// The mutex is per process, which is the right grain: the collision is within
-/// one test binary. What is shared here is the reason, not the state
-/// (`CLAUDE.md` §7).
+/// The `#[ignore]`d benchmarks in one test binary take turns: libtest runs a
+/// filter's matches in parallel, and benchmarks timed against each other
+/// mismeasure (`TODO.md` #64b). Per process, the grain of the collision.
 static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A turn, held for the whole body of a benchmark.
@@ -149,15 +129,9 @@ pub fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
 /// An allocator that tallies calls per thread, wrapping whichever one the test
 /// binary would otherwise install.
 ///
-/// Two test binaries count allocations — `rdns/tests/allocations.rs` over
-/// `dhat::Alloc` and `rdnsr`'s over `System` — and the reason the tally is
-/// *per thread* is subtle enough that a second copy would get it wrong (§7):
-/// a global counter cannot be made exact by a mutex here, because the threads
-/// that allocate inside the window are libtest's. CI once read 10 for a parse
-/// that reads 6 on four machines, and passed on a re-run of the same commit.
-///
-/// Counts `alloc`, `alloc_zeroed` and `realloc`, which is what dhat's
-/// `total_blocks` counts, so a number measured either way means the same thing.
+/// Per thread because libtest's threads allocate inside the window, which no
+/// global counter excludes. Counts `alloc`, `alloc_zeroed` and `realloc`, as
+/// dhat's `total_blocks` does.
 pub struct Counting<A>(pub A);
 
 thread_local! {
@@ -183,13 +157,9 @@ pub fn allocations<T>(body: impl FnOnce() -> T) -> (T, u64) {
 }
 
 /// Enter one allocator call, counting it if `count` and this is the outermost
-/// one on this thread. Nested calls are the wrapped allocator's own
-/// bookkeeping, not the caller's cost — which is why every entry point takes
-/// this guard, including the one that counts nothing.
-///
-/// `try_with`: a thread allocating while its own TLS is being destroyed must
-/// not resurrect the key. Both cells are `const`-initialized and have no
-/// destructor, so the access itself never allocates and cannot recurse.
+/// on this thread; nested calls are the wrapped allocator's bookkeeping.
+/// `try_with`, so a thread in TLS teardown does not resurrect the key; the
+/// cells are `const` with no destructor.
 fn enter(count: bool) -> impl Drop {
     struct Guard(bool);
     impl Drop for Guard {
@@ -223,9 +193,8 @@ unsafe impl<A: std::alloc::GlobalAlloc> std::alloc::GlobalAlloc for Counting<A> 
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        // Allocations are what is counted, so nothing is counted here — the
-        // guard is for what the wrapped allocator may allocate while recording
-        // the free.
+        // Nothing counted; the guard covers what the wrapped allocator
+        // allocates while freeing.
         let _entered = enter(false);
         unsafe { self.0.dealloc(ptr, layout) }
     }

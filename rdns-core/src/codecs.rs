@@ -76,14 +76,9 @@ pub fn base64_encode(bytes: &[u8]) -> String {
 /// Decode RFC 1035 §5.1's escapes: `\X` is a literal `X`, and `\DDD` is the
 /// octet with that three-digit decimal value.
 ///
-/// RFC 9460 Appendix A calls this "character-string decoding" and defers to
-/// §5.1 for it; `escaped = "\" ( non-digit / dec-octet )`, so the digit form is
-/// exactly three digits and nothing else counts as one.
-///
-/// Bytes out, not a `String`: §5.1 can spell any octet and most of them are not
-/// UTF-8. The zone tokenizer keeps backslashes rather than resolving them, so
-/// this is the one place they are resolved — which is why `\DDD` had no
-/// spelling anywhere in this tree until SVCB needed one.
+/// Exactly three digits (RFC 9460 Appendix A's `escaped` rule). Bytes, not a
+/// `String`: §5.1 spells any octet. The zone tokenizer keeps backslashes, so
+/// this is the one place they resolve.
 pub fn char_string_decode(text: &str) -> WireResult<Vec<u8>> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -130,13 +125,9 @@ pub fn char_string_decode(text: &str) -> WireResult<Vec<u8>> {
 
 /// The inverse: the text that goes *between quotes* in a zone file.
 ///
-/// Escapes the two characters that would end the string or start an escape,
-/// and spells every non-printable octet as `\DDD`. Total — there is no byte
-/// §5.1 cannot say — which is why callers of this do not have a "cannot write
-/// it" case to handle.
-///
-/// The quotes are the caller's to add: a value inside a comma-separated list
-/// is escaped the same way but not quoted individually.
+/// Escapes `"` and `\`, and spells every non-printable octet `\DDD`; total,
+/// since §5.1 can say any byte. The quotes are the caller's: a list item is
+/// escaped alike but not quoted alone.
 pub fn char_string_escaped(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len());

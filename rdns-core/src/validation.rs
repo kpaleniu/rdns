@@ -26,14 +26,9 @@ use crate::{DnsMessage, NameRef, OpCode, Qtype, QueryClass};
 
 /// A message that arrived at a listening socket and is a question.
 ///
-/// The only constructor is [`Request::from_bytes`], which refuses QR=1: a
-/// response answered at a listening socket is a packet loop neither end can see.
-/// A wrapper rather than a split of [`DnsMessage`], because the resolver, `tsig`
-/// and `xfr` all need messages that may have QR=1.
-///
-/// `Deref` only — `request.response = true` would restore the excluded state.
-///
-/// It does not run [`AdmissionCheck`], check the opcode, or verify a TSIG.
+/// [`Request::from_bytes`] refuses QR=1, a packet loop. A wrapper, as the
+/// resolver, `tsig` and `xfr` need QR=1 messages; `Deref` only. It does not run
+/// [`AdmissionCheck`], check the opcode, or verify a TSIG.
 #[derive(Debug, Clone)]
 pub struct Request(DnsMessage);
 
@@ -121,13 +116,8 @@ pub fn answers_query(reply: &DnsMessage, sent: &SentQuery) -> Result<(), AnswerM
 
 /// Which transport a message arrived on.
 ///
-/// Not a bool: it decides the admission size cap below (RFC 1035 §4.2.1's 512
-/// against a ceiling we chose), whether a reply may be truncated, and whether
-/// the peer completed a handshake — three questions one `is_tcp` was answering.
-///
-/// Here rather than in `rdns_transport`, because this is the module that reads
-/// it: an enum one crate above the decision it makes has to be converted back
-/// to the bool it replaced at the call site.
+/// Not a bool: it decides the admission cap, truncation, and whether a
+/// handshake was completed. Here, where it is read, not in `rdns_transport`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Udp,
@@ -136,17 +126,9 @@ pub enum Transport {
 
 /// What the connection a message arrived on hid from the path it crossed.
 ///
-/// Separate from [`Transport`] rather than two more variants of it, because
-/// they answer different questions and the same message can want both: DoT is
-/// framed like TCP and private like nothing else, and every size and
-/// truncation rule keyed on `Transport` would have had to learn the new
-/// variants to keep saying the same thing.
-///
-/// The version matters, which is why this is not a bool. RFC 9103 §7.2: "All
-/// implementations of this specification MUST use only TLS 1.3 \[RFC8446\] or
-/// later" — so a zone transfer over a 1.2 connection is not XFR-over-TLS, while
-/// a *query* over one is ordinary DoT (RFC 7858 §4.1 asks only for 1.2 or
-/// later).
+/// Not [`Transport`] variants: DoT is framed like TCP. The TLS version matters:
+/// RFC 9103 §7.2 requires 1.3 for a transfer, while RFC 7858 §4.1 accepts 1.2
+/// for queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Privacy {
     /// Plain UDP or TCP: everyone on the path read it.
@@ -166,28 +148,12 @@ impl Privacy {
     }
 }
 
-/// Which protocol carried a message, and what it negotiated.
+/// Which protocol carried a message, and what it negotiated: what dnstap's
+/// `SocketProtocol` wants.
 ///
-/// Three questions, three types, and this one answers the other two.
-/// [`Transport`] is "what size may this answer be"; [`Privacy`] is "what did
-/// the connection hide"; this is "what was it called", which dnstap's
-/// `SocketProtocol` wants and neither of the others can give — DoT, DoH and DoQ
-/// are one [`Privacy`] and one [`Transport`] between them.
-///
-/// An enum with the TLS version inside rather than a `{ protocol, privacy }`
-/// pair, because the pair can be written down wrong: `Tcp` with `Tls13`, or
-/// `Doq` with `TlsOlder`, are states no connection can be in and every one of
-/// the five construction sites would have to keep saying so. Here `Doq` carries
-/// RFC 9001 §4.2 — "QUIC ... MUST use TLS 1.3 or greater" — in the type, and
-/// `Tcp` cannot claim to have hidden anything (`CLAUDE.md` §17).
-///
-/// No `Udp` variant, on purpose: this reaches a consumer by way of a
-/// *connection* handler, and a datagram takes a different path in both daemons.
-///
-/// `Clone` rather than `Copy`: an encrypted connection carries what the client
-/// proved about itself, which is a certificate, and a plain one cannot. The
-/// clone is one `Arc` bump per message on a connection that already spends a
-/// round trip.
+/// TLS version inside the variant, so `Tcp` with TLS or `Doq` without 1.3 (RFC
+/// 9001 §4.2) is unrepresentable (`CLAUDE.md` §17). No `Udp`: datagrams take
+/// another path. `Clone`, not `Copy`: it can carry a certificate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Arrival {
     /// Plain TCP (RFC 1035 §4.2.2).
@@ -204,15 +170,9 @@ pub enum Arrival {
 /// What the client proved about itself in the handshake: the end-entity
 /// certificate it presented, or nothing.
 ///
-/// The DER as rustls verified it, not a name read out of it. Which name counts
-/// is the *authorizing* end's question — RFC 9103 §7.5's mTLS says a transfer
-/// client may be recognised by its certificate and says nothing about how the
-/// two are matched — and a transport that answered it would be deciding policy
-/// (`CLAUDE.md` §16).
-///
-/// `None` is the ordinary case: a DoT stub resolver asking a question offers no
-/// certificate and must not be made to (RFC 8310 §8.2's mTLS is a different
-/// relationship from RFC 9103's).
+/// The DER as verified, not a name: matching is the authorizing end's policy
+/// (RFC 9103 §7.5, `CLAUDE.md` §16). `None` is ordinary, as for a DoT stub (RFC
+/// 8310 §8.2).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PeerCertificate(Option<Arc<Vec<u8>>>);
 
@@ -275,17 +235,8 @@ impl Arrival {
     /// Whether this transport can carry a *sequence* of messages in answer to
     /// one request, which a zone transfer is (RFC 5936 §2.2).
     ///
-    /// The fourth question, and not the same as whether the reply channel is
-    /// framed. DoH is framed and carries one message: RFC 8484 §4.2 makes one
-    /// HTTP response one `application/dns-message`, defines no framing that
-    /// would carry the rest, and RFC 9103 §7.1 leaves DoH outside zone transfer
-    /// altogether. Asked as "is it framed", a transfer over DoH is built in
-    /// full, drained by the adapter and thrown away — except for a zone small
-    /// enough to fit one envelope, which succeeds.
-    ///
-    /// Here rather than on the dispatcher's own wrapper, for the reason the
-    /// other two answers are here: this is a fact about the protocol, and
-    /// every adapter that builds an [`Arrival`] has already decided it.
+    /// Not "is it framed": DoH is framed but one response is one message (RFC
+    /// 8484 §4.2), outside zone transfer (RFC 9103 §7.1).
     pub fn carries_a_sequence(&self) -> bool {
         match self {
             Arrival::Tcp | Arrival::Dot(..) | Arrival::Doq(_) => true,
@@ -314,14 +265,9 @@ const MAX_REQUEST_ADDITIONALS: usize = 4;
 
 /// The two size caps admission applies, one per transport.
 ///
-/// A resource bound — how much of a stranger's datagram we are willing to parse
-/// — and not a protocol rule (`TODO.md` #40f). RFC 1035 §4.2.1's 512 limits
-/// what a server may *send* without EDNS; a requestor's own limit is the
-/// payload size it advertises (RFC 6891 §4.3). A daemon that advertises 4,096
-/// and refuses over 512 answers a client that believed it with silence:
-/// `rdns/examples/request_size_probe.rs` measures a 2,048-bit DKIM key rotation
-/// at 566 octets signed, and the TSIG the server *requires* is what pushes it
-/// over.
+/// A resource bound, not a protocol rule: RFC 1035 §4.2.1's 512 limits what a
+/// server sends; a requestor's limit is its advertised payload (RFC 6891 §4.3).
+/// Signed UPDATEs exceed 512 (`TODO.md` #40f).
 #[derive(Debug, Clone)]
 pub struct AdmissionLimits {
     max_udp_size: usize,
@@ -469,14 +415,8 @@ impl AdmissionCheck {
             });
         }
 
-        // Per section, and capped rather than forbidden — a cap is a statement
-        // about resources, not a guess about which extensions exist:
-        //
-        // - Answer: empty in a QUERY, but a NOTIFY carries the zone's SOA
-        //   (RFC 1996 §3.7).
-        // - Authority: an IXFR request is a QUERY carrying the client's SOA
-        //   there (RFC 1995 §3).
-        // - Additional: the OPT (RFC 6891 §6.1.1) and the TSIG/SIG(0).
+        // Capped, not forbidden: NOTIFY carries an answer (RFC 1996 §3.7), IXFR
+        // an authority (RFC 1995 §3).
         let qr_flag = data[2] & 0x80 != 0;
         let opcode = OpCode::from_u8((data[2] >> 3) & 0x0f);
         if !qr_flag {

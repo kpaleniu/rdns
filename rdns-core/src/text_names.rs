@@ -19,14 +19,9 @@ pub fn ascii_lowered(name: &str) -> String {
 
 /// Whether `name` holds an ASCII capital, and so needs folding at all.
 ///
-/// A fold, not a search. `bytes().any(..)` exits on the first hit, and LLVM will
-/// not vectorize a loop whose exit depends on the data — so it ran one byte per
-/// iteration while the `make_ascii_lowercase` it exists to avoid ran thirty-two
-/// (`TODO.md` #25g). Reducing with OR has no early exit and vectorizes, and the
-/// name's length is the client's to choose.
-///
-/// `wrapping_sub(b'A') < 26` is `is_ascii_uppercase` without the second
-/// comparison and a branch.
+/// A fold, not `any`: an early exit stops LLVM vectorizing, and the name's
+/// length is the client's (`TODO.md` #25g). `wrapping_sub(b'A') < 26` is
+/// `is_ascii_uppercase` with one comparison.
 fn has_ascii_uppercase(name: &str) -> bool {
     name.bytes()
         .fold(0u8, |seen, b| seen | u8::from(b.wrapping_sub(b'A') < 26))
@@ -69,14 +64,9 @@ pub fn absolute_lowered(name: &str) -> std::borrow::Cow<'_, str> {
 /// Whether the `.` at byte `at` separates two labels, or is one *inside* a
 /// label.
 ///
-/// RFC 1035 §5.1 spells a literal dot `\.` and a literal backslash `\\`, so a
-/// dot is a separator exactly when an even number of backslashes precedes it.
-/// Only presentation text has this ambiguity — [`crate::Name`] holds wire
-/// octets, where a label carries its own length — so every helper below asks
-/// this one function instead of splitting on `.` for itself (`CLAUDE.md` §7).
-///
-/// RFC 9460's presentation form and `Name` (`TODO.md` #36) make such a name
-/// loadable, signable and servable, so counting dots is wrong.
+/// A separator exactly when an even number of backslashes precedes it (RFC 1035
+/// §5.1). Every helper below asks this rather than splitting on `.`
+/// (`CLAUDE.md` §7).
 fn separates_labels(bytes: &[u8], at: usize) -> bool {
     let mut back = at;
     while back > 0 && bytes[back - 1] == b'\\' {

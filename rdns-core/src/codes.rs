@@ -317,16 +317,11 @@ impl Ttl {
     }
 
     /// How long a negative answer may be held, and every record proving it: the
-    /// lesser of the SOA record's own TTL and its MINIMUM field (RFC 2308 §5;
-    /// RFC 9077 §§3.1-3.3 say the same of the NSEC or NSEC3 beside it).
+    /// lesser of the SOA's own TTL and its MINIMUM (RFC 2308 §5; RFC 9077 §3).
     ///
-    /// Named rather than spelled `min` per site because the drift is an omitted
-    /// *term*, and a call taking both cannot omit one. A fixture of `$TTL 3600`
-    /// over `minimum 300` cannot catch the omission: the two terms give the
-    /// same number there.
-    ///
-    /// A cache's own ceiling is policy on top of this and stays at its call
-    /// site: [`Ttl::capped_at`].
+    /// One function, as the drift is an omitted term, which a `$TTL 3600` over
+    /// `minimum 300` fixture cannot catch. A cache's own ceiling stays at its
+    /// call site: [`Ttl::capped_at`].
     pub const fn negative_answer(soa_ttl: Ttl, minimum: u32) -> Ttl {
         Ttl(if soa_ttl.0 < minimum {
             soa_ttl.0
@@ -368,11 +363,8 @@ impl Serial {
     }
 
     /// Whether this version is later than `other` (RFC 1982 §3.2): the forward
-    /// distance is in the first half of the space. Equal serials are not newer,
-    /// so a secondary does not re-transfer an unchanged zone.
-    ///
-    /// Not `PartialOrd`: §3.2 leaves the result undefined for serials exactly
-    /// half the space apart, and an `Ord` would have to invent one.
+    /// distance is in the first half of the space, and equal is not newer. Not
+    /// `PartialOrd`: §3.2 leaves serials half the space apart undefined.
     pub const fn is_newer_than(self, other: Serial) -> bool {
         let forward = self.0.wrapping_sub(other.0);
         forward != 0 && forward < 0x8000_0000

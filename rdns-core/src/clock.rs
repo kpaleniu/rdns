@@ -26,47 +26,10 @@ pub fn current_unix_timestamp() -> u64 {
 
 /// Where a caller reads the wall clock.
 ///
-/// One indirection, and what it buys is a test that does not toss a coin: a
-/// rate limit asserted against [`current_unix_timestamp`] is decided by whether
-/// two connects straddled a second boundary, because the bucket refills by
-/// whole seconds (`CLAUDE.md` §10). Lengthening the window only makes the coin
-/// heavier.
-///
-/// Nothing in production holds anything but [`Clock::system`]. That is the
-/// reason this is an enum rather than a boxed closure: the ordinary path stays
-/// a branch and a direct call, and `Fixed` names what a test wants — an instant
-/// it can move — rather than leaving each test to assemble one.
-///
-/// **A request path reads the time through a `Clock`, with one exception
-/// below** (`TODO.md` #92, #107). In `rdns` that is eleven reads: `NsecCache`'s
-/// four, the delegation and key caches' six and `validate`'s one.
-///
-/// **One request-reachable read declines, and for #92's reason.**
-/// `DnssecValidator::validate_rrset` reads the wall clock, and the UPDATE path
-/// reaches it: `dispatch`'s pre-install check calls `FreshlySigned::verify`,
-/// which validates every touched RRset. It stays, because the instant it wants
-/// can be chosen another way — a test picks the signature's inception and
-/// expiration through `SigningPolicy`, which is the parameter one level down
-/// that #92 declined its twelve for. A `Clock` there would be a seam nothing
-/// passes anything but `Clock::system()` to (`CLAUDE.md` §14).
-///
-/// The rest of #92's reasoning is about `rdnsd`. Twelve wall-clock reads there
-/// are outside a request path — the load path's `signed_at`, the NOTIFY
-/// client's TSIG timestamps, the REFRESH/RETRY/EXPIRE timers, the re-signing
-/// policy and `status`'s ages — and the question asked of each is whether it
-/// decides a test's outcome. None does, because every one of them already takes
-/// its instant as a parameter one level down: `resign_interval_at`,
-/// `policy_for`, `apply_keeping`, `has_expired`, `expire_if_out_of_contact`.
-/// Threading a `Clock` through `Reloading`, the NOTIFY task, the replication
-/// timer and `Control` would add four constructor parameters to duplicate a
-/// seam that is already there and already used.
-///
-/// The closest candidate declines for a different reason, which is the one
-/// worth knowing. `send_notify` signs with `tsig::now()`, and RFC 8945
-/// §5.2.3's fudge makes a skewed clock visible on the wire. But it retries over
-/// minutes, so each attempt has to sign with a *current* timestamp: a seam
-/// there has to be a `Clock` and not an instant, and passing an instant in
-/// would be the defect rather than the fix.
+/// An enum so a test can fix and move the instant, where a rate limit against
+/// the system clock tosses a coin on a second boundary (`CLAUDE.md` §10). A
+/// request path reads through a `Clock`; which reads do not, and why, is
+/// `TODO.md` #92 and #107.
 #[derive(Clone, Debug)]
 pub enum Clock {
     /// [`current_unix_timestamp`].

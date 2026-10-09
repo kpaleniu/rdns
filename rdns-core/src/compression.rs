@@ -25,12 +25,10 @@ pub struct NameCompressor {
     /// first written at. Never holds two entries for the same suffix.
     seen: Vec<Suffix>,
     /// Folded hash of a suffix to its entry in `seen`, built only once `seen`
-    /// outgrows [`SCAN_LIMIT`] and empty before that: a `HashMap` allocates on
-    /// its first insert, and a one-record response is held to three allocations.
+    /// outgrows [`SCAN_LIMIT`]: a `HashMap` allocates on its first insert.
     ///
-    /// A hash collision drops the newer suffix rather than chaining it, so the
-    /// value is one index. Compression is optional (RFC 1035 §4.1.4), so a
-    /// collision costs a few bytes; the older entry kept has the lower offset.
+    /// A collision drops the newer suffix: compression is optional (RFC 1035
+    /// §4.1.4), and the older entry has the lower offset.
     index: HashMap<u64, u32>,
 }
 
@@ -57,13 +55,10 @@ impl NameCompressor {
 
     /// Forget everything, keeping the room it was kept in.
     ///
-    /// Offsets are meaningless across messages, so a compressor carried from one
-    /// serialization to the next must be emptied between them or it writes
-    /// pointers into a message that is no longer there. That is why
-    /// [`crate::DnsMessage::to_bytes_with`] clears at the *start* of a
-    /// serialization rather than leaving it to the caller: the truncation retry
-    /// serializes twice through one call, and a rule the caller has to remember
-    /// would be wrong on the path least likely to be exercised.
+    /// Offsets mean nothing across messages, so
+    /// [`crate::DnsMessage::to_bytes_with`] clears at the start of every
+    /// serialization, the truncation retry included, rather than trusting
+    /// callers.
     pub fn clear(&mut self) {
         self.arena.clear();
         self.seen.clear();
@@ -72,22 +67,16 @@ impl NameCompressor {
 
     /// Forget every suffix at or past `at`, keeping the rest.
     ///
-    /// For a writer that rewinds the output buffer — an answer that overflowed
-    /// the size limit drops back to the question and sets TC. Whatever was
-    /// recorded past the rewind point now points at bytes that are about to be
-    /// overwritten, which is silent wire corruption on the least-tested path.
-    ///
-    /// `seen` is ordered by offset: a name's suffixes are recorded left to
-    /// right, and `pos` only ever moves forward.
+    /// For a writer that rewinds its buffer to set TC: entries past the point
+    /// would point at overwritten bytes. `seen` is ordered by offset.
     pub fn rewind(&mut self, at: usize) {
         let keep = self.seen.partition_point(|s| (s.offset as usize) < at);
         if keep == self.seen.len() {
             return;
         }
         self.seen.truncate(keep);
-        // The index holds positions in `seen`, so the entries pointing past its
-        // new end go with them. The arena is left alone: it is bytes, and the
-        // surviving entries' ranges are still theirs.
+        // Index entries pointing past `keep` go too; the arena's bytes stay,
+        // still owned by the survivors.
         self.index.retain(|_, i| (*i as usize) < keep);
     }
 
@@ -125,11 +114,8 @@ impl NameCompressor {
             }
         }
 
-        // Everything before the match is written literally here, so record
-        // where each of those suffixes lands as a target for a later name. From
-        // the match on is already recorded; a match at 0 contributes nothing,
-        // not even a copy. With no match the whole name goes out except its
-        // root octet, which is written below as the terminator.
+        // Record where each literally written suffix lands, as a later target;
+        // with no match, all but the root octet, written below.
         let fresh_end = matched.map_or(wire.len() - 1, |(start, _)| start);
         if fresh_end > 0 {
             let first_new = self.seen.len();
@@ -165,16 +151,9 @@ impl NameCompressor {
 
     /// The offset a suffix was first written at, if it has been.
     ///
-    /// Case-insensitive over ASCII only (RFC 4343): `str::to_lowercase` folds
-    /// U+212A KELVIN SIGN to `k`, and two names that differ on the wire must not
-    /// compress against each other. [`folded_hash`] folds identically or the
-    /// index would file a suffix where nothing looks for it.
-    ///
-    /// Both arms compare against the arena, so the index is only an accelerator
-    /// and a collision cannot become a pointer to the wrong name.
-    ///
-    /// The comparison is written out twice rather than shared: factoring it into
-    /// a method or a closure cost the scan 51 -> 75 ns per name.
+    /// ASCII-only folding (RFC 4343), as [`folded_hash`] folds; both arms
+    /// compare against the arena, so a collision cannot point at the wrong
+    /// name. Written out twice: sharing it measurably slowed the scan.
     fn lookup(&self, needle: &[u8]) -> Option<u16> {
         if self.index.is_empty() {
             let arena = self.arena.as_slice();
@@ -261,13 +240,8 @@ impl NameCompressor {
                 let pos = self.write_name(exchange.as_ref(), buf, pos)?;
                 write_bytes(buf, pos, rest)
             }
-            // Everything else — including SRV, DNAME, SVCB/HTTPS and the
-            // DNSSEC types — goes out byte-for-byte (RFC 3597 §4,
-            // RFC 4034 §3.1.7/§4.1.1). Two of them say so themselves: a DNAME's
-            // <target> "MUST NOT be sent out in compressed form"
-            // (RFC 6672 §2.5), and SVCB's is "the uncompressed, fully qualified
-            // TargetName" (RFC 9460 §2.2). That is why neither is in the arm
-            // above with the other single-name RDATAs.
+            // The rest byte-for-byte (RFC 3597 §4); DNAME and SVCB targets must
+            // not be compressed (RFC 6672 §2.5, RFC 9460 §2.2).
             _ => write_bytes(buf, pos, rdata),
         }
     }

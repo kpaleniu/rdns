@@ -101,15 +101,9 @@ impl Name {
 
     /// A zone file's owner-name text resolved against `origin`, into `buf`.
     ///
-    /// The three spellings RFC 1035 §5.1 gives one name — `@`, a trailing dot,
-    /// and anything else — decided in one place, because a second copy of that
-    /// rule is a zone whose apex records land under a different name than its
-    /// relative ones.
-    ///
-    /// Into the caller's buffer, because the parser resolves one of these per
-    /// record and keeps none of them: a zone copies the octets into its own
-    /// arena, so the `Name` between the two was a heap allocation and a free
-    /// per record (`TODO.md` #72).
+    /// RFC 1035 §5.1's three spellings (`@`, trailing dot, relative) decided
+    /// once, so apex and relative records agree. Into the caller's buffer: the
+    /// parser keeps none of them.
     pub fn absolutized_in<'b>(
         text: &str,
         origin: NameRef<'_>,
@@ -175,17 +169,11 @@ impl Name {
 
     /// Read presentation text, resolving RFC 1035 §5.1's escapes.
     ///
-    /// The text is taken as **absolute**: a trailing `.` is optional and adds
-    /// nothing, because there is no origin here to resolve against. A zone
-    /// file's relative name is joined to its origin before it arrives.
-    ///
-    /// `\.` is a dot *inside* a label and `\\` a backslash — the two octets
-    /// #13e had to refuse, because presentation storage could not tell either
-    /// of them from the separator.
+    /// Taken as absolute: a trailing `.` is optional, as there is no origin
+    /// here. `\.` is a dot inside a label and `\\` a backslash.
     pub fn from_presentation(text: &str) -> WireResult<Name> {
-        // Exactly one allocation, sized after the escapes have been resolved:
-        // `Name` keeps a boxed slice, so a `Vec` grown and then shrunk would
-        // copy twice.
+        // One allocation, sized after the escapes resolve: a grown-then-shrunk
+        // `Vec` would copy twice.
         let mut buf = [0u8; MAX_NAME_LEN];
         let len = presentation_wire_in(text, &mut buf)?;
         Ok(Name(buf[..len].into()))
@@ -207,9 +195,8 @@ pub fn presentation_wire_in(text: &str, buf: &mut [u8]) -> WireResult<usize> {
     }
     let bytes = text.as_bytes();
     let mut at = 0usize;
-    // Where the current label's length octet is reserved, or `None` between
-    // labels. Reserved on the first octet of a label rather than after each
-    // separator, so a trailing dot leaves nothing half-written.
+    // The current label's reserved length octet, or `None` between labels;
+    // reserved at a label's first octet, so a trailing dot writes nothing.
     let mut label_start: Option<usize> = None;
     let mut i = 0;
     while i < bytes.len() {
@@ -324,23 +311,12 @@ pub struct NameSpan {
     len: u8,
 }
 
-/// Every owner name in one allocation.
+/// Every owner name in one allocation: the store behind a zone.
 ///
-/// The store behind a zone (`TODO.md` #71e), and here rather than in a module
-/// of its own for the reason [`RdataArena`] is in `record_data.rs`: handing out
-/// a [`NameRef`] over octets it holds means minting one without the label walk
-/// [`NameRef::from_wire_slice`] does, and a `pub(crate)` constructor for that
-/// would be open to every module in the library rather than to the one caller.
-/// What seals this instead is its own door — the only way in is a `NameRef`, so
-/// what comes out was a name on the way in (`CLAUDE.md` §17).
-///
-/// **Append-only, and spans belong to the arena that minted them.** Nothing
-/// here removes or rewrites octets: a span handed back after a removal would
-/// otherwise name something else. Reclaiming what a removed record held means
-/// rebuilding the arena, which is the owner's business — `rdns::zone::Zone`
-/// does it on a counter.
-///
-/// [`RdataArena`]: crate::RdataArena
+/// Here so minting a [`NameRef`] without the label walk needs no crate-wide
+/// constructor; the only way in is a `NameRef` (`CLAUDE.md` §17). Append-only:
+/// spans belong to the arena that minted them, and `rdns::zone::Zone` rebuilds
+/// it to reclaim octets.
 #[derive(Debug, Clone, Default)]
 pub struct NameArena {
     bytes: Vec<u8>,
@@ -351,21 +327,16 @@ impl NameArena {
         NameArena::default()
     }
 
-    /// Copy `name`'s octets in and give back where they went.
-    ///
-    /// The only way to make a [`NameSpan`], which is what lets [`get`] be
-    /// infallible and skip the walk.
+    /// Copy `name`'s octets in and give back where they went: the only way to
+    /// make a [`NameSpan`], which lets [`get`] skip the walk.
     ///
     /// [`get`]: NameArena::get
     pub fn push(&mut self, name: NameRef<'_>) -> NameSpan {
         let off = self.bytes.len();
         self.bytes.extend_from_slice(name.0);
         NameSpan {
-            // `check_name_len` bounds a name at 255 octets, so `len` cannot
-            // overflow; `off` is checked because an arena past 4 GiB is
-            // reachable on a zone big enough to exhaust the machine, and a
-            // silent truncation there is §2's "`as` is a bug until proven
-            // otherwise" with a wrong answer at the end of it.
+            // `len` is at most 255; `off` is checked, as a silent truncation
+            // past 4 GiB is a wrong answer (§2).
             off: u32::try_from(off).expect("a name arena under 4 GiB"),
             len: name.0.len() as u8,
         }
@@ -593,25 +564,14 @@ impl<'a> NameRef<'a> {
     }
 }
 
-/// One label as presentation text, escaped so a zone file reads it back as
-/// the same octets.
+/// One label as presentation text, escaped so a zone file reads it back as the
+/// same octets.
 ///
-/// Three groups, and the third is the one that is easy to miss:
-///
-/// - `.` and `\`, which are the separator and the escape.
-/// - Anything outside printable ASCII, as `\DDD` — space included, since a
-///   bare space ends a field.
-/// - **The characters a zone file gives its own meaning**: `;` starts a
-///   comment, `"` opens a quoted string, `(` and `)` group a line, `@` is the
-///   origin and `$` begins a directive. A label may hold any of them
-///   (RFC 2181 §11), and one written raw would be read back as syntax rather
-///   than as data. RFC 1035 §5.1's `\X` covers every one of them.
-///
-/// Not `codecs::char_string_escaped`: that one escapes `"` and not `.`, because
-/// a character-string's separator is the quote and a dot inside one is
-/// ordinary. Two rules that overlap without either containing the other, so
-/// two functions — `CLAUDE.md` §7 is about one rule written twice, not about
-/// two rules that resemble each other.
+/// Escaped: `.` and `\`; anything outside printable ASCII as `\DDD`, space
+/// included; and `;`, `"`, `(`, `)`, `@`, `$`, which a zone file reads as
+/// syntax (RFC 2181 §11 allows them in a label). Not
+/// `codecs::char_string_escaped`, whose rule differs: `"` matters there, `.`
+/// does not.
 fn escape_label(label: &[u8], out: &mut String) {
     use std::fmt::Write as _;
     for &byte in label {
@@ -628,10 +588,8 @@ fn escape_label(label: &[u8], out: &mut String) {
     }
 }
 
-// Case-insensitive throughout, and ASCII-only: `str::to_lowercase` folds
-// U+212A KELVIN SIGN onto `k` and merges two names that differ on the wire
-// (RFC 4343). `Eq` and `Hash` agree by construction, both folding the same
-// octets the same way.
+// Case-insensitive, ASCII-only (RFC 4343): `str::to_lowercase` folds U+212A
+// KELVIN SIGN onto `k`. `Eq` and `Hash` fold alike.
 
 impl PartialEq for NameRef<'_> {
     fn eq(&self, other: &Self) -> bool {
@@ -721,10 +679,6 @@ impl std::fmt::Debug for Name {
     }
 }
 
-/// A name from a literal, for tests only: `Name` is fallible to build and a test
-/// that writes a bad one should fail loudly at that line rather than threading a
-/// `Result` through a fixture. `rdns::test_records::nm` is the same helper for
-/// the crate above.
 /// What a DNAME does to one query name (RFC 6672 §2.2).
 ///
 /// Three answers rather than an `Option<Result<..>>`, because the caller
@@ -746,20 +700,9 @@ pub enum Redirect {
 
 /// Apply a DNAME to a query name: RFC 6672 §2.2's substitution, and Table 1.
 ///
-/// "A DNAME substitution is performed by replacing the suffix labels of the
-/// name being sought matching the owner name of the DNAME resource record with
-/// the string of labels in the RDATA field. The matching labels end with the
-/// root label in all cases. Only whole labels are replaced."
-///
-/// **Whole labels is structural here.** Over wire form a suffix at a label
-/// boundary is the only kind of suffix there is, so `ab.example.com.` simply is
-/// not under `b.example.com.`, which a `str::ends_with` over presentation text
-/// gets wrong. Nor does the root, as owner or as target, need a case of its
-/// own.
-///
-/// Strictly below, so the owner is not redirected by its own DNAME (§2.3) —
-/// Table 1's second row, whose answer depends on the QTYPE and so is not a
-/// substitution at all.
+/// "Only whole labels are replaced" is structural over wire form, where
+/// `str::ends_with` on text would put `ab.example.com.` under `b.example.com.`.
+/// Strictly below the owner, which its own DNAME does not redirect (§2.3).
 pub fn dname_redirect(qname: NameRef<'_>, owner: NameRef<'_>, target: NameRef<'_>) -> Redirect {
     if !qname.is_at_or_under(owner) || qname == owner {
         return Redirect::NoMatch;
@@ -777,6 +720,8 @@ pub fn dname_redirect(qname: NameRef<'_>, owner: NameRef<'_>, target: NameRef<'_
     }
 }
 
+/// A name from a literal, for tests only: a bad one fails loudly at that line
+/// rather than threading a `Result` through a fixture.
 #[cfg(test)]
 pub(crate) fn nm(text: &str) -> Name {
     text.parse().expect("a test name parses")

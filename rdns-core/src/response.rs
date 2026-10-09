@@ -80,13 +80,10 @@ pub struct ResponseWriter<'a> {
 
 impl<'a> ResponseWriter<'a> {
     /// Begin a reply to `request`: the header's placeholder and the echoed
-    /// question, which is what every caller here starts with.
+    /// question.
     ///
-    /// The question is written straight from the request, so echoing it costs
-    /// neither the `Vec` nor the QNAME `String` that a `queries.clone()` did.
-    ///
-    /// `compressor` is cleared here for the reason [`DnsMessage::to_bytes_with`]
-    /// clears it: an offset is a position in *this* message.
+    /// The question is written from the request, with no clone. `compressor` is
+    /// cleared as in [`DnsMessage::to_bytes_with`].
     pub fn start(
         out: &'a mut Vec<u8>,
         compressor: &'a mut NameCompressor,
@@ -161,10 +158,8 @@ impl<'a> ResponseWriter<'a> {
         self.edns = Some(edns);
     }
 
-    /// Say *why* this reply carries the RCODE it does (RFC 8914).
-    ///
-    /// Order-independent: it may be set before or after [`set_edns`], and
-    /// reaches the wire only if there is an OPT to put it in.
+    /// Say *why* this reply carries the RCODE it does (RFC 8914), before or
+    /// after [`set_edns`]; it reaches the wire only with an OPT.
     ///
     /// [`set_edns`]: ResponseWriter::set_edns
     pub fn set_extended_error(&mut self, error: ExtendedError) {
@@ -195,11 +190,8 @@ impl<'a> ResponseWriter<'a> {
                 self.pos = end;
                 self.counts[section as usize] += 1;
             }
-            // Fits the buffer but not what the caller asked to send, or does not
-            // fit the buffer at all. The second arrives as an error from the
-            // writer rather than a comparison, because the buffer *is* the limit
-            // (`CLAUDE.md` §13); every other `WireError` is a real failure to
-            // encode and is the caller's problem.
+            // Over the caller's limit, or over the buffer, which the writer
+            // reports as `Truncated` (`CLAUDE.md` §13); other errors are real.
             Ok(_)
             | Err(WireError::Truncated {
                 what: "the output buffer",
@@ -212,17 +204,9 @@ impl<'a> ResponseWriter<'a> {
 
     /// Drop back to the question and set TC (RFC 1035 §4.2.1).
     ///
-    /// All of the records, not back to a record boundary: a partial RRset must
-    /// not go out (RFC 2181 §9), and this is the shape `to_bytes_within_buf`
-    /// already produced by rebuilding the message with its sections cleared.
-    ///
-    /// The compressor rewinds with the buffer, because a suffix recorded past
-    /// this point is a pointer into bytes about to be overwritten — and
-    /// `write_name` records a name's suffixes *before* writing them, so even the
-    /// record that overflowed has left entries behind. Nothing after this point
-    /// compresses a name today (the OPT's owner is the root), so the rewind is
-    /// not observable on the wire; it is here so that it stays true of a change
-    /// that writes something else after truncating.
+    /// All records, as a partial RRset must not go out (RFC 2181 §9). The
+    /// compressor rewinds too: `write_name` records suffixes before writing, so
+    /// the overflowing record left entries.
     fn truncate(&mut self) {
         self.truncated = true;
         self.pos = self.body;
@@ -248,17 +232,8 @@ impl<'a> ResponseWriter<'a> {
                     what: "the output buffer",
                     ..
                 }) => {
-                    // The OPT survives truncation: the size limit is itself
-                    // signalled through EDNS. A header, a question and an OPT
-                    // are under 300 octets, and an EDE adds at most 6 plus
-                    // `ede::MAX_EXTRA_TEXT`, so the 512-octet floor `start`
-                    // sized the buffer to leaves room for this one.
-                    //
-                    // Truncating rather than dropping the EDE is RFC 8914 §3
-                    // the way round it asks for: "servers SHOULD truncate
-                    // messages by dropping EDE options before dropping other
-                    // data" is about an EDE on an *answer*, and every reply
-                    // that carries one here carries no other data to drop.
+                    // The OPT and EDE survive: 512 octets fit both, and RFC
+                    // 8914 §3 drops EDE only before data.
                     self.truncate();
                     self.pos = write_opt(self.out, self.pos, &edns, rcode)?;
                     self.counts[3] = 1;
@@ -299,15 +274,9 @@ pub(crate) fn wire_rcode(rcode: ResponseCode, has_edns: bool) -> Result<u16, Wir
     Ok(rcode)
 }
 
-/// The TC bit of a message that is already bytes.
-///
-/// Reparsing a finished reply to read one flag costs a `DnsMessage`, and the
-/// caller that needs this — `rdnsd`'s signing epilogue, which owes RFC 8945
-/// §5.3's altered response — is on the answer path. Here rather than at that
-/// call site so the bit's position is written once, beside the `write_header`
-/// that puts it there.
-///
-/// `false` for anything shorter than a header, which is not a message.
+/// The TC bit of a message that is already bytes, `false` for anything shorter
+/// than a header. Beside `write_header`, so the bit's position is written once;
+/// `rdnsd`'s signing epilogue needs it (RFC 8945 §5.3).
 pub fn is_truncated(message: &[u8]) -> bool {
     message.len() >= HEADER_LEN && message[2] & 0b10 != 0
 }
@@ -417,13 +386,9 @@ pub(crate) fn write_opt(
 /// What a request's OPT record says, once the two refusals RFC 6891 requires
 /// are out of the way.
 ///
-/// Carries only what a reply needs: whether to attach an OPT at all
-/// (RFC 6891 §6.1.1), what to set DO to (RFC 3225 §3), and which options the
-/// client asked for that a reply honours — Padding (RFC 7830 §4, `TODO.md`
-/// #187) and NSID (RFC 5001, #179), one field each. The advertised
-/// payload size is not here — that is [`DnsMessage::udp_payload_size`], which
-/// applies §6.2.3's floor, and is a question about the transport rather than
-/// about the reply's OPT.
+/// Whether to attach an OPT (§6.1.1), DO (RFC 3225 §3), and Padding (RFC 7830
+/// §4) and NSID (RFC 5001) requests. The payload size is
+/// [`DnsMessage::udp_payload_size`]'s: a transport question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientEdns {
     /// No OPT record: the reply carries none either.
@@ -461,19 +426,11 @@ impl ServerOpt {
 }
 
 impl ClientEdns {
-    /// The client's EDNS as far as a *reply* needs it. Total: it has no refusal
-    /// to report.
+    /// The client's EDNS as far as a *reply* needs it; total.
     ///
-    /// [`client_edns`] is the answering path's version, and refuses a malformed
-    /// option list with the RCODE that refuses it. A reply that has already
-    /// chosen its RCODE — a refusal, a TC=1, a NOTIMP — has nothing left to
-    /// refuse, still owes the OPT (RFC 6891 §6.1.1), and cannot read DO out of
-    /// a list that did not parse, so that case mirrors DO clear.
-    ///
-    /// Every such reply goes through here rather than through `has_edns()` and
-    /// a fresh `Edns`: three sites did that and all three dropped the client's
-    /// DO bit, which RFC 3225 §3 says "MUST be copied in the response"
-    /// (`CLAUDE.md` §7).
+    /// For a reply whose RCODE is chosen: it still owes the OPT (RFC 6891
+    /// §6.1.1) and DO "MUST be copied" (RFC 3225 §3), clear if the list did not
+    /// parse. [`client_edns`] is the answering path's version (`CLAUDE.md` §7).
     pub fn of(request: &DnsMessage) -> ClientEdns {
         client_edns(request).unwrap_or(ClientEdns::Present {
             do_bit: false,
@@ -532,18 +489,11 @@ impl ClientEdns {
         })
     }
 
-    /// The same OPT, carrying `error` when there is one (RFC 8914 §2).
+    /// The same OPT, carrying `error` when there is one (RFC 8914 §2), only
+    /// where the OPT goes.
     ///
-    /// The EDE goes where the OPT goes and nowhere else, so a client that sent
-    /// none gets neither: this is the [`DnsMessage`]-shaped half of the rule
-    /// [`ResponseWriter::set_extended_error`] holds for the writer-shaped half.
-    ///
-    /// Total. Encoding the option can only fail on one too long for its length
-    /// field, which [`ExtendedError`]'s own bound on EXTRA-TEXT puts out of
-    /// reach on the fresh OPT this builds; the answer to that impossible `Err`
-    /// is to drop the *reason* and keep the reply, since a refusal without its
-    /// annotation is still the answer and a refusal that failed to serialize is
-    /// not. Decided here rather than by each caller (`CLAUDE.md` §7).
+    /// Total: [`ExtendedError`]'s bound makes encoding fail only in theory, and
+    /// then the reason is dropped and the reply kept (`CLAUDE.md` §7).
     pub fn mirror_with(self, server: ServerOpt, error: Option<ExtendedError>) -> Option<Edns> {
         let mirrored = self.mirror(server)?;
         let Some(error) = error else {
@@ -560,16 +510,9 @@ impl ClientEdns {
 
 /// Read `request`'s EDNS, or the RCODE that refuses it.
 ///
-/// `Err` is FORMERR for an option list that does not parse and BADVERS for a
-/// version past [`crate::EDNS_VERSION`] (RFC 6891 §6.1.3). Both refusals still owe the
-/// client a bare version-0 OPT, since BADVERS is an extended RCODE and its high
-/// bits live in that record — the caller attaches it, because a refusal is
-/// answered differently on each daemon.
-///
-/// `edns_header` rather than `edns()`: nothing here wants the option list,
-/// which costs a `Vec` per option, and it still checks the list is well formed.
-/// One function for both daemons (`CLAUDE.md` §7). The Padding option is looked
-/// for with [`Edns::has_option`], which copies nothing.
+/// FORMERR for an unparseable option list, BADVERS past [`crate::EDNS_VERSION`]
+/// (RFC 6891 §6.1.3); both still owe a bare version-0 OPT, which the caller
+/// attaches. `edns_header`, not `edns()`: no option `Vec`s.
 pub fn client_edns(request: &DnsMessage) -> Result<ClientEdns, ResponseCode> {
     let header = request
         .edns_header()
@@ -595,26 +538,12 @@ pub fn client_edns(request: &DnsMessage) -> Result<ClientEdns, ResponseCode> {
 /// multiple of 468 octets".
 pub const PADDING_BLOCK: usize = 468;
 
-/// Pad a finished, unsigned reply whose last record is its OPT, in place
-/// (RFC 7830, `TODO.md` #187). `false` when there is no OPT last, or no room.
+/// Pad a finished, unsigned reply whose last record is its OPT, in place (RFC
+/// 7830). `false` when there is no OPT last, or no room.
 ///
-/// The caller decides *whether*: only a reply over an encrypted transport to a
-/// query that carried the option, because RFC 7830 §6 says "implementations
-/// MUST NOT use this option if the DNS transport is not encrypted". This
-/// decides *how much*: the whole message, option header included, to the next
-/// multiple of [`PADDING_BLOCK`], with 0x00 octets (§3).
-///
-/// Here, on bytes, because only the final length decides it, and every reply
-/// leaves through serialization by a different builder. Before TSIG, which
-/// must be last (RFC 8945 §5.1) and has to cover the padding.
-///
-/// `payload` is the client's advertised size and `frame` what the transport
-/// can carry, each less anything the caller will still append. §4: "padded
-/// DNS messages MUST NOT exceed the number of octets specified in the
-/// Requestor's Payload Size field", so a reply that fits under `payload` is
-/// padded at most to it. One already past it — a stream reply larger than a
-/// datagram could be, which is ordinary — was never bounded by it, and is
-/// bounded by `frame` instead.
+/// The caller decides whether: encrypted transports only (§6). This pads to a
+/// multiple of [`PADDING_BLOCK`] with zeros (§3), before TSIG (RFC 8945 §5.1),
+/// bounded by `payload` (§4) or, for a reply already past it, `frame`.
 pub fn pad_reply(reply: &mut Vec<u8>, payload: usize, frame: usize) -> bool {
     let Some(opt) = last_record_is_opt(reply) else {
         return false;

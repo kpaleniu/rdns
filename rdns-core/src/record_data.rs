@@ -16,38 +16,24 @@ use crate::dname::{skip_uncompressed_name, DNameUnpacker};
 use crate::error::WireError;
 use crate::{ParsedRecord, Rtype, Serial};
 
-/// A record's data, stored as uncompressed wire-format bytes.
+/// A record's data, stored as uncompressed, self-contained wire-format bytes:
+/// 24 bytes whatever the type.
 ///
-/// 24 bytes whatever the type: the large DNSSEC and SOA payloads do not sit
-/// inline in every record. Embedded names are expanded on the way in, so the
-/// bytes are self-contained: re-parsing or re-serializing needs no access to
-/// the message they came from.
-///
-/// Private fields are the invariant — the bytes decode as their TYPE, and the
-/// three constructors are the only way in. What it does not claim:
-///
-/// - A type with no decoder here is stored verbatim (RFC 3597 §5), as is an
-///   RDLENGTH of zero, which RFC 2136 §2.4 and §2.5 use to mean "this type, no
-///   value".
-/// - [`RecordData::parse`] still returns a `Result`. Making it infallible would
-///   mean proving every `ParsedRecord` re-encodes to bytes that decode again.
-/// - Nothing bounds the length; that check lives where the 16-bit RDLENGTH is
-///   written, at message serialization.
+/// The bytes decode as their TYPE; the constructors are the only way in. Not
+/// claimed: a type with no decoder, or RDLENGTH 0 (RFC 2136 §2.4, §2.5), is
+/// stored verbatim (RFC 3597 §5); [`RecordData::parse`] stays fallible; the
+/// length is bounded at serialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordData {
     rtype: Rtype,
     rdata: Box<[u8]>,
 }
 
-/// A borrowed [`RecordData`]: a TYPE and octets that decode as it.
+/// A borrowed [`RecordData`]: a TYPE and octets that decode as it, from a
+/// `RecordData` or an [`RdataArena`].
 ///
-/// The same invariant as the owned form and the same way in — nothing here
-/// constructs one from parts, so every `RecordDataRef` came from a
-/// `RecordData` or from an [`RdataArena`] that was handed one.
-///
-/// Every read-only accessor lives here and [`RecordData`] delegates to it, so
-/// the offset arithmetic that reads an SOA's SERIAL or an RRSIG's TYPE COVERED
-/// exists once (`CLAUDE.md` §7).
+/// Every read-only accessor lives here and [`RecordData`] delegates, so the
+/// offset arithmetic exists once (`CLAUDE.md` §7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecordDataRef<'a> {
     rtype: Rtype,
@@ -92,11 +78,8 @@ impl RecordData {
                 rdata: rdata.to_vec().into_boxed_slice(),
             });
         }
-        // Sized from what arrived, because re-encoding changes the length only
-        // where a compression pointer was expanded — and then upwards. An
-        // exactly-sized `Vec` is a `Box` without a second allocation to shrink
-        // it, which growing from empty would need: `extend_from_slice` on an
-        // empty `Vec<u8>` takes capacity to 8 whatever the record is.
+        // Sized from what arrived: re-encoding only grows an expanded pointer,
+        // and an exact `Vec` boxes without a shrink.
         let mut out = Vec::with_capacity(rdata.len());
         let rtype = parsed.encode_into(&mut out)?;
         Ok(RecordData {
@@ -308,19 +291,11 @@ impl RdataSpan {
     }
 }
 
-/// Every record's RDATA in one allocation.
+/// Every record's RDATA in one allocation: the store behind a zone.
 ///
-/// The store behind a zone (`TODO.md` #71e). A `Box<[u8]>` per record is a heap
-/// allocation to make, one to copy and one to free per record; an arena is one
-/// of each per zone, and a record shrinks to a span. Measured at a million
-/// records: cloning them was 78 ms and 2 000 001 allocations, and the same
-/// octets in an arena are 3.8 ms and two.
-///
-/// **Append-only, and spans belong to the arena that minted them.** Nothing
-/// here removes or rewrites octets: a span handed back after a removal would
-/// otherwise name something else. Reclaiming the octets of a record that has
-/// gone means rebuilding the arena, which is the owner's business —
-/// `rdns::zone::Zone` does it on a counter.
+/// A record shrinks to a span: one allocation per zone, not per record.
+/// Append-only: spans belong to the arena that minted them, and
+/// `rdns::zone::Zone` rebuilds it to reclaim octets.
 #[derive(Debug, Clone, Default)]
 pub struct RdataArena {
     bytes: Vec<u8>,
@@ -331,22 +306,16 @@ impl RdataArena {
         RdataArena::default()
     }
 
-    /// Copy `data`'s octets in and give back where they went.
-    ///
-    /// The only way to make an [`RdataSpan`], which is what lets [`get`] be
-    /// infallible and unchecked: what comes out was a [`RecordDataRef`] on the
-    /// way in.
+    /// Copy `data`'s octets in and give back where they went: the only way to
+    /// make an [`RdataSpan`], so [`get`] is infallible.
     ///
     /// [`get`]: RdataArena::get
     pub fn push(&mut self, data: RecordDataRef<'_>) -> RdataSpan {
         let off = self.bytes.len();
         self.bytes.extend_from_slice(data.rdata);
         RdataSpan {
-            // RDLENGTH is 16 bits, so `len` cannot overflow; `off` is checked
-            // because an arena past 4 GiB is reachable on a zone big enough to
-            // exhaust the machine and a silent truncation there is §2's "`as`
-            // is a bug until proven otherwise" with a wrong answer at the end
-            // of it.
+            // RDLENGTH is 16 bits; `off` is checked, as a silent truncation
+            // past 4 GiB is a wrong answer (§2).
             off: u32::try_from(off).expect("an RDATA arena under 4 GiB"),
             len: data.rdata.len() as u16,
             rtype: data.rtype,
@@ -355,15 +324,9 @@ impl RdataArena {
 
     /// Encode `parsed` straight into the arena and give back where it went.
     ///
-    /// The allocation-free spelling of `push(RecordData::from_parsed(..))`, and
-    /// exactly as trustworthy: neither checks, because both take the TYPE and
-    /// the octets from one `ParsedRecord` and `encode` is `decode`'s inverse.
-    /// What a caller cannot do through either is pair a TYPE with octets of its
-    /// own choosing (`CLAUDE.md` §17).
-    ///
-    /// A failed encode leaves the arena as it found it, so a zone that refuses
-    /// a record does not carry its half-written RDATA for the life of the
-    /// process.
+    /// As trustworthy as `push(RecordData::from_parsed(..))`: TYPE and octets
+    /// come from one `ParsedRecord` (`CLAUDE.md` §17). A failed encode leaves
+    /// the arena as it was.
     pub fn push_parsed(&mut self, parsed: &ParsedRecord) -> Result<RdataSpan, WireError> {
         let off = self.bytes.len();
         let rtype = match parsed.encode_into(&mut self.bytes) {
