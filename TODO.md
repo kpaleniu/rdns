@@ -40,20 +40,19 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Nine items. #171-#185 were filed 2026-10-05 from a comparison against
+Eight items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
 #173, #194 out of re-reading #190 and #192, #195-#198 out of a review on
 2026-10-08, #199 and #200 out of triaging #197. #181 was closed wontfix in
 triage; #171-#174, #176, #179, #183, #184, #186, #187, #189, #191, #178,
-#188, #175, #177, #180 and #182 closed 2026-10-07, and #197 and #199 2026-10-09:
+#188, #175, #177, #180 and #182 closed 2026-10-07, and #196, #197 and #199 2026-10-09:
 
 - #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
   closed, 185c and 185d wontfix.
 - #193 six RFC 6303 zones are not empty zones (needs triage).
 - #195 concurrent UPDATEs lose acknowledged changes; 195a reload, 195b
   folded in (bug, ready for agent).
-- #196 raw control bytes in two test literals (needs triage).
 - #198 the journal is fsynced under the zone map's write guard (needs triage).
 - #200 `CLAUDE.md` is written in the register it forbids in comments; split
   into rules and `docs/LESSONS.md` (enhancement, ready for human).
@@ -1126,6 +1125,7 @@ the week; the record is under "How the queue kept going stale" in
 | **172** | `rdnsr` could not forward one domain and recurse the rest | **filed 2026-10-05, closed 2026-10-07.** · `c76081a` · [`docs/closed/172.md`](docs/closed/172.md) |
 | **174** | `rdnsr` had no local data except through RPZ | **filed 2026-10-05, closed 2026-10-07.** · `977c0f6` · [`docs/closed/174.md`](docs/closed/174.md) |
 | **191** | `rdnsr` emitted no dnstap | **filed 2026-10-07, closed 2026-10-07.** · `410adf9`, `c8810c3` · [`docs/closed/191.md`](docs/closed/191.md) |
+| **196** | raw control bytes in two test literals | **filed 2026-10-08, closed 2026-10-09.** · `1738468` · [`docs/closed/196.md`](docs/closed/196.md) |
 | **178** | rdnsr control socket: flush, dump, nta, reload | **filed 2026-10-05, closed 2026-10-07.** · `3fcd534` · [`docs/closed/178.md`](docs/closed/178.md) |
 | **188** | Windows control channel: a named pipe | **filed 2026-10-06, closed 2026-10-07.** · `e8ebd1c` · [`docs/closed/188.md`](docs/closed/188.md) |
 | **175** | DNS over TLS to forwarders | **filed 2026-10-05, closed 2026-10-07.** · `b21b5dd`, ` d8f5561` · [`docs/closed/175.md`](docs/closed/175.md) |
