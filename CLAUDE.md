@@ -45,6 +45,45 @@ finding definitions, and symbol queries in Rust files.
 
 ---
 
+## Writing comments
+
+Before writing a comment, in order:
+
+1. The code is clear without it: write nothing.
+2. It is a reason (a constraint, the RFC section, the rejected alternative and
+   why it fails): write that. Present tense. `//`: at most two lines. Doc
+   comment: a summary line and at most one short paragraph of contract.
+3. Anything else: the commit message.
+
+Never in a comment: "used to", "was", "now", "no longer", "previously",
+"until #N", "since #N", "watched failing", a strike-through, a list of past
+bugs, a measurement. Tests say what they check: "Fails if the zone is
+installed without writing the file."
+
+Cite RFC sections and these rules freely. Cite a closed item only where its
+file holds what the claim rests on: a measurement, a rejected design, a
+comparison with another implementation. A pointer to where a fix landed is
+history; `git log` finds it.
+
+Bad:
+
+```rust
+// Four ways to answer and one tail, because three of them used to `return`
+// past it: `record_dnstap` was reachable only through `finish`, so a capture
+// held no UPDATE and no transfer while `--dnstap` says "every answered
+// request" ...
+```
+
+Good:
+
+```rust
+// Every branch yields the bytes sent, so `answer` records dnstap once for all.
+```
+
+This file is written as lessons, with their history. Comments are not.
+
+---
+
 ## 1. A test that agrees with the code is not evidence
 
 The suite was green at 590 tests while `rdnsd` could not serve a CNAME, a
@@ -443,21 +482,10 @@ Cheap to re-check, expensive to rediscover.
 - A `#[global_allocator]` applies to the whole binary, so allocation-count tests
   belong in their own `tests/` file.
 
-## 11. Comments, commits, and `TODO.md`
+## 11. Commits and `TODO.md`
 
-Terse. Facts, not essays. Say why, in as few words as it takes, then stop.
+Comments: see "Writing comments" above §1.
 
-- A comment records why, or why not: the rejected alternative, the bug the
-  obvious version would have, the RFC that forbids it. One or two lines. Never
-  restate the code.
-- A comment describes the code as it is, never how it got there. "Used to",
-  "until #N", "was #N", "watched failing against", a struck-through claim, a
-  list of past bugs: all of it belongs in the commit message, which is where
-  `git blame` leads and which travels with the change. A comment that cites a
-  closed item as its reason has not stated the reason; state it. Cite an open
-  item only to name a limitation that is still true. Measurements that settled
-  a choice go in the commit; the comment states the choice.
-- No comment where the code is plain. Deleting a redundant comment is a fix.
 - Commit messages: imperative subject line, then reasoning, RFC citations, and
   how it was verified. Terse bullets. Do not narrate the diff, and do not
   describe the machine it was built on (§20) — a message is the one thing here
@@ -475,10 +503,12 @@ Terse. Facts, not essays. Say why, in as few words as it takes, then stop.
   closed-work table already held, two of them nested into markdown that no longer
   rendered. Overwrite a status line; strike a claim. The test is whether somebody
   reading the struck version learns why something went wrong.
-- Issue numbers are stable identifiers referenced from the code and from each
-  other: `docs/issues/NNN.md` while open, `docs/closed/NNN.md` after. Move the
-  file, never renumber it. A citation reads `TODO.md #N` because the closed
-  table there points at the file.
+- Issue numbers are stable identifiers: `docs/issues/NNN.md` while open,
+  `docs/closed/NNN.md` after. Move the file, never renumber it. A citation
+  reads `TODO.md #N` because the closed table there points at the file. Code
+  cites a closed item only as "Writing comments" allows.
+- Strike-throughs are for `TODO.md` and issue files, which have no commit
+  message of their own. Never in code.
 
 ## 12. Formatting: `cargo fmt --all`, every time
 
