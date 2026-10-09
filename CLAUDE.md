@@ -32,8 +32,15 @@ Before writing a comment, in order:
 1. The code is clear without it: write nothing.
 2. It is a reason (a constraint, the RFC section, the rejected alternative and
    why it fails): write that. Present tense. `//`: at most two lines. Doc
-   comment: a summary line and at most one short paragraph of contract.
-3. Anything else: the commit message.
+   comment: one paragraph of at most eight lines, or a summary of at most two
+   and one paragraph of at most six. Fenced code and tables do not count;
+   `//!` module docs are exempt. Quote an RFC down to the clause that carries
+   the claim, and keep the section number.
+3. A design argument too long for that, which is hard to reverse, surprising
+   and a real trade-off: an ADR in `docs/adr/`, and the comment links it.
+4. Anything else: the commit message.
+
+`python tools/comment_caps.py` counts the blocks over these limits.
 
 Never in a comment: "used to", "was", "now", "no longer", "previously",
 "until #N", "since #N", "watched failing", a strike-through, a list of past
