@@ -4,12 +4,12 @@
 //! One connect, one command, one reply, then close ([`rdns_core::control`]). Nothing
 //! to overlap, so `std` rather than `tokio`.
 //!
-//! A Unix socket, or on Windows a named pipe (`TODO.md` #188).
+//! A Unix socket, or on Windows a named pipe.
 
 // `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
 #![warn(unreachable_pub)]
-// `TODO.md` #143: `push_str(&format!(..))` allocates a `String` to copy it;
-// `write!` into the target does not. Off by default (restriction group).
+// `push_str(&format!(..))` allocates a `String` to copy it; `write!` into the
+// target does not. Off by default (restriction group).
 #![warn(clippy::format_push_string)]
 
 use clap::Parser;
@@ -122,9 +122,9 @@ fn exchange(cli: &Cli, request: &str) -> anyhow::Result<String> {
     Ok(reply)
 }
 
-/// The pipe opened as a file (`TODO.md` #188). A pipe has no half-close and
-/// `std` no read timeout on a file, so the request ends at its newline and
-/// the exchange runs on a thread the timeout abandons.
+/// The pipe opened as a file. A pipe has no half-close and `std` no read
+/// timeout on a file, so the request ends at its newline and the exchange runs
+/// on a thread the timeout abandons.
 #[cfg(windows)]
 fn exchange(cli: &Cli, request: &str) -> anyhow::Result<String> {
     use anyhow::Context;
