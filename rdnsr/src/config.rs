@@ -40,7 +40,7 @@ pub(crate) struct Config {
     #[serde(default)]
     rpz: Rpz,
     /// TSIG keys, by key name, in `rdnsd`'s spelling: `[keys."partner.key."]`.
-    /// A policy feed's `master` names one with `#name` (`TODO.md` #57f).
+    /// A policy feed's `master` names one with `#name`.
     #[serde(default)]
     keys: std::collections::BTreeMap<String, Key>,
     /// Routed domains (`TODO.md` #172): `[[forward-zone]]` and `[[stub-zone]]`.
@@ -444,9 +444,9 @@ impl Config {
     ///
     /// Every table is destructured without `..`, so a key added to a
     /// declaration does not compile until this names it, and one named and not
-    /// used is `unused_variables`. `dead_code` covered only a key nothing read;
-    /// one `check` validates and this forgot passed silently (`TODO.md` #113,
-    /// #103). `[server]`'s projection is `server_table!`'s.
+    /// used is `unused_variables`. `dead_code` covers only a key nothing reads;
+    /// one `check` validates and this forgot would pass silently. `[server]`'s
+    /// projection is `server_table!`'s.
     pub(crate) fn apply(&self, cli: &mut Cli) {
         let Config {
             server,
@@ -616,11 +616,10 @@ tls-key = "./key.pem"
 
     /// Every `[server]` key reaches the flag of the same name, with its value.
     ///
-    /// `TODO.md` #103: `deny_unknown_fields` refuses a key the struct does not
-    /// declare, and nothing refused a key the struct declared and `apply`
-    /// never read. The projection comes out of `server_table!` now, and this
-    /// asserts the value rather than "not the default", so a key wired to the
-    /// wrong flag fails here too.
+    /// `deny_unknown_fields` refuses a key the struct does not declare; this
+    /// refuses one the struct declares and `apply` never reads. The projection
+    /// comes out of `server_table!`, and this asserts the value rather than
+    /// "not the default", so a key wired to the wrong flag fails here too.
     #[test]
     fn every_server_key_reaches_its_flag() {
         let mut cli = Cli::parse_from(["rdnsr"]);
@@ -667,8 +666,7 @@ tls-key = "./key.pem"
         }
     }
 
-    /// A config file that sets nothing changes no default (`TODO.md` #63e, for
-    /// this daemon).
+    /// A config file that sets nothing changes no default.
     ///
     /// A tripwire, not a regression test (`CLAUDE.md` §10): both sides read one
     /// function in the crate root, so nothing here can be wrong today. What it
@@ -716,12 +714,12 @@ tls-key = "./key.pem"
     /// Every flag `--config` conflicts with has a key in this file, and the two
     /// spellings match.
     ///
-    /// This is what ties the two declarations together, and what #46c is the
-    /// precedent for: `[zones."x"].also-notify` was parsed into a field nothing
-    /// read, because a key and a flag that mean one setting were written in two
-    /// places with nothing comparing them. clap knows which flags conflict with
-    /// `--config` — that set *is* "what the file must be able to say" — so the
-    /// check is mechanical rather than a list somebody maintains.
+    /// This is what ties the two declarations together: a key and a flag that
+    /// mean one setting, written in two places with nothing comparing them, is
+    /// how a key comes to be parsed into a field nothing reads. clap knows
+    /// which flags conflict with `--config` — that set *is* "what the file must
+    /// be able to say" — so the check is mechanical rather than a list somebody
+    /// maintains.
     ///
     /// A type error counts as found: what is being asserted is that the key
     /// exists under one of the three tables, not that this value fits it.
@@ -830,8 +828,8 @@ hsot = \"127.0.0.1\"
     }
 
     /// The pair rule is checked once, over the merged view, by
-    /// `Encrypted::configure` (`TODO.md` #153): a file naming a listener and no
-    /// certificate parses, and is refused there.
+    /// `Encrypted::configure`: a file naming a listener and no certificate
+    /// parses, and is refused there.
     #[test]
     fn a_tls_listener_needs_a_certificate() {
         let mut cli = Cli::parse_from(["rdnsr"]);
@@ -1086,9 +1084,8 @@ master = \"a.example.@192.0.2.9\"
         assert!(err.to_string().contains("unknown on-expire"), "got: {err}");
     }
 
-    /// Matched as the keyring matches, not as text: `#partner.key` for
-    /// `partner.key.` was refused here and resolves through the flags
-    /// (`TODO.md` #141).
+    /// Matched as the keyring matches, not as text: fails if `#partner.key` for
+    /// `partner.key.` is refused here while it resolves through the flags.
     #[test]
     fn a_feed_key_reference_matches_as_the_keyring_does() {
         for (defined, named) in [
@@ -1107,7 +1104,7 @@ master = \"a.example.@192.0.2.9\"
         }
     }
 
-    /// #57f: a feed's master may name a key, and a name that defines nothing is
+    /// A feed's master may name a key, and a name that defines nothing is
     /// refused at startup rather than sending an unsigned transfer.
     #[test]
     fn a_feed_can_name_a_key_and_an_undefined_one_is_refused() {

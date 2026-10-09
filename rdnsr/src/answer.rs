@@ -58,8 +58,8 @@ pub(crate) struct Resolving {
     pub(crate) empty_zones: EmptyZones,
     /// Who may send a NOTIFY asking for the `--rpz` files to be re-read, and
     /// how to queue one. `None` unless `--rpz-notify-from` named somebody, and
-    /// then a NOTIFY is NOTIMP as it was before `TODO.md` #57c — because then
-    /// this resolver really does not implement one.
+    /// then a NOTIFY is NOTIMP, because then this resolver really does not
+    /// implement one.
     pub(crate) rpz_notify: Option<NotifyAcl>,
     /// One wake per *transferred* feed (`TODO.md` #57d shape A). A NOTIFY names
     /// a zone, so the feed it names is the feed that refreshes; waking the
@@ -145,9 +145,8 @@ pub(crate) async fn handle_query(
     };
     let timer = LatencyTimer::new();
     ctx.metrics.count(&ctx.metrics.queries_received);
-    // Per source and per type, for the periodic anomaly warnings — the counters
-    // `rdnsd` has kept since #9d and this daemon held and never filled
-    // (`TODO.md` #30m). `now` is the caller's: on UDP it is the instant the rate
+    // Per source and per type, for the periodic anomaly warnings, as `rdnsd`
+    // counts them. `now` is the caller's: on UDP it is the instant the rate
     // limiter already used.
     ctx.logger
         .log_query(peer, msg.queries.first().map(|q| q.qtype), now);
@@ -161,7 +160,7 @@ pub(crate) async fn handle_query(
     let client_max = ctx.udp.reply_ceiling(&msg, transport);
 
     // A NOTIFY is how a policy feed says it has changed, for a resolver told
-    // whose word to take for it (`TODO.md` #57c).
+    // whose word to take for it.
     if msg.opcode == OpCode::Notify {
         if let Some(acl) = rpz_notify {
             let (reply, rcode) = policy_notify(
@@ -191,7 +190,7 @@ pub(crate) async fn handle_query(
     // Before any work on the client's behalf: a malformed option list is
     // FORMERR, an unimplemented EDNS version is BADVERS (RFC 6891 §6.1.3), and
     // both replies carry a bare version-0 OPT. `rdnsd` reads the same decision
-    // out of the same function (`TODO.md` #30h).
+    // out of the same function.
     let client_edns = match rdns::response::client_edns(&msg) {
         Ok(edns) => edns,
         Err(rcode) => {
@@ -205,18 +204,16 @@ pub(crate) async fn handle_query(
     // RFC 9619 §4: "A DNS message with OPCODE = 0 MUST NOT include a QDCOUNT
     // parameter whose value is greater than 1", and one that does "MUST be
     // treated as an incorrectly formatted message" — one RCODE and one set of
-    // sections cannot describe two lookups. This answered the first question
-    // and echoed one, so the reply did not match the request either
-    // (`TODO.md` #30r).
+    // sections cannot describe two lookups, and answering the first question
+    // and echoing one is a reply that does not match the request either.
     //
-    // QDCOUNT = 0 was *dropped* here until `TODO.md` #78c, where `rdnsd`
-    // answered it: one packet, two daemons, two behaviours. §4's QDCOUNT = 0
-    // sentence settles neither, since it binds firewalls rather than
-    // responders. RFC 7873 §5.4 is what such a query is for, extends the QUERY
-    // opcode to it only "for servers with DNS Cookies enabled", and says a
-    // server without them "will normally send FORMERR". Measured: BIND
-    // 9.20.27, Knot 3.6.0, NSD 4.12.0 and Unbound 1.23.1 all answer it and
-    // none drops it.
+    // QDCOUNT = 0 too, as `rdnsd` answers it (`TODO.md` #78c): one packet, one
+    // behaviour across the two daemons. §4's QDCOUNT = 0 sentence settles
+    // neither, since it binds firewalls rather than responders. RFC 7873 §5.4
+    // is what such a query is for, extends the QUERY opcode to it only "for
+    // servers with DNS Cookies enabled", and says a server without them "will
+    // normally send FORMERR". Measured: BIND 9.20.27, Knot 3.6.0, NSD 4.12.0
+    // and Unbound 1.23.1 all answer it and none drops it.
     let [query] = msg.queries.as_slice() else {
         ctx.record_answer(ResponseCode::FormatError, timer);
         return empty_error(
@@ -355,8 +352,8 @@ pub(crate) async fn handle_query(
     };
     // The cache said this entry is in the last tenth of its TTL and nobody has
     // been asked to refresh it yet. Offered here, at the lookup, so no exit
-    // below can drop it (`TODO.md` #78a, #102), and to a queue, so nothing
-    // runs in this task after the reply (#114).
+    // below can drop it, and to a queue, so nothing runs in this task after the
+    // reply.
     if let (Some(refreshes), Some(hit)) = (refreshes, &hit) {
         if hit.refresh {
             refreshes.offer(query.clone(), Why::Prefetch, &ctx.metrics);
@@ -392,10 +389,9 @@ pub(crate) async fn handle_query(
         // drawn on.
         ctx.metrics.count(&ctx.metrics.cache_misses);
         ctx.metrics.count(&ctx.metrics.queries_recursive);
-        // The nameserver triggers, which can only be asked while the
-        // delegation chain is being walked (`rdns::rpz`, `TODO.md` #56).
-        // Built only when some zone has one: a feed of QNAME rules pays
-        // nothing here.
+        // The nameserver triggers, which can only be asked while the delegation
+        // chain is being walked (`rdns::rpz`). Built only when some zone has
+        // one: a feed of QNAME rules pays nothing here.
         let watch = policy
             .watches_delegations()
             .then(|| policy.at_delegations(query.qname.as_ref(), query.qtype));
@@ -517,7 +513,7 @@ pub(crate) async fn handle_query(
 
     resp.cd = checking_disabled;
     // Once per answer a client gets, cache hits included; a prefetch and
-    // DNS64's A query resolve outside this function (`TODO.md` #186).
+    // DNS64's A query resolve outside this function.
     if let Some(outcome) = outcome {
         ctx.metrics.count_outcome(outcome);
     }
@@ -553,9 +549,9 @@ pub(crate) async fn handle_query(
 /// **Every path that can produce an empty AAAA answer ends here**, and the two
 /// that must not synthesize end at `finish` instead: a name RFC 6761 answers
 /// from the table is not an IPv4 name behind a translator, and a name a policy
-/// zone blocked is blocked (`TODO.md` #45a). `CLAUDE.md` §7 is about the
-/// opposite mistake — an early return jumping over a shared epilogue — so the
-/// split is deliberate and the reason is written at both ends.
+/// zone blocked is blocked. `CLAUDE.md` §7 is about the opposite mistake — an
+/// early return jumping over a shared epilogue — so the split is deliberate and
+/// the reason is written at both ends.
 ///
 /// `client.dns64` carries everything about the request that decides this, so
 /// nothing here re-derives it.
@@ -670,7 +666,7 @@ async fn synthesized_aaaa(
 ///
 /// The answer section, or `None` for a failure or a bogus answer. What is
 /// stored is what the query path stores: failing closed and CD are about the
-/// reply, not the cache (`TODO.md` #117).
+/// reply, not the cache.
 async fn resolve_and_store(
     serving: &Resolving,
     query: &QuerySection,
@@ -707,12 +703,10 @@ async fn resolve_and_store(
 /// for it is how a DNS64 resolver doubles its own traffic.
 ///
 /// Not the denial cache: it saves at most one upstream query per AAAA, and the
-/// query path skips it under CD, so this would need the bit passed in to agree
-/// (`TODO.md` #117).
+/// query path skips it under CD, so this would need the bit passed in to agree.
 ///
 /// [`Caches::lookup`] rather than the caches one at a time: asked "yes" first,
-/// this synthesized from an A that a newer "no" had replaced
-/// (`TODO.md` #129).
+/// this would synthesize from an A that a newer "no" has replaced.
 async fn cached_or_resolve(
     serving: &Resolving,
     query: &QuerySection,
@@ -844,7 +838,7 @@ fn stale_answer(
 /// Printed at startup and again after every reload, for the reason the rate
 /// limiter's policy is: a rewrite is invisible on the wire, so the feed that
 /// loaded and the feed the operator meant to load are otherwise the same
-/// picture (`CLAUDE.md` §4, §14, `TODO.md` #45a, #56).
+/// picture (`CLAUDE.md` §4, §14).
 pub(crate) fn log_policy(zones: &PolicyZones) {
     for zone in zones.zones() {
         let [qname, client_ip, response_ip, nsdname, nsip] = zone.trigger_counts();
@@ -1250,9 +1244,8 @@ fn policy_notify(
 /// not ours (RFC 1035 §4.1.1). RA is set here because this is a recursive
 /// resolver; that is the one policy field every caller agrees on.
 ///
-/// This used to clear CD, against RFC 4035 §3.2.2's "the name server side MUST
-/// copy the setting of the CD bit from a query to the corresponding response",
-/// and two of the eight call sites set it back by hand (`TODO.md` #30g).
+/// CD is the client's: RFC 4035 §3.2.2, "the name server side MUST copy the
+/// setting of the CD bit from a query to the corresponding response".
 fn build_response(
     request: &DnsMessage,
     answers: Vec<ResourceRecord>,
@@ -1270,7 +1263,7 @@ fn build_response(
 ///
 /// Smaller than the query that asked for it, so useless for amplification, and
 /// RFC 1035 §4.2.1 has the client retry over TCP where the handshake proves the
-/// source and the budget no longer applies. Silence would leave a legitimate
+/// source and the budget does not apply. Silence would leave a legitimate
 /// client with a timeout and no idea TCP would work.
 ///
 /// Built by reading our own reply back rather than editing its header in place:
@@ -1378,7 +1371,7 @@ mod tests {
     }
 
     /// NOTIMP is built away from `finish`, so it mirrors the OPT by hand and
-    /// used to drop DO with it (RFC 6891 §6.1.1, RFC 3225 §3; `CLAUDE.md` §7).
+    /// can drop DO with it (RFC 6891 §6.1.1, RFC 3225 §3; `CLAUDE.md` §7).
     #[test]
     fn an_unimplemented_opcode_keeps_the_clients_do_bit() {
         let mut request = rdns::DnsMessageBuilder::new()
@@ -1522,8 +1515,8 @@ mod tests {
         matches!(fut.as_mut().poll(&mut cx), Poll::Ready(()))
     }
 
-    /// The whole of `TODO.md` #57c's happy path: a listed sender, a zone we
-    /// hold, NOERROR, and a re-read queued rather than run.
+    /// The happy path: a listed sender, a zone we hold, NOERROR, and a re-read
+    /// queued rather than run.
     #[tokio::test]
     async fn a_notify_from_a_listed_address_queues_a_re_read() {
         let (serving, reload) = notified_by(&["198.51.100.0/24"]);
@@ -1669,8 +1662,7 @@ mod tests {
     }
 
     /// A handle with a serve-stale window and a clock the test moves: a TTL is
-    /// whole seconds, so every other way of reaching expiry is a sleep
-    /// (`TODO.md` #52).
+    /// whole seconds, so every other way of reaching expiry is a sleep.
     fn serving_stale(seconds: u64) -> (Arc<Resolving>, Clock) {
         timed(StalePolicy::seconds(seconds))
     }
@@ -1756,7 +1748,7 @@ mod tests {
     /// known goes out instead of SERVFAIL, with the 30-second TTL §4 asks for
     /// and RFC 8914 §4.4's code saying what happened.
     ///
-    /// Watched failing with `--serve-stale` off: SERVFAIL, no answers.
+    /// Fails with `--serve-stale` off: SERVFAIL, no answers.
     #[tokio::test]
     async fn an_expired_answer_is_served_when_the_resolution_fails() {
         let (serving, clock) = serving_stale(3600);
@@ -1863,8 +1855,8 @@ mod tests {
     /// The resolution timer firing is SERVFAIL with EDE 22, at 10 s, as BIND,
     /// PowerDNS and Knot answer it (`TODO.md` #168).
     ///
-    /// Watched failing without the timer: the exchange's own 30 s, and the
-    /// text "no authority answered".
+    /// Fails without the timer: the exchange's own 30 s, and the text "no
+    /// authority answered".
     #[tokio::test(start_paused = true)]
     async fn a_resolution_past_its_timer_is_servfail_with_no_reachable_authority() {
         let (serving, _clock) = timed_with(
@@ -1899,7 +1891,7 @@ mod tests {
     /// The timer is a failure like any other, so RFC 8767 §4's stale answer
     /// takes the SERVFAIL's place.
     ///
-    /// Watched failing without the timer: the same stale answer, at 30 s.
+    /// Fails without the timer: the same stale answer, at 30 s.
     #[tokio::test(start_paused = true)]
     async fn a_resolution_past_its_timer_is_answered_stale() {
         let (serving, clock) = timed_with(
@@ -2011,11 +2003,11 @@ mod tests {
     /// once from what was last known, and its refresh goes to the queue —
     /// BIND's `stale-answer-client-timeout 0` (`TODO.md` #58).
     ///
-    /// Against an upstream that never answers, so an answer that waited for
-    /// the resolution misses `asked_at_once`'s two seconds. The EDE says a
-    /// refresh is under way and not that the servers were unreachable: nothing
-    /// has asked them yet. Watched failing with the early arm removed: the
-    /// query waited out the upstream and `asked_at_once` timed out.
+    /// Against an upstream that never answers, so an answer that waited for the
+    /// resolution misses `asked_at_once`'s two seconds. The EDE says a refresh
+    /// is under way and not that the servers were unreachable: nothing has
+    /// asked them yet. Fails with the early arm removed: the query waits out
+    /// the upstream and `asked_at_once` times out.
     #[tokio::test]
     async fn an_expired_answer_is_served_first_and_refreshed_behind_it() {
         let (resolver, _upstream) = silent_resolver();
@@ -2079,8 +2071,8 @@ mod tests {
     /// Stale, the later of a "yes" and a "no" answers, and here the "no" is
     /// later: an address cached, then the name deleted (`TODO.md` #132).
     /// RFC 8767 §4: an NXDomain answer "MUST be considered to have refreshed
-    /// the data at the resolver". Watched failing with the "yes" asked first:
-    /// NOERROR with the address.
+    /// the data at the resolver". Fails with the "yes" asked first: NOERROR
+    /// with the address.
     #[tokio::test]
     async fn a_stale_denial_learned_later_beats_a_stale_address() {
         let (resolver, _upstream) = silent_resolver();
@@ -2100,8 +2092,8 @@ mod tests {
         assert_eq!(stale_errors(&reply)[0].0, InfoCode::STALE_NXDOMAIN);
     }
 
-    /// An NXDOMAIN is about the name, so one learned asking for AAAA beats an
-    /// A held from before it. Watched failing as the test above.
+    /// An NXDOMAIN is about the name, so one learned asking for AAAA beats an A
+    /// held from before it. Fails as the test above.
     #[tokio::test]
     async fn a_stale_denial_of_the_name_covers_every_type_held_before_it() {
         let (resolver, _upstream) = silent_resolver();
@@ -2155,8 +2147,8 @@ mod tests {
 
     /// Fresh, a "yes" stored after a "no" answers. The query path never stores
     /// one under a fresh "no", but a refresh queued before the "no" arrived
-    /// does (`TODO.md` #133). Watched failing without the retiring in
-    /// `Caches::store`: NXDOMAIN for the negative TTL.
+    /// does (`TODO.md` #133). Fails without the retiring in `Caches::store`:
+    /// NXDOMAIN for the negative TTL.
     #[tokio::test]
     async fn a_fresh_address_stored_after_a_denial_is_the_answer() {
         let (resolver, _upstream) = silent_resolver();
@@ -2174,8 +2166,7 @@ mod tests {
     }
 
     /// And the NXDOMAIN of an ancestor, which denies every name below it
-    /// (RFC 8020) until a name below it turns out to exist. Watched failing
-    /// as above.
+    /// (RFC 8020) until a name below it turns out to exist. Fails as above.
     #[tokio::test]
     async fn a_fresh_address_below_a_denied_name_is_the_answer() {
         let (resolver, _upstream) = silent_resolver();
@@ -2229,10 +2220,9 @@ mod tests {
         );
     }
 
-    /// A name added inside a cached NSEC gap, once an answer for it is held,
-    /// is that answer: the exact match is asked before the gap (RFC 8198
-    /// Appendix A, `TODO.md` #134). Watched failing with synthesis first:
-    /// NXDOMAIN, 0 answers.
+    /// A name added inside a cached NSEC gap, once an answer for it is held, is
+    /// that answer: the exact match is asked before the gap (RFC 8198 Appendix
+    /// A, `TODO.md` #134). Fails with synthesis first: NXDOMAIN, 0 answers.
     #[tokio::test]
     async fn an_answer_held_inside_a_cached_gap_is_the_answer() {
         let (resolver, _upstream) = silent_resolver();
@@ -2254,7 +2244,7 @@ mod tests {
 
     /// The wildcard half (RFC 8198 §5.3): a name the zone has since given its
     /// own record, once that is held, is not answered with the wildcard's.
-    /// Watched failing with synthesis first: the wildcard's 192.0.2.7.
+    /// Fails with synthesis first: the wildcard's 192.0.2.7.
     #[tokio::test]
     async fn an_answer_held_under_a_cached_wildcard_is_the_answer() {
         let (resolver, _upstream) = silent_resolver();
@@ -2402,10 +2392,8 @@ mod tests {
     }
 
     /// And the other way round: the pool `--serve-stale-first` starts does not
-    /// switch prefetching on. `Resolving` held an `Option<Prefetch>` whose
-    /// presence was `--prefetch`, so running the pool for a second reason
-    /// would have been. Watched failing with the lookup's switch read as
-    /// `refreshes.is_some()`: the live entry in its last tenth was queued.
+    /// switch prefetching on. Fails with the lookup's switch read as
+    /// `refreshes.is_some()`: the live entry in its last tenth is queued.
     #[tokio::test]
     async fn the_stale_first_pool_alone_does_not_prefetch() {
         let (serving, clock, mut queue) = stale_first(test_resolver());
@@ -2480,14 +2468,14 @@ mod tests {
         Outcome::ALL.map(|o| serving.ctx.metrics.outcome_count(o))
     }
 
-    /// Every answer a client gets is counted once by what validation concluded
-    /// (`TODO.md` #186): secure resolved and secure again from the cache,
-    /// unanchored, and insecure out of the cache, where it is seeded because
-    /// the signed fixture has no unsigned delegation to prove. A prefetch is
-    /// counted nowhere: no client is getting it.
+    /// Every answer a client gets is counted once by what validation concluded:
+    /// secure resolved and secure again from the cache, unanchored, and
+    /// insecure out of the cache, where it is seeded because the signed fixture
+    /// has no unsigned delegation to prove. A prefetch is counted nowhere: no
+    /// client is getting it.
     ///
-    /// Watched failing with the count after the answer tuple removed: the
-    /// resolved and cached answers moved nothing.
+    /// Fails with the count after the answer tuple removed: the resolved and
+    /// cached answers move nothing.
     #[tokio::test]
     async fn each_answer_is_counted_by_what_validation_concluded() {
         // Outside the anchored zone the fixture's NXDOMAIN proof is the wrong
@@ -2576,8 +2564,8 @@ mod tests {
     }
 
     /// Which caches a resolution reaches, by what validation concluded and
-    /// whether it answered (`TODO.md` #117). Read back through the lookups a
-    /// later query makes, so a row is what that query would find.
+    /// whether it answered. Read back through the lookups a later query makes,
+    /// so a row is what that query would find.
     #[test]
     fn a_resolution_is_stored_by_what_validation_concluded() {
         let zone = SignedZone::new();
@@ -2638,8 +2626,8 @@ mod tests {
     /// A prefetch keeps a validated denial as the query path does, so the rest
     /// of its gap is answered without asking again (RFC 8198 §5.1).
     ///
-    /// Watched failing with `resolve_and_store`'s own storing restored — the
-    /// answers and negatives only — as a second upstream query for `b`.
+    /// Fails if `resolve_and_store` stores the answers and negatives only: a
+    /// second upstream query for `b`.
     #[tokio::test]
     async fn a_refreshed_denial_answers_the_rest_of_its_gap() {
         let (resolver, asked) = SignedZone::new().upstream();
@@ -2680,8 +2668,8 @@ mod tests {
     }
 
     /// An answer synthesized from a cached wildcard is a cache hit, as the
-    /// other three arms answered from something held are (`TODO.md` #127).
-    /// Watched failing with the count removed: 0 hits.
+    /// other three arms answered from something held are. Fails with the count
+    /// removed: 0 hits.
     #[tokio::test]
     async fn a_synthesized_wildcard_answer_is_a_cache_hit() {
         let zone = SignedZone::new();
@@ -2715,14 +2703,13 @@ mod tests {
         assert_eq!(read(&m.cache_misses), 0);
     }
 
-    /// The sink closes when the reply is in it, not when the prefetch the
-    /// reply discovered has finished (`TODO.md` #114).
+    /// The sink closes when the reply is in it, not when the prefetch the reply
+    /// discovered has finished.
     ///
     /// DoH answers once the handler task is joined and DoQ sends FIN once the
-    /// sink closes, so for them this *is* the reply's latency. Against an
-    /// upstream that never answers, the refresh that used to run inside
-    /// `handle` held the sink open for 1.5 s after a reply ready in 0.9 ms.
-    /// Watched failing with a refresh put back after the reply in `handle`.
+    /// sink closes, so for them this *is* the reply's latency. Fails with a
+    /// refresh after the reply in `handle`: against an upstream that never
+    /// answers, it holds the sink open for 1.5 s after a reply ready in 0.9 ms.
     #[tokio::test]
     async fn a_handler_is_done_when_its_reply_is_sent() {
         use rdns_transport::tcp::{Handler, Reply};
@@ -2775,13 +2762,10 @@ mod tests {
 
     /// A rewritten answer still asks for its prefetch.
     ///
-    /// `refresh` was set at the cache hit and read by the tail; the `rpz-ip`
-    /// exit between them returned `reply.into()`, and `From<Option<Vec<u8>>>`
-    /// filled `refresh: None` — so one rule matching one address turned
-    /// prefetching off for that name with nothing to see (`TODO.md` #78a).
-    /// §7's early return over a shared epilogue, with the epilogue in a
-    /// struct field. Since #114 the offer is made at the lookup, before any
-    /// exit.
+    /// The offer is made at the lookup, before any exit: carried to a tail, an
+    /// `rpz-ip` exit returning `reply.into()` fills `refresh: None`, and one
+    /// rule matching one address turns prefetching off for that name with
+    /// nothing to see — §7's early return over a shared epilogue.
     #[tokio::test]
     async fn a_rewritten_answer_still_asks_for_its_refresh() {
         let (serving, clock, mut queue) =
@@ -2827,11 +2811,10 @@ mod tests {
 
     /// And so does a dropped one, which is the same exit.
     ///
-    /// `rpz-drop` sends nothing back, and the entry still ages out of the
-    /// cache while the next client waits for a full recursion. Refreshing it
-    /// is also how the name stops being blocked when it moves off the address
-    /// the rule names. Pinned because the fix changed it: this path used to
-    /// lose the prefetch with the rewrite path.
+    /// `rpz-drop` sends nothing back, and the entry still ages out of the cache
+    /// while the next client waits for a full recursion. Refreshing it is also
+    /// how the name stops being blocked when it moves off the address the rule
+    /// names.
     #[tokio::test]
     async fn a_dropped_answer_still_asks_for_its_refresh() {
         let (serving, clock, mut queue) = prefetching(
@@ -3125,8 +3108,7 @@ mod tests {
 
     /// A newer "no" for the A outranks the older A still held, as it does for a
     /// client's A query: both caches can hold the question, because a prefetch
-    /// finding the A gone stores the "no" without retiring the "yes"
-    /// (`TODO.md` #129).
+    /// finding the A gone stores the "no" without retiring the "yes".
     #[tokio::test]
     async fn a_newer_no_for_the_a_is_not_synthesized_over() {
         let serving = with_dns64();
@@ -3235,7 +3217,7 @@ mod tests {
         );
     }
 
-    /// The whole of #56 end to end: a name nothing in the feed mentions,
+    /// A nameserver trigger end to end: a name nothing in the feed mentions,
     /// delegated to a nameserver the feed does mention, comes back NXDOMAIN.
     ///
     /// The fake root refers and nothing else answers, so the `192.0.2.13` glue
@@ -3699,8 +3681,8 @@ mod tests {
 
     /// RFC 6303 §3: a name in an empty zone is an authoritative NXDOMAIN, with
     /// the zone's SOA, and nothing is asked upstream. The apex is the zone's
-    /// SOA, NS and NODATA. AA was clear on all of these until `TODO.md` #173;
-    /// watched failing on that with the `authoritive = true` removed.
+    /// SOA, NS and NODATA, all with AA set (`TODO.md` #173). Fails with the
+    /// `authoritive = true` removed.
     #[tokio::test]
     async fn an_empty_zone_is_answered_authoritatively_and_never_forwarded() {
         let (serving, asked) = empty_zone_resolver(EmptyZones::default(), "");
@@ -3731,8 +3713,8 @@ mod tests {
     }
 
     /// One empty zone switched off is resolved like any other name, and its
-    /// neighbours stay local. Watched failing with `lookup` ignoring the set:
-    /// nothing reached the upstream.
+    /// neighbours stay local. Fails with `lookup` ignoring the set: nothing
+    /// reaches the upstream.
     #[tokio::test]
     async fn a_switched_off_empty_zone_is_resolved() {
         let zones =
@@ -3748,9 +3730,9 @@ mod tests {
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// A routed domain for the empty zone answers from its servers, not
-    /// the built-in NXDOMAIN (ADR 0008, `TODO.md` #172). Watched failing with
-    /// `routed` passed as `None`: NXDOMAIN, nothing asked.
+    /// A routed domain for the empty zone answers from its servers, not the
+    /// built-in NXDOMAIN (ADR 0008, `TODO.md` #172). Fails with `routed` passed
+    /// as `None`: NXDOMAIN, nothing asked.
     #[tokio::test]
     async fn a_route_under_an_empty_zone_is_asked() {
         let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -3939,14 +3921,14 @@ mod tests {
     }
 
     /// The client's EDNS advertisement is a ceiling this resolver may lower,
-    /// not one it has to honour (`TODO.md` #41b).
+    /// not one it has to honour.
     ///
-    /// A stub advertising 65,535 was given 65,535, so a large cached RRset left
-    /// as fragments — which is what every other resolver's `max-udp-size`
-    /// exists to prevent. Answered out of the cache so no upstream is involved;
-    /// the ceiling is `finish`'s and every answer path goes through it.
+    /// A stub advertising 65,535 given 65,535 gets a large cached RRset as
+    /// fragments — which is what every other resolver's `max-udp-size` exists
+    /// to prevent. Answered out of the cache so no upstream is involved; the
+    /// ceiling is `finish`'s and every answer path goes through it.
     ///
-    /// Watched failing against `msg.udp_payload_size()`: 2,093 octets, TC clear.
+    /// Fails with `msg.udp_payload_size()`: 2,093 octets, TC clear.
     #[tokio::test]
     async fn a_udp_reply_is_capped_by_this_resolver_and_not_only_by_the_client() {
         let serving = context();
@@ -4002,14 +3984,12 @@ mod tests {
 
     /// CD comes back as the client set it: RFC 4035 §3.2.2, "The name server
     /// side MUST copy the setting of the CD bit from a query to the
-    /// corresponding response". `build_response` cleared it, and two of its
-    /// eight call sites set it back by hand — the other six, this one included,
-    /// answered a CD client with CD off (`TODO.md` #30g).
+    /// corresponding response".
     ///
     /// `localhost` because `special_names` answers it from the table
     /// (RFC 6761 §6.3), so the ordinary answer path runs with no upstream.
     ///
-    /// Watched failing against the old builder: CD came back clear.
+    /// Fails with a builder that clears CD: CD comes back clear.
     #[tokio::test]
     async fn the_checking_disabled_bit_is_the_clients() {
         let serving = context();
@@ -4030,12 +4010,10 @@ mod tests {
     }
 
     /// RFC 9619 §4: a QUERY carrying more than one question "MUST be treated as
-    /// an incorrectly formatted message". `rdnsd` has refused it since #9f;
-    /// `rdnsr` answered the first question and echoed one, so the reply did not
-    /// even match the request (`TODO.md` #30r).
+    /// an incorrectly formatted message", as `rdnsd` treats it.
     ///
-    /// Watched failing without the check: NOERROR, one question, `localhost`
-    /// answered.
+    /// Fails without the check: NOERROR, one question, `localhost` answered — a
+    /// reply that does not even match the request.
     #[tokio::test]
     async fn two_questions_in_one_query_are_a_format_error() {
         let serving = context();
@@ -4058,13 +4036,12 @@ mod tests {
 
     /// No question at all is answered, not dropped (`TODO.md` #78c).
     ///
-    /// This dropped the datagram while `rdnsd` answered an empty NOERROR: one
-    /// packet, two daemons, two behaviours. RFC 9619 §4 settles neither — its
-    /// QDCOUNT = 0 sentence is addressed to firewalls, not responders — so the
-    /// peers were asked. All four answer and none drops; three of them, and the
-    /// fourth without an OPT, answer FORMERR, which is also what RFC 7873 §5.4
-    /// says a server without DNS Cookies "will normally send" to the cookie
-    /// probe that is the reason such a query exists.
+    /// RFC 9619 §4 does not settle it — its QDCOUNT = 0 sentence is addressed
+    /// to firewalls, not responders — so the peers were asked. All four answer
+    /// and none drops; three of them, and the fourth without an OPT, answer
+    /// FORMERR, which is also what RFC 7873 §5.4 says a server without DNS
+    /// Cookies "will normally send" to the cookie probe that is the reason such
+    /// a query exists.
     ///
     /// | | no OPT | OPT, no COOKIE | OPT + COOKIE |
     /// |---|---|---|---|
@@ -4073,7 +4050,7 @@ mod tests {
     /// | NSD 4.12.0 | FORMERR | NOERROR | NOERROR |
     /// | Unbound 1.23.1 | FORMERR | FORMERR | FORMERR + cookie |
     ///
-    /// Watched failing against the old code: `handle_query` returned `None`.
+    /// Fails if `handle_query` returns `None`.
     #[tokio::test]
     async fn a_query_with_no_question_is_answered_not_dropped() {
         let serving = context();
@@ -4127,10 +4104,9 @@ mod tests {
         );
     }
 
-    /// The resolver fills the counters the periodic warnings read. It held a
-    /// `QueryLogger` and only ever called `log_rate_limited` on it, so
-    /// `--anomaly-query-rate` and `--anomaly-source-queries` would have watched
-    /// a number that was always zero (`TODO.md` #30m).
+    /// The resolver fills the counters the periodic warnings read. Fails if
+    /// only `log_rate_limited` is called: `--anomaly-query-rate` and
+    /// `--anomaly-source-queries` watch a number that is always zero.
     ///
     /// `localhost` so the answer comes from the table and no upstream is
     /// involved (RFC 6761 §6.3).
@@ -4237,7 +4213,7 @@ mod tests {
     /// The reload's obligation to the caches, and its limit: an answer held
     /// from before a *nameserver* rule arrived is the one thing that rule
     /// cannot reach, because a cache hit never walks a delegation
-    /// (`TODO.md` #56, #57).
+    /// (`TODO.md` #57).
     #[tokio::test]
     async fn a_nameserver_rule_that_arrived_at_a_reload_empties_the_caches() {
         let dir = ScratchDir::new("reload-caches");

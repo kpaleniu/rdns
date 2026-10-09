@@ -175,7 +175,7 @@ impl tcp::Handler for Resolving {
     }
 
     /// One reply or none, into a sink that can carry several — a resolver never
-    /// sends more than one, and the shape is `rdnsd`'s AXFR's (`TODO.md` #30a).
+    /// sends more than one, and the shape is `rdnsd`'s AXFR's.
     async fn handle(
         &self,
         packet: Vec<u8>,
@@ -245,13 +245,13 @@ mod tests {
     /// halves: silence is right, because a reply to a spoofed source is what an
     /// amplifier sends, which is exactly why the counter has to exist.
     ///
-    /// Watched failing without the limiter check: all four datagrams answered,
+    /// Fails without the limiter check: all four datagrams answered,
     /// `rate_limited` at 0.
     #[tokio::test]
     async fn a_source_over_its_query_rate_is_dropped_and_counted() {
         // One per second, burst of one, on a clock nothing moves: against
         // `SystemTime` a second boundary inside the burst hands back a token
-        // and only two of the four are dropped (`TODO.md` #52).
+        // and only two of the four are dropped.
         let ctx = Arc::new(ServeContext {
             limiter: Arc::new(RateLimiter::new(RateLimitConfig::per_second(1, 1))),
             responses: Arc::new(ResponseLimiter::disabled()),
@@ -315,7 +315,7 @@ mod tests {
         let other = Peer::from("192.0.2.1".parse::<std::net::IpAddr>().unwrap());
         // One instant for the whole test: the bucket refills by whole seconds,
         // so a clock read per call decides the last assertion on whether two of
-        // them straddled a boundary (`TODO.md` #52).
+        // them straddled a boundary.
         let now = rdns::clock::current_unix_timestamp();
         for _ in 0..10 {
             assert!(
@@ -377,9 +377,9 @@ mod tests {
     /// three queries against a burst of one are all answered, and
     /// `rate_limited` stays at zero. A QR=1 datagram gets nothing.
     ///
-    /// Watched failing with the ACL check removed from `udp_main`: the first
-    /// query was resolved (SERVFAIL from the unreachable upstream) and the
-    /// next two were rate-limited.
+    /// Fails with the ACL check removed from `udp_main`: the first query is
+    /// resolved (SERVFAIL from the unreachable upstream) and the next two are
+    /// rate-limited.
     #[tokio::test]
     async fn an_unlisted_peer_is_refused_and_never_rate_limited() {
         let (addr, metrics, shutdown, server) = acl_server("127.0.0.1:0", &["192.0.2.0/24"]).await;
@@ -442,10 +442,9 @@ mod tests {
         let _ = server.await;
     }
 
-    /// RFC 7830 §4 over DoT, and never over plain TCP (§6), for this
-    /// daemon's handler (`TODO.md` #187). The UPDATE is NOTIMP out of the
-    /// message alone, so nothing is resolved. Watched failing with the
-    /// handler's padding removed.
+    /// RFC 7830 §4 over DoT, and never over plain TCP (§6), for this daemon's
+    /// handler (`TODO.md` #187). The UPDATE is NOTIMP out of the message alone,
+    /// so nothing is resolved. Fails with the handler's padding removed.
     #[tokio::test]
     async fn a_padded_query_over_dot_gets_a_padded_reply() {
         let mut msg = DnsMessage::try_from_bytes(&message(OpCode::Update, false)).expect("parses");
@@ -542,9 +541,8 @@ mod tests {
         buf
     }
 
-    /// The admission check runs on TCP as well. It ran on one of the two
-    /// transports (`TODO.md` #30q), so the 16 KiB ceiling, the QDCOUNT cap and
-    /// the per-section counts all stopped at the UDP loop.
+    /// The admission check runs on TCP as well, so the 16 KiB ceiling, the
+    /// QDCOUNT cap and the per-section counts do not stop at the UDP loop.
     ///
     /// Provoked with the additional-count cap because it is the cheapest of
     /// those rules to build; the check is one call, so any rule of it firing is
@@ -553,7 +551,7 @@ mod tests {
     /// rather than a timeout somewhere else, and the second one is what says
     /// the connection survived the first.
     ///
-    /// Watched failing with the check removed: the reply carried 0xBAD1.
+    /// Fails with the check removed: the reply carries 0xBAD1.
     #[tokio::test]
     async fn a_tcp_message_over_the_admission_caps_is_dropped_and_the_connection_kept() {
         let serving = context();
@@ -613,8 +611,8 @@ mod tests {
     /// `handle_query` answers with NOTIMP out of the message alone — no cache,
     /// no network — so "no reply" means dropped at the door.
     ///
-    /// Watched failing with the `try_acquire_owned` removed: the NOTIMP came
-    /// straight back.
+    /// Fails with the `try_acquire_owned` removed: the NOTIMP comes straight
+    /// back.
     #[tokio::test]
     async fn a_datagram_over_the_in_flight_ceiling_is_dropped() {
         let black_hole = UdpSocket::bind("127.0.0.1:0").await.expect("bind");

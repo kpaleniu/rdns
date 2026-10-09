@@ -1,11 +1,10 @@
-//! `rdnsr`'s startup sequence, run as a process (`TODO.md` #90).
+//! `rdnsr`'s startup sequence, run as a process.
 //!
 //! The reasoning is `rdnsd/tests/startup.rs`'s and is not repeated. What is
 //! different here is that a resolver needs no zone source, so the bare dry run
 //! is the *valid* case rather than a refusal — `rdnsr` with no flags recurses
-//! from the built-in root hints — and `--check-config` has never carried
-//! `requires = "config"`, which is the argument #90 removed it from `rdnsd`
-//! for.
+//! from the built-in root hints — and `--check-config` carries no
+//! `requires = "config"`, for `rdnsd`'s reason.
 
 use std::process::{Command, Output};
 
@@ -94,12 +93,11 @@ fn the_dry_run_refuses_a_policy_feed_that_does_not_parse() {
     );
 }
 
-/// The same defect as `rdnsd`'s dnstap target, one daemon over and worse.
+/// A secret that is not base64 fails the dry run, not the started process.
 ///
-/// `TsigKey::parse` sat two hundred lines below the exit, after both sockets
-/// were bound and the anomaly watcher spawned, so a secret that is not base64
-/// passed the dry run and killed a started process (`TODO.md` #99). Move the
-/// parse back down and this fails with a zero status.
+/// Parsed below the exit, after both sockets are bound and the anomaly watcher
+/// spawned, it passes the dry run and kills a started process. Fails that way
+/// with a zero status.
 #[test]
 fn the_dry_run_refuses_a_tsig_secret_that_is_not_base64() {
     let dir = ScratchDir::new("rdnsr-bad-key");
@@ -122,9 +120,8 @@ secret = \"not!base64!\"
     );
 }
 
-/// The dry run names each encrypted listener, a DoH-only one included: the
-/// case `rdnsd`'s copy of this line once reported as disabled, and which this
-/// daemon reported only as "certificate loads" (`TODO.md` #153).
+/// The dry run names each encrypted listener, a DoH-only one included, rather
+/// than reporting it as disabled or only as "certificate loads".
 #[test]
 fn the_dry_run_names_a_doh_only_listener() {
     let dir = ScratchDir::new("rdnsr-doh-only");
@@ -159,9 +156,8 @@ fn the_dry_run_names_a_doh_only_listener() {
     );
 }
 
-/// §15 again, and #63i's row: `--dnstap-max-bytes` was the one flag of 35 not
-/// refused beside `--config`, so the file overwrote it in silence. This asks
-/// whether the refusal reaches the operator.
+/// §15 again: a flag not refused beside `--config` is one the file overwrites
+/// in silence. This asks whether the refusal reaches the operator.
 #[test]
 fn a_flag_beside_config_is_refused_by_the_process() {
     let dir = ScratchDir::new("rdnsr-conflict");

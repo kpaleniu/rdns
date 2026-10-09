@@ -18,20 +18,14 @@
 //! | the difference from the version in force (IXFR) | 383-395 |
 //! | writing the file and installing the zone | 526 |
 //!
-//! Re-measured 2026-09-18, the last row having been 1 141-1 261 before: it
-//! is the serialization (247 ms), the write of 38 MB, the read and digest that
-//! proves the file is still that zone (21 ms), and the index (41 ms). What it
-//! no longer contains is a parse of what this process had already built, which
-//! was 613 ms of it.
+//! Measured 2026-09-18. The last row is the serialization (247 ms), the write
+//! of 38 MB, the read and digest that proves the file is still that zone (21
+//! ms), and the index (41 ms); a parse of what this process has already built
+//! would add 613 ms (`TODO.md` #71f).
 //!
-//! The figures before that — 1 596, 808 and 1 351 — were taken with three
-//! million-rule measurements running at once (`TODO.md` #71's head); the
-//! transfer rows then halved again when #71c gave the zone rebuild the record
-//! count it already had.
-//!
-//! So an unchanged million-rule feed costs one round trip where it used to cost
-//! a transfer and a reload, and a changed one asks for what changed. What is
-//! left zone-sized is the serialization and the write — the file is the store
+//! So an unchanged million-rule feed costs one round trip rather than a
+//! transfer and a reload, and a changed one asks for what changed. What is left
+//! zone-sized is the serialization and the write — the file is the store
 //! (`TODO.md` #57d's shape A) — and, on the transfer side, #71a's rebuild.
 //!
 //! **What it buys**, and the reason the row called it the one that argues for
@@ -48,13 +42,12 @@
 //! an older serial, and RFC 1995 §4 lets a master answer that with a longer
 //! chain or with the whole zone.
 //!
-//! The transfer is signed when the feed's master names a key with `#name`
-//! (`TODO.md` #57f). The key is resolved out of `[keys]` at startup, so a name
-//! that defines nothing stops the process rather than sending an unsigned
-//! request — an unauthenticated blocklist is one anybody on the path can
-//! replace. Unsigned is still allowed, because a feed reached over a private
-//! link is a real deployment; what is refused is *asking* for a key and not
-//! getting one.
+//! The transfer is signed when the feed's master names a key with `#name`. The
+//! key is resolved out of `[keys]` at startup, so a name that defines nothing
+//! stops the process rather than sending an unsigned request — an
+//! unauthenticated blocklist is one anybody on the path can replace. Unsigned
+//! is still allowed, because a feed reached over a private link is a real
+//! deployment; what is refused is *asking* for a key and not getting one.
 //!
 //! EXPIRE is obeyed as the operator asked, per feed: `on-expire = "enforce"`
 //! keeps a feed's rules in force past it, `"lift"` stops enforcing them. There
@@ -86,7 +79,7 @@ pub(crate) struct TransferredFeed {
     pub(crate) spec: MasterSpec,
     /// The key this feed's transfer is signed with, resolved from the keyring
     /// at startup so a name that defines nothing is a startup error and not a
-    /// transfer that silently goes out unsigned (`TODO.md` #57f).
+    /// transfer that silently goes out unsigned.
     pub(crate) key: Option<TsigKey>,
     /// Where to write what arrives — the same path the feed is read from.
     pub(crate) file: PathBuf,
@@ -219,7 +212,6 @@ impl Replica for FeedReplica {
     async fn in_contact(&mut self, after_expiry: bool) {
         // The same gauge `rdnsd` sets for a replicated zone, because a policy
         // feed is one: same name, same shape, same alert (`CLAUDE.md` §7, §14).
-        // `TODO.md` #57g.
         self.metrics
             .note_zone_transfer(self.feed.spec.zone.as_ref(), self.clock.now());
         if after_expiry {
@@ -331,7 +323,7 @@ async fn fetch_and_write(
 
     // Serializing and writing is blocking — the write especially, which is an
     // fsync and a rename (`rdns::persist`) — and so is the indexing that
-    // follows. Off the workers, as the reload itself has been since #57b.
+    // follows. Off the workers, as the reload itself is (`TODO.md` #57b).
     //
     // The zone goes to the store as well as to the file: the reload below reads
     // the file either way, but with the digest of what was written in hand it
@@ -344,10 +336,9 @@ async fn fetch_and_write(
         let written = write_zone_text(&text, &path)?;
         // Warned and not propagated: the transfer's job was to get the zone on
         // disk and it is done, so a store that cannot place the zone costs the
-        // reload a parse — the route this refresh took before #71f — rather
-        // than a failed refresh and a retry. Only a feed nobody reads gets
-        // here, which the configuration makes unreachable: `[[rpz.feeds]]`
-        // builds both lists.
+        // reload a parse rather than a failed refresh and a retry. Only a feed
+        // nobody reads gets here, which the configuration makes unreachable:
+        // `[[rpz.feeds]]` builds both lists.
         if let Err(e) = store.offer(&written, zone) {
             tracing::warn!(
                 "the transferred zone will be parsed back from {}: {e}",
@@ -613,7 +604,7 @@ mod tests {
     /// succeeds.
     ///
     /// Fails against starting from `RefreshTimers::default()`, whose EXPIRE is
-    /// never: the file stays and no reload is asked for (`TODO.md` #135).
+    /// never: the file stays and no reload is asked for.
     #[tokio::test(start_paused = true)]
     async fn a_restart_with_the_master_gone_still_expires() {
         let dir = ScratchDir::new("rpz-restart-expire");

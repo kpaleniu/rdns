@@ -11,8 +11,8 @@
 
 // `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
 #![warn(unreachable_pub)]
-// `TODO.md` #143: `push_str(&format!(..))` allocates a `String` to copy it;
-// `write!` into the target does not. Off by default (restriction group).
+// `push_str(&format!(..))` allocates a `String` to copy it; `write!` into the
+// target does not. Off by default (restriction group).
 #![warn(clippy::format_push_string)]
 
 #[cfg(test)]
@@ -98,9 +98,8 @@ const NSEC_CACHE_ZONES: usize = 1000;
 
 // The resolver's defaults, in one place because each is spelled twice: `Cli`
 // takes them through `default_value_t` and the config file's tables through
-// `#[serde(default = "crate::...")]`. `rdnsd` has the same block for the same
-// reason, and the reason is `TODO.md` #63e — sixteen settings there had a
-// literal on each side and nothing comparing them.
+// `#[serde(default = "crate::...")]`, and a literal on each side has nothing
+// comparing them. `rdnsd` has the same block for the same reason.
 //
 // Here and not in `config`, because a flag's default is the daemon's and the
 // file inherits it — and an item private in the crate root is visible to every
@@ -322,9 +321,9 @@ struct Cli {
     /// caches, list the negative trust anchors, reload. `help` on the socket
     /// lists the commands.
     ///
-    /// Mode 0600, so the server's user and root; that is the authentication.
-    /// On Windows a named pipe, `\\.\pipe\NAME`, which only the owner,
-    /// administrators and SYSTEM may write to (`TODO.md` #188).
+    /// Mode 0600, so the server's user and root; that is the authentication. On
+    /// Windows a named pipe, `\\.\pipe\NAME`, which only the owner,
+    /// administrators and SYSTEM may write to.
     #[arg(long, value_name = "PATH", conflicts_with = "config")]
     control_socket: Option<PathBuf>,
     /// Write log lines to this file instead of standard error, appended,
@@ -450,8 +449,8 @@ struct Cli {
     ///
     /// [`rdns::FLAG_DAY_UDP_SIZE`] is the default of BIND's `edns-udp-size`,
     /// Knot's `udp-max-payload`, NSD's `ipv4-edns-size` and Unbound's
-    /// `edns-buffer-size` after DNS Flag Day 2020. Not the size an upstream answer is read into, which is
-    /// separate since `TODO.md` #41c. Floored at 512.
+    /// `edns-buffer-size` after DNS Flag Day 2020. Not the size an upstream
+    /// answer is read into, which is separate. Floored at 512.
     #[arg(long, value_name = "OCTETS", default_value_t = default_udp_payload_size(), conflicts_with = "config")]
     udp_payload_size: u16,
     /// Largest UDP reply this resolver will send, in octets.
@@ -694,13 +693,12 @@ struct Cli {
     /// An RPZ is a DNS zone, so the thing that maintains one already announces
     /// a change this way — an `rdnsd` replicating the feed announces it to its
     /// `--also-notify` targets after every transfer, with no new code on that
-    /// side. This is the ear for it (`TODO.md` #57c).
+    /// side. This is the ear for it.
     ///
     /// A list rather than a default, because a NOTIFY costs its recipient a
     /// re-read of the feed it names: ~720 ms for a million-rule one, and that
     /// feed's memory twice over while both versions are live (`TODO.md` #71b).
-    /// Naming nobody leaves a NOTIFY answered NOTIMP, which is what this
-    /// resolver did before.
+    /// Naming nobody leaves a NOTIFY answered NOTIMP.
     #[arg(long, value_name = "ADDR|CIDR", conflicts_with = "config")]
     rpz_notify_from: Vec<String>,
     /// Read the settings from this file instead of the command line.
@@ -738,7 +736,7 @@ struct Cli {
     #[arg(skip)]
     rpz_masters: Vec<TransferredFeed>,
     /// TSIG keys a transferred feed's master may be signed with, in
-    /// `TsigKey::parse`'s form (`TODO.md` #57f).
+    /// `TsigKey::parse`'s form.
     ///
     /// Not a flag: a secret in `argv` is readable out of `ps` by anyone on the
     /// machine, and the config file is where §15 puts one. `rdnsc` has the flag
@@ -851,7 +849,7 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
     }
 
     // Refused here, above the dry run, so `--check-config` says so too: on
-    // Windows a path that is not a pipe name (`TODO.md` #188).
+    // Windows a path that is not a pipe name.
     if let Some(path) = &cli.control_socket {
         rdns_transport::control::check(path)?;
     }
@@ -863,7 +861,7 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
     // What this host can reassemble and the largest datagram it will send. One
     // advertisement, in both directions: the number is a fact about this stack,
     // not about who is being told, which is how Unbound's `edns-buffer-size`
-    // reads too (`TODO.md` #41c).
+    // reads too.
     let udp = UdpSizes::new(cli.udp_payload_size, cli.max_udp_response);
 
     // Recursion is the default; naming an upstream is what selects forwarding.
@@ -1134,11 +1132,10 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         }
     };
 
-    // Read before anything binds, which is what this comment claimed while
-    // sitting below three of them: a certificate that will not load is a DoT
-    // listener that answers nothing, and `--check-config` has to reach it.
-    // Over the merged view, once: the file and the flags each had their own
-    // check of the pair rule (`TODO.md` #153).
+    // Read before anything binds: a certificate that will not load is a DoT
+    // listener that answers nothing, and `--check-config` has to reach it. Over
+    // the merged view, once, so the file and the flags cannot each have their
+    // own check of the pair rule.
     let encrypted = Encrypted::configure(cli.encrypted_flags(), None)?;
 
     // Here for the same reason, and it was below the binds too: a typo in the
@@ -1159,8 +1156,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
     //
     // Above the exit, and not beside the feed tasks that use it: down there it
     // is parsed after both sockets are bound and the anomaly watcher is
-    // spawned, so a secret that is not base64 passed the dry run and killed a
-    // started process (`TODO.md` #99).
+    // spawned, so a secret that is not base64 passes the dry run and kills a
+    // started process (`CLAUDE.md` §15).
     let policy_keys: Vec<rdns::tsig::TsigKey> = cli
         .tsig_key
         .iter()
@@ -1271,8 +1268,8 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
         nsid,
         clock,
     });
-    // Without validation every answer is indeterminate, so the family would
-    // say nothing; absent says that (`TODO.md` #186).
+    // Without validation every answer is indeterminate, so the family would say
+    // nothing; absent says that.
     if cli.dnssec_validate {
         ctx.metrics.validating();
     }
@@ -1441,9 +1438,9 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
     for (feed, wake) in cli.rpz_masters.iter().zip(&feed_wakes) {
         // Resolved here rather than in the task: a key name that defines
         // nothing must stop the process, not send one unsigned request per
-        // refresh forever (`TODO.md` #57f). `Config::check` refuses it first
-        // for the file path; this is the second door, and the one that holds if
-        // a key's secret file could not be read.
+        // refresh forever. `Config::check` refuses it first for the file path;
+        // this is the second door, and the one that holds if a key's secret
+        // file could not be read.
         let mut feed = feed.clone();
         if let Some(name) = &feed.spec.key_name {
             // By name alone, not through `TsigKeyring::get`: that takes an

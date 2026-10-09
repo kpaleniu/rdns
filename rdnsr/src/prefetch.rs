@@ -2,13 +2,13 @@
 //! last tenth of its TTL (Unbound's `prefetch`), or once it has been answered
 //! stale (`--serve-stale-first`, `TODO.md` #58).
 //!
-//! A queue and a pool rather than work done by the task that answered
-//! (`TODO.md` #114). That task is `tcp::Handler::handle` on four transports,
-//! and two of them take its return as the end of the answer: DoH builds the
-//! HTTP response only after the handler task is joined, DoQ sends FIN only once
-//! the sink closes. A refresh run there put an upstream resolution in front of
-//! the reply it was meant to follow — 1.5 s against an upstream that never
-//! answers, for a reply that was ready in under a millisecond.
+//! A queue and a pool rather than work done by the task that answered. That
+//! task is `tcp::Handler::handle` on four transports, and two of them take its
+//! return as the end of the answer: DoH builds the HTTP response only after the
+//! handler task is joined, DoQ sends FIN only once the sink closes. A refresh
+//! run there puts an upstream resolution in front of the reply it was meant to
+//! follow — 1.5 s against an upstream that never answers, for a reply that was
+//! ready in under a millisecond.
 
 use std::sync::Arc;
 
@@ -196,9 +196,10 @@ mod tests {
     /// Two workers resolve two names at once, against an upstream that never
     /// answers, and the stop ends the pool without waiting for either.
     ///
-    /// Watched failing with the worker loop written as `while let Some(query) =
-    /// queue.lock().await.recv().await`: the guard lives through the body, so
-    /// the second refresh waited for the first's timeout.
+    /// Fails with the worker loop written as
+    /// `while let Some(query) = queue.lock().await.recv().await`: the guard
+    /// lives through the body, so the second refresh waits for the first's
+    /// timeout.
     #[tokio::test]
     async fn the_workers_run_at_once_and_the_stop_abandons_them() {
         let (resolver, _upstream) = silent_resolver();

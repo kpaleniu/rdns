@@ -1,18 +1,17 @@
 //! What one answer off `rdnsr`'s cache costs the allocator.
 //!
-//! `TODO.md` #88. Every allocation assertion in this tree lived in `rdns` and
-//! measured the *authoritative* path; the resolver had none, so "the two
-//! daemons build a reply two ways" was an observation nobody could price.
+//! `TODO.md` #88. The allocation assertions in `rdns` measure the
+//! *authoritative* path; this prices "the two daemons build a reply two ways"
+//! from the resolver's side.
 //!
 //! **Why this is a module and not `rdnsr/tests/allocations.rs`.** `rdnsr` is a
 //! binary, so a `tests/` file cannot reach [`crate::answer::handle_query`]
-//! without a `lib.rs` and a handful of `pub`s — and `pub` in this tree has gone
-//! 517 → 651 since #38's sweep with no ratchet behind it (#82b). `CLAUDE.md`
-//! §10 asks for a separate file because a `#[global_allocator]` applies to the
-//! whole binary, and that reason is answered rather than ignored: the count is
-//! [`rdns::testutil::Counting`]'s **per-thread** tally, which is what
-//! `rdns/tests/allocations.rs` had to invent anyway when its own separate file
-//! turned out to be neither necessary nor sufficient. The allocator here is
+//! without a `lib.rs` and a handful of `pub`s, and `pub` in this tree is what
+//! the ratchet counts (`TODO.md` #82b). `CLAUDE.md` §10 asks for a separate
+//! file because a `#[global_allocator]` applies to the whole binary, and that
+//! reason is answered rather than ignored: the count is
+//! [`rdns::testutil::Counting`]'s **per-thread** tally, which a separate file
+//! needs anyway, being neither necessary nor sufficient. The allocator here is
 //! `#[cfg(test)]` and wraps `System`, so it is a pass-through plus one
 //! thread-local increment for the other tests in this binary, and no dhat: the
 //! profiler is the global part, and nothing here reads peak bytes.
@@ -74,19 +73,18 @@ fn query_bytes(name: &rdns::Name) -> Vec<u8> {
 /// in between: the cache lookup, the records copied out of it, and the reply
 /// message they are assembled into.
 ///
-/// Thirteen and eight until #134, which moved RFC 8198 synthesis behind the
-/// answer cache: a hit no longer builds the `*.<parent>` name
-/// `NsecCache::synthesize_wildcard` looks up.
+/// RFC 8198 synthesis is behind the answer cache, so a hit builds no
+/// `*.<parent>` name for `NsecCache::synthesize_wildcard` (`TODO.md` #134).
 ///
 /// That seven is #88's real answer, and it says **decline**. `rdnsd` writes its
-/// answer straight into a held buffer with `ResponseWriter` — `rdns`'s
-/// "write a one-record response" is **0**, and **3** with neither buffer nor
-/// compressor in hand, which is what it pays per message on TCP. `rdnsr` clones
-/// the records out of the cache into a `DnsMessage` and serializes that, for 3.
-/// So the two shapes differ by the *cache lookup and the copy out of it*, not
-/// by the writing, and the difference is a constant rather than a per-record
-/// cost — which the ratio test below is the other half of. There is a number to
-/// argue from now instead of a paragraph, and it does not argue for a rewrite.
+/// answer straight into a held buffer with `ResponseWriter` — `rdns`'s "write a
+/// one-record response" is **0**, and **3** with neither buffer nor compressor
+/// in hand, which is what it pays per message on TCP. `rdnsr` clones the
+/// records out of the cache into a `DnsMessage` and serializes that, for 3. So
+/// the two shapes differ by the *cache lookup and the copy out of it*, not by
+/// the writing, and the difference is a constant rather than a per-record cost
+/// — which the ratio test below is the other half of. The number does not argue
+/// for a rewrite.
 ///
 /// What it does **not** measure: the resolution behind a miss, which is a
 /// network round trip and not an allocation question.

@@ -8,19 +8,20 @@
 //! [`rdns::rpz::PolicyStore::reload`] builds the whole new set before
 //! installing any of it. The 2x peak is inherent and `TODO.md` #61 says why.
 //!
-//! Both of those are now the cost of a feed *that moved*. `TODO.md` #71b made
-//! the test per feed: a file whose bytes are what this process last parsed is
+//! Both of those are the cost of a feed *that moved*. The test is per feed
+//! (`TODO.md` #71b): a file whose bytes are what this process last parsed is
 //! handed back as the zone already in force, at 21 ms and no second copy, so a
-//! three-feed set with one publisher is 781 ms where it was 2 200 and a SIGHUP
-//! over a quiet set is 62 ms. The task still reads every file, because the only
-//! honest way to know a feed did not move is to read it (`CLAUDE.md` §4).
+//! three-feed set with one publisher is 781 ms against 2 200 for the whole set
+//! and a SIGHUP over a quiet set is 62 ms. The task still reads every file,
+//! because the only honest way to know a feed did not move is to read it
+//! (`CLAUDE.md` §4).
 //!
-//! They ran on a tokio worker until `TODO.md` #57b, and `#[tokio::main]` gives
-//! one worker per core: measured on a one-worker runtime, a probe asking for
-//! 1 ms ticks saw a 2.715 s gap, which is a resolver answering nothing for the
-//! length of a reload. With two workers it was 2.28 ms against a 2.17 ms floor
-//! — the defect cost 1/N of capacity above one core and everything at one, so
-//! the work goes to [`tokio::task::spawn_blocking`] (`CLAUDE.md` §9).
+//! Not on a tokio worker (`TODO.md` #57b): `#[tokio::main]` gives one worker
+//! per core, and measured on a one-worker runtime a probe asking for 1 ms ticks
+//! saw a 2.715 s gap, which is a resolver answering nothing for the length of a
+//! reload. With two workers it was 2.28 ms against a 2.17 ms floor — 1/N of
+//! capacity above one core and everything at one, so the work goes to
+//! [`tokio::task::spawn_blocking`] (`CLAUDE.md` §9).
 //!
 //! The task is sequential, so two reloads never overlap: four at once on four
 //! workers stalled every task for 3.53 s and took 4.50 s to do 2.70 s of work.
@@ -218,24 +219,23 @@ mod tests {
         );
     }
 
-    /// The defect #57b fixed, on the runtime shape that made it fatal.
+    /// A reload on a worker, on the runtime shape that makes it fatal
+    /// (`TODO.md` #57b).
     ///
     /// One worker, so a reload that occupies it is the whole runtime. The probe
-    /// counts completed yields rather than measuring a delay, because a count is
-    /// deterministic where a wall-clock assertion is a coin toss (`CLAUDE.md`
-    /// §10): against the old `reload_policy(&serving)` called straight from the
-    /// task, the probe cannot advance at all while the parse runs and this reads
-    /// 0. Checked by putting that shape back — the first version of this test
-    /// passed against it, because `block_on` drives the test's own future on the
-    /// calling thread and the worker under test was never the blocked one. Both
-    /// halves are `tokio::spawn`ed for that reason, which is also how `main`
-    /// runs them.
+    /// counts completed yields rather than measuring a delay, because a count
+    /// is deterministic where a wall-clock assertion is a coin toss
+    /// (`CLAUDE.md` §10): with `reload_policy(&serving)` called straight from
+    /// the task, the probe cannot advance at all while the parse runs and this
+    /// reads 0. Both halves are `tokio::spawn`ed, which is also how `main` runs
+    /// them: `block_on` drives the test's own future on the calling thread,
+    /// where the worker under test is never the blocked one and the test passes
+    /// against the defect.
     ///
     /// **The feed is rewritten before the reload**, or there is nothing to
-    /// measure: since `TODO.md` #71b a file whose bytes have not moved is not
-    /// parsed at all, and a 100k feed that is merely re-read is ~2 ms — which
-    /// the old blocking shape would have passed. The rewrite puts the parse
-    /// back.
+    /// measure: a file whose bytes have not moved is not parsed at all, and a
+    /// 100k feed that is merely re-read is ~2 ms — which a blocking shape would
+    /// pass. The rewrite puts the parse back.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_reload_does_not_stop_the_only_worker() {
         let dir = ScratchDir::new("reload-blocking");

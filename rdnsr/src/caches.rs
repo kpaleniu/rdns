@@ -2,8 +2,7 @@
 //!
 //! A file of its own so the three fields are private to it: `store` is the one
 //! way anything gets in, and a second writer that forgets a cache does not
-//! compile (`TODO.md` #117 — two writers had drifted, and one never fed
-//! `denials`).
+//! compile.
 
 use rdns::cache::{Cached, StalePolicy};
 use rdns::clock::Clock;
@@ -56,11 +55,9 @@ impl Caches {
     /// `stale` reaches the first two and not `denials`: a denial is served
     /// because its signature proves it, and an expired proof proves nothing —
     /// RFC 8198 §5 rests on the validity period the signer chose, which
-    /// RFC 8767 has no standing to extend.
-    /// `clock` is the daemon's, the one `ServeContext` reads: one process, one
-    /// idea of the time, and a test that can move it (`TODO.md` #52). All
-    /// three, since #107a — it reached two of them for a year, three lines
-    /// above the one it did not.
+    /// RFC 8767 has no standing to extend. `clock` is the daemon's, the one
+    /// `ServeContext` reads: one process, one idea of the time, and a test that
+    /// can move it. All three caches take it.
     pub(crate) fn new(
         capacity: usize,
         denial_zones: usize,
@@ -78,9 +75,8 @@ impl Caches {
     /// Keep what a resolution of `query` concluded, in every cache it belongs
     /// in.
     ///
-    /// The one way in for a resolution, whoever asked: the query path, a
-    /// prefetch and DNS64 each wrote their own copy until `TODO.md` #117, and
-    /// the two that ask on nobody's behalf never fed `denials`.
+    /// The one way in for a resolution, whoever asked — the query path, a
+    /// prefetch and DNS64 — so none of them can skip `denials`.
     pub(crate) fn store(
         &self,
         query: &QuerySection,
@@ -127,8 +123,7 @@ impl Caches {
     /// What is held for this question, unexpired.
     ///
     /// The order is the caches' business rather than the caller's, because
-    /// whether it is right depends on what `store` retires: #127 and #132 both
-    /// lived in an order spelled out by the answer path (`TODO.md` #129).
+    /// whether it is right depends on what `store` retires (`TODO.md` #132).
     ///
     /// `synthesize` false skips the RFC 8198 arms; the caller decides, since it
     /// is the client's CD bit.

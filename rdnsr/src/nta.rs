@@ -256,8 +256,8 @@ mod tests {
     }
 
     /// RFC 7646 §1.1: under an NTA a zone whose DNSSEC is broken is answered,
-    /// AD clear, where without one it is SERVFAIL. Watched failing with the
-    /// `covering` check removed from `resolve_validated`: SERVFAIL both times.
+    /// AD clear, where without one it is SERVFAIL. Fails with the `covering`
+    /// check removed from `resolve_validated`: SERVFAIL both times.
     #[tokio::test]
     async fn an_nta_answers_a_broken_zone_without_ad() {
         let serving = broken();
@@ -274,8 +274,8 @@ mod tests {
 
     /// A secure answer cached before the NTA is flushed when it is added, and
     /// what was cached under it is flushed when it lapses (§4). The gauge
-    /// follows. Watched failing with `flush` doing nothing: the cached secure
-    /// answer survived the add.
+    /// follows. Fails with `flush` doing nothing: the cached secure answer
+    /// survives the add.
     #[tokio::test]
     async fn the_subtree_is_flushed_on_add_and_on_expiry() {
         let (resolver, _) = SignedZone::new().upstream();

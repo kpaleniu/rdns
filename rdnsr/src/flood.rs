@@ -101,8 +101,8 @@ fn question(id: u16, name: &str) -> Vec<u8> {
 /// frees a place 128 / 1.8 s = 71 times a second, shared between the attack's
 /// 128 and the client's 10: about half at best.
 ///
-/// 17 and 18 of 40 answered here. Watched failing against the semaphore it
-/// replaced: 0 of 40, since nothing frees inside the timer's first 10 s.
+/// 17 and 18 of 40 answered here. Fails with a plain semaphore: 0 of 40, since
+/// nothing frees inside the timer's first 10 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_flood_of_silent_zones_leaves_room_for_a_client_that_is_waiting() {
     const PLACES: usize = 128;

@@ -156,8 +156,8 @@ mod capture {
 
     /// One `CLIENT_QUERY` and one `CLIENT_RESPONSE` per client query, read back
     /// out of a capture file. The UPDATE is NOTIMP out of the message alone.
-    /// Watched failing with `record_client` removed from the UDP loop: no data
-    /// frames between START and STOP.
+    /// Fails with `record_client` removed from the UDP loop: no data frames
+    /// between START and STOP.
     #[tokio::test]
     async fn a_client_exchange_is_two_frames() {
         let dir = ScratchDir::new("rdnsr-dnstap");

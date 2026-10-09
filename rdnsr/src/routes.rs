@@ -495,8 +495,8 @@ mod tests {
         }
 
         /// AA set, AD clear, no EDE, and not cached so a reload is seen at
-        /// once. Watched failing with the cache check removed: the answer
-        /// was in the cache.
+        /// once. Fails with the cache check removed: the answer is in the
+        /// cache.
         #[tokio::test]
         async fn a_local_answer_is_authoritative_and_not_cached() {
             let dir = ScratchDir::new("local-zone");
