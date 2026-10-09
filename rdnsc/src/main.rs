@@ -2,8 +2,8 @@
 
 // `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
 #![warn(unreachable_pub)]
-// `TODO.md` #143: `push_str(&format!(..))` allocates a `String` to copy it;
-// `write!` into the target does not. Off by default (restriction group).
+// `push_str(&format!(..))` allocates a `String` to copy it; `write!` into the
+// target does not. Off by default (restriction group).
 #![warn(clippy::format_push_string)]
 
 use std::io::{Read, Write};
@@ -77,7 +77,7 @@ fn main() -> Result<()> {
         .with_context(|| format!("server address {:?}", args.dns_server))?;
 
     // A QTYPE, not an RTYPE: ANY, AXFR and IXFR are questions no record is the
-    // answer to, and asking for a record type made them unaskable (#33b).
+    // answer to, and asking for a record type makes them unaskable.
     let qtype = qtype_name_to_code(&args.record).ok_or_else(|| {
         anyhow!(
             "{:?} is not a type this client can ask for; TYPEnnn asks for a number",
@@ -232,16 +232,16 @@ fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
 /// than assembled — a client that held the zone would be `rdns::xfr`, which
 /// `rdnsc` does not link.
 ///
-/// What is printed is the zone-file presentation format, so `rdnsc … AXFR
-/// example.com > example.com.zone` produces a file this tree's own parser
-/// reads. Every line carries an absolute owner name, its own TTL and its class,
-/// so no `$ORIGIN` or `$TTL` is needed and no line depends on another
-/// (`TODO.md` #66b).
+/// What is printed is the zone-file presentation format, so
+/// `rdnsc … AXFR example.com > example.com.zone` produces a file this tree's
+/// own parser reads. Every line carries an absolute owner name, its own TTL and
+/// its class, so no `$ORIGIN` or `$TTL` is needed and no line depends on
+/// another.
 ///
 /// **It is not a secondary.** There is no SOA probe, so every run is a full
-/// transfer; no IXFR; no NOTIFY, so whatever calls this is on its own timer;
-/// and no TSIG yet (#66c). A feed refreshed this way is refreshed when cron
-/// says so, not when the publisher does.
+/// transfer; no IXFR; no NOTIFY, so whatever calls this is on its own timer. A
+/// feed refreshed this way is refreshed when cron says so, not when the
+/// publisher does.
 fn read_transfer(
     server: SocketAddr,
     query: &[u8],
@@ -434,9 +434,9 @@ fn matches_request(message: &DnsMessage, request: &DnsMessage) -> Result<(), Ans
 ///
 /// A function because the two callers are a printed answer and a refused
 /// transfer, and a refused transfer is the reply an operator is most likely to
-/// be holding when they want one (`TODO.md` #44b). An unreadable option list is
-/// reported rather than dropped: it is FORMERR for the message, and the parse
-/// that produced it let it through.
+/// be holding when they want one. An unreadable option list is reported rather
+/// than dropped: it is FORMERR for the message, and the parse that produced it
+/// let it through.
 fn extended_errors(msg: &DnsMessage) -> String {
     let Some(edns) = msg.edns.as_ref() else {
         return String::new();
@@ -479,7 +479,7 @@ mod tests {
     /// as the end marker (RFC 5936 §2.2), split across two messages.
     fn transferred() -> (Vec<DnsMessage>, rdns::zone::Zone) {
         // Column zero on purpose: a leading space makes the parser read the
-        // owner name as omitted, which is `TODO.md` #60's defect arriving in a
+        // owner name as omitted: a flattened `\` continuation, arriving in a
         // fixture rather than in a message.
         let text = concat!(
             "$ORIGIN example.com.\n",
