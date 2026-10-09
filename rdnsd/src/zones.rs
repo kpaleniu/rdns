@@ -570,6 +570,21 @@ impl std::ops::Deref for Zones {
     }
 }
 
+/// The one writer of served versions from zone files: each UPDATE, and each
+/// reload from its first read until it has installed (RFC 2136 §3.7).
+///
+/// One lock for all zones, because a reload replaces every zone at once. It
+/// guards the digest of each zone file as this server last wrote it, a fact
+/// made under it. Lock order: this, then the zone map.
+#[derive(Clone, Default)]
+pub(crate) struct ZoneWrites(Arc<tokio::sync::Mutex<HashMap<PathBuf, FileDigest>>>);
+
+impl ZoneWrites {
+    pub(crate) async fn lock(&self) -> tokio::sync::MutexGuard<'_, HashMap<PathBuf, FileDigest>> {
+        self.0.lock().await
+    }
+}
+
 /// The three things that describe what this server is currently serving.
 ///
 /// Grouped because they are only ever updated together: a zone installed is a

@@ -12,11 +12,10 @@
 //! root and every descendant (`CLAUDE.md` §17).
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use rdns::peer::Peer;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -46,7 +45,9 @@ use rdns_transport::ServeContext;
 
 use crate::answer::{write_response, NOT_OUR_ZONE};
 use crate::replication::{Notified, Secondaries};
-use crate::zones::{install_zone, ZoneContext, ZoneMap, ZoneSigning, ZoneSource, Zones};
+use crate::zones::{
+    install_zone, ZoneContext, ZoneMap, ZoneSigning, ZoneSource, ZoneWrites, Zones,
+};
 use crate::Scratch;
 use crate::{bad_request, serving_error};
 
@@ -303,27 +304,26 @@ pub(crate) struct UpdateHandling {
     /// And checked the way a loaded one is: the same validator `verify_zones`
     /// is given, so `--require-signed` means one thing.
     validator: Arc<DnssecValidator>,
-    /// Serializes the read-modify-write, which RFC 2136 §3.7 requires.
-    ///
-    /// One lock for all zones; held across file I/O and signing, so `tokio`'s.
-    /// It guards the digest of each file this server last wrote, a fact made
-    /// under this lock and so never stale.
-    applying: tokio::sync::Mutex<HashMap<PathBuf, FileDigest>>,
+    /// Shared with the reload, so the two never replace a served version at
+    /// once; held across file I/O and signing, so `tokio`'s.
+    writes: ZoneWrites,
 }
 
 impl UpdateHandling {
-    /// UPDATEs applied to `source`, signed with `signing` and checked with
-    /// `validator` — the three a reload uses, so the two agree on what a zone is.
+    /// UPDATEs applied to `source`, signed with `signing`, checked with
+    /// `validator` and serialized by `writes`: what a reload uses, so the two
+    /// agree on what a zone is.
     pub(crate) fn new(
         source: ZoneSource,
         signing: Option<Arc<ZoneSigning>>,
         validator: Arc<DnssecValidator>,
+        writes: ZoneWrites,
     ) -> Self {
         UpdateHandling {
             source: Some(source),
             signing,
             validator,
-            applying: tokio::sync::Mutex::new(HashMap::new()),
+            writes,
         }
     }
 
@@ -334,7 +334,7 @@ impl UpdateHandling {
             source: None,
             signing: None,
             validator: Arc::new(DnssecValidator::new(false)),
-            applying: tokio::sync::Mutex::new(HashMap::new()),
+            writes: ZoneWrites::default(),
         }
     }
 }
@@ -1192,13 +1192,14 @@ impl Server {
         };
         let zone_name = request.zone.clone();
 
-        // §3.1.1: not ours is NOTAUTH. One read guard, so the zone served and
-        // the version signed agree; `snapshot` is a refcount.
-        let previous = {
-            let zones = self.zone_map.read().await;
-            zones.snapshot(zone_name.as_ref())
-        };
-        let Some(previous) = previous else {
+        // §3.1.1: not ours is NOTAUTH.
+        let served = self
+            .zone_map
+            .read()
+            .await
+            .snapshot(zone_name.as_ref())
+            .is_some();
+        if !served {
             tracing::info!(peer = %ip, "UPDATE of {zone_name}: NOTAUTH (not a zone served here)");
             return self.signed_error(
                 refused,
@@ -1206,7 +1207,7 @@ impl Server {
                 Some(NOT_OUR_ZONE),
                 session,
             );
-        };
+        }
 
         // §3.3: unsigned is REFUSED, with no address alternative; a key, scoped
         // by `rdns::tsig::UpdatePolicy`, is the only credential.
@@ -1297,9 +1298,19 @@ impl Server {
             }
         };
 
-        // §3.7's serialization across the whole read-modify-write, with the
-        // digests guarded by the lock that makes them true.
-        let mut digests = self.updates.applying.lock().await;
+        // §3.7: the whole read-modify-write under one lock, the served version
+        // taken inside it, so a queued UPDATE builds on the one before it.
+        let mut digests = self.updates.writes.lock().await;
+        let previous = self.zone_map.read().await.snapshot(zone_name.as_ref());
+        let Some(previous) = previous else {
+            tracing::info!(peer = %ip, "UPDATE of {zone_name}: NOTAUTH (withdrawn while queued)");
+            return self.signed_error(
+                refused,
+                ResponseCode::NotAuthorized,
+                Some(NOT_OUR_ZONE),
+                Some(session),
+            );
+        };
         let known = digests.get(&path).copied();
         // Cloned for the digest map below: the blocking task takes the original.
         let for_digest = path.clone();
@@ -3260,6 +3271,11 @@ pub(crate) mod tests {
     /// [`spawn_updatable`]'s server, before it listens, for a test that needs
     /// one more piece of configuration.
     fn updatable_server(dir: &Path, key: TsigKey) -> Server {
+        updatable_server_writing(dir, key, ZoneWrites::default())
+    }
+
+    /// [`updatable_server`] sharing `writes` with the test, which can hold it.
+    pub(crate) fn updatable_server_writing(dir: &Path, key: TsigKey, writes: ZoneWrites) -> Server {
         std::fs::write(dir.join("example.com.zone"), UPDATE_ZONE).expect("write the zone file");
         let source = ZoneSource::Directory(dir.to_string_lossy().to_string());
         let zones = load_zones(&source, false, false, None)
@@ -3272,10 +3288,11 @@ pub(crate) mod tests {
                 source,
                 None,
                 Arc::new(DnssecValidator::new(false)),
+                writes,
             ))
     }
 
-    async fn listen_updatable(server: Server) -> SocketAddr {
+    pub(crate) async fn listen_updatable(server: Server) -> SocketAddr {
         let server = Arc::new(server);
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -3295,7 +3312,7 @@ pub(crate) mod tests {
         addr
     }
 
-    fn a_record(name: &str, addr: &str) -> ResourceRecord {
+    pub(crate) fn a_record(name: &str, addr: &str) -> ResourceRecord {
         ResourceRecord {
             name: nm(name),
             class: rdns::Class::IN,
@@ -3308,7 +3325,7 @@ pub(crate) mod tests {
     }
 
     /// Send one message over TCP and read one reply.
-    async fn round_trip(addr: SocketAddr, bytes: Vec<u8>) -> DnsMessage {
+    pub(crate) async fn round_trip(addr: SocketAddr, bytes: Vec<u8>) -> DnsMessage {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = TcpStream::connect(addr).await.expect("connect");
         stream
@@ -3320,6 +3337,76 @@ pub(crate) mod tests {
         let mut buf = vec![0u8; u16::from_be_bytes(len) as usize];
         stream.read_exact(&mut buf).await.expect("body");
         DnsMessage::try_from_bytes(&buf).expect("a reply")
+    }
+
+    /// Send a signed UPDATE adding an A record at `name`, and return its RCODE.
+    pub(crate) async fn add_a(addr: SocketAddr, key: &TsigKey, name: &str) -> ResponseCode {
+        let message = update_message("example.com.", vec![a_record(name, "192.0.2.50")]);
+        let bytes = message.to_bytes_within(4096).expect("serialize");
+        let signed = rdns::tsig::sign_request(bytes, key, tsig::now()).expect("sign");
+        round_trip(addr, signed).await.rcode
+    }
+
+    /// Whether `name` has an A record in the zone file and in what is served.
+    pub(crate) async fn written_and_served(
+        addr: SocketAddr,
+        dir: &Path,
+        name: &str,
+    ) -> (bool, bool) {
+        let file = std::fs::read_to_string(dir.join("example.com.zone")).expect("read back");
+        let asked = round_trip(
+            addr,
+            query(name, Qtype::of(record_types::A), false)
+                .to_bytes_within(4096)
+                .expect("serialize"),
+        )
+        .await;
+        (
+            file.contains(name.trim_end_matches(".example.com.")),
+            !asked.answers.is_empty(),
+        )
+    }
+
+    /// Two UPDATEs queued on the zone-writes lock both reach the zone file and
+    /// the served version (RFC 2136 §3.7). Fails if an UPDATE takes its served
+    /// version before the lock: the second builds on the version before the
+    /// first, and the file shortcut writes the first change out.
+    #[tokio::test]
+    async fn updates_queued_on_the_lock_are_not_lost() {
+        let dir = ScratchDir::new("queued-updates");
+        let key = update_key(rdns::tsig::UpdatePolicy::Any);
+        let writes = ZoneWrites::default();
+        let server = updatable_server_writing(dir.path(), key.clone(), writes.clone());
+        let metrics = Arc::clone(&server.ctx().metrics);
+        let addr = listen_updatable(server).await;
+
+        let held = writes.lock().await;
+        let mut clients = tokio::task::JoinSet::new();
+        for name in ["first.example.com.", "second.example.com."] {
+            let key = key.clone();
+            clients.spawn(async move { add_a(addr, &key, name).await });
+        }
+        // Counted at the door, and nothing from there to the lock waits on
+        // anything but the lock, on this one-thread runtime.
+        while metrics
+            .queries_received
+            .load(std::sync::atomic::Ordering::Relaxed)
+            < 2
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        drop(held);
+        while let Some(rcode) = clients.join_next().await {
+            assert_eq!(rcode.expect("the client task"), ResponseCode::Ok);
+        }
+
+        for name in ["first.example.com.", "second.example.com."] {
+            assert_eq!(
+                written_and_served(addr, dir.path(), name).await,
+                (true, true),
+                "{name}: (in the file, answered)"
+            );
+        }
     }
 
     /// Fails with a handler that installs the new zone without writing the

@@ -538,8 +538,10 @@ the zone map would be discarded within one re-signing interval.
 
 An UPDATE is therefore a zone-file edit followed by the load path: read the zone
 as the file has it, check §3.2 against that, apply, write atomically, sign,
-verify, install. §3.7's atomicity is one mutex held across the whole
-read-modify-write.
+verify, install. §3.7's atomicity is one mutex, `ZoneWrites`, held across the
+whole read-modify-write with the served version read inside it. A reload holds
+the same mutex from its first zone-file read to its install, so a reload and
+an UPDATE never revert each other.
 
 A zone whose file `$INCLUDE`s another is REFUSED, with an EDE saying so. The
 write-back serializes the whole zone into one file, which would inline the

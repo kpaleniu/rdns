@@ -51,7 +51,7 @@ use std::time::{Duration, Instant};
 use zones::{
     discard_orphan_journals, install_all_zones, load_zones, note_serials, restore_journals,
     validate_zone_source, verify_zones, Keepable, Loaded, LoadedFiles, ProvenSigning, SigningRun,
-    ZoneContext, ZoneMap, ZoneSigning, ZoneSource, Zones,
+    ZoneContext, ZoneMap, ZoneSigning, ZoneSource, ZoneWrites, Zones,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -1357,6 +1357,9 @@ struct ReloadContext {
     /// Re-read on every reload, so a renewed certificate costs a SIGHUP rather
     /// than a restart (`TODO.md` #42a). `None` when there is no DoT listener.
     tls: Option<Arc<CertificateStore>>,
+    /// Held from the first zone-file read to the install, as an UPDATE holds
+    /// it, so neither reverts the other.
+    writes: ZoneWrites,
 }
 
 /// One reload, installed and announced. What SIGHUP, the re-signing timer and
@@ -1375,6 +1378,7 @@ async fn reload_once(
         served,
         notify,
         tls,
+        writes,
     } = ctx;
     let why = trigger.why();
     // Rotation: a log file moved away is followed from here (`TODO.md` #190).
@@ -1387,6 +1391,7 @@ async fn reload_once(
             Err(e) => tracing::warn!("could not re-read the TLS certificate ({why}): {e:#}"),
         }
     }
+    let writing = writes.lock().await;
     // Under the read lock and nothing else: a `ZoneMap` is `Arc`s, so this is a
     // hash map's worth of refcount bumps and no query waits on a signing run.
     let previous = if reloading.signing.is_some() && !trigger.refreshes_signatures() {
@@ -1403,6 +1408,7 @@ async fn reload_once(
             // The files bring back a zone withdrawn for EXPIRE; judge it again
             // before anything is announced or answered.
             reloading.withdraw_unvouched(served).await;
+            drop(writing);
             tracing::info!("zones reloaded ({why})");
             // Something changed, new data or at least new signatures and
             // serial, so the secondaries hear of it.
@@ -1415,6 +1421,7 @@ async fn reload_once(
             // The loaded zones keep answering: the version in memory is the
             // last known good.
             tracing::error!("failed to reload zones ({why}): {e}");
+            drop(writing);
             // `{e:#}` for the requester: the whole `anyhow` chain, where the
             // log line keeps the outermost context.
             (announced, Err(format!("{e:#}")))
@@ -2040,7 +2047,13 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
 
     // Taken before `source` and `signing` move into the maintenance task: an
     // UPDATE must read and sign exactly as a reload does.
-    let updates = UpdateHandling::new(source.clone(), signing.clone(), Arc::clone(&validator));
+    let writes = ZoneWrites::default();
+    let updates = UpdateHandling::new(
+        source.clone(),
+        signing.clone(),
+        Arc::clone(&validator),
+        writes.clone(),
+    );
 
     let udp = UdpSizes::new(cli.udp_payload_size, cli.max_udp_response);
 
@@ -2063,6 +2076,7 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
             served: served.clone(),
             notify,
             tls: encrypted.as_ref().map(Encrypted::store),
+            writes,
         },
         announced,
         shutdown.lifecycle(),
@@ -3528,6 +3542,7 @@ mod tests {
             served: served(&zone_map, &deltas),
             notify: Arc::new(NotifyPolicy::default()),
             tls: None,
+            writes: ZoneWrites::default(),
         };
 
         // The version being served when the reload arrives: the same file, signed
@@ -3620,6 +3635,75 @@ mod tests {
             served: served(zone_map, &Arc::new(RwLock::new(DeltaLog::new()))),
             notify: Arc::new(NotifyPolicy::default()),
             tls: None,
+            writes: ZoneWrites::default(),
+        }
+    }
+
+    /// A reload and an UPDATE take turns on the zone-writes lock, so neither
+    /// reverts the other: the operator's edit and the UPDATE both end up in
+    /// the file and served. Fails if the reload does not take the lock: it
+    /// installs while the lock is held, which the timeout below catches.
+    #[tokio::test]
+    async fn a_reload_waits_for_the_zone_writes_lock() {
+        use crate::dispatch::tests::{
+            add_a, listen_updatable, updatable_server_writing, written_and_served,
+        };
+
+        let dir = ScratchDir::new("reload-and-update");
+        let key = crate::testutil::update_key(rdns::tsig::UpdatePolicy::Any);
+        let writes = ZoneWrites::default();
+        let server = updatable_server_writing(dir.path(), key.clone(), writes.clone());
+        let ctx = ReloadContext {
+            reloading: Reloading {
+                replicating: false,
+                allow_partial: false,
+                secondaries: Arc::new(Secondaries::default()),
+                zone_dir: None,
+                signing: None,
+                validator: Arc::new(DnssecValidator::new(false)),
+                proved: ProvenSigning::default(),
+                files: LoadedFiles::default(),
+                catalog: None,
+            },
+            source: ZoneSource::Directory(dir.path().to_string_lossy().to_string()),
+            served: server.zone_context(),
+            notify: Arc::new(NotifyPolicy::default()),
+            tls: None,
+            writes: writes.clone(),
+        };
+        let addr = listen_updatable(server).await;
+
+        // The operator's edit, which only the reload installs.
+        let file = dir.path().join("example.com.zone");
+        let mut text = std::fs::read_to_string(&file).expect("the zone file");
+        text.push_str("operator IN A 192.0.2.9\n");
+        std::fs::write(&file, text).expect("the edit");
+
+        let held = writes.lock().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let reload = tokio::spawn(async move {
+            let busy = test_shutdown().lifecycle().busy;
+            reload_once(&ctx, Vec::new(), &busy, ReloadTrigger::Control(tx)).await;
+        });
+        let update = tokio::spawn({
+            let key = key.clone();
+            async move { add_a(addr, &key, "update.example.com.").await }
+        });
+        let mut rx = rx;
+        if let Ok(done) = tokio::time::timeout(Duration::from_millis(500), &mut rx).await {
+            panic!("the reload finished while the lock was held: {done:?}");
+        }
+        drop(held);
+        assert_eq!(rx.await.expect("the reload answered"), Ok(1));
+        reload.await.expect("the reload task");
+        assert_eq!(update.await.expect("the UPDATE task"), ResponseCode::Ok);
+
+        for name in ["operator.example.com.", "update.example.com."] {
+            assert_eq!(
+                written_and_served(addr, dir.path(), name).await,
+                (true, true),
+                "{name}: (in the file, answered)"
+            );
         }
     }
 
