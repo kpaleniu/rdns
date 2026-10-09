@@ -139,10 +139,8 @@ fn answer(c: &mut Criterion) {
         })
     });
 
-    // A transfer envelope: 300-500 records, nearly all distinct owner names, so
-    // the compressor's table is hundreds of entries rather than a handful — the
-    // one shape "a scan beats a hash for a few names" is false of. Names are
-    // short so the message stays inside the 14-bit pointer range.
+    // A transfer envelope of 300-500 distinct short names: the compressor's
+    // table is hundreds deep, where a scan loses to a hash.
     let mut envelope = query_message("example.com.", Qtype::AXFR);
     envelope.response = true;
     envelope.authoritive = true;
@@ -172,10 +170,8 @@ fn answer(c: &mut Criterion) {
         })
     });
 
-    // Parse, answer from the zone, write: the library's share of one query as
-    // `rdnsd` runs it, through `zone_answer::write` into a held buffer and
-    // compressor. Not a parsed `DnsMessage` cloned, filled and serialized,
-    // which is neither daemon's path.
+    // Parse, answer from the zone, write into a held buffer and compressor: the
+    // library's share of a query as `rdnsd` runs it.
     let mut compressor = rdns::compression::NameCompressor::new();
     group.bench_function("parse and write one zone answer", |b| {
         b.iter(|| {
@@ -253,9 +249,8 @@ fn admission(c: &mut Criterion) {
 fn shared_state(c: &mut Criterion) {
     let mut group = c.benchmark_group("state");
 
-    // Amortized over 100 inserts: the cache halves itself when it goes over, so
-    // one insert in thousands pays for the rest and a per-insert timing would
-    // report the median instead of the cost.
+    // Amortized over 100 inserts: one insert in thousands pays for a halving,
+    // which a per-insert median would hide.
     let cache = DnsCache::new(20_000);
     let record = |name: &str| ResourceRecord {
         name: nm(name),
@@ -420,9 +415,8 @@ fn dnssec(c: &mut Criterion) {
 
 criterion_group! {
     name = benches;
-    // Below criterion's five-and-three default: everything here is
-    // sub-microsecond except the cache batch, and a file that takes over a
-    // minute does not get run before a change.
+    // Below criterion's defaults, so the file runs before a change rather than
+    // taking over a minute.
     config = Criterion::default()
         .warm_up_time(Duration::from_secs(1))
         .measurement_time(Duration::from_secs(3));

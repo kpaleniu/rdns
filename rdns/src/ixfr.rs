@@ -652,10 +652,8 @@ mod tests {
     fn steps() -> Vec<(Vec<ResourceRecord>, Vec<ResourceRecord>)> {
         let base = zone_at(1, "www IN A 192.0.2.1\nmail IN A 192.0.2.2\n");
         let second = zone_at(2, "www IN A 192.0.2.9\nmail IN A 192.0.2.2\n");
-        // `ftp` arrives in step two and is gone again in step three, which is
-        // the case a patch staged against the base alone gets wrong: no record
-        // of the base answers that deletion, so `ftp` survives into a version
-        // that never had it.
+        // `ftp` arrives in step two and leaves in step three: staged against
+        // the base alone, that deletion matches nothing and `ftp` survives.
         let third = zone_at(
             3,
             "www IN A 192.0.2.9\nmail IN A 192.0.2.2\nftp IN A 192.0.2.3\n",
@@ -763,16 +761,10 @@ mod tests {
     /// A patch applied to a copy has to arrive at the zone a load of the same
     /// records builds (`TODO.md` #71a).
     ///
-    /// The reference is a parse and not the rebuild this replaced, because a
-    /// parse is the one thing that cannot share a mistake with it. Every
-    /// record, and every name-kind the index answers — the edit walks none of
-    /// the base's records, so the index is where it could differ without the
-    /// record vector showing it. Not a comparison of two counts: that is what
-    /// the assertion #71f was filed on turned out to be.
-    ///
-    /// Fails against a removal that leaves an empty non-terminal over a
-    /// deleted subtree, and against one that drops an ancestor another name
-    /// still needs.
+    /// Against a parse, which cannot share the edit's mistakes: every record
+    /// and every name-kind, since the index can differ where the records do
+    /// not. Fails if a removal leaves an empty non-terminal or drops a needed
+    /// ancestor.
     #[test]
     fn a_patch_applied_to_a_copy_builds_the_zone_a_load_would() {
         let base = zone_at(
@@ -785,9 +777,8 @@ mod tests {
         );
         let final_soa = zone_at(9, "").apex_soa_record().expect("an apex SOA");
 
-        // A record at a name that keeps one, a subtree deleted down to one
-        // surviving leaf, a name that arrives with an ancestor of its own, and
-        // an addition a later step takes back.
+        // A name keeping one record, a subtree cut to one leaf, a name with a
+        // new ancestor, and an addition taken back.
         let gone: Vec<ResourceRecord> = base
             .records()
             .iter()

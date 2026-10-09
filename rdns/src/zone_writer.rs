@@ -365,20 +365,15 @@ mod tests {
     }
 
     /// CDS and CDNSKEY read and write under their own names, not as
-    /// `TYPE59`/`TYPE60`.
+    /// `TYPE59`/`TYPE60` (RFC 7344 §3.1, §3.2).
     ///
-    /// They share DS's and DNSKEY's formats (RFC 7344 §3.1, §3.2) and one
-    /// `ParsedRecord` arm each, so what could go wrong is the *name*: a record
-    /// that parses into the DS arm and prints as `DS` is a different record,
-    /// and a signature over it covers a different type code. Until `TODO.md`
-    /// #55 neither name parsed at all — the row said an operator could write
-    /// them by hand, and `record_type_name_to_code` said `unsupported record
-    /// type "CDS"`.
+    /// They share DS's and DNSKEY's formats, so the name is what can go wrong:
+    /// a CDS printed as `DS` is another record, and a signature over it covers
+    /// another type code.
     #[test]
     fn cds_and_cdnskey_round_trip_under_their_own_names() {
-        // Unindented, because a leading space makes a line a continuation of
-        // the record above it — a zone file's own syntax, not this file's
-        // formatting.
+        // Unindented: a leading space continues the record above, in zone-file
+        // syntax.
         const TEXT: &str = "\
 @ IN SOA ns1. admin. 1 2 3 4 5
 @ 3600 IN CDS 12345 8 2 49FD46E6C4B45C55D4AC69CBD3CD34AC1AFE51DE1EE8F13B5F5D1D1D1D1D1D1D

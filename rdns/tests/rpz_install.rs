@@ -56,10 +56,8 @@ impl Tracking {
     }
 }
 
-// Verbatim `tests/scale.rs`'s allocator, which is deliberate duplication: a
-// `#[global_allocator]` is per binary, so sharing it would mean a library item
-// that every other test binary then links (`CLAUDE.md` §7's exception — this is
-// not shared reasoning, it is a per-binary attribute).
+// `tests/scale.rs`'s allocator, copied: a `#[global_allocator]` is per binary,
+// so this is not shared reasoning (`CLAUDE.md` §7).
 unsafe impl GlobalAlloc for Tracking {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = System.alloc(layout);
@@ -185,9 +183,8 @@ fn installing_a_transferred_policy_zone() {
         .chain(std::iter::once(largest))
         .collect();
 
-    // The first measured block in a process picks up one-off initialization,
-    // which for a comparison of two paths lands entirely on whichever runs
-    // first (`CLAUDE.md` §10). Run both once and throw the numbers away.
+    // Run both once and discard: the first measured block pays one-off
+    // initialization (`CLAUDE.md` §10).
     {
         let dir = scratch("warmup");
         let zone = transferred(&dir, 1_000);
@@ -205,15 +202,13 @@ fn installing_a_transferred_policy_zone() {
 
     for rules in sizes {
         let dir = scratch(&format!("{rules}"));
-        // Measured, because it is what B is handed and what A throws away: the
-        // two columns below are otherwise taken from different baselines and
-        // the memory comparison is between a zone and no zone.
+        // Measured, as B is handed it and A throws it away; otherwise the
+        // columns have different baselines.
         let (zone, from_transfer) = measure(|| transferred(&dir, rules));
         let path = dir.join("feed.zone");
 
-        // A: serialize, write, then read the file back and index it. Both
-        // halves separately, because the row's open question is whether the
-        // serialization it never measured is the expensive one.
+        // A: serialize, write, read back, index; the halves apart, to see
+        // whether serializing is the cost.
         let (_, serialized) = measure(|| zone_to_string(&zone).expect("serializes"));
         let (_, written) = measure(|| write_zone_file(&zone, &path).expect("written"));
         let (a_zone, reloaded) =
@@ -224,11 +219,8 @@ fn installing_a_transferred_policy_zone() {
         let (b_zone, indexed) =
             measure(|| PolicyZone::new(zone, PolicyOverride::Given).expect("indexes"));
 
-        // Counts: `PolicyZone::records` is a record count and not the records.
-        // Record-for-record equality is
-        // `rpz::tests::what_is_installed_is_what_the_file_would_have_parsed_to`,
-        // which is in the suite because #71f rests on it — this line read as
-        // that for a day and was not it (`CLAUDE.md` §4).
+        // Counts only; record equality is
+        // `rpz::tests::what_is_installed_is_what_the_file_would_have_parsed_to`.
         assert_eq!(
             a_zone.records(),
             b_zone.records(),
@@ -244,9 +236,8 @@ fn installing_a_transferred_policy_zone() {
             ms(a_total),
             ms(indexed.elapsed),
             per_rule(reloaded.held, rules),
-            // B keeps the zone it was handed, so its footprint is that zone
-            // plus whatever indexing added. A's `held` already contains a zone,
-            // because it parsed a second one out of the file.
+            // B keeps the zone it was handed plus its index; A's `held`
+            // includes the zone it parsed back.
             per_rule(from_transfer.held + indexed.held, rules),
         );
         println!(
@@ -269,19 +260,11 @@ fn installing_a_transferred_policy_zone() {
     println!();
 }
 
-/// What one *refresh* of an already-installed feed costs, which is the question
-/// `TODO.md` #57e asks and the test above does not.
+/// What one *refresh* of an installed feed costs (`TODO.md` #57e): ask the
+/// master, get the change, install it, three routes timed at each size.
 ///
-/// The test above measures the install: what happens after the last envelope
-/// arrives. A refresh is the whole round — ask the master what it has, get what
-/// changed, put it where the answer path reads it — and the three routes are
-/// timed against each other at each size, over a loopback socket against a
-/// master built from `axfr_messages`/`ixfr_response`. That is the same code
-/// `rdnsd` answers a transfer with, so this is the two halves against each
-/// other rather than a mock.
-///
-/// Time only, and no memory column: the master runs in this process, so the
-/// global counter above would be reading both sides of the wire at once.
+/// Against a loopback master built from `axfr_messages` and `ixfr_response`,
+/// `rdnsd`'s own code. Time only: the master shares the allocation counter.
 #[test]
 #[ignore = "a measurement to take, not a check to run"]
 fn refreshing_a_transferred_policy_zone() {
@@ -366,9 +349,8 @@ fn refreshing_a_transferred_policy_zone() {
                 "both routes must arrive at the same zone, or this times two things"
             );
 
-            // The half of an IXFR that is not the wire. An empty difference
-            // sequence is the floor: whatever this costs is what applying
-            // *nothing* to a zone of this size costs.
+            // An empty difference sequence: the floor, what applying nothing
+            // costs at this size.
             let start = Instant::now();
             let (rebuilt, _) = rdns::ixfr::apply_changes(
                 &before,
@@ -382,10 +364,8 @@ fn refreshing_a_transferred_policy_zone() {
             (probe, axfr, ixfr, applied)
         });
 
-        // What applying the *real* difference costs, and what it is made of.
-        // #71a took the rebuild out of this, and what is left is nearly all the
-        // copy: the next stage is the copy's two allocations per record (#71e),
-        // not anything in `Patch`.
+        // The real difference: after #71a nearly all of it is the copy, whose
+        // allocations are #71e's.
         let delta = rdns::ixfr::diff(&before, &after).expect("both versions have an SOA");
         let new_soa = after.apex_soa_record().expect("an apex SOA");
         let mut patch = rdns::ixfr::Patch::new();
@@ -403,22 +383,16 @@ fn refreshing_a_transferred_policy_zone() {
         drop(copy);
         let dropped = start.elapsed();
 
-        // What either route pays afterwards, and the reason #57e is a question
-        // about the whole refresh rather than about the format: shape A writes
-        // the file, and the two columns are whether it then parses it back.
+        // What either route pays after: A writes the file; the columns are
+        // whether it parses it back.
         let path = dir.join("feed.zone");
         let (_, installed) = measure(|| {
             write_zone_file(&after, &path).expect("written");
             PolicyZone::load(&path, PolicyOverride::Given).expect("loads")
         });
 
-        // #71f: the same file, written the same way, and a reload that reads
-        // it to prove it is still the zone this process holds rather than to
-        // parse it.
-        //
-        // Its own file, holding the *previous* version: a store already at the
-        // new one keeps what it has and the column would measure neither route
-        // (the assertion below is what caught that).
+        // #71f: a reload that reads only to prove it holds this zone, from a
+        // file at the previous version, or neither route is measured.
         let path = dir.join("feed-71f.zone");
         write_zone_file(&before, &path).expect("the previous version is on disk");
         let store =
@@ -456,16 +430,11 @@ fn refreshing_a_transferred_policy_zone() {
     println!();
 }
 
-/// What a *set* of feeds costs when one of them publishes — `TODO.md` #71b.
+/// What a *set* of feeds costs when one of them publishes (`TODO.md` #71b);
+/// `RDNS_RPZ_FEEDS` sets how many.
 ///
-/// The two above measure one feed. This one measures the thing an operator
-/// actually runs: several feeds, one publisher, and a reload. `RDNS_RPZ_FEEDS`
-/// sets how many.
-///
-/// Three rows, and the middle one is the number the row was filed on: a cold
-/// load of the set, a reload with nothing changed, and a reload with exactly
-/// one feed rewritten. What the last two cost above the read-and-digest floor
-/// is the parse that was not skipped.
+/// Cold load, reload with nothing changed, reload with one feed rewritten: the
+/// last two above the read-and-digest floor are parses not skipped.
 #[test]
 #[ignore = "a measurement to take, not a check to run"]
 fn reloading_a_set_when_one_feed_publishes() {

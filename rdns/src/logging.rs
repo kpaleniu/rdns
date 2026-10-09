@@ -513,15 +513,8 @@ mod tests {
         let stats = logger.get_stats();
         assert!(stats.queries_by_source.len() <= MAX_TRACKED_SOURCES);
         assert!(stats.rate_limited_sources.len() <= MAX_TRACKED_SOURCES);
-        // Every query is still counted in total, and the shortfall is visible
-        // rather than silent — an operator reading "top talkers" has to know the
-        // list is a sample.
-        // Every query is still counted in total; only the per-source breakdown
-        // is a sample. (`untracked_sources` stays zero here because these
-        // sources send one datagram each, so the halving forgets them all and
-        // there is always room — which is the bound working, not failing. The
-        // counter earns its keep when the table is full of *repeat* sources; see
-        // the next test.)
+        // Every query is in the total; only the per-source breakdown samples.
+        // One datagram each, so `untracked_sources` stays zero.
         assert_eq!(stats.total_queries, MAX_TRACKED_SOURCES as u64 * 3);
     }
 
@@ -576,24 +569,16 @@ mod tests {
         note_source(&mut map, ip(9), &mut untracked, 4);
         assert_eq!(map.len(), 4, "the map does not grow past its bound");
         assert_eq!(untracked, 1, "and says it could not attribute the hit");
-        // The halving is not free: the surviving counts are decayed, which is the
-        // price of keeping the table bounded and is why these are anomaly
-        // signals rather than accounting.
+        // Halving decays the survivors: anomaly signals, not accounting.
         assert!(map.values().all(|&count| count >= 1));
     }
 
-    /// The regression test for the quadratic. A `log_query` that pushes one
-    /// timestamp per query into a `Vec` and `retain`s the whole thing on every
-    /// call costs more the more traffic is already logged — 469 ns at 1k deep,
-    /// 19,419 ns at 100k. That is a server-wide ~23k qps ceiling that no
-    /// profile of the answer path would ever point at.
+    /// The regression test for the quadratic: a `log_query` that retains a
+    /// whole `Vec` per call slows with the traffic already logged.
     ///
-    /// Asserted as a *ratio* rather than a floor, deliberately: a wall-clock
-    /// floor is what `bench_logger_throughput` had, and lowering it is how this
-    /// very regression got ratified (`CLAUDE.md` §10). A ratio does not care
-    /// how fast the machine is or what else is running on it — only whether the
-    /// second batch costs more than the first because of what came before. ~20×
-    /// against the quadratic, ~1× here.
+    /// A ratio, not a floor, which is how this regression was once ratified
+    /// (`CLAUDE.md` §10): the second batch must not cost more because of the
+    /// first.
     #[test]
     fn logging_a_query_costs_the_same_however_many_came_before() {
         use std::time::Instant;

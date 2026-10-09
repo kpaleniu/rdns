@@ -1265,17 +1265,10 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
 32.13.2.0.192.rpz-nsip      IN CNAME .
 ";
 
-    /// Indexing address triggers must not be quadratic in their number.
-    ///
-    /// A ratio, not a wall-clock floor: doubling the rules must roughly double
-    /// the work, which is machine-independent where a time limit is a coin toss
-    /// (`CLAUDE.md` §10). The `Vec` scanned per record read 4x per doubling —
-    /// 92.8 ms at 8k rules and 400.3 ms at 16k — and fails this at 3x with room
-    /// to spare, while the set is at ~2x.
-    ///
-    /// The trigger lists are what the module's own comment calls "tens of
-    /// entries". Nothing enforces that, and an IP blocklist delivered as RPZ is
-    /// all `rpz-ip` (`TODO.md` #62b).
+    /// Indexing address triggers must not be quadratic in their number:
+    /// doubling the rules roughly doubles the work, a ratio rather than a floor
+    /// (`CLAUDE.md` §10). An IP blocklist as RPZ is all `rpz-ip` (`TODO.md`
+    /// #62b).
     #[test]
     fn indexing_address_triggers_does_not_grow_quadratically() {
         fn feed(rules: usize) -> String {
@@ -1349,9 +1342,8 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
                 "every rule is a trigger"
             );
 
-            // Addresses no rule covers. The miss is the case to measure: a hit
-            // stops at whichever rule matched, so a scan looks fast whenever
-            // the answer is near the front of it.
+            // Misses: a hit stops at its rule, so a scan looks fast when the
+            // answer is near the front.
             let miss: Vec<IpAddr> = (0..64)
                 .map(|i| IpAddr::V4(Ipv4Addr::new(203, 0, 113, i)))
                 .collect();
@@ -1985,14 +1977,9 @@ evil.example.com IN CNAME .
         );
     }
 
-    /// A policy per feed, which is what a set of them is for: the new feed is
-    /// measured in `passthru` while the enforced one stays enforced
-    /// (`TODO.md` #63j).
-    ///
-    /// Fails against the shape this replaced, where `load` took one policy for
-    /// the set and both rules would read as `Passthru`. The match path is
-    /// unchanged — `PolicyZone` has held its own policy since it was written,
-    /// and `action_at` has always applied that one.
+    /// A policy per feed: a new feed measured in `passthru` while the enforced
+    /// one stays enforced (`TODO.md` #63j). Fails if `load` takes one policy
+    /// for the set: both rules read `Passthru`.
     #[test]
     fn each_feed_keeps_the_policy_it_was_loaded_with() {
         let dir = ScratchDir::new("rpz-per-feed");
@@ -2242,18 +2229,12 @@ evil.example.com IN CNAME .
         assert_eq!((again.reread, again.installed), (0, 0));
     }
 
-    /// The property #71f rests on: the zone installed from an offer is the
-    /// zone the file parses to, record for record.
+    /// The property #71f rests on: the zone installed from an offer is the zone
+    /// the file parses to, record for record.
     ///
-    /// Nothing asserted it before this: `rpz_install.rs`'s "the two shapes must
-    /// install the same zone" compares `PolicyZone::records`, which is a
-    /// *count*, and five trigger counts beside it — a claim read off a method
-    /// name instead of out of the method (`CLAUDE.md` §4). That one is also
-    /// `#[ignore]`d, so it guards nothing a suite runs.
-    ///
-    /// Field by field rather than comparing the two serializations: a
-    /// round-trip through the writer would hide anything the writer drops,
-    /// which is the half of this worth testing.
+    /// Field by field, not by comparing serializations, which would hide
+    /// anything the writer drops. `rpz_install.rs` compares counts only, and is
+    /// ignored.
     #[test]
     fn what_is_installed_is_what_the_file_would_have_parsed_to() {
         let dir = ScratchDir::new("rpz-offer-equal");
@@ -2294,13 +2275,9 @@ evil.example.com IN CNAME .
         );
     }
 
-    /// The digest is the whole test, so a file somebody else rewrote between
-    /// the write and the reload is parsed rather than papered over with the
-    /// zone this process meant to be there.
-    ///
-    /// The failure it prevents is an edit silently not taken (`CLAUDE.md` §4) —
-    /// the same one `of_self_contained` exists for, arriving from the other
-    /// direction.
+    /// The digest is the whole test: a file rewritten between the write and the
+    /// reload is parsed, not papered over with the offered zone, so no edit is
+    /// silently lost (`CLAUDE.md` §4).
     #[test]
     fn an_offer_is_declined_when_the_file_no_longer_holds_it() {
         let dir = ScratchDir::new("rpz-offer-stale");

@@ -605,9 +605,8 @@ mod tests {
         cache.insert(nm("zero.test.").as_ref(), vec![server], Vec::new(), 0);
         assert!(cache.best_match(nm("zero.test.").as_ref()).is_none());
 
-        // An entry is returned inside its TTL and not after it. Through
-        // `insert` and a moved clock, not a `CachedDelegation` forged through
-        // the mutex, which would test the comparison and never the insert.
+        // Inside its TTL and not after, through `insert` and a moved clock, so
+        // the insert is tested too.
         cache.insert(nm("stale.test.").as_ref(), vec![server], Vec::new(), 3600);
         assert!(cache.best_match(nm("stale.test.").as_ref()).is_some());
         clock.advance(3_599);

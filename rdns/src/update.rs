@@ -1052,9 +1052,8 @@ mail IN MX  10 mx.example.com.
     /// this module runs. Every other test here builds its message in memory.
     #[test]
     fn an_update_survives_the_wire_including_its_empty_rdata() {
-        // §2.4.1 RRset exists (value independent) and §2.4.3 RRset does not
-        // exist; then §2.5.2 delete an RRset, and one ordinary §2.5.1 add so the
-        // message is not made only of the interesting case.
+        // §2.4.1 and §2.4.3 prerequisites, a §2.5.2 RRset delete, and one
+        // ordinary §2.5.1 add.
         let prerequisites = vec![
             rr("www.example.com.", Class::new(255), Ttl::ZERO, bare(rt::A)),
             rr("new.example.com.", Class::new(254), Ttl::ZERO, bare(rt::A)),
@@ -1563,9 +1562,8 @@ mail IN MX  10 mx.example.com.
         assert_eq!(with_dname.changed, 1);
         assert_eq!(held(&with_dname.zone, "r.example.com.", rt::DNAME), 1);
 
-        // "If a DNAME is already associated with that name, then it is replaced
-        // with the new DNAME." Two would be the shape `check_dname_rules`
-        // refuses to load.
+        // "it is replaced with the new DNAME"; two would be what
+        // `check_dname_rules` refuses.
         let replaced = apply(
             &with_dname.zone,
             &[add("r.example.com.", 3600, dname("b.test."))],
@@ -1901,10 +1899,8 @@ mail IN MX  10 mx.example.com.
             "an UPDATE inside one signing hour must still look like a new version"
         );
 
-        // What a `max(file, now)` would serve: the same number twice, because
-        // the ten-digit `YYYYMMDDnn` form is larger than a current timestamp
-        // (2026080301 against 1.75e9). The eight-digit form is smaller and the
-        // `max` would swallow it whole, hence the `nn`.
+        // A `max(file, now)` would serve the same number twice: a ten-digit
+        // `YYYYMMDDnn` serial exceeds a current timestamp.
         let date_style_before = Serial::new(2_026_080_301);
         let date_style_after = date_style_before.wrapping_add(1);
         let maxed = |file: Serial| Serial::new(file.to_u32().max(signed_at as u32));

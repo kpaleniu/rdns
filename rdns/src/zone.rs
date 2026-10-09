@@ -1469,23 +1469,14 @@ mod tests {
             );
         }
 
-        // A prefix test, so a name beginning with the directive reads as one
-        // too. Deliberate and stated in the doc comment: erring towards a
-        // re-parse is the direction that cannot lose an edit.
+        // A prefix test, so `$INCLUDED` counts too: erring towards a re-parse
+        // cannot lose an edit.
         assert!(FileDigest::of_self_contained(b"$INCLUDED IN TXT nope\n").is_none());
     }
 
-    /// Two names whose folded octets hash to the same `u64` are still two
-    /// names — `TODO.md` #71d.
-    ///
-    /// Not hypothetical and not synthetic: FxHash collides on 2.5% of a
-    /// million-rule feed's names, and this pair is one of 236 found in the ten
-    /// thousand `bench_zone_lookup` already builds. The first version of the
-    /// arena index filed both records under one of them, because its
-    /// hand-rolled collision chain handed back the *incumbent's* slot on an
-    /// insert — `bench_zone_lookup` failed on the first run and this test names
-    /// the reason. The shipped index leaves collisions to hashbrown, which is
-    /// the argument for using it.
+    /// Two names whose folded octets hash to the same `u64` are still two names
+    /// (`TODO.md` #71d): a real FxHash pair from `bench_zone_lookup`'s names,
+    /// kept apart because hashbrown compares the arena bytes.
     #[test]
     fn an_index_keeps_two_names_that_hash_alike_apart() {
         let a = nm("host1319.example.com.");
@@ -1563,20 +1554,10 @@ mod tests {
     }
 
     /// `has_delegations` skips the ancestor walk, so it decides whether a
-    /// referral is found at all. Which NS records count is a fact about the
-    /// *apex*, and `set_origin` moves the apex: raising it turns the old apex's
-    /// own NS RRset into a zone cut (RFC 1034 §4.2.1).
-    ///
-    /// The mistake it catches is a `reindex` that rebuilds the index without
-    /// re-deciding which NS records are cuts: the flag then keeps the answer
-    /// the *old* apex gave, stays `false`, and the server answers
-    /// authoritatively for a child's names — `CLAUDE.md` §8's opening defect,
-    /// reached through an optimization rather than through the resolution
-    /// logic. The only test in the tree that catches it.
-    ///
-    /// Dropping the `= false` reset alone does *not* fail, which is worth
-    /// knowing: that leaves the flag stale only in the direction that costs a
-    /// wasted walk.
+    /// referral is found, and `set_origin` moves the apex that decides which NS
+    /// records are cuts (RFC 1034 §4.2.1). Fails if `reindex` keeps the old
+    /// apex's answer: the server answers authoritatively for a child's names
+    /// (`CLAUDE.md` §8).
     #[test]
     fn test_moving_the_apex_turns_the_old_apex_ns_into_a_delegation() {
         let mut zone = parse_zone_file(
@@ -1915,15 +1896,10 @@ timed 60 IN A 192.0.2.3
         );
     }
 
-    /// `query_with_kind` must answer exactly what `query` and `name_kind`
-    /// answer, for every kind of name — the kind is what decides NXDOMAIN
-    /// against NODATA, so a disagreement is a wrong rcode, not a slow one.
-    ///
-    /// The kind is the live half: `query` delegates here, so comparing the
-    /// records to `query`'s is a tautology, while the kind is checked against
-    /// `name_kind`'s own walk. Fails with the kind forced to `NotFound` — which
-    /// `an_empty_non_terminal_is_nodata_not_nxdomain` in `rdnsd` also catches,
-    /// since that is a NODATA turning into NXDOMAIN.
+    /// `query_with_kind` must answer what `query` and `name_kind` answer for
+    /// every kind of name, as the kind decides NXDOMAIN against NODATA. `query`
+    /// delegates here, so the kind, checked against `name_kind`'s own walk, is
+    /// the live half. Fails with the kind forced to `NotFound`.
     #[test]
     fn test_query_with_kind_answers_what_the_two_calls_did() {
         let zone = parse_zone_file(
@@ -2026,16 +2002,11 @@ timed 60 IN A 192.0.2.3
         );
     }
 
-    /// A name with descendants exists (RFC 4592 §2.2.2): NODATA, not NXDOMAIN,
-    /// which an RFC 8020 resolver would extend downwards over the zone's own
-    /// data.
     /// A node's kind is what it holds, not the order the zone file arrived in.
     ///
-    /// The two maps became one in #22, so "is this a node" and "does it have
-    /// records" are one lookup — which makes insertion *order* the thing that
-    /// could go wrong. A name noted as an ancestor and then given records must
-    /// read `Exact`, and a record added below a name that already has records
-    /// must not stop the ancestor walk early.
+    /// One lookup answers "is this a node" and "does it have records", so
+    /// order is what could go wrong: a noted ancestor given records reads
+    /// `Exact`, and a record below one with records keeps the walk going.
     #[test]
     fn a_non_terminal_that_gains_records_is_an_ordinary_name() {
         for (order, text) in [
@@ -2073,6 +2044,8 @@ deep.a.b IN TXT \"x\"
         }
     }
 
+    /// A name with descendants exists (RFC 4592 §2.2.2): NODATA, not NXDOMAIN,
+    /// which an RFC 8020 resolver would extend over the zone's own data.
     #[test]
     fn test_empty_non_terminals_exist() {
         let zone = parse_zone_file("deep.a.b IN TXT \"down here\"\n", "example.com.").unwrap();
@@ -2160,9 +2133,8 @@ deep.a.b IN TXT \"x\"
             );
         }
 
-        // §2.4 forbids a CNAME at a DNAME's owner name too. That one is refused
-        // by `check_cname_exclusivity`, citing RFC 1034 §3.6.2 — the older
-        // statement of the same rule — so it is not in the loop above.
+        // A CNAME at a DNAME's owner is `check_cname_exclusivity`'s to refuse
+        // (RFC 1034 §3.6.2), so not looped above.
         let err = parse_zone_file(
             "sub IN DNAME a.example.net.\nsub IN CNAME b.example.net.\n",
             "example.com.",
@@ -2337,15 +2309,9 @@ deep.a.b IN TXT \"x\"
             .is_empty());
     }
 
-    /// The index as a sorted list, for comparing two zones that must be one
-    /// zone. `Slot` is three shapes for one answer, so it is the answer that is
-    /// compared.
     /// Every name the index holds and the records at each, in a form two zones
-    /// built different ways compare by.
-    ///
-    /// Not `index_of`: a removal fills its hole from the end, so positions are
-    /// a permutation of a straight load's and nothing reads a zone in load
-    /// order ([`Zone::remove_record`]).
+    /// built different ways compare by. Not `index_of`: a removal permutes
+    /// positions, and nothing reads load order ([`Zone::remove_record`]).
     fn shape_of(zone: &Zone) -> Vec<(Vec<u8>, Vec<String>)> {
         let mut out: Vec<(Vec<u8>, Vec<String>)> = zone
             .index
@@ -2418,9 +2384,8 @@ deep.a.b IN TXT \"down here\"
         zone.remove_record(at);
         index_agrees_with_records(&zone, "after the TXT went");
 
-        // NXDOMAIN, not NODATA: an empty non-terminal left over a name with
-        // nothing under it says a subtree exists that does not
-        // (RFC 4592 §2.2.2).
+        // NXDOMAIN, not NODATA: an empty non-terminal over nothing would claim
+        // a subtree (RFC 4592 §2.2.2).
         for gone in [
             "deep.a.b.example.com.",
             "a.b.example.com.",
@@ -2573,11 +2538,8 @@ deep.a.b IN TXT \"down here\"
     }
 
     /// The chains hold positions too, so a removal owes them both halves: the
-    /// entry of the record that went, and the entry of the record that moved
-    /// into its place.
-    ///
-    /// An NSEC and an NSEC3 together, because they are two maps and a fix that
-    /// reached one of them would pass a test that asked about the other.
+    /// record that went and the one that moved into its place. NSEC and NSEC3
+    /// together, as a fix reaching one map would pass a test of the other.
     #[test]
     fn a_removal_moves_the_denial_chains_with_the_records() {
         let text = "$TTL 3600\n\
@@ -2666,25 +2628,10 @@ deep.a.b IN TXT \"down here\"
 
     /// Applying deltas forever must not grow a zone that is not growing.
     ///
-    /// **All four of the append-only stores**: the index's name arena, the
-    /// spill lists, and the record name and RDATA arenas (`TODO.md` #71e). A
-    /// difference sequence spells a changed record as a deletion and an
-    /// addition (RFC 1995 §2), so every publication appends the same octets
-    /// again and a name that falls back to one record leaves its position list
-    /// behind. Unbounded in a process that refreshes a feed for a year without
-    /// restarting, and invisible: the entry count, the record count and every
-    /// answer stay right while the process grows.
-    ///
-    /// Four times the rounds and the same peak, rather than a size: a bound is
-    /// a statement about what a number does *not* depend on (`CLAUDE.md` §10).
-    /// The peak and not the final figure, because the rebuild is periodic and
-    /// where a run stops between two of them is not the question.
-    ///
-    /// Against the version without the rebuild `remove_record` triggers, the
-    /// index arena peaks at 120 031 octets over 100 rounds and 408 031 over
-    /// 400; against one that reindexes without compacting the record arenas,
-    /// the name arena reads 121 849 and 415 249. With both, 35 647 and 35 719,
-    /// and the spill list 14 either way.
+    /// All four append-only stores (`TODO.md` #71e): each changed record is a
+    /// deletion and an addition (RFC 1995 §2). Four times the rounds, the same
+    /// peak (`CLAUDE.md` §10); the peak, as the rebuild is periodic. Fails
+    /// without the rebuild, or without compacting the record arenas.
     #[test]
     fn applying_deltas_forever_does_not_grow_the_index() {
         fn churn(rounds: u32) -> (usize, usize, usize, usize, usize, usize) {
@@ -2716,9 +2663,8 @@ deep.a.b IN TXT \"down here\"
                 record.ttl = Ttl::from_secs(3600 + round);
                 zone.add_record(record);
                 index_agrees_with_records(&zone, &format!("round {round}"));
-                // The peak, not the end: the rebuild is periodic, so where a
-                // run stops between two of them moves the final figure and not
-                // the bound this is about.
+                // The peak, not the end: where a run stops between rebuilds
+                // moves only the final figure.
                 peak_arena = peak_arena.max(zone.index.names.len());
                 peak_spills = peak_spills.max(zone.spills.len());
                 peak_names = peak_names.max(zone.names.len());
@@ -2741,9 +2687,8 @@ deep.a.b IN TXT \"down here\"
             (long.2, long.3),
             "no name and no record arrived or left"
         );
-        // Within a few parts in a thousand: which names a cycle happens to
-        // re-intern before the rebuild moves the peak a little, and the
-        // question is whether it moves with the *rounds*.
+        // Within a few parts in a thousand: re-interning order moves the peak a
+        // little, but not with the rounds.
         assert!(
             100 * long.0 <= 105 * short.0,
             "the arena's peak grew with the number of publications: {} then {}",
@@ -2770,6 +2715,8 @@ deep.a.b IN TXT \"down here\"
         );
     }
 
+    /// The index as a sorted list, for comparing two zones that must be one.
+    /// `Slot` is three shapes for one answer, so the answer is compared.
     fn index_of(zone: &Zone) -> Vec<(Vec<u8>, Vec<usize>)> {
         let mut out: Vec<(Vec<u8>, Vec<usize>)> = zone
             .index
@@ -2781,15 +2728,11 @@ deep.a.b IN TXT \"down here\"
     }
 
     /// A top-level `$ORIGIN` after a record leaves the zone that setting the
-    /// apex first would have built — the bookkeeping that is *about* the apex
-    /// included, not merely the records.
+    /// apex first would have built, the bookkeeping about the apex included.
     ///
-    /// The parser owes one rebuild at the end rather than one per `$ORIGIN`
-    /// (`TODO.md` #62c), so this is what "the same zone" has to mean. The
-    /// records here are the three things the apex decides: an NS RRset that is
-    /// a delegation under one apex and the apex's own under the other, a
-    /// wildcard, and a name whose ancestors become empty non-terminals only for
-    /// an apex above them.
+    /// One rebuild at the end (`TODO.md` #62c). The records are what the apex
+    /// decides: an NS RRset that may be a cut, a wildcard, and ancestors that
+    /// are empty non-terminals only under a higher apex.
     #[test]
     fn a_late_origin_leaves_the_zone_setting_the_apex_first_would_have() {
         let text = "ns1.old.test. IN A 192.0.2.1\n\
@@ -2845,21 +2788,11 @@ deep.a.b IN TXT \"down here\"
     }
 
     /// Parsing must not cost more per record because the file has more
-    /// `$ORIGIN` lines.
+    /// `$ORIGIN` lines (`TODO.md` #62c).
     ///
-    /// A ratio, not a wall-clock floor (`CLAUDE.md` §10): doubling a file whose
-    /// every record carries its own `$ORIGIN` must roughly double the work.
-    /// `set_origin` rebuilds the index over every record so far, so calling it
-    /// per line was O(sections x records) — 3.81 s at 8 000 records and 13.64 s
-    /// at 16 000 in release, ~4x per doubling — and fails this at 3x with room
-    /// to spare. Deferring the move to one rebuild reads ~2x.
-    ///
-    /// Best of five a side, because a ratio is machine-independent and not
-    /// noise-independent: a single ~14 ms sample that loses a scheduling slice
-    /// reads 3.03x and fails, which the Windows runner did in CI run
-    /// 35538607349 — thirty seconds after the same test passed in the same job.
-    /// Contention only ever adds time, so the minimum is the sample the machine
-    /// was least busy for.
+    /// A ratio, not a floor (`CLAUDE.md` §10): doubling a file with an
+    /// `$ORIGIN` per record roughly doubles the work, where a rebuild per line
+    /// quadruples it. Best of five a side, as contention only adds time.
     #[test]
     fn parsing_does_not_cost_more_per_record_when_every_record_moves_the_origin() {
         fn parse(records: usize) -> std::time::Duration {
@@ -3423,13 +3356,8 @@ $TTL 3600
         let err = parse_zone_file(zone_content, "example.com.").unwrap_err();
         assert!(err.to_string().contains("$TTL"), "got: {err}");
     }
-    /// A *quoted* escape in a name was eaten by the tokenizer, so `"a\.b"`
-    /// reached the parser as `a.b` and became two labels — while the unquoted
-    /// form was refused outright. The tokenizer keeps the backslash now, so
-    /// both spellings take the same path and mean the same one label.
-    ///
-    /// Found while writing RFC 9460's SvcParamValue decoding, which needed the
-    /// backslash to survive tokenizing for `\DDD` to mean anything.
+    /// A quoted escape in a name means what the unquoted one does: `"a\.b"` and
+    /// `a\.b` are both one label, as the tokenizer keeps the backslash.
     #[test]
     fn a_quoted_escape_in_a_name_means_the_same_as_an_unquoted_one() {
         for line in [

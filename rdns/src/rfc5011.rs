@@ -1276,9 +1276,8 @@ mod tests {
         );
     }
 
-    // The tests above drive the state machine with keys that never signed
-    // anything, which cannot exercise the one rule resting on cryptography: a
-    // key revokes only itself. Below, the roll is played out with real keys.
+    // With real keys: the one rule resting on cryptography is that a key
+    // revokes only itself.
 
     use crate::dnssec_test_util::{rrsig_record, TestKey};
 

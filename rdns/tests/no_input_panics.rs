@@ -138,9 +138,8 @@ fn corpus(zone: &Zone, signed: &Zone) -> Vec<(&'static str, Vec<u8>)> {
         ("alias.example.com.", record_types::CNAME),
         ("example.com.", record_types::SOA),
         ("example.com.", record_types::NS),
-        // Every RDATA with a length field an attacker picks. DNAME's is the
-        // name; SVCB and HTTPS carry a 16-bit length *per parameter*, read in
-        // a loop, which is the shape `CLAUDE.md` §2 opens with.
+        // Every attacker-chosen RDATA length: DNAME's name, and SVCB and
+        // HTTPS's 16-bit length per parameter (`CLAUDE.md` §2).
         ("redir.example.com.", record_types::DNAME),
         ("svc.example.com.", record_types::HTTPS),
         ("svc.example.com.", record_types::SVCB),
@@ -310,9 +309,8 @@ fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring
             let _ = z.delegation_for(query.qname.as_ref());
             let _ = z.matches_query(nm("www.example.com.").as_ref(), query.qname.as_ref());
 
-            // The zone's answer, DO set, as `rdnsd` writes it, rather than the
-            // four proof writers one by one on names the answer path never
-            // sends them.
+            // The zone's answer with DO, as `rdnsd` writes it, not the proof
+            // writers on names the answer path never sends them.
             let mut out = Vec::new();
             let mut compressor = rdns::compression::NameCompressor::new();
             if let Ok(mut w) = rdns::response::ResponseWriter::start(

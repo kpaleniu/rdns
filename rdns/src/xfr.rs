@@ -1442,9 +1442,8 @@ mod tests {
             "got: {err}"
         );
 
-        // And an answer that does not open with the zone's SOA. Dropping the
-        // first record would *not* be caught — the second record is an SOA too —
-        // which is safe only because the serial names the base we apply against.
+        // An answer not opening with the zone's SOA. Dropping only the first
+        // record is safe: the serial names the base.
         let mut assembler = IxfrAssembler::new(nm("example.com."));
         let mut headless = crate::ixfr::ixfr_response(&ixfr_from(&v1), &v2, &log)
             .unwrap()
@@ -1466,16 +1465,9 @@ mod tests {
         );
     }
 
-    /// Serve one AXFR on a loopback port and hand back its address.
-    ///
-    /// Built from `transfer::axfr_messages`, the same code `rdnsd` answers a
-    /// transfer with, so this is the two halves against each other, not a mock.
-    /// What this master declines, so the refusal cases drive the *same* master
-    /// as every other test rather than a second one written beside it (§7).
-    ///
-    /// The two are separate because that is the configuration #96 is about:
-    /// `allow-query` and `allow-transfer` are different ACLs, so a master can
-    /// refuse either without the other.
+    /// What this master declines, so refusal cases drive the same master as
+    /// every other test (§7). Two fields, as `allow-query` and `allow-transfer`
+    /// are separate ACLs (`TODO.md` #96).
     #[derive(Clone, Copy, Default)]
     struct Refuses {
         soa_probe: bool,
@@ -1533,9 +1525,8 @@ mod tests {
 
             let request = DnsMessage::try_from_bytes(&packet).expect("parse the request");
 
-            // A request that does not verify is answered with the
-            // rejection, as a real master does; hanging up would test a
-            // different failure.
+            // A request that fails verification gets the rejection, as from a
+            // real master; hanging up is another failure.
             let mut session = None;
             if let Some(k) = key.as_ref() {
                 let keyring = crate::tsig::TsigKeyring::new(vec![k.clone()]);
@@ -1728,14 +1719,9 @@ mod tests {
         spawn_tls_master_inner(zone, name, None).await
     }
 
-    /// The same master, demanding a client certificate that chains to
-    /// `client_root` — RFC 9103 §7.5's mTLS, from the side this tree does not
-    /// implement as a *server* (`TODO.md` #59). Written here because the client
-    /// half has to be provable against something that actually asks.
-    ///
-    /// One function with a parameter rather than two spawners (`CLAUDE.md` §7):
-    /// everything but the verifier is the same, and a second copy is where the
-    /// ALPN token or the TLS version would come to differ.
+    /// The same master, demanding a client certificate chaining to
+    /// `client_root` (RFC 9103 §7.5), so the client half is proved against
+    /// something that asks. One function with a parameter (`CLAUDE.md` §7).
     async fn spawn_tls_master_inner(
         zone: Zone,
         name: &str,
@@ -1925,14 +1911,8 @@ mod tests {
             .expect("mutual TLS");
         assert_eq!(received.records().len(), source.records().len());
 
-        // And without one. The failure does *not* come back from the handshake:
-        // TLS 1.3 has the client finish and send application data in the same
-        // flight, so `connect` returns `Ok` and the master's
-        // `CertificateRequired` alert arrives on the first read. Asserted as
-        // measured rather than as expected — this is the message an operator
-        // whose master started demanding a certificate actually sees, and it is
-        // under "transferring example.com. from ..." rather than under a
-        // handshake error.
+        // No certificate: TLS 1.3 lets `connect` succeed and the alert arrive
+        // on the first read, under "transferring example.com. from ...".
         let err = fetch_zone(
             &xot_master(&master, "master.test"),
             nm("example.com.").as_ref(),
@@ -1964,13 +1944,9 @@ mod tests {
         );
     }
 
-    /// A master may refuse the SOA probe and still hand over the zone: the probe
-    /// is an ordinary query and `allow-query` is not `allow-transfer`
-    /// (`TODO.md` #96).
-    ///
-    /// Reverted against the fix this hangs the zone out to EXPIRE: `fetch_soa`
-    /// mapped every rcode to `Malformed` and `refresh_zone` propagated it with
-    /// `?` before ever asking for the transfer.
+    /// A master may refuse the SOA probe and still hand over the zone:
+    /// `allow-query` is not `allow-transfer` (`TODO.md` #96). Fails if the
+    /// probe's refusal is propagated before the transfer is asked for.
     #[tokio::test]
     async fn a_refused_soa_probe_still_transfers_the_zone() {
         let source = source_zone();

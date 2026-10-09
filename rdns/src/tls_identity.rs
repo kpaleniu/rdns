@@ -123,16 +123,10 @@ mod tests {
 /// The certificate authorities a peer's certificate is checked against, read
 /// from one PEM bundle.
 ///
-/// Both directions need this: an XoT *client* checking a master's certificate
-/// ([`crate::xot::TlsClientTrust`]) and a primary checking a transfer client's
-/// (`TODO.md` #59). The empty-file refusal is the reason it is one function —
-/// an anchor set with nothing in it loads, starts, and then refuses every
-/// handshake with a message about the other end (`CLAUDE.md` §4, §7).
-///
-/// A newtype rather than a bare `Arc<RootCertStore>` so that a caller outside
-/// this crate can hold one without naming `rustls`, and so the count survives:
-/// rustls does not hand the store back once a verifier has it, and the startup
-/// banner should say how many anchors an operator actually loaded.
+/// For both directions: an XoT client checking a master
+/// ([`crate::xot::TlsClientTrust`]) and a primary checking a transfer client.
+/// One function so an empty file is refused once (`CLAUDE.md` §4, §7). A
+/// newtype hides `rustls` and keeps the count for the startup banner.
 #[derive(Debug, Clone)]
 pub struct TrustAnchors {
     roots: Arc<RootCertStore>,

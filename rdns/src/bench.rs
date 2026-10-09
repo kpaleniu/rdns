@@ -36,11 +36,8 @@ mod benches {
             iterations
         );
 
-        // ~3.1M ops/sec in debug, so 100k is a factor of thirty of headroom and
-        // still an order of magnitude above what the O(window) `log_query`
-        // reached. A wall-clock floor is not the real guard:
-        // `logging::tests::logging_a_query_costs_the_same_however_many_came_before`
-        // asserts the shape as a ratio.
+        // A loose floor (`CLAUDE.md` §10); the real guard is the ratio in
+        // `logging_a_query_costs_the_same_however_many_came_before`.
         assert!(
             ops_per_sec > 100_000.0,
             "logger too slow: {:.0} ops/sec",

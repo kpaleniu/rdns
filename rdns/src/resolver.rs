@@ -1325,9 +1325,8 @@ mod tests {
 
     #[test]
     fn test_randomize_case_changes_only_case() {
-        // Length octets, digits and hyphens included: only an ASCII letter may
-        // move, and then only in bit 0x20. Flipping a length octet would be a
-        // different name rather than the same one in another case.
+        // Only an ASCII letter moves, in bit 0x20; a flipped length octet would
+        // be another name.
         for text in ["www.Example.com.", "9-a.b."] {
             let name = nm(text);
             for _ in 0..64 {
@@ -1346,16 +1345,9 @@ mod tests {
         }
     }
 
-    /// `TODO.md` #45e, answered **no**: nothing about the client goes upstream.
-    ///
-    /// The query this resolver sends carries one OPT with a payload size and
-    /// possibly DO, and no options at all — EDNS Client Subnet included, which
-    /// is the one an operator would be tempted to add for the sake of a near
-    /// replica. RFC 7871 §11: the option makes the client's network "visible to
-    /// all servers involved in the resolution process".
-    ///
-    /// A test for the absence of a behaviour, because `build_query` is where it
-    /// would be added and nothing else would notice.
+    /// Nothing about the client goes upstream: one OPT, payload size and maybe
+    /// DO, no options, ECS included (RFC 7871 §11). A test of an absence, as
+    /// `build_query` is where one would be added unnoticed.
     #[test]
     fn the_query_sent_upstream_carries_nothing_about_the_client() {
         for dnssec in [false, true] {
@@ -1435,12 +1427,9 @@ this line has no record and is skipped
         assert!(result.is_err());
     }
 
-    /// RFC 5452 §9.1 makes "Query class and type" part of what a reply must
-    /// match (`TODO.md` #30o). A reply echoing the right name under another
-    /// type is somebody else's answer.
-    ///
-    /// Fails if the check is the id and the name alone: the MX-questioned reply
-    /// is taken as the answer to an A query, address record and all.
+    /// RFC 5452 §9.1 includes "Query class and type" in what a reply must
+    /// match. Fails if the check is id and name alone: an MX-questioned reply
+    /// answers an A query.
     #[tokio::test]
     async fn a_reply_that_echoes_another_type_is_not_this_answer() {
         let net = Net::default();
@@ -1467,15 +1456,8 @@ this line has no record and is skipped
     /// Lowering what this resolver advertises does not narrow what it can
     /// receive.
     ///
-    /// With an answer buffer of `vec![0; config.udp_payload_size]`, moving the
-    /// advertisement to DNS Flag Day's 1232 makes every answer over 1232
-    /// unreadable — and unreadable, not truncated: the receive itself fails on
-    /// Windows and drops the tail elsewhere, so the answer is lost rather than
-    /// parsed short.
-    ///
-    /// The upstream here answers with more than it was told to, which is the
-    /// only case this is about; a conforming server never reaches it.
-    ///
+    /// The upstream sends more than advertised, which only a non-conforming
+    /// server does; a datagram larger than the buffer is lost, not truncated.
     /// Fails with `NoResponse` if the buffer is the advertised size.
     #[tokio::test]
     async fn an_upstream_that_ignores_the_advertisement_is_still_read() {
@@ -1777,13 +1759,9 @@ this line has no record and is skipped
         assert!(matches!(err, ResolveError::PolicyStopped), "{err:?}");
     }
 
-    /// The regression that decided the shape of the delegation cache: a walk
-    /// starts at the deepest delegation already known, so a policy asked only
-    /// at referrals is a rule in force for the client that walked the chain and
-    /// for nobody after it.
-    ///
-    /// Fails against a cache holding addresses alone — the second query starts
-    /// at `example.test.`, sees no referral, and resolves.
+    /// A walk starts at the deepest cached delegation, so a policy asked only
+    /// at referrals binds one client. Fails against a cache holding addresses
+    /// alone: the second query sees no referral and resolves.
     #[tokio::test]
     async fn a_cached_delegation_is_still_offered_to_the_policy() {
         let net = Net::default();
@@ -1877,14 +1855,10 @@ this line has no record and is skipped
         assert!(resolver.resolve(&query).await.is_ok());
     }
 
-    /// RFC 6672 §3.4.1 step 4D and §3.4: a DNAME in the answer is followed,
-    /// and the CNAME the server did not send is synthesized here — "recursive
-    /// caching name servers MUST perform CNAME synthesis on behalf of clients".
-    ///
-    /// The upstream deliberately sends the DNAME *alone*, which §3.1 says a
-    /// conforming authoritative server would not do. That is the case worth
-    /// testing: with a CNAME in the response the chase is the ordinary CNAME
-    /// path and proves nothing about DNAME.
+    /// RFC 6672 §3.4: a DNAME in the answer is followed and its CNAME
+    /// synthesized here. The upstream sends the DNAME alone, as a
+    /// non-conforming server would; with a CNAME the ordinary path would prove
+    /// nothing.
     #[tokio::test]
     async fn a_dname_alone_is_followed_and_its_cname_synthesized() {
         let net = Net::default();
@@ -1931,9 +1905,8 @@ this line has no record and is skipped
              so the chain filter used to drop it: {:?}",
             answer.answers
         );
-        // Compared case-insensitively: the owner is a suffix of the question,
-        // so it goes out as a compression pointer into a 0x20-randomized name
-        // and comes back in that case (RFC 4343).
+        // Case-insensitive: the owner went out as a pointer into the 0x20 name
+        // and returns in that case (RFC 4343).
         assert_eq!(dnames[0].name, nm("example.test."));
 
         let cnames: Vec<_> = answer
@@ -2084,9 +2057,8 @@ this line has no record and is skipped
             })
             .await;
 
-        // With that glue rejected the delegation is glueless, and resolving
-        // ns.example.test. goes nowhere in this fake hierarchy — so the resolve
-        // fails rather than returning the attacker's address.
+        // Without that glue the delegation is glueless and unresolvable here,
+        // so the resolve fails, not the attacker's address.
         let answers = result.map(|r| r.answers).unwrap_or_default();
         assert!(
             !answers.iter().any(|rr| {
@@ -2191,9 +2163,8 @@ this line has no record and is skipped
         let net = Net::default();
         let (root_addr, tld_addr, auth_addr) = (fake(1), fake(2), fake(3));
 
-        // Authoritative for example.test., and also holds the A for
-        // ns.hoster.test. — which must be this server's real address, since the
-        // resolver dials whatever the A says.
+        // Authoritative for example.test. and holding ns.hoster.test.'s A,
+        // which must be this server, as the resolver dials it.
         let IpAddr::V4(auth_ip) = auth_addr.ip() else {
             unreachable!("bound on IPv4 loopback")
         };
@@ -2599,13 +2570,9 @@ this line has no record and is skipped
         );
     }
 
-    /// Two servers that both answer, the slower listed first: it is asked
-    /// once, timed, and the faster one is asked from then on. The failing-server
-    /// test above shows a timeout's charge; this one shows a measured round
-    /// trip's, which only `ask_any` records.
-    ///
-    /// 150 ms is past `UNKNOWN_RTT_MS`, so an untimed server outranks it. The
-    /// clock is paused, so the sleeps take no time and the order is exact.
+    /// Two answering servers, the slower first: it is asked once, timed, and
+    /// the faster asked thereafter; only `ask_any` records a round trip. 150 ms
+    /// is past `UNKNOWN_RTT_MS`; the clock is paused, so the order is exact.
     #[tokio::test(start_paused = true)]
     async fn test_rtt_selection_prefers_the_faster_of_two_answering_servers() {
         let (slow, fast) = (fake(2), fake(3));
@@ -2644,11 +2611,9 @@ this line has no record and is skipped
         assert_eq!(*asked.lock().unwrap(), [slow, fast, fast]);
     }
 
-    /// A referral to 70 glued nameservers that never answer: the query budget
-    /// alone lets this run 63 exchanges, 157.5 s (`TODO.md` #168). The timer
-    /// abandons it at 10 s, to the tick, because the clock is paused.
-    ///
-    /// Fails without the timer: 157.5 s and `NoResponse`.
+    /// A referral to 70 silent glued nameservers, which the budget alone would
+    /// let run 63 exchanges (`TODO.md` #168); abandoned at 10 s exactly, clock
+    /// paused. Fails without the timer: `NoResponse` much later.
     #[tokio::test(start_paused = true)]
     async fn a_resolution_is_abandoned_when_its_timer_expires() {
         let root = fake(1);
@@ -3058,13 +3023,9 @@ this line has no record and is skipped
         (answer, asked)
     }
 
-    /// A forwarder is not authoritative for what its upstream is authoritative
-    /// for (RFC 1035 §4.1.1), and relaying AA costs more than a wrong bit:
-    /// with AA set, RFC 8020 lets a downstream resolver read an NXDOMAIN as a
-    /// claim about the whole subtree.
-    ///
-    /// The clearing is in `resolve_validated`, past both modes, so `forward`
-    /// cannot skip it.
+    /// A forwarded answer drops the upstream's AA (RFC 1035 §4.1.1), which RFC
+    /// 8020 would let a downstream read as a claim on the subtree. Cleared past
+    /// both modes in `resolve_validated`.
     #[tokio::test]
     async fn a_forwarded_answer_does_not_carry_the_upstreams_aa_bit() {
         let (answer, _) = resolve_against_an_authoritative_upstream().await;
@@ -3076,16 +3037,9 @@ this line has no record and is skipped
 
     /// The question handed back is the client's, byte for byte.
     ///
-    /// Not a cosmetic point: with 0x20 on by default the question sent
-    /// upstream carries a scrambled case, and a downstream resolver running
-    /// its own 0x20 check compares the echoed question *case-sensitively*
-    /// (RFC 5452 §9.1) — this crate's own `response_matches` is that check.
-    /// Relaying the upstream's copy makes our answer unacceptable to it.
-    ///
-    /// A `QuerySection` compares case-insensitively (RFC 4343), so the
-    /// assertion is on the text. Before the fix this failed unless the
-    /// scramble happened to leave all ten letters alone, which is 1 in 1 024;
-    /// after it, it cannot fail.
+    /// Upstream sees a 0x20-scrambled case, and a downstream 0x20 check
+    /// compares case-sensitively (RFC 5452 §9.1). `QuerySection` folds case, so
+    /// this asserts on the text.
     #[tokio::test]
     async fn a_forwarded_answer_echoes_the_clients_question_not_the_one_sent() {
         let (answer, asked) = resolve_against_an_authoritative_upstream().await;
@@ -3130,9 +3084,8 @@ this line has no record and is skipped
         );
     }
 
-    // A signed hierarchy in-process: the tests below sign with `ring` at run
-    // time and put the whole resolve path through it — root KSK/ZSK, a DS in
-    // each parent, and a signature over the answer.
+    // A signed hierarchy in-process, signed with `ring` at run time: root keys,
+    // a DS per parent, a signed answer.
 
     use crate::denial_wire::build_type_bitmap;
     use crate::dnssec_test_util::{ds_record, TestZone};
@@ -3210,9 +3163,8 @@ this line has no record and is skipped
 
         let anchors = TrustAnchors::new(vec![root.ds(2)]);
 
-        // Everything each server will ever say is computed and signed up front,
-        // so the closures below need only clone — the keys themselves never
-        // cross a thread boundary.
+        // Everything each server says is signed up front, so the closures only
+        // clone and keys cross no thread.
         let root_keys = root.dnskey_records();
         // The root's own SOA, signed: what a local root probe asks (#177).
         let root_soa = {
@@ -3241,9 +3193,8 @@ this line has no record and is skipped
         let (answers, leaf_authority) = leaf(&auth);
         let denial = signed_nxdomain_authority(&auth);
         let nsec3_denial = signed_nsec3_nxdomain_authority(&auth);
-        // The same proof with the closest-encloser record removed. It still
-        // *covers* the queried name, so a validator that only checked coverage
-        // would call it proved.
+        // Without the closest-encloser record: still covering, so a
+        // coverage-only validator would call it proved.
         let nsec3_incomplete: Vec<ResourceRecord> = {
             let full = signed_nsec3_nxdomain_authority(&auth);
             // Keep the SOA (and its signature) and the covering record (and
@@ -3286,9 +3237,8 @@ this line has no record and is skipped
                 resp.authorities = denial.clone();
                 resp
             } else if name == "nsec3-gone.example.test." {
-                // The same "no", proved with NSEC3 instead: a record matching the
-                // closest encloser and one covering both the next closer name and
-                // the wildcard position.
+                // The same "no" with NSEC3: one matching the encloser, one
+                // covering next closer and wildcard.
                 let mut resp = response_to(q);
                 resp.authoritive = true;
                 resp.rcode = ResponseCode::NoSuchDomain;
@@ -3301,25 +3251,22 @@ this line has no record and is skipped
                 resp.authorities = nsec3_incomplete.clone();
                 resp
             } else if name == "wild-nodata.example.test." && qtype == Qtype::of(rt::AAAA) {
-                // A wildcard NODATA: the name does not exist, `*.example.test.`
-                // answered, and it has an A but no AAAA. NOERROR with an empty
-                // answer section.
+                // A wildcard NODATA: `*.example.test.` holds A, not AAAA;
+                // NOERROR, empty answer section.
                 let mut resp = response_to(q);
                 resp.authoritive = true;
                 resp.authorities = wildcard_nodata.clone();
                 resp
             } else if name == "stripped-wildcard.example.test." && qtype == Qtype::of(rt::AAAA) {
-                // The same, with the record at the wildcard removed: what is
-                // left covers the name but says nothing about what a wildcard
-                // would have answered with.
+                // Without the record at the wildcard: the name is covered, the
+                // wildcard's types unproved.
                 let mut resp = response_to(q);
                 resp.authoritive = true;
                 resp.authorities = stripped_wildcard.clone();
                 resp
             } else if name == "chase.example.test." || name == "stripped-chase.example.test." {
-                // An alias, answered with the CNAME alone — which is what makes
-                // the response's answer section non-empty while holding none of
-                // the data that was asked for.
+                // The CNAME alone: an answer section that is not empty but
+                // holds nothing asked for.
                 let records = if name == "chase.example.test." {
                     alias_cname.clone()
                 } else {
@@ -3469,24 +3416,11 @@ this line has no record and is skipped
         vec![soa, soa_sig, nsec, nsec_sig]
     }
 
-    /// The authority section of a signed NXDOMAIN proved with NSEC3.
-    ///
-    /// End to end, because a test that builds its own records and hands them
-    /// straight to the denial functions checks the proof logic and nothing
-    /// about the path to it — whether the resolver collects NSEC3 records
-    /// across hops, whether they survive being parsed off the wire, whether
-    /// their signatures verify as an RRset at their hashed owner names.
-    ///
-    /// RFC 5155 §7.2.2 wants three things proved, and two records do it here:
-    ///
-    /// - an NSEC3 matching the closest encloser, `example.test.`;
-    /// - an NSEC3 covering the next closer name, the queried name itself;
-    /// - an NSEC3 covering `*.example.test.`, since a wildcard could
-    ///   otherwise have answered.
-    ///
-    /// The covering record spans everything between an all-zero and an all-ones
-    /// hash, so it covers the last two at once. Opt-out is deliberately clear: set,
-    /// it would make this Insecure rather than Secure, which is a different test.
+    /// The authority section of a signed NXDOMAIN proved with NSEC3, end to
+    /// end, so collection, parsing and RRset verification are tested with the
+    /// logic. RFC 5155 §7.2.2's three proofs from two records: one matching the
+    /// encloser `example.test.`, one spanning all hashes, covering the queried
+    /// name and `*.example.test.`. Opt-out clear: set, it would be Insecure.
     fn signed_nsec3_nxdomain_authority(auth: &TestZone) -> Vec<ResourceRecord> {
         use crate::denial_wire::base32hex_encode;
         use crate::dnssec_denial::nsec3_hash;
@@ -3512,9 +3446,8 @@ this line has no record and is skipped
         };
 
         let nsec3 = |owner_hash: &[u8], next: &[u8], types: &[Rtype]| ResourceRecord {
-            // An NSEC3's owner name is the base32hex of the hash, under the zone
-            // — which is why nothing about this shape can be checked without
-            // hashing for real.
+            // The owner is the hash in base32hex under the zone, so hashing for
+            // real is needed.
             name: nm(&format!("{}.{zone}", base32hex_encode(owner_hash))),
             class: Class::IN,
             ttl: Ttl::from_secs(3600),
@@ -3544,14 +3477,9 @@ this line has no record and is skipped
     }
 
     /// The authority section of a signed wildcard NODATA: the SOA, and the NSEC
-    /// at `*.example.test.` whose bitmap carries A but not AAAA — and which also
-    /// covers the queried name, since `*` sorts before every ordinary label, so
-    /// one record shows both that the name does not exist and what the wildcard
-    /// that answered for it holds.
-    ///
-    /// With `at_wildcard` false the record is moved off the wildcard to
-    /// `m.example.test.`: it still covers the queried names, and proves nothing
-    /// about what a wildcard would have answered.
+    /// at `*.example.test.` with A and not AAAA, which also covers the queried
+    /// name. With `at_wildcard` false it moves to `m.example.test.`: still
+    /// covering, but proving nothing about the wildcard.
     fn signed_wildcard_nodata_authority(auth: &TestZone, at_wildcard: bool) -> Vec<ResourceRecord> {
         let soa = ResourceRecord {
             name: nm("example.test."),
@@ -3627,18 +3555,11 @@ this line has no record and is skipped
             .expect("the resolution itself should succeed")
     }
 
-    /// QTYPE=ANY is a *question* value, not a type any record has (RFC 1035
-    /// §3.2.3), so `rr.rdata.rtype() == query.qtype` is false for every record in
-    /// a perfectly good answer. The validator reads that as "the answer does not
-    /// hold what was asked for", sets `negative`, and goes looking for a denial
-    /// proof that a positive answer has no reason to carry — so an answer that
-    /// verifies is reported Bogus, and `rdnsr --dnssec-validate` fails closed
-    /// and returns SERVFAIL.
+    /// QTYPE=ANY is a question value no record has (RFC 1035 §3.2.3), so a type
+    /// comparison would read a good answer as a denial and fail it Bogus.
     ///
-    /// Nothing on this path rejects or special-cases ANY, so a client asking
-    /// for it reaches the comparison. The answer is the same signed A RRset
-    /// `test_signed_hierarchy_validates_as_secure` calls Secure; only the QTYPE
-    /// on the question changed.
+    /// The same signed A RRset `test_signed_hierarchy_validates_as_secure`
+    /// calls Secure, asked as ANY.
     #[tokio::test]
     async fn an_any_query_is_a_positive_answer_and_must_not_be_read_as_a_denial() {
         let h = signed_hierarchy(signed_ds, signed_answer);
@@ -3684,16 +3605,10 @@ this line has no record and is skipped
         );
     }
 
-    /// A resolution starts below the anchor because a delegation and its zone's
-    /// keys are cached (`best_start`), and the keys expire before validation
-    /// resumes from them (`establish_chain`). The second resolution here starts
-    /// at `example.test.`; the authoritative server moves the clock past every
-    /// cached key set while it answers.
-    ///
-    /// Asserts `Secure`, which is what the answer is. Fails with `Bogus` if the
-    /// resume re-reads the key cache: it falls back to the anchor, the walk has
-    /// no referral evidence for the cuts below it, and the answer's signer has
-    /// no keys.
+    /// Cached keys expire between `best_start` and `establish_chain`: the
+    /// second resolution starts at `example.test.` and the server moves the
+    /// clock past them. Asserts `Secure`; fails `Bogus` if the resume re-reads
+    /// the key cache.
     #[tokio::test]
     async fn a_key_set_expiring_mid_resolution_still_validates() {
         let h = signed_hierarchy(signed_ds, signed_answer);
@@ -3745,16 +3660,9 @@ this line has no record and is skipped
         assert_eq!(second, ValidationState::Secure, "{second}; asked {asked:?}");
     }
 
-    /// What one validation costs once the cache is warm: the second resolution
-    /// starts at `example.test.` from the cache and the walk resumes from that
-    /// trusted start. Counted on this thread, which a current-thread runtime
-    /// keeps every task of the resolution on.
-    ///
-    /// The whole resolution is counted, so the number is a ceiling rather than
-    /// exact: 122 with `ChainWalk`, against 124 with a loop in
-    /// `establish_chain` that clones the trusted start's keys into locals —
-    /// which is the walker's case: it costs no more than the loop. The net two
-    /// are not attributed.
+    /// What one warm validation allocates, resuming from the cached start;
+    /// counted on this thread, which a current-thread runtime keeps the whole
+    /// resolution on. A ceiling, as the whole resolution is counted.
     #[tokio::test]
     async fn a_resumed_validation_is_counted() {
         let h = signed_hierarchy(signed_ds, signed_answer);
@@ -4249,19 +4157,11 @@ this line has no record and is skipped
         );
     }
 
-    /// Strip the terminal denial after a legitimate CNAME and the answer used
-    /// to be handed to clients as authenticated.
+    /// A stripped terminal denial after a legitimate CNAME is bogus: no forged
+    /// signature needed, only deletion.
     ///
-    /// `let negative = response.answers.is_empty()` was the test, and a CNAME
-    /// chain is not empty: `negative` was false, so the authority section was
-    /// never signature-verified, `check_denial` never ran, and `validate` fell
-    /// through to Secure. `rdnsr` then set AD and cached it as validated. It was
-    /// a downgrade relative to the non-CNAME path, which handled the same attack
-    /// correctly — and it needed no forged signature, only deletion.
-    ///
-    /// RFC 4035 §5 requires a validator to authenticate negative responses;
-    /// §5.4 keys the proof to the name actually denied, which after a chain is
-    /// the end of the chain.
+    /// RFC 4035 §5 authenticates negative responses, and §5.4 keys the proof to
+    /// the chain's end. Fails if "negative" means an empty answer section.
     #[tokio::test]
     async fn a_stripped_denial_after_a_cname_is_bogus() {
         let h = signed_hierarchy(signed_ds, signed_answer);
@@ -4285,13 +4185,9 @@ this line has no record and is skipped
         );
     }
 
-    /// A signed CNAME chain, end to end. There was no CNAME anywhere in these
-    /// tests before, which mattered once the answer's *shape* became part of the
-    /// verdict: a check that rejects incoherent answers is only useful if it
-    /// accepts coherent ones, and the way to find out is to resolve one.
-    ///
-    /// Both RRsets come in a single response, which is what an authoritative
-    /// server sends for a CNAME whose target it also holds.
+    /// A signed CNAME chain end to end, both RRsets in one response, as an
+    /// authority holding the target sends: the shape check must accept coherent
+    /// answers.
     #[tokio::test]
     async fn test_a_signed_cname_chain_validates_as_secure() {
         let h = signed_hierarchy_with(signed_ds, |auth| {
@@ -4329,15 +4225,9 @@ this line has no record and is skipped
         );
     }
 
-    /// The positive half of RFC 8198 (section 5.3), end to end: a validated
-    /// wildcard answer is a signed statement about every name the wildcard
-    /// reaches, so once it is cached, another such name is answered without
-    /// asking anyone.
-    ///
-    /// The counterpart to `test_a_validated_denial_answers_other_names_in_its_gap`
-    /// and, like it, the test of the *join* — validation and the cache are each
-    /// well covered alone, and a mistake between them is what would let a
-    /// wildcard answer for a name it does not govern.
+    /// RFC 8198 §5.3 end to end: a cached validated wildcard answers another
+    /// name it reaches without asking anyone. The join between validation and
+    /// cache is what is tested, as `..._in_its_gap` does for denials.
     #[tokio::test]
     async fn test_a_validated_wildcard_answers_other_names_it_reaches() {
         use crate::nsec_cache::NsecCache;
@@ -4350,9 +4240,8 @@ this line has no record and is skipped
         let cache = NsecCache::new(16);
         cache.insert_validated_wildcard(&answer);
 
-        // A name nobody has asked about, answered from the cached wildcard. The
-        // gap in the proof runs from `*.example.test.` to `zzz.example.test.`, so
-        // this name is inside it and provably absent.
+        // A name never asked, inside the proof's gap from `*.example.test.` to
+        // `zzz.example.test.`.
         let synthesized = cache
             .synthesize_wildcard(nm("never-asked.example.test.").as_ref(), Qtype::of(rt::A))
             .expect("the cached wildcard reaches this name too");

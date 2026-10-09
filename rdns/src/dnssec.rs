@@ -893,9 +893,8 @@ mod tests {
             signed_owner_name(nm("example.com.").as_ref(), 9).unwrap(),
             nm("example.com.")
         );
-        // A dot *inside* a label is not a separator (RFC 1035 §5.1). Counting
-        // dots makes this four labels against the three its RRSIG claims, so a
-        // plain answer is reported as expanded from `*.b.example.com.`.
+        // A dot inside a label is not a separator (RFC 1035 §5.1): three
+        // labels, as the RRSIG claims, not four.
         let escaped = nm(r"a\.b.example.com.");
         assert_eq!(escaped.as_ref().label_count(), 3);
         assert_eq!(
@@ -905,14 +904,9 @@ mod tests {
         );
     }
 
-    /// The whole of the above through the signer and the verifier: a correctly
-    /// signed RRset at a name holding an escaped dot must verify *and* come back
-    /// owing no wildcard proof.
-    ///
-    /// Fails with a dot-counting spelling, which returns
-    /// `Verified { wildcard: Some("*.b.example.test.") }` — a wildcard that
-    /// does not exist, which `ChainValidator::validate_wildcard_proofs` then
-    /// grades bogus for want of a denial no signer writes.
+    /// An escaped dot through signer and verifier: the RRset verifies and owes
+    /// no wildcard proof. Fails with dot-counting, which reports an expansion
+    /// from a `*.b.example.test.` that does not exist and grades it bogus.
     #[test]
     fn an_escaped_dot_in_an_owner_is_not_a_wildcard_expansion() {
         let zone = TestZone::new("example.test.");
@@ -1041,9 +1035,8 @@ mod tests {
         );
     }
 
-    // Real crypto. These are the tests the old suite could not make:
-    // every signature below is produced by ring at test time, so a
-    // verifier that never actually runs cannot pass them.
+    // Real crypto: every signature below comes from ring at test time, so a
+    // verifier that never runs cannot pass.
 
     #[test]
     fn test_ecdsa_p256_signature_verifies() {
@@ -1211,10 +1204,8 @@ mod tests {
         let rdatas = vec![a_rdata(1)];
         let now = current_unix_timestamp();
 
-        // The two halves of "not current" are two INFO-CODEs and two different
-        // operator problems — a re-signing run that stopped, and a clock or a
-        // signature published early — so a client told only "bogus" has to
-        // guess between them.
+        // Expired and not-yet-valid are two codes and two operator problems,
+        // which "bogus" alone conflates.
         for (inception, expiration, expected, what) in [
             (
                 now - 7200,
@@ -1328,10 +1319,8 @@ mod tests {
         let mut dnskey = key.dnskey("example.com.");
         dnskey.protocol = 4;
 
-        // Signed *after* the tag is pointed at the modified key: the key tag
-        // sits in the RRSIG RDATA that `signed_data` hashes, so retagging a
-        // ready-made signature would break the crypto and the test would pass
-        // without the protocol field being read at all.
+        // Signed after retagging: the tag is in the hashed RRSIG RDATA, so a
+        // retagged signature would fail on crypto alone.
         let owner = nm("example.com.");
         let rrset = Rrset::new(owner.as_ref(), rt::A, Class::IN, &rdatas);
         let mut rrsig = key.rrsig_template(rrset.owner, rt::A, 3600, "example.com.", dnskey.flags);

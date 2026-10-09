@@ -166,9 +166,8 @@ fn what_a_copy_is_made_of() {
         );
     }
 
-    // What the same bytes cost with nothing per record on the heap: two
-    // vectors and a memcpy, which is the ceiling any arena shape is measured
-    // against.
+    // The same bytes with nothing per record on the heap: the ceiling any arena
+    // shape is measured against.
     let mut arena: Vec<u8> = Vec::new();
     let mut ranges: Vec<(u32, u32, u32, u32)> = Vec::with_capacity(records.len());
     for r in &records {

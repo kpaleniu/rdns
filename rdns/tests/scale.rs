@@ -364,9 +364,8 @@ fn signing_one_big_zone() {
 
     for hosts in sizes_up_to(largest) {
         let text = big_zone_text(hosts);
-        // Measured, because what a machine has to have is both versions at
-        // once: `ZoneSigning::apply` replaces the `Arc` and the unsigned zone
-        // is dropped only after the signed one exists.
+        // Measured: a machine holds both versions, as the unsigned zone drops
+        // only after the signed one exists.
         let (zone, load) = measure(|| parse_zone_file(&text, "example.com.").expect("parse"));
         drop(text);
         let records = zone.records().len();
@@ -386,17 +385,9 @@ fn signing_one_big_zone() {
 
 /// What `rdnsd` does to a zone it has just signed, before serving any of it.
 ///
-/// `zones::verify_zones` asks one question per signed RRset. A check that
-/// collects every DNSKEY and every RRSIG *in the whole zone* per call is
-/// quadratic (`TODO.md` #50), so the keys are collected once and
-/// `validate_rrset` takes them.
-///
-/// A zone this server signed is proved once per set of signing keys, so what is
-/// timed here is the first load of a zone and every load of one this server did
-/// not sign.
-///
-/// What to read is the µs/RRset column against itself. Flat is the fix; a
-/// column that doubles when the zone doubles is the defect back.
+/// One check per signed RRset, keys collected once (`TODO.md` #50); a zone this
+/// server signed is proved once per key set. Read µs/RRset against itself: flat
+/// is right, doubling with the zone is the defect.
 fn verifying_a_signed_zone() {
     let largest = knob("RDNS_SCALE_VERIFY", 2_000);
     let keys = keys_for("example.com.");
@@ -438,9 +429,8 @@ fn verifying_a_signed_zone() {
         rrsets.dedup();
 
         let (checked, cost) = measure(|| {
-            // Hoisted, as `verify_zones` hoists it: the collection is O(the
-            // zone) and there is one of it per zone, not per RRset. Inside the
-            // measurement because a load pays for it.
+            // Hoisted as `verify_zones` hoists it, once per zone, and timed, as
+            // a load pays it.
             let zone_keys = ZoneKeys::of(&signed);
             let mut checked = 0usize;
             for (name, rtype) in &rrsets {
@@ -500,14 +490,9 @@ fn many_small_zones() {
     drop(map);
 }
 
-/// What a reload costs: what `rdnsd`'s SIGHUP path does, in the order it does
-/// it — read and parse every file, sign every zone, then diff each new version
-/// against the one being served.
-///
-/// The diff is measured twice because `ixfr::plan_change` returns before
-/// walking when the serial has not moved, and an operator editing one zone in a
-/// fleet reloads the whole set: the unchanged number is what the other N-1
-/// zones cost.
+/// What a reload costs, in `rdnsd`'s SIGHUP order: parse every file, sign every
+/// zone, diff each against the served. The diff twice, as an unchanged serial
+/// returns early: what the other N-1 zones cost.
 fn reloading_them_all() {
     let count = knob("RDNS_SCALE_RELOAD", 1_000);
     let dir = scratch("reload");

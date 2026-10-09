@@ -291,16 +291,9 @@ mod tests {
         }
     }
 
-    /// RFC 5936 §2.2.5: "it SHOULD include one OPT RR in the first response
-    /// message and MAY do so in subsequent response messages" — and RFC 3225
-    /// §3: "the DO bit of the query MUST be copied in the response" (`TODO.md`
-    /// #47).
-    ///
-    /// The DO bit changes nothing about what a transfer carries — §3 says the
-    /// security records "are part of the zone data for an AXFR or IXFR query"
-    /// and go whether it was set or not — so what a cleared bit says is that
-    /// this server stopped doing DNSSEC, which is exactly how the same slip
-    /// read on three reply paths in #38.
+    /// The first envelope mirrors the client's OPT (RFC 5936 §2.2.5) with its
+    /// DO bit (RFC 3225 §3). DO changes nothing a transfer carries, so a
+    /// cleared bit only says, falsely, that this server stopped doing DNSSEC.
     #[test]
     fn the_first_envelope_mirrors_the_clients_opt_and_its_do_bit() {
         let zone = small_zone();

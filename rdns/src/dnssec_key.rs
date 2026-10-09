@@ -972,10 +972,8 @@ mod tests {
             SigningKey::generate(SigningAlgorithm::Ed25519, "example.com.", 0x0100).expect("a key");
         let text = key.to_key_file();
 
-        // `create_atomically_private`, not `ScratchDir::write`: `load_dir`
-        // refuses a key file the group can read, and that check is `cfg(unix)`
-        // — so a 0644 fixture passes on Windows and fails on Linux. It did,
-        // before this line (`CLAUDE.md` §1).
+        // `create_atomically_private`: `load_dir` refuses a group-readable key
+        // on Unix only, so a 0644 fixture fails just there (`CLAUDE.md` §1).
         let old = dir.join("Kold.rdnskey");
         crate::persist::create_atomically_private(&old, &text).expect("write");
         let from_future = dir.join("Kfuture.rdnskey");
@@ -1168,9 +1166,8 @@ mod tests {
 
     #[test]
     fn a_key_without_the_zone_bit_is_refused() {
-        // RFC 4034 §2.1.1: without it the DNSKEY is not a key for zone data, so
-        // its signatures verify against nothing. Fail at load, not after
-        // signing a zone nobody can validate.
+        // RFC 4034 §2.1.1: without the Zone Key bit nothing verifies, so fail
+        // at load, not after signing.
         let err = SigningKey::generate(SigningAlgorithm::Ed25519, "example.com.", 0).unwrap_err();
         assert!(err.to_string().contains("Zone Key"), "{err}");
     }
@@ -1248,9 +1245,8 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(tags, expected);
 
-        // 0600: `fs::write` leaves 0644, and `load_dir` refuses a world-readable
-        // key *before* parsing it, so the assertion below would pass on the
-        // permission error instead of on the broken key.
+        // 0600: `load_dir` refuses a readable key before parsing, which would
+        // pass for the wrong reason.
         let broken = dir.join("broken.rdnskey");
         std::fs::write(&broken, "Owner: example.com.\n").unwrap();
         restrict(&broken);

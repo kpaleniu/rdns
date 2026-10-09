@@ -1001,9 +1001,8 @@ mod tests {
             ResponseCode::NoSuchDomain,
             vec![
                 soa_record("example.com.", 3600, Ttl::from_secs(3600)),
-                // The apex NSEC covers everything from the apex to www, which
-                // includes the wildcard position, so a name in the gap has no
-                // wildcard to fall back on either.
+                // The apex NSEC covers apex to www, the wildcard position
+                // included, so a name in the gap has no wildcard.
                 nsec_record(
                     "example.com.",
                     "www.example.com.",
@@ -1031,10 +1030,8 @@ mod tests {
             )
             .unwrap();
             i += 1;
-            // The span runs from the owner to the same hash with its last octet
-            // at 0xff, so it wraps around nothing and contains nothing. A hash
-            // already ending in 0xff would make the range empty *and* wrapped,
-            // which covers everything instead.
+            // From the owner to the same hash ending 0xff, containing nothing;
+            // one already ending 0xff would wrap and contain everything.
             if *hash.as_bytes().last().unwrap() == 0xff {
                 continue;
             }
@@ -1063,14 +1060,9 @@ mod tests {
         format!("{}example.com.", "a.".repeat(115))
     }
 
-    /// Filling the cache must not make a lookup in it slower. The NSEC3 half is
-    /// keyed by owner hash and hashes a name once per chain, so what is cached
-    /// is not in the cost.
-    ///
-    /// A ratio rather than a floor (`CLAUDE.md` §10): the absolute numbers are
-    /// the machine's, the complexity class is the code's. Fails against a scan
-    /// of the cached proofs: 31.6× and 1.6 s per lookup in a debug build, with
-    /// the cache's one lock held for all of it.
+    /// Filling the cache must not make a lookup slower: NSEC3 is keyed by owner
+    /// hash and each chain hashes once. A ratio, not a floor (`CLAUDE.md` §10);
+    /// fails against a scan of the cached proofs.
     #[test]
     fn a_lookup_costs_the_same_however_many_proofs_are_cached() {
         use std::time::Instant;
@@ -1161,9 +1153,8 @@ mod tests {
             ResponseCode::NoSuchDomain,
             vec![
                 soa_record("example.com.", 3600, Ttl::from_secs(3600)),
-                // A delegation at sub.example.com., with the next name in the
-                // parent zone being www. Canonically, x.sub.example.com. falls
-                // inside (sub.example.com., www.example.com.).
+                // A delegation at sub.example.com., next name www;
+                // x.sub.example.com. sorts inside the gap.
                 nsec_record(
                     "sub.example.com.",
                     "www.example.com.",
@@ -2008,9 +1999,8 @@ mod tests {
             Some(nm("*.b.example.com.")),
             "the immediate parent, which is what makes the depth check work"
         );
-        // A top-level name's parent is the root, so the wildcard that would
-        // govern it is `*.` — refused rather than derived. The root publishes no
-        // wildcard, and a rule about synthesizing TLDs is not one to have.
+        // A TLD's wildcard would be `*.`, refused: the root publishes none, and
+        // synthesizing TLDs is not a rule to have.
         assert_eq!(wildcard_for_parent_of(nm("com.").as_ref()), None);
         assert_eq!(wildcard_for_parent_of(nm(".").as_ref()), None);
     }

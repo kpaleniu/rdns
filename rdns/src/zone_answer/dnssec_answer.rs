@@ -636,28 +636,10 @@ deep.a.b IN TXT "down here"
 
     /// A denial never outlives the SOA beside it, whatever MINIMUM says.
     ///
-    /// RFC 9077 §3: the NSEC or NSEC3 TTL is the *lesser* of the SOA's MINIMUM
-    /// and the SOA record's own TTL. RFC 4034 §4.1.1's older "same as MINIMUM"
-    /// predates RFC 8198, under which the denial's own TTL is how long a
-    /// resolver may keep synthesizing this "no" out of its cache.
-    ///
-    /// Fails with `denial_ttl = MINIMUM`: the NSEC and its RRSIG read 3600
-    /// beside an SOA of 300. Every other fixture in this tree is `$TTL 3600`
-    /// with `minimum 300`, which is the masking direction — the `min` is
-    /// invisible unless the SOA's own TTL is the smaller of the two. A zone
-    /// signed somewhere else is capped when it is *answered*, not only when it
-    /// is signed.
-    ///
-    /// `TODO.md` #77a. The signer's cap covers every zone this server signs and
-    /// none that arrives already signed — a replicated one, or one whose chain
-    /// another operator's signer built. RFC 9077 §§3.1-3.3 put the requirement
-    /// on "the TTL of the NSEC RR **that is returned**", so it belongs on this
-    /// path as well.
-    ///
-    /// The fixture is what a signer following RFC 4034 §4.1.1's older wording
-    /// produces: NSEC records at MINIMUM, 3600, above the SOA's own TTL of 300.
-    /// Fails with a cap of MINIMUM alone — the NSEC goes out at 3600 beside an
-    /// SOA of 300.
+    /// RFC 9077 §3: the NSEC TTL is the lesser of MINIMUM and the SOA's own
+    /// TTL, on what is returned, so a zone signed elsewhere to RFC 4034
+    /// §4.1.1's older MINIMUM is capped when answered (`TODO.md` #77a). Fails
+    /// with a cap of MINIMUM alone: an NSEC at 3600 beside an SOA of 300.
     #[test]
     fn a_denial_from_another_signer_is_capped_when_it_is_answered() {
         const SIGNED_ELSEWHERE: &str = concat!(
@@ -843,9 +825,8 @@ www     IN A   192.0.2.10\n";
 
     #[test]
     fn nodata_through_a_wildcard_says_both_halves() {
-        // `anything.example.com.` has no MX, so the record denying MX sits at
-        // `*.example.com.` — a statement about a name nobody asked about until
-        // the denial of the queried name ties the two together.
+        // The MX denial sits at `*.example.com.`, tied to the query only by the
+        // denial of the queried name.
         for chain in [DenialChain::Nsec, DenialChain::nsec3()] {
             let zone = signed(chain.clone());
             let records = negative(

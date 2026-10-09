@@ -1178,19 +1178,12 @@ mod zone_gauge_tests {
         assert_eq!(escape_label("a\nb"), "a\\nb");
     }
 
-    /// Buckets are cumulative in the *output* and one-per-sample on the write
-    /// path, so the sum has to be rebuilt at scrape. Get that wrong and the
-    /// histogram reads as a distribution nobody observed.
-    ///
-    /// `le` is inclusive, which is the boundary the write path can get off by
-    /// one: a sample of exactly 5 µs belongs to `le="0.000005"`, not the one
-    /// above it.
+    /// Buckets are one-per-sample when written and cumulative when rendered,
+    /// and `le` is inclusive: 5 µs belongs to `le="0.000005"`.
     #[test]
     fn the_latency_histogram_renders_cumulative_buckets() {
         let metrics = DnsMetrics::new();
-        // One in the first bucket; one exactly on a bound; one exactly on the
-        // 1.8 s bound, which is the one `TODO.md` #58 reads; one past every
-        // bound.
+        // First bucket, exactly on a bound, exactly on 1.8 s, past every bound.
         for us in [1, 5, 1_800_000, 6_000_000] {
             metrics.observe_latency_us(us);
         }
@@ -1217,14 +1210,10 @@ mod zone_gauge_tests {
         );
     }
 
-    /// A sample past the last bound has no bucket of its own — `+Inf` is the
-    /// count — and must still reach the count and the sum. An `unwrap` on the
-    /// bucket index would panic here, and a `min` would put it in the last
-    /// bucket and claim a 10-second answer took under 5 s.
-    ///
-    /// The sample moved with the bounds: 60 µs past the old 50 ms top is an
-    /// ordinary recursion under the new one, so left alone this test would have
-    /// gone on passing while testing nothing (`CLAUDE.md` §1).
+    /// A sample past the last bound has no bucket, as `+Inf` is the count, and
+    /// must still reach count and sum. An `unwrap` would panic; a `min` would
+    /// put a 10-second answer under 5 s. The sample sits past the current top
+    /// bound.
     #[test]
     fn a_latency_past_every_bound_lands_only_in_inf() {
         let metrics = DnsMetrics::new();
@@ -1316,14 +1305,9 @@ mod tests {
         m.to_prometheus_format()
     }
 
-    /// The shape Prometheus requires, asserted rather than eyeballed.
-    ///
-    /// The agreement between a family's declaration and its samples, which a
-    /// name copied into three string literals does not hold: stray spaces in a
-    /// `# HELP` line, an embedded newline where the rest use `\n`.
-    ///
-    /// It does *not* pin the text. A golden blob would fail on every new
-    /// counter and teach nobody why.
+    /// The shape Prometheus requires, asserted rather than eyeballed: each
+    /// sample's family declared, no stray space or newline. It does not pin the
+    /// text, which every new counter would break.
     #[test]
     fn the_scrape_is_well_formed() {
         let scrape = a_fully_populated_scrape();
@@ -1348,9 +1332,8 @@ mod tests {
                 assert!(!typed.contains(&name), "{name} typed twice");
                 typed.push(name);
             } else {
-                // A sample: `name` or `name{label="v"}`, then a space and a
-                // number. Its family has to be one already declared, or the
-                // scrape names a series nothing described.
+                // A sample: `name` or `name{label="v"}`, a space, a number, of
+                // a declared family.
                 let head = line.split([' ', '{']).next().expect("a sample name");
                 assert!(
                     declared.iter().any(|d| head == *d
@@ -1363,9 +1346,8 @@ mod tests {
         }
         assert_eq!(declared, typed, "every family needs both lines, in order");
 
-        // The label escape, end to end: a zone whose name holds a quote would
-        // otherwise make everything after it unparseable (RFC 1035 §5.1 allows
-        // the escape that puts one there).
+        // The label escape end to end: a quote in a zone name (RFC 1035 §5.1)
+        // must not break the scrape.
         assert!(
             scrape.contains(r#"dns_zone_serial{zone="ex\\\"ample.net."} 8"#),
             "a quote in a zone name reached the scrape unescaped"
@@ -1445,16 +1427,11 @@ mod tests {
         assert!(prometheus.contains("# TYPE"));
     }
 
-    /// A counter that is declared and incremented and never *rendered* is worse
-    /// than one that does not exist: the code reads as if it reports something.
-    /// All four encrypted-transport counters were added at once and one pair was
-    /// left out of `to_prometheus_format` by an edit that silently did not
-    /// apply; the series was simply absent from the scrape.
+    /// A counter that is declared and incremented and never rendered is worse
+    /// than none: the code reads as if it reports something.
     ///
-    /// Emitted even at zero, on purpose. A series that appears only once
-    /// something has happened cannot be alerted on beforehand, and for a
-    /// handshake count zero is a fact rather than a missing measurement —
-    /// unlike the per-zone gauges, which are omitted so `absent()` can ask.
+    /// Emitted at zero, as zero handshakes is a fact and can be alerted on;
+    /// per-zone gauges, by contrast, are omitted.
     #[test]
     fn every_encrypted_transport_counter_reaches_the_scrape() {
         let metrics = DnsMetrics::new();
@@ -1464,9 +1441,8 @@ mod tests {
             "dns_tls_handshake_failures_total",
             "dns_quic_handshakes_total",
             "dns_quic_handshake_failures_total",
-            // Not an encrypted transport, and here for the same reason: a
-            // stream nobody configured reads zero, and zero is the fact
-            // (`TODO.md` #44g).
+            // Not encrypted transports, but likewise: zero frames from an
+            // unconfigured stream is the fact.
             "dns_dnstap_frames_total",
             "dns_dnstap_dropped_total",
         ] {

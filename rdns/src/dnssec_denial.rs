@@ -1042,9 +1042,8 @@ mod tests {
     /// wildcard whose bitmap lacks the type.
     #[test]
     fn test_nsec3_wildcard_nodata_is_proved() {
-        // `a.example.com.` does not exist: the encloser is the apex (matched),
-        // the next closer name is `a.example.com.` itself (covered), and the
-        // wildcard is matched with only A in its bitmap.
+        // `a.example.com.` does not exist: apex matched, next closer covered,
+        // wildcard matched with only A.
         let apex = nsec3_matching("example.com.", &[rt::SOA, rt::NS, rt::RRSIG]);
         let next_closer = nsec3_span_around("a.example.com.", 0);
         let wildcard = nsec3_matching("*.example.com.", &[rt::A, rt::RRSIG]);
@@ -1372,14 +1371,9 @@ mod tests {
 
     /// A hash of the wrong length is not a short hash, it is not a hash.
     ///
-    /// RFC 5155 registers one algorithm, SHA-1, and this refuses any other — so
-    /// 20 octets is the only length either hash in the record can have. Both
-    /// come off the wire under a remote party's control: the owner's first label
-    /// is base32hex of whatever they put there, and §3.1.7 gives
-    /// `next_hashed_owner` an explicit length octet. Before `Nsec3Hash`
-    /// (`TODO.md` #40a) a wrong length parsed, went into the cache, and then
-    /// matched nothing for as long as it lived, which is what `covers_hash`
-    /// carried an `is_empty()` guard for.
+    /// SHA-1 is the only algorithm, so 20 octets is the only length, and both
+    /// hashes come off the wire (§3.1.7). Fails if a wrong length parses, to
+    /// match nothing for as long as it is cached.
     #[test]
     fn an_nsec3_whose_hashes_are_the_wrong_length_is_refused() {
         use crate::ParsedRecord;

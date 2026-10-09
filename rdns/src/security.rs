@@ -883,9 +883,8 @@ mod tests {
 
         assert!(limiter.should_allow(ip, now));
 
-        // The clock jumps an hour backwards. Without saturation the first call
-        // refills to burst on an underflowed elapsed time, so the bucket never
-        // empties.
+        // The clock steps back an hour; unsaturated, the elapsed time
+        // underflows and the bucket never empties.
         let stepped_back = now - 3600;
         for _ in 0..19 {
             limiter.should_allow(ip, stepped_back);
@@ -938,9 +937,8 @@ mod tests {
         });
         let idle = Peer::from(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1)));
         let busy = Peer::from(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2)));
-        // The real clock, because `last_cleanup` is seeded from it at
-        // construction: a synthetic `now` in the past never reaches the
-        // interval, and the sweep would silently never run.
+        // The real clock: `last_cleanup` is seeded from it, so a past `now`
+        // would never reach the interval.
         let start = current_unix_timestamp();
 
         assert!(limiter.should_allow(idle, start));
@@ -956,9 +954,8 @@ mod tests {
         );
         assert_eq!(limiter.get_tokens(idle), limiter.get_tokens(busy) + 1.0);
 
-        // And the next caller in the same interval does not sweep again: `busy`
-        // is one second old and would survive either way, so what this holds is
-        // that the timestamp advanced rather than that nothing was dropped.
+        // The next caller in the interval does not sweep: what holds is that
+        // the timestamp advanced.
         assert!(limiter.should_allow(busy, start + 62));
         assert_eq!(limiter.get_stats().tracked_ips, 1);
     }

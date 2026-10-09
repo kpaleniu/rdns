@@ -1048,14 +1048,9 @@ mod tests {
         assert!(cache.len() <= 4, "held {} entries", cache.len());
     }
 
-    /// #33a's measurement as an assertion: what an insert costs must not depend
-    /// on the bound. A ratio and not a floor (`CLAUDE.md` §10) — both halves run
-    /// on the machine running the test.
-    ///
-    /// Fails with a `min_by_key`-per-victim eviction: 66x in a debug build (47
-    /// ms against 3.11 s for 10 000 inserts), and 14.6 µs per insert against
-    /// 0.99 in a release one at this bound, which is `rdnsr`'s default
-    /// `--cache-size`.
+    /// What an insert costs must not depend on the bound: a ratio, not a floor
+    /// (`CLAUDE.md` §10). Fails with a `min_by_key`-per-victim eviction, at
+    /// `rdnsr`'s default `--cache-size` (`TODO.md` #33a).
     #[test]
     fn inserting_into_a_full_cache_costs_what_inserting_with_room_does() {
         use std::time::Instant;

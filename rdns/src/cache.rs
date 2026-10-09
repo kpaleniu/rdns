@@ -811,12 +811,8 @@ mod tests {
     }
 
     /// A stale entry answered first hands out one refresh per
-    /// [`STALE_REFRESH_INTERVAL`] (RFC 8767 §5's failure recheck timer), not one
-    /// per query and not one ever.
-    ///
-    /// The second half is the reason it is a period: with `refreshing`'s
-    /// set-once rule, a refresh that failed would leave the name answered
-    /// stale, untried, for the rest of the window.
+    /// [`STALE_REFRESH_INTERVAL`] (RFC 8767 §5), not one per query and not one
+    /// ever, so a failed refresh is retried.
     #[test]
     fn a_stale_entry_hands_out_one_refresh_per_recheck_interval() {
         let (cache, clock) = fixed_cache(16, StalePolicy::seconds(3600));
@@ -931,12 +927,9 @@ mod tests {
         assert!(stats.total_entries <= 10, "cache exceeded max capacity");
     }
 
-    /// Expiries are whole seconds, so a cache filled in one burst at one TTL has
-    /// every entry on the same `expires_at` and a strict comparison empties it
-    /// instead of halving it.
-    ///
-    /// Fails against the naive rewrite (1 of 100 survives), not against a
-    /// quadratic eviction, which gets ties right one entry at a time.
+    /// Expiries are whole seconds, so one burst at one TTL ties every entry,
+    /// and a strict comparison would empty the cache. Fails against the naive
+    /// rewrite: 1 of 100 survives.
     #[test]
     fn evicting_a_cache_whose_entries_all_expire_together_halves_it() {
         let cache = DnsCache::new(100);
