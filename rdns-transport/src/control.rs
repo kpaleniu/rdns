@@ -4,10 +4,10 @@
 //! [`rdns::control`].
 //!
 //! - Unix: a socket, owner-only by file mode.
-//! - Windows: a named pipe, `\\.\pipe\NAME` (`TODO.md` #188). The default
-//!   security descriptor gives write access only to the creator owner,
-//!   administrators and LocalSystem; Everyone and anonymous get read, which
-//!   cannot send a command. A custom descriptor would need tokio's `unsafe`
+//! - Windows: a named pipe, `\\.\pipe\NAME`. The default security descriptor
+//!   gives write access only to the creator owner, administrators and
+//!   LocalSystem; Everyone and anonymous get read, which cannot send a command.
+//!   A custom descriptor would need tokio's `unsafe`
 //!   `create_with_security_attributes_raw`.
 
 use std::future::Future;
@@ -282,7 +282,7 @@ where
             // Nothing sent is not a command. On Windows it is what a client
             // holding only read access, which the pipe's default descriptor
             // grants Everyone, looks like; answering it `help` would be
-            // answering somebody who may not write (`TODO.md` #188).
+            // answering somebody who may not write.
             Ok(Ok(0)) if buf.is_empty() => return Ok(()),
             // A client that closed without a newline still gets its command
             // run: `printf status | socat ...` sends no trailing newline.

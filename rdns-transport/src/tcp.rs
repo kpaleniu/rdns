@@ -1,12 +1,12 @@
 //! DNS over TCP: accept, frame, admit, hand to a handler.
 //!
-//! Both daemons had written this loop, 21 identical lines in the middle of it
-//! (`TODO.md` #30a). What differs between them is the *answering*, which is why
-//! the handler is a trait and the loop is not: `rdnsd` sends a sequence of
-//! envelopes for an AXFR (RFC 5936 §2.2) and `rdnsr` sends one reply, so the
-//! shape that fits both is a sink. `domain` shipped both a `Service` that may
-//! emit several responses and a `SingleService` for one rather than choosing;
-//! here the sink is the only shape, and a single-reply handler sends once.
+//! One loop for both daemons. What differs between them is the *answering*,
+//! which is why the handler is a trait and the loop is not: `rdnsd` sends a
+//! sequence of envelopes for an AXFR (RFC 5936 §2.2) and `rdnsr` sends one
+//! reply, so the shape that fits both is a sink. `domain` shipped both a
+//! `Service` that may emit several responses and a `SingleService` for one
+//! rather than choosing; here the sink is the only shape, and a single-reply
+//! handler sends once.
 //!
 //! The UDP loops stay two and are not here. `rdnsd` answers inline on a fixed
 //! worker pool with a reused buffer and compressor — #27b measured the
@@ -49,7 +49,7 @@ pub enum Reply {
 ///
 /// Prefix and message in one buffer, so the writer emits them in a single call.
 /// A reply too long to frame is dropped rather than sent with a wrapped prefix,
-/// which the peer would read as a broken stream — that wrap was #17.
+/// which the peer would read as a broken stream.
 pub async fn send_framed(out: &mpsc::Sender<Reply>, bytes: &[u8]) -> bool {
     match rdns::framed(bytes) {
         Ok(framed) => out.send(Reply::Frame(framed)).await.is_ok(),
@@ -106,7 +106,7 @@ pub trait Handler: Send + Sync + 'static {
     ///
     /// Return once the last reply is in `out`. DoH answers when this returns
     /// and DoQ sends FIN when `out` drops, so work done here after the reply is
-    /// the client's latency on those two (`TODO.md` #114).
+    /// the client's latency on those two.
     fn handle(
         &self,
         packet: Vec<u8>,
@@ -148,10 +148,8 @@ impl RateLimit {
     ///
     /// The other half, and a pair rather than two spellings of one `if`: a
     /// caller that asks both questions charges once however the policy is set,
-    /// where an adapter that asked `allow_source` outright charged a
-    /// `PerConnection` client twice for its first message. That was `https`,
-    /// the one of the four that was handed `rate` and did not consult it
-    /// (`TODO.md` #105).
+    /// where an adapter that asks `allow_source` outright charges a
+    /// `PerConnection` client twice for its first message.
     ///
     /// `now` is the caller's, for [`ServeContext::allow_source`]'s reason.
     pub fn admits_message(self, ctx: &ServeContext, peer: Peer, now: u64) -> bool {
@@ -349,9 +347,8 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
         };
         let handler = handler.clone();
         let tx = tx.clone();
-        // One `Arc` bump per message since `TODO.md` #59 made an `Arrival`
-        // carry what the client proved; the message it rides with cost a round
-        // trip to arrive.
+        // One `Arc` bump per message, because an `Arrival` carries what the
+        // client proved; the message it rides with cost a round trip to arrive.
         let arrival = arrival.clone();
         tokio::spawn(async move {
             handler.handle(packet, peer, now, arrival, tx).await;
@@ -630,10 +627,9 @@ mod tests {
     /// tell a truncated AXFR from a complete one, so a process that exits with
     /// one half-written has served a lie.
     ///
-    /// Watched failing with `serve_one`'s stop arm returning instead of
-    /// breaking to the epilogue: the connection task ended at once, its `Busy`
-    /// went with it, and the drain finished ~180 ms before the reply reached
-    /// the client.
+    /// Fails with `serve_one`'s stop arm returning instead of breaking to the
+    /// epilogue: the connection task ends at once, its `Busy` goes with it, and
+    /// the drain finishes ~180 ms before the reply reaches the client.
     #[tokio::test]
     async fn the_drain_waits_for_a_reply_still_being_written() {
         let shutdown = Shutdown::new();
@@ -849,8 +845,8 @@ mod tests {
     ///
     /// A limiter with a burst of one and per-connection charging: were the ACL
     /// after it, the second and third connections would be rate-limited
-    /// instead. Watched failing with the `admits_connection` call removed: the
-    /// echo came back.
+    /// instead. Fails with the `admits_connection` call removed: the echo comes
+    /// back.
     #[tokio::test]
     async fn a_peer_the_query_acl_does_not_list_is_closed_unserved() {
         let shutdown = Shutdown::new();
@@ -944,8 +940,8 @@ mod tests {
     /// connection then ends one `read_timeout` after the last byte moved
     /// rather than never, freeing its slot and the drain (`TODO.md` #163).
     ///
-    /// Watched failing without the progress deadline and the read loop's
-    /// `tx.closed()` arms: `serve_one` was still running at the bound.
+    /// Fails without the progress deadline and the read loop's `tx.closed()`
+    /// arms: `serve_one` is still running at the bound.
     #[tokio::test]
     async fn a_client_that_reads_nothing_does_not_hold_the_connection() {
         let shutdown = Shutdown::new();
@@ -1028,8 +1024,8 @@ mod tests {
     /// can be answered, so the read loop ends too rather than admitting and
     /// answering into a closed channel until the client gives up.
     ///
-    /// Watched failing without the read loop's `tx.closed()` arm: it sat out
-    /// the 10 s idle timeout.
+    /// Fails without the read loop's `tx.closed()` arm: it sits out the 10 s
+    /// idle timeout.
     #[tokio::test]
     async fn a_write_error_ends_the_read_loop() {
         let shutdown = Shutdown::new();
@@ -1066,7 +1062,7 @@ mod tests {
 
     /// A reply too long to frame is dropped rather than sent with a wrapped
     /// prefix, which the peer would read as a message boundary in the middle of
-    /// a message and never recover from. That wrap was `TODO.md` #17.
+    /// a message and never recover from.
     #[tokio::test]
     async fn a_reply_too_long_to_frame_is_dropped_rather_than_wrapped() {
         let (tx, mut rx) = mpsc::channel::<Reply>(4);
@@ -1086,11 +1082,10 @@ mod tests {
     /// next connection waits for the refill.
     ///
     /// The clock is the test's. `RateLimiter::should_allow` refills by whole
-    /// seconds, so against `SystemTime` the refusal below was decided by
-    /// whether two connects straddled a second boundary — about one run in
-    /// thirty served the second connection instead (`TODO.md` #52). A longer
-    /// window would only have made the coin heavier; a clock nothing else moves
-    /// takes it out of the assertion.
+    /// seconds, so against `SystemTime` the refusal below is decided by whether
+    /// two connects straddle a second boundary — about one run in thirty serves
+    /// the second connection instead. A longer window would only make the coin
+    /// heavier; a clock nothing else moves takes it out of the assertion.
     #[tokio::test]
     async fn the_query_rate_can_be_per_connection_instead_of_per_message() {
         let shutdown = Shutdown::new();

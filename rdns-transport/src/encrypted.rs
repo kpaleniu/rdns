@@ -1,10 +1,8 @@
 //! DoT, DoQ and DoH, configured once and bound once, for both daemons.
 //!
-//! Each daemon had checked the certificate pair, loaded the store, bound the
-//! three listeners and spawned them with plain TCP in its own copy, and the
-//! copies had drifted in policy: one checked the pair rule over the merged
-//! view, the other per source, and `rdnsr` never named its listeners
-//! (`TODO.md` #153). What differs between the daemons is a parameter: the
+//! Checking the certificate pair, loading the store, binding the three
+//! listeners and spawning them is one copy, because two drift in policy
+//! (`CLAUDE.md` §7). What differs between the daemons is a parameter: the
 //! client anchors (`rdnsd`'s `--transfer-client-ca`) and the [`RateLimit`].
 //!
 //! Two values and not one function, because `--check-config` sits between

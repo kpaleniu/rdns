@@ -15,8 +15,8 @@
 //!
 //! No lock: the waiting set is fixed at construction and only shrinks.
 //!
-//! Here rather than in `rdns`, where it was until `TODO.md` #82a: `rdns` never
-//! named it, and what answers `/readyz` with it is this crate's metrics server.
+//! Here rather than in `rdns`, which never names it: what answers `/readyz`
+//! with it is this crate's metrics server.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;

@@ -199,7 +199,8 @@ mod tests {
     use super::*;
 
     /// `::` serves an IPv4 client over UDP and over TCP, on either platform.
-    /// Windows' default refused both before #159.
+    /// Fails on Windows if `IPV6_V6ONLY` is left at its default, which refuses
+    /// both (`TODO.md` #159).
     #[tokio::test]
     async fn the_ipv6_wildcard_serves_ipv4_clients() {
         let udp = udp("[::]:0").await.expect("bind udp");

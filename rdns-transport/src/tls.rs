@@ -317,9 +317,9 @@ pub async fn serve<H: Handler>(
 /// failed, ran past `limits.idle_timeout`, or shutdown came first.
 ///
 /// The deadline is the idle timeout because a peer that has not finished its
-/// handshake has sent no message, which is what idle means on these
-/// listeners. Unbounded, a peer sending no ClientHello held a
-/// `--max-connections` slot until it hung up (`TODO.md` #162).
+/// handshake has sent no message, which is what idle means on these listeners.
+/// Unbounded, a peer sending no ClientHello holds a `--max-connections` slot
+/// until it hangs up.
 pub(crate) async fn handshake(
     acceptor: &TlsAcceptor,
     stream: TcpStream,
@@ -851,8 +851,8 @@ mod tests {
         server.abort();
     }
 
-    /// A peer that connects and never sends a ClientHello is closed at the
-    /// idle timeout, and its slot goes to the next client (`TODO.md` #162).
+    /// A peer that connects and never sends a ClientHello is closed at the idle
+    /// timeout, and its slot goes to the next client.
     ///
     /// One slot, so the second client is answered only if the first released
     /// it. The test bounds its own waits: against an unbounded handshake the

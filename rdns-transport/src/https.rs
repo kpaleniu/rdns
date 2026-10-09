@@ -3,9 +3,9 @@
 //! The odd one of the three. DoT and DoQ carry the wire format unchanged — the
 //! 2-octet prefix RFC 1035 §4.2.2 defines — and this does not: RFC 8484 §4.1
 //! sends the bare message as an entity body, with the length in
-//! `Content-Length` where the prefix used to be. So [`crate::tcp::send_framed`]
-//! still produces the reply and this module takes the prefix back off, which is
-//! the one place in the tree where framing is removed rather than added.
+//! `Content-Length` in place of the prefix. So [`crate::tcp::send_framed`]
+//! produces the reply and this module takes the prefix back off, which is the
+//! one place in the tree where framing is removed rather than added.
 //!
 //! **Two forms**, and both are required of a server:
 //!
@@ -27,11 +27,11 @@
 //!
 //! The refusal is the *dispatcher's*, on
 //! [`rdns::validation::Arrival::carries_a_sequence`], because only it can
-//! refuse before the zone is looked up. This module used to find out by
-//! draining what had already been built and warning — and a zone small enough
-//! to fit one envelope transferred, so whether DoH carried a transfer depended
-//! on zone size (`TODO.md` #106). The drain is still here as a backstop: the
-//! `Handler` trait permits a sequence because `tcp` and `quic` need it.
+//! refuse before the zone is looked up: found out here, by draining what had
+//! been built, a zone small enough to fit one envelope transfers, so whether
+//! DoH carries a transfer depends on zone size. The drain is here as a
+//! backstop: the `Handler` trait permits a sequence because `tcp` and `quic`
+//! need it.
 
 use std::future::Future;
 use std::io;
@@ -216,7 +216,7 @@ pub async fn serve<H: Handler>(
             let idle = limits.idle_timeout;
             let served = if negotiated_h2 {
                 // The in-flight cap TCP and DoQ apply; hyper's own default is
-                // 200 (`TODO.md` #170). A stream past it is refused with
+                // 200. A stream past it is refused with
                 // REFUSED_STREAM, which RFC 9113 §8.7 makes safe to retry.
                 let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                     .max_concurrent_streams(limits.max_inflight_per_connection as u32)
@@ -293,10 +293,10 @@ async fn answer<H: Handler>(
     };
 
     let now = handler.context().clock.now();
-    // Through `rate`, as the other three adapters ask it. Asking
-    // `allow_source` outright charged a `PerConnection` client a second token
-    // for the first request of every connection, so `--query-rate` meant one
-    // thing over DoT and another over DoH (`TODO.md` #105).
+    // Through `rate`, as the other three adapters ask it. Asking `allow_source`
+    // outright charges a `PerConnection` client a second token for the first
+    // request of every connection, so `--query-rate` would mean one thing over
+    // DoT and another over DoH.
     if !rate.admits_message(handler.context(), Peer::from(peer), now) {
         // 429 rather than a silent drop, and the difference from UDP is the
         // point: this peer completed a TCP and a TLS handshake, so there is
@@ -440,9 +440,9 @@ fn min_ttl(message: &[u8]) -> u32 {
         // OPT's TTL field is a flags word rather than a lifetime, so one in the
         // additional section would make every answer with DO clear `max-age=0`
         // and quietly disable HTTP caching for the whole endpoint. It cannot
-        // happen here because #13d took the pseudo-record out of the resource
-        // list — `DnsMessage::edns` holds it — which is `CLAUDE.md` §17's
-        // "make it unrepresentable" paying out in a module written years later.
+        // happen here because the pseudo-record is not in the resource list —
+        // `DnsMessage::edns` holds it — which is `CLAUDE.md` §17's "make it
+        // unrepresentable".
         //
         // No clamp either: `Ttl` is unsigned by construction, clamped once at
         // the parse boundary per RFC 2181 §8.
@@ -639,9 +639,9 @@ mod tests {
         )
     }
 
-    /// A peer that connects and never sends a ClientHello is closed at the
-    /// idle timeout, and its slot goes to the next client (`TODO.md` #162).
-    /// One slot, so the request after it is answered only if it was released.
+    /// A peer that connects and never sends a ClientHello is closed at the idle
+    /// timeout, and its slot goes to the next client. One slot, so the request
+    /// after it is answered only if it was released.
     #[tokio::test]
     async fn a_peer_that_never_says_hello_is_closed_and_its_slot_freed() {
         let ctx = context(0);
@@ -709,12 +709,12 @@ mod tests {
     }
 
     /// A client that ignores the server's SETTINGS and opens a seventeenth
-    /// stream while sixteen are being answered gets that stream refused, as
-    /// a TCP connection's seventeenth message waits and DoQ's is never
-    /// credited (`TODO.md` #170). Frames by hand, because a conforming client
-    /// would queue the seventeenth itself and test nothing.
+    /// stream while sixteen are being answered gets that stream refused, as a
+    /// TCP connection's seventeenth message waits and DoQ's is never credited.
+    /// Frames by hand, because a conforming client would queue the seventeenth
+    /// itself and test nothing.
     ///
-    /// Watched failing without the limit: no refusal, hyper's 200 admitted it.
+    /// Fails without the limit: no refusal, hyper's 200 admits it.
     #[tokio::test]
     async fn a_seventeenth_http2_stream_is_refused() {
         let (addr, der, shutdown, task) = started_limited(
@@ -917,16 +917,16 @@ mod tests {
 
     /// A DoH client is charged one token for its connection, not two.
     ///
-    /// `TODO.md` #105. `serve` charges `allow_source` at accept when the
-    /// caller asked for `PerConnection`; `answer` took no `rate` and charged
-    /// again for every request, so the *first* request of every connection
-    /// paid twice — and `--query-rate` meant something different over DoH than
-    /// over DoT, which is the one thing a shared parameter is for.
+    /// `serve` charges `allow_source` at accept when the caller asked for
+    /// `PerConnection`. Fails if `answer` charges again for every request: the
+    /// *first* request of every connection pays twice — and `--query-rate`
+    /// means something different over DoH than over DoT, which is the one thing
+    /// a shared parameter is for.
     ///
-    /// A burst of one, so the double charge is the whole difference between
-    /// 200 and 429. The clock is the test's for `TODO.md` #52's reason: the
-    /// limiter refills by whole seconds, and against `SystemTime` this would
-    /// be decided by whether the two charges straddled a boundary.
+    /// A burst of one, so the double charge is the whole difference between 200
+    /// and 429. The clock is the test's because the limiter refills by whole
+    /// seconds, and against `SystemTime` this would be decided by whether the
+    /// two charges straddled a boundary.
     #[tokio::test]
     async fn a_doh_connection_is_charged_once_and_not_once_per_request() {
         let clock = Clock::fixed(1_000_000_000);

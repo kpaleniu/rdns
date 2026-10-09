@@ -222,8 +222,8 @@ async fn pump<W>(
     }
 
     // What was queued before the stop: `Sink::send` counted it as sent, and it
-    // is the last requests a capture holds (`TODO.md` #68a). A payload sent
-    // after this is counted as dropped by `send`, once the receiver is gone.
+    // is the last requests a capture holds. A payload sent after this is
+    // counted as dropped by `send`, once the receiver is gone.
     while let Ok(frame) = queue.try_recv() {
         if put(&mut writer, &mut cap, &metrics, &frame).await.is_err() {
             return;
@@ -405,8 +405,8 @@ mod tests {
 
     /// The capture at `path` once the pump has written STOP.
     ///
-    /// Polled rather than slept: a fixed sleep lets a loaded machine decide
-    /// the result, which is how #68a hid.
+    /// Polled rather than slept: a fixed sleep lets a loaded machine decide the
+    /// result.
     async fn closed_capture(path: &std::path::Path) -> Vec<u8> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
@@ -426,9 +426,9 @@ mod tests {
     /// What was queued before the stop is written before STOP.
     ///
     /// `Sink::send` has already counted each of these in `dnstap_frames`, so a
-    /// pump that dropped them on stop left a capture missing the last requests
-    /// and a counter claiming them. Watched failing against the `break` on
-    /// `stop.wait()`: 0 or 1 of 100 written (`TODO.md` #68a).
+    /// pump that drops them on stop leaves a capture missing the last requests
+    /// and a counter claiming them. Fails with a `break` on `stop.wait()`: 0 or
+    /// 1 of 100 written.
     #[tokio::test]
     async fn what_is_queued_when_the_stop_begins_is_written() {
         let dir = rdns::testutil::ScratchDir::new("dnstap-stop-drains");

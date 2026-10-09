@@ -3,9 +3,8 @@
 //! Not `rdns::logging`, which is the counting a log line is drawn from and is
 //! library code. Installing a subscriber is a process-global decision, so it
 //! belongs to whoever *is* the process: the workspace manifest says it on the
-//! `tracing` entry — "the library only emits; the binaries choose where it goes"
-//! — and `rdns::logging::init` was the one place that did not hold
-//! (`TODO.md` #85).
+//! `tracing` entry — "the library only emits; the binaries choose where it
+//! goes" — so no subscriber is installed in `rdns`.
 //!
 //! Here rather than twice, once per binary, for the reason in this crate's
 //! header: the two daemons are its only consumers, and two copies of a level

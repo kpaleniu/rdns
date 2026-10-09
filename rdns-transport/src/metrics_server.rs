@@ -2,45 +2,29 @@
 //! orchestrator asks for: `/healthz` (alive) and `/readyz` (finished starting).
 //! [`crate::readiness`] has the distinction.
 //!
-//! **This was hand-rolled, and its own header said why**: "Prometheus needs a
-//! `GET` returning text, and an HTTP stack for one method on one path costs
-//! `hyper` and everything under it." That was a cost comparison, and #42c
-//! retired its premise — DoH makes `hyper` unconditional, so the stack is
-//! already linked and the comparison is now between using it and keeping a
-//! second HTTP implementation next to it.
+//! **On `hyper`**, because DoH links it unconditionally (`TODO.md` #42c), and
+//! the alternative is a second HTTP implementation next to it. What is not HTTP
+//! is ours — the accept loop, the `Stop`/`Busy` shutdown integration, the
+//! `try_acquire` that drops a scrape rather than queueing it, and the
+//! `match (method, path)`.
 //!
-//! **What the fold actually removed**, since the filing estimated it and an
-//! estimate is worth checking: the request-line parser and its 8 KB read loop,
-//! `write_all`, and `response`'s status-line and header formatting. What stayed
-//! is everything that is not HTTP — the accept loop, the `Stop`/`Busy` shutdown
-//! integration, the `try_acquire` that drops a scrape rather than queueing it,
-//! and the `match (method, path)`, which is a `service_fn` with the same arms
-//! and the same bodies.
+//! **What hyper does not check**
+//! (`hyper_serves_what_the_header_used_to_claim_it_refused`): with no `Host` it
+//! answers **200**; an over-long request line is **414** past ~64 KB, hyper's
+//! read buffer. `CLAUDE.md` §4: never state what a function does without
+//! opening it, a dependency's included.
 //!
-//! ~~**Two behaviours changed, both toward the RFC.** An HTTP/1.1 request with
-//! no `Host` header now gets 400 — RFC 9112 §3.2 requires that. And a request
-//! line longer than 8 KB is now hyper's 431.~~ **Neither was true**, and the
-//! tests in this file had disproved half of it on the day it was written:
-//! `a_query_string_is_still_a_scrape` sent no `Host` and asserted 200. Measured
-//! (`hyper_serves_what_the_header_used_to_claim_it_refused`): no `Host` was
-//! **200**, hyper does not look; an over-long request line is **414** past
-//! ~64 KB, hyper's read buffer, not 431 at 8 KB. Both numbers were estimates of
-//! somebody else's code — `CLAUDE.md` §4's "never state what a function does
-//! without opening it", about a dependency.
-//!
-//! **The first half is true now because this file makes it so** (`TODO.md`
-//! #70): `bad_host` below answers 400 to an HTTP/1.1 request with no `Host`,
-//! with two of them, or with one that is not `host[:port]` — all three of §3.2's
-//! MUSTs, and hyper answered 200 to all three. The cost is that
+//! **So RFC 9112 §3.2 is this file's**: `bad_host` below answers 400 to an
+//! HTTP/1.1 request with no `Host`, with two of them, or with one that is not
+//! `host[:port]` — all three of §3.2's MUSTs. The cost is that
 //! `printf 'GET /metrics HTTP/1.1\r\n\r\n' | nc` stops working, so the refusal
 //! names the spelling that does: §3.2 exempts HTTP/1.0, and every scraper and
-//! `curl` sends a `Host` anyway. The second half is still hyper's and is
+//! `curl` sends a `Host` anyway. The request-line length is hyper's and is
 //! pinned, not enforced.
 //!
 //! **Keep-alive is off on purpose**, which is the one thing hyper offers here
 //! that is not taken. The permit below is held for a connection's life, so a
-//! handful of idle keep-alive connections would hold every scrape slot; the
-//! hand-rolled version closed after one response and this keeps that.
+//! handful of idle keep-alive connections would hold every scrape slot.
 //!
 //! No TLS and no auth. Bind it on a management address or on loopback: the
 //! counters say how much traffic a server takes and which zones are failing.
@@ -378,12 +362,10 @@ mod tests {
         assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
     }
 
-    /// RFC 9112 §3.2's three MUSTs, each of which hyper answered 200 to before
-    /// this endpoint checked them itself (`TODO.md` #70).
+    /// RFC 9112 §3.2's three MUSTs, each of which hyper alone answers 200 to.
     ///
-    /// Fails against the code it replaced in all four assertions, which is the
-    /// whole of the change: nothing here is about hyper's behaviour, only
-    /// about ours on top of it.
+    /// Fails in all four assertions without `bad_host`: nothing here is about
+    /// hyper's behaviour, only about ours on top of it.
     #[tokio::test]
     async fn a_request_whose_host_breaks_the_rfc_is_refused() {
         let (addr, _shutdown, _metrics) = start().await;

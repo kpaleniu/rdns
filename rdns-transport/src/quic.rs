@@ -92,7 +92,7 @@ pub fn server_config(
     // them for us: a stream is a query, so the in-flight cap is a stream cap.
     // QUIC's idle timer is only the floor for a silent client: RFC 9000 §10.1
     // restarts it on every packet, PINGs included, so `serve_connection` keeps
-    // its own (`TODO.md` #164).
+    // its own.
     transport.max_concurrent_bidi_streams((limits.max_inflight_per_connection as u32).into());
     // A client has no reason to open one of these, so allowing any is allowing
     // an unanswerable stream to sit there holding memory.
@@ -706,10 +706,8 @@ mod tests {
     /// "It SHOULD forcibly abort the connection using QUIC's CONNECTION_CLOSE
     /// mechanism".
     ///
-    /// This replaces a test that expected the stream alone reset, which
-    /// encoded the old behaviour (`TODO.md` #165). Watched failing against it:
-    /// every case read a stream reset, and a second query after the first was
-    /// answered.
+    /// Fails if only the stream is reset: every case reads a stream reset, and
+    /// a second query after the first is answered (`TODO.md` #165).
     #[tokio::test]
     async fn a_stream_framed_wrongly_closes_the_connection() {
         let server = Server::start(TransportLimits::default(), Duration::ZERO).await;
@@ -774,8 +772,7 @@ mod tests {
     /// "The server MUST issue a RESET_STREAM"), coded `DOQ_NO_ERROR`, and the
     /// connection goes on.
     ///
-    /// Watched failing against the old code: the reset carried
-    /// `DOQ_PROTOCOL_ERROR`.
+    /// Fails if the reset carries `DOQ_PROTOCOL_ERROR`.
     #[tokio::test]
     async fn a_cancelled_query_is_reset_with_no_error() {
         let server = Server::start(TransportLimits::default(), Duration::ZERO).await;
@@ -802,7 +799,7 @@ mod tests {
     /// with a reset rather than a FIN, which reads as a complete answer of
     /// nothing.
     ///
-    /// Watched failing against the old code: the stream ended with a FIN.
+    /// Fails if the stream ends with a FIN.
     #[tokio::test]
     async fn a_refused_query_resets_only_its_stream() {
         let server = Server::start(TransportLimits::default(), Duration::ZERO).await;
@@ -831,8 +828,7 @@ mod tests {
     /// A transfer the server cannot finish is its own failure, not the
     /// client's: RESET_STREAM with `DOQ_INTERNAL_ERROR` (§4.3.2).
     ///
-    /// Watched failing against the old code: the reset carried
-    /// `DOQ_PROTOCOL_ERROR`.
+    /// Fails if the reset carries `DOQ_PROTOCOL_ERROR`.
     #[tokio::test]
     async fn an_abandoned_transfer_resets_with_internal_error() {
         let server = Server::start(TransportLimits::default(), Duration::ZERO).await;
@@ -850,11 +846,11 @@ mod tests {
         let _ = server.task.await;
     }
 
-    /// PINGs restart QUIC's idle timer (RFC 9000 §10.1) and are not a query,
-    /// so they must not hold a connection and its slot (`TODO.md` #164).
+    /// PINGs restart QUIC's idle timer (RFC 9000 §10.1) and are not a query, so
+    /// they must not hold a connection and its slot.
     ///
-    /// Watched failing without `serve_connection`'s idle deadline: the
-    /// connection was still open at the bound.
+    /// Fails without `serve_connection`'s idle deadline: the connection is
+    /// still open at the bound.
     #[tokio::test]
     async fn a_client_sending_only_pings_is_closed_when_idle() {
         let server = Server::start(idle_300ms(), Duration::ZERO).await;
@@ -875,8 +871,8 @@ mod tests {
     /// Idle is no new stream, whatever is in flight, so the clock runs while
     /// this one is answered; the close waits for it.
     ///
-    /// Watched failing with the close made as soon as the deadline passed:
-    /// the stream was cut off by the CONNECTION_CLOSE.
+    /// Fails with the close made as soon as the deadline passes: the stream is
+    /// cut off by the CONNECTION_CLOSE.
     #[tokio::test]
     async fn a_stream_in_flight_at_the_idle_timeout_is_answered() {
         // Half again the idle timeout, inside the one more the drain allows.
@@ -926,9 +922,8 @@ mod tests {
     /// stream, one for the drain. `read_timeout` is left at its 5 s so the
     /// stall reset is not what ends it.
     ///
-    /// Watched failing without the idle deadline: with PINGs the connection
-    /// was open at the bound. Without PINGs it passed before, closed by QUIC's
-    /// own timer, as triage measured.
+    /// Fails without the idle deadline: with PINGs the connection is open at
+    /// the bound. Without PINGs QUIC's own timer closes it.
     #[tokio::test]
     async fn a_reply_never_read_does_not_hold_the_connection() {
         for pings in [false, true] {
@@ -991,8 +986,8 @@ mod tests {
     /// Shutdown answers a stream already in flight before closing, as on TCP:
     /// a CONNECTION_CLOSE ends every stream at once (RFC 9000 §10.2).
     ///
-    /// Watched failing against the old stop, which closed the endpoint at
-    /// once: the stream ended with the connection.
+    /// Fails with a stop that closes the endpoint at once: the stream ends with
+    /// the connection.
     #[tokio::test]
     async fn shutdown_answers_a_stream_already_in_flight() {
         let server = Server::start(TransportLimits::default(), Duration::from_millis(300)).await;
@@ -1017,8 +1012,8 @@ mod tests {
     /// FIN is a protocol error that "SHOULD forcibly abort the connection"
     /// with `DOQ_PROTOCOL_ERROR` (§4.3.3).
     ///
-    /// Watched failing without the read deadline: the connection was still
-    /// open at the bound.
+    /// Fails without the read deadline: the connection is still open at the
+    /// bound.
     #[tokio::test]
     async fn a_query_stream_with_no_fin_closes_the_connection() {
         let limits = TransportLimits {
@@ -1051,9 +1046,9 @@ mod tests {
     /// And the transfer answering it stops, rather than blocking on a reply
     /// channel nobody drains.
     ///
-    /// Watched failing without the progress deadline: the starved stream was
-    /// never reset. Without dropping the channel before awaiting the handler,
-    /// the handler never returned.
+    /// Fails without the progress deadline: the starved stream is never reset.
+    /// Without dropping the channel before awaiting the handler, the handler
+    /// never returns.
     #[tokio::test]
     async fn a_reply_starved_of_credit_resets_only_its_stream() {
         let limits = TransportLimits {

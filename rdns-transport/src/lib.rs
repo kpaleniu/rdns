@@ -19,8 +19,8 @@
 
 // `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
 #![warn(unreachable_pub)]
-// `TODO.md` #143: `push_str(&format!(..))` allocates a `String` to copy it;
-// `write!` into the target does not. Off by default (restriction group).
+// `push_str(&format!(..))` allocates a `String` to copy it; `write!` into the
+// target does not. Off by default (restriction group).
 #![warn(clippy::format_push_string)]
 
 pub mod bind;
@@ -117,12 +117,12 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// one worth ending the process over.
 ///
 /// Both daemons run their accept loops in a `JoinSet` whose first finished task
-/// ends the process, so the `accepted?` these four loops used to spell made
-/// *any* accept error a whole-server outage — every transport, not just the one
-/// that failed. Measured on Linux: at the descriptor limit `accept` returns
-/// `EMFILE`, and the condition clears by itself as connections close. That is
-/// `CLAUDE.md` §4's receive-loop rule, which [`recv_error_is_transient`]
-/// answers for UDP and no accept loop had asked.
+/// ends the process, so an `accepted?` in these four loops makes *any* accept
+/// error a whole-server outage — every transport, not just the one that failed.
+/// Measured on Linux: at the descriptor limit `accept` returns `EMFILE`, and
+/// the condition clears by itself as connections close. That is `CLAUDE.md`
+/// §4's receive-loop rule, which [`recv_error_is_transient`] answers for UDP
+/// and no accept loop had asked.
 ///
 /// The other half of that rule — what a *remote* party can provoke — was
 /// measured and is nothing: a connection reset with `SO_LINGER 0` before the
@@ -169,11 +169,10 @@ pub const UDP_RECEIVE_BUFFER: usize = 65_535;
 
 /// What a task needs to serve a request that is not the answer itself.
 ///
-/// The five handles both daemons hold: `rdnsr` had them as `Shell` and `rdnsd`
-/// as five loose fields of `Server`, same types and same purpose under two
-/// spellings, which is how the admission pipeline came to be written twice
-/// (`TODO.md` #32). `Arc`-cloned into every task, so this is a bag by
-/// construction and says so in its name.
+/// The five handles both daemons hold, one type rather than two spellings of
+/// the same purpose, which is how an admission pipeline comes to be written
+/// twice. `Arc`-cloned into every task, so this is a bag by construction and
+/// says so in its name.
 #[derive(Clone)]
 pub struct ServeContext {
     /// Queries per second per source. The first refusal, and the cheapest.
@@ -199,12 +198,11 @@ pub struct ServeContext {
     pub nsid: Option<&'static [u8]>,
     /// Where the accept loops read the wall clock.
     ///
-    /// The four of them had `rdns::clock::current_unix_timestamp()` written out
-    /// seven times, which left a rate-limit test deciding on whether two
-    /// connects straddled a second boundary (`TODO.md` #52). A handler still
-    /// gets `now` as an argument for the reason [`ServeContext::allow_source`]
-    /// gives — the clock read belongs to the caller — and this says which clock
-    /// that read comes from.
+    /// Not `rdns::clock::current_unix_timestamp()`, which leaves a rate-limit
+    /// test deciding on whether two connects straddled a second boundary. A
+    /// handler still gets `now` as an argument for the reason
+    /// [`ServeContext::allow_source`] gives — the clock read belongs to the
+    /// caller — and this says which clock that read comes from.
     pub clock: Clock,
 }
 
@@ -292,11 +290,10 @@ impl ServeContext {
     /// refusal owes.
     ///
     /// The third refusal path, beside [`ServeContext::allow_source`] and
-    /// [`ServeContext::accept_packet`], and it was the one written twice
-    /// (`TODO.md` #33h). The verdict comes back rather than the reply: what a
-    /// truncated answer looks like is each daemon's — `rdnsd` rebuilds one from
-    /// the question it parsed, `rdnsr` shortens the bytes it already has — and
-    /// #30j settled that those stay two.
+    /// [`ServeContext::accept_packet`]. The verdict comes back rather than the
+    /// reply: what a truncated answer looks like is each daemon's — `rdnsd`
+    /// rebuilds one from the question it parsed, `rdnsr` shortens the bytes it
+    /// already has — and #30j settled that those stay two.
     ///
     /// `now` is the caller's, for the reason [`ServeContext::allow_source`]
     /// gives: `rdnsr` reads the clock again here because a recursion sat
@@ -417,9 +414,9 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: NonZeroU64 = NonZeroU64::new(10).unwrap();
 /// are what both daemons ran with, and each may take the field it disagrees
 /// about without either editing the other's.
 ///
-/// The connection ceiling and the idle timeout are settings since #155, the two
-/// BIND, NSD, Unbound and Knot all expose. The other two stay constants: of
-/// those four only Knot offers either (`tcp-io-timeout`).
+/// The connection ceiling and the idle timeout are settings (`TODO.md` #155),
+/// the two BIND, NSD, Unbound and Knot all expose. The other two stay
+/// constants: of those four only Knot offers either (`tcp-io-timeout`).
 #[derive(Debug, Clone, Copy)]
 pub struct TransportLimits {
     /// How long a connection may sit idle between messages. RFC 7766 §6.2.3
@@ -506,9 +503,9 @@ where
 
 /// Serve until a listener stops or the operator does, then drain.
 ///
-/// The epilogue both daemons had written out (`TODO.md` #30d): whichever
-/// listener ends first ends the process, because answering on one transport and
-/// not the other is worse than being plainly down; a signal is an orderly stop.
+/// The epilogue both daemons share: whichever listener ends first ends the
+/// process, because answering on one transport and not the other is worse than
+/// being plainly down; a signal is an orderly stop.
 ///
 /// `background` is the task that is *not* a listener — the periodic anomaly
 /// warnings — and is awaited rather than dropped, because dropping a
@@ -647,9 +644,8 @@ mod tests {
         );
     }
 
-    /// And so is the third refusal, which is the one that was written twice —
-    /// once per daemon, with the two counter increments spelled out in each
-    /// (`TODO.md` #33h). The verdict is the daemons'; the counting is not.
+    /// And so is the third refusal. The verdict is the daemons'; the counting,
+    /// two counter increments, is not.
     ///
     /// Slip of two so both refusals appear: the first response over budget is
     /// dropped and the second truncated, which is what RRL's slip means.
@@ -736,9 +732,9 @@ mod tests {
     }
 
     /// The provocation is in `TODO.md` #69: at `ulimit -n`, `accept` returns
-    /// this and the four loops used to `?` it, which ends the process because
-    /// the first task out of the `JoinSet` ends it. `Uncategorized`, so the
-    /// raw code is the whole test.
+    /// this, and a loop that `?`s it ends the process because the first task
+    /// out of the `JoinSet` ends it. `Uncategorized`, so the raw code is the
+    /// whole test.
     #[tokio::test]
     async fn descriptor_exhaustion_does_not_end_an_accept_loop() {
         let exhausted = std::io::Error::from_raw_os_error(if cfg!(windows) { 10024 } else { 24 });
