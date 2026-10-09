@@ -55,7 +55,8 @@ triage; #171-#174, #176, #179, #183, #184, #186, #187, #189, #191, #178,
   folded in (bug, ready for agent).
 - #196 raw control bytes in two test literals (needs triage).
 - #198 the journal is fsynced under the zone map's write guard (needs triage).
-- #199 comments exceed the length "Writing comments" allows (needs triage).
+- #199 comments exceed the length "Writing comments" allows (enhancement,
+  ready for agent).
 - #200 `CLAUDE.md` is written in the register it forbids in comments; split
   into rules and `docs/LESSONS.md` (enhancement, ready for human).
 
