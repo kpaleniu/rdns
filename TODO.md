@@ -54,12 +54,12 @@ triage; #171-#174, #176, #179, #183, #184, #186, #187, #189, #191, #178,
 - #195 concurrent UPDATEs lose acknowledged changes; 195a reload, 195b
   folded in (bug, ready for agent).
 - #196 raw control bytes in two test literals (needs triage).
-- #197 comments narrate history (enhancement, ready for agent; `rdns-core`
-  first, owner review before the rest).
+- #197 comments narrate history (enhancement, ready for agent once #200
+  lands; `rdns-core` first, owner review before the rest).
 - #198 the journal is fsynced under the zone map's write guard (needs triage).
 - #199 comments exceed the length "Writing comments" allows (needs triage).
-- #200 `CLAUDE.md` is written in the register it forbids in comments (needs
-  triage).
+- #200 `CLAUDE.md` is written in the register it forbids in comments; split
+  into rules and `docs/LESSONS.md` (enhancement, ready for human).
 
 Deferred 2026-10-08 by the owner, not needed now; each file's "Deferred"
 section holds what was found before parking:
