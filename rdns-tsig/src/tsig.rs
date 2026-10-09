@@ -613,7 +613,7 @@ impl TsigSession {
     /// included." A caller with a size ceiling therefore has to reserve this
     /// *before* it writes the body — appending the record is the one path that
     /// grows a message past the size it was serialized to, and discovering that
-    /// afterwards leaves nothing to do about it (`TODO.md` #41d).
+    /// afterwards leaves nothing to do about it.
     pub fn reply_overhead(&self) -> usize {
         tsig_record_len(
             &self.key.name,
@@ -1048,10 +1048,10 @@ fn skip_record(packet: &[u8], pos: usize) -> Option<usize> {
 /// A name read from `packet` at `pos`, following pointers. Used for the TSIG
 /// owner name only, which is the key name.
 ///
-/// `Name`'s parser and presentation form rather than labels joined as text: a
-/// `.` inside a label read as a separator, and a non-UTF-8 octet as U+FFFD, so
-/// `name_wire` rebuilt different octets and the MAC did not verify
-/// (`TODO.md` #139).
+/// `Name`'s parser and presentation form rather than labels joined as text,
+/// which reads a `.` inside a label as a separator and a non-UTF-8 octet as
+/// U+FFFD, so `name_wire` rebuilds different octets and the MAC does not
+/// verify.
 fn read_name_at(packet: &[u8], pos: usize) -> Option<String> {
     let unpacker = rdns_core::dname::DNameUnpacker::new(packet);
     let (name, _) = rdns_core::Name::from_wire_in(packet.get(pos..)?, &unpacker).ok()?;
@@ -1067,9 +1067,9 @@ fn read_name(data: &[u8]) -> Option<(String, &[u8])> {
 
 /// Whether two spellings name one key, as [`TsigKeyring::by_name`] decides it.
 ///
-/// For a config check that runs before there is a keyring to ask. Its own
-/// comparison, `eq_ignore_ascii_case` on the text, refused `#partner.key` for
-/// `[keys."partner.key."]`, which the flags accept (`TODO.md` #141).
+/// For a config check that runs before there is a keyring to ask. Not
+/// `eq_ignore_ascii_case` on the text, which refuses `#partner.key` for
+/// `[keys."partner.key."]`, which the flags accept.
 pub fn same_key_name(a: &str, b: &str) -> bool {
     canonical_key_name(a) == canonical_key_name(b)
 }
@@ -1094,8 +1094,7 @@ mod tests {
     use super::*;
     use rdns_core::record_types as rt;
     /// `rdns::test_records::nm`, which is `#[cfg(test)]` there and so invisible
-    /// across a crate boundary (`TODO.md` #66c, and #67f's fixture problem for
-    /// the third time).
+    /// across a crate boundary (`TODO.md` #66c).
     fn nm(text: &str) -> rdns_core::Name {
         rdns_core::Name::from_presentation(text).expect("a name")
     }
@@ -1478,11 +1477,11 @@ mod tests {
     /// adds — for every algorithm, and for a key name whose wire form is not
     /// its text length.
     ///
-    /// Exact rather than "at least": `TODO.md` #41d is a ceiling that was
-    /// exceeded by a fixed amount, and a bound that drifts from the real size
-    /// re-opens it in one direction or wastes the datagram in the other. This
-    /// is the test that makes `reply_overhead` a claim the compiler cannot
-    /// check into one the suite does (`CLAUDE.md` §4).
+    /// Exact rather than "at least": a ceiling exceeded by a fixed amount is
+    /// the defect, and a bound that drifts from the real size re-opens it in
+    /// one direction or wastes the datagram in the other. This is the test that
+    /// makes `reply_overhead` a claim the compiler cannot check into one the
+    /// suite does (`CLAUDE.md` §4).
     #[test]
     fn the_reserved_tsig_size_is_the_size_signing_adds() {
         let now = 1_800_000_000;
@@ -1573,10 +1572,10 @@ mod tests {
         }
     }
 
-    /// Read as lossy, joined text, a `.` inside a label became a separator and
-    /// a non-UTF-8 octet became U+FFFD, so our own signature failed our own
-    /// check (`TODO.md` #139). RFC 1035 §5.1's escapes are how the name
-    /// survives the round trip through presentation form.
+    /// Fails if the name is read as lossy, joined text: a `.` inside a label
+    /// becomes a separator and a non-UTF-8 octet U+FFFD, so our own signature
+    /// fails our own check. RFC 1035 §5.1's escapes are how the name survives
+    /// the round trip through presentation form.
     #[test]
     fn a_key_name_needing_escapes_verifies() {
         let now = 1_800_000_000;
