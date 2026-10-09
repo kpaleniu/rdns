@@ -370,17 +370,9 @@ impl TsigKeyring {
 
     /// The key of that name, whatever its algorithm: the *config* lookup.
     ///
-    /// Deliberately not [`Self::get`], and the difference is where the algorithm
-    /// comes from. On the wire a peer supplies both, and a name that matches
-    /// under the wrong algorithm must be BADKEY rather than a downgrade — so
-    /// `get` requires both. Here the operator has written `#partner.key.` in a
-    /// `--secondary` or `--also-notify`, and the algorithm is whatever the
-    /// `--tsig-key` defining that name says; making them repeat it would be a
-    /// second place to get it wrong.
-    ///
-    /// One function because two call sites wanted it and the second was about to
-    /// be a copy of the first, which is how the four-algorithm fallback in
-    /// `rdnsd`'s replication came to exist (`CLAUDE.md` §7).
+    /// Not [`Self::get`]: on the wire a name matching under the wrong algorithm
+    /// must be BADKEY rather than a downgrade, so `get` requires both. In
+    /// config the `--tsig-key` defining the name supplies the algorithm.
     pub fn by_name(&self, name: &str) -> Option<&TsigKey> {
         let name = canonical_key_name(name);
         self.keys.iter().find(|k| k.name == name)
@@ -927,10 +919,8 @@ fn find_tsig(packet: &[u8]) -> Option<(usize, &[u8], String)> {
     if rtype != TSIG_TYPE {
         return None;
     }
-    // After the TYPE check, not before it. `read_name_at` allocates the name
-    // and its text, so reading first charged every EDNS query for the OPT
-    // record's owner name and then threw it away, on a path reached before
-    // anything is authenticated.
+    // After the TYPE check: `read_name_at` allocates, and this runs for every
+    // EDNS query before anything is authenticated.
     let owner = read_name_at(packet, pos)?;
     let rdlen = u16::from_be_bytes([packet[after_name + 8], packet[after_name + 9]]) as usize;
     let rdata_start = after_name + 10;
@@ -972,9 +962,8 @@ fn append_tsig(mut message: Vec<u8>, tsig: &Tsig) -> ConfigResult<Vec<u8>> {
         .ok_or_else(|| ConfigError::new("additional count would overflow"))?;
     message[10..12].copy_from_slice(&ar.to_be_bytes());
 
-    // The only path that grows a message past the size it was serialized to: ~82
-    // octets onto finished bytes. Past 65,535 the TCP framing prefix wraps, and
-    // at 65,536 it is 0, which every read loop treats as a broken peer.
+    // The one path that grows finished bytes, by ~82 octets. Past 65,535 the
+    // TCP length prefix wraps, and 65,536 reads as 0: a broken peer.
     let tsig_octets = owner.len() + 10 + rdata.len();
     if message.len() > u16::MAX as usize {
         return Err(ConfigError::new(format!(
@@ -988,17 +977,11 @@ fn append_tsig(mut message: Vec<u8>, tsig: &Tsig) -> ConfigResult<Vec<u8>> {
     Ok(message)
 }
 
-/// The size of the TSIG record a signer will append (RFC 8945 §4.2): the owner
-/// name, the ten fixed record octets — type, class, TTL, RDLENGTH — and the
-/// RDATA, whose only variable parts are the algorithm name, the MAC and the
-/// "other data".
+/// The size of the TSIG record a signer appends (RFC 8945 §4.2): owner name,
+/// ten fixed octets and RDATA, names uncompressed (see [`append_tsig`]).
 ///
-/// Neither name is compressed, for the reason [`append_tsig`] gives, so both
-/// cost their full wire form. The `unwrap_or` is a bound rather than an exact
-/// length and is unreachable from either caller: a session's key matched a name
-/// that came off the wire and a rejection's came off the wire itself, so both
-/// parse. It is here so this stays infallible — a caller sizing a buffer has
-/// nothing to do with an error, and [`append_tsig`] reports the same one.
+/// The `unwrap_or` is a bound, unreachable from both callers because both names
+/// came off the wire and parse; it keeps buffer sizing infallible.
 fn tsig_record_len(
     key_name: &str,
     algorithm_name: &str,
@@ -1473,15 +1456,11 @@ mod tests {
         assert!(ring.get("other.key.", TsigAlgorithm::HmacSha256).is_none());
     }
 
-    /// The reservation a caller makes is the exact number of octets signing
-    /// adds — for every algorithm, and for a key name whose wire form is not
-    /// its text length.
+    /// Fails if the reservation differs from the octets signing adds, for every
+    /// algorithm and for a key name whose wire form is not its text length.
     ///
-    /// Exact rather than "at least": a ceiling exceeded by a fixed amount is
-    /// the defect, and a bound that drifts from the real size re-opens it in
-    /// one direction or wastes the datagram in the other. This is the test that
-    /// makes `reply_overhead` a claim the compiler cannot check into one the
-    /// suite does (`CLAUDE.md` §4).
+    /// Exact, not "at least": a bound that drifts re-opens the overflow one way
+    /// or wastes the datagram the other.
     #[test]
     fn the_reserved_tsig_size_is_the_size_signing_adds() {
         let now = 1_800_000_000;
