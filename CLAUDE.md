@@ -265,6 +265,13 @@ Good:
 git ls-files -z | LC_ALL=C xargs -0 grep -na $'\xc3[\xa2-\xaf]\xc2[\x80-\xbf]\xc2[\x80-\xbf]'
 ```
 
+- And this prints nothing (a raw control byte, which makes `grep` call a
+  source file binary and skip it):
+
+```sh
+git grep -naP '[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]' -- '*.rs' '*.md' '*.toml' '*.sh' '*.yml' '*.py' '*.txt'
+```
+
 ## 13. Size a buffer for what you will send, not for what the protocol allows
 
 [Lesson](docs/LESSONS.md#13)

@@ -688,7 +688,7 @@ mod tests {
         // The length-prefixed label, counting targets only. Twice: a pointer
         // from the second to the first is the compression the section forbids.
         assert_eq!(
-            buf[..n].windows(3).filter(|w| *w == b"to").count(),
+            buf[..n].windows(3).filter(|w| *w == b"\x02to").count(),
             2,
             "each DNAME spells its own target out"
         );

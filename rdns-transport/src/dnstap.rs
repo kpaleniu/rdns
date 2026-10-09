@@ -444,7 +444,10 @@ mod tests {
         shutdown.begin();
 
         let written = closed_capture(&path).await;
-        let frames = written.windows(11).filter(|w| *w == b"   payload").count();
+        let frames = written
+            .windows(11)
+            .filter(|w| *w == b"\x00\x00\x00\x07payload")
+            .count();
         assert_eq!(frames, 100, "every queued frame, then STOP");
         assert_eq!(counter(&metrics.dnstap_frames), 100);
         assert_eq!(counter(&metrics.dnstap_dropped), 0);
