@@ -249,16 +249,10 @@ struct CatalogState {
 impl Catalogs {
     /// Resolve the `--catalog` specs against the keyring.
     ///
-    /// `configured` is every zone the rest of the configuration names, and
-    /// `held` every zone loaded from disk at startup. Both are protected from
-    /// being taken over by a catalog (§5.2) — `held` minus this server's own
-    /// members, because those are exactly the files a previous run wrote.
-    ///
-    /// Which way that has to fail is the question. A file on disk that no
-    /// sidecar row claims is read as somebody's zone rather than as an orphan:
-    /// mistaking a member for a configured zone refuses to provision it and
-    /// says so, while mistaking a configured zone for a member replicates over
-    /// a file the operator wrote.
+    /// `configured` and `held` are protected from takeover (§5.2), `held` less
+    /// this server's own members. An unclaimed file on disk counts as
+    /// somebody's zone: refusing to provision a member is louder and safer than
+    /// replicating over an operator's file.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         specs: Vec<MasterSpec>,
@@ -288,9 +282,8 @@ impl Catalogs {
                     Some(name) => format!(" signed with {name}"),
                     None => String::new(),
                 },
-                // Printed for the reason every other policy is: a member
-                // fetched from somewhere else than the catalog's own master is
-                // invisible otherwise (`CLAUDE.md` §14).
+                // Printed like every policy: a member fetched from elsewhere is
+                // otherwise invisible (`CLAUDE.md` §14).
                 match rules.len() {
                     0 => String::new(),
                     n => format!(
@@ -325,11 +318,8 @@ impl Catalogs {
     }
 
     /// What each catalog provisioned and what it declined, for the control
-    /// socket (RFC 9432 §6: "Implementations are ... advised to provide a tool
-    /// ... to perform queries on catalog zones").
-    ///
-    /// A snapshot under the one lock the reconcile also takes, so a report is
-    /// never half of one reconcile and half of the next.
+    /// socket (RFC 9432 §6 advises a tool), as a snapshot under the reconcile's
+    /// lock.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) async fn report(&self) -> Vec<CatalogReport> {
         let state = self.state.lock().await;
@@ -388,27 +378,18 @@ impl Catalogs {
     /// Apply the EXPIRE rule to the members a previous run provisioned, before
     /// anything is served.
     ///
-    /// A member's zone file is in `--zone-dir` like any other, so a restart
-    /// loads and serves it with AA set — and its refresh task does not exist
-    /// until the catalog arrives and is reconciled. Without this, a member whose
-    /// master has been unreachable for a week comes back at the next restart as
-    /// a zone nothing vouches for and nothing withdraws. The specs are rebuilt
-    /// from the sidecar, since that is where the answer to "whose member is this"
-    /// lives; the master is the one its catalog is configured with.
-    ///
-    /// A row whose catalog is no longer configured cannot be given a master and
-    /// so cannot be checked. Those are named at WARN rather than withdrawn: an
-    /// operator who took a `--catalog` flag away still has the zone files, and
-    /// deleting the data because a flag went is the larger mistake.
+    /// A member's file loads with AA set at restart, before its catalog arrives
+    /// to start its refresh task; this vouches for it from the sidecar's
+    /// master. A row whose catalog is no longer configured is named at WARN,
+    /// not withdrawn: deleting data because a flag went is the larger mistake.
     pub(crate) async fn vouch_for_members(&self, replication: &ReplicationContext) {
         let state = self.state.lock().await;
         let mut specs = Vec::new();
         let mut orphaned: Vec<Name> = Vec::new();
         for row in state.membership.rows() {
             match self.by_zone.get(&*catalog_of(row.node.as_ref()).folded()) {
-                // The group the row records, not the catalog's own master: a
-                // member fetched from a group's master is vouched for against
-                // that master or against nothing at all.
+                // The row's group, not the catalog's master: vouched for
+                // against the master it was fetched from.
                 Some(spec) => specs.extend(spec.masters_for(&row.zone, row.group.as_deref())),
                 None => orphaned.push(row.zone.clone()),
             }
@@ -454,21 +435,15 @@ impl Catalogs {
             .matching(zone)
             .cloned()
         else {
-            // §5.1: "when a catalog zone expires, it loses its catalog meaning
-            // and MUST no longer be processed as such. No special processing
-            // occurs" — so an expired or not-yet-transferred catalog withdraws
-            // nothing.
+            // §5.1: an expired catalog "loses its catalog meaning", with "No
+            // special processing", so it withdraws nothing.
             return;
         };
 
         let mut state = self.state.lock().await;
         let key = NameKeyBuf::new(zone);
-        // Equality, not order: the question is whether this is the version last
-        // reconciled, and `Serial` has no `PartialOrd` for the reason
-        // `CLAUDE.md` §17 gives. A producer that edits a catalog without moving
-        // its serial is therefore not noticed — the same trade every serial-based
-        // decision here makes, and RFC 1982 §3.1 is why the serial is the
-        // producer's to move.
+        // Equality, not order (`CLAUDE.md` §17): an edit without a serial bump
+        // goes unnoticed (RFC 1982 §3.1).
         if let (Some(serial), Some(last)) = (held.serial(), state.reconciled.get(&key)) {
             if serial == *last {
                 return;
@@ -478,10 +453,8 @@ impl Catalogs {
         let catalog = match Catalog::from_zone(&held) {
             Ok(catalog) => catalog,
             Err(e) => {
-                // §5.1: a broken catalog "loses its catalog meaning ... Member
-                // zones previously configured by this catalog MUST NOT be
-                // removed or reconfigured in any way", and the reason "SHOULD be
-                // communicated clearly to the operator".
+                // §5.1: a broken catalog's members "MUST NOT be removed or
+                // reconfigured", and the operator is told.
                 tracing::warn!(
                     "catalog {zone} is broken and is being ignored, its members left as they are: {e}"
                 );
@@ -503,9 +476,8 @@ impl Catalogs {
 
         let (path, text) = state.membership.snapshot();
         if let Err(e) = write_snapshot(&path, &text) {
-            // A warning and not a failure, but the consequence is stated: the
-            // rows are how a removal that happens while this process is down is
-            // noticed at the next start.
+            // A warning, with the consequence: the rows notice a removal made
+            // while this process is down.
             tracing::warn!(
                 "could not write {}: a member removed while this server is not \
                  running would go unnoticed until the file is writable again ({e})",
@@ -533,10 +505,8 @@ impl Catalogs {
             // whether the answer is a conflict (§4.3.2).
             let fetch = spec.fetch(member);
             if let Fetch::Ambiguous(why) = &fetch {
-                // Refused, and *left alone* if it is already ours: §5.1's rule
-                // for an instruction that cannot be followed is that member
-                // zones "MUST NOT be removed or reconfigured in any way", and
-                // an ambiguous group is exactly that instruction.
+                // Refused, and left alone if ours: §5.1, members "MUST NOT be
+                // removed or reconfigured".
                 tracing::error!(
                     "catalog {}: not provisioning {} — {why}",
                     spec.spec.zone,
@@ -554,15 +524,8 @@ impl Catalogs {
                 // Already ours, under the same node label and the same group:
                 // nothing to do.
                 Some(row) if row.node.as_ref() == member.node() && row.group == group => {}
-                // The label is the same and the group is not: the same zone,
-                // fetched from somewhere else. Not §5.4's removal — that is
-                // about the *node* label and deletes the file and the transfer
-                // state — so the refresh task is replaced and the data stays.
-                // The zone does stop being *served* until the new master
-                // answers, because nothing has vouched for the age of a copy
-                // that came from the old one; that is `withdraw_unvouched_zones`
-                // applying the same rule a configured secondary gets when its
-                // `masters` change.
+                // New group, same label: a new master, not §5.4's removal. The
+                // data stays, unserved until the new master answers.
                 Some(row) if row.node.as_ref() == member.node() => {
                     tracing::info!(
                         "catalog {}: {} moves from {} to {} (RFC 9432 §4.3.2). Its \
@@ -577,11 +540,8 @@ impl Catalogs {
                     self.add(state, spec, member, &fetch, replication, lifecycle)
                         .await;
                 }
-                // §5.4: "When the member node's label value (<unique-N>) changes
-                // ... catalog consumers MUST process this as a member zone
-                // removal, including the removal of all the zone's associated
-                // state ... and then immediately process the member as a newly
-                // added zone".
+                // §5.4: a changed label is a removal "of all the zone's
+                // associated state", then an addition.
                 Some(row) => {
                     let was = row.node.clone();
                     self.remove(
@@ -614,12 +574,8 @@ impl Catalogs {
                         refused.push(member.zone().to_owned(), why);
                     }
                     Ownership::AlreadyHandedOver(to) => {
-                        // Not an error, and this is why it is not: §4.3.1 leaves
-                        // the member in the old catalog until "it has been
-                        // established that all its consumers have processed the
-                        // Change of Ownership", so this is the ordinary state of
-                        // a migration in progress and would otherwise log one
-                        // per refresh, forever.
+                        // Not an error: §4.3.1 keeps it in the old catalog
+                        // until all consumers moved, so this repeats.
                         tracing::debug!(
                             "catalog {}: {} has already moved to {to}",
                             spec.spec.zone,
@@ -634,9 +590,8 @@ impl Catalogs {
                             member.zone()
                         );
                         if reset {
-                            // §4.3.1: "Unless the member node label ... is the
-                            // same in $NEWCATZ, all its associated state for a
-                            // just migrated zone MUST be reset."
+                            // §4.3.1: a different member node label means its
+                            // state "MUST be reset".
                             self.remove(
                                 state,
                                 member.zone(),
@@ -646,9 +601,8 @@ impl Catalogs {
                             )
                             .await;
                         } else {
-                            // The state stays; only who asks for it changes, and
-                            // the old catalog's refresh task is asking with the
-                            // old catalog's master and key.
+                            // State stays; the old catalog's task asks with its
+                            // old master and key.
                             self.secondaries.retired(member.zone()).await;
                         }
                         self.add(state, spec, member, &fetch, replication, lifecycle)
@@ -707,16 +661,14 @@ impl Catalogs {
         if owner.as_ref() == spec.spec.zone.as_ref() {
             return Ownership::Free;
         }
-        // We handed it to that catalog ourselves, and §4.3.1 keeps it listed
-        // here until the producer is satisfied every consumer has seen the
-        // change.
+        // We handed it over, and §4.3.1 keeps it listed until the producer is
+        // satisfied.
         if member.coo() == Some(owner.as_ref()) {
             return Ownership::AlreadyHandedOver(owner);
         }
 
-        // The old catalog as it is *now*. If we no longer hold it — it expired,
-        // or its `--catalog` spec is gone — then there is nothing saying we may
-        // take the zone, and §5.2's default stands.
+        // The old catalog as held now; if gone, nothing permits taking the zone
+        // and §5.2's default stands.
         let old = replication
             .served
             .zone_map
@@ -731,9 +683,8 @@ impl Catalogs {
                 catalog
                     .member(zone)
                     .filter(|old| old.coo() == Some(spec.spec.zone.as_ref()))
-                    // §4.3.1: the same member node label carries the state over,
-                    // a different one resets it (§5.6). Folded, because every
-                    // other comparison of a label here is (RFC 4343).
+                    // §4.3.1: the same label carries state, another resets it
+                    // (§5.6); folded (RFC 4343).
                     .map(|old| !old.id().eq_ignore_ascii_case(member.id()))
             });
         match handover {
@@ -756,9 +707,8 @@ impl Catalogs {
         lifecycle: &Lifecycle,
     ) {
         let zone = member.zone().to_owned();
-        // One entry for the catalog's own master, or one per master the group
-        // names — which is the shape a configured secondary with two masters
-        // gets, since `Secondaries` holds a task list per zone.
+        // One entry per master, the catalog's or the group's, as a configured
+        // secondary with two masters has.
         let masters: Vec<(MasterSpec, Option<TsigKey>)> = match fetch {
             Fetch::FromGroup(rule) => rule
                 .masters
@@ -777,11 +727,8 @@ impl Catalogs {
                 .join(", "),
             describe_groups(member, fetch)
         );
-        // The same rule a configured secondary gets at startup: a copy on disk
-        // whose age cannot be vouched for is not served until its master answers
-        // (`CLAUDE.md` §4). This is the adoption path — the file is already
-        // there from a previous run — and a no-op for a member we have never
-        // held.
+        // A configured secondary's startup rule: an adopted copy of unknown age
+        // is not served until its master answers (`CLAUDE.md` §4).
         let specs: Vec<MasterSpec> = masters.iter().map(|(spec, _)| spec.clone()).collect();
         withdraw_unvouched_zones(&specs, &replication.served, &replication.zone_dir).await;
         state.membership.set(MemberRow {
@@ -811,9 +758,8 @@ impl Catalogs {
         withdraw(&replication.served, zone).await;
         state.membership.forget(zone);
 
-        // "The zone and associated state (such as zone data and DNSSEC keys)
-        // MUST be removed": the copy on disk, and the transfer state that would
-        // otherwise vouch for the age of a zone of the same name added later.
+        // §5.4's "MUST be removed": the file, and the transfer state that would
+        // vouch for a later zone of the same name.
         let path = zone_file_path(&replication.zone_dir, &zone.to_presentation());
         if let Err(e) = std::fs::remove_file(&path) {
             if e.kind() != std::io::ErrorKind::NotFound {
@@ -829,10 +775,8 @@ impl Catalogs {
             tracing::warn!("could not write {}: {e}", snapshot.0.display());
         }
 
-        // WARN, not INFO: a member leaving a catalog takes a zone off this
-        // server, and RFC 9432 §6 is blunt about what a mistaken producer can do
-        // with that — "millions of member zones may get deleted from their
-        // secondaries within seconds".
+        // WARN: a departing member takes a zone off this server, and RFC 9432
+        // §6 warns of "millions of member zones" deleted in seconds.
         tracing::warn!("no longer serving {zone}: {why}");
     }
 }
@@ -941,17 +885,9 @@ struct MemberRow {
 /// Which catalog provisioned which zone, under which member node, and under
 /// which group.
 ///
-/// One line per member: the zone, the member node it came from, then the group.
-/// The node carries the catalog — a member node is `<unique-N>.zones.$CATZ` —
-/// so the two facts §5.3 and §5.4 need are one name and cannot disagree with
-/// each other. Both names are written in presentation form, which escapes
-/// whatever octets a producer chose for `<unique-N>`.
-///
-/// A row may have two fields: a file written without groups reads as "no
-/// group", which is what it meant. The reverse is not true — an older build
-/// reading a three-field row skips it and loses that member's provenance — so a
-/// downgrade costs one reconcile's worth of removals going unnoticed, and the
-/// file says so.
+/// One line per member: zone, member node, group. The node names the catalog,
+/// so §5.3's and §5.4's facts cannot disagree. A two-field row reads as no
+/// group; an older build skips three-field rows, which a downgrade costs.
 struct Membership {
     path: PathBuf,
     rows: Vec<MemberRow>,

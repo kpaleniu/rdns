@@ -285,9 +285,8 @@ fn what_a_signed_answer_weighs() {
         .iter()
         .map(|(label, alg, chain)| (*label, signed(*alg, chain.clone(), 1)))
         .collect();
-    // The DO=0 column is an *unsigned* zone: DNSSEC records are not answer data
-    // unless DO asked for them (RFC 4035 §3.1.1), so this is what the same
-    // question costs a deployment that does not sign at all.
+    // DO=0 is an unsigned zone (RFC 4035 §3.1.1): what the question costs a
+    // deployment that does not sign.
     let plain = {
         let mut zones = Zones::default();
         drop(zones.insert(parse_zone_file(ZONE, "example.com.").expect("the zone parses")));
@@ -336,9 +335,8 @@ fn what_a_signed_answer_weighs() {
     }
     println!("the largest signed answer here is {worst} octets");
 
-    // A ZSK rollover publishes two zone keys and signs every RRset with both
-    // (RFC 6781 §4.1.1), so the whole table moves for as long as it runs. The
-    // three rows it moves most are the ones already nearest a ceiling.
+    // A ZSK rollover signs with two keys (RFC 6781 §4.1.1), moving the whole
+    // table while it runs.
     println!();
     println!(
         "{:<42} {:>11} {:>11}",
@@ -357,12 +355,8 @@ fn what_a_signed_answer_weighs() {
         worst = worst.max(after);
     }
 
-    // The one assertion, and it is about the *other* default an operator might
-    // reach for: `--max-udp-response 4096` is "the client's number, bounded",
-    // and it is only that if nothing this zone can answer exceeds it. A row
-    // that grows past 4096 is a row that starts forcing TCP at a setting whose
-    // whole point is not to — file what moved it rather than raising the number
-    // (`CLAUDE.md` §10).
+    // The one assertion: nothing grows past 4096, or `--max-udp-response 4096`
+    // starts forcing TCP. File what moved it (`CLAUDE.md` §10).
     assert!(
         worst <= 4096,
         "the largest answer here is {worst} octets, over the 4096 an operator \

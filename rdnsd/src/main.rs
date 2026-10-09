@@ -101,14 +101,8 @@ fn admission_limits(udp: UdpSizes, max_udp: u16, max_tcp: u16) -> AdmissionLimit
     AdmissionLimits::new(max_udp.max(udp.advertised()) as usize, max_tcp as usize)
 }
 
-// The daemon's defaults, in one place because each is spelled twice: `Cli`
-// takes them through `default_value_t` and the config file's `[server]` and
-// `[signing]` tables through `#[serde(default = "crate::...")]`, and a literal
-// on each side has nothing comparing them.
-//
-// Here and not in `config`, because a flag's default is the daemon's and the
-// file inherits it — and an item private in the crate root is visible to every
-// module under it, which is all `config` needs (`CLAUDE.md` §17).
+// Defaults in one place, which `Cli` and the config file both take; in the
+// crate root, so `config` sees them (`CLAUDE.md` §17).
 
 fn default_host() -> String {
     "0.0.0.0".to_string()
@@ -185,10 +179,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinSet;
 
-// Both macros are re-exported with `pub(crate) use` rather than left to
-// `macro_rules!`'s textual scoping, which would force `mod dispatch;` below
-// this point; `#[macro_export]` would widen them to the crate's public surface
-// instead.
+// Re-exported with `pub(crate) use`: textual scoping would force `mod
+// dispatch;` below here, and `#[macro_export]` would make them public.
 
 /// A peer sent something we could not use: a malformed packet, a truncated TCP
 /// message, a response arriving at a listening socket.
@@ -274,14 +266,11 @@ struct Cli {
     )]
     secondary: Vec<String>,
     /// Ask this server for ZONE's DS before one of ZONE's key-signing keys
-    /// retires: `ZONE@ADDR[:PORT][#KEY][+tls=NAME]`, repeatable, the
-    /// endpoint spelled as for --secondary.
-    ///
-    /// A KSK past its Inactive or Delete time keeps signing and stays
-    /// published until every agent's DS RRset shows an active successor and
-    /// has for the RRset's TTL. The answers are not validated, so reach an
-    /// agent across an untrusted path with #KEY or +tls=: a forged DS can
-    /// make a key retire early, which is the outage this exists to stop.
+    /// retires: `ZONE@ADDR[:PORT][#KEY][+tls=NAME]`, repeatable, as
+    /// --secondary. A retiring KSK keeps signing until every agent's DS RRset
+    /// has shown an active successor for its TTL. Answers are not validated, so
+    /// use #KEY or +tls= across an untrusted path: a forged DS retires a key
+    /// early.
     #[arg(
         long,
         value_name = "ZONE@AGENT[:PORT][#KEY][+tls=NAME]",
@@ -352,14 +341,12 @@ struct Cli {
     /// holding 40 zones would rather serve 39 than none — but as a decision.
     #[arg(long, conflicts_with = "config")]
     allow_partial_load: bool,
-    /// Publish an RFC 9432 catalog zone at NAME listing every zone this
-    /// server is primary for, so a secondary consuming it provisions a new
-    /// zone with no edit of its own. NAME under invalid., or strictly under a
-    /// zone served here as primary (§6).
+    /// Publish an RFC 9432 catalog zone at NAME listing every zone this server
+    /// is primary for. NAME under invalid., or under a primary zone here (§6).
     ///
-    /// Rebuilt on every reload; a zone opts out with `catalog-member = false`
-    /// in its `[zones.*]` table. Served by transfer only, under
-    /// --allow-transfer; ordinary queries under it are REFUSED.
+    /// Rebuilt on every reload; `catalog-member = false` opts a zone out.
+    /// Served by transfer only, under --allow-transfer; queries under it are
+    /// REFUSED.
     #[arg(long, value_name = "NAME", conflicts_with = "config")]
     generate_catalog: Option<String>,
     /// Response bytes per second, per IPv4 /24 or IPv6 /56 a reply goes to.
@@ -377,14 +364,10 @@ struct Cli {
     response_rate: u32,
     /// Largest UDP request accepted, in octets.
     ///
-    /// Floored at the payload size this server advertises it can reassemble
-    /// (RFC 6891 §6.2.4), because that advertisement is a promise: refusing
-    /// under it is how a client that believed us got silence, which is what this
-    /// default being 512 did (`TODO.md` #40f). Raise it for a deployment whose
-    /// signed UPDATEs are large — a 2,048-bit DKIM key rotation weighs 566
-    /// octets with its TSIG, measured in
-    /// `rdns/examples/request_size_probe.rs`. Over the cap is dropped in
-    /// silence, so the effective value is in the startup line.
+    /// Floored at the advertised payload size (RFC 6891 §6.2.4), a promise to
+    /// clients. Raise it for large signed UPDATEs, such as a DKIM key rotation
+    /// (`rdns/examples/request_size_probe.rs`). Over it is dropped silently;
+    /// the startup line shows the value.
     #[arg(
         long,
         value_name = "OCTETS",
@@ -665,16 +648,10 @@ struct Cli {
     transfer_client_ca: Option<PathBuf>,
     /// A client certificate that may transfer, as `name[:zone[,zone]]`.
     ///
-    /// The name is one the certificate carries as a subject alternative name,
-    /// and it is checked by the same code that verified the chain. Without
-    /// zones the holder may transfer every zone this server has, exactly as an
-    /// unscoped --tsig-key may; the startup banner prints what each one is
-    /// allowed, because a wide rule nobody reads is the defect `TODO.md` #16
-    /// was filed for.
-    ///
-    /// Repeat for more clients. Needs --transfer-client-ca: a rule about a
-    /// certificate nothing verifies would be a policy the operator believes is
-    /// in force and is not (`CLAUDE.md` §15).
+    /// The name is a subject alternative name, checked by the code that
+    /// verified the chain. Without zones it may transfer every zone, like an
+    /// unscoped --tsig-key; the startup banner prints each rule. Repeatable.
+    /// Needs --transfer-client-ca (`CLAUDE.md` §15).
     #[arg(
         long,
         value_name = "NAME[:ZONES]",
@@ -693,20 +670,10 @@ struct Cli {
     transfer_tls_only: bool,
     /// Stream every answered request to a dnstap collector.
     ///
-    /// `tcp:<addr:port>` for a collector, `file:<path>` for a capture `dnstap
-    /// -r` reads. The scheme is not optional: a path and an address are both
-    /// plausible bare, and guessing is how an operator gets the other one.
-    ///
-    /// This is the query *stream*, not the query log — the log deliberately
-    /// says nothing per packet above DEBUG, which is why a pipeline needs its
-    /// own output. The queue between the answer path and the sink is bounded
-    /// and drops rather than blocking: `dns_dnstap_dropped_total` is the
-    /// shortfall, and a collector that stops reading must not become an outage.
-    ///
-    /// No Unix socket, which is dnstap's usual transport: `tokio` has no
-    /// `UnixStream` on Windows and a cfg-gated sink is a module that stops
-    /// compiling on one platform behind a green suite. TCP is portable and does
-    /// the same job.
+    /// `tcp:<addr:port>` for a collector, `file:<path>` for a `dnstap -r`
+    /// capture; the scheme is required. The queue to the sink is bounded and
+    /// drops (`dns_dnstap_dropped_total`), so a stalled collector is not an
+    /// outage. No Unix socket: `tokio` has none on Windows.
     #[arg(
         long,
         value_name = "tcp:ADDR:PORT|file:PATH",
@@ -715,14 +682,10 @@ struct Cli {
     dnstap: Option<String>,
     /// Stop writing a dnstap *file* after this many octets. 0 is no limit.
     ///
-    /// A capture file is not rotated and not reopened, so without a bound it is
-    /// a way to fill a disk and take the server down with it. Reaching the
-    /// bound stops the writing, warns once, and counts every further payload as
-    /// dropped. Ignored for a `tcp:` target, where the collector owns the
-    /// storage.
-    ///
-    /// The config file's `server.dnstap-max-bytes` is the same setting, and
-    /// takes its default from the same [`default_dnstap_max_bytes`].
+    /// A capture is not rotated, so the bound protects the disk; past it,
+    /// writing stops, one warning, and the rest count as dropped. Ignored for
+    /// `tcp:`. The config file's `server.dnstap-max-bytes` shares
+    /// [`default_dnstap_max_bytes`].
     #[arg(
         long,
         value_name = "OCTETS",
@@ -738,11 +701,8 @@ struct Cli {
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "config")]
     metrics_listen: Option<String>,
     /// Answer an NSID request (RFC 5001) with this identifier: text, or `0x`
-    /// and hex for raw bytes. Off unless given — RFC 5001 §5 counts what it
-    /// says about the server as "security sensitive".
-    ///
-    /// Only a query that carries an NSID option gets one back, whatever it
-    /// put in it (§2.2).
+    /// and hex. Off unless given, as §5 calls it "security sensitive"; only a
+    /// query carrying the option gets one (§2.2).
     #[arg(long, value_name = "TEXT|0xHEX", conflicts_with = "config")]
     nsid: Option<String>,
     /// Answer `rdnsctl` on this Unix socket, or on Windows this named pipe
@@ -769,25 +729,14 @@ struct Cli {
     service: Option<String>,
     /// Read the settings from a TOML file instead of from flags.
     ///
-    /// Exclusive of the flags it would set: `--config` with `--port` is an
-    /// error, not a precedence rule. Both values are valid, so the failure
-    /// would be silent.
-    ///
-    /// The file can express two things a flag cannot: a TSIG secret in a file of
-    /// its own (so it is in neither `argv` nor the config), and per-zone signing
-    /// settings.
+    /// Exclusive of the flags it would set, so no silent precedence. It can
+    /// also hold a TSIG secret in its own file and per-zone signing settings.
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
     /// Validate the configuration and exit without binding a socket.
     ///
-    /// Reads the config, the TSIG secrets and the signing keys, and checks
-    /// everything knowable without the network. Exit 0 means it would start.
-    ///
-    /// No `requires = "config"`: everything this checks is flag-settable too,
-    /// so the requirement would be inert where it matters — `--zone-file`
-    /// conflicts with `--config`, so clap never enforces it there — and
-    /// misleading where it fires, telling an operator running a flags-only
-    /// server to write a TOML file. `rdnsr`'s `check_config` is the same.
+    /// Reads the config, the TSIG secrets and the signing keys; exit 0 means it
+    /// would start. Works with flags as with `--config`, as `rdnsr`'s does.
     #[arg(long)]
     check_config: bool,
     /// How much to say: error, warn, info, debug or trace.
@@ -926,10 +875,8 @@ async fn serve(
             }
         )
     };
-    // Appended rather than folded in: `--transfer-tls-only` narrows whatever
-    // the line above says, and an operator reading "allowed for 2 address
-    // rule(s)" should not have to know the flag exists to find out that none of
-    // them applies over plain TCP (RFC 9103 §11, `CLAUDE.md` §14).
+    // Appended: `--transfer-tls-only` narrows every rule above, which the
+    // operator should not need to know the flag to learn (`CLAUDE.md` §14).
     let transfers = if transfer_tls_only {
         format!("{transfers}, over TLS 1.3 only (--transfer-tls-only)")
     } else {
@@ -940,9 +887,8 @@ async fn serve(
     } else {
         format!("{response_rate} bytes/s per IPv4 /24 or IPv6 /56")
     };
-    // Printed at startup: over-limit queries are dropped silently — replying to
-    // a spoofed source is what an amplifier does — so the number has to be
-    // visible somewhere else.
+    // Printed: over-limit queries are dropped silently, as a reply to a spoofed
+    // source amplifies.
     let query_limit_note = if query_limit.tokens_per_window == 0 {
         "off".to_string()
     } else {
@@ -977,9 +923,8 @@ async fn serve(
         )
     };
 
-    // Bind everything before announcing anything, so a port conflict fails here
-    // rather than after one transport is up. The metrics listener included: a
-    // typo in `--metrics-listen` must stop the start, not silently disable it.
+    // Bind everything before announcing anything, the metrics listener too, so
+    // a port conflict or a typo stops the start.
     let socket = bind::udp(addr).await?;
     let listening = socket.describe();
     let socket = Arc::new(socket.socket);
@@ -1001,10 +946,8 @@ async fn serve(
         None => None,
     };
 
-    // Before the sockets, with the other things that must fail at startup: a
-    // collector that is not listening, or a capture path that cannot be
-    // written, is a misconfiguration and not a stream that quietly never
-    // appears (`CLAUDE.md` §4).
+    // Before the sockets: an unreachable collector or unwritable capture is a
+    // misconfiguration, not a stream that never appears (`CLAUDE.md` §4).
     let dnstap = match &dnstap {
         Some((target, max_bytes)) => Some(
             rdns_transport::dnstap::Sink::spawn(
@@ -1094,9 +1037,8 @@ async fn serve(
         );
     }
 
-    // Not in the `JoinSet` below: that set's rule is "the first task to end ends
-    // the process", and this one ends on the stop signal by design. Joined after
-    // the drain instead, so it is not a detached task (`CLAUDE.md` §9).
+    // Outside the `JoinSet`, as it ends on the stop signal by design; joined
+    // after the drain, so not detached (`CLAUDE.md` §9).
     let anomalies = tokio::spawn(watch_anomalies(
         server.ctx().logger.clone(),
         anomaly_thresholds,
@@ -1104,13 +1046,11 @@ async fn serve(
         shutdown.stop_handle(),
     ));
 
-    // `JoinSet`, not two `JoinHandle`s in a `select!`: dropping a `JoinHandle`
-    // detaches the task rather than cancelling it. `join_next` is cancel-safe
-    // and leaves both tasks owned.
+    // `JoinSet`, not `JoinHandle`s in a `select!`: dropping a handle detaches
+    // its task, and `join_next` is cancel-safe.
     let mut loops = JoinSet::new();
-    // Workers are peers: each receives from the shared socket and answers
-    // inline, so the first to stop for a reason other than the signal ends the
-    // process, as for the accept loops.
+    // Workers are peers on one socket, so the first to stop for any reason but
+    // the signal ends the process.
     for _ in 0..udp_workers {
         loops.spawn(udp_loop(
             socket.clone(),
@@ -1166,10 +1106,8 @@ async fn serve(
         ));
     }
 
-    // Whichever listener ends first ends the process: answering on one transport
-    // and not the other is worse than being plainly down. The drain then waits
-    // for an AXFR already on the wire, which a client cannot tell from a
-    // complete one if it is cut.
+    // The first listener to end ends the process; the drain waits for an AXFR
+    // on the wire, which a client cannot tell from a complete one if cut.
     rdns_transport::serve_until_stopped(loops, anomalies, shutdown).await
 }
 
@@ -1184,15 +1122,9 @@ fn absolute_name(name: &str) -> std::borrow::Cow<'_, str> {
 /// Receive datagrams and answer them, as one of `--udp-workers` identical tasks
 /// sharing the socket.
 ///
-/// No task per datagram: a fixed pool bounds concurrency before the packet is
-/// copied, and the overflow queues in the socket receive buffer where the kernel
-/// drops and counts it. A spawn per datagram cost 1,536 bytes, 46% of everything
-/// a query allocated. Costs one 64 KB receive buffer per worker — see
-/// [`default_udp_workers`].
-///
-/// This loop must not block: a worker stuck here is a worker not receiving.
-///
-/// A panic while answering ends the worker, and `serve` then ends the process.
+/// A fixed pool bounds concurrency before the copy, and the kernel drops and
+/// counts the overflow; one 64 KB buffer per worker ([`default_udp_workers`]).
+/// This loop must not block. A panic ends the worker, then the process.
 async fn udp_loop(
     socket: Arc<UdpSocket>,
     server: Arc<Server>,
@@ -1215,15 +1147,12 @@ async fn udp_loop(
             Err(e) => return Err(e),
         };
         let packet = &buf[..size];
-        // Canonical for every check and record (`TODO.md` #158); the reply
-        // goes to `from`, which on a dual-stack socket is the mapped form the
-        // socket can send to.
+        // Canonical for every check and record; the reply goes to `from`, the
+        // form a dual-stack socket sends to.
         let peer = rdns::peer::canonical(from);
 
-        // One clock read per datagram, shared by the limiter, the logger, the
-        // TSIG check and the response budget, where one each costs 24-26 ns a
-        // call (`TODO.md` #28a). Through `ctx`, because a `Clock::fixed` that
-        // reaches only the accept loops reaches nothing a UDP query touches.
+        // One clock read per datagram, for limiter, logger, TSIG and response
+        // budget, through `ctx` so a test's `Clock::fixed` reaches UDP too.
         let now = server.ctx().clock.now();
 
         // Both are decisions to do nothing, so they run on `&buf[..size]` with
@@ -1238,9 +1167,8 @@ async fn udp_loop(
             continue;
         }
 
-        // Claims the drain until this answer is on the wire and no longer: a
-        // claim held across the loop would keep the drain open for the whole
-        // budget.
+        // Claims the drain for this answer only; held across the loop it would
+        // keep the drain open.
         let _busy = busy.clone();
         server
             .answer(
@@ -1254,16 +1182,10 @@ async fn udp_loop(
     }
 }
 
-/// What one UDP worker reuses from datagram to datagram.
+/// What one UDP worker reuses from datagram to datagram: the reply buffer,
+/// sized to the largest EDNS payload asked, and the name compressor.
 ///
-/// Per-message state that a task-per-datagram server pays for every time and a
-/// fixed pool pays for once: the reply buffer, which settles at the largest
-/// EDNS payload size this worker has been asked for, and the name compressor,
-/// whose two allocations are per message (`TODO.md` #27b). No folded lookup
-/// key: the folds are on the stack.
-///
-/// One struct because they are one thing — the scratch space — and because
-/// more parameters on `answer_datagram` is what clippy's argument limit is for
+/// One struct, as they are one scratch space and clippy limits arguments
 /// (`CLAUDE.md` §14).
 #[derive(Default)]
 struct Scratch {
@@ -1281,14 +1203,12 @@ struct Scratch {
 struct Reloading {
     replicating: bool,
     allow_partial: bool,
-    /// The zones we replicate, and the directory their state sidecar lives in.
-    /// A reload re-reads every `.zone` file from disk, so it can resurrect a zone
-    /// that was withdrawn for EXPIRE — these are what let it be withdrawn again.
+    /// The zones we replicate, and the directory their state sidecar lives in,
+    /// so a reload cannot resurrect a zone withdrawn for EXPIRE.
     ///
-    /// The live registry rather than the `--secondary` specs: a catalog's
-    /// members are replicated zones whose files are in the same directory, and
-    /// a list fixed at startup would let a reload serve one of those with AA
-    /// set however long its master had been unreachable.
+    /// The live registry, not the `--secondary` specs: catalog members share
+    /// the directory, and a list fixed at startup would serve one with AA
+    /// however stale.
     secondaries: Arc<Secondaries>,
     zone_dir: Option<PathBuf>,
     signing: Option<Arc<ZoneSigning>>,
@@ -1312,14 +1232,9 @@ impl Reloading {
     /// Read the zones again and put them through signing and checking, or say
     /// why not.
     ///
-    /// Nothing is installed unless the whole set comes through: a reload that
-    /// replaced half the zones and gave up would serve a mixture of two
-    /// versions, and the half that failed is the half needing attention.
-    ///
-    /// On a blocking thread, all of it. Every step blocks — `read_dir`, a parse
-    /// per zone, an ECDSA signing run over every RRset of every signed zone,
-    /// then verification — and both callers run while the listeners are live, so
-    /// on the runtime this is a worker out of service with queries behind it.
+    /// All or nothing: half a reload would serve two versions. All of it on a
+    /// blocking thread: read, parse, sign and verify each block, and the
+    /// listeners are live.
     async fn load(&self, source: &ZoneSource, previous: Option<ZoneMap>) -> Result<ZoneMap> {
         let reloading = self.clone();
         let source = source.clone();
@@ -1330,14 +1245,11 @@ impl Reloading {
 
     /// The blocking half of [`Reloading::load`], and named so at the call site.
     fn load_blocking(&self, source: &ZoneSource, previous: Option<&ZoneMap>) -> Result<ZoneMap> {
-        // One moment for the whole reload: `Keepable` decides whether a zone's
-        // key roles have moved and `apply` signs with the answer, so a key
-        // crossing its Activate between two reads would be a reload that
-        // silently declined to act on it.
+        // One moment for the whole reload, so a key crossing its Activate
+        // between two reads cannot be silently declined.
         let signed_at = rdns::clock::current_unix_timestamp();
-        // An empty map when the re-signing timer is the caller, which carries
-        // nothing forward and so may keep nothing — but still records what it
-        // read, or the SIGHUP after a tick re-parses everything.
+        // Empty when the re-signing timer calls: nothing kept, but what it read
+        // is recorded, or the next SIGHUP re-parses everything.
         let nothing = ZoneMap::new();
         let keep = Keepable {
             files: &self.files,
@@ -1467,15 +1379,8 @@ async fn reload_once(
     let why = trigger.why();
     // Rotation: a log file moved away is followed from here (`TODO.md` #190).
     rdns_transport::logging::reopen();
-    // Before the zones, and independent of whether they load. This is the one
-    // function SIGHUP, `rdnsctl reload` and the re-signing timer all pass
-    // through, which is why the certificate renewal story is a reload and not a
-    // restart (`TODO.md` #42a): `certbot --deploy-hook 'rdnsctl reload'`.
-    //
-    // A failure here is a warning and nothing more. `CertificateStore::reload`
-    // keeps the certificate it is already serving, so half a renewal costs a
-    // log line rather than the listener — and the zones, which have nothing to
-    // do with it, still reload.
+    // Every reload path passes here, so a certificate renewal is `rdnsctl
+    // reload`; a failure warns and the old certificate stays.
     if let Some(store) = tls {
         match store.reload() {
             Ok(()) => tracing::info!("TLS certificate re-read ({why})"),
@@ -1492,39 +1397,31 @@ async fn reload_once(
     let (announced, outcome) = match reloading.load(source, previous).await {
         Ok(new_zones) => {
             let loaded = new_zones.len();
-            // A reload is a version step like any other: the difference from
-            // what we were serving is what an IXFR will answer with, and this is
-            // the only moment both versions exist.
+            // A reload is a version step: the difference is what an IXFR
+            // answers, and only now do both versions exist.
             install_all_zones(served, new_zones).await;
-            // A reload re-reads the files, so a zone withdrawn for EXPIRE is
-            // back in the map at this point. Judge it again before anything is
-            // announced or answered.
+            // The files bring back a zone withdrawn for EXPIRE; judge it again
+            // before anything is announced or answered.
             reloading.withdraw_unvouched(served).await;
             tracing::info!("zones reloaded ({why})");
-            // The point of reloading is that something changed — new data, or at
-            // minimum new signatures and a new serial — so this is exactly when a
-            // secondary wants to hear about it.
+            // Something changed, new data or at least new signatures and
+            // serial, so the secondaries hear of it.
             (
                 crate::notify_out::announce_zones(&served.zone_map, &announced, notify, busy).await,
                 Ok(loaded),
             )
         }
         Err(e) => {
-            // The zones already loaded keep answering. A reload that failed is a
-            // file that changed for the worse, and the version in memory is the
-            // last one known good.
+            // The loaded zones keep answering: the version in memory is the
+            // last known good.
             tracing::error!("failed to reload zones ({why}): {e}");
-            // `{e:#}` rather than `{e}`: `anyhow`'s `Display` prints only the
-            // outermost context, and the operator holding the terminal wants
-            // the whole chain — "the zone-loading task: example.com.zone:12:
-            // ..." — not just its first clause. The log line above keeps the
-            // short form because a log line is scanned rather than read.
+            // `{e:#}` for the requester: the whole `anyhow` chain, where the
+            // log line keeps the outermost context.
             (announced, Err(format!("{e:#}")))
         }
     };
-    // Whoever asked hears how it went. A dropped receiver is an `rdnsctl` that
-    // gave up waiting, which is not this task's problem — the reload happened
-    // either way and the log has it.
+    // A dropped receiver is an `rdnsctl` that gave up; the reload happened and
+    // the log has it.
     if let ReloadTrigger::Control(reply) = trigger {
         let _ = reply.send(outcome);
     }
@@ -1534,37 +1431,26 @@ async fn reload_once(
 /// Keep the zones current: reload on SIGHUP or on the control socket, and
 /// re-sign on a timer.
 ///
-/// One task. The re-signing timer works by *reloading* (see
-/// [`ZoneSigning::resign_interval`]), so it and SIGHUP are the same operation on
-/// two triggers, and `rdnsctl reload` is a third. Two tasks would mean two
-/// reloads running at once, each installing a different snapshot of the files
-/// and holding its own idea of which serials have been announced.
-///
-/// It holds a [`Busy`] and exits on [`Stop`]: a reload part-way through
-/// installing zones is work the drain should wait for, and a task that never
-/// exits while holding a `Busy` spends the whole budget every shutdown.
+/// One task: re-signing is a reload ([`ZoneSigning::resign_interval`]), and two
+/// tasks would install different snapshots concurrently. It holds a [`Busy`]
+/// and exits on [`Stop`], so the drain waits for an install.
 fn spawn_zone_maintenance(
     ctx: ReloadContext,
     announced: Vec<(Name, Serial)>,
     lifecycle: Lifecycle,
 ) -> mpsc::Sender<ReloadTrigger> {
     let Lifecycle { stop, busy } = lifecycle;
-    // `None` when nothing is signed: a server with no keys has nothing to
-    // re-sign, and a timer that fired anyway would reload the zones on a
-    // schedule nobody asked for.
+    // `None` when nothing is signed, so no timer reloads on a schedule nobody
+    // asked for.
     if let Some(signing) = ctx.reloading.signing.as_ref() {
         tracing::info!("{}", signing.resign_interval());
     }
 
-    // Depth 1: a reload is the whole zone set, so a queue of them is a queue of
-    // identical work. The second `rdnsctl reload` to arrive while one is running
-    // waits for a slot rather than being dropped, and there is nothing to gain
-    // from letting a third pile up behind it.
+    // Depth 1: a reload is the whole set, so a second request waits for the
+    // slot and a third has nothing to add.
     let (requests, mut receiver) = mpsc::channel(1);
-    // The task keeps a sender of its own, so `recv` parks forever when nothing
-    // is asking rather than returning `None` the moment the control socket is
-    // not configured. A `None` branch here would be a busy loop or a dead arm,
-    // and neither is worth having when one clone removes the question.
+    // A sender of its own keeps `recv` parked rather than returning `None` when
+    // there is no control socket.
     let keepalive = requests.clone();
 
     tokio::spawn(async move {
@@ -1573,14 +1459,8 @@ fn spawn_zone_maintenance(
         let mut announced = announced;
         let mut signals = reload_signal();
         loop {
-            // Whichever comes first. A trigger that arrives during shutdown is
-            // ignored: reloading zones we are about to stop serving is work for
-            // nobody.
-            //
-            // `recv` on the request channel is cancel-safe, so losing this race
-            // leaves the request queued rather than dropping it — and a request
-            // that loses to the stop is one whose sender is about to be told the
-            // server stopped, which is true.
+            // Ignored during shutdown. `recv` is cancel-safe: a request losing
+            // to the stop stays queued, and its sender learns of the stop.
             let trigger = tokio::select! {
                 reloaded = next_reload(&mut signals) => {
                     if !reloaded {
@@ -1591,10 +1471,8 @@ fn spawn_zone_maintenance(
                 // `None` is unreachable while `_keepalive` is alive, and it is
                 // alive for exactly as long as this loop.
                 Some(trigger) = receiver.recv() => trigger,
-                // Asked each time round rather than once at startup: the
-                // interval follows the nearest key rollover step when one is
-                // closer than the ordinary tick, and that moment moves as the
-                // steps are taken.
+                // Asked each time: the interval follows the nearest key
+                // rollover step, which moves as steps are taken.
                 _ = sleep_for(ctx.reloading.signing.as_ref().map(|s| s.resign_interval().every))
                     => ReloadTrigger::Timer,
                 _ = stop.wait() => break,
@@ -1634,22 +1512,17 @@ fn main() -> std::process::ExitCode {
 }
 
 async fn serve_main(mut cli: Cli) -> Result<()> {
-    // Held to the end of `main`, because the profiler writes `dhat-heap.json`
-    // on `Drop` — a daemon that never returns from `main` never writes one at
-    // all, which is why this item waited on graceful shutdown. Binding it in
-    // `serve` instead would drop it before the drain and report short.
+    // Held to the end of `main`: the profiler writes `dhat-heap.json` on
+    // `Drop`, and binding it in `serve` would drop it before the drain.
     #[cfg(feature = "dhat-heap")]
     let _dhat = dhat::Profiler::new_heap();
 
-    // The first thing, so `status`'s uptime covers the zone load rather than
-    // starting once the sockets are bound. On a server with forty signed zones
-    // the load *is* the start.
+    // First, so `status`'s uptime covers the zone load, which on a signed
+    // server is the start.
     let started = Instant::now();
 
-    // A config file supplies the same settings the flags do, plus the two things
-    // a flag cannot express — a secret in its own file, and per-zone settings.
-    // It *replaces* the flags rather than layering over them; see `config` for
-    // why that is an error rather than a precedence rule.
+    // The file replaces the flags rather than layering over them; `config` says
+    // why.
     let per_zone = match cli.config.clone() {
         Some(path) => {
             let config = config::Config::load(&path)?;
@@ -1660,9 +1533,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         None => config::PerZone::default(),
     };
     let cli = cli;
-    // As early as the config allows: the file may name the log file. `--quiet`
-    // is the same as `--log-level error`; clap refuses the two together, so
-    // this is a rename and not a precedence rule (`CLAUDE.md` §15).
+    // Early, as the file may name the log file. clap refuses `--quiet` with
+    // `--log-level`, so this is a rename (`CLAUDE.md` §15).
     rdns_transport::logging::init(
         if cli.quiet {
             LogLevel::Error
@@ -1705,23 +1577,18 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         rdns_transport::control::check(path)?;
     }
 
-    // Created here rather than in `serve`, because the things that need to be
-    // drained start before the listeners do: the startup NOTIFY burst, and every
-    // secondary's refresh task. A `Shutdown` created at the point the sockets
-    // bind would leave both of those outside the only mechanism that waits for
-    // them.
+    // Here, not in `serve`: the startup NOTIFY burst and every refresh task
+    // start before the listeners, and the drain must wait for them.
     let shutdown = Shutdown::new();
-    // Created here for the same reason as `shutdown`: the facts it records —
-    // which serial is served, when a zone last transferred — start being true
-    // before the listeners exist, at the initial zone load.
+    // Here for the same reason: served serials and transfer times are true from
+    // the initial load.
     let metrics = Arc::new(DnsMetrics::new());
     // A typo in either list stops the server rather than quietly narrowing it —
     // or, worse, being read as something wider.
     let transfer_acl = TransferAcl::parse(&cli.allow_transfer)?;
     let tsig_keys = TsigKeyring::parse(&cli.tsig_key)?;
-    // The incoming half of RFC 9103 §7.5: anchors for a *client's*
-    // certificate. Read here because the encrypted listeners below are built
-    // with them.
+    // The incoming half of RFC 9103 §7.5: anchors for a client's certificate,
+    // which the encrypted listeners are built with.
     let client_anchors = match &cli.transfer_client_ca {
         Some(path) => Some(rdns::tls_identity::TrustAnchors::from_ca_file(
             path,
@@ -1729,9 +1596,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         )?),
         None => None,
     };
-    // Loaded before anything binds, like every other thing that can stop the
-    // start. A certificate that will not read is a DoT listener that answers
-    // nothing, which is the failure `--metrics-listen` is already refused for.
+    // Before anything binds: a certificate that will not read is a DoT listener
+    // that answers nothing.
     let encrypted = Encrypted::configure(
         EncryptedFlags {
             tls_listen: cli.tls_listen.as_deref(),
@@ -1743,11 +1609,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         },
         client_anchors,
     )?;
-    // A transfer arrives on a connection, and if none of them can be encrypted
-    // then this refuses every transfer there will ever be. That is a
-    // configuration that cannot do what it says, so it is a startup error and
-    // not a server that answers REFUSED to its own secondaries all night
-    // (`CLAUDE.md` §15).
+    // With no encrypted listener this refuses every transfer, so it is a
+    // startup error (`CLAUDE.md` §15).
     if cli.transfer_tls_only && encrypted.is_none() {
         return Err(anyhow!(
             "--transfer-tls-only needs a listener a transfer can arrive on: \
@@ -1762,9 +1625,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         &per_zone.notify,
         &tsig_keys,
     )?);
-    // Said out loud for the reason the transfer policy is: whether a NOTIFY is
-    // signed decides whether a secondary with a keyed notify ACL will act on it,
-    // and the failure is otherwise a zone that is quietly hours stale (#46).
+    // Said out loud: whether a NOTIFY is signed decides whether a keyed notify
+    // ACL acts on it.
     if !notify.is_empty() {
         tracing::info!("notifying {}", notify.describe());
     }
@@ -1778,9 +1640,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
             "--max-connections-per-source-exempt",
         )?,
     );
-    // Above the dry run, as every setting is (`CLAUDE.md` §15). Leaked once:
-    // it is read on every reply for the life of the process, and `'static`
-    // keeps `ServerOpt` `Copy`.
+    // Above the dry run (`CLAUDE.md` §15). Leaked once: read on every reply,
+    // and `'static` keeps `ServerOpt` `Copy`.
     let nsid: Option<&'static [u8]> = cli
         .nsid
         .as_deref()
@@ -1789,15 +1650,11 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         .map(|bytes| &*Box::leak(bytes.into_boxed_slice()));
 
     let mut secondary_specs = parse_secondary_specs(&cli.secondary)?;
-    // A catalog is replicated by the same machinery as any other zone
-    // (RFC 9432 §5.1), so it joins the list rather than growing a second one:
-    // the refresh timers, the NOTIFY handling, the EXPIRE withdrawal and the
-    // file on disk are then the ones that are already tested.
+    // A catalog replicates like any zone (RFC 9432 §5.1), so it joins the list
+    // and reuses the tested timers, NOTIFY, EXPIRE and file handling.
     let catalog_specs = parse_catalog_specs(&cli.catalog)?;
-    // Here rather than where the refresh tasks start, which is after
-    // `--check-config` has already answered: a dry run has to run everything
-    // that does not bind a socket (`CLAUDE.md` §15), and a spec naming a key no
-    // `--tsig-key` defines is a startup failure either way.
+    // Here, above the dry run: a spec naming an undefined key fails the start
+    // either way (`CLAUDE.md` §15).
     for spec in secondary_specs.iter() {
         resolve_key(spec, &tsig_keys, "--secondary")?;
     }
@@ -1806,13 +1663,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
     }
     secondary_specs.extend(catalog_specs.iter().cloned());
 
-    // The anchors every XoT master is checked against, and the check that a
-    // spec asking for TLS has somewhere to check against. Here, with the key
-    // resolution above and for the same reason: `--check-config` has to reach
-    // it, and "no anchors" is a startup failure rather than a transfer that
-    // goes out in clear months later (`CLAUDE.md` §4).
-    // Both or neither: clap's `requires` says so for the flags, and the config
-    // file has no equivalent, so `Config::check` says it there.
+    // The outgoing XoT identity and anchors, here so `--check-config` reaches
+    // them. Both or neither: `Config::check` says so for the file.
     let transfer_identity = match (&cli.transfer_tls_cert, &cli.transfer_tls_key) {
         (Some(cert), Some(key)) => Some(TlsIdentity::from_files(
             cert,
@@ -1839,13 +1691,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         Some(path) => Some(TlsClientTrust::from_ca_file(path, transfer_identity)?),
         None => None,
     };
-    // What the outgoing half of RFC 9103 is configured to do, where the two
-    // facts an operator cannot otherwise see are the anchor count and whether a
-    // client certificate is loaded. A certificate is offered only when a master
-    // sends a CertificateRequest, so "mTLS is in force" is not a claim this end
-    // can make; what it can say is what it holds (`CLAUDE.md` §4). This is also
-    // `TlsClientTrust::anchor_count`'s first caller — it was written for a banner
-    // that was never added (`CLAUDE.md` §18).
+    // The outgoing half of RFC 9103: anchor count and whether a client
+    // certificate is held, which is all this end can claim about mTLS.
     if let Some(xot) = &xot {
         tracing::info!(
             "zone transfers fetched over TLS: {} trust anchor(s), client certificate {}",
@@ -1857,10 +1704,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
             }
         );
     }
-    // The incoming half of §7.5: the list of which client may take which zone.
-    // Read here with everything else a dry run has to reach, and refused, with
-    // the anchors, without a listener a transfer can arrive on — a policy that
-    // cannot act is one the operator believes is in force (`CLAUDE.md` §15).
+    // The incoming half of §7.5: which client may take which zone, refused
+    // without a listener to arrive on (`CLAUDE.md` §15).
     let transfer_clients = TransferCertificates::parse(&cli.allow_transfer_cert)?;
     if cli.transfer_client_ca.is_some() && encrypted.is_none() {
         return Err(anyhow!(
@@ -1870,9 +1715,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         ));
     }
     if let Some(anchors) = encrypted.as_ref().and_then(Encrypted::clients) {
-        // What the incoming half is configured to do, and what each client may
-        // take. An unscoped rule transfers everything, so it is printed rather
-        // than left to be discovered (`CLAUDE.md` §14, §16).
+        // Printed: an unscoped rule transfers everything (`CLAUDE.md` §14,
+        // §16).
         tracing::info!(
             "zone transfers accepted over mTLS: {} trust anchor(s), {} client(s) listed",
             anchors.len(),
@@ -1912,9 +1756,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
     // Read before the source is taken apart, which consumes the two path
     // fields.
     let mut signing = ZoneSigning::load(&cli, &per_zone.signing)?;
-    // Before the first signing run: unknown is hold, so a key past its
-    // retirement time keeps signing until the parent has been asked
-    // (`TODO.md` #180).
+    // Before the first signing run: unknown is hold, so a retiring key signs
+    // until the parent has been asked.
     let parental_agents = parental::parse_agents(&cli.parental_agent, &tsig_keys, xot.as_ref())?;
     let gated: Vec<Name> = parental_agents.keys().cloned().collect();
     let parental = parental::ParentalGate::new(parental_agents, |origin| {
@@ -1930,9 +1773,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
     let source = if per_zone.files.is_empty() {
         validate_zone_source(cli.zone_file, cli.zone_dir, replicating)?
     } else {
-        // Zones that named their own files. `Config::apply` has already refused
-        // this combined with `zone-dir`, and `Config::check` has refused a
-        // secondary zone with no directory to write to.
+        // Zones naming their own files; `Config::apply` and `Config::check`
+        // refused the combinations that cannot work.
         for path in per_zone.files.values() {
             if !Path::new(path).exists() {
                 return Err(anyhow!("Zone file not found: {path}"));
@@ -1946,13 +1788,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
                 .collect(),
         )
     };
-    // Blocking, and deliberately left on this thread: startup has no listeners
-    // bound yet and nothing to answer, so there is no worker to take out of
-    // service. The reload path is the one that needs `spawn_blocking`.
-    //
-    // Nothing is being served, so nothing can be kept; what the pass is for is
-    // the digests, which is what lets the *first* SIGHUP skip a file nobody
-    // touched rather than the second (`TODO.md` #64f).
+    // Blocking on this thread: nothing is bound yet. Nothing can be kept; the
+    // pass records digests so the first SIGHUP skips untouched files.
     let files = LoadedFiles::default();
     let nothing = ZoneMap::new();
     let proved = ProvenSigning::default();
@@ -1971,9 +1808,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
     )?
     .zones;
 
-    // Signing happens between loading and serving, and so does checking the
-    // result: verifying what we just produced is what catches a canonicalization
-    // bug here rather than at every validator on the internet.
+    // Verify what was just signed, so a canonicalization bug is caught here,
+    // not at every validator.
     let run = match &signing {
         // Startup: nothing is being served, so there is nothing to carry
         // forward from (`ZoneSigning::apply`).
@@ -2025,9 +1861,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         ));
     }
 
-    // Parsed here and not in `serve`'s argument list: an argument expression is
-    // evaluated below the dry-run exit, where a bad value is accepted by
-    // `--check-config` and refused by the real start (`CLAUDE.md` §15).
+    // Parsed here, not in `serve`'s arguments, which run below the dry-run exit
+    // (`CLAUDE.md` §15).
     let dnstap = match &cli.dnstap {
         Some(spec) => Some((
             spec.parse::<rdns_transport::dnstap::Target>()?,
@@ -2036,27 +1871,17 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         None => None,
     };
 
-    // The dry run exits here, and *here* specifically: everything above is
-    // everything that can be known without touching the network. The config
-    // parsed, the TSIG secrets were read and their permissions checked, the ACLs
-    // and master specs parsed, every zone file loaded and was signed, and every
-    // signature verified. What is left is binding sockets and starting timers.
-    //
-    // A shallower check — parse the TOML and stop — would pass for the failures
-    // that actually break a deploy: a zone with a typo in it, a key file that got
-    // chmodded, a zone whose signatures do not verify.
+    // The dry run exits here: everything above is knowable without the network,
+    // including every zone loaded, signed and verified; what is left binds.
     if cli.check_config {
-        // `println!`, not `tracing`: this is `--check-config`'s answer on
-        // stdout, not a log line. A deploy script reads it, and `--quiet` must
-        // not be able to take away the output of a command whose entire job is
-        // to produce it.
+        // `println!`: the answer goes to stdout for a deploy script, and
+        // `--quiet` must not hide it.
         println!(
             "configuration is valid: {} zone(s){}, {} TSIG key(s), signing {}, listening on {}, \
              encrypted transports {}, NSID {}",
             zones.len(),
-            // Said out loud because the member zones are not among the count
-            // above: they arrive with the catalog, and what a dry run can check
-            // is that the catalog itself is configured and its key resolves.
+            // Said because members are not in the count: they arrive with the
+            // catalog.
             match catalog_specs.len() {
                 0 => String::new(),
                 n => format!(", {n} catalog(s) to consume"),
@@ -2072,10 +1897,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
                 let addr = format!("{}:{}", cli.host, cli.port);
                 bind::planned(&addr).unwrap_or(addr)
             },
-            // Named because the certificate was read, permission-checked and
-            // matched against its key above — a dry run has to run everything
-            // that does not bind a socket (`CLAUDE.md` §15), and saying nothing
-            // about it would leave an operator unable to tell whether it did.
+            // Named because the certificate was read and checked above, so the
+            // dry run says it did (`CLAUDE.md` §15).
             match &encrypted {
                 None => "disabled".to_string(),
                 Some(encrypted) => format!("on {}, certificate loads", encrypted.listeners()),
@@ -2090,16 +1913,11 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
 
     note_serials(&metrics, &zones);
     let zone_map = Arc::new(RwLock::new(Zones::new(zones)));
-    // Empty at startup by design: the deltas are between versions *this process*
-    // has held, and a zone read from disk has no previous version here. Every
-    // secondary asking for an increment across a restart gets a full transfer
-    // instead, which RFC 1995 §4 permits unconditionally and which corrects
-    // itself at the next change. See `docs/architecture/ixfr.md`.
+    // Empty at startup: no previous version exists in this process, so an
+    // increment across a restart is a full transfer (RFC 1995 §4).
     let deltas = Arc::new(RwLock::new(DeltaLog::new()));
-    // Where those steps are persisted, so the paragraph above stops being true
-    // across a restart. Only a directory-shaped source has somewhere to put it:
-    // `--zone-file` names one file and writing a journal beside it would put a
-    // file into a directory the operator did not give us.
+    // The journal persists the steps across restarts, with a directory source
+    // only: `--zone-file` gives no directory to write into.
     let journal = match &source {
         ZoneSource::Directory(dir) => Some(Arc::new(Journal::new(PathBuf::from(dir)))),
         ZoneSource::SingleFile(_) | ZoneSource::Files(_) => None,
@@ -2113,27 +1931,21 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
     };
     if let Some(journal) = &journal {
         restore_journals(journal, &zone_map, &deltas).await;
-        // A separate walk because it is a separate question: the restore asks
-        // what each zone's journal says, this asks which journals are no zone's
+        // A separate walk for a separate question: journals that are no zone's
         // (`CLAUDE.md` §4).
         discard_orphan_journals(journal, &zone_map).await;
     }
     let addr = format!("{}:{}", cli.host, cli.port);
 
-    // Before anything is served: a replicated zone whose copy on disk went out
-    // of contact past its EXPIRE is not ours to answer for, however recently the
-    // process started.
+    // Before anything is served: a replicated copy past its EXPIRE is not ours
+    // to answer for.
     let mut reload_zone_dir: Option<PathBuf> = None;
-    // Filled in below for a secondary. A primary's is empty and it is ready as
-    // soon as it is alive: every zone it serves was loaded, signed and verified
-    // above, and a failure in any of that stopped the start rather than reaching
-    // here.
+    // Filled in below for a secondary. A primary is ready once alive: every
+    // zone loaded, signed and verified, or the start failed.
     let mut readiness = Readiness::ready();
     let secondaries = Arc::new(Secondaries::default());
-    // Hoisted out of the block below so the control socket can report what each
-    // catalog holds. A server with no `--secondary` and no `--catalog` never
-    // enters that block, and this stays the empty consumer — which
-    // `rdnsctl catalog` answers as "this server consumes no catalogs".
+    // Hoisted so the control socket can report catalogs; without `--secondary`
+    // or `--catalog` it stays the empty consumer.
     let mut control_catalogs: Option<Arc<Catalogs>> = None;
     if !secondary_specs.is_empty() {
         let ZoneSource::Directory(dir) = &source else {
@@ -2145,11 +1957,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         withdraw_unvouched_zones(&secondary_specs, &served, &zone_dir).await;
         reload_zone_dir = Some(zone_dir.clone());
 
-        // What we are configured to answer for but do not hold — asked *after*
-        // the withdrawal above, because a zone read off disk whose age cannot be
-        // vouched for has just stopped being served and is exactly what this has
-        // to wait for. Built before the refresh tasks start, so an arrival can
-        // never be reported to a `Readiness` that does not exist yet.
+        // What we answer for but do not hold, asked after the withdrawal above
+        // and built before the refresh tasks can report an arrival.
         readiness = {
             let zones = zone_map.read().await;
             Readiness::waiting_for(
@@ -2160,9 +1969,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
             )
         };
 
-        // What a catalog may not take over (RFC 9432 §5.2): the zones the
-        // configuration names, and the zones already on disk that no catalog
-        // says are its.
+        // What a catalog may not take over (RFC 9432 §5.2): configured zones
+        // and zones on disk no catalog claims.
         let held: Vec<Name> = {
             let zones = zone_map.read().await;
             zones.keys().map(|key| key.as_name().to_owned()).collect()
@@ -2191,9 +1999,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
             xot: xot.clone(),
             clock: Clock::system(),
         };
-        // Before the tasks start and before anything is served: the members a
-        // previous run provisioned are on disk too, and their refresh tasks do
-        // not exist until their catalog is reconciled below.
+        // Before the tasks and serving: members from a previous run are on
+        // disk, and their tasks start only once their catalog is reconciled.
         catalogs.vouch_for_members(&replication).await;
 
         spawn_secondaries(
@@ -2204,10 +2011,8 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
             &secondaries,
         )?;
 
-        // The members of every catalog we already hold a copy of. A reload does
-        // not repeat this: a catalog reaches a consumer by transfer, and the
-        // refresh task reconciles what it installs, so the only thing a SIGHUP
-        // re-reads is the file that transfer wrote.
+        // The members of every catalog held. A reload does not repeat this: the
+        // refresh task reconciles what each transfer installs.
         for zone in catalogs.zones() {
             catalogs
                 .reconcile(zone.as_ref(), &replication, &shutdown.lifecycle())
@@ -2233,18 +2038,14 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
     // this runs at startup and not only on reload.
     let announced = notify_out::announce_zones(&zone_map, &[], &notify, &shutdown.busy()).await;
 
-    // What a dynamic UPDATE needs, taken before `source` and `signing` are moved
-    // into the maintenance task. It holds the same two things that task does, on
-    // purpose: an UPDATE is a zone-file edit followed by the load path, so it has
-    // to read and sign exactly the way a reload does or the two will disagree
-    // about what the zone is.
+    // Taken before `source` and `signing` move into the maintenance task: an
+    // UPDATE must read and sign exactly as a reload does.
     let updates = UpdateHandling::new(source.clone(), signing.clone(), Arc::clone(&validator));
 
-    // Reload on SIGHUP or on the control socket, and re-sign on the signature
-    // timer. The sender it hands back is how `rdnsctl reload` reaches the same
-    // loop rather than becoming a second implementation of a reload.
     let udp = UdpSizes::new(cli.udp_payload_size, cli.max_udp_response);
 
+    // Reload and re-sign in one loop; the sender it returns is how
+    // `rdnsctl reload` reaches it.
     let reloads = spawn_zone_maintenance(
         ReloadContext {
             reloading: Reloading {
@@ -2405,11 +2206,8 @@ fn generate_keys(zone: &str, dir: &Path, algorithm: &str) -> Result<()> {
         "\nUntil it is published, {zone} is signed but insecure: a validator has no way to \
          reach these keys."
     );
-    // The second half of the same operator task, which nothing else names: a
-    // parent that polls CDS does not need the paste, and the only way to ask it
-    // to is a field in the key file (RFC 7344, `TODO.md` #55). Said here
-    // because this is the one command an operator runs before a rollover, and a
-    // feature nobody can find is a feature nobody uses (`CLAUDE.md` §14).
+    // CDS polling (RFC 7344) needs no paste but a key-file field; said here,
+    // the command run before a rollover (`CLAUDE.md` §14).
     println!(
         "\nFor a parent that polls CDS/CDNSKEY instead (RFC 7344), add\n\
          \n    SyncPublish: <unix seconds>\n\
@@ -2439,15 +2237,12 @@ fn write_key_pair(
     let written: Result<Vec<PathBuf>, _> = pair.iter().map(|key| key.write_to_dir(dir)).collect();
     let written = match written {
         Ok(written) => written,
-        // All or nothing: a key left behind has no timing, so the server
-        // publishes and signs with it, and a KSK the operator never saw a DS
-        // for is the result.
+        // All or nothing: a key left behind has no timing and would publish and
+        // sign.
         Err(e) => return Err(remove_key_pair(dir, pair, e.into())),
     };
     for path in written {
-        // Also stdout on purpose, for the same reason as `--check-config`:
-        // `--generate-keys` exists to print a DS record somebody pastes into a
-        // registrar form, and that is output, not logging.
+        // Stdout, as for `--check-config`: the DS record is output to paste.
         println!("Wrote {}", path.display());
     }
     Ok(ksk)

@@ -59,13 +59,10 @@ use crate::{bad_request, serving_error};
 /// transfer is TCP-only" is now a branch the compiler can see rather than a
 /// comment about which caller got here.
 pub(super) enum Wire<'a> {
-    /// A connection's writer, and what the connection hid from the path.
-    /// Length-prefixed (RFC 1035 §4.2.2), a sequence allowed, and no response
-    /// budget: the handshake proved the address.
-    ///
-    /// The [`Arrival`] rides here rather than beside it because it is a fact
-    /// about *this* connection and only a framed one can carry a transfer,
-    /// which is the one answer that has a policy about it (RFC 9103 §11).
+    /// A connection's writer, and what the connection hid from the path:
+    /// length-prefixed (RFC 1035 §4.2.2), a sequence allowed, no response
+    /// budget. Only a framed connection carries a transfer, the one answer with
+    /// a policy about it (RFC 9103 §11), so the [`Arrival`] rides here.
     Framed(&'a mpsc::Sender<Reply>, Arrival),
     /// One datagram back to the peer, capped by its EDNS advertisement and
     /// charged against the response budget.
@@ -142,15 +139,11 @@ impl Wire<'_> {
     }
 }
 
-/// Everything both transports answer from. One per process, so a connection or
-/// datagram task clones a single `Arc`.
+/// Everything both transports answer from, one per process behind an `Arc`, so
+/// a rate limit survives a change of transport.
 ///
-/// Shared across transports on purpose: a client's rate limit must not reset
-/// because it switched transport, and the metrics are one server's.
-///
-/// Here rather than in the crate root, with every field private, so that what
-/// the root may do with one is build it and read three things. [`Server::new`]
-/// refuses everything it is not told otherwise about.
+/// Fields private: the root may build one and read three things, and
+/// [`Server::new`] refuses whatever it is not told.
 pub(crate) struct Server {
     zone_map: Arc<RwLock<Zones>>,
     /// The limiter, the response budget, the validator, the logger and the
@@ -312,14 +305,9 @@ pub(crate) struct UpdateHandling {
     validator: Arc<DnssecValidator>,
     /// Serializes the read-modify-write, which RFC 2136 §3.7 requires.
     ///
-    /// One lock for all zones rather than one per zone: two concurrent UPDATEs
-    /// is not a workload this has. Held across file I/O and a signing run, so
-    /// `tokio::Mutex` and not a `std` one.
-    ///
-    /// It guards the digest of each zone file as this server last wrote it
-    /// (`TODO.md` #64b), because that fact is *made* under this lock: nothing
-    /// else writes a zone file while it is held, so the map cannot be stale
-    /// with respect to anything the server itself did.
+    /// One lock for all zones; held across file I/O and signing, so `tokio`'s.
+    /// It guards the digest of each file this server last wrote, a fact made
+    /// under this lock and so never stale.
     applying: tokio::sync::Mutex<HashMap<PathBuf, FileDigest>>,
 }
 
@@ -369,9 +357,8 @@ impl tcp::Handler for Server {
         arrival: Arrival,
         out: mpsc::Sender<Reply>,
     ) {
-        // A scratch per message here, where the UDP worker keeps one per worker:
-        // `tcp::Handler` has no per-connection state to hang one on
-        // (`TODO.md` #39e).
+        // A scratch per message: `tcp::Handler` has no per-connection state to
+        // keep one in.
         let mut scratch = Scratch::default();
         self.answer(
             &packet,
@@ -450,17 +437,10 @@ struct Admitted<'a> {
 impl Server {
     /// Answer one request, whatever it arrived on.
     ///
-    /// One function for both transports: everything up to the TSIG check is the
-    /// same question asked of the same bytes, and what differs afterwards is
-    /// `wire` (`TODO.md` #39b). Sent rather than returned, because an AXFR
-    /// response is a sequence of messages (RFC 5936 §2.2) and a slow client
-    /// should back-pressure the next envelope rather than have the whole zone
-    /// built ahead of it. Sending nothing is how a query earns no response.
-    ///
-    /// `now` is the transport's single clock read for this message: the limiter
-    /// has already used it, and the logger and the TSIG check want the same
-    /// instant (`TODO.md` #28a). Admission ran before this was called, which is
-    /// where it belongs (`CLAUDE.md` §9).
+    /// Everything up to the TSIG check is common; `wire` is what differs. Sent,
+    /// not returned, so an AXFR back-pressures per envelope (RFC 5936 §2.2);
+    /// sending nothing is no response. `now` is the transport's one clock read,
+    /// already used for admission (`CLAUDE.md` §9).
     pub(super) async fn answer(
         &self,
         packet: &[u8],
@@ -470,9 +450,8 @@ impl Server {
         scratch: &mut Scratch,
     ) {
         let ip = Peer::from(peer);
-        // `Request` is the door: it parses and it refuses QR=1. `AdmissionCheck`
-        // accepts QR=1 on purpose — it runs on both directions of the wire — so
-        // the check belongs here, where we know the packet reached a listener.
+        // `Request` parses and refuses QR=1; `AdmissionCheck` accepts it,
+        // running on both directions, so the check is here at a listener.
         let msg = match Request::from_bytes(packet) {
             Ok(msg) => msg,
             Err(RequestError::Wire(_)) => {
@@ -504,9 +483,8 @@ impl Server {
             self.ctx.metrics.track_query_type(qtype);
         }
 
-        // One ceiling for every reply this request can produce, read once from
-        // the transport that will carry it and from this server's own limit —
-        // not from the client's advertisement alone.
+        // One ceiling for every reply, from the transport and this server's
+        // limit, not the client's advertisement alone.
         let ceiling = self.ctx.udp.reply_ceiling(&msg, wire.transport());
         let advertised = self.ctx.server_opt();
 
@@ -538,12 +516,8 @@ impl Server {
                     rejection.key_name(),
                     rejection.error.reason()
                 );
-                // No RFC 8914 reason: the TSIG record this reply carries says
-                // BADKEY, BADSIG or BADTIME itself (RFC 8945 §4.3), which is a
-                // finer answer than any INFO-CODE has.
-                // A `match` and not a `let ... else`: this is an arm now, so
-                // "no reply fits" is a value it produces rather than a
-                // divergence it escapes through.
+                // No RFC 8914 reason: the TSIG record says BADKEY, BADSIG or
+                // BADTIME (RFC 8945 §4.3), finer than any INFO-CODE.
                 let response = error_reply(
                     &msg,
                     ResponseCode::NotAuthorized,
@@ -562,9 +536,8 @@ impl Server {
                     Some(response) => match rejection.attach(response, now) {
                         Ok(bytes) => {
                             wire.send(&bytes, &self.ctx.logger, ip).await;
-                            // Returned rather than dropped: the tail records
-                            // what went out, and a NOTAUTH is an answered
-                            // request.
+                            // Returned, not dropped: the tail records what went
+                            // out, and NOTAUTH is an answer.
                             Some(Cow::Owned(bytes))
                         }
                         Err(e) => {
@@ -612,10 +585,8 @@ impl Server {
             advertised,
         } = *admitted;
         let ip = Peer::from(peer);
-        // The record the signer appends comes out of the ceiling, not on top of
-        // it: RFC 8945 §5.3 says a TSIG that would not fit means altering the
-        // response, not sending it oversized. Signing is the one thing here
-        // that grows finished bytes.
+        // The signer's record comes out of the ceiling: an over-long TSIG means
+        // altering the response (RFC 8945 §5.3), not sending it oversized.
         let max_len = match &session {
             Some(session) => reserve(ceiling, session.reply_overhead()),
             None => ceiling,
@@ -625,17 +596,12 @@ impl Server {
         // for all, the TSIG refusal included (`CLAUDE.md` §7).
         let transfer = matches!(qtype, Some(Qtype::AXFR) | Some(Qtype::IXFR));
         let sent = if let (true, Wire::Framed(out, arrival)) = (transfer, wire) {
-            // A sequence of messages, gated on an ACL, and the answer can be
-            // the whole zone. Only where a sequence can be carried — AXFR is
-            // TCP alone (RFC 5936 §4.2) and an IXFR over UDP is answered with a
-            // single SOA (RFC 1995 §2), both of which `write_response` does
-            // below.
+            // A gated sequence, possibly the whole zone, only where a sequence
+            // is carried; `write_response` answers AXFR and UDP IXFR otherwise.
             self.answer_transfer(msg, peer, session.as_mut(), now, arrival, out)
                 .await;
-            // No one envelope is the reply, and buffering the zone to name one
-            // would undo what `answer_transfer` is shaped to avoid. The entry
-            // says a transfer arrived, which is what a reader cannot get
-            // anywhere else.
+            // No one envelope is the reply, and buffering one would undo the
+            // streaming; the entry records that a transfer arrived.
             None
         } else if msg.opcode == OpCode::Query && self.catalog_refuses(msg, ip, session.is_some()) {
             let refused = Refused {
@@ -656,11 +622,8 @@ impl Server {
             }
             reply.map(Cow::Owned)
         } else if msg.opcode == OpCode::Update {
-            // Likewise, plus: an UPDATE installs a new zone, and
-            // `make_response` holds a read guard on the zone map that
-            // installing would deadlock against. RFC 2136 §1 permits it on
-            // either transport, and the checks, the ordering and the
-            // persistence are the request's, not the transport's.
+            // Likewise; and installing would deadlock against `make_response`'s
+            // read guard. RFC 2136 §1 allows either transport.
             let reply = self
                 .answer_update(msg, peer, session.as_mut(), now, max_len, wire.pads(msg))
                 .await;
@@ -700,15 +663,10 @@ impl Server {
     /// The epilogue every ordinary answer leaves through: charge it, sign it,
     /// send it.
     ///
-    /// Charging is the datagram transport's alone — over TCP the handshake has
-    /// proved the address, so there is nothing to amplify. Over budget, a
-    /// truncated reply is the useful refusal: it carries no records, so it
-    /// cannot amplify, and a real client reads TC=1 and asks again over TCP.
-    /// Dropping is for the rest.
-    ///
-    /// `Cow` so the ordinary answer — no budget trouble, no TSIG — goes out of
-    /// the caller's scratch buffer with nothing allocated. The two exceptions
-    /// build a message of their own and own it.
+    /// Only datagrams are charged. Over budget, a truncated reply carries no
+    /// records and sends a real client to TCP; anything else is dropped. `Cow`,
+    /// so an ordinary answer leaves the caller's scratch with nothing
+    /// allocated.
     async fn finish<'s>(
         &self,
         wire: &Wire<'_>,
@@ -720,9 +678,8 @@ impl Server {
     ) -> Option<Cow<'s, [u8]>> {
         let ip = Peer::from(peer);
         let advertised = self.ctx.server_opt();
-        // The ceiling `answer` wrote the body against, signature reserved and
-        // all: a truncated reply is signed too, so it is bounded by the same
-        // number.
+        // The ceiling `answer` wrote against, signature reserved: a truncated
+        // reply is signed too.
         let ceiling = self.ctx.udp.reply_ceiling(request, wire.transport());
         let ceiling = match &session {
             Some(session) => reserve(ceiling, session.reply_overhead()),
@@ -738,18 +695,8 @@ impl Server {
                 ResponseVerdict::Drop => None,
             },
         };
-        // RFC 8945 §5.3: "If addition of the TSIG record will cause the message
-        // to be truncated, the server MUST alter the response so that a TSIG can
-        // be included. This response contains only the question and a TSIG
-        // record, has the TC bit set, and has an RCODE of 0 (NOERROR)."
-        //
-        // `answer` reserved the record out of the ceiling, so the body has
-        // already gone; what the writer cannot know is that the RCODE goes with
-        // it, never having heard of TSIG. Applied to every truncated signed
-        // reply rather than only to one the signature pushed over, because the
-        // two produce the same message and §5.3 is the stricter shape. The OPT
-        // stays — RFC 6891 §6.1.1 requires mirroring it, and §5.3 is older than
-        // that being true of every reply.
+        // RFC 8945 §5.3: a signed reply that truncates is "only the question
+        // and a TSIG record", TC set, NOERROR; the OPT stays (RFC 6891 §6.1.1).
         if session.is_some() && reply.as_deref().is_some_and(rdns::response::is_truncated) {
             reply = truncated_reply(request, ceiling, advertised).map(Cow::Owned);
         }
@@ -763,12 +710,8 @@ impl Server {
                 );
             }
         }
-        // Sign whatever we ended up sending — including a truncated one, since
-        // that is still our answer to a question someone authenticated. Same
-        // session, so the reply's MAC covers the request's: that is what stops
-        // one question's reply being replayed as another's. This is where the
-        // borrow above becomes a copy, and it is the right place for it: a
-        // signed query over UDP is a NOTIFY or an SOA probe, not traffic.
+        // Sign whatever is sent in the same session, so the reply's MAC covers
+        // the request's and cannot be replayed.
         let reply = match (reply, session) {
             (Some(reply), Some(session)) => match session.sign(reply.into_owned(), now) {
                 Ok(signed) => Some(Cow::Owned(signed)),
@@ -779,10 +722,8 @@ impl Server {
             },
             (reply, _) => reply,
         };
-        // `None` is a request answered with silence — over the response
-        // budget. The caller records it either way: a query-only entry says it
-        // arrived and got nothing, which is the one thing a log line at DEBUG
-        // cannot tell an analytics pipeline.
+        // `None` is silence, over the budget; the caller records it either way,
+        // as a query-only entry.
         if let Some(reply) = reply {
             wire.send(&reply, &self.ctx.logger, ip).await;
             Some(reply)
@@ -793,15 +734,9 @@ impl Server {
 
     /// Put this exchange on the query stream, if there is one.
     ///
-    /// One entry per exchange rather than the two BIND emits: the response
-    /// entry carries the query verbatim in `Message.query_message`, which is
-    /// what the schema is for, and halves the frames on the hot path.
-    ///
-    /// `socket_protocol` names the transport exactly, DoT, DoH and DoQ
-    /// included, because the dispatcher is told [`Arrival`] — which protocol
-    /// carried the message as well as what it hid. [`Privacy`] alone cannot
-    /// tell the three apart, and DOT for a DoH query is a wrong value where an
-    /// absent one is a reader showing nothing (`CLAUDE.md` §14).
+    /// One entry per exchange, the query in `Message.query_message`, where BIND
+    /// emits two. `socket_protocol` comes from [`Arrival`], since [`Privacy`]
+    /// cannot tell DoT, DoH and DoQ apart (`CLAUDE.md` §14).
     fn record_dnstap(
         &self,
         wire: &Wire<'_>,
@@ -826,28 +761,22 @@ impl Server {
             // The listener's address is not carried this far, and a wrong one
             // is worse than none on a multi-homed host.
             responder: None,
-            // Both to nanoseconds, because a reader subtracts them. See
-            // `Incoming::arrived` for why the transport's `now` is not one of
-            // them.
+            // Both in nanoseconds, as a reader subtracts them;
+            // `Incoming::arrived` says why not the transport's `now`.
             query_time: incoming.arrived.unwrap_or_default(),
             response_time: reply.map(|_| dnstap::Timestamp::now()),
             query: Some(incoming.bytes),
             response: reply,
-            // `Message.query_zone` needs the zone the answer came out of, which
-            // the epilogue is not told. Optional in the schema, and a reader
-            // takes the zone from the question.
+            // Optional in the schema, and the epilogue does not know the zone;
+            // a reader takes it from the question.
             zone: None,
         });
     }
 
     /// Answer an AXFR: the whole zone, or a refusal.
     ///
-    /// Every attempt is logged, allowed or not: a refused one is a probe, an
-    /// allowed one is a copy of the zone leaving the building.
-    ///
-    /// Written to `out` one envelope at a time, so the zone is never
-    /// materialized whole. What that costs in failure handling is on
-    /// [`Server::abandon_transfer`].
+    /// Every attempt is logged. Written one envelope at a time, never whole;
+    /// the failure handling that costs is on [`Server::abandon_transfer`].
     async fn answer_transfer(
         &self,
         msg: &DnsMessage,
@@ -870,13 +799,8 @@ impl Server {
         let incremental = msg.queries.first().map(|q| q.qtype) == Some(Qtype::IXFR);
         let kind = if incremental { "IXFR" } else { "AXFR" };
 
-        // Before anything about who is asking, and before this one too: the
-        // answer cannot leave by the door it arrived at, whoever is asking and
-        // whatever the policy. Checked here rather than at the dispatch that
-        // chose to stream, because this is where a refusal is logged and signed
-        // — an authenticated refusal is still signed (RFC 8945 §5.3,
-        // `CLAUDE.md` §16) — and because it is before the zone is looked up,
-        // which is the whole point of refusing rather than building.
+        // The answer cannot leave by this door: refused here, logged and signed
+        // (RFC 8945 §5.3), before the zone is looked up.
         if !arrival.carries_a_sequence() {
             serving_error!(
                 self.ctx.logger,
@@ -884,9 +808,8 @@ impl Server {
                 "{kind} of {qname} REFUSED: {} carries one message per request",
                 match arrival {
                     Arrival::Doh(..) => "DoH",
-                    // Unreachable while DoH is the only one, and written out
-                    // so adding a transport that cannot stream is a compile
-                    // error here rather than a wrong sentence.
+                    // Written out, so a new transport that cannot stream is a
+                    // compile error.
                     Arrival::Tcp | Arrival::Dot(..) | Arrival::Doq(_) => "this transport",
                 }
             );
@@ -901,18 +824,8 @@ impl Server {
             return;
         }
 
-        // Before anything about who is asking: RFC 9103 §11 — "An individual
-        // zone transfer is not considered protected by XoT unless both the
-        // client and server are configured to use only XoT" — and this is the
-        // server's half. TLS 1.3 or better, because §7.2 is "All
-        // implementations of this specification MUST use only TLS 1.3
-        // [RFC8446] or later" and a 1.2 DoT connection is a fine way to ask a
-        // question and not a way to take a zone.
-        //
-        // REFUSED, not NOTAUTH: the zone exists and the answer is policy. The
-        // reply says which policy, because "REFUSED" alone over a working TLS
-        // connection is the sort of thing an operator debugs for an afternoon
-        // (RFC 8914).
+        // RFC 9103 §11, the server's half, and TLS 1.3 or later (§7.2).
+        // REFUSED, not NOTAUTH: the zone exists; the EDE names the policy.
         if self.transfer_tls_only && !privacy.is_xot() {
             serving_error!(
                 self.ctx.logger,
@@ -936,16 +849,8 @@ impl Server {
             return;
         }
 
-        // Either a verified TSIG or an address rule grants the transfer, and an
-        // IXFR is gated identically because it may answer with the whole zone
-        // (RFC 1995 §4).
-        //
-        // A verified key says who, not what: authorize it against the apex, and
-        // do so before the zone is looked up or any message built. A key with no
-        // zone list still authorizes everything (`TsigKey::zones`).
-        //
-        // REFUSED, not NOTAUTH: the peer proved who it is and the answer is no,
-        // which is policy rather than a claim about the zone's authority.
+        // A verified TSIG or an address rule grants AXFR and IXFR (RFC 1995
+        // §4); a key is checked against the apex first. REFUSED is policy.
         let apex = &qname;
         let apex_text = apex.as_ref().to_presentation();
         let unauthorized = session
@@ -969,13 +874,8 @@ impl Server {
             return;
         }
 
-        // RFC 9103 §7.5's other method, and the one it says to prefer: "mutual
-        // TLS (mTLS)". A certificate verified against `--transfer-client-ca`
-        // during the handshake says *who*; `--allow-transfer-cert` says what
-        // they may take, and an unlisted certificate authorizes nothing
-        // (`CLAUDE.md` §16). Scoped elsewhere is a refusal of its own, for the
-        // reason the key one is: the peer proved who it is and the answer is
-        // no.
+        // RFC 9103 §7.5's preferred mTLS: the certificate says who,
+        // `--allow-transfer-cert` what (`CLAUDE.md` §16).
         let by_certificate = self
             .transfer_clients
             .identify(arrival.peer_certificate())
@@ -1013,14 +913,8 @@ impl Server {
             return;
         }
 
-        // An exact match on the origin, not the enclosing-zone lookup an ordinary
-        // query does: transferring example.com. because www.example.com. was
-        // asked for would hand over a zone nobody named.
-        //
-        // A snapshot, not the guard: the lock may not be held across writing a
-        // whole zone to a socket, but the transfer must still be of one version
-        // throughout. `Zones::snapshot` is an `Arc` of the version current now,
-        // which reloads replace rather than mutate.
+        // An exact origin match, not the enclosing zone. A snapshot, not the
+        // guard: one version for the whole transfer without holding the lock.
         let (zone, prepared) = {
             let zones = self.zone_map.read().await;
             let Some(zone) = zones.snapshot(apex.as_ref()) else {
@@ -1055,9 +949,8 @@ impl Server {
                             "IXFR of {qname}: sending the whole zone instead ({why})"
                         ),
                     }
-                    // A full transfer is left unbuilt: the envelope iterator below
-                    // exists not to materialize the zone. The rest is bounded by
-                    // the delta log.
+                    // A full transfer is left unbuilt for the iterator below;
+                    // the rest is bounded by the delta log.
                     match response {
                         IxfrResponse::FullTransfer { .. } => Ok(Vec::new()),
                         other => other.messages(msg, &zone),
@@ -1081,10 +974,8 @@ impl Server {
             }
         };
 
-        // One envelope at a time: built, serialized, signed, framed and handed to
-        // the writer before the next one exists — hence an iterator rather than a
-        // materialized zone. `+ Send` because it stays alive across the `await`
-        // on every envelope, in a spawned task.
+        // One envelope at a time, built, signed and framed before the next
+        // exists; `+ Send` as it lives across each `await` in a spawned task.
         let envelopes: Box<dyn Iterator<Item = DnsMessage> + Send + '_> = if prepared.is_empty() {
             match axfr_envelopes(msg, &zone) {
                 Ok(envelopes) => Box::new(envelopes),
@@ -1110,9 +1001,8 @@ impl Server {
         let mut sent = 0usize;
         for mut message in envelopes {
             records += message.answers.len();
-            // Padding rides in the OPT, which RFC 5936 §2.2.5 puts on the first
-            // envelope and allows on the rest: a padded transfer carries it on
-            // every one, so every one is padded.
+            // Padding rides in the OPT, which a padded transfer carries on
+            // every envelope (RFC 5936 §2.2.5), so every one is padded.
             if refused.pad && message.edns.is_none() {
                 if let Some(edns) = ClientEdns::of(msg).mirror(ServerOpt {
                     payload_size: msg.udp_payload_size(),
@@ -1141,9 +1031,8 @@ impl Server {
                     session.as_ref().map_or(0, |s| s.reply_overhead()),
                 );
             }
-            // Every envelope is signed, and the MACs chain (RFC 8945 §5.3.1): a
-            // dropped or reordered message then fails at the client instead of
-            // passing for a complete zone.
+            // Every envelope signed, MACs chained (RFC 8945 §5.3.1), so a
+            // dropped or reordered message fails at the client.
             let bytes = match session.as_mut() {
                 Some(session) => match session.sign(bytes, now) {
                     Ok(signed) => signed,
@@ -1223,15 +1112,11 @@ impl Server {
         }
     }
 
-    /// One error reply, signed if the request was.
+    /// One error reply, signed if the request was (RFC 8945 §5.3), or a client
+    /// cannot tell a refusal from tampering.
     ///
-    /// RFC 8945 §5.3: an error response to a verified request is signed too.
-    /// Unsigned, a client cannot tell a refusal from a tampered reply.
-    ///
-    /// `now` is the instant that verified the request, not a second read of the
-    /// clock: [`Server::finish`] already signs with it, and a reply signed off
-    /// a clock the request was not checked against is the one thing here that
-    /// can disagree with itself.
+    /// `now` is the instant that verified the request, as [`Server::finish`]
+    /// signs with, not a second clock read.
     fn signed_error(
         &self,
         refused: Refused,
@@ -1273,16 +1158,10 @@ impl Server {
 
     /// Answer a dynamic UPDATE (RFC 2136).
     ///
-    /// Answered here rather than in `make_response`: gated on a permission, it
-    /// touches the disk, and it changes what this server says next.
-    ///
-    /// Order: §3.1 reads the message, §3.1.1 asks whether the zone is ours,
-    /// §3.3 whether the requestor may write it, §3.2 checks the prerequisites,
-    /// and only then does §3.4 change anything. Zone before permission, so
-    /// NOTAUTH and REFUSED tell a client whether to change server or key.
-    /// Permission before §3.2, where the RFC lists it after: prerequisites
-    /// answer NXDOMAIN/YXDOMAIN about the zone's contents, and BIND, Knot and
-    /// PowerDNS all check permission first (`TODO.md` #118).
+    /// Order: §3.1, then zone (§3.1.1), permission (§3.3), prerequisites
+    /// (§3.2), change (§3.4). Permission before §3.2, as BIND, Knot and
+    /// PowerDNS do (`TODO.md` #118), so prerequisites leak nothing to the
+    /// unauthorized.
     async fn answer_update(
         &self,
         msg: &DnsMessage,
@@ -1313,15 +1192,8 @@ impl Server {
         };
         let zone_name = request.zone.clone();
 
-        // §3.1.1: a zone we are not an authority for is NOTAUTH — not the query
-        // path's REFUSED, because an UPDATE names the zone and asks whether we
-        // are its authority.
-        //
-        // Taken, not merely tested for, and in the one read guard: "do we serve
-        // it" and the version the signer works against must be the same one.
-        // `snapshot` rather than `matching(..).cloned()` — the map holds
-        // `Arc<Zone>`, so this is a refcount and not a copy of the whole zone,
-        // which was 150 ms at a million records (`TODO.md` #64a).
+        // §3.1.1: not ours is NOTAUTH. One read guard, so the zone served and
+        // the version signed agree; `snapshot` is a refcount.
         let previous = {
             let zones = self.zone_map.read().await;
             zones.snapshot(zone_name.as_ref())
@@ -1336,10 +1208,8 @@ impl Server {
             );
         };
 
-        // §3.3: no permission, REFUSED. An unsigned UPDATE is refused outright,
-        // with no address-based alternative: a write is not handed out on a
-        // source address UDP makes nobody prove. A key is the only credential,
-        // and it must be scoped (`rdns::tsig::UpdatePolicy`).
+        // §3.3: unsigned is REFUSED, with no address alternative; a key, scoped
+        // by `rdns::tsig::UpdatePolicy`, is the only credential.
         let Some(session) = session else {
             serving_error!(
                 self.ctx.logger,
@@ -1363,10 +1233,8 @@ impl Server {
             );
         }
 
-        // A zone we replicate is the master's copy: the next refresh transfers
-        // over the change, so accepting it tells the client a write succeeded
-        // that has a timer on it. Folded through the helper the table is keyed
-        // with, so the two cannot disagree.
+        // A replicated zone is the master's: the next refresh would undo the
+        // write. Folded as the table is keyed.
         if self.secondaries.replicates(zone_name.as_ref()) {
             serving_error!(
                 self.ctx.logger,
@@ -1382,9 +1250,8 @@ impl Server {
             );
         }
 
-        // A zone we cannot write back must not be updated: the change would live
-        // in memory only and be discarded by the next reload, having told the
-        // client it succeeded. See [`crate::UpdateHandling`].
+        // Not writable back, so not updatable: the change would die at the next
+        // reload. See [`crate::UpdateHandling`].
         let Some(source) = self.updates.source.as_ref() else {
             serving_error!(
                 self.ctx.logger,
@@ -1430,19 +1297,15 @@ impl Server {
             }
         };
 
-        // §3.7's serialization, held across the whole read-modify-write — and
-        // the digests live under it, so "this is what we last wrote" is
-        // guarded by the lock that made it true rather than remembered beside
-        // it (`TODO.md` #64b).
+        // §3.7's serialization across the whole read-modify-write, with the
+        // digests guarded by the lock that makes them true.
         let mut digests = self.updates.applying.lock().await;
         let known = digests.get(&path).copied();
         // Cloned for the digest map below: the blocking task takes the original.
         let for_digest = path.clone();
 
-        // Everything from here to the installed zone is blocking — a parse, a
-        // full ECDSA signing run, and two file operations — so it goes to a
-        // blocking thread rather than stalling a worker that is also answering
-        // queries (`CLAUDE.md` §9).
+        // Parse, signing and file writes block, so a blocking thread
+        // (`CLAUDE.md` §9).
         let signing = self.updates.signing.clone();
         let validator = Arc::clone(&self.updates.validator);
         let changes = request.changes.clone();
@@ -1490,9 +1353,8 @@ impl Server {
                 tracing::info!(peer = %ip, "UPDATE of {zone_name}: {rejected}");
                 return self.signed_error(refused, rejected.rcode, None, Some(session));
             }
-            // The two checks above this task answer the configuration's
-            // spellings of "nowhere to write it"; this is the file's, and it
-            // needs the bytes, which is why it is not up there with them.
+            // The file's own "nowhere to write it", which needs the bytes, so
+            // it is not with the checks above.
             Err(UpdateFailure::NotWritable(why)) => {
                 serving_error!(
                     self.ctx.logger,
@@ -1502,9 +1364,8 @@ impl Server {
                 );
                 return self.signed_error(refused, ResponseCode::Refused, Some(why), Some(session));
             }
-            // §3.4.2.1: a system failure is SERVFAIL with every applied update
-            // undone. Nothing to undo here — the write is atomic and the map is
-            // untouched until it succeeds.
+            // §3.4.2.1: SERVFAIL with nothing to undo; the write is atomic and
+            // the map untouched until it succeeds.
             Err(UpdateFailure::System(e)) => {
                 serving_error!(self.ctx.logger, ip, "UPDATE of {zone_name} failed: {e:#}");
                 return self.signed_error(
@@ -1640,14 +1501,8 @@ const NO_SUCH_ZONE: ExtendedError = ExtendedError::new(InfoCode::OTHER, "not a z
 /// The start of every reply that carries no records: the question echoed, and
 /// the client's OPT mirrored with its DO bit (RFC 6891 §6.1.1, RFC 3225 §3).
 ///
-/// One function because the mirroring is what drifts. It was written out at four
-/// call sites, and three of them dropped the DO bit, so a validating client that
-/// asked over UDP and got TC=1 read the answer as coming from a server that had
-/// stopped doing DNSSEC (`TODO.md` #38, `CLAUDE.md` §7).
-///
-/// `why` is RFC 8914's reason for the RCODE, and rides in that OPT or nowhere
-/// (§2) — which is [`ClientEdns::mirror_with`]'s rule, and so is what happens
-/// to a reason that will not encode.
+/// One function, because the mirroring drifts (`CLAUDE.md` §7). `why` rides in
+/// that OPT or nowhere (RFC 8914 §2): [`ClientEdns::mirror_with`]'s rule.
 fn empty_reply(
     request: &DnsMessage,
     advertised: ServerOpt,
@@ -1707,14 +1562,9 @@ enum UpdateFailure {
 /// Apply an UPDATE to the zone as its *file* has it, persist it, sign it, check
 /// what was signed, and return the version to install.
 ///
-/// `Ok((None, report, digest))` when nothing changed: no write, nothing to
-/// install, and the client still gets NOERROR. See [`crate::UpdateHandling`]
-/// for why the file rather than the copy in memory is what gets read and
-/// written.
-///
-/// Write then install: a crash between the two loses nothing, where the other
-/// order serves a change that a restart makes disappear. The write is atomic
-/// (`rdns::persist`), so the next reload sees one version or the other.
+/// `Ok((None, report, digest))` when nothing changed. Written, then installed:
+/// a crash loses nothing, and the atomic write shows a reload one version or
+/// the other. [`crate::UpdateHandling`] says why the file.
 #[allow(clippy::type_complexity)]
 fn apply_update_to_file(
     path: &Path,
@@ -1725,35 +1575,19 @@ fn apply_update_to_file(
     check: SigningCheck<'_>,
     known: Option<FileDigest>,
 ) -> Result<(Option<Zone>, UpdateReport, FileDigest), UpdateFailure> {
-    // The zone as the file has it: unsigned, on the operator's serial. Taken
-    // from the file rather than from the served copy, so an edit since the last
-    // load is not silently reverted.
-    //
-    // The *bytes* always; the parse only when they are not the bytes this
-    // server last wrote (`TODO.md` #64b). Reading and digesting 24 MB is
-    // 7.8 ms against 435 for the parse and index, so the honest test is 1.8%
-    // of what it replaces. Why it is the bytes rather than a `stat` at 0.07 ms
-    // is `FileDigest`'s own doc, which is where all three callers' copy of
-    // that argument now lives (#104).
+    // The file's zone, unsigned, so an edit since the load is kept; parsed only
+    // if not the bytes this server last wrote.
     let raw = std::fs::read(path)
         .with_context(|| format!("re-reading {} to update it", path.display()))
         .map_err(UpdateFailure::System)?;
-    // The one place the shape of the file is judged, and the digest is what it
-    // is judged for: `FileDigest::of` is only sound over text this process
-    // wrote or a file known to carry no `$INCLUDE`, and this is neither until
-    // asked. A digest of the parent says nothing about the included file, so a
-    // remembered one would match while the include had moved — the operator's
-    // change silently reverted (`TODO.md` #104, `CLAUDE.md` §2's rule about
-    // where a check belongs).
+    // `FileDigest::of` is sound only for a file with no `$INCLUDE`, whose
+    // change a parent digest cannot see (`TODO.md` #104).
     let Some(digest) = FileDigest::of_self_contained(&raw) else {
         return Err(UpdateFailure::NotWritable(INCLUDES_ANOTHER_FILE));
     };
 
-    // Reusing the served copy is only sound with no signing configured: then it
-    // *is* what the file holds, because the last thing written there was the
-    // last thing installed. A signed server serves RRSIGs and NSECs the file
-    // does not carry, and 64d measured the four O(zone) steps at 12% of a
-    // signed update anyway — so the case worth having is this one.
+    // The served copy is the file only when unsigned: signing adds RRSIGs and
+    // NSECs the file lacks.
     let reused = known == Some(digest) && check.signing.is_none();
     let parsed;
     let source = if reused {
@@ -1762,12 +1596,8 @@ fn apply_update_to_file(
         let text = String::from_utf8(raw)
             .map_err(|_| anyhow::anyhow!("{} is not UTF-8", path.display()))
             .map_err(UpdateFailure::System)?;
-        // `parse_zone_text_at`, not `parse_zone_file`: the latter has no base
-        // directory and resolves `$INCLUDE` against the process's working
-        // directory, where the loader resolves it against the file's. The
-        // refusal above means no include reaches here, so this cannot differ
-        // today — it is the right function for text that came from a path, and
-        // two spellings of "parse this zone file" is what drifts (§7).
+        // `parse_zone_text_at`: it resolves `$INCLUDE` against the file, as the
+        // loader does; one spelling of "parse this zone file" (§7).
         parsed = rdns::zone::parse_zone_text_at(&text, origin, path)
             .with_context(|| format!("re-reading {} to update it", path.display()))
             .map_err(UpdateFailure::System)?;
@@ -1799,14 +1629,8 @@ fn apply_update_to_file(
     // the text rather than by re-reading it: the same bytes went to the file.
     let written = FileDigest::of(text.as_bytes());
 
-    // Signed as a load would sign it, from the file's now-bumped serial, so the
-    // served number moves too. Incrementally against the version being served:
-    // a full re-sign would reinception every RRSIG and put the whole zone into
-    // the next IXFR delta. Verified before it is installed: `main.rs`'s two
-    // calls to `verify_zones` cover loading and reloading, and this is the
-    // third way a zone reaches the map. The signing call hands back something
-    // the zone cannot be got out of without asking, so the check is the value's
-    // obligation rather than this function's memory of it (`CLAUDE.md` §17).
+    // Signed as a load signs, incrementally against the served version, so the
+    // IXFR delta stays small; verified before install (`CLAUDE.md` §17).
     let installed = match check.signing {
         Some(signing) => signing
             .sign_one_incrementally(previous, zone)
@@ -1859,33 +1683,21 @@ struct UpdateReport {
 
 /// An empty TC=1 answer to `request`: the question echoed, no records.
 ///
-/// What a client over its response budget gets instead of the answer: smaller
-/// than the query, so useless for amplification, and RFC 1035 §4.2.1 has the
-/// client retry over TCP, where the handshake proves the source address. Silence
-/// would leave a legitimate client with a timeout and no hint that TCP works.
-///
-/// No AA — the reply carries no data — and bounded by the caller's ceiling,
-/// which on the transport this can happen on is the smaller of the client's
-/// EDNS payload size and this server's own, rather than 512 (RFC 6891 §6.2.4).
+/// What a client over its response budget gets: smaller than the query, and a
+/// real client retries over TCP (RFC 1035 §4.2.1). No AA; bounded by the
+/// caller's ceiling (RFC 6891 §6.2.4).
 fn truncated_reply(request: &DnsMessage, max_len: usize, advertised: ServerOpt) -> Option<Vec<u8>> {
     let mut resp = empty_reply(request, advertised, None);
     resp.truncation = true;
     resp.to_bytes_within(max_len).ok()
 }
 
-/// Answer a NOTIFY (RFC 1996).
+/// Answer a NOTIFY (RFC 1996), as a NOTIFY: same opcode, question echoed, no
+/// data (§4.7).
 ///
-/// - A zone we replicate, from one of its masters: NOERROR, and the refresh task
-///   is woken. The serial in the message is unauthenticated, so it is not acted
-///   on — the refresh compares against what the master answers.
-/// - A zone we replicate, from anywhere else: REFUSED (§3.10). A NOTIFY is a
-///   spoofable datagram that costs its recipient a transfer, so who may send one
-///   is a list.
-/// - Anything else: NOTAUTH, "I am not a secondary for that zone" — true alike
-///   for a zone we are primary for and one we never heard of, distinguished in
-///   the log rather than the rcode.
-///
-/// Answered as a NOTIFY: same opcode, question echoed, no data (§4.7).
+/// A replicated zone from a master: NOERROR and the refresh task woken; the
+/// serial is unauthenticated and ignored. From anyone else: REFUSED (§3.10).
+/// Any other zone: NOTAUTH; the log says whether we are its primary.
 fn notify_reply(
     msg: &DnsMessage,
     zone_map: &ZoneMap,
@@ -1916,10 +1728,8 @@ fn notify_reply(
         Notified::NotOurs => {}
     }
 
-    // Folded octets, which is what the zone map is keyed on, so this is a lookup
-    // rather than a scan of every origin. The fold is ASCII-only (RFC 4343) and
-    // `Name` does it; `str::to_lowercase` would fold U+212A KELVIN SIGN onto `k`
-    // and merge two names that differ on the wire.
+    // Folded octets key the zone map, so a lookup; ASCII-only (RFC 4343), as
+    // `Name` folds.
     let ours = zone_map.contains_key(zone.as_ref().folded().as_ref());
     // The same distinction on the wire and in the log: the log alone is the
     // half an operator on the *sending* side cannot read (`TODO.md` #47).

@@ -74,9 +74,8 @@ pub(crate) async fn announce_zones(
         let all: Vec<&Zone> = zones.values().map(Arc::as_ref).collect();
         let current = notify::zone_serials(&all);
         let changed = notify::changed_zones(announced, &current);
-        // Build the messages under the lock, send them outside it: a NOTIFY that
-        // goes unanswered takes seconds to retry, and holding the zone map that
-        // long would block a reload behind the network.
+        // Built under the lock, sent outside it: an unanswered NOTIFY retries
+        // for seconds, and a reload would wait.
         let pending: Vec<(Name, Serial, Option<rdns::ResourceRecord>)> = changed
             .iter()
             .filter_map(|(name, serial)| {
@@ -98,9 +97,8 @@ pub(crate) async fn announce_zones(
             let peer = peer.clone();
             let zone = zone.clone();
             let soa = soa.clone();
-            // Fire-and-forget, but not unaccounted-for: a NOTIFY dropped at
-            // shutdown is a secondary that waits out a whole REFRESH before it
-            // learns of a change we already knew about, so the drain covers it.
+            // Covered by the drain: a NOTIFY dropped at shutdown leaves a
+            // secondary a whole REFRESH behind.
             let busy = busy.clone();
             tokio::spawn(async move {
                 let _busy = busy;
@@ -113,16 +111,9 @@ pub(crate) async fn announce_zones(
 
 /// Tell the configured secondaries that a zone *we* replicate has moved.
 ///
-/// RFC 1996 §3.2's "master" is whoever serves the zone to someone, which a
-/// secondary in the middle of a tree is. Without this, `announce_zones` covers
-/// only the moments a *primary* learns of a change — startup and SIGHUP — while a
-/// secondary learns of one by transferring it and says nothing, so the first
-/// level of a tree updates at once and every level below it waits out a refresh
-/// timer.
-///
-/// Spawned rather than awaited for the same reason the primary's announcements
-/// are: an unanswered NOTIFY takes seconds to give up on, and a refresh should
-/// not be held behind the network to tell somebody about work it has finished.
+/// A mid-tree secondary is RFC 1996 §3.2's "master" to those below; without
+/// this each level waits out a refresh. Spawned, so a refresh is not held
+/// behind the network.
 pub(crate) fn announce_transfer(
     zone: NameRef<'_>,
     serial: Serial,
@@ -132,9 +123,8 @@ pub(crate) fn announce_transfer(
 ) {
     for peer in notify.targets_for(zone) {
         let (zone, soa, peer) = (zone.to_owned(), soa.clone(), peer.clone());
-        // Accounted for by the drain, like the primary's announcements: a NOTIFY
-        // dropped at shutdown costs the level below us a whole REFRESH before it
-        // learns of a change that has already reached us.
+        // Covered by the drain, like the primary's: a drop costs the level
+        // below a REFRESH.
         let busy = busy.clone();
         tokio::spawn(async move {
             let _busy = busy;
@@ -145,18 +135,10 @@ pub(crate) fn announce_transfer(
 
 /// Send one NOTIFY, retrying until it is answered (RFC 1996 §3.6).
 ///
-/// Signed when the target carries a key (RFC 8945), because a secondary's notify
-/// ACL can demand one and two of the three this tree is tested against do when
-/// asked — `TODO.md` #46a. The reply is then verified: an unsigned or wrongly
-/// signed answer to a signed request is not an answer.
-///
-/// Every rcode ends the retries, because the secondary has the message and
-/// repeating it would not change its mind — but only NOERROR means it will
-/// refresh, and the difference is logged rather than flattened into
-/// "acknowledged".
-///
-/// Giving up after [`notify::NOTIFY_ATTEMPTS`] is safe because the secondary's
-/// refresh timer is the backstop this is an optimisation over.
+/// Signed when the target has a key (RFC 8945), as notify ACLs may demand, and
+/// the reply verified. Any rcode ends the retries, but only NOERROR is logged
+/// as a refresh. Giving up after [`notify::NOTIFY_ATTEMPTS`] is safe: the
+/// refresh timer is the backstop.
 async fn send_notify(
     zone: NameRef<'_>,
     serial: Serial,
@@ -175,19 +157,14 @@ async fn send_notify(
     for attempt in 1..=notify::NOTIFY_ATTEMPTS {
         let id = rdns::rand_id();
         let msg = notify::notify_request(zone, soa.clone(), id);
-        // `to_bytes_within` sizes the buffer to what the message needs and
-        // only truncates past the ceiling, so the wire maximum here is not a
-        // 64 KiB allocation. It replaces a fixed 512-byte buffer that
-        // `to_bytes` would have refused to write into for a zone whose SOA
-        // carries long enough names -- losing the notification, with
-        // "could not serialize" as the only sign.
+        // `to_bytes_within` sizes the buffer to the message, so the wire
+        // maximum costs nothing and a long SOA cannot fail to serialize.
         let Ok(mut packet) = msg.to_bytes_within(u16::MAX as usize) else {
             tracing::warn!("NOTIFY {zone}: could not serialize");
             return;
         };
-        // The MAC of our request opens the digest the reply is verified against
-        // (RFC 8945 §4.3.3), so it has to be kept — the same sequence
-        // `rdns::xfr` uses on the client side of a transfer.
+        // Our MAC opens the reply's digest (RFC 8945 §4.3.3), as `rdns::xfr`
+        // keeps it on a transfer's client side.
         let mut request_mac = Vec::new();
         if let Some(key) = &peer.key {
             match tsig::sign_request(packet, key, tsig::now()) {
@@ -209,11 +186,8 @@ async fn send_notify(
         // A NOTIFY reply echoes the question and carries no data; 4 KiB is well
         // past anything one plus a TSIG can weigh.
         let mut reply = vec![0u8; 4096];
-        // Something answered, but not this? Treat it as no answer rather than as
-        // an acknowledgement: an off-path reply should not be able to silence a
-        // notification. A TSIG that does not verify is the same case — which is
-        // why this keeps retrying rather than returning, and remembers the
-        // reason for the line at the end.
+        // An off-path reply, or a TSIG that does not verify, is no answer: keep
+        // retrying, and remember why for the final line.
         if let Ok(Ok((n, _))) = tokio::time::timeout(wait, socket.recv_from(&mut reply)).await {
             let packet = &reply[..n];
             let verified = match &peer.key {
@@ -235,9 +209,8 @@ async fn send_notify(
                             tracing::info!("NOTIFY {zone} serial {serial} to {peer}: accepted");
                             return;
                         }
-                        // It arrived and was refused, so stop — but say so.
-                        // Nothing is going to refresh, and the zone is stale on
-                        // that secondary until its REFRESH timer fires.
+                        // Received and refused: stop, but warn, as the
+                        // secondary is stale until its REFRESH.
                         Some(NotifyOutcome::Rejected(rcode)) => {
                             tracing::warn!(
                                 "NOTIFY {zone} serial {serial} to {peer}: refused ({rcode:?}) — \

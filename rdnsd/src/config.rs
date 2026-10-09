@@ -45,9 +45,8 @@ pub(crate) struct Config {
     zones: BTreeMap<String, ZoneConfig>,
 }
 
-// `[server]`: the keys both daemons have, from `rdns::server_table!`, then
-// this daemon's fourteen. The macro also writes `Default`, so the shared half is
-// spelled once there rather than once per daemon (`TODO.md` #63).
+// `[server]`: the keys both daemons share, from `rdns::server_table!`, which
+// writes `Default` too, then this daemon's own.
 rdns::server_table! {
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields, rename_all = "kebab-case")]
@@ -140,15 +139,9 @@ struct Key {
     zones: Vec<String>,
     /// The zones this key may rewrite through dynamic UPDATE (RFC 2136 §3.3).
     ///
-    /// Empty means none, which is the opposite of `zones` directly above.
-    /// The argument is at `rdns::tsig::UpdatePolicy`: a transfer hands over a
-    /// copy and an update rewrites the original, and no working deployment can
-    /// be broken by denying something nothing has ever served. `["*"]` grants
-    /// every zone, and has to be typed.
-    ///
-    /// The two lists sit next to each other with opposite defaults on purpose —
-    /// an operator reading this table is deciding both at once, which is where
-    /// `CLAUDE.md` §16 says narrowing belongs.
+    /// Empty means none, the opposite of `zones` above, on purpose: denying a
+    /// write breaks nothing that worked (`rdns::tsig::UpdatePolicy`,
+    /// `CLAUDE.md` §16). `["*"]` grants every zone, and has to be typed.
     #[serde(default)]
     update_zones: Vec<String>,
 }
@@ -186,26 +179,16 @@ struct ZoneConfig {
     /// Who to NOTIFY for *this* zone, in addition to `server.also-notify`.
     #[serde(default)]
     also_notify: Vec<String>,
-    /// Whether this zone is a catalog to consume rather than a zone to serve
-    /// (RFC 9432): the zones it lists are replicated from the same masters,
-    /// with the same key.
-    ///
-    /// It is still replicated and served like any other zone — a catalog is an
-    /// ordinary zone (§5.1) — so this adds a reading of it, and takes nothing
-    /// away.
+    /// Whether this zone is also a catalog to consume (RFC 9432): its members
+    /// are replicated from the same masters with the same key. It is still
+    /// served like any other zone (§5.1).
     #[serde(default)]
     catalog: bool,
     /// Members of this catalog carrying one of these group values are fetched
     /// differently (RFC 9432 §4.3.2), keyed by the group value.
     ///
-    /// `[zones."catalog.invalid.".groups."operator-x"]`. Per catalog zone and
-    /// not globally, which is the shape §4.3.2 names: "Implementations MAY
-    /// facilitate mapping of a specific group value to a specific configuration
-    /// configurable on a per catalog zone basis" — a producer may publish one
-    /// catalog to several consumer operators who each agreed different values.
-    ///
-    /// Only on a `catalog = true` zone; a group on anything else is refused,
-    /// because nothing would ever read it.
+    /// `[zones."catalog.invalid.".groups."operator-x"]`: per catalog, as §4.3.2
+    /// puts it. Refused on a zone that is not `catalog = true`.
     #[serde(default)]
     groups: BTreeMap<String, GroupConfig>,
     /// Per-zone signing overrides. Absent means "use `[signing]`".
@@ -240,14 +223,9 @@ struct GroupConfig {
 
 /// Who signs a zone's apex DNSKEY RRset.
 ///
-/// `imported` is RFC 8901 §2.1.1's Model 1, where "the zone owner holds the KSK
-/// set ... and is responsible for signing the DNSKEY RRset and distributing it
-/// to the providers": the RRSIG arrives in the zone file and this server keeps
-/// it rather than replacing it with one from a key it does not have.
-///
-/// Model 2 (§2.1.2) needs no setting. Each provider has its own KSK and signs
-/// the DNSKEY RRset itself; importing the other providers' ZSKs is a zone-file
-/// edit, and the signer has always published a key it did not put there.
+/// `imported` is RFC 8901 §2.1.1's Model 1: the owner signs the DNSKEY RRset,
+/// and its RRSIG in the zone file is kept. Model 2 (§2.1.2) needs no setting:
+/// an imported ZSK is a zone-file edit.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum DnskeyRrsig {
@@ -348,20 +326,16 @@ impl Config {
                  a bucket starts full, and a full bucket of nothing has no token to spend"
             );
         }
-        // The flag floors this at 1 instead, which is not an inconsistency: a
-        // mistyped flag should be wrong rather than fatal, and a config file is
-        // the one place a wrong value can be reported with a line number to the
-        // operator who is editing the whole policy at once. `query-burst` above
-        // splits the same way for the same reason.
+        // Unlike the flag, which floors to 1: a file can report the line.
+        // `query-burst` splits the same way.
         if self.server.udp_workers == 0 {
             bail!(
                 "server.udp-workers 0 binds the UDP socket and answers nothing on it; \
                  1 is the smallest server"
             );
         }
-        // Both or neither, and only where something fetches a zone over TLS.
-        // The flags get this from clap's `requires`, which a file has no
-        // equivalent of (`CLAUDE.md` §15).
+        // Both or neither, only where something fetches over TLS: clap's
+        // `requires` has no file equivalent (`CLAUDE.md` §15).
         match (
             &self.server.transfer_tls_cert,
             &self.server.transfer_tls_key,
@@ -410,16 +384,8 @@ impl Config {
                 );
             }
         }
-        // A zone naming a key that does not exist is the failure mode the flags
-        // already refuse: an operator who believes a transfer is authenticated
-        // and finds it is not has no way to see that from the outside.
-        //
-        // Through `MasterSpec::parse` rather than a `split_once('#')` here,
-        // which is the shape `CLAUDE.md` §7 warns about: the endpoint syntax
-        // has a `+tls=` suffix, and a copy reads `k.+tls=ns1.example.net.` as
-        // the key name. The flag's parser is the only thing that knows the
-        // syntax, so it is what has to be asked — and asking it validates the
-        // address here too.
+        // A key naming nothing is a transfer believed signed and not. Through
+        // `MasterSpec::parse`, the one `+tls=` parser (`CLAUDE.md` §7).
         for (zone, settings) in &self.zones {
             for master in &settings.masters {
                 let spec = rdns::secondary::MasterSpec::parse(&format!("{zone}@{master}"))
@@ -432,10 +398,8 @@ impl Config {
                         );
                     }
                 }
-                // The same rule the flags get, in the place the file's own
-                // reader can say it: anchors are what RFC 9103 §7.5's "the
-                // client MUST authenticate the server" needs, and a `+tls=`
-                // without them is a transfer that cannot happen.
+                // A `+tls=` master needs anchors to authenticate (RFC 9103
+                // §7.5), said where the file's reader can.
                 if spec.tls.is_some() && self.server.transfer_tls_ca.is_none() {
                     bail!(
                         "zone {zone:?} replicates from {master:?} over TLS, and \
@@ -540,9 +504,8 @@ impl Config {
                 _ => unreachable!("checked in Config::check"),
             };
             let mut spec = format!("{algorithm}:{name}:{secret}");
-            // The update scope is the fifth field, so granting one means
-            // spelling the fourth: `*` is how the unrestricted transfer scope is
-            // written when it cannot simply be left off the end.
+            // The update scope is the fifth field, so the fourth is spelled `*`
+            // when unrestricted.
             if !zones.is_empty() || !update_zones.is_empty() {
                 spec.push(':');
                 if zones.is_empty() {
@@ -562,20 +525,10 @@ impl Config {
 
     /// Fold this config into `cli`, returning what does not fit a flag.
     ///
-    /// Overwriting `cli` rather than threading a second settings type through the
-    /// daemon keeps every downstream caller untouched: the flags and the file
-    /// produce the same shape, so there is one code path and not two to drift
-    /// apart (`CLAUDE.md` §7). It is sound because the two are mutually exclusive
-    /// — nothing in `cli` can be an operator's explicit choice here.
-    ///
-    /// `[server]` is `apply_to`'s, generated beside the declarations, so a key
-    /// cannot parse and do nothing. What is left below is what is not a
-    /// `[server]` key.
-    ///
-    /// The rest is destructured without `..`, so a key added to a declaration
-    /// does not compile until this names it, and one named and not used is
-    /// `unused_variables`. `dead_code` covers only a key nothing reads; one
-    /// `check` validates and this forgot would pass silently.
+    /// One shape from flags and file, so one code path (`CLAUDE.md` §7); sound
+    /// because the two are exclusive. `[server]` is `apply_to`'s; the rest is
+    /// destructured without `..`, so a key added and not handled fails to
+    /// compile.
     pub(crate) fn apply(&self, cli: &mut Cli) -> Result<PerZone> {
         let Config {
             server,
@@ -635,11 +588,8 @@ impl Config {
                          would be a silent choice about what is being served"
                     );
                 }
-                // The origin comes from the *table key*, not from the file name.
-                // That quietly fixes a long-standing trap the flags still have:
-                // `--zone-file example.com.zone` derives the origin from the
-                // filename, so a mismatch yields NXDOMAIN for everything with no
-                // indication why. Here the operator has said the origin out loud.
+                // The origin is the table key, not the file name, so it cannot
+                // silently mismatch as `--zone-file`'s derived one can.
                 per_zone.files.insert(origin.clone(), file.clone());
             }
             if !also_notify.is_empty() {

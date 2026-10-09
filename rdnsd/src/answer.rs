@@ -46,11 +46,8 @@ pub(crate) fn write_response(
     let mut w = ResponseWriter::start(out, compressor, max_len, msg)?;
     w.set_authoritative(true);
 
-    // EDNS-level rejections take precedence over any zone lookup: a malformed
-    // option list is FORMERR, an EDNS version we don't implement is BADVERS.
-    // Both replies carry a bare version-0 OPT — BADVERS is an extended RCODE,
-    // so the OPT record is what carries its high bits. `rdnsr` reads the same
-    // decision out of `client_edns`.
+    // EDNS rejections first: FORMERR for a bad option list, BADVERS for an
+    // unknown version, both with a bare version-0 OPT (`client_edns`).
     let client_edns = match rdns::response::client_edns(msg) {
         Ok(edns) => edns,
         Err(rcode) => {
@@ -65,41 +62,22 @@ pub(crate) fn write_response(
     // (RFC 4035 §3.1.1). Not a demand that the zone be signed.
     let dnssec_ok = client_edns.do_bit();
 
-    // Only QUERY reaches the zone lookup. NOTIFY is answered by the caller,
-    // which knows the peer's address; anything else is NOTIMP rather than
-    // treated as a lookup (RFC 1035 §4.1.1).
+    // Only QUERY reaches the lookup; the caller answers NOTIFY, anything else
+    // is NOTIMP (RFC 1035 §4.1.1).
     if msg.opcode != OpCode::Query {
         w.set_rcode(ResponseCode::NotImplemented);
         w.set_authoritative(false);
         w.set_extended_error(UNIMPLEMENTED_OPCODE);
-        // This `return` jumps over the EDNS mirroring at the end of the
-        // function, and RFC 6891 §6.1.1 says a response to a request that had an
-        // OPT includes one. Some clients remember a missing OPT as a downgrade
-        // and never offer EDNS again.
-        //
-        // `ClientEdns::Present` and `msg.has_edns()` agree here: they differ
-        // only for a malformed option list, which answered FORMERR above.
+        // This `return` skips the EDNS mirroring at the end, and RFC 6891
+        // §6.1.1 requires the OPT, so mirror it here.
         if let Some(edns) = client_edns.mirror(advertised) {
             w.set_edns(edns);
         }
         return w.finish();
     }
 
-    // Exactly one question, or FORMERR. RFC 9619 §4: "A DNS message with
-    // OPCODE = 0 MUST NOT include a QDCOUNT parameter whose value is greater
-    // than 1", and one that does "MUST be treated as an incorrectly formatted
-    // message" — one RCODE, one AA bit and one set of sections cannot describe
-    // two lookups.
-    //
-    // QDCOUNT = 0 too (`TODO.md` #78c). §4's other sentence binds *firewalls*
-    // ("Such firewalls MUST NOT treat messages with OPCODE = 0 and QDCOUNT = 0
-    // as malformed"), not responders, and a NOERROR would set AA over a
-    // question section naming nothing to be authoritative for. RFC 7873 §5.4 is
-    // what such a query is for and extends the QUERY opcode to it only "for
-    // servers with DNS Cookies enabled"; without cookies it says such a server
-    // "will normally send FORMERR". Measured: BIND 9.20.27, Knot 3.6.0, NSD
-    // 4.12.0 and Unbound 1.23.1 all answer FORMERR to one carrying no OPT, and
-    // none of them sets AA.
+    // Exactly one question, else FORMERR (RFC 9619 §4), QDCOUNT = 0 included,
+    // since NOERROR would claim AA over nothing (`TODO.md` #78c).
     match msg.queries.as_slice() {
         [query] => answer_question(query, zones, dnssec_ok, &mut w)?,
         _ => {
@@ -155,11 +133,8 @@ fn answer_question(
     dnssec_ok: bool,
     w: &mut ResponseWriter,
 ) -> Result<(), WireError> {
-    // Every zone here is IN, and RFC 1034 §4.3.2 step 1 searches the zones
-    // *of the question's class* — so a CH or HS question is the same
-    // situation as a zone we do not serve, and REFUSED for the reason at the
-    // bottom of this function. QCLASS=ANY (255) matches any class
-    // (RFC 1035 §3.2.5), so it is not refused.
+    // Every zone is IN: a CH or HS question is a zone we do not serve (RFC 1034
+    // §4.3.2 step 1). QCLASS=ANY matches (RFC 1035 §3.2.5).
     if !matches!(query.qclass, QueryClass::IN | QueryClass::Any) {
         w.set_rcode(ResponseCode::Refused);
         w.set_authoritative(false);
@@ -167,19 +142,14 @@ fn answer_question(
         return Ok(());
     }
 
-    // AXFR is defined over TCP alone (RFC 5936 §4.2), so a UDP request for
-    // it is malformed rather than merely refused. The TCP server answers
-    // AXFR before reaching here, so this is the UDP path speaking.
+    // AXFR is TCP only (RFC 5936 §4.2), so over UDP it is malformed.
     if query.qtype == Qtype::AXFR {
         w.set_rcode(ResponseCode::FormatError);
         return Ok(());
     }
 
-    // An IXFR over UDP is expected. RFC 1995 §2: answer a single SOA of the
-    // current version, telling the client to come back over TCP. Done
-    // always, rather than only when the increment will not fit — the ACL,
-    // TSIG session and message packing all live on the TCP path. The SOA
-    // discloses nothing an ordinary SOA query does not.
+    // IXFR over UDP: a single SOA, sending the client to TCP (RFC 1995 §2),
+    // where the ACL and TSIG live.
     if query.qtype == Qtype::IXFR {
         match zones.for_query(query.qname.as_ref()) {
             Some(zone) => {
@@ -205,11 +175,8 @@ fn answer_question(
     // `for_query` and `zone_answer` each fold onto the stack, so neither
     // allocates.
     let Some(zone) = zones.for_query(query.qname.as_ref()) else {
-        // A zone we do not serve is REFUSED, not NXDOMAIN. NXDOMAIN asserts
-        // the name exists nowhere, which we have no standing to say, and a
-        // resolver caches it (RFC 2308). BIND, NSD and Knot all answer
-        // REFUSED here. It matters most for a *withdrawn* zone: an expired
-        // secondary answering NXDOMAIN takes its zone off the internet.
+        // REFUSED, not NXDOMAIN: we cannot say the name exists nowhere, and a
+        // cached NXDOMAIN would take a withdrawn zone off the internet.
         w.set_rcode(ResponseCode::Refused);
         w.set_authoritative(false);
         w.set_extended_error(NOT_OUR_ZONE);

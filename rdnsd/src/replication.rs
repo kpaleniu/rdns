@@ -63,12 +63,9 @@ pub(crate) struct RefreshTask {
     spec: MasterSpec,
     /// A NOTIFY arriving cuts the wait short.
     wake: Arc<Notify>,
-    /// Held rather than dropped, so a task can be stopped. Dropping a
-    /// `JoinHandle` detaches the task and cancels nothing (`CLAUDE.md` §9), and
-    /// a catalog that drops a member has to stop asking its master about it.
-    ///
-    /// `None` only in a registry a test built: what those check is what the
-    /// registry answers, and there is no runtime under them to have spawned on.
+    /// Held, so a task can be stopped: dropping a `JoinHandle` detaches it
+    /// (`CLAUDE.md` §9). `None` only in a registry a test built, with no
+    /// runtime.
     handle: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -81,18 +78,10 @@ pub(crate) struct ReplicatedZone {
 
 /// Replicated zones by origin.
 ///
-/// [`NameKeyBuf`] rather than `Vec<u8>`, which leaves the insertion here and
-/// the probe in [`Secondaries::notified`] each folding by hand (`CLAUDE.md`
-/// §17). The constructor folds, so they cannot disagree, and `Borrow<[u8]>`
-/// keeps the probe free of an allocation.
-///
-/// Mutable behind a lock, because catalog zones make membership a thing that
-/// changes while the process runs (RFC 9432 §5.1: "when a name server that
-/// supports catalog zones completes a zone transfer for a catalog zone, it
-/// SHOULD apply changes ... without any manual intervention"). A
-/// `std::sync::RwLock` and not tokio's: every section below is a map probe,
-/// `notified` is called from a `fn` on the answering path, and nothing here
-/// awaits.
+/// [`NameKeyBuf`] folds on construction, so insertion and the probe in
+/// [`Secondaries::notified`] agree (`CLAUDE.md` §17). Mutable, as catalogs
+/// change membership at run time (RFC 9432 §5.1), behind a `std` lock: every
+/// section is a map probe, called from sync code.
 #[derive(Default)]
 pub(crate) struct Secondaries {
     by_zone: std::sync::RwLock<HashMap<NameKeyBuf, ReplicatedZone>>,
@@ -210,17 +199,9 @@ impl Secondaries {
 
     /// Stop replicating `zone`: abort its refresh tasks and forget them.
     ///
-    /// Aborted rather than asked to stop, so that the caller's next step — which
-    /// is removing the zone and deleting its file — cannot race a transfer that
-    /// is halfway through installing it. What an abort can interrupt is an await,
-    /// so the two places it can land in a refresh are a socket read and a lock
-    /// acquisition, and `install_zone` mutates nothing between taking its two
-    /// guards and finishing.
-    ///
-    /// The handles come back because `abort` only *requests* it: the task stops
-    /// at its next poll, which can be after a `write_zone_file` already under
-    /// way. Awaiting them is what makes "deleted the member's file" true rather
-    /// than likely — see [`Secondaries::retired`].
+    /// Aborted, so deleting the file cannot race an install; an abort lands
+    /// only at an await. The handles come back because abort is a request:
+    /// awaiting them makes the deletion final ([`Secondaries::retired`]).
     #[must_use = "await the handles, or the file this deletes can be written again"]
     pub(crate) fn retire(&self, zone: NameRef<'_>) -> Vec<tokio::task::JoinHandle<()>> {
         let Some(replicated) = self.write().remove(&*zone.folded()) else {
@@ -241,9 +222,8 @@ impl Secondaries {
     /// writing that zone's file.
     pub(crate) async fn retired(&self, zone: NameRef<'_>) {
         for handle in self.retire(zone) {
-            // `Err` is the cancellation we asked for, or a panic already logged
-            // by the runtime. Either way the task has stopped, which is the
-            // whole question here.
+            // `Err` is the requested cancellation or a logged panic; either way
+            // the task has stopped.
             let _ = handle.await;
         }
     }
@@ -281,16 +261,11 @@ pub(crate) struct ReplicationContext {
 }
 
 impl ReplicationContext {
-    /// How to reach this spec's master: TLS when the spec asked for it
-    /// (RFC 9103), plain TCP otherwise.
+    /// How to reach this spec's master: TLS when the spec asked for it (RFC
+    /// 9103), plain TCP otherwise.
     ///
-    /// The error cannot be reached from a running server — startup refuses a
-    /// `+tls=` spec when no `--transfer-tls-ca` names the anchors, and a
-    /// catalog's member inherits its catalog's spec whole
-    /// ([`MasterSpec::for_member`]). It is an error rather than a fall back to
-    /// cleartext because a transfer that quietly goes out unencrypted after an
-    /// operator asked for TLS is `CLAUDE.md` §4's case exactly: nothing fails,
-    /// and the zone crosses the wire in the clear.
+    /// Unreachable while startup refuses `+tls=` without anchors, and an error
+    /// rather than cleartext: a silent fallback is `CLAUDE.md` §4's case.
     fn master(&self, spec: &MasterSpec) -> Result<Master> {
         match (&spec.tls, &self.xot) {
             (None, _) => Ok(Master::plain(spec.master)),
@@ -464,9 +439,8 @@ impl Replica for ZoneReplica {
     }
 
     async fn in_contact(&mut self, _after_expiry: bool) {
-        // If this zone is a catalog, what it now lists is what this server
-        // should hold (RFC 9432 §5.1). A no-op for every other zone, and for a
-        // catalog whose serial has not moved.
+        // A catalog's listing is what this server should hold (RFC 9432 §5.1);
+        // a no-op otherwise or with an unmoved serial.
         self.replication
             .catalogs
             .reconcile(self.spec.zone.as_ref(), &self.replication, &self.lifecycle)
@@ -547,10 +521,8 @@ pub(crate) async fn refresh_once(
     write_zone_file(&fetched, &path)?;
 
     let count = fetched.records().len();
-    // A whole-zone replacement under the write lock: readers see the old zone
-    // or the new one, never a half-applied transfer. The delta is computed here
-    // because this is the only moment both versions exist, and it is what lets
-    // us answer an IXFR for this step to our own downstream secondaries.
+    // Replaced whole under the write lock, so readers see one version. The
+    // delta is computed now, the only moment both exist, for our own IXFR.
     let soa = fetched.apex_soa_record();
     install_zone(served, fetched).await;
     record_state(state, spec, serial, now, metrics).await?;
@@ -585,15 +557,12 @@ pub(crate) async fn record_state(
     now: u64,
     metrics: &DnsMetrics,
 ) -> Result<()> {
-    // Contact, not transfer: all three callers mean "reached the master", and
-    // contact is what EXPIRE counts from. A replica in contact with nothing new
-    // to fetch is healthy, and a gauge moving only on a transfer calls it stale.
+    // Contact, not transfer: EXPIRE counts from contact, and an up-to-date
+    // replica is healthy.
     metrics.note_zone_transfer(spec.zone.as_ref(), now);
 
-    // Update in memory under the guard, write outside it. `StateFile::record`
-    // does both, and its write ends in an fsync of the file and its directory —
-    // holding a `std::sync::Mutex` that every other refresh loop then spins on,
-    // on a worker also answering queries.
+    // Updated under the guard, written outside it: the write fsyncs, and other
+    // refresh loops would wait on the `std` mutex.
     let (path, text) = {
         let mut file = state.lock().expect("state mutex");
         file.set(TransferState {
@@ -679,24 +648,10 @@ pub(crate) async fn withdraw(served: &ZoneContext, zone: NameRef<'_>) -> bool {
 
 /// Withdraw every replicated zone whose age we cannot vouch for.
 ///
-/// Called after each fill of the zone map from disk — startup and every reload,
-/// since that is when an expired file can come back. Called from `main` alone,
-/// a SIGHUP re-reads every `.zone` file and serves it with AA set again.
-///
-/// Two ways a zone fails to earn an answer:
-///
-/// - Its last successful contact is older than the SOA's EXPIRE.
-/// - There is no record of contact at all, so the zone came off disk — a
-///   missing sidecar, an unreadable one, or lines only for masters no longer
-///   configured. `StateFile::load` returns empty and never fails, so unknown
-///   age has to mean "do not serve". The zone returns at the first successful
-///   transfer.
-///
-/// Asked per zone over all of its masters in `specs`, not per spec: one master
-/// in contact vouches for the zone (`TODO.md` #131).
-///
-/// A zone we hold but do not replicate is untouched: the loop is over the
-/// `--secondary` specs.
+/// Called after each fill from disk, startup and every reload. A zone fails if
+/// its last contact is older than EXPIRE, or there is none on record, as
+/// `StateFile::load` never fails. One master in contact vouches for the zone
+/// (`TODO.md` #131); a zone we do not replicate is untouched.
 pub(crate) async fn withdraw_unvouched_zones(
     specs: &[MasterSpec],
     served: &ZoneContext,

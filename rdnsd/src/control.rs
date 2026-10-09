@@ -128,16 +128,14 @@ async fn status(control: &Control) -> String {
         let mut rows: Vec<Row> = zones
             .values()
             .map(|zone| {
-                // The metrics label is presentation text, so that comparison
-                // happens there; the replication registry is keyed on names and
-                // is asked as one.
+                // The metrics label is text and compared as text; the registry
+                // is keyed on names.
                 let origin = zone.origin().to_presentation();
                 let gauge = facts.iter().find(|f| f.zone.eq_ignore_ascii_case(&origin));
                 Row {
                     zone: origin.clone(),
-                    // The gauge is the number being served, which is not the
-                    // file's once signing is on. The fallback covers the moment
-                    // between a zone being installed and its gauge being set.
+                    // The served serial, not the file's once signed; the
+                    // fallback covers the moment before the gauge is set.
                     serial: gauge
                         .map(|g| g.serial)
                         .or_else(|| zone.serial())
@@ -213,15 +211,8 @@ async fn status(control: &Control) -> String {
 /// What each consumed catalog provisioned, under which member node and group,
 /// and what it declined.
 ///
-/// RFC 9432 §6 asks for exactly this: "Querying/serving catalog zone contents
-/// may be inconvenient via DNS due to the nature of their representation ...
-/// Implementations are therefore advised to provide a tool that uses either the
-/// output of AXFR or an out-of-band method to perform queries on catalog
-/// zones."
-///
-/// The refusals are the half `status` cannot have. A member this server
-/// declined — §5.2's clash, or two groups that disagree — has no zone, so it has
-/// no row in `status`, and until now it appeared in the log and nowhere else.
+/// RFC 9432 §6 advises such a tool. A declined member, a §5.2 clash or
+/// disagreeing groups, has no zone and so no row in `status`.
 async fn catalog(args: &[String], control: &Control) -> String {
     let reports = control.catalogs.report().await;
     if reports.is_empty() {
@@ -265,9 +256,7 @@ async fn catalog(args: &[String], control: &Control) -> String {
                 // catalog, which the heading already said.
                 String::from_utf8_lossy(node.as_ref().labels().next().unwrap_or(b"")),
                 match group {
-                    // Lossy on purpose, and only here: a group value is octets
-                    // and this is a line for a person to read. Nothing compares
-                    // against what this prints.
+                    // Lossy, for a person to read; nothing compares against it.
                     Some(value) => format!("{:?}", String::from_utf8_lossy(value)),
                     None => "-".to_string(),
                 }
