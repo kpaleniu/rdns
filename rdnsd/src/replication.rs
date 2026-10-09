@@ -840,12 +840,8 @@ mod tests {
         assert_eq!(entry.serial, Serial::new(7));
         assert!(entry.refreshed_at > 0);
 
-        // ...*on disk*, and not only in the copy held in memory. The assertion
-        // above passes whether or not the sidecar was ever written, which is
-        // exactly what a restart depends on — and the half a refactor of the
-        // write path can break in silence. `record_state` updates under the
-        // mutex and writes after dropping it, so "the entry is there" and "the
-        // file has it" became two separate claims.
+        // And on disk: `record_state` writes after dropping the mutex, so the
+        // in-memory entry and the file are separate claims.
         let on_disk = StateFile::load(&state_file_path(dir.path()))
             .get("example.com.", master)
             .cloned()
@@ -1326,9 +1322,8 @@ mod tests {
             tls: None,
         };
 
-        // The first transfer announces; answer it. Unanswered, it is resent
-        // after `NOTIFY_RETRY_SECS` (RFC 1996 §3.6), and under load that resend
-        // lands in the silence window below.
+        // Answer the first announcement, or its resend (RFC 1996 §3.6) lands in
+        // the silence window below.
         refresh_once(&spec, None, &r, &test_shutdown().busy())
             .await
             .expect("transfer");
@@ -1567,11 +1562,8 @@ mod tests {
         assert!(reply.answers.is_empty(), "a refusal carries no zone");
     }
 
-    /// #46a: a NOTIFY signed, and verified by the *reader* rather than by
-    /// looking at it. `check_request` is the same function the answering path
-    /// runs on an inbound message, so this is the check a real secondary makes.
-    ///
-    /// Fails at `TsigCheck::Unsigned` if the NOTIFY goes out unsigned.
+    /// A signed NOTIFY verified by `check_request`, as a real secondary checks
+    /// it. Fails at `TsigCheck::Unsigned` if it goes out unsigned.
     #[tokio::test]
     async fn test_a_notify_can_be_signed_and_verifies_as_a_request() {
         let dir = ScratchDir::new("announce-signed");

@@ -255,12 +255,9 @@ x.sub2   IN A   192.0.2.30
             .collect()
     }
 
-    /// RFC 6672 §3.1 and §3.2 step 3C: a name below a DNAME gets the DNAME and
-    /// a CNAME the server synthesizes from it, and the chain then continues at
-    /// the substituted name.
-    ///
-    /// Fails with NXDOMAIN, from a zone that holds the redirection and never
-    /// applies it.
+    /// RFC 6672 §3.1 and §3.2 step 3C: a name below a DNAME gets the DNAME, a
+    /// synthesized CNAME, and the chain at the substituted name. Fails with
+    /// NXDOMAIN from a zone that never applies the redirection.
     #[test]
     fn a_name_below_a_dname_is_redirected_through_a_synthesized_cname() {
         let response = ask("a.redir.example.com.", Qtype::of(record_types::A));
@@ -337,13 +334,9 @@ x.sub2   IN A   192.0.2.30
         assert_eq!(cnames[0].name, nm("A.ReDiR.example.com."));
     }
 
-    /// RFC 6672 §2.2: "The domain name can get too long during substitution...
-    /// If this occurs, the server returns an RCODE of YXDOMAIN. The DNAME
-    /// record and its signature (if the zone is signed) are included in the
-    /// answer as proof for the YXDOMAIN (value 6) RCODE."
-    ///
-    /// The RFC's own arithmetic: a target of 250 octets and a first label over
-    /// five octets.
+    /// RFC 6672 §2.2: a substitution too long is YXDOMAIN, with "The DNAME
+    /// record and its signature" as proof. The RFC's own arithmetic: a
+    /// 250-octet target and a first label over five octets.
     #[test]
     fn a_substitution_over_255_octets_is_yxdomain_with_the_dname_as_proof() {
         let label = "a".repeat(49);
@@ -389,15 +382,9 @@ x.sub2   IN A   192.0.2.30
         assert_eq!(rdatas(&response.answers, record_types::CNAME).len(), 1);
     }
 
-    /// RFC 6672 §2.4: "Resource records MUST NOT exist at any subdomain of the
-    /// owner of a DNAME RR... If the server does load the zone, those names
-    /// below the DNAME RR will be occluded as described in RFC 2136,
-    /// Section 7.18."
-    ///
-    /// `check_dname_rules` refuses such a zone from a file, so this one is
-    /// built the way a transfer or an UPDATE builds one — which is the case
-    /// that check cannot reach, and the reason the redirection is applied
-    /// before the name is looked up rather than after.
+    /// RFC 6672 §2.4: names below a DNAME owner "will be occluded". Built as a
+    /// transfer or UPDATE builds it, since `check_dname_rules` refuses the
+    /// file; hence the redirection is applied before the lookup.
     #[test]
     fn a_record_below_a_dname_owner_is_occluded_not_answered() {
         let mut zone = parse_zone_file(ZONE, "example.com.").expect("the test zone parses");
@@ -429,21 +416,13 @@ x.sub2   IN A   192.0.2.30
         assert_eq!(rdatas(&response.answers, record_types::CNAME).len(), 1);
     }
 
-    /// A resolver randomizes the case of the QNAME and compares the echo byte
-    /// for byte; a mismatch is a spoofed answer as far as it is concerned
-    /// (DNS-0x20). The answer therefore echoes the name *as asked*, not as the
-    /// zone or the lookup key spells it (RFC 1034 §4.3.3, RFC 4343 on why the
-    /// lookup may fold and the echo may not).
-    ///
-    /// The folded key and the echoed name are separate values, and only a
-    /// mixed-case question can tell them apart: every other test here asks in
-    /// lower case, where a regression is invisible.
+    /// A DNS-0x20 resolver compares the echo byte for byte, so the QNAME is
+    /// echoed as asked, not as the zone spells it (RFC 1034 §4.3.3, RFC 4343).
+    /// Only a mixed-case question tells the folded key from the echo.
     #[test]
     fn a_case_randomized_qname_is_echoed_exactly_as_asked() {
-        // `host` is a plain A: `www` in this zone is a CNAME, whose answer
-        // section ends at the target's own name and would hide the property.
-        // The wildcard case is the second one — synthesis must echo the name
-        // asked for, never `*.example.com.` (RFC 4592 §3.3.1).
+        // `host`, a plain A, as the CNAME at `www` would hide this. The
+        // wildcard case echoes the name asked, never `*.example.com.`.
         for asked in [
             "HoSt.eXaMpLe.CoM.",
             "AnYtHiNg.ExAmPlE.cOm.",
@@ -546,18 +525,13 @@ x.sub2   IN A   192.0.2.30
         assert_eq!(glue[0].name, nm("ns.sub.example.com."));
     }
 
-    /// A wildcard *below* the cut does not make the name exist here either,
-    /// and the referral comes first.
+    /// A wildcard *below* the cut does not make the name exist here either, and
+    /// the referral comes first.
     ///
-    /// `dnssec_answer::deny_the_name_and_its_wildcard` needs
-    /// `*.<closest encloser>` to be absent, or its `nsec_covering` search
-    /// yields the record before a name that is in the chain and proves nothing.
-    /// `Zone::name_kind` does not guarantee it: its delegation `NotFound` is
-    /// because RFC 4592 §2.2.1 forbids synthesis below a cut, which says
-    /// nothing about the index. The guarantor is `rdns::zone_answer`'s
-    /// `resolve_in_zone`, which asks `delegation_for` before anything else
-    /// (RFC 1034 §4.3.2's first case), so a name under a cut never reaches a
-    /// negative proof at all. This holds it end to end.
+    /// `deny_the_name_and_its_wildcard` needs `*.<closest encloser>` absent;
+    /// the guarantee is `resolve_in_zone` asking `delegation_for` first (RFC
+    /// 1034 §4.3.2), so a name under a cut never reaches a proof. Held end to
+    /// end.
     #[test]
     fn a_wildcard_below_a_cut_is_still_a_referral() {
         let mut text = ZONE.to_string();
@@ -725,15 +699,9 @@ ns1 IN A   192.0.2.1
         assert_eq!(rdatas(&response.authorities, record_types::SOA).len(), 1);
     }
 
-    /// The class was stored, parsed and then never compared, so a CH
-    /// question was answered out of the IN zone — putting `CLASS=CH` in the
-    /// echoed question next to `CLASS=IN` records in the answer, a pairing
-    /// no resolver can make sense of. RFC 1034 §4.3.2 step 1 searches the
-    /// zones *of the question's class*, and there are none.
-    ///
-    /// REFUSED rather than NXDOMAIN for the reason the rest of this file
-    /// gives: NXDOMAIN is an assertion about the DNS that a server holding
-    /// nothing in that class has no standing to make, and resolvers cache it.
+    /// A CH question is not answered from the IN zone: RFC 1034 §4.3.2 step 1
+    /// searches the zones of the question's class, and there are none. REFUSED,
+    /// not NXDOMAIN, which would be cached as a claim we cannot make.
     #[test]
     fn a_class_this_server_does_not_serve_is_refused() {
         for class in [QueryClass::CH, QueryClass::HS, QueryClass::Other(99)] {
@@ -804,21 +772,9 @@ ns1 IN A   192.0.2.1
         }
     }
 
-    /// Two questions is FORMERR (RFC 9619 §4), not two answers.
-    ///
-    /// Every answer piled into one message has no meaning: there is one RCODE,
-    /// one AA bit and one set of sections, so a NOERROR answer and an NXDOMAIN
-    /// in the same reply are indistinguishable from an answer and a NODATA. §4
-    /// makes it explicit — "A DNS message with OPCODE = 0 MUST NOT include a
-    /// QDCOUNT parameter whose value is greater than 1", to "be treated as an
-    /// incorrectly formatted message" — and BIND, NSD, Knot and Unbound all do
-    /// this.
-    ///
-    /// So is no question at all (`TODO.md` #78c). §4's other sentence — "Such
-    /// firewalls MUST NOT treat messages with OPCODE = 0 and QDCOUNT = 0 as
-    /// malformed" — is addressed to middleboxes deciding what to forward, not
-    /// to responders deciding what to answer, and says nothing about an AA bit
-    /// over an empty question section.
+    /// Two questions is FORMERR (RFC 9619 §4), not two answers: one RCODE, AA
+    /// bit and set of sections cannot describe two lookups. No question is
+    /// FORMERR too (`TODO.md` #78c); §4's QDCOUNT = 0 sentence binds firewalls.
     #[test]
     fn two_questions_in_one_query_are_a_format_error() {
         let mut msg = query("www.example.com.", Qtype::of(record_types::A), false);
@@ -847,18 +803,12 @@ ns1 IN A   192.0.2.1
         assert!(none.answers.is_empty());
     }
 
-    /// Choosing a zone folds ASCII case and nothing else (RFC 4343), which
-    /// is what the zone index inside it has always done.
+    /// Choosing a zone folds ASCII case and nothing else (RFC 4343), as the
+    /// zone index does.
     ///
-    /// The lookup lower-cased both sides with `str::to_lowercase`
-    /// — the full Unicode mapping, which folds U+212A KELVIN SIGN to `k`. A
-    /// query for `\u{212A}.example.com.` therefore *selected* the zone
-    /// `k.example.com.`, two names that are different bytes on the wire. The
-    /// lookup inside then folded ASCII, found nothing, and the answer went
-    /// out as NXDOMAIN with AA set — an assertion that a name does not
-    /// exist anywhere, made by a server with no standing to make it, and
-    /// cached by every resolver that hears it (`CLAUDE.md` §8). REFUSED is
-    /// the answer for a name we hold no zone for.
+    /// `str::to_lowercase` folds U+212A KELVIN SIGN to `k`, which would select
+    /// `k.example.com.` for a different name and answer NXDOMAIN with AA; the
+    /// answer for a name we hold no zone for is REFUSED (`CLAUDE.md` §8).
     #[test]
     fn choosing_a_zone_folds_ascii_case_and_nothing_else() {
         let zone = parse_zone_file(
@@ -892,14 +842,9 @@ ns1 IN A   192.0.2.1
         assert_eq!(rdatas(&answered.answers, record_types::SOA).len(), 1);
     }
 
-    /// A child zone answers for its own names even when its parent is served
-    /// here too — the most specific zone wins, which is what the walk finds
-    /// first and what the scan's `max_by_key` found by length.
-    ///
-    /// Preventative, not a regression (§10): both spellings of the lookup get
-    /// this right. It is here because the walk is the *only* thing that decides
-    /// it now, and a walk that started at the apex instead of the QNAME would
-    /// pass every other test in this file.
+    /// A child zone answers for its own names when its parent is served too:
+    /// the most specific wins. Preventative (`CLAUDE.md` §10): a walk starting
+    /// at the apex would pass every other test here.
     #[test]
     fn the_child_zone_answers_for_names_below_the_cut() {
         let parent = parse_zone_file(ZONE, "example.com.").expect("the parent zone parses");
@@ -1177,9 +1122,8 @@ ns.plain  IN A   192.0.2.30
                 };
                 assert_eq!(wildcard, nm("*.example.com."));
 
-                // And the denial it owes: without it one captured answer is a
-                // valid answer for every name the wildcard reaches
-                // (RFC 4035 §3.1.3).
+                // And the denial it owes, or one captured answer is valid for
+                // every name the wildcard reaches (RFC 4035 §3.1.3).
                 let verdict = proves_wildcard_expansion(
                     nm(qname).as_ref(),
                     wildcard.as_ref(),
@@ -1193,18 +1137,11 @@ ns.plain  IN A   192.0.2.30
             }
         }
 
-        /// An ANY answer from a signed zone owes a signature over every
-        /// RRset it returns, and the filter that finds them was
-        /// `sig.type_covered != qtype` — which matches nothing for QTYPE 255,
-        /// because no RRSIG covers a QTYPE. Left alone, making ANY return every
-        /// type would have handed a validator the whole of a signed name's data
-        /// with no signatures on it at all: bogus, not merely unsigned, and a
-        /// SERVFAIL for the name.
+        /// An ANY answer from a signed zone owes a signature over every RRset
+        /// it returns; no RRSIG covers QTYPE 255, so a type filter finds none.
         ///
-        /// Judged with `verify_rrset` — the same code that judges a real zone
-        /// off the internet — rather than by counting RRSIG records, because a
-        /// signature that is present and does not verify passes a count
-        /// (`CLAUDE.md` §1).
+        /// Judged with `verify_rrset`, the code that judges a real zone, not by
+        /// counting RRSIGs, which a bad signature passes (`CLAUDE.md` §1).
         #[test]
         fn an_any_answer_from_a_signed_zone_is_signed_rrset_by_rrset() {
             for nsec3 in [false, true] {
@@ -1217,10 +1154,8 @@ ns.plain  IN A   192.0.2.30
 
                 assert_eq!(response.rcode, ResponseCode::Ok, "nsec3={nsec3}");
 
-                // Every type the apex actually holds must be in the answer, and
-                // the DNSSEC meta types must not: RFC 4035 §3.1.1 keeps NSEC and
-                // the signatures out of the answer section, and an NSEC there
-                // would also make an empty non-terminal look like data.
+                // Every type at the apex, and no DNSSEC meta type: RFC 4035
+                // §3.1.1 keeps NSEC and RRSIG out of the answer section.
                 for rtype in [record_types::SOA, record_types::NS, record_types::DNSKEY] {
                     assert!(
                         response.answers.iter().any(|r| r.rdata.rtype() == rtype),
@@ -1435,9 +1370,8 @@ ns.plain  IN A   192.0.2.30
 
         #[test]
         fn a_client_that_did_not_ask_gets_no_dnssec_records() {
-            // The DO bit is what says the client can read them. Sending them
-            // anyway is bytes on an amplification path for a client that will
-            // ignore them, and a response that may no longer fit a datagram.
+            // Without DO the client cannot read them: bytes on an amplification
+            // path, and a reply that may not fit.
             let (zones, _keys) = signed_server(false);
             let metrics = DnsMetrics::new();
 
@@ -1494,11 +1428,8 @@ ns.plain  IN A   192.0.2.30
 
         #[test]
         fn keys_are_generated_loaded_and_used_without_anything_in_between() {
-            // The whole operator path in one test: make the keys, point the
-            // server at the directory, and have what it serves verify. Each
-            // step is checked elsewhere; what this catches is the two ends not
-            // meeting — a key written under a name the loader does not look
-            // for, or loaded for a zone whose origin is spelled differently.
+            // The whole operator path: generate keys, load, verify what is
+            // served; it catches the ends not meeting on a name or origin.
             let dir = ScratchDir::new("signing");
             generate_keys("example.com", dir.path(), "ECDSAP256SHA256").expect("generate");
 
@@ -1586,9 +1517,8 @@ ns.plain  IN A   192.0.2.30
 
         #[test]
         fn a_signature_that_stopped_matching_its_records_stops_the_server() {
-            // The failure this check exists for: the zone file was edited and
-            // the signatures were not renewed, so what goes out is signed data
-            // that no longer says what the signature says it says.
+            // The case this exists for: the file edited and the signatures not
+            // renewed.
             let (mut zones, _keys) = signed_server(false);
             let edited = {
                 let zone = zones

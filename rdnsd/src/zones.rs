@@ -1719,12 +1719,8 @@ mod tests {
     /// A journal belonging to no zone we hold is deleted at startup, and one
     /// belonging to a zone we do hold is not.
     ///
-    /// The withdrawal nobody was running for: a reload deletes the journal of a
-    /// zone it drops, so the only way to leave one behind is to remove the zone
-    /// while the process is down, and the file then resurfaces under a zone of
-    /// the same name.
-    ///
-    /// Fails without the sweep: both journals are still there.
+    /// The zone was removed while the process was down. Fails without the
+    /// sweep: both journals remain.
     #[tokio::test]
     async fn a_journal_no_zone_claims_is_discarded_at_startup() {
         let dir = ScratchDir::new("orphan-journal");
@@ -1825,14 +1821,9 @@ mod tests {
         );
     }
 
-    /// Choosing a zone must cost the same however many zones are served.
-    ///
-    /// A ratio, not a floor: the same lookups timed against one zone and
-    /// against a thousand, on whatever machine runs it. A scan reads 10.3 ns at
-    /// one zone and 4.1 µs at a thousand; the walk reads 30 ns and 32. Fails
-    /// against the scan at 554×.
-    ///
-    /// The two loops do identical work per query; only the map size differs.
+    /// Choosing a zone must cost the same however many zones are served: a
+    /// ratio, one zone against a thousand, identical work per query. Fails
+    /// against a scan.
     #[test]
     fn choosing_a_zone_costs_the_same_however_many_are_served() {
         const ZONES: usize = 1_000;
@@ -1859,17 +1850,9 @@ mod tests {
         );
     }
 
-    /// And it must cost the same however long the *client's* name is.
-    ///
-    /// The other multiplier, and the one a stranger picks. A 34-label
-    /// reverse-IPv6 PTR has 34 suffixes, and on a server whose zones are two
-    /// labels deep only the last two can match. Walking down from the QNAME
-    /// hashes all of them: 598 ns against 40 for an ordinary name. Starting at
-    /// [`Zones::deepest`] reads 53 either way.
-    ///
-    /// A regression for a defect the walk introduced, not for the scan it
-    /// replaced — a scan gets this right by accident, its cost being the zone
-    /// count and never the name.
+    /// And the same however long the client's name is: a 34-label PTR has 34
+    /// suffixes, and only the deepest few can match. Starting at
+    /// [`Zones::deepest`] makes the length irrelevant.
     #[test]
     fn a_long_qname_does_not_cost_more_than_a_short_one() {
         let mut zones = Zones::default();
@@ -1892,20 +1875,8 @@ mod tests {
 
     /// Verifying a zone costs the same *per RRset* however big the zone is.
     ///
-    /// A ratio and not a floor (`CLAUDE.md` §10), because the number itself is
-    /// one ECDSA verification and belongs to the machine. What belongs to the
-    /// code is the shape: `TODO.md` #50 was the check collecting
-    /// every DNSKEY and every RRSIG in the zone on every call, so the per-RRset
-    /// cost grew with the zone — 32 µs at 5,006 RRsets against 1,402, and
-    /// 5,632 at 20,006. On a load that meant two minutes for a zone of ten
-    /// thousand records and days for a million.
-    ///
-    /// Four times the zone, so the per-RRset cost is the assertion. Measured on
-    /// the development machine, debug build: **1.02×** as it stands and
-    /// **2.23×** against the old call, which is what the bound of 1.5 sits
-    /// between. Not larger sizes: the quadratic would read further above 1 and
-    /// the signing that sets the zone up is already three quarters of the
-    /// second this test costs.
+    /// A ratio at four times the zone, bound 1.5 (`CLAUDE.md` §10). Fails when
+    /// keys are collected per call, the quadratic of `TODO.md` #50.
     #[test]
     fn verifying_a_zone_costs_the_same_per_rrset_however_big_it_is() {
         const SMALL: usize = 1000;
@@ -1978,14 +1949,8 @@ mod tests {
         (map, rrsets)
     }
 
-    /// A zone this server signed is proved once, not at every reload.
-    ///
-    /// Re-signing is a reload, and a reload that re-verifies everything spends
-    /// 76 s of a million-record zone proving what the 28 s above it has just
-    /// produced with the same keys.
-    ///
-    /// Counts, not a clock (`CLAUDE.md` §10): the claim is that the second pass
-    /// checks nothing, which is an equality.
+    /// A zone this server signed is proved once, not at every reload; counted,
+    /// not timed (`CLAUDE.md` §10).
     #[test]
     fn a_zone_we_signed_with_the_same_keys_is_proved_once() {
         let signing = signing_with(vec![new_key()]);
@@ -2127,14 +2092,9 @@ mod tests {
         verify_zones(&zones, &validator, &run, &proved).expect_err("still does not verify");
     }
 
-    /// A reload that re-signed a zone checks what it signed, proved or not.
-    ///
-    /// `ProvenSigning`'s skip is about the *whole-zone* pass. The zone is
-    /// already proved for these keys, so nothing is verified a second time —
-    /// and the RRsets this run made are not a second time, they are a first.
-    /// Fails if the skip covers exactly the runs that signed something new.
-    ///
-    /// Counts, not a clock (`CLAUDE.md` §10).
+    /// A reload that re-signed a zone checks what it signed, proved or not: the
+    /// skip is the whole-zone pass, and these RRsets are new. Counted
+    /// (`CLAUDE.md` §10).
     #[test]
     fn a_reload_that_resigned_checks_what_it_signed_even_when_proved() {
         let signing = signing_with(vec![new_key()]);
@@ -2270,9 +2230,8 @@ mod tests {
     /// The same file with `extra` appended: what an operator's edit looks like
     /// to a reload.
     fn unsigned_zone_with(extra: &str) -> ZoneMap {
-        // Unindented on purpose: a leading space makes a line a continuation of
-        // the record above it, which is a zone file's own syntax and not this
-        // file's formatting.
+        // Unindented: a leading space continues the record above, in zone-file
+        // syntax.
         const TEXT: &str = "$ORIGIN example.com.
 $TTL 3600
 @ IN SOA ns1.example.com. admin.example.com. ( 1 3600 600 604800 300 )
@@ -2341,13 +2300,9 @@ www IN A 192.0.2.2
 ns1 IN A 192.0.2.1
 ";
 
-    /// A reload keeps the zone it is serving when the file did not move, and
-    /// reads it again when it did — `TODO.md` #64f, 11.4 s against 39 ms per
-    /// unchanged million-record signed zone.
-    ///
-    /// Pointer identity rather than a clock (`CLAUDE.md` §10): "this is the
-    /// same allocation" is exactly the claim, and a timing of it is a coin
-    /// toss.
+    /// A reload keeps the zone it serves when the file did not move, and reads
+    /// it when it did (`TODO.md` #64f). Pointer identity, not a clock
+    /// (`CLAUDE.md` §10).
     #[test]
     fn an_unchanged_zone_file_is_not_read_again_and_an_edited_one_is() {
         let dir = ScratchDir::new("keep-unchanged");
@@ -2589,28 +2544,15 @@ ns1 IN A 192.0.2.1
         assert_eq!(zone_map.read().await.len(), 1);
     }
 
-    /// A reload must not block every query for the length of its diffs:
-    /// `ixfr::diff` runs under the read lock, and only the swap under the write
-    /// lock.
+    /// A reload must not block every query for the length of its diffs: only
+    /// the swap is under the write lock.
     ///
-    /// Self-calibrating: time one unlocked diff, then require a contiguous
-    /// window at least half that long inside the reload in which a reader could
-    /// have been admitted. Such a window exists only if the diff ran under a
-    /// shared lock, and a slower box stretches baseline and window together. 90%
-    /// of the reload with the split, 9% with the diff under the write lock.
-    ///
-    /// Not a ratio of `try_read` samples: `tokio::sync::RwLock` is fair, so
-    /// `try_read` fails while a writer is merely queued, which measures wake
-    /// latency against a denominator that is the sampler's spin rate.
-    ///
-    /// Multi-threaded, because the diff has no `.await`: on one thread the
-    /// reload finishes before the reader is polled and the test passes against
-    /// both versions.
+    /// Self-calibrating: a reader must find a window half an unlocked diff
+    /// long. Not `try_read` samples: tokio's fair lock refuses behind a queued
+    /// writer. Two threads, as the diff has no `.await`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_reload_does_not_hold_the_write_lock_across_its_diffs() {
-        // Every record differs between the two versions, so nothing cancels out
-        // and the diff does the most work it can — which is the work that used
-        // to happen with every query waiting on it.
+        // Every record differs, so the diff does all the work it can.
         const RECORDS: u32 = 6000;
         let version = |serial: u32, tail: u8| {
             use std::fmt::Write as _;
@@ -2628,15 +2570,8 @@ ns1 IN A 192.0.2.1
         let v1 = version(1, 1);
         let v2 = version(2, 2);
 
-        // Observing this is a race, and losing it is not a failure. If this
-        // task is descheduled between spawning the reload and starting to
-        // sample, the whole reload can be over before the first probe — there is
-        // then nothing to measure and no verdict to give either way. On a
-        // machine pinned to two cores with the rest of the suite running, about
-        // one attempt in four saw nothing at all. So the *observation* is
-        // retried, and only never managing to observe anything is a failure.
-        // Each attempt gets its own map and log, so a retry cannot inherit
-        // anything from the one before it.
+        // Observing is a race: the reload can finish before the first probe.
+        // Only never observing fails; each attempt has its own map and log.
         let mut observed = None;
         for _ in 0..16 {
             let zone_map = Arc::new(RwLock::new(Zones::default()));
@@ -2645,11 +2580,8 @@ ns1 IN A 192.0.2.1
             initial.insert(zone_key(&v1), std::sync::Arc::new(v1.clone()));
             install_all_zones(&served(&zone_map, &deltas), initial).await;
 
-            // What one diff costs on this machine right now, with no locks and
-            // nothing else running: the yardstick the window below is measured
-            // against. Timed here rather than assumed, because it is what makes
-            // the assertion portable — CI's runner is several times slower than
-            // this one and the comparison has to survive that.
+            // One unlocked diff on this machine now: the yardstick, timed here
+            // so the assertion survives a slower runner.
             let mut baseline_zones = HashMap::new();
             baseline_zones.insert(zone_key(&v2), std::sync::Arc::new(v2.clone()));
             let baseline = {
@@ -2668,21 +2600,8 @@ ns1 IN A 192.0.2.1
                 install_all_zones(&reloading, reloaded).await;
             });
 
-            // Sample continuously for as long as the reload runs, rather than
-            // asking once after a fixed delay: a single probe times out against
-            // how long the diff happens to take on this machine, and a probe
-            // that arrives after the reload has finished measures nothing.
-            // Every sample is one query's worth of "could I have been answered
-            // right now?".
-            //
-            // What is kept is the longest *contiguous stretch of time* over
-            // which every sample was admitted. A stretch, rather than a count or
-            // a fraction: the count depends on how often this loop gets
-            // scheduled, and the fraction has the writer's wake latency in its
-            // denominator. A stretch of wall-clock time has neither in it. Gaps
-            // in sampling cannot shorten one either — only a refusal ends a
-            // stretch — so a starved sampler measures the same window as an idle
-            // one.
+            // Sample throughout the reload, keeping the longest stretch of wall
+            // time in which every sample was admitted; only a refusal ends one.
             let mut attempts = 0u32;
             let started = std::time::Instant::now();
             let mut stretch_began = started;
@@ -2727,12 +2646,8 @@ ns1 IN A 192.0.2.1
             );
         };
 
-        // Half the baseline, which is a factor of five clear of both measured
-        // shapes: the window is ~90% of a reload with the split and ~9% without
-        // it, and the reload is a little longer than one diff. Halving leaves
-        // room for the diff inside the reload to run slower than the unlocked
-        // baseline — it is competing with this sampler, after all — without
-        // leaving room for a reload without the split to pass.
+        // Half the baseline: well clear of both shapes, with room for a
+        // contended diff and none for a reload without the split.
         assert!(
             longest * 2 > baseline,
             "over {attempts} samples the longest window in which a reader could be \

@@ -2374,19 +2374,10 @@ mod tests {
         assert_eq!(dir.entries(), vec!["broken.rdnskey".to_string()]);
     }
 
-    /// A suppressed log line must not build its message.
+    /// A suppressed log line must not build its message: `tracing`'s macros
+    /// evaluate nothing without a subscriber, and `bad_request!` wraps one.
     ///
-    /// This is the half of the malformed-packet finding that a level alone does
-    /// not fix. The old call site was
-    /// `log_error(ip, &format!("invalid query: {}", ...))` — the `format!` runs,
-    /// and the `String` is allocated, before `log_error` is even entered, so
-    /// turning the logging off would still have paid for every message at 50k
-    /// pps. `tracing`'s macros do not evaluate their arguments unless a
-    /// subscriber is interested, and `bad_request!` is a thin wrapper over one.
-    ///
-    /// The counter is asserted in the same test on purpose: an error that stops
-    /// being *counted* when the level is turned down would make `total_errors`
-    /// mean "errors we happened to log", and every graph built on it wrong.
+    /// Counted all the same, or `total_errors` means "errors we logged".
     #[test]
     fn a_suppressed_bad_request_costs_nothing_to_format_and_is_still_counted() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2461,9 +2452,7 @@ mod tests {
 
     #[test]
     fn test_validate_cli_args_invalid_port_too_high() {
-        // Test CLI argument validation with port > 65535
-        // Since port is u16, we can only test with maximum valid value
-        // This test documents the port range constraint
+        // `port` is a `u16`; this pins the maximum.
         let result = validate_cli_args("0.0.0.0", 65535);
         assert!(result.is_ok(), "Max port (65535) should pass validation");
     }
@@ -2546,14 +2535,9 @@ mod tests {
         /// The client's EDNS advertisement is a ceiling this server may lower,
         /// not one it has to honour.
         ///
-        /// With `max_len` at `request.udp_payload_size()` alone, a client
-        /// advertising 65,535 is given 65,535 and a large answer leaves as ~45
-        /// IP fragments — which middleboxes drop and which is what every other
-        /// implementation's `max-udp-size` exists to prevent. Fails that way:
-        /// the reply comes back whole, over 1232 octets, with TC clear.
-        ///
-        /// The cap is the datagram's alone. The same question over TCP is
-        /// answered in full, which is where a truncated client is sent.
+        /// At 65,535 a large answer leaves as IP fragments, which
+        /// `max-udp-size` in other servers prevents. Fails with the reply
+        /// whole, over 1232, TC clear. TCP is answered in full.
         #[tokio::test]
         async fn a_udp_reply_is_capped_by_this_server_and_not_only_by_the_client() {
             let server = server_with(pool_zone(128));
@@ -2614,23 +2598,10 @@ mod tests {
 
         /// The TSIG comes out of the reply's ceiling, not on top of it.
         ///
-        /// `TsigSession::sign` appends its record to bytes already serialized
-        /// to `max_len`, so without the reservation the signed datagram goes
-        /// out at the cap *plus* 85 octets — a cap exceeded by a fixed amount
-        /// is not a cap. RFC 8945 §5.3 says what to do instead: "If addition of
-        /// the TSIG record will cause the message to be truncated, the server
-        /// MUST alter the response so that a TSIG can be included. This
-        /// response contains only the question and a TSIG record, has the TC
-        /// bit set, and has an RCODE of 0 (NOERROR)."
-        ///
-        /// The zone is sized so the answer lands in the window where the
-        /// question is live: it fits the cap and does not fit the cap with a
-        /// signature. The first assertion holds that window, so a zone that
-        /// drifts out of it fails loudly rather than passing for the wrong
-        /// reason (`CLAUDE.md` §1).
-        ///
-        /// Fails with the unreserved ceiling: 1,250 octets out of a 1,232-octet
-        /// cap, TC clear.
+        /// Otherwise the datagram leaves at the cap plus the record; RFC 8945
+        /// §5.3 says to alter the response instead. The first assertion holds
+        /// the zone in the window where it matters (`CLAUDE.md` §1). Fails
+        /// unreserved: 1,250 octets out of a 1,232 cap, TC clear.
         #[tokio::test]
         async fn a_signed_reply_reserves_its_signature_out_of_the_ceiling() {
             let key = TsigKey::new("transfer.key.", TsigAlgorithm::HmacSha256, vec![0x0b; 32]);
@@ -2649,9 +2620,8 @@ mod tests {
                 .to_bytes_within(4096)
                 .expect("serialize");
 
-            // Read off the wire, not out of the scratch buffer: signing builds
-            // a message of its own, so the bytes that were sent are the only
-            // ones this is about.
+            // Off the wire: signing builds its own message, so the sent bytes
+            // are what counts.
             let answer = |packet: &[u8]| {
                 let server = Arc::clone(&server);
                 let packet = packet.to_vec();
@@ -2720,19 +2690,12 @@ mod tests {
             );
         }
 
-        /// A transfer asked for over UDP is not streamed, and that is a branch
-        /// rather than a position.
+        /// A transfer asked for over UDP is not streamed, by a branch rather
+        /// than a position.
         ///
-        /// One dispatcher for both transports (`TODO.md` #39b) makes the
-        /// streaming branch reachable from a datagram, so the rule is a `match`
-        /// on `Wire` and this is what holds it: AXFR is FORMERR because it is
-        /// defined over TCP alone (RFC 5936 §4.2), and an IXFR is answered with
-        /// a single SOA of the current version, which tells the client to come
-        /// back over TCP (RFC 1995 §2).
-        ///
-        /// Fails with a gate that trusts the caller: dropping the
-        /// `Wire::Framed` guard streams the zone into the datagram path, and
-        /// both assertions go.
+        /// AXFR is FORMERR (RFC 5936 §4.2), IXFR a single SOA (RFC 1995 §2).
+        /// Fails without the `Wire::Framed` guard: the zone streams into the
+        /// datagram path.
         #[tokio::test]
         async fn a_transfer_over_udp_is_answered_rather_than_streamed() {
             let server = server_with(one_record_zone());
@@ -2770,15 +2733,9 @@ mod tests {
 
         /// A request that fails its TSIG check is still a request that arrived.
         ///
-        /// Counted before the TSIG check on both transports, or a rejected
-        /// request is a received query on one transport and not on the other.
-        /// The exported name is `dns_queries_received_total`, "Total DNS
-        /// queries received", and a request whose MAC does not verify arrived
-        /// (`CLAUDE.md` §14: a counter's name is a claim about what it counts).
-        ///
-        /// Both transports in one test, because the claim is that they agree —
-        /// which is what makes it a test of the *counter*. Fails with the count
-        /// after the check on UDP: the UDP half reads 0.
+        /// `dns_queries_received_total` says "received" (`CLAUDE.md` §14). Both
+        /// transports, as the claim is that they agree. Fails with the UDP
+        /// count after the check.
         #[tokio::test]
         async fn a_rejected_tsig_is_a_received_query_on_both_transports() {
             use std::sync::atomic::Ordering;
@@ -2868,15 +2825,10 @@ mod tests {
 
         /// The UDP loop's instant is `ServeContext`'s, not the wall clock's.
         ///
-        /// What makes this a test rather than an assertion about a call: TSIG
-        /// is the one thing on the request path that *compares* the server's
-        /// instant with a number the client chose, and RFC 8945 §5.2.3 gives
-        /// it a 300-second fudge. So a clock the loop does not read is visible
-        /// from outside the process — sign at an instant far outside that
-        /// window, and a server reading the wall clock answers BADTIME while
-        /// one reading `ctx.clock` answers the question.
-        ///
-        /// Fails with `let now = tsig::now()`: `rcode: NotAuthorized`.
+        /// TSIG compares the server's instant with the client's within a
+        /// 300-second fudge (RFC 8945 §5.2.3), so signing far outside it shows
+        /// which clock the loop reads. Fails with `let now = tsig::now()`:
+        /// `NotAuthorized`.
         #[tokio::test]
         async fn the_udp_loop_signs_and_checks_against_the_context_clock() {
             // 2023-11-14, far past any fudge from the real now, and fixed so
@@ -2917,17 +2869,9 @@ mod tests {
                 .expect("no io error");
         }
 
-        /// A response sent to the UDP port must not be answered.
-        ///
-        /// `CLAUDE.md` §8: "A response is not a question. Test QR before doing
-        /// anything with a packet that arrived at a listening socket, on both
-        /// daemons. Two servers pointed at each other, or one spoofed
-        /// datagram, is otherwise a packet loop neither end can see."
-        ///
-        /// UDP is the transport where a spoofed source and a packet loop
-        /// matter. Both paths go through `rdns::validation::Request`, the only
-        /// way to get a message out of a packet here, which refuses QR=1
-        /// itself; this test says what the behaviour is.
+        /// A response sent to the UDP port must not be answered (`CLAUDE.md`
+        /// §8): two servers pointed at each other would loop. Both paths refuse
+        /// QR=1 in `rdns::validation::Request`; this states the behaviour.
         #[tokio::test]
         async fn a_response_to_the_udp_port_is_not_answered() {
             let server = server_with(one_record_zone());
@@ -2957,16 +2901,9 @@ mod tests {
             );
         }
 
-        /// The response buffer is the worker's, not the datagram's.
-        ///
-        /// Fails if `answer_datagram` calls `to_bytes_within` rather than
-        /// writing into the worker's buffer: the second answer allocates afresh
-        /// and the pointer moves.
-        ///
-        /// Asserted on the pointer and the capacity rather than on a timing,
-        /// which is the same reason `a_small_response_does_not_carry_a_64k_buffer`
-        /// asserts on capacity: both are exact and neither cares what else is
-        /// running (`CLAUDE.md` §10).
+        /// The response buffer is the worker's, not the datagram's. On pointer
+        /// and capacity, which are exact (`CLAUDE.md` §10). Fails if
+        /// `answer_datagram` allocates per answer.
         #[tokio::test]
         async fn answering_a_second_datagram_reuses_the_first_one_s_buffer() {
             let server = server_with(one_record_zone());
@@ -3032,27 +2969,12 @@ mod tests {
         }
     }
 
-    /// An UPDATE reaches the zone file, not just the zone map.
+    /// An UPDATE reaches the zone file, not just the zone map: the re-signing
+    /// timer reloads from files, so a change in memory alone is lost.
     ///
-    /// This is the assertion the whole design turns on, and it is why write-back
-    /// is a precondition rather than a follow-on: the re-signing timer reloads
-    /// every zone from its file (`ZoneSigning::resign_interval` explains why it
-    /// must), so a change that lived only in memory would be discarded within one
-    /// interval, silently, having told the client it succeeded. Asserting on the
-    /// map alone would pass against exactly that bug.
-    ///
-    /// A signed UPDATE over 512 octets is admitted on UDP, because that is what
-    /// this server advertises it can reassemble.
-    ///
-    /// `TODO.md` #40f, and the defect rather than the knob: every reply's OPT
-    /// says 4,096 (RFC 6891 §6.2.4), so admission refusing over 512 does it in
-    /// silence — no FORMERR, nothing on the wire. A 2,048-bit DKIM key rotation
-    /// is the ordinary request that falls in the gap, and the TSIG this server
-    /// *requires* is what pushes it over: 470 octets unsigned, 566 signed
-    /// (`rdns/examples/request_size_probe.rs`).
-    ///
-    /// Fails with `max_udp_size` at 512: the signed message is refused and the
-    /// unsigned one, being smaller, is not.
+    /// A signed DKIM-sized UPDATE over 512 octets is admitted on UDP, as the
+    /// OPT advertises 4,096 (RFC 6891 §6.2.4; `TODO.md` #40f). Fails with
+    /// `max_udp_size` at 512: the signed message is refused.
     #[test]
     fn a_signed_dkim_sized_update_is_admitted_on_udp() {
         let key = update_key(rdns::tsig::UpdatePolicy::Any);
@@ -3316,18 +3238,11 @@ mod tests {
             assert!(zones.contains_key(zkey("example.com.").as_slice()));
         }
 
-        /// A secondary's first start has nothing on disk yet, and refusing to run
-        /// until a zone arrives would mean it never could.
+        /// A secondary's first start has nothing on disk yet, and refusing to
+        /// run until a zone arrives would mean it never could.
         ///
-        /// This is a regression test for a fix, not for the original bug.
-        /// Removing the `unwrap_or_default()` that turned an unreadable directory
-        /// into `Ok(empty)` also removed the only thing making an *empty*
-        /// directory work, because `enumerate_zone_files` returned
-        /// `Err("No .zone files found")` for one — and the commit that removed it
-        /// claimed the opposite. Nothing caught it, because nothing tested a
-        /// secondary starting from an empty directory. The emptiness check now
-        /// lives in `load_zones`, which is the only place that knows
-        /// whether the caller is a secondary.
+        /// The emptiness check is in `load_zones`, the only place that knows
+        /// the caller is a secondary.
         #[tokio::test]
         async fn a_secondary_may_start_with_an_empty_zone_directory() {
             let dir = dir_with("empty-secondary", &[]);
@@ -3390,15 +3305,8 @@ mod tests {
                 .expect("write the sidecar");
         }
 
-        /// Expiry that lasts only until the next deploy is not expiry.
-        ///
-        /// `expire_stale_zones_at_startup` ran from `main` and nowhere else, while
-        /// `Reloading::load` re-reads every `.zone` file from disk without
-        /// consulting the sidecar. A zone correctly withdrawn because its primary
-        /// had been unreachable for a week came straight back on SIGHUP and was
-        /// served with AA set — which is precisely the "permanently wrong
-        /// answers nobody can see are wrong" the withdrawal code's own comment
-        /// says it exists to prevent.
+        /// Expiry that lasts only until the next reload is not expiry: a zone
+        /// withdrawn for EXPIRE must not come back on SIGHUP with AA set.
         #[tokio::test]
         async fn a_reload_does_not_resurrect_a_zone_that_expired() {
             let Replica {
@@ -3431,15 +3339,9 @@ mod tests {
             );
         }
 
-        /// The other half: no record of contact at all.
-        ///
-        /// `StateFile::load` returns empty rather than failing — right for a
-        /// cache, wrong for expiry, because forgetting the last-contact time
-        /// *is* the difference between withdrawn and served. Read as empty, a
-        /// missing or unreadable sidecar serves the stale copy on disk
-        /// authoritatively from a cold start. Unknown age has to read as "do
-        /// not serve": the zone comes back at the first successful transfer,
-        /// which is what makes it ours to answer for in the first place.
+        /// The other half: no record of contact at all. `StateFile::load`
+        /// returns empty, so unknown age must read as "do not serve" until a
+        /// transfer.
         #[tokio::test]
         async fn a_zone_with_no_record_of_transfer_is_not_served() {
             let Replica {
@@ -3504,20 +3406,11 @@ mod tests {
             }
         }
 
-        /// A reload must not take the runtime worker with it.
+        /// A reload must not take the runtime worker with it: every load step
+        /// blocks, with listeners live.
         ///
-        /// Every step of a load blocks — `read_dir`, a parse per zone, an ECDSA
-        /// signing run, verification — and it runs while both listeners are
-        /// live.
-        ///
-        /// One worker thread, so the question has a yes-or-no answer instead of
-        /// a ratio: if the load blocks the runtime, the ticker below is not
-        /// polled once while it runs.
-        ///
-        /// The load has to be inside a spawned task. `#[tokio::test]` runs the
-        /// body on the calling thread via `block_on`, so a blocking call there
-        /// never occupies the worker it is supposed to be starving — the body is
-        /// the observer.
+        /// One worker, so a blocked load polls the ticker never. The load is in
+        /// a spawned task: `#[tokio::test]`'s body runs on the calling thread.
         #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
         async fn a_reload_does_not_block_the_runtime_it_was_called_from() {
             use std::fmt::Write as _;
@@ -3561,9 +3454,8 @@ mod tests {
                 }
             });
 
-            // The loader announces itself and then does the work, so the count
-            // is taken across the load and not across the scheduling that
-            // preceded it.
+            // Announced, then loading, so the count spans the load and not the
+            // scheduling before it.
             let (started, has_started) = tokio::sync::oneshot::channel();
             let loader = tokio::spawn(async move {
                 let _ = started.send(());
@@ -3587,22 +3479,10 @@ mod tests {
 
     /// A reload keeps the signatures it can, and the re-signing timer does not.
     ///
-    /// Signing every zone from scratch at every load makes a SIGHUP or an
-    /// `rdnsctl reload` cost a full sign — 27.6 s at a million records against
-    /// 9.7 s (`TODO.md` #65b) — and moves the RDATA of every RRSIG in the zone,
-    /// which is the whole zone in the next IXFR delta.
-    ///
-    /// The timer is the exception and has to stay one: it reloads *in order to*
-    /// refresh (`ZoneSigning::resign_interval`), so everything it would carry
-    /// forward is what it woke up to replace.
-    ///
-    /// The discriminator is the expiration, not the signature bytes. The served
-    /// version is signed for 30 days and the reload is configured for 7, so a
-    /// carried signature is one expiring more than a week out — `expiry_for`
-    /// spreads back by a fifth, which leaves the two windows 17 days apart.
-    /// ECDSA would give fresh bytes anyway, since its nonce is random, but a
-    /// test that turns on that is a test passing for a reason unrelated to its
-    /// subject.
+    /// A full sign per reload costs time and puts every RRSIG in the next IXFR
+    /// (`TODO.md` #65b); the timer reloads to refresh. Told apart by
+    /// expiration, 30 days served against 7 reloaded, not by ECDSA's random
+    /// bytes.
     #[tokio::test]
     async fn a_reload_carries_signatures_forward_and_the_resigning_timer_does_not() {
         use clap::Parser;
@@ -3692,9 +3572,8 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         reload_once(&ctx, Vec::new(), &busy, ReloadTrigger::Control(tx)).await;
         assert_eq!(rx.await.expect("the reload answered"), Ok(1));
-        // All of them, the apex SOA's included: the served serial is the file's
-        // plus a term in *hours* (`zone_signer::signed_serial`), so two runs in
-        // the same hour agree about it and the RRset has not moved either.
+        // The apex SOA too: the served serial adds an hours term, so two runs
+        // in one hour agree.
         assert_eq!(
             carried(&zone_map).await,
             before,

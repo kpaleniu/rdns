@@ -737,15 +737,9 @@ allow-partial-load = true
 
     /// Every `[server]` key reaches the flag of the same name, with its value.
     ///
-    /// `deny_unknown_fields` refuses a key the struct does not declare; this
-    /// refuses one the struct declares and `apply` never reads, which parses
-    /// and does nothing. The projection is generated from the declarations
-    /// (`server_table!`), and this is the behavioural half: it asserts the
-    /// *value*, so a key wired to the wrong flag fails too, which a comparison
-    /// against the default cannot see.
-    ///
-    /// Against a hand-written projection with one line deleted, it names that
-    /// key.
+    /// `deny_unknown_fields` catches an undeclared key; this catches one
+    /// declared and never read, or wired to the wrong flag, by asserting the
+    /// value.
     #[test]
     fn every_server_key_reaches_its_flag() {
         let mut cli = Cli::parse_from(["rdnsd"]);
@@ -808,15 +802,9 @@ allow-partial-load = true
 
     /// A config file that sets only what it must changes no default.
     ///
-    /// The two spellings of one setting are a flag and a `[server]` or
-    /// `[signing]` key, and `Config::apply` overwrites `cli` field by field —
-    /// so they are never both in force and a pair that disagreed would look
-    /// correct from either side. Both sides read one function in the crate
-    /// root, which is what makes this pass by construction rather than by luck.
-    ///
-    /// **A tripwire, not a regression test** (`CLAUDE.md` §10). What it catches
-    /// is a new pair added with a fresh literal on each side — run against a
-    /// `default_query_burst` of 201, it fails naming `query-burst`.
+    /// Flag and key share one default function in the crate root, so they agree
+    /// by construction. A tripwire (`CLAUDE.md` §10): a new pair with a literal
+    /// on each side fails, naming the key.
     #[test]
     fn a_minimal_config_changes_no_flag_default() {
         let mut cli = Cli::parse_from(["rdnsd"]);
@@ -951,14 +939,9 @@ allow-transfer-cert = ["https://partner.example"]
         );
     }
 
-    /// A flag the file can also set has to be refused beside `--config` (§15):
-    /// two sources for one setting is an error, not a precedence rule, and the
-    /// failure is silent because both values are valid.
-    ///
-    /// The mirror of `rdnsr`'s tie test — there, every flag `--config` replaces
-    /// has a key in the file; here, every flag it does *not* replace has none.
-    /// clap owns one half and serde the other, so neither list is maintained by
-    /// hand.
+    /// A flag the file can also set is refused beside `--config` (§15): two
+    /// sources for one setting, silently. The mirror of `rdnsr`'s tie test;
+    /// clap and serde own one half each.
     #[test]
     fn a_setting_the_file_can_write_is_refused_beside_config() {
         let command = Cli::command();

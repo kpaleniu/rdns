@@ -1807,11 +1807,8 @@ pub(crate) mod tests {
         text
     }
 
-    /// What one dynamic UPDATE costs as the zone grows (`TODO.md` #64).
-    ///
-    /// `#[ignore]`d and refused in debug, as `rdns/tests/scale.rs` is: it
-    /// builds zone files of up to a million records, and the question is what
-    /// a deployment pays.
+    /// What one dynamic UPDATE costs as the zone grows. `#[ignore]`d and
+    /// refused in debug, as `rdns/tests/scale.rs` is.
     ///
     /// ```text
     ///   records      total   re-read     apply to_string     write
@@ -1820,30 +1817,8 @@ pub(crate) mod tests {
     ///   1000000    1713.0ms   452.6ms   361.8ms   637.5ms   140.1ms
     /// ```
     ///
-    /// Linear in the zone, at about 1.7 µs a record, and **four separate
-    /// O(zone) steps for a one-record change**. The re-read is 26% of it and
-    /// not the dominant term — `zone_to_string` is, at 37%.
-    ///
-    /// No fifth column for a `Zone::clone` of the installed zone:
-    /// [`UpdateReport`] has none, and one costs 150.7 ms at a million records
-    /// (`TODO.md` #64a).
-    ///
-    /// The total is printed in milliseconds because `{:.1?}` past a second is
-    /// one significant figure: with and without that clone both read "1.8s",
-    /// where milliseconds separate them, **1907–1947 ms against 1694–1731**,
-    /// six warm runs against five. Discard the first run after a rebuild — one
-    /// read 1983.9 ms, 270 ms above the five that followed it.
-    ///
-    /// Unsigned. `sign_one_incrementally` is not in these numbers and has not
-    /// been measured; #44c's 28 s is a *full* sign of a zone this size and is
-    /// an upper bound that does not apply.
-    ///
-    /// This is the cold path throughout — the re-read column is what
-    /// [`warm_update_cost_against_cold`] skips.
-    ///
-    /// All of it runs under `UpdateHandling::applying`, which is one lock for
-    /// the whole process — so this is the server's update throughput, not one
-    /// client's latency.
+    /// Unsigned and cold. What the table shows, and how it was taken, is in
+    /// `docs/closed/064.md`.
     #[test]
     #[ignore]
     fn update_cost_against_zone_size() {
@@ -1904,12 +1879,8 @@ pub(crate) mod tests {
             let source = parse_zone_file_at(&path, "example.com.").expect("parses");
             let reread = start.elapsed();
 
-            // What a "did the file change" test would cost instead of that
-            // re-read (`TODO.md` #64b). Two candidates, and the question is
-            // whether the cheap one is honest: `stat` cannot see an edit that
-            // preserves length and timestamp, and a missed edit is an
-            // operator's change silently reverted, which is the failure the
-            // re-read exists to prevent (`CLAUDE.md` §4).
+            // What a "did the file change" test would cost instead; `stat`
+            // misses an edit that keeps length and timestamp (`CLAUDE.md` §4).
             let start = Instant::now();
             let meta = std::fs::metadata(&path).expect("stat");
             let stat_len = meta.len();
@@ -1940,9 +1911,8 @@ pub(crate) mod tests {
             let start = Instant::now();
             rdns::persist::write_atomically_str(&path, &out).expect("persists");
             let write = start.elapsed();
-            // Total in milliseconds whatever its size: `{:.1?}` switches to
-            // seconds past 1 s, and one significant figure there is coarser
-            // than the run-to-run spread of the columns it sums.
+            // Milliseconds whatever the size: `{:.1?}` past a second is too
+            // coarse.
             println!(
                 "{records:>9}  {:>7.1}ms {reread:>9.1?} {apply:>9.1?} {to_string:>9.1?} {write:>9.1?}  {:>6} KB",
                 total.as_secs_f64() * 1000.0,
@@ -1952,8 +1922,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// What skipping the re-read saves: the same update, cold against warm
-    /// (`TODO.md` #64b).
+    /// What skipping the re-read saves: the same update, cold against warm.
     ///
     /// ```text
     ///   records       cold      warm     saved
@@ -1962,19 +1931,8 @@ pub(crate) mod tests {
     ///   1000000   1905.8ms  1178.1ms       38%
     /// ```
     ///
-    /// Every iteration starts from the *same* state — the file holds exactly
-    /// what the served zone serializes to, and the digest is the digest of
-    /// those bytes, which the assertion below checks — so the only difference
-    /// between a cold iteration and a warm one is whether `known` is supplied.
-    /// Alternating rather than one of each, because what a call costs depends
-    /// on where in the process's life it falls, and one of each charges that
-    /// difference to the thing under test. The first version of this
-    /// measurement did exactly that and read 1-5% at a million records
-    /// (`CLAUDE.md` §1).
-    ///
-    /// The saving *grows* with the zone, because it is the parse plus the
-    /// freeing of what the parse built, less a read and a hash — see #64b for
-    /// that decomposition, which sums to the total within 2 ms.
+    /// Every iteration starts from the same state, alternating cold and warm;
+    /// `docs/closed/064.md` says why.
     #[test]
     #[ignore]
     fn warm_update_cost_against_cold() {
@@ -2005,9 +1963,8 @@ pub(crate) mod tests {
 
             for round in 0..6 {
                 let reuse = round % 2 == 1;
-                // A record nobody has added yet: an UPDATE that changes nothing
-                // returns before serializing, which would time the early exit
-                // and read as a win (`CLAUDE.md` §1).
+                // A new record each round: a no-op UPDATE returns before
+                // serializing (`CLAUDE.md` §1).
                 let change = update::Change::Add(rdns::ResourceRecord {
                     name: nm(&format!("added-{round}.example.com.")),
                     class: rdns::Class::IN,
@@ -2032,10 +1989,8 @@ pub(crate) mod tests {
                 assert_eq!(report.changed, 1, "one record added at {records}");
                 served = installed.unwrap_or_else(|| panic!("a changed zone at {records}"));
                 digest = written;
-                // The premise of the comparison: whatever the call did, the
-                // next iteration starts from a file that is what the served
-                // zone serializes to, and from its digest. Without this the two
-                // kinds of iteration would differ in more than `known`.
+                // The premise: each iteration starts from the served zone's
+                // file and digest, so only `known` differs.
                 assert_eq!(
                     digest,
                     FileDigest::of(&std::fs::read(&path).expect("read back")),
@@ -2054,12 +2009,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// What the *signed* update path costs, which the table above does not
-    /// measure (`TODO.md` #64d).
-    ///
-    /// The question the row asks: does `sign_one_incrementally` swamp the four
-    /// O(zone) steps, making 64b's 26% and 64c's 42% shares of something that
-    /// barely matters? **It does.**
+    /// What the *signed* update path costs.
     ///
     /// ```text
     ///   records   unsigned     signed  incr-sign     verify  full-sign      carried
@@ -2068,37 +2018,8 @@ pub(crate) mod tests {
     ///   1000000   1326.2ms  9788.0ms  8832.5ms     21.1ms 27801.1ms  2000004/2000008
     /// ```
     ///
-    /// Three warm runs, discarding the first after a rebuild. At a million
-    /// records **signing is 8.8 s of 9.8 s, 90%**, so the whole of 64b and
-    /// 64c — 68% of the unsigned 1.33 s — is **9% of what a signed update
-    /// costs**. `full-sign` reproduces #44c's 28 s by a different route.
-    ///
-    /// `verify`: the RRsets this run signed, plus every signed RRset at a name
-    /// the update named. **21 ms at a million records, 0.2% of the signed
-    /// update** — against the 76 s a whole-zone `verify_zones` pass costs at
-    /// that size, which is why it is the change and not the pass.
-    ///
-    /// Measured 2026-09-21 on the development machine, all columns.
-    ///
-    /// A real [`ZoneSigning`] rather than a bare `sign_zone_incrementally`, so
-    /// the column is the whole path an operator pays. The row filed this as
-    /// wanting "signing keys on disk", and it does — but generated ones,
-    /// written out by `SigningKey::write_to_dir`, not an operator's.
-    ///
-    /// `carried` is how many of the installed zone's RRSIGs are byte-identical
-    /// to one at the same owner in the served version, over how many there
-    /// are: a count rather than a timing, so it reads the same on every
-    /// machine. **Four are made fresh at every size** — the A RRset added, the
-    /// two NSECs the insertion moves, and the bumped SOA — which is what makes
-    /// the 10.3 s the interesting number. It is not the ECDSA. Carrying every
-    /// signature forward still pays `PreviousSignatures::of` over the served
-    /// zone, `carry_over_records`, `Layout::of` and a full NSEC chain, all
-    /// O(zone); `sign_zone_incrementally`'s header argues for building the
-    /// chain in full and is right, and this is what that costs (`TODO.md`
-    /// #64e).
-    ///
-    /// NSEC, one ECDSA P-256 KSK and one ZSK, which is the cheap end: NSEC3
-    /// hashes every name, and a second algorithm signs every RRset twice.
+    /// `carried` counts RRSIGs byte-identical to the served version's. NSEC,
+    /// one ECDSA P-256 KSK and ZSK. The reading is in `docs/closed/064.md`.
     #[test]
     #[ignore]
     fn signed_update_cost_against_zone_size() {
@@ -2176,9 +2097,8 @@ pub(crate) mod tests {
                 .expect("the rdata builds"),
             });
 
-            // Both paths through the same door, so the difference between the
-            // columns is the signing and nothing else. The file is restored
-            // between them: the first call already added the record to it.
+            // Both paths through one door, so the columns differ only by
+            // signing; the file is restored between them.
             let start = Instant::now();
             apply_update_to_file(
                 &path,
@@ -2211,11 +2131,8 @@ pub(crate) mod tests {
             assert_eq!(report.changed, 1, "one record added at {records}");
             let installed = installed.expect("a changed zone is installed");
 
-            // The signing step alone, from the same inputs the call above fed
-            // it, so `signed` minus this and `verify` is the four unsigned
-            // steps. Timed apart because they are different questions: one is
-            // the ECDSA and the carry-forward, the other the check of what was
-            // signed.
+            // The signing alone, from the same inputs, so `signed` less this
+            // and `verify` is the unsigned steps.
             std::fs::write(&path, &text).expect("restore the fixture");
             let reparsed = parse_zone_file_at(&path, "example.com.").expect("parses");
             let applied = update::apply(&reparsed, std::slice::from_ref(&change));
@@ -2277,28 +2194,9 @@ pub(crate) mod tests {
     /// An UPDATE to a zone whose file `$INCLUDE`s another is refused, not
     /// applied against the wrong file.
     ///
-    /// Two defects, and the first hid the second (`TODO.md` #104).
-    ///
-    /// The parse was `parse_zone_file(&text, origin)`, which has no base
-    /// directory and so resolves `$INCLUDE` against the *process's* working
-    /// directory — where the reload path uses `parse_zone_file_at` and
-    /// resolves it against the zone file's. So the same file parsed to two
-    /// different zones depending on which path read it, and usually to an
-    /// error here.
-    ///
-    /// Underneath it: the digest was `FileDigest::of` over bytes read off
-    /// disk, which the type's doc restricts to text this process wrote or a
-    /// file known to carry no `$INCLUDE`. A no-op UPDATE stores that digest,
-    /// and a later one then matches it while the *included* file has moved —
-    /// the operator's change silently reverted, which is the failure the
-    /// re-read exists to prevent (`CLAUDE.md` §4). Unreachable only because
-    /// the parse above failed first.
-    ///
-    /// Refused rather than flattened. Writing the zone back with
-    /// `zone_to_string` inlines the include and drops the directive, so the
-    /// file the operator's other tooling maintains stops being read with
-    /// nothing said — and REFUSED is what the two other "this is not a
-    /// writable source" checks already answer.
+    /// `FileDigest::of` is sound only without `$INCLUDE`, and writing back
+    /// would inline the include and drop the directive (`TODO.md` #104).
+    /// REFUSED, as the other "not a writable source" checks answer.
     #[test]
     fn an_update_to_a_zone_file_that_includes_another_is_refused() {
         let dir = rdns::testutil::ScratchDir::new("update-include");
@@ -2364,19 +2262,12 @@ pub(crate) mod tests {
         );
     }
 
-    /// The rule the re-read exists for, kept while the re-read is skipped: an
-    /// edit made under a running server is not silently reverted
-    /// (`TODO.md` #64b).
+    /// An edit made under a running server is not reverted while the re-read is
+    /// skipped.
     ///
-    /// Three updates against one file. The first has no remembered digest and
-    /// parses. The second is handed the digest the first returned and must
-    /// still produce the same zone — that is the fast path. The third is handed
-    /// that same digest after the file has been *edited* underneath, and must
-    /// see the edit: the digest does not match, so the parse happens.
-    ///
-    /// Fails against a `stat`-based test on the third case whenever the edit
-    /// preserves length and timestamp, and fails against reusing the served
-    /// copy unconditionally on the third case always.
+    /// Three updates: the first parses; the second, given the digest, produces
+    /// the same zone; the third, after an edit, sees it. Fails against a `stat`
+    /// test or unconditional reuse on the third.
     #[test]
     fn an_edit_under_a_running_server_is_seen_even_when_the_re_read_is_skipped() {
         let dir = rdns::testutil::ScratchDir::new("update-digest");
@@ -2551,10 +2442,8 @@ pub(crate) mod tests {
         assert_eq!(report.changed, 1);
         let installed = installed.expect("a changed zone is installed");
 
-        // The same question the install now answers, asked again from outside
-        // it: every signature in the zone, not only the ones this run made.
-        // A pass that agrees with the signer is not evidence (`CLAUDE.md` §1),
-        // and this one is the whole-zone check the UPDATE path cannot afford.
+        // Every signature in the zone, not only this run's: a pass that agrees
+        // with the signer is not evidence (`CLAUDE.md` §1).
         let keys = rdns::dnssec_validation_mode::ZoneKeys::of(&installed);
         assert!(keys.is_signed(), "the installed zone carries its DNSKEYs");
         for (name, rtype) in crate::zones::signed_rrsets(&installed) {
@@ -2568,15 +2457,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every encrypted transport gets its own dnstap label.
+    /// Every encrypted transport gets its own dnstap label; [`Privacy`] alone
+    /// leaves DoT, DoH and DoQ one value, so the field would be absent.
     ///
-    /// Under [`Privacy`] — `Clear`, `Tls13` or `TlsOlder` — DoT, DoH and DoQ
-    /// are one value, and the field is left *absent* rather than guessed at: a
-    /// reader showing nothing where it should show three different things.
-    /// Fails that way with the last three rows reading `None`.
-    ///
-    /// A table rather than a live exchange: the mapping is the point, and
-    /// `record_dnstap` needs a sink, a socket and a parsed message to reach.
+    /// A table, not a live exchange: the mapping is the point. Fails with the
+    /// last three rows `None`.
     #[test]
     fn a_dnstap_entry_names_the_transport_including_the_encrypted_three() {
         use rdns::validation::{PeerCertificate, TlsVersion};
@@ -2611,15 +2496,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every reply built away from `answer.rs` mirrors the client's OPT the
-    /// same way that file does — RFC 6891 §6.1.1 for the record, RFC 3225 §3
-    /// for the DO bit inside it.
+    /// Every reply built away from `answer.rs` mirrors the client's OPT, DO
+    /// included (RFC 6891 §6.1.1, RFC 3225 §3).
     ///
-    /// A reply that sets an OPT of its own with DO clear tells a validating
-    /// client asking over UDP and getting TC=1 that the server dropped DNSSEC
-    /// (`CLAUDE.md` §7). `truncated_reply` and `error_reply` both go through
-    /// [`empty_reply`], so this covers both: a mirror written a third time is
-    /// the way this comes back.
+    /// `truncated_reply` and `error_reply` both use [`empty_reply`]; a third
+    /// copy is how a dropped DO comes back (`CLAUDE.md` §7).
     #[test]
     fn every_empty_reply_mirrors_the_clients_opt() {
         let udp = UdpSizes::default();
@@ -2691,9 +2572,8 @@ pub(crate) mod tests {
         let mut zones = HashMap::new();
         zones.insert(zone_key(&primary_zone), std::sync::Arc::new(primary_zone));
 
-        // The NOTIFY carries an OPT, because #47 is about what comes back in
-        // one: RFC 6891 §6.1.1's MUST applies to a *request*, and a NOTIFY is
-        // one.
+        // The NOTIFY carries an OPT: RFC 6891 §6.1.1 binds what comes back to a
+        // request that had one.
         let from = |zone: &str, ip: &str| {
             let mut msg = notify::notify_request(nm(zone).as_ref(), None, 1);
             msg.set_edns(rdns::Edns::with_payload_size(1232));
@@ -2854,14 +2734,9 @@ pub(crate) mod tests {
             stream.write_all(&framed).await.expect("send the request");
         }
 
-        /// The harm: a `systemctl stop` that cuts an in-flight AXFR mid-stream,
-        /// where the client cannot tell a truncated transfer from a complete
-        /// one — it sees records, then silence, and a secondary that believes
-        /// it holds a zone it holds half of.
-        ///
-        /// Drives the real `tcp_loop` and the real `serve_connection`, and stops
-        /// the server after the first message of a multi-message transfer has
-        /// arrived — so the stop is unambiguously mid-transfer.
+        /// A stop must not cut an AXFR mid-stream: the client cannot tell it
+        /// from a complete one. The real `tcp_loop` and `serve_connection`,
+        /// stopped after the first message arrived.
         #[tokio::test]
         async fn a_transfer_in_flight_survives_the_stop() {
             let shutdown = Shutdown::new();
@@ -2885,9 +2760,8 @@ pub(crate) mod tests {
 
             shutdown.begin();
 
-            // Everything else must still arrive, ending with the closing SOA
-            // that RFC 5936 §2.2 uses to bracket a transfer — which is exactly
-            // the thing a cut connection withholds.
+            // The rest must arrive, ending with the closing SOA (RFC 5936 §2.2)
+            // a cut connection withholds.
             let mut records = first.answers.len();
             let mut messages = 1;
             while let Some(msg) = read_message(&mut stream).await {
@@ -2944,9 +2818,8 @@ pub(crate) mod tests {
                 .await
                 .expect("the accept loop must return on stop");
 
-            // The listener is dropped with the loop, so this either fails to
-            // connect or connects and is never answered. Both are "not served";
-            // what must not happen is a reply.
+            // The listener goes with the loop: no connection or no answer are
+            // both fine; a reply is not.
             if let Ok(Ok(mut stream)) =
                 tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr)).await
             {
@@ -2993,9 +2866,8 @@ pub(crate) mod tests {
 
             shutdown.begin();
 
-            // TCP_IDLE_TIMEOUT is ten seconds; this budget is well under it, so
-            // passing means the connection observed the stop rather than timing
-            // out. Keep the client end alive so nothing else can close it.
+            // Well under the ten-second idle timeout, so passing means the stop
+            // was seen; the client end stays open.
             let drained = shutdown.drain(Duration::from_secs(3)).await;
             drop(stream);
             assert!(
@@ -3009,19 +2881,10 @@ pub(crate) mod tests {
 
     mod transfer_authorization {
         use super::*;
-        /// A transfer is a sequence of messages, and DoH carries one.
-        ///
-        /// Deciding to stream from the QTYPE and `Wire::Framed` alone sends a
-        /// DoH request to `answer_transfer`, and the whole zone is serialized
-        /// one envelope at a time into a channel `https::answer` drains and
-        /// discards — the client waiting on the producer to finish before it is
-        /// handed the first envelope. RFC 8484 defines no framing that would
-        /// carry the rest and RFC 9103 §7.1 puts DoH outside zone transfer, so
-        /// the answer is a refusal rather than a stream nothing can read.
-        ///
-        /// The arrival is the whole of what this drives, so the socket is a
-        /// plain one — the same shape `transfer_by_certificate` uses to test
-        /// authorization without a handshake.
+        /// A transfer is a sequence of messages and DoH carries one (RFC 9103
+        /// §7.1), so a transfer over DoH is refused, not streamed into a
+        /// channel nobody reads. The socket is plain, as only the arrival is
+        /// driven.
         mod transfer_needs_a_transport_that_carries_a_sequence {
             use super::*;
             use rdns::validation::{Arrival, PeerCertificate, TlsVersion};
@@ -3117,13 +2980,10 @@ pub(crate) mod tests {
             }
         }
 
-        /// RFC 9103 §7.5's other method: a transfer authorized by the certificate
-        /// the client presented, with no TSIG key and an empty address ACL —
-        /// `TODO.md` #59.
-        ///
-        /// The handshake half is `rdns_transport::tls`'s
-        /// `a_client_certificate_reaches_the_handler`; what these drive is the
-        /// authorization, which is the half §16 is about.
+        /// RFC 9103 §7.5's mTLS: a transfer authorized by the client's
+        /// certificate, with no TSIG key and an empty address ACL. The
+        /// handshake half is `rdns_transport::tls`'s; this is the authorization
+        /// (`CLAUDE.md` §16).
         mod transfer_by_certificate {
             use super::*;
             use rdns::validation::{Arrival, PeerCertificate, TlsVersion};
@@ -3552,23 +3412,17 @@ pub(crate) mod tests {
     /// All four answering paths reach the query stream, not just the ordinary
     /// one.
     ///
-    /// With `record_dnstap` behind `finish` and a branch returning above it, a
-    /// capture holds no UPDATE and no transfer — while `--dnstap` says "every
-    /// answered request". Fails that way with one data frame, not three, and at
-    /// three if the TSIG-rejection branch returns past the tail
-    /// (`TODO.md` #77b).
-    ///
-    /// The transfer is refused, because this server has no ACL. That is the
-    /// case worth capturing anyway — `answer_transfer` logs every attempt for
-    /// the same reason — and it exercises the branch rather than the zone.
+    /// Fails with one data frame, not three, if `record_dnstap` sits behind an
+    /// early return, and at three if the TSIG-rejection branch does. The
+    /// transfer is refused, as this server has no ACL; the branch is what is
+    /// exercised.
     #[tokio::test]
     async fn every_answering_path_reaches_the_dnstap_stream() {
         let dir = ScratchDir::new("dnstap-paths");
         let capture = dir.join("capture.fstrm");
         let key = update_key(rdns::tsig::UpdatePolicy::Any);
-        // Its own `Shutdown`: the pump flushes when it stops, and
-        // `test_shutdown` is one static that every other test's accept loop is
-        // holding.
+        // Its own `Shutdown`: the pump flushes on stop, and `test_shutdown` is
+        // shared by every test's accept loop.
         let shutdown = Shutdown::new();
         let sink = rdns_transport::dnstap::Sink::spawn(
             &rdns_transport::dnstap::Target::File(capture.clone()),
@@ -3616,9 +3470,8 @@ pub(crate) mod tests {
             "an empty ACL refuses everyone"
         );
 
-        // The fourth door. A key the server does not hold is *answered* —
-        // NOTAUTH, signed per RFC 8945 §5.3 — and it is the one capture an
-        // operator wants during a key-guessing probe.
+        // The fourth door: an unknown key is answered NOTAUTH, signed (RFC 8945
+        // §5.3), the capture a key-guessing probe leaves.
         let stranger = TsigKey::new("stranger.key.", TsigAlgorithm::HmacSha256, vec![9u8; 32]);
         let probe = update_message(
             "example.com.",
@@ -3632,10 +3485,8 @@ pub(crate) mod tests {
             "a key this server does not hold"
         );
 
-        // Polled rather than slept, twice, because a loaded machine decides a
-        // sleep. A frame is recorded after its reply is sent, so the client can
-        // hold the fourth reply before the server has queued the fourth frame;
-        // stopping then leaves three.
+        // Polled, not slept: a frame is recorded after its reply is sent, so
+        // the fourth reply can arrive before its frame.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while data_frames(&std::fs::read(&capture).expect("the capture file")) < 4 {
             assert!(
@@ -3668,23 +3519,18 @@ pub(crate) mod tests {
         );
     }
 
-    /// A refused UPDATE is signed at the instant that verified it.
+    /// A refused UPDATE is signed at the instant that verified it, not a second
+    /// clock read, which only a fixed clock exposes.
     ///
-    /// Not a second read of the wall clock, which differs from the `now` the
-    /// request was checked against — invisible under `Clock::System`, so it
-    /// takes a fixed clock to see, and the guard is a type (`Refused`) rather
-    /// than a thirteenth careful call site.
-    ///
-    /// Fails with `session.sign(bytes, current_unix_timestamp())`:
-    /// `TsigError::BadTime`.
+    /// The guard is a type (`Refused`). Fails with `session.sign(bytes,
+    /// current_unix_timestamp())`: `TsigError::BadTime`.
     #[tokio::test]
     async fn a_refused_update_is_signed_at_the_instant_that_verified_it() {
         // Fixed, and far outside RFC 8945 §5.2.3's 300-second fudge from any
         // real now, so the wrong clock cannot pass by luck.
         const WHEN: u64 = 1_700_000_000;
-        // Valid, and scoped to a zone this server does not hold: the TSIG
-        // verifies, so there is a session to sign the refusal with, and §3.3
-        // refuses it.
+        // Valid but scoped elsewhere: the TSIG verifies, giving a session to
+        // sign the §3.3 refusal with.
         let key = update_key(rdns::tsig::UpdatePolicy::Zones(vec![
             "elsewhere.test.".to_string()
         ]));
@@ -3730,10 +3576,8 @@ pub(crate) mod tests {
             ResponseCode::Refused,
             "§3.3: the key grants nothing here"
         );
-        // The whole point: a client whose clock agrees with the server's must
-        // be able to verify the refusal. RFC 8945 §5.3 — unsigned, or signed
-        // off a different instant, a refusal is indistinguishable from a
-        // tampered reply.
+        // A client whose clock agrees must verify the refusal (RFC 8945 §5.3),
+        // or it cannot tell a refusal from tampering.
         rdns::tsig::check_response(reply, &key, &request_mac, true, WHEN)
             .expect("the refusal verifies at the instant it was signed at");
     }
@@ -3825,9 +3669,8 @@ pub(crate) mod tests {
             "§3.1.1: not one of this server's authority zones"
         );
 
-        // NOTAUTH whatever the credential: the zone is checked first, or the
-        // rcode does not say which of server and key to change
-        // (`TODO.md` #118).
+        // NOTAUTH whatever the credential: the zone is checked first (`TODO.md`
+        // #118).
         let unsigned_elsewhere = update_message(
             "nowhere.test.",
             vec![a_record("new.nowhere.test.", "192.0.2.50")],
@@ -3980,14 +3823,11 @@ pub(crate) mod tests {
         assert_eq!(written, with_include, "a refused update writes nothing");
     }
 
-    /// A zone directory that cannot be read is a server failure, not a refusal
-    /// (RFC 2136 §2.2: "for example an operating system error"). The client
-    /// acts on the difference: SERVFAIL sends it to the next server, anything
-    /// else ends the update (§4.5, §4.6).
+    /// An unreadable zone directory is SERVFAIL, not a refusal (RFC 2136 §2.2):
+    /// SERVFAIL sends the client to the next server (§4.5, §4.6).
     ///
-    /// Removed rather than chmod'ed: a mode does not stop root, and Windows has
-    /// none. Fails with `file_for` reading `read_dir(dir).ok()?`, which answers
-    /// REFUSED with `NOT_WRITABLE`.
+    /// Removed, not chmod'ed, as root ignores modes. Fails with `file_for`
+    /// reading `read_dir(dir).ok()?`: REFUSED.
     #[tokio::test]
     async fn an_update_when_the_zone_directory_cannot_be_read_is_servfail() {
         let dir = ScratchDir::new("update-no-dir");
@@ -4029,17 +3869,12 @@ pub(crate) mod tests {
         assert_eq!(asked.answers.len(), 1, "still serving: {:?}", asked.answers);
     }
 
-    /// An UPDATE leaves a journal, and the journal answers an IXFR from
-    /// before it.
+    /// An UPDATE leaves a journal, and the journal answers an IXFR from before
+    /// it.
     ///
-    /// Asserting on the file alone would not show it: what matters is that a
-    /// *fresh* `DeltaLog`, as after a restart, can chain from the serial a
-    /// secondary held beforehand. Anything less is a file that exists rather
-    /// than a history that works.
-    ///
-    /// Fails with the journal write removed from `install_zone`: the update
-    /// still applies and is still served, and `Journal::load` comes back empty,
-    /// so `chain_from` has nothing to answer with.
+    /// A fresh `DeltaLog`, as after a restart, must chain from the old serial.
+    /// Fails with the journal write removed from `install_zone`: `chain_from`
+    /// has nothing.
     #[tokio::test]
     async fn an_update_leaves_a_journal_that_survives_the_process() {
         let dir = ScratchDir::new("update-journal");

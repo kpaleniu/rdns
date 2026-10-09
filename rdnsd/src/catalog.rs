@@ -1471,9 +1471,8 @@ mod tests {
             "a name clash, not a migration (§5.2)"
         );
 
-        // The old catalog now hands it over, and the new one is reconciled
-        // again — §4.3.1 makes the migration wait for an update of the new
-        // catalog in which the member is present.
+        // The old catalog hands it over and the new one is reconciled again:
+        // §4.3.1 waits for an update of the new catalog listing the member.
         h.publish(catalog_zone(
             "old.invalid.",
             2,
@@ -1494,10 +1493,8 @@ mod tests {
              its state (§4.3.1)"
         );
 
-        // §4.3.1 leaves the member in the old catalog "until it has been
-        // established that all its consumers have processed the Change of
-        // Ownership", so the old catalog goes on listing it — and reconciling
-        // the old catalog again must not read that as a clash and take it back.
+        // §4.3.1 keeps the member in the old catalog until all consumers moved,
+        // so reconciling it again must not take the member back.
         h.publish(catalog_zone(
             "old.invalid.",
             3,
@@ -1510,9 +1507,8 @@ mod tests {
             h.membership().contains("nj2xg5b.zones.new.invalid."),
             "the migration stands"
         );
-        // And it is not merely refused as a clash: a clash is logged as an
-        // error, and this one is the state §4.3.1 asks the producer to leave the
-        // catalog in, so it would be one error per refresh forever.
+        // Not refused as a clash either: that logs an error, every refresh, for
+        // the state §4.3.1 asks for.
         let old = h
             .zone_map
             .read()
@@ -1718,13 +1714,9 @@ mod tests {
         );
     }
 
-    /// §5.4's reset is about the member *node* label. A group changing under an
-    /// unchanged label is the same zone fetched from somewhere else, so the
-    /// refresh task is replaced and the data is not.
-    ///
-    /// Fails without the group in the sidecar row: the reconcile sees an
-    /// unchanged node, does nothing, and the member keeps coming from the old
-    /// master.
+    /// §5.4's reset is about the member node label: a new group under the same
+    /// label re-points the refresh task and keeps the data. Fails without the
+    /// group in the sidecar row: the member keeps the old master.
     #[tokio::test]
     async fn a_changed_group_re_points_the_member_without_resetting_it() {
         let h = Harness::grouped(
@@ -1774,12 +1766,8 @@ mod tests {
         );
     }
 
-    /// RFC 9432 §6: the refusals §5.2 says to log are also reported, because a
-    /// member this server declined has no zone and so no row in
-    /// `rdnsctl status`.
-    ///
-    /// Rebuilt every reconcile, so a member refused once and accepted later
-    /// stops being reported — which the second half asserts.
+    /// RFC 9432 §6: a member refused under §5.2 is reported, having no row in
+    /// `rdnsctl status`, and stops being reported once accepted.
     #[tokio::test]
     async fn a_refused_member_is_reported_until_it_stops_being_refused() {
         let h = Harness::new("catalog-report", &["catalog.invalid."], &["example.com."]);
