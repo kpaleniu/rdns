@@ -523,15 +523,11 @@ mod tests {
         assert!(Label::try_from_bytes(&[0x02, b'a']).is_err());
     }
 
-    /// The encode door holds the same 255-octet limit as the parse door
-    /// (RFC 1035 §2.3.4), so a name that arrived from a zone file rather than
-    /// off the wire cannot be written over-long either.
+    /// The encode door holds the parse door's 255-octet limit (RFC 1035
+    /// §2.3.4), so a name from a zone file cannot be written over-long either.
     ///
-    /// Fails without `check_name_len`: the over-long cases return `Ok` with a
-    /// 256- and a 321-octet buffer.
-    ///
-    /// The boundary is tested either side, in presentation lengths: four labels
-    /// encoding to exactly 255 octets is fine, and one octet more is not.
+    /// Fails without `check_name_len`: the over-long cases return `Ok`. Tested
+    /// either side of the boundary: exactly 255 octets, and one more.
     #[test]
     fn a_name_over_255_octets_is_not_encoded() {
         let label = "x".repeat(MAX_LABEL_LEN);
@@ -557,9 +553,8 @@ mod tests {
             "got {err:?}"
         );
 
-        // And the case that found the parse-side hole, from this direction. It
-        // reports 256 rather than 321: the encoder stops at the first octet
-        // that does not fit and does not decode the rest to total it up.
+        // The encoder stops at the first octet that does not fit, so it reports
+        // 256, not 321.
         let five = format!("{label}.{label}.{label}.{label}.{label}.");
         let err = crate::Name::from_presentation(&five).expect_err("321 octets");
         assert!(
@@ -652,9 +647,8 @@ mod tests {
         let (dname, _) = DName::try_from_bytes(data).expect("should parse pointer");
         let result = unpacker.unpack(dname);
 
-        // Matched on the variant rather than on the message: what a caller acts
-        // on is the category, and an assertion on wording breaks every time the
-        // wording improves.
+        // On the variant, not the message: a caller acts on the category
+        // (`CLAUDE.md` §3).
         assert!(
             matches!(
                 result,
@@ -727,13 +721,11 @@ mod tests {
         );
     }
 
-    /// A pointer must point backwards (RFC 1035 §4.1.4 — a name is replaced
-    /// "with a pointer to a prior occurance of the same name"), and a chain that
-    /// runs forwards is refused.
+    /// A pointer must point backwards (RFC 1035 §4.1.4, "a prior occurance"),
+    /// so a chain that runs forwards is refused.
     ///
-    /// Fails under a visited-offsets check: this chain repeats no offset, and
-    /// unpacks to `"a.b."`. Two hops are needed to demonstrate it because the
-    /// first is unconstrained — see `unpack_internal`.
+    /// Fails under a visited-offsets check, as this chain repeats no offset.
+    /// Two hops, because the first is free (`docs/adr/0002`).
     #[test]
     fn a_pointer_chain_that_runs_forwards_is_refused() {
         let mut data = vec![0u8; 16];
@@ -767,9 +759,8 @@ mod tests {
     /// backwards and still works, including through two hops.
     #[test]
     fn an_ordinary_backwards_pointer_chain_still_resolves() {
-        // offset 0: "b." (the tail every name below shares)
-        // offset 4: the label "a" then a pointer back to 0  => "a.b."
-        // offset 8: the label "w" then a pointer back to 4  => "w.a.b."
+        // 0: "b."; 4: "a" then a pointer to 0, "a.b."; 8: "w" then a pointer to
+        // 4, "w.a.b.".
         let data = vec![
             0x01, b'b', 0x00, 0x00, // 0: "b.", then a spare byte
             0x01, b'a', 0xc0, 0x00, // 4: "a" -> 0
@@ -797,14 +788,11 @@ mod tests {
         data
     }
 
-    /// A name over 255 encoded octets is refused (RFC 1035 §2.3.4: "names 255
-    /// octets or less"), with the boundary tested on both sides.
+    /// A name over 255 encoded octets is refused (RFC 1035 §2.3.4), tested on
+    /// both sides of the boundary, with no pointer involved.
     ///
-    /// Fails without `UnpackedDName::new`'s check: five 63-octet labels, each
-    /// legal, come back `Ok` as a 320-character name.
-    ///
-    /// No pointer is involved in any of these: the limit is on the total, not
-    /// in the compression logic.
+    /// Fails without `UnpackedDName::new`'s check: five legal 63-octet labels
+    /// come back `Ok`.
     #[test]
     fn a_name_over_255_octets_is_refused() {
         // 5 x 63 = 321 encoded octets.
@@ -823,9 +811,8 @@ mod tests {
             "got {err:?}"
         );
 
-        // The boundary either side. 3 x 63 = 192, plus a 61-octet label (62)
-        // plus the root's zero is exactly 255; making that label 62 octets is
-        // 256. An off-by-one in the check lands between these two.
+        // 3 x 64 + 62 + 1 is exactly 255; one octet more in the last label is
+        // 256.
         let mut exact = wire_name(3, MAX_LABEL_LEN);
         exact.pop(); // the root, put back after the fourth label
         exact.push(61);
@@ -853,14 +840,11 @@ mod tests {
         );
     }
 
-    /// The same limit holds for a name *assembled* across compression pointers,
-    /// which is the second of the two paths through `unpack_internal` and a
-    /// separate branch of code from the one above.
+    /// The same limit for a name assembled across pointers, the second path
+    /// through `unpack_internal`.
     ///
-    /// Both halves are legal on their own — 128 and 126 encoded octets — so this
-    /// fails against any check placed on the parse of a single name rather than
-    /// on the resolved total, which is why the bound sits in `UnpackedDName::new`
-    /// where both paths meet.
+    /// Both halves are legal alone, 128 and 126 octets, so this fails against a
+    /// check on one name rather than on the total `UnpackedDName::new` sees.
     #[test]
     fn a_compressed_name_whose_total_exceeds_255_is_refused() {
         // offset 0: two 63-octet labels, then the root. 128 octets.

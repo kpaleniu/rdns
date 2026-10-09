@@ -347,13 +347,9 @@ mod tests {
         }
     }
 
-    /// An opcode with no name here is echoed unchanged. RFC 1035 §4.1.1 has
-    /// OPCODE set by the originator and copied into the response, so a sentinel
-    /// that cannot carry the value sends a DSO client (opcode 6, RFC 8490) a
-    /// NOTIMP naming a different opcode.
-    ///
-    /// Written from raw bytes: a test that starts by naming a variant can only
-    /// reach the values that have names.
+    /// An opcode with no name here is echoed unchanged (RFC 1035 §4.1.1), or a
+    /// DSO client (opcode 6, RFC 8490) gets a NOTIMP naming another opcode.
+    /// Written from raw bytes, which reach values a named variant cannot.
     #[test]
     fn an_opcode_this_library_has_no_name_for_is_echoed_unchanged() {
         for raw in 0u8..16 {
@@ -507,10 +503,8 @@ mod tests {
         let mut buf = [0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("to_bytes");
 
-        // 12 header + 21 question (17-byte name + type + class) + 10 * (2
-        // pointer + 2 type + 2 class + 4 TTL + 2 RDLEN + 4 address) = 193.
-        // Without compression each answer would carry the 17-byte name instead
-        // of a 2-byte pointer: 33 + 10 * 31 = 343.
+        // 12 + 21 + 10 x 16 = 193 with a pointer per answer; spelling the name
+        // out would be 33 + 10 x 31 = 343.
         assert_eq!(n, 193);
 
         let parsed = DnsMessage::try_from_bytes(&buf[0..n]).expect("try_from_bytes");
@@ -565,9 +559,8 @@ mod tests {
             assert_eq!(got.rdata, want.rdata);
         }
 
-        // Every one of those names ends in a pointer rather than spelling the
-        // zone out again. (Labels are length-prefixed on the wire, so the
-        // literal to look for is the label "example", not "example.com".)
+        // Each name ends in a pointer; the wire spells the label "example", not
+        // "example.com".
         assert_eq!(
             buf[..n].windows(7).filter(|w| *w == b"example").count(),
             1,
@@ -692,9 +685,8 @@ mod tests {
         let mut buf = [0u8; 512];
         let n = msg.to_bytes(&mut buf).expect("to_bytes");
 
-        // The length-prefixed label, so this counts targets and not substrings
-        // of some other name. Twice: the second record pointing at the first
-        // would be exactly the compression the section forbids.
+        // The length-prefixed label, counting targets only. Twice: a pointer
+        // from the second to the first is the compression the section forbids.
         assert_eq!(
             buf[..n].windows(3).filter(|w| *w == b"to").count(),
             2,
@@ -1090,13 +1082,9 @@ mod tests {
         assert!(parsed.edns().is_some(), "the OPT record, in its own field");
     }
 
-    /// RFC 2181 §8, at the boundary that owns it: "implementations should treat
-    /// TTL values received with the most significant bit set as if the entire
-    /// value received was zero".
-    ///
-    /// Driven from the wire rather than from `Ttl::from_wire`, because the
-    /// claim being tested is that *parsing a record* applies the rule — that is
-    /// what lets fourteen call sites stop applying it themselves.
+    /// RFC 2181 §8: a TTL "with the most significant bit set" is treated as
+    /// zero. Driven from the wire, since parsing a record is where the rule
+    /// applies, so no call site applies it again.
     #[test]
     fn a_ttl_with_the_high_bit_set_parses_as_zero() {
         for raw in [-1i32, i32::MIN, -3600] {
@@ -1150,9 +1138,8 @@ mod tests {
         assert_eq!(got.version, 0);
         assert_eq!(msg.udp_payload_size(), 4096);
 
-        // `set_edns` replaces rather than accumulates. OPT is an `Option`
-        // field, so a second one is unspellable, which is also what RFC 6891
-        // §6.1.1 says about receiving one.
+        // `set_edns` replaces: OPT is an `Option`, so a second is unspellable
+        // (RFC 6891 §6.1.1).
         msg.set_edns(Edns::with_payload_size(1232));
         assert!(msg.additionals.is_empty(), "OPT is not a resource record");
         assert_eq!(msg.edns().expect("still present").udp_payload_size, 1232);
@@ -1330,9 +1317,8 @@ mod tests {
             msg.set_edns(
                 Edns::with_options(payload, version, do_bit, &options).expect("encode the options"),
             );
-            // Through the wire, because that is where a request comes from and
-            // the version lives in a field `set_edns` writes and the parser
-            // re-reads.
+            // Through the wire: the version is a field `set_edns` writes and
+            // the parser re-reads.
             let bytes = msg.to_bytes_within(512).expect("serialize");
             let parsed = DnsMessage::try_from_bytes(&bytes).expect("parse");
 
@@ -1394,10 +1380,8 @@ mod tests {
             .to_bytes(&mut buf)
             .expect_err("extended RCODE needs an OPT record");
         assert!(err.to_string().contains("OPT record"), "got: {err}");
-        // The whole message, not a substring of it: this literal carried 22
-        // spaces where a `\` continuation belonged, and the assertion above was
-        // true throughout. rustfmt does not touch string literals (§12), so a
-        // wrapped one has no other check.
+        // The whole message: rustfmt does not touch string literals
+        // (`CLAUDE.md` §12), so a broken `\` continuation shows only here.
         assert!(
             !err.to_string().contains("  "),
             "a wrapped literal leaked its indentation: {err}"
@@ -1450,13 +1434,8 @@ mod tests {
     }
 
     /// Fails if the response is built in a zeroed 64 KB scratch and truncated:
-    /// `truncate` shrinks the *length* and not the capacity, so the `Vec` held
-    /// for the send reads 65535 whatever the answer — a 1000x overshoot at a
-    /// thousand in flight.
-    ///
-    /// Asserted on capacity rather than on a timing, deliberately: capacity is
-    /// exact and does not care what else is running on the machine (`CLAUDE.md`
-    /// §10).
+    /// `truncate` keeps the capacity, so the send holds 65535 whatever the
+    /// answer. On capacity, which is exact, not a timing (`CLAUDE.md` §10).
     #[test]
     fn a_small_response_does_not_carry_a_64k_buffer_into_the_send() {
         use std::net::Ipv4Addr;
@@ -1478,10 +1457,8 @@ mod tests {
             bytes.capacity()
         );
 
-        // And the TCP path, which passes the protocol ceiling because the length
-        // prefix is its only limit. This is what `TODO.md` #25b measured: 65 535
-        // bytes allocated and zeroed for the same 60 bytes of answer, because
-        // the scratch was sized to the limit rather than to the message.
+        // The TCP path passes the protocol ceiling, as the length prefix is its
+        // only limit; the scratch must still be sized to the message.
         let framed = msg.to_bytes_within(u16::MAX as usize).expect("TCP");
         assert_eq!(framed, bytes, "the limit does not change the bytes");
         assert!(
@@ -1781,13 +1758,9 @@ mod tests {
         assert!(!msg.cd, "CD bit should be false by default");
     }
 
-    /// **D-1's actual claim, at the message level.** A response carrying a
-    /// label that is not valid UTF-8 parses, so `rdnsr` can relay somebody
-    /// else's zone that has one (RFC 2181 §11: "any binary string whatever can
-    /// be used as the label").
-    ///
-    /// `rdns-core` has no presentation reader to contrast with, so what is
-    /// asserted is the relay itself: in, out, and the same octets.
+    /// D-1 at the message level: a response with a label that is not UTF-8
+    /// parses and relays byte for byte, so `rdnsr` can relay another zone's
+    /// (RFC 2181 §11, "any binary string whatever").
     #[test]
     fn a_response_carrying_a_binary_label_relays_byte_for_byte() {
         // Header, one question, one answer. The owner's first label is a single

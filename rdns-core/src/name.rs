@@ -778,13 +778,10 @@ mod tests {
         }
     }
 
-    /// **This is D-1.** A label is "any binary string" (RFC 2181 §11), and the
-    /// three cases below are what presentation storage could not hold: an octet
-    /// that is not UTF-8, a dot *inside* a label, and a backslash.
-    ///
-    /// The middle one is also the injectivity case: the one-label name `a.b`
-    /// and the two-label `a`,`b` read as the same text and must not be the same
-    /// name.
+    /// D-1: a label is "any binary string" (RFC 2181 §11): an octet that is not
+    /// UTF-8, a dot inside a label, and a backslash. The dot is also
+    /// injectivity: the one-label `a.b` and the two labels `a`, `b` must
+    /// differ.
     #[test]
     fn a_label_may_hold_any_octet() {
         // Not UTF-8: 0xff is not a valid first byte of any UTF-8 sequence.
@@ -832,9 +829,7 @@ mod tests {
         // And it goes back out as the octets it arrived as.
         assert_eq!(name.as_ref().as_wire(), &wire);
 
-        // And it has a spelling, which is what a zone file needs: `String` is
-        // UTF-8 and 0xff begins no UTF-8 sequence, so the octet has to be
-        // escaped rather than carried (RFC 1035 §5.1).
+        // Not UTF-8, so the octet is escaped in presentation (RFC 1035 §5.1).
         assert_eq!(name.as_ref().to_presentation(), r"\255.example.");
         assert_eq!(Name::from_presentation(r"\255.example.").unwrap(), name);
     }
@@ -918,9 +913,8 @@ mod tests {
         assert!(!under("ab.example.com.", "b.example.com."));
         // Case-insensitively, like everything else.
         assert!(under("A.ExAmPlE.CoM.", "example.com."));
-        // RFC 1035 §5.1's escape is a dot *inside* a label, and on the wire it
-        // is not a boundary at all, which a text version has to be taught and
-        // this one cannot get wrong.
+        // An escaped dot (RFC 1035 §5.1) is inside a label, not a boundary,
+        // which wire form cannot get wrong.
         assert!(!under(r"x.a\.b.com.", "b.com."));
         assert!(under(r"x.a\.b.com.", r"a\.b.com."));
     }
@@ -1101,14 +1095,11 @@ mod tests {
         );
     }
 
-    /// RFC 6672 §2.2: "suppose the target name of the DNAME RR is 250 octets in
-    /// length (multiple labels), if an incoming QNAME that has a first label
-    /// over 5 octets in length, the result would be a name over 255 octets. If
-    /// this occurs, the server returns an RCODE of YXDOMAIN."
+    /// RFC 6672 §2.2: a 250-octet target with a first label over 5 octets
+    /// overflows 255, and "the server returns an RCODE of YXDOMAIN".
     ///
-    /// The RFC's own arithmetic, so the target is built to exactly 250 encoded
-    /// octets: four 49-octet labels and one of 48 are 4 × 50 + 49 = 249, and
-    /// the root's terminator is the 250th.
+    /// The RFC's own arithmetic: four 49-octet labels and one of 48 encode to
+    /// 249, and the root makes 250.
     #[test]
     fn a_substitution_that_overflows_255_octets_is_yxdomain() {
         let label = "a".repeat(49);

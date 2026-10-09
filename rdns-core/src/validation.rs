@@ -987,15 +987,9 @@ mod tests {
         assert!(!Arrival::Tcp.privacy().is_xot());
     }
 
-    /// Sixteen octets, so the reason is here (§17): a connection carries the
-    /// certificate its client presented, which is an `Option<Arc<Vec<u8>>>` —
-    /// one pointer, `None` costing nothing extra by the niche, and the version
-    /// and discriminant padded out beside it. `Arc<[u8]>` would be worse, being
-    /// a fat pointer.
-    ///
-    /// Pinned because this rides on the answer path, once per message
-    /// (`CLAUDE.md` §17's rule about measuring rather than assuming a newtype
-    /// is free).
+    /// Sixteen octets on the answer path, once per message (`CLAUDE.md` §17):
+    /// the certificate is an `Option<Arc<Vec<u8>>>`, one pointer by the niche,
+    /// where `Arc<[u8]>` would be a fat one.
     #[test]
     fn an_arrival_costs_sixteen_octets() {
         assert_eq!(std::mem::size_of::<Arrival>(), 16);

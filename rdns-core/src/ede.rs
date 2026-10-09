@@ -260,9 +260,8 @@ mod tests {
     fn the_longest_text_still_leaves_the_reply_room() {
         const EDE: ExtendedError = ExtendedError::new(InfoCode::OTHER, "x");
         assert_eq!(EDE.to_option().data.len(), 3);
-        // 12 octets of header, 259 of the longest question, 11 of OPT and 4 of
-        // option header, plus the option itself, inside the 512 the writer
-        // floors its buffer at.
+        // Header, longest question, OPT, option header and the option itself
+        // fit inside the 512 the writer floors its buffer at.
         assert!(12 + 259 + 11 + 4 + 2 + MAX_EXTRA_TEXT < CLASSIC_UDP_SIZE as usize);
     }
 }

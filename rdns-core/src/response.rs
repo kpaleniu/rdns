@@ -650,16 +650,8 @@ mod tests {
     use super::*;
     use crate::ede::InfoCode;
 
-    /// `TODO.md` #45e, answered **no**: this resolver does not implement EDNS
-    /// Client Subnet, so a query carrying one is answered without it. RFC 7871
-    /// §11 is the reason — the option makes "the network address of the client
-    /// ... visible to all servers involved in the resolution process" — and the
-    /// mechanism is that `mirror` builds a *fresh* OPT rather than copying the
-    /// client's.
-    ///
-    /// A test for the absence of a behaviour, because that is the kind that
-    /// comes back: echoing an option is one line away from here, and an echoed
-    /// ECS with SCOPE 0 is a claim to support it (RFC 7871 §7.2).
+    /// No client option is echoed: a fresh OPT, not a copy, so no ECS (RFC 7871
+    /// §11). An echoed ECS with SCOPE 0 would claim support (§7.2).
     #[test]
     fn no_option_of_the_clients_is_echoed_back() {
         use crate::edns::{EdnsOption, EDNS_OPTION_CLIENT_SUBNET, EDNS_OPTION_NSID};
