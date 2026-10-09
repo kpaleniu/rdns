@@ -4,7 +4,7 @@
 `//`: at most 2 lines. `///`: one paragraph of at most 8 lines, or a summary
 of at most 2 then one paragraph of at most 6. `//!` is exempt; fenced code and
 table rows count toward neither. Test code is a `tests/` or `benches/` file, or anything after
-a `#[cfg(test)]` that opens a `mod`.
+a `#[cfg(test)]` that opens an inline `mod`.
 
     python tools/comment_caps.py            # counts per crate and region
     python tools/comment_caps.py --list     # every block over, file:line
@@ -79,7 +79,7 @@ def opens_test_mod(lines, i):
         s = nxt.strip()
         if s.startswith("#["):
             continue
-        return bool(re.match(r"(pub(\(\w+\))? )?mod \w+", s))
+        return bool(re.match(r"(pub(\(\w+\))? )?mod \w+ \{", s))
     return False
 
 
