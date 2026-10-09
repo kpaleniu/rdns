@@ -8,12 +8,12 @@
 //! rather than transferred, because what is being compared is what happens
 //! *after* the last envelope arrives.
 //!
-//! **`installing_a_transferred_policy_zone` is that comparison as it was
-//! taken**, and A is no longer what the resolver does: #71f writes the file and
-//! installs the zone the process holds, so the reload reads the file to prove
-//! it is still that zone rather than to parse it. The live cost is the `#71f`
-//! column of `refreshing_a_transferred_policy_zone` below. Kept as it was
-//! because it is the measurement 57d was decided on.
+//! **`installing_a_transferred_policy_zone` is that comparison**, and A is not
+//! what the resolver does: it writes the file and installs the zone the process
+//! holds, so the reload reads the file to prove it is still that zone rather
+//! than to parse it (`TODO.md` #71f). The live cost is the `#71f` column of
+//! `refreshing_a_transferred_policy_zone` below. Kept because it is the
+//! measurement 57d was decided on.
 //!
 //! ```sh
 //! cargo test --release -p rdns --test rpz_install -- --ignored --nocapture
@@ -459,8 +459,8 @@ fn refreshing_a_transferred_policy_zone() {
 /// What a *set* of feeds costs when one of them publishes — `TODO.md` #71b.
 ///
 /// The two above measure one feed. This one measures the thing an operator
-/// actually runs: several feeds, one publisher, and a reload that used to be
-/// all-or-nothing over the set. `RDNS_RPZ_FEEDS` sets how many.
+/// actually runs: several feeds, one publisher, and a reload. `RDNS_RPZ_FEEDS`
+/// sets how many.
 ///
 /// Three rows, and the middle one is the number the row was filed on: a cold
 /// load of the set, a reload with nothing changed, and a reload with exactly

@@ -139,7 +139,7 @@ impl<I: Iterator<Item = ResourceRecord>> Iterator for Envelopes<'_, I> {
     type Item = DnsMessage;
 
     fn next(&mut self) -> Option<DnsMessage> {
-        // The name's wire length exactly, now that a name is its wire form.
+        // The name's wire length exactly: a `Name` is its wire form.
         let cost =
             |rr: &ResourceRecord| rr.name.as_ref().as_wire().len() + 10 + rr.rdata.bytes().len();
         let mut current: Vec<ResourceRecord> = Vec::new();
@@ -306,8 +306,8 @@ mod tests {
 
     /// RFC 5936 §2.2.5: "it SHOULD include one OPT RR in the first response
     /// message and MAY do so in subsequent response messages" — and RFC 3225
-    /// §3: "the DO bit of the query MUST be copied in the response", which this
-    /// dropped until #47. Nothing asserted either before.
+    /// §3: "the DO bit of the query MUST be copied in the response" (`TODO.md`
+    /// #47).
     ///
     /// The DO bit changes nothing about what a transfer carries — §3 says the
     /// security records "are part of the zone data for an AXFR or IXFR query"

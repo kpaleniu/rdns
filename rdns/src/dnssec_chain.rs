@@ -48,12 +48,11 @@ pub enum ValidationState {
     Indeterminate(String),
 }
 
-/// What validation concluded, without the reason: what a cache keeps beside
-/// an answer and what a counter counts (`TODO.md` #186).
+/// What validation concluded, without the reason: what a cache keeps beside an
+/// answer and what a counter counts.
 ///
-/// It replaced a `secure: bool` in both caches, which kept the AD bit and lost
-/// the rest: a cache hit could not say whether it was provably unsigned or
-/// never in scope.
+/// Not a `secure: bool`, which keeps the AD bit and loses the rest: a cache hit
+/// could not say whether it was provably unsigned or never in scope.
 ///
 /// The discriminants index [`Outcome::ALL`], which the metrics rely on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,8 +264,7 @@ fn parse_ds_line(line: &str) -> Result<Ds, DnssecError> {
         .parse()
         .map_err(|_| DnssecError::parse(format!("bad digest type {:?}", tokens[2],)))?;
     // The digest may be split across whitespace, as it is in IANA's own file,
-    // which `hex_decode` skips — this was a third copy of that loop, inline and
-    // so invisible to a grep for `parse_hex` (`TODO.md` #26c).
+    // which `hex_decode` skips.
     let digest = hex_decode(&tokens[3..].concat())
         .map_err(|e| DnssecError::parse(format!("digest: {e}")))?;
 
@@ -801,10 +799,9 @@ pub(crate) enum ChainNeed {
 /// what it needs, the resolver fetches it, and it ends in a
 /// [`ValidationState`].
 ///
-/// The start, the resume from a trusted start, the step cap and the
-/// delegation verdicts are here, so a synchronous test reaches them; the
-/// resolver keeps the fetch, the key cache and the referral evidence it
-/// gathered (`TODO.md` #151).
+/// The start, the resume from a trusted start, the step cap and the delegation
+/// verdicts are here, so a synchronous test reaches them; the resolver keeps
+/// the fetch, the key cache and the referral evidence it gathered.
 pub(crate) struct ChainWalk<'a> {
     validator: ChainValidator<'a>,
     target: Name,
@@ -820,8 +817,7 @@ impl<'a> ChainWalk<'a> {
     ///
     /// A trusted start's keys are used as given: they were validated to the
     /// anchor when they were read, and the resolution that started there
-    /// skipped the referrals above it, so the walk has to resume exactly there
-    /// (`TODO.md` #151a).
+    /// skipped the referrals above it, so the walk has to resume exactly there.
     pub(crate) fn start<'t>(
         anchors: &'a TrustAnchors,
         now: u64,
@@ -1056,9 +1052,8 @@ pub(crate) fn cname_chain_shape(
     // A CNAME is the only record at its owner (RFC 1034 §3.6.2), so two of them
     // cannot both be followed.
     //
-    // No canonicalizing pass: `Name` compares case-insensitively, so the copies
-    // this used to make of every owner and every target — one per record, to
-    // make `==` mean what DNS means — are gone.
+    // No canonicalizing pass: `Name` compares case-insensitively, so `==`
+    // already means what DNS means without a copy per record.
     let mut cnames: Vec<(Name, Name)> = Vec::new();
     for rr in answers.iter().filter(|rr| rr.rdata.rtype() == rt::CNAME) {
         let Ok(ParsedRecord::CNAME(target)) = rr.rdata.parse() else {
@@ -1872,7 +1867,7 @@ example.test. DS 12345 13 2 ABCDEF0123456789
         );
     }
 
-    // `ChainWalk`, synchronously (`TODO.md` #151). Each test names the rule.
+    // `ChainWalk`, synchronously. Each test names the rule.
 
     /// Root, `test.` and `example.test.`, each signed, with the root as the
     /// one anchor.
@@ -1963,8 +1958,8 @@ example.test. DS 12345 13 2 ABCDEF0123456789
     }
 
     /// The resume rule: the deepest trusted start at or above the target and
-    /// under the anchor, with its keys as given — no cache read, no fetch.
-    /// This is #151a's case, reached without a resolver.
+    /// under the anchor, with its keys as given — no cache read, no fetch. A
+    /// key set expiring mid-resolution, reached without a resolver.
     #[test]
     fn a_walk_resumes_from_the_deepest_trusted_start() {
         let c = chain();

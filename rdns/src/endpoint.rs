@@ -3,24 +3,24 @@
 //!
 //! Two flags name a peer this way. `--secondary zone@addr[:port][#key]` says
 //! where a zone is replicated *from*; `--also-notify addr[:port][#key]` says
-//! who is told when it changes. They were not one parser until `TODO.md` #46,
-//! and the cost was exactly what `CLAUDE.md` §7 predicts: `--secondary` grew
-//! the `#key` half and `--also-notify` did not, so a transfer could be
-//! authenticated while the notification that triggers it could not be — and a
-//! secondary whose notify ACL names a key refused every one of them.
+//! who is told when it changes. One parser, because two is what `CLAUDE.md` §7
+//! predicts: one grows the `#key` half and the other does not, so a transfer
+//! can be authenticated while the notification that triggers it cannot — and a
+//! secondary whose notify ACL names a key refuses every one of them (`TODO.md`
+//! #46).
 //!
 //! The `#key` is a *name*, resolved against the keyring `--tsig-key` builds, so
 //! a secret is written down once ([`crate::tsig::TsigKeyring::by_name`]).
 //!
-//! `+tls=name` is XFR over TLS (`TODO.md` #44d): fetch this zone over TLS and
-//! require the master's certificate to carry that name. It is last, and the
-//! name is not optional — RFC 9103 §7.5 makes authenticating the server a MUST,
-//! so there is deliberately no spelling of "encrypt but do not check"
-//! ([`crate::xot`]). `--secondary` accepts it, and since `TODO.md` #175 so
-//! does a resolver's forwarder ([`parse_server`]), where it means DNS over TLS
-//! (RFC 7858). The `Endpoint` a `--also-notify` parses to carries the field,
-//! and `NotifyTarget::parse` refuses it rather than accepting a flag that
-//! would do nothing.
+//! `+tls=name` is XFR over TLS: fetch this zone over TLS and require the
+//! master's certificate to carry that name. It is last, and the name is not
+//! optional — RFC 9103 §7.5 makes authenticating the server a MUST, so there is
+//! deliberately no spelling of "encrypt but do not check" ([`crate::xot`]).
+//! `--secondary` accepts it, and so does a resolver's forwarder (`TODO.md`
+//! #175) ([`parse_server`]), where it means DNS over TLS (RFC 7858). The
+//! `Endpoint` a `--also-notify` parses to carries the field, and
+//! `NotifyTarget::parse` refuses it rather than accepting a flag that would do
+//! nothing.
 
 use std::net::{IpAddr, SocketAddr};
 

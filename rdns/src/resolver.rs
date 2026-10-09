@@ -32,10 +32,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
 // The two types below are here rather than in `crate::error` because
-// `From<tokio::time::error::Elapsed>` can only be written where the error
-// type is defined, and that one impl held a `tokio` dependency in a module
-// almost every other one imports (`TODO.md` #67b). `crate::error` does not
-// re-export them: a `pub use` would put the edge straight back.
+// `From<tokio::time::error::Elapsed>` can only be written where the error type
+// is defined, and that one impl would hold a `tokio` dependency in a module
+// almost every other one imports. `crate::error` does not re-export them: a
+// `pub use` would put the edge straight back.
 
 /// This module's `Result` alias, matching core's.
 pub type ResolveResult<T> = std::result::Result<T, ResolveError>;
@@ -59,7 +59,7 @@ pub enum ResolveError {
     BudgetExhausted,
     /// A [`crate::resolver::NameserverPolicy`] refused a delegation. Its own
     /// variant because it is not a failure: the caller that supplied the policy
-    /// has an answer to send and the walk stopped so it could (`TODO.md` #56).
+    /// has an answer to send and the walk stopped so it could.
     #[error("a delegation was refused by policy")]
     PolicyStopped,
     /// The resolution ran past its [`ResolutionTimer`] and was abandoned. Its
@@ -175,7 +175,7 @@ const MINIMIZED_PROBE_TYPE: Qtype = Qtype::of(rt::A);
 /// goes out, so a deep name degrades instead of exhausting `query_budget`.
 const MAX_MINIMISE_COUNT: usize = 10;
 
-/// IPv4 addresses of the 13 root servers, used to prime recursion.
+/// IPv4 addresses of the 13 root servers, which prime recursion.
 ///
 /// A fallback only; these change, so load the published hints file with
 /// [`parse_root_hints`] into `root_hints`. A stale entry degrades: servers are
@@ -418,9 +418,9 @@ pub struct ResolverConfig {
     /// this host can reassemble, which is the same claim `rdnsr` makes to its
     /// own clients and is set from the same flag.
     ///
-    /// Not the size of the buffer an answer is read into — those were one
-    /// number until `TODO.md` #41c, which is why lowering this was not free.
-    /// See `upstream::UPSTREAM_RECEIVE_BUFFER`.
+    /// Not the size of the buffer an answer is read into, so lowering this
+    /// narrows nothing this resolver can read. See
+    /// `upstream::UPSTREAM_RECEIVE_BUFFER`.
     pub udp_payload_size: u16,
     /// How many zone delegations to remember. 0 disables the cache, which makes
     /// every query restart at the root — correct, but only acceptable in tests.
@@ -578,8 +578,8 @@ impl Budget {
 /// A callback rather than a second return value, because the delegation chain
 /// is walked and discarded: handing it back means every caller pays for a
 /// `Vec<Name>` it does not want, and only this shape can *stop* the resolution,
-/// which is what `rdns::rpz`'s NSDNAME and NSIP triggers are for (`TODO.md`
-/// #56). Nothing is asked and nothing is allocated when no policy is set.
+/// which is what `rdns::rpz`'s NSDNAME and NSIP triggers are for. Nothing is
+/// asked and nothing is allocated when no policy is set.
 ///
 /// `Sync`, because the reference is held across the walk's awaits and the
 /// resolution is spawned.
@@ -621,8 +621,8 @@ struct Resolution<'a> {
 /// Held rather than looked up again at validation: the walk below the start
 /// skipped the referrals above it, so validation has to resume exactly here.
 /// Re-reading the key cache lets an entry that expired in between send the walk
-/// back to the anchor with no evidence for the cuts below it, which turned a
-/// secure answer Bogus (`TODO.md` #151a).
+/// back to the anchor with no evidence for the cuts below it, which turns a
+/// secure answer Bogus.
 struct TrustedStart {
     zone: Name,
     keys: Vec<Dnskey>,
@@ -726,9 +726,8 @@ pub struct Resolver {
     nsids: NsidStore,
     /// Zones whose DNSKEY set we have already validated.
     keys: KeyCache,
-    /// The one every read on this resolver's request path goes through
-    /// (`TODO.md` #107b). `validate` reads it directly; the two caches hold
-    /// their own clone.
+    /// The one every read on this resolver's request path goes through.
+    /// `validate` reads it directly; the two caches hold their own clone.
     clock: Clock,
     upstream: Upstream,
     tap: Option<ExchangeTap>,
@@ -745,8 +744,8 @@ impl Resolver {
     /// As [`Resolver::new`], reading `clock` instead of the system's.
     ///
     /// The delegation cache, the key cache and `validate` read it: seven reads
-    /// on the request path that were the system's until #107b, so a test could
-    /// only reach an expiry by forging an entry through the cache's own mutex.
+    /// on the request path, so a test reaches an expiry by moving the clock
+    /// rather than by forging an entry through the cache's own mutex.
     pub fn with_clock(config: ResolverConfig, clock: Clock) -> Self {
         let delegations = DelegationCache::new(config.delegation_cache_size, clock.clone());
         let rtt = RttStore::new(config.delegation_cache_size);
@@ -945,13 +944,13 @@ impl Resolver {
         let mut state = Resolution::new(self.config.query_budget, policy);
         state.probe = probe;
         let mut response = self.recurse(query, &mut state).await?;
-        // Past both modes, because `recurse` did this and `forward` relayed
-        // the upstream's header verbatim (`TODO.md` #78b). The question is the
-        // client's byte for byte: 0x20 sent a different case upstream, and a
-        // downstream resolver checks the echoed question case-sensitively
-        // (RFC 5452 §9.1 — `response_matches` below is that check). And this
-        // resolver is authoritative for nothing (RFC 1035 §4.1.1); with AA
-        // set, RFC 8020 reads an NXDOMAIN as a claim about the whole subtree.
+        // Past both modes, so neither relays the upstream's header verbatim.
+        // The question is the client's byte for byte: 0x20 sent a different
+        // case upstream, and a downstream resolver checks the echoed question
+        // case-sensitively (RFC 5452 §9.1 — `response_matches` below is that
+        // check). And this resolver is authoritative for nothing (RFC 1035
+        // §4.1.1); with AA set, RFC 8020 reads an NXDOMAIN as a claim about the
+        // whole subtree.
         response.queries = vec![query.clone()];
         // AA stays on an answer from a local zone, which this resolver *is*
         // authoritative for (#174); `zone_answer` already cleared it on a
@@ -1179,10 +1178,10 @@ mod tests {
     /// differently map to different codes.
     ///
     /// The point of RFC 8914 here: "no authority answered" sends somebody to
-    /// the delegation, "the query budget was exhausted" to a zone naming
-    /// dozens of glueless nameservers, and a bare SERVFAIL to neither. The
-    /// same distinction `ResolveError` already draws for the log line and the
-    /// counter (`CLAUDE.md` §3), now visible on the wire.
+    /// the delegation, "the query budget was exhausted" to a zone naming dozens
+    /// of glueless nameservers, and a bare SERVFAIL to neither. The same
+    /// distinction `ResolveError` already draws for the log line and the
+    /// counter (`CLAUDE.md` §3), visible on the wire.
     #[test]
     fn every_lookup_failure_has_a_code_a_client_can_act_on() {
         let cases = [
@@ -1486,12 +1485,11 @@ this line has no record and is skipped
     }
 
     /// RFC 5452 §9.1 makes "Query class and type" part of what a reply must
-    /// match, and this check had only the id and the name — `rdnsc`'s copy of it
-    /// had all three (`TODO.md` #30o). A reply echoing the right name under
-    /// another type is somebody else's answer.
+    /// match (`TODO.md` #30o). A reply echoing the right name under another
+    /// type is somebody else's answer.
     ///
-    /// Watched failing before the shared predicate: the MX-questioned reply was
-    /// taken as the answer to an A query, address record and all.
+    /// Fails if the check is the id and the name alone: the MX-questioned reply
+    /// is taken as the answer to an A query, address record and all.
     #[tokio::test]
     async fn a_reply_that_echoes_another_type_is_not_this_answer() {
         let net = Net::default();
@@ -1516,18 +1514,18 @@ this line has no record and is skipped
     }
 
     /// Lowering what this resolver advertises does not narrow what it can
-    /// receive (`TODO.md` #41c).
+    /// receive.
     ///
-    /// The two were one number: the answer buffer was
-    /// `vec![0; config.udp_payload_size]`, so moving the advertisement to DNS
-    /// Flag Day's 1232 would have made every answer over 1232 unreadable — and
-    /// unreadable, not truncated: the receive itself fails on Windows and drops
-    /// the tail elsewhere, so the answer is lost rather than parsed short.
+    /// With an answer buffer of `vec![0; config.udp_payload_size]`, moving the
+    /// advertisement to DNS Flag Day's 1232 makes every answer over 1232
+    /// unreadable — and unreadable, not truncated: the receive itself fails on
+    /// Windows and drops the tail elsewhere, so the answer is lost rather than
+    /// parsed short.
     ///
     /// The upstream here answers with more than it was told to, which is the
     /// only case this is about; a conforming server never reaches it.
     ///
-    /// Watched failing against the coupled buffer: `NoResponse`.
+    /// Fails with `NoResponse` if the buffer is the advertised size.
     #[tokio::test]
     async fn an_upstream_that_ignores_the_advertisement_is_still_read() {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("bind a fake upstream");
@@ -1831,7 +1829,7 @@ this line has no record and is skipped
     /// The regression that decided the shape of the delegation cache: a walk
     /// starts at the deepest delegation already known, so a policy asked only
     /// at referrals is a rule in force for the client that walked the chain and
-    /// for nobody after it (`TODO.md` #56).
+    /// for nobody after it.
     ///
     /// Fails against a cache holding addresses alone — the second query starts
     /// at `example.test.`, sees no referral, and resolves.
@@ -2696,10 +2694,10 @@ this line has no record and is skipped
     }
 
     /// A referral to 70 glued nameservers that never answer: the query budget
-    /// alone let this run 63 exchanges, 157.5 s (`TODO.md` #168). The timer
+    /// alone lets this run 63 exchanges, 157.5 s (`TODO.md` #168). The timer
     /// abandons it at 10 s, to the tick, because the clock is paused.
     ///
-    /// Watched failing without the timer: 157.5 s and `NoResponse`.
+    /// Fails without the timer: 157.5 s and `NoResponse`.
     #[tokio::test(start_paused = true)]
     async fn a_resolution_is_abandoned_when_its_timer_expires() {
         let root = fake(1);
@@ -3114,8 +3112,8 @@ this line has no record and is skipped
     /// with AA set, RFC 8020 lets a downstream resolver read an NXDOMAIN as a
     /// claim about the whole subtree.
     ///
-    /// `recurse` cleared this and `forward` did not (`TODO.md` #78b), so the
-    /// clearing is in `resolve_validated`, past both.
+    /// The clearing is in `resolve_validated`, past both modes, so `forward`
+    /// cannot skip it.
     #[tokio::test]
     async fn a_forwarded_answer_does_not_carry_the_upstreams_aa_bit() {
         let (answer, _) = resolve_against_an_authoritative_upstream().await;
@@ -3522,13 +3520,11 @@ this line has no record and is skipped
 
     /// The authority section of a signed NXDOMAIN proved with NSEC3.
     ///
-    /// Worth having end to end, because every NSEC3 test in this repo until now
-    /// built its own records and handed them straight to the denial functions.
-    /// That checks the proof logic and nothing about the path to it — whether the
-    /// resolver collects NSEC3 records across hops, whether they survive being
-    /// parsed off the wire, whether their signatures verify as an RRset at their
-    /// hashed owner names. The NSEC side has been resolved end to end since it was
-    /// written; this closes the gap for NSEC3 (an open item under #1).
+    /// End to end, because a test that builds its own records and hands them
+    /// straight to the denial functions checks the proof logic and nothing
+    /// about the path to it — whether the resolver collects NSEC3 records
+    /// across hops, whether they survive being parsed off the wire, whether
+    /// their signatures verify as an RRset at their hashed owner names.
     ///
     /// RFC 5155 §7.2.2 wants three things proved, and two records do it here:
     ///
@@ -3737,16 +3733,16 @@ this line has no record and is skipped
         );
     }
 
-    /// `TODO.md` #151a, the first window: a resolution starts below the
-    /// anchor because a delegation and its zone's keys are cached
-    /// (`best_start`), and the keys expire before validation resumes from
-    /// them (`establish_chain`). The second resolution here starts at
-    /// `example.test.`; the authoritative server moves the clock past every
+    /// A resolution starts below the anchor because a delegation and its zone's
+    /// keys are cached (`best_start`), and the keys expire before validation
+    /// resumes from them (`establish_chain`). The second resolution here starts
+    /// at `example.test.`; the authoritative server moves the clock past every
     /// cached key set while it answers.
     ///
-    /// Asserts `Secure`, which is what the answer is. Before #151c this read
-    /// `Bogus`: the resume fell back to the anchor, the walk had no referral
-    /// evidence for the cuts below it, and the answer's signer had no keys.
+    /// Asserts `Secure`, which is what the answer is. Fails with `Bogus` if the
+    /// resume re-reads the key cache: it falls back to the anchor, the walk has
+    /// no referral evidence for the cuts below it, and the answer's signer has
+    /// no keys.
     #[tokio::test]
     async fn a_key_set_expiring_mid_resolution_still_validates() {
         let h = signed_hierarchy(signed_ds, signed_answer);
@@ -3800,15 +3796,14 @@ this line has no record and is skipped
 
     /// What one validation costs once the cache is warm: the second resolution
     /// starts at `example.test.` from the cache and the walk resumes from that
-    /// trusted start (`TODO.md` #151). Counted on this thread, which a
-    /// current-thread runtime keeps every task of the resolution on.
+    /// trusted start. Counted on this thread, which a current-thread runtime
+    /// keeps every task of the resolution on.
     ///
     /// The whole resolution is counted, so the number is a ceiling rather than
-    /// exact: 124 with `establish_chain`'s own loop, 122 once `ChainWalk` took
-    /// the rules over. The walker copies the trusted start's keys into its own
-    /// store where the loop cloned them into locals; the net two are not
-    /// attributed. The ceiling is what #151 chose the walker on: it costs no
-    /// more than the loop it replaced.
+    /// exact: 122 with `ChainWalk`, against 124 with a loop in
+    /// `establish_chain` that clones the trusted start's keys into locals —
+    /// which is the walker's case: it costs no more than the loop. The net two
+    /// are not attributed.
     #[tokio::test]
     async fn a_resumed_validation_is_counted() {
         let h = signed_hierarchy(signed_ds, signed_answer);
@@ -3920,8 +3915,8 @@ this line has no record and is skipped
         assert!(state.is_bogus(), "expected bogus, got {state}");
     }
 
-    /// Bogus is not one failure, and the client is owed which one it was
-    /// (RFC 8914, `TODO.md` #44b).
+    /// Bogus is not one failure, and the client is owed which one it was (RFC
+    /// 8914).
     ///
     /// Two shapes that both end in SERVFAIL and send an operator to two
     /// different places: signatures that never arrived, and signatures that
@@ -4524,9 +4519,8 @@ this line has no record and is skipped
             }
         }
 
-        /// RFC 5001 §2.1: the resolver "MUST NOT include any NSID payload
-        /// data in the query message". Watched failing with the option left
-        /// out of `build_query`.
+        /// RFC 5001 §2.1: the resolver "MUST NOT include any NSID payload data
+        /// in the query message". Fails if `build_query` leaves the option out.
         #[tokio::test]
         async fn every_upstream_query_carries_an_empty_nsid_option_when_on() {
             let (off, seen) = forwarder(false, b"node-a");
@@ -4681,9 +4675,8 @@ this line has no record and is skipped
         }
 
         /// A forward zone is asked with RD=1 and a public name is recursed;
-        /// neither side hears the other's names. Watched failing with the
-        /// route lookup removed from `resolve_from_root`: the corp name went
-        /// to the root.
+        /// neither side hears the other's names. Fails without the route lookup
+        /// in `resolve_from_root`: the corp name goes to the root.
         #[tokio::test]
         async fn a_forward_zone_takes_its_names_and_nothing_else() {
             let net = Net::default();

@@ -290,11 +290,10 @@ impl StateFile {
 
     /// Forget every master's state for one zone.
     ///
-    /// For a zone that stops being ours: a catalog dropping a member
-    /// (`TODO.md` #44a). The row is what vouches for the age of the copy on
-    /// disk, so leaving it behind means a zone of the same name provisioned
-    /// later is served from whatever file it finds, with AA set, on the
-    /// strength of a transfer of something else.
+    /// For a zone that stops being ours: a catalog dropping a member The row is
+    /// what vouches for the age of the copy on disk, so leaving it behind means
+    /// a zone of the same name provisioned later is served from whatever file
+    /// it finds, with AA set, on the strength of a transfer of something else.
     pub fn forget(&mut self, zone: &str) {
         self.entries.retain(|e| !e.zone.eq_ignore_ascii_case(zone));
     }
@@ -377,9 +376,9 @@ pub trait Replica: Send {
 
     /// The timers of the zone held now, or the default if none is.
     ///
-    /// Required rather than an initial value the caller picks: `rdnsr` began
-    /// at `RefreshTimers::default()`, EXPIRE never, while holding a feed from
-    /// its last run (`TODO.md` #135).
+    /// Required rather than an initial value the caller picks: a caller
+    /// starting at `RefreshTimers::default()` while holding a feed from its
+    /// last run never reaches EXPIRE.
     fn held_timers(&self) -> impl Future<Output = RefreshTimers> + Send;
 
     /// When the zone last had contact by some path besides this cycle, if that
@@ -404,9 +403,9 @@ pub trait Replica: Send {
 /// a NOTIFY cutting the wait short. Out of contact past EXPIRE the replica is
 /// told once.
 ///
-/// The [`Busy`](crate::shutdown::Busy) claim covers a refresh and what follows it, never the sleep,
-/// which is hours long (`CLAUDE.md` §9). Written once for both daemons: the two
-/// copies it replaced had drifted twice (`TODO.md` #128, #135).
+/// The [`Busy`](crate::shutdown::Busy) claim covers a refresh and what follows
+/// it, never the sleep, which is hours long (`CLAUDE.md` §9). Written once for
+/// both daemons (`CLAUDE.md` §7).
 pub async fn refresh_cycle<R: Replica>(
     mut replica: R,
     wake: &Notify,
@@ -922,8 +921,8 @@ mod tests {
     }
 
     /// EXPIRE is acted on once per spell out of contact, counted from the held
-    /// zone's timers when nothing has been fetched (`TODO.md` #135). Contact
-    /// ends the spell and says it came after one.
+    /// zone's timers when nothing has been fetched. Contact ends the spell and
+    /// says it came after one.
     #[tokio::test(start_paused = true)]
     async fn expire_acts_once_per_spell() {
         let c = cycle(Scripted::with(|s| {

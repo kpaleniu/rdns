@@ -1,9 +1,8 @@
 //! What one admission decision costs, and what the shared mutex does to it.
 //!
-//! `TODO.md` #25f. `should_allow` took *two* global locks per datagram — one to
-//! compare a cleanup timestamp, one for the bucket map — and the first is an
-//! `AtomicU64` now. The second stays and is the ceiling: every UDP worker takes
-//! it for every datagram.
+//! `TODO.md` #25f. The cleanup timestamp `should_allow` compares is an
+//! `AtomicU64`, not a second global lock; the lock on the bucket map stays and
+//! is the ceiling: every UDP worker takes it for every datagram.
 //!
 //! ```sh
 //! cargo run --release -p rdns --example limiter_probe

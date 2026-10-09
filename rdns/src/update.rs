@@ -627,11 +627,8 @@ struct Working<'a> {
 impl<'a> Working<'a> {
     fn new(base: &'a Zone) -> Working<'a> {
         Working {
-            // A straight copy. This used to normalize every name on the way
-            // in, because a zone built through `add_record` could hold relative
-            // ones and every comparison below had to be against a settled form.
-            // A `Name` is absolute by construction, so there is nothing to
-            // settle.
+            // A straight copy: a `Name` is absolute by construction, so there
+            // is nothing to settle before comparing.
             records: base.records().iter().map(|r| r.to_owned()).collect(),
             base,
         }

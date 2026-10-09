@@ -78,15 +78,15 @@ pub fn origin_from_path(path: &str) -> String {
 /// One copy for three callers — `rdnsd`'s UPDATE path (`TODO.md` #64b) and its
 /// reload path (#64f), and the resolver's policy reload (#71b) — because two
 /// implementations of "did these bytes change" is how the two answers come to
-/// differ (`CLAUDE.md` §7). It lived in `rdnsd` alone until the third.
+/// differ (`CLAUDE.md` §7).
 ///
 /// **Why the bytes and not a `stat`.** The argument is the same at all three
-/// and was written out at each of them (#104): `stat` cannot see an edit that
-/// preserves length and timestamp, and a missed edit is the operator's change
-/// silently reverted — the failure the re-read exists to prevent
-/// (`CLAUDE.md` §4). Each caller keeps its own *measurement* of what the read
-/// costs against the parse it saves, because those are different numbers about
-/// different files; the reason they are willing to pay it is this one.
+/// (`TODO.md` #104): `stat` cannot see an edit that preserves length and
+/// timestamp, and a missed edit is the operator's change silently reverted —
+/// the failure the re-read exists to prevent (`CLAUDE.md` §4). Each caller
+/// keeps its own *measurement* of what the read costs against the parse it
+/// saves, because those are different numbers about different files; the reason
+/// they are willing to pay it is this one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileDigest(u64);
 
@@ -129,21 +129,20 @@ impl FileDigest {
 /// every name in one arena, and a table whose entries do not own their key.
 ///
 /// A name that exists only because something below it does — an empty
-/// non-terminal (RFC 4592 §2.2.2) — is an entry with **no positions**. It was a
-/// second `HashSet` until 2026-09-05, which made every level of a miss walk
-/// hash the name twice to ask two halves of one question (`TODO.md` #22): "is
-/// this a node of the zone, and does it have records". An ENT costs no arena
-/// bytes either: it is a suffix of a name already interned, so it is a range
-/// into that one.
+/// non-terminal (RFC 4592 §2.2.2) — is an entry with **no positions**, not a
+/// member of a second set: that would make every level of a miss walk hash the
+/// name twice to ask two halves of one question (`TODO.md` #22): "is this a
+/// node of the zone, and does it have records". An ENT costs no arena bytes
+/// either: it is a suffix of a name already interned, so it is a range into
+/// that one.
 ///
-/// **Why not a `HashMap`, which is what this was until `TODO.md` #71d.** A
-/// `HashMap` reaches its key only through `Borrow`, so the key must own and
-/// hash its own bytes — `Box<[u8]>` here, because `Name` cannot borrow to
-/// `NameRef` without the `unsafe` cast `str` uses (`rdns_core::name_keys`
-/// makes the same argument for the same reason). That is a `Box` per name,
-/// which is a heap allocation per name to load and another per name to copy:
-/// cloning a million-record zone's index was two million of them, 244 ms where
-/// the same table keyed on a `u64` takes 6.
+/// **Why not a `HashMap`** (`TODO.md` #71d). A `HashMap` reaches its key only
+/// through `Borrow`, so the key must own and hash its own bytes — `Box<[u8]>`
+/// here, because `Name` cannot borrow to `NameRef` without the `unsafe` cast
+/// `str` uses (`rdns_core::name_keys` makes the same argument for the same
+/// reason). That is a `Box` per name, which is a heap allocation per name to
+/// load and another per name to copy: cloning a million-record zone's index is
+/// two million of them, 244 ms where the same table keyed on a `u64` takes 6.
 ///
 /// [`hashbrown::HashTable`] takes the hash and an equality closure from the
 /// caller, so an entry can be a range into the arena and nothing here allocates
@@ -552,15 +551,14 @@ pub struct Zone {
     /// Positions in `records`, by the folded wire form of the owner name.
     ///
     /// A name that exists only because something below it does — an empty
-    /// non-terminal (RFC 4592 §2.2.2) — is a key with **no positions**. It was
-    /// a second `HashSet` until 2026-09-05, which made every level of a miss
-    /// walk hash the name twice to ask two halves of one question
-    /// (`TODO.md` #22): "is this a node of the zone, and does it have records".
-    /// Keyed on the *folded* wire form, because a `HashMap` probe needs a
-    /// borrowed key and `Name`'s own case-insensitive `Hash` cannot be reached
-    /// through `Borrow` without the `unsafe` cast `str` uses. `Box<[u8]>`
-    /// borrows as `[u8]`, so a lookup costs a fold only when the name arrived
-    /// in mixed case.
+    /// non-terminal (RFC 4592 §2.2.2) — is a key with **no positions**, not a
+    /// member of a second set, which would make every level of a miss walk hash
+    /// the name twice to ask two halves of one question (`TODO.md` #22): "is
+    /// this a node of the zone, and does it have records". Keyed on the
+    /// *folded* wire form, because a `HashMap` probe needs a borrowed key and
+    /// `Name`'s own case-insensitive `Hash` cannot be reached through `Borrow`
+    /// without the `unsafe` cast `str` uses. `Box<[u8]>` borrows as `[u8]`, so
+    /// a lookup costs a fold only when the name arrived in mixed case.
     index: NameIndex,
     /// The position lists of the names that own more than one record. See
     /// [`Slot`]; a name that owns one keeps its position in the table.
@@ -812,11 +810,9 @@ impl Zone {
     /// all apex children needs. On such a feed, where the two agree on size,
     /// the exact form still measured 386 ms against 401 at a million records.
     ///
-    /// The three callers that rebuild a zone record by record all had the
-    /// counts and none of them passed them — `TODO.md` #61b reserved the parse
-    /// and stopped at one of four sites (#71c). One caller is left:
-    /// `ixfr::Patch::apply` copies the base now instead of rebuilding it
-    /// (#71a), and `xfr::AxfrAccumulator` has no base to be like.
+    /// One caller, `update`'s rebuild: `ixfr::Patch::apply` copies the base
+    /// instead of rebuilding it (`TODO.md` #71a), and `xfr::AxfrAccumulator`
+    /// has no base to be like.
     pub(crate) fn reserve_like(&mut self, base: &Zone, extra: usize) {
         self.records.reserve(base.records.len() + extra);
         self.names.reserve(base.names.len());
@@ -879,9 +875,8 @@ impl Zone {
         self.shortcuts.note(key, rdata.rtype(), at_apex);
         let at = self.index.intern(key);
         // Ancestors only when the name is new to the index: one name notes them
-        // and every later record at it would find them present. That probe was
-        // the walk's own first step until #71a moved it here, where it is the
-        // insertion's answer rather than a second lookup.
+        // and every later record at it would find them present. The probe is
+        // the insertion's answer rather than a second lookup.
         if Zone::file(&mut self.index, &mut self.spills, key, at, position) {
             Zone::note_non_terminals(&mut self.index, key, at, &origin_key);
         }
@@ -925,14 +920,14 @@ impl Zone {
     /// record that was last — and the index reaches that one entry by that
     /// record's own owner name.
     ///
-    /// **What it costs is the record order.** `records()` is no longer load
-    /// order once anything has been removed. Nothing reads it as one: the
-    /// serializer writes the apex SOA itself and then the rest
-    /// ([`crate::zone_writer`]), and an AXFR brackets its own SOA
-    /// (RFC 5936 §2.2, [`crate::transfer`]). The alternative that keeps order
-    /// is a tombstone per removed record, and it was not built: it buys an
-    /// order nothing reads, and costs `records()` its slice — which is the
-    /// blast radius `TODO.md` #71e counted at 98 compiler errors.
+    /// **What it costs is the record order.** `records()` is not load order
+    /// once anything has been removed. Nothing reads it as one: the serializer
+    /// writes the apex SOA itself and then the rest ([`crate::zone_writer`]),
+    /// and an AXFR brackets its own SOA (RFC 5936 §2.2, [`crate::transfer`]).
+    /// The alternative that keeps order is a tombstone per removed record, and
+    /// it was not built: it buys an order nothing reads, and costs `records()`
+    /// its slice — which is the blast radius `TODO.md` #71e counted at 98
+    /// compiler errors.
     ///
     /// [`Zone::shortcuts`] is not recomputed. Each one stale in the *true*
     /// direction costs a walk that finds nothing; stale in the false direction
@@ -1173,9 +1168,8 @@ impl Zone {
     /// The apex SOA as a standalone record, owner name absolute — the form that
     /// goes into a message.
     ///
-    /// Lived in three places at once (`TODO.md` #33d): `notify::soa_record`,
-    /// public and in a module about a different protocol, plus byte-identical
-    /// private copies in `xfr` and `ixfr`. It belongs where the data is.
+    /// Here because it belongs where the data is, and once: `notify`, `xfr` and
+    /// `ixfr` all ask for it (`CLAUDE.md` §7).
     pub fn apex_soa_record(&self) -> Option<ResourceRecord> {
         self.apex_soa().map(|soa| ResourceRecord {
             name: self.origin.clone(),
@@ -1196,10 +1190,10 @@ impl Zone {
     /// Whether `record` is this zone's apex SOA.
     ///
     /// The normalization is the point: an owner name in a `Zone` may be `@` or
-    /// relative, and two of the five places that asked this question compared
-    /// [`ZoneRecord::name`] raw (`TODO.md` #33f). Callers holding a
-    /// [`ResourceRecord`] off the wire and a zone *name* — `xfr`, `journal` —
-    /// have no `Zone` to ask and still write it out.
+    /// relative, and a caller comparing [`ZoneRecord::name`] raw gets that
+    /// wrong. Callers holding a [`ResourceRecord`] off the wire and a zone
+    /// *name* — `xfr`, `journal` — have no `Zone` to ask and still write it
+    /// out.
     pub fn is_apex_soa(&self, record: ZoneRecordRef<'_>) -> bool {
         record.rdata.rtype() == rt::SOA && record.name == self.origin.as_ref()
     }
@@ -1270,9 +1264,8 @@ impl Zone {
     /// Whether this name is a node of the zone: it has records, or it has
     /// descendants (RFC 4592 §2.2.2). Takes a lookup key.
     ///
-    /// One lookup, because both kinds of node are in `index`. This is the walk's
-    /// inner loop — once per label of a name the client chose — and it asked
-    /// two maps until #22.
+    /// One lookup, because both kinds of node are in `index`. This is the
+    /// walk's inner loop — once per label of a name the client chose.
     fn node_exists(&self, key: NameRef<'_>) -> bool {
         self.index.contains_key(key.as_wire())
     }
@@ -1745,10 +1738,9 @@ mod tests {
         assert_eq!(zone.origin, nm("example.com."));
     }
 
-    /// Every question about "is this the apex SOA" compares owner names, and
-    /// two of the five places that asked it compared the stored name raw
-    /// (`TODO.md` #33f). Relativity is gone with the type — a `Name` is
-    /// absolute — but case is not: RFC 4343 makes `EXAMPLE.com.` the same apex.
+    /// Every question about "is this the apex SOA" compares owner names.
+    /// Relativity is gone with the type — a `Name` is absolute — but case is
+    /// not: RFC 4343 makes `EXAMPLE.com.` the same apex.
     #[test]
     fn the_apex_soa_is_found_under_a_differently_cased_owner_name() {
         let mut zone = Zone::new(nm("example.com."));
@@ -1784,11 +1776,11 @@ mod tests {
     /// own NS RRset into a zone cut (RFC 1034 §4.2.1).
     ///
     /// The mistake it catches is a `reindex` that rebuilds the index without
-    /// re-deciding which NS records are cuts: the flag then keeps the answer the
-    /// *old* apex gave, stays `false`, and the server answers authoritatively
-    /// for a child's names — `CLAUDE.md` §8's opening defect, reached through an
-    /// optimization rather than through the resolution logic. Watched failing
-    /// that way, and it is the only test in the tree that catches it.
+    /// re-deciding which NS records are cuts: the flag then keeps the answer
+    /// the *old* apex gave, stays `false`, and the server answers
+    /// authoritatively for a child's names — `CLAUDE.md` §8's opening defect,
+    /// reached through an optimization rather than through the resolution
+    /// logic. The only test in the tree that catches it.
     ///
     /// Dropping the `= false` reset alone does *not* fail, which is worth
     /// knowing: that leaves the flag stale only in the direction that costs a
@@ -2131,15 +2123,15 @@ timed 60 IN A 192.0.2.3
         );
     }
 
-    /// `query_with_kind` must answer exactly what the two calls it replaced
-    /// answered, for every kind of name — the kind is what decides NXDOMAIN
+    /// `query_with_kind` must answer exactly what `query` and `name_kind`
+    /// answer, for every kind of name — the kind is what decides NXDOMAIN
     /// against NODATA, so a disagreement is a wrong rcode, not a slow one.
     ///
-    /// The kind is the live half: `query` delegates here now, so comparing the
-    /// records to `query`'s is a tautology, while the kind is still checked
-    /// against `name_kind`'s own walk. Watched failing with the kind forced to
-    /// `NotFound` — which `an_empty_non_terminal_is_nodata_not_nxdomain` in
-    /// `rdnsd` also catches, since that is a NODATA turning into NXDOMAIN.
+    /// The kind is the live half: `query` delegates here, so comparing the
+    /// records to `query`'s is a tautology, while the kind is checked against
+    /// `name_kind`'s own walk. Fails with the kind forced to `NotFound` — which
+    /// `an_empty_non_terminal_is_nodata_not_nxdomain` in `rdnsd` also catches,
+    /// since that is a NODATA turning into NXDOMAIN.
     #[test]
     fn test_query_with_kind_answers_what_the_two_calls_did() {
         let zone = parse_zone_file(
@@ -2752,8 +2744,8 @@ deep.a.b IN TXT \"down here\"
         );
     }
 
-    /// Loaded, a 256-octet salt had a length octet of 0 and was served as a
-    /// different NSEC3 (`TODO.md` #138). The line is what the operator needs.
+    /// Loaded, a 256-octet salt would have a length octet of 0 and be served as
+    /// a different NSEC3. The line is what the operator needs.
     #[test]
     fn an_nsec3_salt_past_255_octets_refuses_the_zone() {
         let text = format!(
@@ -2767,9 +2759,9 @@ deep.a.b IN TXT \"down here\"
         assert!(matches!(err, ZoneError::Syntax { line: 4, .. }), "{err}");
     }
 
-    /// U+017F upper-cases to `S` under the Unicode fold, which read `Nſ` as NS
-    /// (`TODO.md` #140). RFC 4343's fold is ASCII only; the lower-case spelling
-    /// still has to work.
+    /// U+017F upper-cases to `S` under the Unicode fold, which reads `Nſ` as
+    /// NS. RFC 4343's fold is ASCII only; the lower-case spelling still has to
+    /// work.
     #[test]
     fn a_type_bitmap_folds_type_names_as_ascii() {
         let zone = |types: &str| {
@@ -2883,9 +2875,9 @@ deep.a.b IN TXT \"down here\"
     /// Applying deltas forever must not grow a zone that is not growing.
     ///
     /// **All four of the append-only stores**: the index's name arena, the
-    /// spill lists, and — since `TODO.md` #71e — the record name and RDATA
-    /// arenas. A difference sequence spells a changed record as a deletion and
-    /// an addition (RFC 1995 §2), so every publication appends the same octets
+    /// spill lists, and the record name and RDATA arenas (`TODO.md` #71e). A
+    /// difference sequence spells a changed record as a deletion and an
+    /// addition (RFC 1995 §2), so every publication appends the same octets
     /// again and a name that falls back to one record leaves its position list
     /// behind. Unbounded in a process that refreshes a feed for a year without
     /// restarting, and invisible: the entry count, the record count and every
@@ -3000,7 +2992,7 @@ deep.a.b IN TXT \"down here\"
     /// apex first would have built — the bookkeeping that is *about* the apex
     /// included, not merely the records.
     ///
-    /// The parser reindexed per `$ORIGIN` and now owes one rebuild at the end
+    /// The parser owes one rebuild at the end rather than one per `$ORIGIN`
     /// (`TODO.md` #62c), so this is what "the same zone" has to mean. The
     /// records here are the three things the apex decides: an NS RRset that is
     /// a delegation under one apex and the apex's own under the other, a
@@ -3099,9 +3091,8 @@ deep.a.b IN TXT \"down here\"
         );
     }
 
-    /// `set_origin` moves the apex and nothing else. It re-keyed records while
-    /// an owner name was text that might be relative; a `Name` is absolute, so
-    /// the question no longer arises and a record stays where it was put.
+    /// `set_origin` moves the apex and nothing else: a `Name` is absolute, so a
+    /// record stays where it was put.
     #[test]
     fn test_set_origin_moves_the_apex_and_not_the_records() {
         let mut zone = Zone::new(nm("example.com."));
@@ -3538,10 +3529,11 @@ $TTL 3600
         assert!(parse_dnssec_time("99991231235959").is_err(), "far past");
     }
 
-    /// A `<domain-name>` in RDATA is one field (RFC 1035 §3.3). NS, CNAME,
-    /// PTR, DNAME and MX joined what followed into it, so `NS ns1.example.com.
-    /// junk` served `ns1.example.com.\032junk.example.com.`, and SOA dropped
-    /// an eighth field unread (`TODO.md` #147).
+    /// A `<domain-name>` in RDATA is one field (RFC 1035 §3.3). Fails if NS,
+    /// CNAME, PTR, DNAME or MX joins what follows into it, so that
+    /// `NS ns1.example.com. junk` serves
+    /// `ns1.example.com.\032junk.example.com.`, or if SOA drops an eighth field
+    /// unread.
     #[test]
     fn a_field_past_the_rdata_is_refused_rather_than_joined_into_a_name() {
         let soa = "@ 3600 IN SOA ns. h. 1 2 3 4 5\n";

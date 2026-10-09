@@ -72,15 +72,14 @@ fn allocation_counts() {
 
 /// Rendering a record as a zone-file line costs the line and nothing else.
 ///
-/// `TODO.md` #66a. `record_to_string` took a `ZoneRecord`, so `journal`, which
-/// holds `ResourceRecord`s, built a throwaway one per record — `name.clone()`
-/// and `rdata.clone()`, two heap blocks a record, to call a function that reads
-/// four fields and writes a string. `record_line` takes the fields instead:
-/// `Ttl` and `Class` are `Copy` and the other two are borrowed.
+/// `record_line` takes the fields, not a `ZoneRecord`: `Ttl` and `Class` are
+/// `Copy` and the other two are borrowed, so `journal`, which holds
+/// `ResourceRecord`s, need not build a throwaway record — two heap blocks — to
+/// call a function that reads four fields and writes a string.
 ///
 /// The assertion is that the two entry points cost the *same*, which is what
 /// "no caller allocates to call this" means and which no timing could say.
-/// Against the old shape the `ResourceRecord` path was two blocks dearer.
+/// Fails by two blocks on the `ResourceRecord` path if it builds a record.
 fn writing_a_record_as_text_borrows_it() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("the zone parses");
     let record = zone
@@ -131,15 +130,11 @@ fn writing_a_record_as_text_borrows_it() {
         zone_blocks, wire_blocks,
         "neither entry point may copy the record to render it"
     );
-    // ~~14 on the development machine: the owner name, the re-encode
-    // `rdata_to_string` compares against, the type name and the line itself.~~
-    // **7 since `TODO.md` #64c**, and the four things listed were never the
-    // whole of it: `rdata_to_string` also built RFC 3597's hex form for every
-    // record and threw it away whenever the type-specific one worked — one
-    // allocation per RDATA octet, so four here and ~110 per RRSIG. Floor moved
-    // 10 -> 5; §17 asks for a reason in either direction.
-    // The range is wide because this is the *equality* above's backstop, not a
-    // budget — a change here is a change in how a line is rendered.
+    // 7 on the development machine (`TODO.md` #64c). RFC 3597's hex form is
+    // built only when the type-specific one fails: built every time, it is one
+    // allocation per RDATA octet, four here and ~110 per RRSIG. The range is
+    // wide because this is the *equality* above's backstop, not a budget — a
+    // change here is a change in how a line is rendered.
     within("rendering one A record as a line", zone_blocks, 5..=18);
 }
 
@@ -343,11 +338,10 @@ fn one_query_end_to_end() {
     // here is input-dependent or hash-ordered: a fourth would be the lookup key
     // becoming an owned `String` again.
     //
-    // **It was four until `TODO.md` #71e**, and the one that went is the
-    // `collect` at the end of this closure: `ZoneRecordRef` and
-    // `ResourceRecord` are both 48 bytes, so `Vec`'s in-place collection reuses
-    // the allocation `query` returned instead of making a second. A
-    // `Vec<&ZoneRecord>` is 8 bytes an element and could not.
+    // No fourth for the `collect` at the end of this closure: `ZoneRecordRef`
+    // and `ResourceRecord` are both 48 bytes, so `Vec`'s in-place collection
+    // reuses the allocation `query` returned instead of making a second
+    // (`TODO.md` #71e). A `Vec<&ZoneRecord>` is 8 bytes an element and cannot.
     within("look up one A record in the zone", lookup_count, 3..=3);
 
     let mut response = parsed.clone();
@@ -454,11 +448,9 @@ fn writing_a_response_costs_nothing_per_record() {
 /// One zone answer to a lower-case question costs nothing: the lookups borrow
 /// the name and the records go straight to the writer.
 ///
-/// Through [`rdns::zone_answer::write`] since #150. It measured three `Zone`
-/// calls by hand — `delegation_for`, `name_kind`, `query` — and read 1, the
-/// `Vec` `query` returns, which `rdnsd` stopped asking for at #27c. A guard
-/// against the lookup key going back to an owned copy per lookup: four per
-/// query, ~14% of everything an answer allocated.
+/// Through [`rdns::zone_answer::write`]. A guard against the lookup key going
+/// back to an owned copy per lookup: four per query, ~14% of everything an
+/// answer allocates.
 fn the_lookups_behind_one_answer_allocate_only_the_answer() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let (reply, count) =
@@ -480,12 +472,9 @@ fn the_lookups_behind_one_answer_allocate_only_the_answer() {
 /// count above is the count for a name that happened to arrive lower-case, and
 /// this is the count for the rest.
 ///
-/// ~~Measured on `rdnsd` under dhat, a whole query goes 13 to 18 with the case
-/// randomized and 17 to 22 with EDNS0 as well: four folds in `Zone` — the walks
-/// here plus `add_answer`'s own — and a fifth in `Zones::for_query`.~~ Those
-/// were 2026-08-31's figures and went stale with #27; the last two folds went
-/// at #160. Measured the same way, on Linux, case randomized: 4.0 a query
-/// before #160 and 2.0 after, the same as lower case, with or without EDNS0.
+/// Measured on `rdnsd` under dhat, on Linux, case randomized: 2.0 a query, the
+/// same as lower case, with or without EDNS0, against 4.0 with the fold in a
+/// `Vec` (`TODO.md` #160).
 fn a_case_randomized_qname_costs_a_fold_per_lookup() {
     let zone = parse_zone_file(ZONE, "example.com.").expect("parse");
     let walks = |zone: &rdns::zone::Zone, name: NameRef<'_>| {
@@ -506,15 +495,14 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
     assert_eq!(kind, NameKind::Exact);
     assert_eq!(records, 1);
     // The answer `Vec` as above, plus one fold per lookup that folds. `ZONE`
-    // delegates nothing, so `delegation_for` answers without folding at all
-    // (`TODO.md` #28c); it read 4 while every zone paid for that walk.
+    // delegates nothing, so `delegation_for` answers without folding at all; a
+    // walk in every zone reads 4.
     within("the same three lookups, case randomized", count, 3..=3);
 
-    // The answer path itself (#150): the fold at the door, then the
-    // delegation walk and one `locate` that serves both the existence test and
-    // the records (#28b, #27c). The fold is onto the stack, a name being at
-    // most 255 octets; it read 1 folding into a `Vec` (`TODO.md` #160), and 4
-    // before #28b, #28c, #27a and #27c.
+    // The answer path itself: the fold at the door, then the delegation walk
+    // and one `locate` that serves both the existence test and the records. The
+    // fold is onto the stack, a name being at most 255 octets; it reads 1
+    // folding into a `Vec` (`TODO.md` #160).
     let (reply, count) =
         zone_answer_count(&zone, "WwW.eXaMpLe.CoM.", Qtype::of(record_types::A), false);
     assert_eq!(reply.answers.len(), 1);
@@ -532,11 +520,10 @@ fn a_case_randomized_qname_costs_a_fold_per_lookup() {
         (cut, located.kind().clone(), has, records)
     };
     // And with somewhere to put them, the same sequence costs nothing at all.
-    // ~~`rdnsd`'s UDP worker holds such a buffer~~: it held one unused from #38
-    // until #160, which put `zone_answer::write`'s fold on the stack instead.
-    // Kept as the measurement of a reused `Vec`, warmed first: the interesting
-    // number is the *steady state* of a worker answering datagram after
-    // datagram, not its first one.
+    // `zone_answer::write` folds onto the stack, so nothing in `rdnsd` holds
+    // such a buffer. Kept as the measurement of a reused `Vec`, warmed first:
+    // the interesting number is the *steady state* of a worker answering
+    // datagram after datagram, not its first one.
     let buffered = |zone: &rdns::zone::Zone, name: NameRef<'_>, buf: &mut Vec<u8>| {
         let key = name.folded_in(buf);
         let cut = zone.delegation_for(key);
@@ -650,8 +637,8 @@ fn reading_a_requests_edns_parameters_allocates_nothing() {
     let found = found.expect("OPT");
     within("reach the OPT record", found_count, 0..=0);
 
-    // The same two allocations as before the split, now charged to the caller
-    // that asks for the options rather than to reaching the record.
+    // Two allocations, charged to the caller that asks for the options rather
+    // than to reaching the record.
     let (full, full_count) = allocations(|| found.options());
     assert_eq!(full.expect("well-formed").len(), 1, "one cookie");
     within(
@@ -752,38 +739,23 @@ fn one_zone_load_and_sign() {
     // Eight records. A ceiling on how much per record, not a claim that a
     // per-record cost is wrong.
     //
-    // Was 120..=320 until the lexer stopped copying: a logical line, a token and
-    // a one-field RDATA text are borrowed from the file unless a comment, a
-    // quote, an escape or a parenthesis means they are not a contiguous run of
-    // it. 89 here, and 325 ms of a million-rule RPZ load.
+    // The lexer borrows a logical line, a token and a one-field RDATA text from
+    // the file unless a comment, a quote, an escape or a parenthesis means they
+    // are not a contiguous run of it.
     //
-    // **87 -> 88 with `TODO.md` #71d, and up is the right direction here.** The
-    // name index holds its keys in one arena instead of a `Box<[u8]>` each, so
-    // it allocates once for the arena and then not per name: this zone has
-    // eight records and pays the one, where a million-record zone stops paying
-    // two million. §17 asks for the reason either way, and this is the shape of
-    // it — a fixed cost traded against a per-record one.
+    // Fixed costs traded for per-record ones (`CLAUDE.md` §17): the name index
+    // keeps its keys in one arena (`TODO.md` #71d), and a zone's owner names
+    // and RDATA are an arena each (#71e), so eight records pay three arenas and
+    // their growth where a million records save a `Box` per name and per
+    // record.
     //
-    // **88 -> 91 with #71e**, the same trade twice more: a zone's owner names
-    // and its RDATA are each one arena now rather than a `Box` per record, so
-    // eight records pay two arenas and their growth where a million records
-    // stop paying two million `Box`es.
-    //
-    // **91 -> 54 with #72**, which is the other direction and four allocations
-    // a record: the owner name is resolved into the parser's own buffer and
-    // handed to `Zone::add` borrowed, so neither the `Name` nor the `Name` the
-    // state carried to the next line exists; the index key is folded onto the
-    // stack; the type name is upper-cased there; and the token vector is
-    // refilled per line rather than rebuilt. At a million records the parse is
-    // 480 ns a record to 322 (`rdns/tests/scale.rs`).
-    //
-    // **54 -> 45 with #72a** — one field list where there were two, so the
-    // second vector per line is gone — **and 45 -> 34 with #72b**, which is the
-    // last of them: `rdata_from_fields` hands back a `ParsedRecord` and
-    // `Zone::add_parsed` encodes it into the zone's RDATA arena, where it used
-    // to be encoded into a `Box` the zone copied and freed. A million-record
-    // zone of A records now parses with **no allocation per record at all** and
-    // in 257 ns; the eight here are the file's fixed costs.
+    // Nothing per record (#72, #72b): the owner name is resolved into the
+    // parser's own buffer and handed to `Zone::add` borrowed, the index key is
+    // folded onto the stack, the type name is upper-cased there, the token
+    // vector is refilled per line, there is one field list per line, and
+    // `Zone::add_parsed` encodes a `ParsedRecord` straight into the RDATA
+    // arena. A million-record zone of A records parses with **no allocation per
+    // record at all** and in 257 ns; the eight here are the file's fixed costs.
     within("parse an eight-record zone", parse_count, 20..=200);
 
     let keys = vec![
@@ -899,8 +871,8 @@ fn the_first_envelope_costs_the_same_however_big_the_zone_is(request: &DnsMessag
         1..=4_000,
     );
 
-    // The whole transfer, for contrast: what the daemon used to pay before
-    // sending anything.
+    // The whole transfer, for contrast: what building it before sending
+    // anything costs.
     let (_, whole_count) =
         allocations(|| rdns::transfer::axfr_messages(request, &large).expect("axfr"));
     assert!(
@@ -948,10 +920,9 @@ fn big_zone(records: usize) -> rdns::zone::Zone {
     parse_zone_file(&text, "example.com.").expect("parse")
 }
 
-/// Every packet is scanned for a TSIG record, and the scan used to heap-allocate
-/// a four-element `Vec<usize>` of section counts *before* checking whether there
-/// was an additional section at all — one block per query on every server, TSIG
-/// configured or not.
+/// Every packet is scanned for a TSIG record, so a scan that allocates before
+/// checking whether there is an additional section at all costs one block per
+/// query on every server, TSIG configured or not.
 ///
 /// Both shapes, because the plain one alone is not evidence: `find_tsig` returns
 /// at `ar == 0` before reaching its body, so a query with no additional section
@@ -1075,10 +1046,8 @@ fn building_the_metrics_registry() {
     let (clone, clone_count) = allocations(|| metrics.clone());
     within("clone one", clone_count, 0..=0);
 
-    // One scrape: 65 before `TODO.md` #84, where 102 `push_str` calls were fed
-    // by a `format!` that built a `String` to copy out of and drop. What is left
-    // is the output buffer growing, plus a `to_string` and an `escape_label` per
-    // zone. The bytes out are identical either way.
+    // One scrape: the output buffer growing, plus a `to_string` and an
+    // `escape_label` per zone. The bytes out are identical either way.
     for zone in ["example.com.", "example.net."] {
         metrics.set_zone_serial(
             zone.parse::<rdns::Name>().expect("a zone name").as_ref(),
@@ -1148,10 +1117,10 @@ fn proving_a_signed_nxdomain() {
         6,
         "the SOA, its RRSIG, and two NSECs with theirs"
     );
-    // 5 until #150, when this wrote the proof alone. The whole answer adds the
-    // SOA, which costs 3 measured by itself — `Zone::query`'s `Vec`, and 2 to
-    // write an SOA, whose MNAME and RNAME are re-encoded — and the total rose
-    // by 2, so the proof's share is one lower beside it. Not investigated.
+    // The whole answer, SOA included: the SOA costs 3 measured by itself —
+    // `Zone::query`'s `Vec`, and 2 to write an SOA, whose MNAME and RNAME are
+    // re-encoded — and the proof alone reads 5, so the proof's share is one
+    // lower beside it. Not investigated.
     within("prove a signed NXDOMAIN", count, 5..=15);
 }
 
@@ -1163,9 +1132,6 @@ fn proving_a_signed_nxdomain() {
 /// canonicalized a name the caller had already folded. The lookup is time
 /// rather than allocations, so what this holds is the fold — one per signed
 /// answer, and none for a name that arrives lower-case.
-///
-/// Until #150 this re-enacted `rdnsd`'s sequence by hand — locate, push, push
-/// the signatures — and would not have followed a change to it.
 fn answering_a_signed_query() {
     let zone = signed_zone();
     let (reply, count) =
@@ -1179,17 +1145,13 @@ fn answering_a_signed_query() {
 /// closest encloser and the next closer name (RFC 5155 §7.2.1), and finding the
 /// encloser is a hash per label of the QNAME.
 ///
-/// **129** when it was first split out of the NSEC figure above, 76 once the
-/// naming stopped allocating, 48 once the walk ran once, 38 once the chain's
-/// salt and iteration count were read at their offset instead of parsed out of
-/// a record per answer, and 28 once the walk itself stopped allocating.
-///
-/// The naming around the hashing was the cost, not the hashing: an owner name
-/// was `format!("{}.{origin}", base32hex_encode(h).to_lowercase())`, three
-/// allocations, and `nsec3_hash` rebuilt the digest as a `Vec` per iteration
-/// over a `Vec` of the wire name over a down-cased copy of the text — four more.
-/// Both are per *candidate* name, and the two halves of an NXDOMAIN each walked
-/// the QNAME to the same closest encloser.
+/// The naming around the hashing is the cost, not the hashing: an owner name
+/// built as `format!("{}.{origin}", base32hex_encode(h).to_lowercase())` is
+/// three allocations, and a digest rebuilt as a `Vec` per iteration over a
+/// `Vec` of the wire name over a down-cased copy of the text four more. Both
+/// are per *candidate* name, and the two halves of an NXDOMAIN walk the QNAME
+/// to the same closest encloser, so the walk runs once and the chain's salt and
+/// iteration count are read at their offset.
 fn proving_a_signed_nxdomain_under_nsec3() {
     let (reply, count) = nxdomain_proof(&signed_zone_nsec3());
     // Six, not eight: one NSEC3 covers the next closer name *and* the
@@ -1200,15 +1162,15 @@ fn proving_a_signed_nxdomain_under_nsec3() {
         6,
         "the SOA, its RRSIG, and two NSEC3s with theirs"
     );
-    // 6 until #150; the same SOA as above.
+    // The same SOA as above.
     within("prove a signed NXDOMAIN under NSEC3", count, 5..=15);
 }
 
 /// An NXDOMAIN through [`rdns::zone_answer::write`], and what writing it costs.
 ///
-/// The whole answer since #150, not the proof alone: the SOA and the walk that
-/// decided NXDOMAIN are counted too, because `rdnsd` pays for them on the same
-/// query and the proof was never reached any other way.
+/// The whole answer, not the proof alone: the SOA and the walk that decides
+/// NXDOMAIN are counted too, because `rdnsd` pays for them on the same query
+/// and the proof is reached no other way.
 fn nxdomain_proof(signed: &rdns::zone::Zone) -> (rdns::DnsMessage, u64) {
     let (reply, count) = zone_answer_count(
         signed,
@@ -1272,14 +1234,10 @@ fn zone_answer_count(
 /// 13 to 2. Both multipliers are per label of the QNAME: this zone is two labels
 /// and a client picks its own.
 fn checking_a_signed_nxdomain() {
-    // NSEC was 6 until `common_suffix` stopped rebuilding its answer with
-    // `rmatch_indices` and took `utils::suffix_labels`'s slice instead
-    // (`TODO.md` #37a). Two fewer `String`s, same proof.
-    //
-    // **Both are 1 since #38**, down from 4 and 2: `Nsec` and `Nsec3` hold
-    // their names as `Name`, so the covering test compares wire octets with
-    // nothing to fold or decode, the closest encloser is a borrowed suffix, and
-    // the one allocation left is the wildcard the proof has to name.
+    // Both are 1: `Nsec` and `Nsec3` hold their names as `Name`, so the
+    // covering test compares wire octets with nothing to fold or decode, the
+    // closest encloser is a borrowed suffix, and the one allocation left is the
+    // wildcard the proof has to name.
     for (what, zone, expected) in [
         ("NSEC", signed_zone(), 1),
         ("NSEC3", signed_zone_nsec3(), 1),
@@ -1322,17 +1280,15 @@ fn checking_a_signed_nxdomain() {
 /// nothing in this file could see: every other count here is a library or
 /// `rdnsd` shape (`TODO.md` #29).
 ///
-/// A miss is the flood shape and the one that must stay cheap. The negative
-/// cache's was **14**: `canonical_name`, then five allocations per ancestor from
-/// the owning `suffix_labels`, for a walk that answers "no" at every step, and
-/// then 1 for the key the NODATA map had no borrowed form of. **Zero now**: a
+/// A miss is the flood shape and the one that must stay cheap: **zero**. A
 /// question that arrives in key form, which is what comes off the wire, is
-/// looked up as it stands.
+/// looked up as it stands, where a canonical copy and owned suffixes per
+/// ancestor cost 14 for a walk that answers "no" at every step.
 fn what_the_resolvers_caches_cost() {
     let cache = rdns::cache::DnsCache::new(1_000);
     let qtype = Qtype::of(record_types::A);
     // The names are built once, outside every measurement: a QNAME arrives off
-    // the wire and the caches take it as it stands (`TODO.md` #38a).
+    // the wire and the caches take it as it stands.
     let held = nm("www.example.com.");
     let absent = nm("nothing.example.com.");
     let rrset: Vec<ResourceRecord> = (0..3)
@@ -1348,9 +1304,8 @@ fn what_the_resolvers_caches_cost() {
     let _ = cache.get(held.as_ref(), qtype);
     let (hit, count) = allocations(|| cache.get(held.as_ref(), qtype));
     assert_eq!(hit.expect("a hit").len(), 3);
-    // One per record's owner and RDATA, and the `Vec` spine. The eighth was the
-    // folded key the `(String, Qtype)` map had no `Borrow` for (`TODO.md` #25e);
-    // what is left is the copy the caller is handed.
+    // One per record's owner and RDATA, and the `Vec` spine: the copy the
+    // caller is handed. An eighth would be a folded lookup key.
     within("look one RRset up in the answer cache", count, 7..=7);
 
     let (miss, count) = allocations(|| cache.get(absent.as_ref(), qtype));

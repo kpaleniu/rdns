@@ -325,7 +325,7 @@ pub(crate) fn signing_keys(origin: &str) -> Vec<SigningKey> {
     ]
 }
 
-/// Two Ed25519 zone-signing keys with one key tag, 19835 (`TODO.md` #121).
+/// Two Ed25519 zone-signing keys with one key tag, 19835.
 ///
 /// Stored, not searched for per run: a birthday search took 232 keys, and a
 /// search for a partner to one given key took 19 724.
@@ -371,9 +371,9 @@ pub(crate) fn one_tag_two_algorithms(origin: &str) -> [SigningKey; 2] {
 }
 
 /// A 2048-bit RSA private key as PKCS#8 DER, base64, made once with
-/// `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | openssl pkcs8
-/// -topk8 -nocrypt -outform DER` (`TODO.md` #183). Not `genpkey -outform DER`
-/// alone, which writes PKCS#1 for RSA and which `ring` refuses.
+/// `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | openssl pkcs8 -topk8 -nocrypt -outform DER`.
+/// Not `genpkey -outform DER` alone, which writes PKCS#1 for RSA and which
+/// `ring` refuses.
 ///
 /// Stored, not generated: `ring` cannot generate RSA keys, which is why
 /// `SigningKey::generate` refuses them and an operator imports one. A test
@@ -409,8 +409,7 @@ pub(crate) fn signing_policy(now: u64, chain: DenialChain) -> SigningPolicy {
 }
 
 // The NSEC3 fixtures, here rather than in `crate::test_records` because they
-// hash a name and that module says it holds nothing cryptographic
-// (`TODO.md` #67f).
+// hash a name and that module says it holds nothing cryptographic.
 
 /// The NSEC3 parameters every fixture here hashes under. One salt and one
 /// iteration count, because two records in one proof that disagree about

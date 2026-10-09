@@ -1,10 +1,8 @@
 //! When a cache entry stops being an answer, in one place.
 //!
-//! Every cache stored `expires_at: u64` and wrote the arithmetic itself: eight
-//! constructions of which one saturated, eleven liveness tests against one
-//! spelled the other way round, four copies of the clamp to a TTL (`TODO.md`
-//! #154). §2 and §6 say `saturating_add` onto a timestamp; a rule applied per
-//! call site was missed at seven of eight, so it lives in the type.
+//! §2 and §6 say `saturating_add` onto a timestamp. A rule applied per call
+//! site is missed at some of them, so it lives in the type, and no cache writes
+//! `expires_at: u64` arithmetic itself.
 //!
 //! Each cache still caps its TTL with its own constant before building one: the
 //! caps are per-cache policy, and this type only does the arithmetic.

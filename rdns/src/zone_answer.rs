@@ -4,10 +4,9 @@
 //! RFC 1034 §4.3.2 for one zone, and the RFC 4035 §3.1 proofs each of its
 //! outcomes owes, behind one function. The split from the daemon is here
 //! because zone *selection* is server policy — the catalog, replication, a
-//! withdrawn secondary — while what a chosen zone says is the RFC's, and the
-//! two had met at an interface that handed the caller the proof table to
-//! apply: four `push_*` functions, a `bool` obligation and a bitmask
-//! (`TODO.md` #150). `rdnsd` keeps the request: opcode, EDNS, class, AXFR and
+//! withdrawn secondary — while what a chosen zone says is the RFC's, and an
+//! interface that hands the caller the proof table to apply is one the caller
+//! can apply wrong. `rdnsd` keeps the request: opcode, EDNS, class, AXFR and
 //! IXFR over UDP, the zone lookup, and REFUSED when there is none.
 //!
 //! The answer is written to the wire as it is found, so sections go out in
@@ -126,8 +125,8 @@ enum Outcome<'a> {
         chain: Vec<Hop>,
         name: Cow<'a, Name>,
         /// The lookup that found them, carried rather than repeated: writing
-        /// the records and their signatures used to locate the same name twice
-        /// more (`TODO.md` #25a).
+        /// the records and their signatures would otherwise locate the same
+        /// name twice more (`TODO.md` #25a).
         at: Located<'a>,
     },
     /// No records. `name` is the name the "no" is about — the end of the chain
@@ -178,9 +177,9 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome
         // folds its argument and `NameRef::folded_into` borrows when there is
         // nothing left to fold, so the three lookups below see a name already
         // lower-case and copy nothing. A case-randomized query — ordinary
-        // traffic, not an attack — folded its name three times without this
-        // (`TODO.md` #27a). `name` keeps the case it was asked in, which is
-        // what goes back out.
+        // traffic, not an attack — would fold its name three times without
+        // this. `name` keeps the case it was asked in, which is what goes back
+        // out.
         let key = name.as_ref().as_ref().folded_into(&mut fold);
 
         // The DNAME that redirects this name, if any: RFC 6672 §2.2, and
@@ -231,9 +230,8 @@ fn resolve_in_zone<'a>(zone: &'a Zone, qname: &'a Name, qtype: Qtype) -> Outcome
 
         // One walk for both questions: `locate` works the kind out to decide
         // whether a wildcard may answer, and asking `name_kind` separately
-        // walked the ancestors and folded the name again (`TODO.md` #28b). The
-        // records are not collected — this asks only whether there are any
-        // (#27c).
+        // would walk the ancestors and fold the name again. The records are not
+        // collected — this asks only whether there are any.
         let located = zone.locate(key);
         if located.has_type(qtype) {
             return Outcome::Answer {
@@ -586,7 +584,7 @@ ns.sub   IN A   192.0.2.20
     /// A broken zone must not hang the server. Two aliases pointing at each
     /// other terminate on the visited set, not on the hop limit.
     ///
-    /// Moved from `rdnsd` with [`MAX_REDIRECTS`], which it names (#150).
+    /// Here with [`MAX_REDIRECTS`], which it names.
     #[test]
     fn a_cname_loop_terminates() {
         let zone = parse_zone_file(ZONE, "example.com.").expect("the test zone parses");
@@ -598,9 +596,9 @@ ns.sub   IN A   192.0.2.20
         );
     }
 
-    /// A DNAME pointing at its own owner's ancestor maps a name to itself —
-    /// RFC 6672 Table 1's `cyc` row. The visited set ends it, as it ends a
-    /// CNAME loop. Moved from `rdnsd` with the test above.
+    /// A DNAME pointing at its own owner's ancestor maps a name to itself — RFC
+    /// 6672 Table 1's `cyc` row. The visited set ends it, as it ends a CNAME
+    /// loop.
     #[test]
     fn a_dname_loop_terminates() {
         let zone_text = "$ORIGIN example.com.\n$TTL 3600\n\
@@ -622,7 +620,7 @@ ns.sub   IN A   192.0.2.20
     /// `*.<closest encloser>` absent, and the guarantor is the order here:
     /// `delegation_for` is asked first (RFC 1034 §4.3.2's first case), so a
     /// name under a cut is a referral even with a wildcard below the cut, and
-    /// never reaches a negative proof (`TODO.md` #79e).
+    /// never reaches a negative proof.
     #[test]
     fn a_wildcard_below_a_cut_is_still_a_referral() {
         let zone = parse_zone_file(ZONE, "example.com.").expect("the test zone parses");

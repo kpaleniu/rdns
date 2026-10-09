@@ -431,7 +431,7 @@ impl IxfrAssembler {
 /// arriving before the closing SOA, carrying NOERROR, and authoritative — AA is
 /// how the master says the zone is its to hand out.
 ///
-/// Both assemblers opened with these three (`TODO.md` #33e).
+/// Both assemblers open with these three.
 fn check_envelope(msg: &DnsMessage, closed: bool) -> TransferResult<()> {
     if closed {
         return Err(TransferError::malformed(
@@ -490,7 +490,7 @@ pub struct Master {
 }
 
 impl Master {
-    /// Cleartext TCP, which is what every transfer was before `TODO.md` #44d.
+    /// Cleartext TCP.
     pub fn plain(addr: std::net::SocketAddr) -> Self {
         Master { addr, xot: None }
     }
@@ -531,10 +531,10 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> TransferStream for T {}
 ///
 /// The chain is why this is a type. RFC 8945 §5.3.1 signs the first envelope
 /// over the *request's* MAC and each later one over its predecessor, so three
-/// pieces of state have to move together on every read — and that loop was
-/// written out twice, the second copy having lost the comment saying why
-/// (`TODO.md` #33e). Not a trait over the two assemblers: they differ in what
-/// finishing means, and `fetch_soa` shares this and has no assembler at all.
+/// pieces of state have to move together on every read, and a second copy of
+/// that loop is one that loses the reason (`CLAUDE.md` §7). Not a trait over
+/// the two assemblers: they differ in what finishing means, and `fetch_soa`
+/// shares this and has no assembler at all.
 struct TransferSession<'a> {
     stream: Box<dyn TransferStream>,
     id: u16,
@@ -746,9 +746,9 @@ pub enum Refresh {
     /// A version newer than the one we hold, however it arrived.
     ///
     /// Boxed because `Fetched` holds a whole [`Zone`], which is 224 bytes of
-    /// vectors and maps — and the *common* case is `Current`, since #57e made a
-    /// refresh probe the serial first. Every `Refresh` moved would otherwise
-    /// carry the big variant to say nothing changed.
+    /// vectors and maps — and the *common* case is `Current`, since a refresh
+    /// probes the serial first (`TODO.md` #57e). Every `Refresh` moved would
+    /// otherwise carry the big variant to say nothing changed.
     Fetched(Box<Fetched>),
 }
 
@@ -1540,9 +1540,9 @@ mod tests {
 
     /// One connection's worth of master, whatever socket it arrived on.
     ///
-    /// Generic since `TODO.md` #44d, so the XoT tests below drive the *same*
-    /// master through a TLS stream: a second copy of this would be the one that
-    /// stops answering the way the first does (`CLAUDE.md` §7).
+    /// Generic, so the XoT tests below drive the *same* master through a TLS
+    /// stream: a second copy of this would be the one that stops answering the
+    /// way the first does (`CLAUDE.md` §7).
     async fn answer_one_transfer<S: AsyncRead + AsyncWrite + Unpin>(
         mut stream: S,
         zone: Zone,

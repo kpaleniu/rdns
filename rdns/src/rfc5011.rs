@@ -53,7 +53,7 @@ pub enum KeyState {
 }
 
 impl KeyState {
-    /// Whether a key in this state may be used to validate.
+    /// Whether a key in this state is trusted for validation.
     fn is_anchor(&self) -> bool {
         matches!(self, KeyState::Valid | KeyState::Missing)
     }

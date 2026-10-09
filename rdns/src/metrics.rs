@@ -250,8 +250,8 @@ pub struct Counters {
     // Security metrics
     pub rate_limited: AtomicU64,
     /// Packets refused by `AdmissionCheck`'s size and section caps, before
-    /// parsing. Renamed from a name a validating resolver's operator would
-    /// read as DNSSEC failures (`TODO.md` #186).
+    /// parsing. Not named "validation errors", which a validating resolver's
+    /// operator would read as DNSSEC failures.
     pub packets_rejected: AtomicU64,
     pub queries_dropped: AtomicU64,
     /// Queries the query limiter admitted with no bucket, and responses the
@@ -373,10 +373,9 @@ pub struct Counters {
     listeners: [ListenerSlots; StreamListener::ALL.len()],
 
     /// Answers a client got, by what DNSSEC validation concluded, indexed by
-    /// [`Outcome::ALL`] (`TODO.md` #186). Exported only once
-    /// [`DnsMetrics::validating`] says validation is on: with it off every
-    /// answer is indeterminate, and a family that says so about everything
-    /// says nothing.
+    /// [`Outcome::ALL`]. Exported only once [`DnsMetrics::validating`] says
+    /// validation is on: with it off every answer is indeterminate, and a
+    /// family that says so about everything says nothing.
     outcomes: [AtomicU64; Outcome::ALL.len()],
     validating: AtomicBool,
 
@@ -543,11 +542,11 @@ impl DnsMetrics {
     /// Record one answer's latency into the histogram.
     ///
     /// One bucket, not every bucket at or above the sample. Prometheus buckets
-    /// are cumulative, and this used to make them cumulative *here* — eight
+    /// are cumulative, and making them cumulative *here* is eight
     /// read-modify-writes on shared cache lines per answer, plus the count and
-    /// the sum. [`DnsMetrics::to_prometheus_format`] adds them up instead, which
-    /// is what every Prometheus client library does and renders byte-for-byte the
-    /// same.
+    /// the sum. [`DnsMetrics::to_prometheus_format`] adds them up instead,
+    /// which is what every Prometheus client library does and renders
+    /// byte-for-byte the same.
     pub fn observe_latency_us(&self, us: u64) {
         // The first bound at or above the sample: `le` is inclusive, so a sample
         // exactly on a bound belongs to that bound's bucket. Past the last bound
@@ -666,8 +665,7 @@ impl DnsMetrics {
 
     /// The Prometheus text for one scrape.
     ///
-    /// Three rules that are not obvious, and that thirty hand-unrolled blocks
-    /// buried 250 lines down (`TODO.md` #84):
+    /// Three rules that are not obvious:
     ///
     /// - **Omit, do not zero, a gauge with no answer.** A zone we are primary
     ///   for has no last-transfer time and neither has a secondary that has
@@ -1394,12 +1392,9 @@ mod tests {
 
     /// The shape Prometheus requires, asserted rather than eyeballed.
     ///
-    /// This is what the thirty hand-unrolled blocks could not have: the
-    /// agreement between a family's declaration and its samples was held by
-    /// copying a name into three string literals, so `TODO.md` #84 found 22
-    /// stray spaces in one `# HELP` line and three blocks using an embedded
-    /// newline where the other 99 used `\n`. None of it was visible to a test,
-    /// because no test looked at a HELP line.
+    /// The agreement between a family's declaration and its samples, which a
+    /// name copied into three string literals does not hold: stray spaces in a
+    /// `# HELP` line, an embedded newline where the rest use `\n`.
     ///
     /// It does *not* pin the text. A golden blob would fail on every new
     /// counter and teach nobody why.

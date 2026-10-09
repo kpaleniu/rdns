@@ -126,12 +126,11 @@ mod tests {
 /// The certificate authorities a peer's certificate is checked against, read
 /// from one PEM bundle.
 ///
-/// Both directions need this and they used to read it separately: an XoT
-/// *client* checking a master's certificate ([`crate::xot::TlsClientTrust`]) and,
-/// since `TODO.md` #59, a primary checking a transfer client's. The empty-file
-/// refusal is the reason it is one function — an anchor set with nothing in it
-/// loads, starts, and then refuses every handshake with a message about the
-/// other end (`CLAUDE.md` §4, §7).
+/// Both directions need this: an XoT *client* checking a master's certificate
+/// ([`crate::xot::TlsClientTrust`]) and a primary checking a transfer client's
+/// (`TODO.md` #59). The empty-file refusal is the reason it is one function —
+/// an anchor set with nothing in it loads, starts, and then refuses every
+/// handshake with a message about the other end (`CLAUDE.md` §4, §7).
 ///
 /// A newtype rather than a bare `Arc<RootCertStore>` so that a caller outside
 /// this crate can hold one without naming `rustls`, and so the count survives:

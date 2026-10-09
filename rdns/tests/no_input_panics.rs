@@ -310,9 +310,9 @@ fn exercise(data: &[u8], zone: &Zone, signed: &Zone, keyring: &tsig::TsigKeyring
             let _ = z.delegation_for(query.qname.as_ref());
             let _ = z.matches_query(nm("www.example.com.").as_ref(), query.qname.as_ref());
 
-            // The zone's answer, DO set, as `rdnsd` writes it (#150). It
-            // called the four proof writers one by one, each into its own
-            // reply, including on names the answer path never sends them.
+            // The zone's answer, DO set, as `rdnsd` writes it, rather than the
+            // four proof writers one by one on names the answer path never
+            // sends them.
             let mut out = Vec::new();
             let mut compressor = rdns::compression::NameCompressor::new();
             if let Ok(mut w) = rdns::response::ResponseWriter::start(

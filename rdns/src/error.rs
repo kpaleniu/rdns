@@ -5,17 +5,16 @@
 //! module holds the rest and re-exports core's, so `rdns::error` is still the
 //! one import path (`CLAUDE.md` §3).
 //!
-//! `DnssecError` and `BrokenCatalog` arrived here on 2026-09-20 (`TODO.md` #86)
-//! from core, where no module named them. `ZoneError` stayed: `rdns-present`
-//! returns it and does not depend on `rdns`.
+//! `DnssecError` and `BrokenCatalog` are here rather than in core, where no
+//! module names them. `ZoneError` is in core: `rdns-present` returns it and
+//! does not depend on `rdns`.
 //!
-//! **It no longer depends on `tokio`, and must not again** (`TODO.md` #67b).
-//! `From<tokio::time::error::Elapsed>` can only be written where the error type
-//! is defined, so two such impls held a runtime dependency in a module almost
-//! every other one imports — which made 30 of 41 modules read as needing a
-//! runtime. The `TransferError` one had no caller at all; the `ResolveError`
-//! one moved to [`crate::resolver`], where the timeout is. `ResolveError` is
-//! deliberately *not* re-exported here: a `pub use` would restore the edge.
+//! **No dependency on `tokio`.** `From<tokio::time::error::Elapsed>` can only
+//! be written where the error type is defined, so such an impl here holds a
+//! runtime dependency in a module almost every other one imports — 30 of 41
+//! modules read as needing a runtime. The `ResolveError` one is in
+//! [`crate::resolver`], where the timeout is. `ResolveError` is deliberately
+//! *not* re-exported here: a `pub use` would restore the edge.
 
 use rdns_core::ResponseCode;
 use std::io;
@@ -28,14 +27,8 @@ pub enum TransferError {
     /// The transfer does not assemble into a zone: something that is not a
     /// transfer at all.
     ///
-    /// ~~There was a `Refused` variant for a master that answered an error
-    /// rcode and nothing ever constructed it (`TODO.md` #79a). A caller would
-    /// have to branch on the distinction for it to be worth a variant (§3), and
-    /// none does.~~ **One does** — see [`TransferError::Rcode`], which is that
-    /// variant with the value it caught in it. The reasoning above was sound
-    /// and the survey behind it was not taken: `CLAUDE.md` §3's own example of
-    /// a branch turned out to be invented (`TODO.md` #95), and the branch that
-    /// is real turned out to be the one nobody had looked for (#96).
+    /// A master that answered an error rcode is [`TransferError::Rcode`], not
+    /// this: a caller branches on it (§3; `TODO.md` #95, #96).
     #[error("{0}")]
     Malformed(String),
     /// The master answered an error rcode rather than a transfer.
@@ -191,6 +184,6 @@ pub enum BrokenCatalog {
 }
 
 /// Per-layer `Result` aliases, matching core's. `ResolveResult` is
-/// `crate::resolver`'s, with the type it names (`TODO.md` #67b).
+/// `crate::resolver`'s, with the type it names.
 pub type TransferResult<T> = std::result::Result<T, TransferError>;
 pub type DnssecResult<T> = std::result::Result<T, DnssecError>;

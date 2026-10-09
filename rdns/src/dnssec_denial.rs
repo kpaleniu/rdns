@@ -18,9 +18,9 @@ use crate::Rtype;
 use crate::{ParsedRecord, ResourceRecord};
 use sha1::{Digest, Sha1};
 
-/// Moved to [`crate::denial_wire`], which holds the encodings: a hash value of
-/// a fixed length is not a hash function (`TODO.md` #67a). Re-exported so the
-/// four importers that read them as this module's keep working.
+/// In [`crate::denial_wire`], which holds the encodings: a hash value of a
+/// fixed length is not a hash function. Re-exported for the four importers that
+/// read them as this module's.
 pub use crate::denial_wire::{Nsec3Hash, NSEC3_HASH_LEN};
 use std::cmp::Ordering;
 
@@ -66,8 +66,8 @@ pub fn nsec3_hash(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Nsec
 ///
 /// SHA-1 is the only algorithm RFC 5155 §5 defines, so the digest is twenty
 /// octets and neither it nor the wire name it starts from needs the heap. The
-/// closest-encloser walk hashes a name per label of the QNAME and each
-/// iteration used to rebuild the digest as a fresh `Vec`.
+/// closest-encloser walk hashes a name per label of the QNAME, so a fresh `Vec`
+/// per iteration is a cost per label.
 fn nsec3_hash_in(name: &str, salt: &[u8], iterations: u16) -> DnssecResult<Nsec3Hash> {
     // Into the stack: §8.3's walk hashes a name per label of the QNAME and
     // keeps none of them, so this is the one place presentation text is read

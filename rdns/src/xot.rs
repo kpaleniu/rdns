@@ -42,8 +42,8 @@
 //! validate its client by "mutual TLS (mTLS)" or by "an IP-based ACL ...
 //! combined with a valid TSIG/SIG(0) signature", and adds "If only one method
 //! is selected, then mTLS is preferred". As a *server* this tree does the
-//! second and has since `security::TransferAcl` and `TODO.md` #16; as a
-//! *client* it will now present a certificate when the operator names one
+//! second (`security::TransferAcl`, `TODO.md` #16); as a *client* it presents a
+//! certificate when the operator names one
 //! (`--transfer-tls-cert`/`--transfer-tls-key`), which is what replicating from
 //! a primary that demands mTLS needs. Off by default because a certificate sent
 //! to a master that did not ask for one is not sent at all — rustls offers it
@@ -61,9 +61,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-// The name and the port moved to `endpoint`, which parses them and needs no
-// TLS stack to do it (`TODO.md` #67c); re-exported because this module is where
-// a reader looks for them.
+// The name and the port are `endpoint`'s, which parses them and needs no TLS
+// stack to do it; re-exported because this module is where a reader looks for
+// them.
 pub use crate::endpoint::{AuthName, DOT_PORT};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::net::TcpStream;

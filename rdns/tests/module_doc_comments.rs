@@ -1,14 +1,9 @@
-//! A `///` above a `mod` declaration that no longer describes that module
-//! (`TODO.md` #89).
+//! A `///` above a `mod` declaration that does not describe that module.
 //!
-//! `e26a479` moved `rdns/src/testutil.rs` into `rdns-core` and left its
-//! `/// Scratch directories, for tests only.` behind, where it attached to the
-//! `pub mod tls_identity;` on the next line and rendered on the crate index.
-//! `cargo doc` cannot catch it, because a wrong doc comment is a valid one.
-//!
-//! #20 hit the same hazard twice in one sitting and wrote the remedy as prose
-//! — "after any move, grep the seam for an orphaned `///`" — so nobody ran it.
-//! This is that grep, as a test.
+//! Moving a module out leaves its `///` behind, attached to the next `mod` and
+//! rendered on the crate index. `cargo doc` cannot catch it, because a wrong
+//! doc comment is a valid one. This is the grep of the seam after a move, as a
+//! test, since a remedy written as prose is not run.
 //!
 //! **What "describes it" is taken to mean.** One content word shared between
 //! the `///` and either the module's name or the first paragraph of its own

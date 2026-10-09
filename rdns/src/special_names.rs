@@ -285,11 +285,11 @@ pub fn is_special_use(name: NameRef<'_>) -> bool {
 
 /// The table's names, parsed once.
 ///
-/// A query used to pay `to_presentation()` and a down-casing `String` to be
-/// compared against text — on every name a resolver is asked for, since this is
-/// consulted before the caches. The names are the same on every call, so they
-/// are built once and the comparison is [`NameRef::is_at_or_under`]'s, which
-/// folds case as it walks (RFC 4343) and allocates nothing.
+/// Consulted before the caches, so on every name a resolver is asked for, where
+/// a `to_presentation()` and a down-casing `String` per query would cost. The
+/// names are the same on every call, so they are built once and the comparison
+/// is [`NameRef::is_at_or_under`]'s, which folds case as it walks (RFC 4343)
+/// and allocates nothing.
 struct Table {
     localhost: Name,
     loopback_ptr: Name,
@@ -613,9 +613,8 @@ mod tests {
         }
     }
 
-    /// RFC 6303 §3's zone has an SOA and an NS at its apex. The apex was
-    /// NXDOMAIN beside an SOA for that same name until `TODO.md` #173 — a test
-    /// asserting that would have encoded the bug, and none did.
+    /// RFC 6303 §3's zone has an SOA and an NS at its apex. Fails if the apex
+    /// is NXDOMAIN beside an SOA for that same name.
     #[test]
     fn an_empty_zone_apex_has_its_soa_and_ns() {
         for zone in [

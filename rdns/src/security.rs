@@ -353,8 +353,8 @@ impl ResponseLimiter {
     ///
     /// Zero disables, because `new(0, ..)` *is* [`disabled`](Self::disabled):
     /// `is_enabled` is `bytes_per_sec > 0` and `admit` sends when it is false.
-    /// Both binaries wrote the branch and the arithmetic out by hand
-    /// (`TODO.md` #30f).
+    /// One constructor, so neither binary writes the branch and the arithmetic
+    /// out by hand (`CLAUDE.md` §7).
     pub fn per_second(bytes_per_sec: u32) -> Self {
         Self::new(bytes_per_sec, bytes_per_sec.saturating_mul(4), 2)
     }
@@ -436,8 +436,7 @@ impl ResponseLimiter {
     /// still whole — nothing here panics holding this lock, and a panic
     /// elsewhere does not unmake a `HashMap` — and "no clients tracked" is a
     /// statement about the limiter that would be false (`CLAUDE.md` §4). Every
-    /// decision path in this file states its failure policy in a comment; this
-    /// one was the exception, and it is `TODO.md` #67g.
+    /// decision path in this file states its failure policy in a comment.
     pub fn tracked(&self) -> usize {
         self.clients
             .lock()
@@ -604,11 +603,10 @@ impl TransferCertificates {
 /// a peer is matched as a [`Peer`], so an IPv4-mapped IPv6 address is the IPv4
 /// address it maps before any rule sees it.
 ///
-/// It used to refuse a mapped peer outright, as "a way around the list". That
-/// reason holds for half the traffic and refused every IPv4 client of a
-/// dual-stack socket (`TODO.md` #158): a stream peer completed a handshake and
-/// is the IPv4 host it names, and what a spoofed UDP datagram gains is in
-/// [`Peer`]'s doc comment.
+/// Not refused outright as "a way around the list". That reason holds for half
+/// the traffic and refuses every IPv4 client of a dual-stack socket (`TODO.md`
+/// #158): a stream peer completed a handshake and is the IPv4 host it names,
+/// and what a spoofed UDP datagram gains is in [`Peer`]'s doc comment.
 #[derive(Debug, Clone, Default)]
 pub struct TransferAcl {
     rules: Vec<AclRule>,
@@ -725,9 +723,9 @@ impl AclRule {
 
 /// Whether the first `prefix` bits of two addresses agree.
 ///
-/// Private again since `TODO.md` #62a: [`crate::rpz`] shared this while its IP
-/// triggers were a list scanned per query, and now turns each prefix into a
-/// range once at load instead — a different question, asked of a table.
+/// Private: [`crate::rpz`] turns each prefix into a range once at load rather
+/// than scanning a list per query (`TODO.md` #62a) — a different question,
+/// asked of a table.
 fn prefix_matches(rule: &[u8], peer: &[u8], prefix: u8) -> bool {
     let whole_bytes = (prefix / 8) as usize;
     if rule[..whole_bytes] != peer[..whole_bytes] {
@@ -941,8 +939,8 @@ mod tests {
     /// bucket either.
     ///
     /// It steps the clock, rather than reaching into `buckets` to stamp one
-    /// entry in the future as it did before `now` became the caller's: an NTP
-    /// step back is what this is about, and now it can be the input.
+    /// entry in the future: an NTP step back is what this is about, and `now`
+    /// is the caller's, so it can be the input.
     #[test]
     fn a_clock_step_backwards_neither_panics_nor_refills_the_bucket() {
         let limiter = RateLimiter::with_defaults();
@@ -995,9 +993,9 @@ mod tests {
         assert!(after_one < initial);
     }
 
-    /// The sweep still runs, and an idle source is forgotten by it — the
-    /// property the timestamp guards, now that the timestamp is an atomic and
-    /// only the caller that wins the swap sweeps (`TODO.md` #25f).
+    /// The sweep runs, and an idle source is forgotten by it — the property the
+    /// timestamp guards, with the timestamp an atomic and only the caller that
+    /// wins the swap sweeping (`TODO.md` #25f).
     #[test]
     fn an_idle_source_is_swept_once_the_interval_has_passed() {
         let limiter = RateLimiter::new(RateLimitConfig {
@@ -1211,8 +1209,8 @@ mod tests {
     }
 
     /// Families do not mix, and a mapped peer is IPv4 by the time a rule sees
-    /// it. This asserted the opposite for the mapped peer until `TODO.md` #158,
-    /// which is what refused every IPv4 client of a dual-stack socket.
+    /// it. Fails if the mapped peer is refused, which refuses every IPv4 client
+    /// of a dual-stack socket (`TODO.md` #158).
     #[test]
     fn test_families_do_not_mix() {
         let acl = parse_acl(&["10.0.0.0/8"]);
@@ -1396,9 +1394,8 @@ mod tests {
         }
     }
 
-    /// A rate of 0 permits everything, so the `if rate == 0 { disabled() }`
-    /// both binaries wrote around this constructor was dead code
-    /// (`TODO.md` #30f): `disabled()` *is* `new(0, 0, 0)`.
+    /// A rate of 0 permits everything, so an `if rate == 0 { disabled() }`
+    /// around this constructor is dead code: `disabled()` *is* `new(0, 0, 0)`.
     #[test]
     fn a_budget_of_zero_is_no_budget() {
         let limiter = ResponseLimiter::per_second(0);

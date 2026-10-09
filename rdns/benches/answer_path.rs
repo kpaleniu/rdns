@@ -174,8 +174,8 @@ fn answer(c: &mut Criterion) {
 
     // Parse, answer from the zone, write: the library's share of one query as
     // `rdnsd` runs it, through `zone_answer::write` into a held buffer and
-    // compressor (#150). It cloned a parsed `DnsMessage`, filled `answers` and
-    // serialized it, which is neither daemon's path.
+    // compressor. Not a parsed `DnsMessage` cloned, filled and serialized,
+    // which is neither daemon's path.
     let mut compressor = rdns::compression::NameCompressor::new();
     group.bench_function("parse and write one zone answer", |b| {
         b.iter(|| {

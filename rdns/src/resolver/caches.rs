@@ -25,9 +25,9 @@ use crate::eviction::Halving;
 pub(super) struct DelegationCache {
     entries: Mutex<HashMap<Box<[u8]>, CachedDelegation>>,
     capacity: usize,
-    /// The resolver's, not the system's (`TODO.md` #107b). Required rather than
-    /// defaulted: an expiry a test cannot move is an expiry tested by forging
-    /// an entry through the mutex, which is what this one's was.
+    /// The resolver's, not the system's. Required rather than defaulted: an
+    /// expiry a test cannot move is an expiry tested by forging an entry
+    /// through the mutex.
     clock: Clock,
 }
 
@@ -37,7 +37,7 @@ struct CachedDelegation {
     /// The NS names the referral carried. Kept because a start from here skips
     /// the referral that named them, and a nameserver policy asked about only
     /// the delegations a query happened to walk is a rule in force for the
-    /// first client and not the next (`TODO.md` #56).
+    /// first client and not the next.
     ns_names: Vec<Name>,
     expires_at: Deadline,
 }
@@ -79,9 +79,9 @@ impl DelegationCache {
         let mut entries = self.entries.lock().ok()?;
 
         // Keys are folded, so the *walk* is over the folded name; folding once
-        // costs at most one copy for the whole walk, where the lowercased
-        // per-label copy it replaces cost one each (`TODO.md` #26f).
-        // Case folding moves no length octet, so the two walks step together.
+        // costs at most one copy for the whole walk, where a lowercased copy
+        // per label costs one each. Case folding moves no length octet, so the
+        // two walks step together.
         let mut buf = Vec::new();
         let folded = qname.folded_in(&mut buf);
         for (candidate, key) in qname.ancestors().zip(folded.ancestors()) {
@@ -322,9 +322,9 @@ impl RttStore {
 pub(super) struct KeyCache {
     entries: Mutex<HashMap<Box<[u8]>, CachedKeys>>,
     capacity: usize,
-    /// The resolver's, not the system's (`TODO.md` #107b). Required rather than
-    /// defaulted: an expiry a test cannot move is an expiry tested by forging
-    /// an entry through the mutex, which is what this one's was.
+    /// The resolver's, not the system's. Required rather than defaulted: an
+    /// expiry a test cannot move is an expiry tested by forging an entry
+    /// through the mutex.
     clock: Clock,
 }
 
@@ -608,10 +608,9 @@ mod tests {
         cache.insert(nm("zero.test.").as_ref(), vec![server], Vec::new(), 0);
         assert!(cache.best_match(nm("zero.test.").as_ref()).is_none());
 
-        // An entry is returned inside its TTL and not after it. This used to
-        // forge a `CachedDelegation` through the mutex, because `insert` clamps
-        // `expires_at` to `now + ttl` and there was no clock to move
-        // (`TODO.md` #107b) — which tested the comparison and never the insert.
+        // An entry is returned inside its TTL and not after it. Through
+        // `insert` and a moved clock, not a `CachedDelegation` forged through
+        // the mutex, which would test the comparison and never the insert.
         cache.insert(nm("stale.test.").as_ref(), vec![server], Vec::new(), 3600);
         assert!(cache.best_match(nm("stale.test.").as_ref()).is_some());
         clock.advance(3_599);
@@ -649,9 +648,8 @@ mod tests {
         assert!(!entries.contains_key(&key_of("a.test.")));
     }
 
-    /// An expiry is `now` plus a TTL, saturating (`TODO.md` #154): a clock
-    /// near the end of `u64` keeps the entry until the end of time rather than
-    /// overflowing.
+    /// An expiry is `now` plus a TTL, saturating: a clock near the end of `u64`
+    /// keeps the entry until the end of time rather than overflowing.
     #[test]
     fn an_entry_cached_at_the_end_of_time_is_kept() {
         let server: SocketAddr = "192.0.2.1:53".parse().unwrap();

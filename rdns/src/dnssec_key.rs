@@ -208,7 +208,7 @@ impl KeyTiming {
     pub fn next_change(&self, now: u64) -> Option<u64> {
         // The two sync moments are here as well: a `SyncPublish` at noon has to
         // reach the zone at noon, and the ordinary tick is a third of the
-        // signature validity. Same reason as the other four (`TODO.md` #44f).
+        // signature validity. Same reason as the other four.
         [
             self.publish,
             self.activate,
@@ -306,8 +306,7 @@ pub struct SigningKey {
     pkcs8: Vec<u8>,
     pair: Pair,
     /// When this key is published and when it signs. All-absent for a key file
-    /// that carries no timing, which is every one written before `TODO.md` #44f
-    /// and every zone that does not roll.
+    /// that carries no timing, which is every zone that does not roll.
     timing: KeyTiming,
     /// Set while the parent's DS has not shown a successor (`TODO.md` #180):
     /// `Inactive` and `Delete` are then not reached. In memory only, and
@@ -371,7 +370,7 @@ impl SigningKey {
                 .to_vec(),
             rsa => {
                 // `genpkey -outform DER` alone writes PKCS#1 for RSA, which
-                // `ring` refuses; the message recommended it until #183 tried it.
+                // `ring` refuses, so the message must not recommend it.
                 return Err(DnssecError::key(format!(
                     "{} keys cannot be generated here — ring implements RSA signing but not \
                      RSA key generation. Make one elsewhere and put its PKCS#8, base64, in \
@@ -469,9 +468,8 @@ impl SigningKey {
         })
     }
 
-    /// When this key is published and when it signs (`TODO.md` #44f), as in
-    /// force: while its retirement is held, without `Inactive` and `Delete`
-    /// (#180).
+    /// When this key is published and when it signs, as in force: while its
+    /// retirement is held, without `Inactive` and `Delete` (#180).
     pub fn timing(&self) -> KeyTiming {
         if self.held.is_held() {
             KeyTiming {
@@ -566,9 +564,9 @@ impl SigningKey {
     /// line in the same place, and `dnssec-keygen` generates again when it is
     /// crossed.
     ///
-    /// Not a correctness question for the signer, which #121 made tell keys
-    /// apart by DNSKEY. It is one for [`SigningKey::write_to_dir`], which names
-    /// the file by tag (`TODO.md` #125).
+    /// Not a correctness question for the signer, which tells keys apart by
+    /// DNSKEY. It is one for [`SigningKey::write_to_dir`], which names the file
+    /// by tag (`TODO.md` #125).
     fn tag_collides_with(&self, other: &SigningKey) -> bool {
         if self.owner != other.owner || self.algorithm != other.algorithm {
             return false;
@@ -747,9 +745,9 @@ impl SigningKey {
                             .map_err(|e| DnssecError::key(format!("the PrivateKey: {e}")))?,
                     )
                 }
-                // The four rollover moments (`TODO.md` #44f). Absent is no
-                // boundary on that side, which is why each is an `Option`
-                // rather than a defaulted number.
+                // The four rollover moments. Absent is no boundary on that
+                // side, which is why each is an `Option` rather than a
+                // defaulted number.
                 "publish" => timing.publish = Some(timestamp(value, "Publish")?),
                 "activate" => timing.activate = Some(timestamp(value, "Activate")?),
                 "inactive" => timing.inactive = Some(timestamp(value, "Inactive")?),
@@ -969,9 +967,8 @@ mod tests {
     use crate::testutil::ScratchDir;
     use crate::Class;
 
-    /// The four rollover moments survive a write and a read, and a key that
-    /// has none writes none — a key that does not roll should look like one
-    /// (`TODO.md` #44f).
+    /// The four rollover moments survive a write and a read, and a key that has
+    /// none writes none — a key that does not roll should look like one.
     #[test]
     fn key_timing_round_trips_through_the_file_and_is_absent_when_unset() {
         let dir = ScratchDir::new("key-timing");
@@ -1333,8 +1330,8 @@ mod tests {
         assert_eq!(dir.entries(), vec![zsk.file_name()], "no temporary left");
     }
 
-    /// Removal takes a key's own file and leaves a colliding key's, which
-    /// has the same name (`TODO.md` #126).
+    /// Removal takes a key's own file and leaves a colliding key's, which has
+    /// the same name.
     #[test]
     fn a_key_removes_its_own_file_and_not_a_twins() {
         let dir = ScratchDir::new("key-file-remove");

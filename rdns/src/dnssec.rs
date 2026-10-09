@@ -272,10 +272,7 @@ pub fn rrsigs_in(records: &[ResourceRecord]) -> Vec<Rrsig> {
 /// The boundary between a record's name and DNSSEC's own bookkeeping. This
 /// module canonicalizes to *presentation text* and derives wire form from it
 /// when signing; that is what produces the octets a signature is computed over,
-/// so it is left exactly as it was when names became wire form — the property
-/// a name refactor must not quietly change (`TODO.md` #13e). The sentence is
-/// here because the `NameRef` wrapper it was written on had no callers
-/// (#79a).
+/// the property a name refactor must not quietly change (`TODO.md` #13e).
 pub fn canonical_name(name: &str) -> String {
     let lowered = name.to_ascii_lowercase();
     if crate::text_names::ends_with_root(&lowered) {
@@ -293,12 +290,10 @@ pub fn canonical_name(name: &str) -> String {
 /// wildcard — `*.example.com.` — not the expanded name the client asked for.
 ///
 /// Not the text form re-encoded, and the only spelling: RFC 1035 §5.1 lets a
-/// label contain a `.`, so counting dots made `a\.b.example.com.` four labels
-/// against the three its RRSIG correctly claims. A zone holding such a name
-/// loaded and answered but could not be signed, and once it could, a plain
-/// answer at it came back reported as expanded from `*.b.example.com.` — a
-/// wildcard that does not exist, owing a denial no signer writes
-/// (`TODO.md` #37a).
+/// label contain a `.`, so counting dots makes `a\.b.example.com.` four labels
+/// against the three its RRSIG correctly claims, and a plain answer at it comes
+/// back reported as expanded from `*.b.example.com.` — a wildcard that does not
+/// exist, owing a denial no signer writes.
 pub fn signed_owner_name(owner: NameRef<'_>, rrsig_labels: u8) -> DnssecResult<Name> {
     let folded = owner.to_folded();
     let have = folded.as_ref().label_count();
@@ -941,9 +936,8 @@ mod tests {
             nm("example.com.")
         );
         // A dot *inside* a label is not a separator (RFC 1035 §5.1). Counting
-        // dots made this four labels against the three its RRSIG claims, so a
-        // plain answer was reported as expanded from `*.b.example.com.`
-        // (`TODO.md` #37a).
+        // dots makes this four labels against the three its RRSIG claims, so a
+        // plain answer is reported as expanded from `*.b.example.com.`.
         let escaped = nm(r"a\.b.example.com.");
         assert_eq!(escaped.as_ref().label_count(), 3);
         assert_eq!(
@@ -957,10 +951,10 @@ mod tests {
     /// signed RRset at a name holding an escaped dot must verify *and* come back
     /// owing no wildcard proof.
     ///
-    /// Watched failing against the dot-counting spelling, which returned
-    /// `Verified { wildcard: Some("*.b.example.test.") }` — a wildcard that does
-    /// not exist, which `ChainValidator::validate_wildcard_proofs` then grades
-    /// bogus for want of a denial no signer writes.
+    /// Fails with a dot-counting spelling, which returns
+    /// `Verified { wildcard: Some("*.b.example.test.") }` — a wildcard that
+    /// does not exist, which `ChainValidator::validate_wildcard_proofs` then
+    /// grades bogus for want of a denial no signer writes.
     #[test]
     fn an_escaped_dot_in_an_owner_is_not_a_wildcard_expansion() {
         let zone = TestZone::new("example.test.");
@@ -1262,7 +1256,7 @@ mod tests {
         // The two halves of "not current" are two INFO-CODEs and two different
         // operator problems — a re-signing run that stopped, and a clock or a
         // signature published early — so a client told only "bogus" has to
-        // guess between them (`TODO.md` #44b).
+        // guess between them.
         for (inception, expiration, expected, what) in [
             (
                 now - 7200,

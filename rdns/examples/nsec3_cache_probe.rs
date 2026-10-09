@@ -1,7 +1,7 @@
 //! What one denial-cache lookup costs when nothing in the cache bears on it.
 //!
-//! The worst case for the scan this replaced, and the case a flood of random
-//! names produces: 256 cached NSEC3 records, every span one hash wide, so every
+//! The worst case for a scan of the cache, and the case a flood of random names
+//! produces: 256 cached NSEC3 records, every span one hash wide, so every
 //! lookup misses after looking at all of them. Two things the client picks are
 //! the arguments — the zone's iteration count and the QNAME's label count —
 //! because both were multipliers.
@@ -12,9 +12,9 @@
 //!
 //! # Measured 2026-08-04, and again 2026-09-04
 //!
-//! Release, per `synthesize`, on the development machine. Every column runs from
-//! this file; "before" is the commit before #23's fix, "walk" the one before
-//! #29b's.
+//! Release, per `synthesize`, on the development machine. Every column runs
+//! from this file; "before" is a scan per lookup under one mutex (`TODO.md`
+//! #23), "walk" an ancestor walk that builds a `String` per candidate.
 //!
 //! | iterations | QNAME | before | after | walk | now |
 //! |---|---|---|---|---|---|

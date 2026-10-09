@@ -210,10 +210,8 @@ impl SigningPolicy {
         if spread == 0 {
             return self.expiration;
         }
-        // Over the *wire* octets since #38, so the spread stays a function of
-        // (owner, type) alone. The numbers differ from the presentation-text
-        // version's, so the first re-signing after that change moved every
-        // expiry once.
+        // Over the *wire* octets, so the spread is a function of (owner, type)
+        // alone.
         let hash = folded_hash(
             name.as_wire()
                 .iter()
@@ -276,16 +274,15 @@ pub fn sign_zone(zone: &Zone, keys: &[SigningKey], policy: &SigningPolicy) -> Re
     Ok(sign_zone_inner(zone, keys, policy, None)?.0)
 }
 
-/// The keys that sign at `now`, which is not the keys that are published
-/// (`TODO.md` #44f).
+/// The keys that sign at `now`, which is not the keys that are published.
 ///
 /// A key inside its pre-publish window is in the DNSKEY RRset and does not
 /// sign; a retired one is still in the RRset so the signatures it made go on
 /// verifying. That is the whole of RFC 6781 §4.1.1.1's ordering.
 ///
 /// `pub` because a caller deciding whether a signing run still needs checking
-/// has to key that decision on this exact set (`TODO.md` #53), and a second
-/// copy of the predicate is what `CLAUDE.md` §7 is about.
+/// has to key that decision on this exact set, and a second copy of the
+/// predicate is what `CLAUDE.md` §7 is about.
 pub fn active_signing_keys(keys: &[SigningKey], now: u64) -> Vec<&SigningKey> {
     keys.iter().filter(|k| k.is_active(now)).collect()
 }
@@ -323,8 +320,8 @@ pub fn sign_zone_incrementally(
 /// The second half is the whole reason the type exists: the signatures a run
 /// carried forward were checked when they were made, and the ones it made now
 /// are the ones nothing has looked at. A caller that verifies its own output
-/// (`TODO.md` #100) needs the difference, and deriving it by diffing the two
-/// zones is the O(zone) pass the incremental path exists to avoid.
+/// needs the difference, and deriving it by diffing the two zones is the
+/// O(zone) pass the incremental path exists to avoid.
 ///
 /// Collected only on this path. A full [`sign_zone`] signs everything, so the
 /// list would be a `Name` clone per RRset — a million of them on a
@@ -596,10 +593,10 @@ impl<'a> PreviousSignatures<'a> {
     ///
     /// A carried RRSIG names its key by tag alone, and a tag "is not a unique
     /// identifier" (RFC 4034 Appendix B). A key added or swapped in with an
-    /// existing key's tag read as no change and carried the old signature
-    /// alone (`TODO.md` #121). Two published keys sharing a tag also refuse,
-    /// re-signing everything until one leaves: telling their signatures apart
-    /// means verifying each one, and a pair collides once in 65 536.
+    /// existing key's tag would read as no change and carry the old signature
+    /// alone. Two published keys sharing a tag also refuse, re-signing
+    /// everything until one leaves: telling their signatures apart means
+    /// verifying each one, and a pair collides once in 65 536.
     fn tags_naming(&self, origin: NameRef<'_>, signers: &[&SigningKey]) -> Option<Vec<u16>> {
         let (_, published) = &self
             .rrsets
@@ -839,7 +836,7 @@ fn publish_dnskeys(
     for key in keys {
         // A key before its `Publish` or past its `Delete` is loaded and not
         // published, which is RFC 6781 §4.1.1.1's pre-publish window at one end
-        // and its withdrawal at the other (`TODO.md` #44f).
+        // and its withdrawal at the other.
         if !key.is_published(now) {
             continue;
         }
@@ -880,7 +877,7 @@ fn publish_dnskeys(
 /// **RFC 8078 §4's "delete" CDS is deliberately not produced here.** A CDS with
 /// algorithm 0 tells the parent to withdraw the DS and take the zone insecure,
 /// which no timing field should be able to reach by accident; an operator who
-/// means it writes `CDS 0 0 0 00` in the zone file, which this tree now parses
+/// means it writes `CDS 0 0 0 00` in the zone file, which this tree parses
 /// (`TODO.md` #55).
 fn publish_sync_records(
     keys: &[SigningKey],
@@ -1255,22 +1252,22 @@ type Rrsets<'a> = BTreeMap<(CanonicalKey, Rtype), (NameRef<'a>, Ttl, Vec<RecordD
 /// than a sort at the end: the key is already [`canonical_sort_key`], and the
 /// chain built above it is in that order too.
 ///
-/// **The map borrows from `signed`, and that bought less than it should have**
-/// (`TODO.md` #64g). Owning it cost a `Name` and a `RecordData` clone per
-/// record; removing them took this pass from 891-944 ms to 689-718 at a
-/// million records and 27 allocations off signing an eight-record zone — and
-/// the total did not move, because `sign-rrsets` rose 5% and `file-sigs` 11%.
-/// The clone was buying locality: it laid the RDATA out in the order the
-/// signing loop reads it, where a borrow leaves that loop chasing a pointer
-/// into the zone's record vector per record. Kept because the allocations are
-/// real and the wall clock is a wash, not because it is faster.
+/// **The map borrows from `signed`, and that buys less than it should**
+/// (`TODO.md` #64g). Owning it costs a `Name` and a `RecordData` clone per
+/// record; borrowing takes this pass from 891-944 ms to 689-718 at a million
+/// records and 27 allocations off signing an eight-record zone — and the total
+/// does not move, because `sign-rrsets` rises 5% and `file-sigs` 11%. The clone
+/// buys locality: it lays the RDATA out in the order the signing loop reads it,
+/// where a borrow leaves that loop chasing a pointer into the zone's record
+/// vector per record. Kept because the allocations are real and the wall clock
+/// is a wash, not because it is faster.
 fn rrsets_of(signed: &Zone) -> Rrsets<'_> {
     // (owner, type) -> the RDATA of that RRset, in the order they were added.
-    // Borrowed from `signed`, which outlives every use of the map: owning it
-    // was a `Name` and a `RecordData` clone per record, 944 ms of an 8 s
-    // incremental sign at a million records and two million allocations to
-    // free afterwards (`TODO.md` #64g). `Rrset` is generic over what holds the
-    // RDATA for this.
+    // Borrowed from `signed`, which outlives every use of the map: owning it is
+    // a `Name` and a `RecordData` clone per record, 944 ms of an 8 s
+    // incremental sign at a million records and two million allocations to free
+    // afterwards (`TODO.md` #64g). `Rrset` is generic over what holds the RDATA
+    // for this.
     let mut rrsets: Rrsets<'_> = BTreeMap::new();
     for record in signed.records() {
         let key = canonical_sort_key(record.name);
@@ -1533,10 +1530,9 @@ a\.b    IN A   192.0.2.50
     }
 
     // RFC 6781 key rollover, driven by the four moments in a key file.
-    // `TODO.md` #44f.
 
-    /// A key with no timing behaves exactly as it did before there was any:
-    /// published, and signing. Every key file written before #44f is this one.
+    /// A key with no timing is published and signing at every instant, which is
+    /// every key file that carries no timing fields.
     #[test]
     fn a_key_with_no_timing_is_published_and_active_at_every_instant() {
         let timing = KeyTiming::default();
@@ -2011,17 +2007,16 @@ a\.b    IN A   192.0.2.50
         assert!(err.to_string().contains("no key is active"), "got: {err}");
     }
 
-    // RFC 8901, multi-signer DNSSEC. `TODO.md` #44e.
+    // RFC 8901, multi-signer DNSSEC.
 
     /// Publish a foreign ZSK at the apex and it stays there, vouched for by our
     /// KSK, while our ZSK goes on signing the data.
     ///
-    /// **This is the test the row that filed #44e did not have.** It said "the
-    /// signer here assumes it owns every key in the apex DNSKEY set"; the
-    /// signer assumes no such thing, and has not since [`publish_dnskeys`] was
-    /// written to leave a key it did not put there alone. Model 2 (§2.1.2) is
-    /// "each provider has their own KSK and ZSK sets" with the other providers'
-    /// ZSKs imported, and that is a zone-file edit here (`CLAUDE.md` §19).
+    /// The signer does not assume it owns every key in the apex DNSKEY set:
+    /// [`publish_dnskeys`] leaves a key it did not put there alone. Model 2
+    /// (§2.1.2) is "each provider has their own KSK and ZSK sets" with the
+    /// other providers' ZSKs imported, and that is a zone-file edit here
+    /// (`CLAUDE.md` §19).
     #[test]
     fn rfc_8901_model_2_needs_only_the_zone_file() {
         let ours = signing_keys(ORIGIN);
@@ -2276,15 +2271,13 @@ a\.b    IN A   192.0.2.50
         }
     }
 
-    /// The slope itself, pinned. `the_spread_is_deterministic_for_a_given_name_and_type`
-    /// below asks whether the number is stable within one process; this asks
-    /// whether it is the *same* number it was, which is the property two servers
-    /// holding one zone need and the one a shared hash can silently break
-    /// (`TODO.md` #81b).
+    /// The slope itself, pinned.
+    /// `the_spread_is_deterministic_for_a_given_name_and_type` below asks
+    /// whether the number is stable within one process; this asks whether it is
+    /// the *same* number it was, which is the property two servers holding one
+    /// zone need and the one a shared hash can silently break.
     ///
-    /// Measured against the tree before `expiry_for`'s own FNV-1a loop was
-    /// merged into `rdns_core::folded_hash`, so it is what says the merge moved
-    /// nothing. It is allowed to change — a deliberate change to the spread is a
+    /// It is allowed to change — a deliberate change to the spread is a
     /// re-signing of every zone, which is exactly what should have to be typed
     /// out here.
     #[test]
@@ -2486,11 +2479,10 @@ a\.b    IN A   192.0.2.50
         assert_every_rrset_verifies(&sign_test_zone(DenialChain::Nsec));
     }
 
-    /// RSA is imported, never generated, and signing with an imported key had
-    /// no test (`TODO.md` #183). The key goes through the operator's path — a
-    /// key file written and read back by `load_dir` — and signs at algorithm 8
-    /// and 10. Watched failing with `Pair::Rsa` signing PKCS#1 SHA-256 at both
-    /// algorithms: the first algorithm-10 RRset checked was bogus.
+    /// RSA is imported, never generated. The key goes through the operator's
+    /// path — a key file written and read back by `load_dir` — and signs at
+    /// algorithm 8 and 10. Fails if `Pair::Rsa` signs PKCS#1 SHA-256 at both
+    /// algorithms: the first algorithm-10 RRset checked is bogus.
     #[test]
     fn a_zone_signs_with_an_imported_rsa_key() {
         use crate::dnssec::{DNSKEY_FLAG_SEP, DNSKEY_FLAG_ZONE};
@@ -2547,9 +2539,9 @@ a\.b    IN A   192.0.2.50
             ) {
                 // `wildcard: None` for all of them, the zone's own `*` RRset
                 // included: a signer signs at names that exist, so nothing here
-                // was expanded from a wildcard. Counting dots in the owner made
-                // `a\.b.example.com.` four labels against the three its RRSIG
-                // claims and reported it as expanded (`TODO.md` #37a).
+                // was expanded from a wildcard. Counting dots in the owner
+                // would make `a\.b.example.com.` four labels against the three
+                // its RRSIG claims and report it as expanded.
                 assert!(
                     matches!(proof, RrsetProof::Verified { wildcard: None, .. }),
                     "{name} type {rtype}: {proof:?}"
@@ -2632,10 +2624,9 @@ a\.b    IN A   192.0.2.50
     /// Every denial in the chain is capped at [`Ttl::negative_answer`], both
     /// ways round (RFC 9077 §§3.1-3.3).
     ///
-    /// The module's `ZONE` is `$TTL 3600` over `minimum 300`, so it can only
-    /// show the direction that was never wrong; the second fixture is the one
-    /// #73's defect survived behind. Watched failing against a `denial_ttl` of
-    /// MINIMUM alone, and of the SOA TTL alone.
+    /// The module's `ZONE` is `$TTL 3600` over `minimum 300`, so it shows one
+    /// direction; the second fixture shows the other. Fails with a `denial_ttl`
+    /// of MINIMUM alone, and of the SOA TTL alone.
     #[test]
     fn a_denial_is_capped_at_the_lesser_of_the_soa_ttl_and_minimum() {
         const SHORT_SOA_TTL: &str = r#"$ORIGIN example.com.
@@ -3307,8 +3298,7 @@ www IN A   192.0.2.10
     }
 
     /// A key tag "is not a unique identifier" (RFC 4034 Appendix B), so a key
-    /// sharing its tag with the one it joins or replaces is still a new key
-    /// (`TODO.md` #121).
+    /// sharing its tag with the one it joins or replaces is still a new key.
     #[test]
     fn a_key_sharing_a_tag_with_the_one_it_joins_or_replaces_still_signs() {
         let [zsk, twin] = colliding_zsks(ORIGIN);
@@ -3504,7 +3494,7 @@ www IN A   192.0.2.10
         /// of it, and so a zone with many keys has somewhere to show up.
         fixed: std::time::Duration,
         layout: std::time::Duration,
-        /// NSEC or NSEC3, whichever `policy.chain` asks for (#111b).
+        /// NSEC or NSEC3, whichever `policy.chain` asks for.
         denial_chain: std::time::Duration,
         build_rrsets: std::time::Duration,
         sign_rrsets: std::time::Duration,
@@ -3601,14 +3591,11 @@ www IN A   192.0.2.10
         let layout = Layout::of(&signed, origin.as_ref());
         let layout_time = start.elapsed();
 
-        // RFC 9077 §3's lesser, as production computes it (#73). The copy had
-        // MINIMUM alone; it changed no number here because `cost_fixture` is
-        // `$TTL 3600` over a SOA MINIMUM of 3600, which is how it survived
-        // (`TODO.md` #111).
+        // RFC 9077 §3's lesser, as production computes it. `cost_fixture` is
+        // `$TTL 3600` over a SOA MINIMUM of 3600, where MINIMUM alone gives the
+        // same number; `SPLIT_ZONE` does not.
         let denial_ttl = Ttl::from_secs(minimum).min(soa_ttl);
-        // Production branches here and the copy did not, so an NSEC3 zone was
-        // not measurable at all and the column was named for the only chain it
-        // could build (`TODO.md` #111b).
+        // Production branches here, so this does too.
         let start = Instant::now();
         match &policy.chain {
             DenialChain::Nsec => {
@@ -3635,10 +3622,9 @@ www IN A   192.0.2.10
         let active = active_signing_keys(keys, policy.signed_at);
         let sep: Vec<&SigningKey> = active.iter().copied().filter(|k| k.is_sep()).collect();
         let rest: Vec<&SigningKey> = active.iter().copied().filter(|k| !k.is_sep()).collect();
-        // The empty-half fallback and the all-inactive refusal, which the copy
-        // did without: with one SEP and one ZSK neither half is ever empty, so a
-        // single-key fixture would have measured a run that signs no data at all
-        // (`TODO.md` #111).
+        // The empty-half fallback and the all-inactive refusal, as production
+        // has them: without them a single-key fixture would measure a run that
+        // signs no data at all.
         let all: Vec<&SigningKey> = active.clone();
         let dnskey_signers = if sep.is_empty() { &all } else { &sep };
         let data_signers = if rest.is_empty() { &all } else { &rest };
@@ -3681,11 +3667,10 @@ www IN A   192.0.2.10
         )
     }
 
-    /// A zone the three drifts of `TODO.md` #111 would each have changed.
+    /// A zone each drift of the split from `sign_zone_inner` changes.
     ///
-    /// The SOA's TTL is under its MINIMUM, so a denial TTL computed the pre-#73
-    /// way (MINIMUM alone) is a different number; `cost_fixture` is 3600 over
-    /// 3600, which is how that drift survived a guard for months.
+    /// The SOA's TTL is under its MINIMUM, so a denial TTL of MINIMUM alone is
+    /// a different number; `cost_fixture` is 3600 over 3600, where it is not.
     const SPLIT_ZONE: &str = "$ORIGIN example.com.
 $TTL 60
 @   IN SOA ns.example.com. hostmaster.example.com. 1 3600 600 86400 86400
@@ -3718,13 +3703,11 @@ deep.b IN A 192.0.2.4
     /// `split_passes` builds the zone `sign_zone_inner` builds — every chain,
     /// both key shapes, record for record.
     ///
-    /// This is what #111 needed and did not have. `check_split` compares a
-    /// record count and a wall clock, and all three drifts preserved both: a
-    /// denial TTL computed the pre-#73 way, a signer fallback the cost fixture
-    /// can never need, and a chain branch the copy did not have. It is also the
-    /// guard that *runs* — the three cost tests are `#[ignore]`d benchmarks that
-    /// panic in a debug build, so the assertion that was supposed to catch this
-    /// has never been part of `cargo test` (#111c).
+    /// `check_split` compares a record count and a wall clock, and a drift can
+    /// preserve both: a denial TTL of MINIMUM alone, a signer fallback the cost
+    /// fixture can never need, a missing chain branch. This is also the guard
+    /// that *runs* — the three cost tests are `#[ignore]`d benchmarks that
+    /// panic in a debug build, so `check_split` is not part of `cargo test`.
     ///
     /// Ed25519 so the comparison can be exact: RFC 8032 signatures are
     /// deterministic, where ECDSA draws a `k` and two runs over the same RRset
@@ -3770,12 +3753,10 @@ deep.b IN A 192.0.2.4
     /// The parts are the function or they are fiction: the same zone out, and
     /// the sum within 0.8x-1.25x of the whole.
     ///
-    /// ~~Wide on the high side because the parts pay a cold allocator that the
-    /// whole, timed first, has already warmed.~~ **That is backwards, measured
-    /// 2026-09-22** (`TODO.md` #111d). The whole pays the cold allocator and the
-    /// parts inherit it warm, which pushes the ratio *down*: 0.78 at 10 000
-    /// records, 2 runs in 3 on Linux, until both callers learned to discard a
-    /// run at the same size first. What the 1.25 side is for is unmeasured.
+    /// The whole pays the cold allocator and the parts inherit it warm, which
+    /// pushes the ratio *down*: 0.78 at 10 000 records, 2 runs in 3 on Linux,
+    /// unless a run at the same size is discarded first, as both callers do
+    /// (`TODO.md` #111d). What the 1.25 side is for is unmeasured.
     fn check_split(
         parts: std::time::Duration,
         whole: std::time::Duration,
@@ -3822,12 +3803,12 @@ deep.b IN A 192.0.2.4
     /// **Six passes, not the four #64e names.** The two it does not: the
     /// largest column, `sign_everything` at 39%, and `free` at 12%, which is
     /// dropping [`PreviousSignatures`] — it dies inside
-    /// `sign_zone_incrementally` after every other timer has stopped, and it
-    /// is the whole of the 11% the split was short before it was measured.
+    /// `sign_zone_incrementally` after every other timer has stopped, and
+    /// without it the split falls 11% short.
     ///
     /// So the carry-forward index costs **2.9 s of 9.4 s, 31%**, to build and
-    /// free. It buys 64d's 16.6 s of ECDSA, so it is still 5.6x its price —
-    /// but it is a third of the bill and the row had it as one of four equals.
+    /// free. It buys 64d's 16.6 s of ECDSA, so it is still 5.6x its price — but
+    /// it is a third of the bill.
     ///
     /// And the NSEC chain that `sign_zone_incrementally`'s header defends
     /// building in full is 16%, not the term to argue about.
@@ -3837,9 +3818,9 @@ deep.b IN A 192.0.2.4
     /// million times is `Layout::entry`, which clones a `NameEntry`;
     /// `PreviousSignatures::reuse`, which folds a key, probes two `BTreeMap`s
     /// and compares the RDATA; and a `ZoneRecord` per carried signature,
-    /// cloning the name and the RDATA. `build-rrsets` is 27% and `file-sigs`
-    /// — two million `Zone::add_record` calls — is 12%, which is the smallest
-    /// of the three and was the one that looked expensive.
+    /// cloning the name and the RDATA. `build-rrsets` is 27% and `file-sigs` —
+    /// two million `Zone::add_record` calls — is 12%, the smallest of the
+    /// three.
     ///
     /// **Two negative results** (`CLAUDE.md` §10). `Zone::reserve` on the
     /// output buys nothing: the signed zone ends at ~4x the input's records
@@ -3850,22 +3831,20 @@ deep.b IN A 192.0.2.4
     /// into the three functions this times is free: three runs each side read
     /// 9 392 ms against 9 364 ms, which overlap.
     ///
-    /// **`build-rrsets` borrows since #64g** — 891-944 ms here, 689-718 after
-    /// — and the total did not move: `sign-rrsets` and `file-sigs` took it
-    /// back, 5% and 11%, neither of them touched. Recorded rather than
-    /// explained away (`CLAUDE.md` §10), with the reading it suggests in
-    /// `rrsets_of`: the clone was laying the RDATA out in the order the
-    /// signing loop reads it.
+    /// **`build-rrsets` borrows** (`TODO.md` #64g): 689-718 ms against the
+    /// table's 891-944, taken with an owned map — and the total does not move:
+    /// `sign-rrsets` and `file-sigs` take it back, 5% and 11%, neither of them
+    /// touched. Recorded rather than explained away (`CLAUDE.md` §10), with the
+    /// reading it suggests in `rrsets_of`: the clone was laying the RDATA out
+    /// in the order the signing loop reads it.
     ///
     /// A test inside this module rather than beside `scale.rs`, because every
     /// pass but the whole is private; the parts run in `sign_zone_inner`'s
-    /// order from its own arguments and the sum is asserted against the whole,
-    /// ~~so the split cannot drift from the function it describes
-    /// (`CLAUDE.md` §7)~~ — **it had drifted three times when that was read**
-    /// (`TODO.md` #111). The sum is a timing and `check_split`'s other
-    /// assertion is a record count, and neither sees a denial TTL computed the
-    /// pre-#73 way, a signer fallback the fixture never needs, or a chain
-    /// branch the copy does not have. Two are fixed (#111a); the chain is #111b.
+    /// order from its own arguments and the sum is asserted against the whole.
+    /// The sum is a timing and `check_split`'s other assertion is a record
+    /// count, so the split can drift from the function it describes with
+    /// neither noticing (`CLAUDE.md` §7);
+    /// `the_split_builds_what_sign_zone_inner_builds` is the guard for that.
     ///
     /// NSEC, one ECDSA P-256 KSK and one ZSK — 64d's shape, so these columns
     /// are comparable with its table. Three warm runs on the development
@@ -4207,7 +4186,7 @@ deep.b IN A 192.0.2.4
     /// [`PreviousSignatures::reuse`] a "refresh before" instant instead of its
     /// already-expired test, so a reload would carry forward what is fresh and
     /// re-sign what is due — making the re-signing *timer* cheap too, which
-    /// keying on the trigger (#65a, what landed) does not.
+    /// keying on the trigger does not.
     ///
     /// It cannot. [`SigningPolicy::expiry_for`] spreads expiry over
     /// `EXPIRY_JITTER_FRACTION` of the validity and the timer runs every

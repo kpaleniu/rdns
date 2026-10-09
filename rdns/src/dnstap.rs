@@ -124,8 +124,7 @@ pub struct Entry<'a> {
     /// that does not know which transport carried a message must leave it out
     /// rather than guess — an absent field is a reader showing nothing, and DOT
     /// for a DoH query is a wrong value (`CLAUDE.md` §14). `rdnsd` fills it in
-    /// every case since `TODO.md` #54; before that the three encrypted
-    /// transports reached it as one `Privacy` and it left this `None`.
+    /// every case.
     pub socket_protocol: Option<SocketProtocol>,
     /// `query_address` and `query_port`: whoever sent the query — the client
     /// for an authoritative or client entry, this resolver for one it sent,

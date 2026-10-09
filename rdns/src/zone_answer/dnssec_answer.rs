@@ -201,17 +201,15 @@ fn absence<'z>(
 /// `nsec_covering` searches strictly below its argument, so a name in the chain
 /// yields the record before it, which proves nothing.
 ///
-/// ~~Guaranteed by [`Zone::name_kind`] — were it present the answer would be a
-/// wildcard match.~~ **Four of its six `NotFound` returns establish that and
-/// the delegation one does not** (`TODO.md` #79e): it returns `NotFound`
+/// [`Zone::name_kind`] does not guarantee it: its delegation `NotFound` is
 /// because RFC 4592 §2.2.1 forbids synthesis below a cut, which says nothing
 /// about whether `*.sub` is in the index. The guarantor is the *caller*:
-/// ~~`rdnsd`'s `resolve_in_zone`~~ [`super::resolve_in_zone`] (since #150)
-/// asks `delegation_for` before anything else — RFC 1034 §4.3.2's first case
-/// — so a name under a cut is a referral and never reaches a negative proof.
-/// `rdnsd`'s `a_wildcard_below_a_cut_is_still_a_referral` holds it end to end,
-/// and `zone_answer`'s own test of the same name holds it here, where the
-/// ordering now lives.
+/// [`super::resolve_in_zone`] asks `delegation_for` before anything else — RFC
+/// 1034 §4.3.2's first case — so a name under a cut is a referral and never
+/// reaches a negative proof. `rdnsd`'s
+/// `a_wildcard_below_a_cut_is_still_a_referral` holds it end to end, and
+/// `zone_answer`'s own test of the same name holds it here, where the ordering
+/// lives.
 fn deny_the_name_and_its_wildcard<'z>(
     zone: &'z Zone,
     qname: NameRef<'_>,
@@ -283,7 +281,7 @@ fn push_soa_signatures(
 /// RFC 9077 §§3.1-3.3 put the requirement on what is *returned*, so it belongs
 /// here as well as in the signer — a zone whose signatures arrived from
 /// somewhere else is answered from this path too, and its chain was built by a
-/// signer this server does not control (`TODO.md` #73, #77a).
+/// signer this server does not control (`TODO.md` #77a).
 ///
 /// `None` for a zone with no apex SOA, which is no cap rather than a cap of
 /// zero: such a zone owes no negative answer either, and a ceiling of zero
@@ -695,23 +693,23 @@ deep.a.b IN TXT "down here"
     /// predates RFC 8198, under which the denial's own TTL is how long a
     /// resolver may keep synthesizing this "no" out of its cache.
     ///
-    /// Watched failing against the old `denial_ttl = MINIMUM`: the NSEC and its
-    /// RRSIG read 3600 beside an SOA of 300. Every other fixture in this tree is
-    /// `$TTL 3600` with `minimum 300`, which is the masking direction — the
-    /// `min` is invisible unless the SOA's own TTL is the smaller of the two.
-    /// A zone signed somewhere else is capped when it is *answered*, not only
-    /// when it is signed.
+    /// Fails with `denial_ttl = MINIMUM`: the NSEC and its RRSIG read 3600
+    /// beside an SOA of 300. Every other fixture in this tree is `$TTL 3600`
+    /// with `minimum 300`, which is the masking direction — the `min` is
+    /// invisible unless the SOA's own TTL is the smaller of the two. A zone
+    /// signed somewhere else is capped when it is *answered*, not only when it
+    /// is signed.
     ///
-    /// `TODO.md` #77a. #73 fixed the signer, which covers every zone this
-    /// server signs and none that arrives already signed — a replicated one, or
-    /// one whose chain another operator's signer built. RFC 9077 §§3.1-3.3 put
-    /// the requirement on "the TTL of the NSEC RR **that is returned**", so it
-    /// belongs on this path as well.
+    /// `TODO.md` #77a. The signer's cap covers every zone this server signs and
+    /// none that arrives already signed — a replicated one, or one whose chain
+    /// another operator's signer built. RFC 9077 §§3.1-3.3 put the requirement
+    /// on "the TTL of the NSEC RR **that is returned**", so it belongs on this
+    /// path as well.
     ///
     /// The fixture is what a signer following RFC 4034 §4.1.1's older wording
     /// produces: NSEC records at MINIMUM, 3600, above the SOA's own TTL of 300.
-    /// Watched failing against the cap that read MINIMUM alone — the NSEC went
-    /// out at 3600 beside an SOA of 300.
+    /// Fails with a cap of MINIMUM alone — the NSEC goes out at 3600 beside an
+    /// SOA of 300.
     #[test]
     fn a_denial_from_another_signer_is_capped_when_it_is_answered() {
         const SIGNED_ELSEWHERE: &str = concat!(
@@ -756,8 +754,8 @@ deep.a.b IN TXT "down here"
     /// a cap of `min(both)` from a cap of the SOA TTL alone. Nor can a zone
     /// this server signed, since the signer already capped the chain — so the
     /// fixture is hand-written with its NSECs at `$TTL`, which is what a signer
-    /// that reads neither term produces. Watched failing against
-    /// `Ttl::negative_answer` returning `soa_ttl`.
+    /// that reads neither term produces. Fails if `Ttl::negative_answer`
+    /// returns `soa_ttl`.
     #[test]
     fn a_denial_from_another_signer_is_capped_at_minimum_when_minimum_is_lesser() {
         const LONG_TTL_SHORT_MINIMUM: &str = concat!(

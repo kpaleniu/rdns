@@ -207,10 +207,10 @@ pub struct DnsCache {
     cache: Arc<Mutex<HashMap<NameTypeKey, CacheEntry>>>,
     max_entries: usize,
     stale: StalePolicy,
-    /// Where "now" comes from. [`Clock::System`] everywhere but in a test, which
-    /// needs one it can move: a TTL is measured in seconds, so asserting
+    /// Where "now" comes from. [`Clock::System`] everywhere but in a test,
+    /// which needs one it can move: a TTL is measured in seconds, so asserting
     /// anything about expiry against the wall clock is a test that waits
-    /// (`TODO.md` #52, `CLAUDE.md` §10).
+    /// (`CLAUDE.md` §10).
     clock: Clock,
 }
 
@@ -684,8 +684,8 @@ mod tests {
     }
 
     /// A name and the same name without its trailing dot are one name, so they
-    /// are one entry — which they were not while the key was `ascii_lowered`,
-    /// the one fold in this crate that does not absolutize (`TODO.md` #25e).
+    /// are one entry. Fails with a key of `ascii_lowered`, the one fold in this
+    /// crate that does not absolutize.
     #[test]
     fn the_trailing_dot_does_not_make_a_second_entry() {
         let cache = DnsCache::with_defaults();
@@ -728,8 +728,8 @@ mod tests {
     }
 
     /// A cache whose clock the test moves, so expiry is asserted rather than
-    /// waited for (`TODO.md` #52): a TTL is whole seconds, and every other way
-    /// of reaching one is a sleep or a zero.
+    /// waited for: a TTL is whole seconds, and every other way of reaching one
+    /// is a sleep or a zero.
     fn fixed_cache(max_entries: usize, stale: StalePolicy) -> (DnsCache, Clock) {
         let clock = Clock::fixed(1_000_000_000);
         (
@@ -865,8 +865,8 @@ mod tests {
     ///
     /// Eleven entries into a cache of ten, all of them expired and all inside
     /// the window, so the one insert that triggers eviction has to halve rather
-    /// than sweep. Watched failing against `retain(|_, e| !e.is_expired(now))`:
-    /// **1** entry survived, being the one that arrived after the sweep.
+    /// than sweep. Fails with `retain(|_, e| !e.is_expired(now))`: **1** entry
+    /// survives, being the one that arrived after the sweep.
     #[test]
     fn eviction_keeps_what_is_still_inside_the_stale_window() {
         let (cache, clock) = fixed_cache(10, StalePolicy::seconds(3600));
@@ -1078,9 +1078,8 @@ mod tests {
         );
     }
 
-    /// An expiry is `now` plus a TTL, saturating (`TODO.md` #154): a clock
-    /// near the end of `u64` keeps the entry until the end of time rather than
-    /// overflowing.
+    /// An expiry is `now` plus a TTL, saturating: a clock near the end of `u64`
+    /// keeps the entry until the end of time rather than overflowing.
     #[test]
     fn an_entry_cached_at_the_end_of_time_is_kept() {
         let clock = Clock::fixed(u64::MAX - 10);

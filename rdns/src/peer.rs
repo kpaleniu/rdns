@@ -25,13 +25,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 /// `rdnsd`'s NOTIFY master match. The only constructor canonicalizes, and every
 /// check takes this type, so no check can be handed the mapped form.
 ///
-/// `TransferAcl` refused mapped peers on purpose — "a way around the list" —
-/// and for a stream that reason does not hold: Linux drops incoming TCPv6
-/// with a mapped source, and a peer that completed a handshake is the IPv4
-/// host it names. For UDP the drop does not apply, so a datagram claiming
-/// `::ffff:a.b.c.d` from an IPv6 network now passes an IPv4 rule. What that
-/// grants is query-limit exemption, with the reply going to the real IPv4
-/// host and `ResponseLimiter` still bounding it — the grant plain IPv4
+/// Refusing mapped peers as "a way around the list" is wrong for a stream:
+/// Linux drops incoming TCPv6 with a mapped source, and a peer that completed a
+/// handshake is the IPv4 host it names. For UDP the drop does not apply, so a
+/// datagram claiming `::ffff:a.b.c.d` from an IPv6 network passes an IPv4 rule.
+/// What that grants is query-limit exemption, with the reply going to the real
+/// IPv4 host and `ResponseLimiter` still bounding it — the grant plain IPv4
 /// spoofing has wherever BCP 38 is not applied. A transfer is stream-only.
 ///
 /// Not for a reply: a datagram back to an IPv4 client on a dual-stack socket

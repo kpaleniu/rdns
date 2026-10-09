@@ -19,7 +19,7 @@
 //! `<prefix>.<addr>.rpz-nsip` — which the answer does not carry, so they are
 //! asked while the delegation chain is being walked, through
 //! [`crate::resolver::NameserverPolicy`]: a match stops the resolution rather
-//! than rewriting its result, which is what the trigger is for (`TODO.md` #56).
+//! than rewriting its result, which is what the trigger is for.
 //!
 //! A stopped resolution caches nothing, so the block holds for every client
 //! rather than the first one — provided the walk actually happens. It need not:
@@ -859,17 +859,16 @@ impl PolicyZones {
     /// set **62 ms** (`rdns/tests/rpz_install.rs`, release, the development
     /// machine).
     ///
-    /// Still all-or-nothing, and that is the property the row said must not be
-    /// lost: every feed is read and parsed before any of the set is built, so a
-    /// half-written file still leaves the previous set whole. What changes is
-    /// that the test is now per feed rather than per set — one feed publishing
-    /// no longer re-parses the others.
+    /// All-or-nothing: every feed is read and parsed before any of the set is
+    /// built, so a half-written file leaves the previous set whole. The test is
+    /// per feed rather than per set — one feed publishing does not re-parse the
+    /// others.
     ///
     /// The bytes are read either way and the digest is taken over them rather
     /// than a `stat` — [`FileDigest`] says why, for all three callers of it
     /// (#104). Measured at a million rules: read and digest 21 ms per feed
-    /// against ~720 for the parse and index it replaces, where `rdnsd`'s
-    /// reload path measured 1.8% (#64f).
+    /// against ~720 for the parse and index it saves, where `rdnsd`'s reload
+    /// path measured 1.8% (#64f).
     ///
     /// `offered` is what this process wrote and did not throw away
     /// (`TODO.md` #71f): a zone from there is taken only when its digest is the
@@ -1107,11 +1106,10 @@ impl PolicyStore {
     /// Index a zone this process just wrote, and keep it for the next reload
     /// to install without parsing the file back — `TODO.md` #71f.
     ///
-    /// The [`Written`] is the write: only [`crate::zone_writer::write_zone_text`]
-    /// makes one, so a caller cannot offer bytes it did not put on disk or
-    /// offer them before it did. That rule used to be this sentence — "the
-    /// caller writes `text` to `path` first and passes the same bytes here" —
-    /// with nothing making it true (`TODO.md` #104, `CLAUDE.md` §17).
+    /// The [`Written`] is the write: only
+    /// [`crate::zone_writer::write_zone_text`] makes one, so a caller cannot
+    /// offer bytes it did not put on disk or offer them before it did — a type,
+    /// where a doc comment could only ask (`TODO.md` #104, `CLAUDE.md` §17).
     ///
     /// A reload still reads every file, and takes this zone only if the file's
     /// bytes are still the bytes written here, so a feed somebody else rewrote
@@ -1242,7 +1240,7 @@ pub struct Reloaded {
     /// what leaves, so a new one of either is in force for the next query
     /// whatever is held. A nameserver rule can only be asked while a delegation
     /// is being walked, so an answer already cached is never offered to it and
-    /// outlives the rule by its TTL (`TODO.md` #56, #57).
+    /// outlives the rule by its TTL (`TODO.md` #57).
     pub delegation_rules_changed: bool,
 }
 
@@ -1679,10 +1677,9 @@ $TTL 60
         }
     }
 
-    /// A mapped client is the IPv4 address it maps, so an IPv4 rule matches
-    /// it. This asserted the opposite until `TODO.md` #158, after the rule
-    /// `security::TransferAcl` held, and both refused every IPv4 client of a
-    /// dual-stack socket.
+    /// A mapped client is the IPv4 address it maps, so an IPv4 rule matches it.
+    /// Fails if a mapped client is refused, which refuses every IPv4 client of
+    /// a dual-stack socket (`TODO.md` #158).
     #[test]
     fn a_v4_client_rule_matches_a_mapped_v6_client() {
         let mapped = Peer::from(IpAddr::V6(Ipv4Addr::new(127, 0, 0, 9).to_ipv6_mapped()));

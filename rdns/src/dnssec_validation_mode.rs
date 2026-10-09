@@ -14,12 +14,11 @@ use crate::{Qtype, RecordDataRef, ResourceRecord};
 /// The keys every RRset in one zone is checked against, collected once.
 ///
 /// A type because collecting them is O(the zone) and checking one RRset is not,
-/// and the check used to do both on every call —
-/// which made verifying a zone at load quadratic in the zone
-/// (`TODO.md` #50: 20,006 RRsets took 112 s where 5,006 took 7). A parameter
-/// makes the zone-wide cost visible at the call site, where it can be hoisted;
-/// as a hidden step inside the check it could only be paid again
-/// (`CLAUDE.md` §17).
+/// and a check doing both on every call makes verifying a zone at load
+/// quadratic in the zone (`TODO.md` #50: 20,006 RRsets took 112 s where 5,006
+/// took 7). A parameter makes the zone-wide cost visible at the call site,
+/// where it can be hoisted; as a hidden step inside the check it could only be
+/// paid again (`CLAUDE.md` §17).
 pub struct ZoneKeys {
     /// Whether the zone holds a DNSKEY record at all, which is what "is this
     /// zone signed" means. Separate from `keys` being non-empty: a zone whose
@@ -61,11 +60,8 @@ impl ZoneKeys {
 
 /// What checking one RRset concluded.
 ///
-/// Three variants where there were two bools. `(is_valid, is_signed)` was
-/// documented in prose and nowhere in the type, all four call sites discarded
-/// the second element, and the file held seven bare tuple literals
-/// (`TODO.md` #80). The signedness was redundant by construction: a caller
-/// holds the [`ZoneKeys`] that answers it.
+/// Three variants, not `(is_valid, is_signed)`: the signedness is redundant by
+/// construction, since a caller holds the [`ZoneKeys`] that answers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Nothing was checked: validation is off, or the zone carries no DNSKEY
@@ -261,8 +257,7 @@ mod tests {
         );
     }
 
-    /// `ZoneKeys` is what answers "is this zone signed", and it is the answer
-    /// the bool used to duplicate.
+    /// `ZoneKeys` is what answers "is this zone signed".
     #[test]
     fn zone_keys_reads_the_dnskeys_a_zone_has() {
         let mut zone = Zone::new(nm(&nm("example.com.").to_string()));

@@ -138,11 +138,11 @@ impl Journal {
 
     /// Every zone with a journal in this directory.
     ///
-    /// Read from the directory rather than from the zone list, because what this
-    /// answers is which journals belong to no zone at all: one left by a zone
-    /// removed while the process was down is invisible to a walk of the zone
-    /// list, and stays on disk until it resurfaces under a zone of the same name
-    /// (`TODO.md` #38b).
+    /// Read from the directory rather than from the zone list, because what
+    /// this answers is which journals belong to no zone at all: one left by a
+    /// zone removed while the process was down is invisible to a walk of the
+    /// zone list, and stays on disk until it resurfaces under a zone of the
+    /// same name.
     ///
     /// A file whose name is not a domain name is somebody else's and is left
     /// out. So is the root zone's `.journal`, which `Path` reads as a name with
@@ -382,10 +382,8 @@ mod tests {
     }
 
     /// The directory answers which journals exist, which is the question the
-    /// zone list cannot: an orphan is exactly a name that is here and not there
-    /// (`TODO.md` #38b).
-    ///
-    /// Watched failing without `journalled_zones`: there was nothing to ask.
+    /// zone list cannot: an orphan is exactly a name that is here and not
+    /// there.
     #[test]
     fn the_journals_on_disk_are_read_from_the_directory() {
         let scratch = ScratchDir::new("journal-enumerate");

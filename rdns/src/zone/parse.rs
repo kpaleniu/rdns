@@ -7,9 +7,10 @@
 //! What a record *means* once its fields are split is [`super::rdata`]'s, and
 //! what a whole zone must not contain is [`super::checks`]'.
 //!
-//! A name here is text and so carries RFC 1035 §5.1's escapes: `absolutize` goes
-//! through [`crate::Name`]'s own text decoder rather than splitting on `.`, since
-//! a second decoder disagreed with it about `\.` (`TODO.md` #35, #36).
+//! A name here is text and so carries RFC 1035 §5.1's escapes: `absolutize`
+//! goes through [`crate::Name`]'s own text decoder rather than splitting on
+//! `.`, since a second decoder is one that disagrees with it about `\.`
+//! (`TODO.md` #36).
 
 use super::checks::{check_cname_exclusivity, check_dname_rules};
 use super::rdata::{parse_generic_rdata, rdata_from_fields};
@@ -335,9 +336,8 @@ fn parse_into(
     // there is: directives and blank lines are the slack.
     zone.reserve(lines.len());
     // Refilled per line rather than rebuilt, which is one `Vec` for the file
-    // and not one per record. It could not be until #72a: there was a second
-    // vector of `&str` borrowed from this one, so this one could not be
-    // touched while it lived.
+    // and not one per record. Nothing else borrows from it across lines, which
+    // a second vector of `&str` over it would.
     let mut tokens: Vec<Cow<'_, str>> = Vec::new();
     for logical in &lines {
         let ln = logical.line_no;
@@ -524,10 +524,10 @@ fn parse_into(
             ln,
         )?;
 
-        // Encoded into the zone's own arena. The `RecordData` this used to
-        // build was a heap allocation and a free per record for octets the
-        // zone copies either way (`TODO.md` #72b), and the line number is what
-        // the encode's own error has no way to carry.
+        // Encoded into the zone's own arena: a `RecordData` here would be a
+        // heap allocation and a free per record for octets the zone copies
+        // either way (`TODO.md` #72b), and the line number is what the encode's
+        // own error has no way to carry.
         zone.add_parsed(state.owner().expect("an owner name"), ttl, class, &parsed)
             .map_err(|e| ZoneError::syntax(ln, format!("{record_type} record: {e}")))?;
     }

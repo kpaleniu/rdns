@@ -31,9 +31,9 @@
 //!
 //! The two that did not fit are the point, and so is *where* they stop fitting:
 //! the DKIM rotation is 470 octets unsigned and 566 signed, so the TSIG the
-//! server requires is what made a legitimate request inadmissible. The cap is
-//! 4,096 now — what both daemons advertise they can reassemble — so every row
-//! here fits, and the column is kept as the reason it moved.
+//! server requires is what makes a legitimate request inadmissible under a cap
+//! of 512. The cap is 4,096 — what both daemons advertise they can reassemble —
+//! so every row here fits, and the column is kept as the reason.
 
 use rdns::tsig::{sign_request, TsigAlgorithm, TsigKey};
 use rdns::{

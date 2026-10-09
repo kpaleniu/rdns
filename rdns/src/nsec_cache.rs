@@ -128,8 +128,8 @@ pub struct WildcardSynthesis {
 /// `labels` counts the signed name's labels, excluding the leading `*` and the
 /// root (RFC 4034 §3.1.3), so the wildcard is `*.` plus that many trailing
 /// labels of the owner — which is [`signed_owner_name`], over the wire name.
-/// This split the owner's *text* on `.`, counting `a\.b.example.com.` as four
-/// labels where its RRSIG correctly claims three (`TODO.md` #37a).
+/// Splitting the owner's *text* on `.` counts `a\.b.example.com.` as four
+/// labels where its RRSIG correctly claims three.
 fn wildcard_for_expansion(owner: NameRef<'_>, labels: u8) -> Option<Name> {
     let signed = signed_owner_name(owner, labels).ok()?;
     (signed.as_ref() != owner).then_some(signed)
@@ -156,12 +156,9 @@ pub struct NsecCache {
     /// structure against a flood of one-off zones or one enormous chain.
     max_zones: usize,
     /// The one the process reads, as [`crate::cache::DnsCache`] and
-    /// [`crate::negative_cache::NegativeCache`] take (`TODO.md` #107a).
-    ///
-    /// `Caches::new` hands those two a `Clock` under "one process, one idea of
-    /// the time, and a test that can move it" and built this one without: an
-    /// expiry nothing can move is an expiry with no test but the degenerate
-    /// one, which is what `test_expired_proofs_are_not_used` was.
+    /// [`crate::negative_cache::NegativeCache`] take: an expiry nothing can
+    /// move is an expiry with no test but the degenerate one, which is what
+    /// `test_expired_proofs_are_not_used` is.
     clock: Clock,
 }
 
@@ -1113,10 +1110,9 @@ mod tests {
     /// is not in the cost.
     ///
     /// A ratio rather than a floor (`CLAUDE.md` §10): the absolute numbers are
-    /// the machine's, the complexity class is the code's. Watched failing
-    /// against the scan this replaced — 31.6× and 1.6 s per lookup in a debug
-    /// build, where the query the finding came from cost 1 156 ms of CPU in a
-    /// release one, with the cache's one lock held for all of it.
+    /// the machine's, the complexity class is the code's. Fails against a scan
+    /// of the cached proofs: 31.6× and 1.6 s per lookup in a debug build, with
+    /// the cache's one lock held for all of it.
     #[test]
     fn a_lookup_costs_the_same_however_many_proofs_are_cached() {
         use std::time::Instant;
@@ -1371,11 +1367,10 @@ mod tests {
     /// A proof is live inside its TTL and gone after it — at 3 600 seconds,
     /// not at zero.
     ///
-    /// What `test_expired_proofs_are_not_used` above cannot ask, and the reason
-    /// #107a exists: that one signs with `Ttl::from_secs(0)`, which asserts
-    /// "a zero TTL means do not reuse this" and says nothing about expiry.
-    /// `MAX_PROOF_TTL` is 3 600 too, so this also pins the ceiling and the TTL
-    /// agreeing at the boundary.
+    /// What `test_expired_proofs_are_not_used` above cannot ask: that one signs
+    /// with `Ttl::from_secs(0)`, which asserts "a zero TTL means do not reuse
+    /// this" and says nothing about expiry. `MAX_PROOF_TTL` is 3 600 too, so
+    /// this also pins the ceiling and the TTL agreeing at the boundary.
     #[test]
     fn a_proof_is_live_until_its_ttl_runs_out() {
         let clock = Clock::fixed(1_000_000_000);
@@ -1445,10 +1440,9 @@ mod tests {
     /// The same bound the other way round: the SOA's own TTL is the shorter
     /// of the two, so it is the one that wins (RFC 9077 §§3.1-3.3).
     ///
-    /// The mirror of the test above, which had only the MINIMUM-is-shorter
-    /// direction — the direction that cannot catch #73's defect, since a cap
-    /// computed from MINIMUM alone gives the right answer there. Watched
-    /// failing against `Ttl::negative_answer` returning `minimum`.
+    /// The mirror of the test above, which has the MINIMUM-is-shorter direction
+    /// — where a cap computed from MINIMUM alone gives the right answer. Fails
+    /// if `Ttl::negative_answer` returns `minimum`.
     #[test]
     fn test_a_short_soa_ttl_bounds_the_negative_ttl_under_a_long_minimum() {
         let cache = NsecCache::new(16);
@@ -2033,8 +2027,8 @@ mod tests {
             None,
             "nothing stripped is not an expansion"
         );
-        // Three wire labels, four dots' worth of text: counting dots reported
-        // this as expanded from `*.b.example.com.` (`TODO.md` #37a).
+        // Three wire labels, four dots' worth of text: counting dots reports
+        // this as expanded from `*.b.example.com.`.
         assert_eq!(
             wildcard_for_expansion(nm(r"a\.b.example.com.").as_ref(), 3),
             None,
@@ -2074,9 +2068,8 @@ mod tests {
         assert!(cache.is_empty());
     }
 
-    /// An expiry is `now` plus a TTL, saturating (`TODO.md` #154): a clock
-    /// near the end of `u64` keeps the entry until the end of time rather than
-    /// overflowing.
+    /// An expiry is `now` plus a TTL, saturating: a clock near the end of `u64`
+    /// keeps the entry until the end of time rather than overflowing.
     #[test]
     fn an_entry_cached_at_the_end_of_time_is_kept() {
         let cache = NsecCache::with_clock(16, Clock::fixed(u64::MAX - 10));

@@ -41,11 +41,11 @@ impl NotifyTarget {
     pub fn parse(spec: &str) -> ConfigResult<Self> {
         let spec = spec.trim();
         let parsed = crate::endpoint::parse_endpoint(spec, spec)?;
-        // The endpoint syntax carries `+tls=` for `--secondary` (`TODO.md`
-        // #44d). RFC 9103 is about the transfer and says nothing about NOTIFY,
-        // and this server has no TLS client for one, so accepting the suffix
-        // here would be a flag that changes nothing — which is the shape
-        // `CLAUDE.md` §15 refuses in a config key.
+        // The endpoint syntax carries `+tls=` for `--secondary`. RFC 9103 is
+        // about the transfer and says nothing about NOTIFY, and this server has
+        // no TLS client for one, so accepting the suffix here would be a flag
+        // that changes nothing — which is the shape `CLAUDE.md` §15 refuses in
+        // a config key.
         if parsed.tls.is_some() {
             return Err(ConfigError::new(format!(
                 "--also-notify {spec:?}: '+tls=' is for --secondary, where it is \
@@ -64,7 +64,7 @@ impl NotifyTarget {
     /// A key named but not defined is a configuration error, not a reason to
     /// notify unsigned: the operator asked for authentication and would
     /// otherwise not be able to see that they did not get it. That is the same
-    /// rule `--secondary` applies to the same syntax, and now the same sentence.
+    /// rule `--secondary` applies to the same syntax, and the same sentence.
     pub fn resolve(&self, keys: &TsigKeyring) -> ConfigResult<NotifyPeer> {
         let key = match &self.key_name {
             Some(name) => Some(
@@ -116,13 +116,9 @@ impl std::fmt::Display for NotifyPeer {
 /// Two settings feed this: `--also-notify` / `[server].also-notify`, which
 /// applies to every zone, and `[zones."x"].also-notify`, which *adds* to it for
 /// one zone — "in addition to", which is what `ZoneConfig::also_notify`'s doc
-/// comment has always said it meant.
-///
-/// It says it for the first time here. The per-zone list was parsed into
-/// `PerZone::notify` and read by nothing, so both `docs/spec/` files documented
-/// a setting that a `deny_unknown_fields` config accepted and silently dropped
-/// (`TODO.md` #46c, and `CLAUDE.md` §4's shape: the operator believes it is in
-/// force and it is not).
+/// comment says it means. Both are read here, so neither is a setting a
+/// `deny_unknown_fields` config accepts and silently drops (`CLAUDE.md` §4: the
+/// operator believes it is in force and it is not).
 ///
 /// The union is built once, at startup, so a zone's list is a slice rather than
 /// something allocated per announcement — and deduplicated, because naming the
@@ -275,7 +271,7 @@ pub fn notified_zone(msg: &DnsMessage) -> Option<Name> {
 ///
 /// Both variants end the retries — the message arrived, and sending it again
 /// would not change the answer. They differ in whether anything is going to
-/// happen as a result, which is the distinction `TODO.md` #46b existed for.
+/// happen as a result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifyOutcome {
     /// NOERROR: the secondary has it and will refresh.
@@ -291,12 +287,11 @@ pub enum NotifyOutcome {
 /// `None` for anything that is not this message's answer, so an off-path reply
 /// cannot silence a notification by arriving first.
 ///
-/// This returned a bare `bool` until #46b, under a comment saying any rcode
-/// counts because the secondary received it either way. That is true and was
-/// not the whole answer: a secondary whose notify ACL names a key refuses every
-/// unsigned NOTIFY, which the bool reported as `acknowledged (Refused)` at INFO
-/// — a permanently broken notification path with nothing in a failed state
-/// (`CLAUDE.md` §4).
+/// Not a bare `bool` for "any rcode counts, because the secondary received it
+/// either way". That is true and not the whole answer: a secondary whose notify
+/// ACL names a key refuses every unsigned NOTIFY, which a bool reports as
+/// `acknowledged (Refused)` at INFO — a permanently broken notification path
+/// with nothing in a failed state (`CLAUDE.md` §4).
 pub fn outcome(reply: &DnsMessage, id: u16) -> Option<NotifyOutcome> {
     if !(reply.response && reply.id == id && reply.opcode == OpCode::Notify) {
         return None;
@@ -417,8 +412,8 @@ mod tests {
     }
 
     /// Every rcode ends the retries — the secondary received it either way —
-    /// but only NOERROR means it is going to do anything about it. #46b: these
-    /// were one answer, and a keyed notify ACL refusing every NOTIFY read as
+    /// but only NOERROR means it is going to do anything about it. Fails if
+    /// they are one answer: a keyed notify ACL refusing every NOTIFY reads as
     /// `acknowledged` at INFO.
     #[test]
     fn test_a_refusal_ends_the_retries_without_being_an_acceptance() {

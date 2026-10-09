@@ -1,9 +1,9 @@
 //! The `[server]` keys both daemons have, written once.
 //!
-//! Most of `rdnsd`'s `[server]` keys name a setting `rdnsr` has as a flag
-//! under the same name (`TODO.md` #63b, #155, #156, #179). Two parsers for
-//! one setting is how `[zones."x"].also-notify` came to be parsed into a field
-//! nothing read (#46c), so the shared half is written here.
+//! Most of `rdnsd`'s `[server]` keys name a setting `rdnsr` has as a flag under
+//! the same name (`TODO.md` #63b, #155, #156, #179). Two parsers for one
+//! setting is how a key comes to be parsed into a field nothing reads, so the
+//! shared half is written here.
 //!
 //! **A macro and not a shared struct**, because the struct was built and
 //! measured (#63h): flattening one into each daemon's `[server]` costs the
@@ -14,17 +14,15 @@
 //! exactly as it does today.
 //!
 //! The contract is that the calling crate's root defines the `default_*`
-//! functions named below and a `Cli` with a field per key, which both daemons
-//! already do (#63e). A crate that does not gets a compile error naming the
-//! missing one.
+//! functions named below and a `Cli` with a field per key. A crate that does
+//! not gets a compile error naming the missing one.
 //!
 //! **The projection is generated too**, not only the declarations and the
-//! defaults. It was written out by hand in each daemon — 36 statements in
-//! `rdnsd` and 23 in `rdnsr` — and a key declared and never assigned parsed,
-//! passed `deny_unknown_fields` and did nothing. `dead_code` catches that only while nothing *else* reads the
-//! field, and `check` reads ten of `rdnsd`'s, so the plausible version of the
-//! mistake — validate the new key, forget to project it — compiled without a
-//! warning (`TODO.md` #103).
+//! defaults. Written by hand, a key declared and never assigned parses, passes
+//! `deny_unknown_fields` and does nothing. `dead_code` catches that only while
+//! nothing *else* reads the field, and `check` reads ten of `rdnsd`'s, so the
+//! plausible version of the mistake — validate the new key, forget to project
+//! it — compiles without a warning.
 use crate::error::{ConfigError, ConfigResult};
 
 /// `Clone::clone`, behind a generic.
@@ -110,12 +108,12 @@ pub fn show_nsid(nsid: &[u8]) -> String {
 ///
 /// The `defaults` block is this daemon's own fields only — the shared ones are
 /// filled from the crate root's `default_*` functions, so the file and the flag
-/// cannot take different numbers (§15, and #63e is what happens when they can).
+/// cannot take different numbers (§15).
 // `crate::` here is the *calling* crate's root, which is the contract this
 // macro exists to state: each daemon's own `default_*` functions, so a flag and
-// a key cannot take different numbers (#63e). `$crate` would name `rdns`, where
-// none of them lives. Clippy warns because that is usually the bug rather than
-// the intent.
+// a key cannot take different numbers. `$crate` would name `rdns`, where none
+// of them lives. Clippy warns because that is usually the bug rather than the
+// intent.
 #[allow(clippy::crate_in_macro_def)]
 #[macro_export]
 macro_rules! server_table {
@@ -192,7 +190,7 @@ macro_rules! server_table {
             /// off.
             nsid: Option<String>,
             /// Where the dnstap stream goes: `tcp:<addr:port>` or
-            /// `file:<path>`. Absent is off. Both daemons since `TODO.md` #191.
+            /// `file:<path>`. Absent is off.
             dnstap: Option<String>,
             /// How large a dnstap *capture file* may grow before the writing
             /// stops. 0 is no limit; ignored for a `tcp:` target.
@@ -204,12 +202,11 @@ macro_rules! server_table {
             /// clap's `requires` and "either listener needs the pair" is not an
             /// `or` `requires` can express.
             ///
-            /// ~~By each daemon's `check`.~~ `rdnsr`'s, yes; `rdnsd` refuses it
-            /// in `main`, where the flags and the file have already been merged
-            /// into one `Cli` and the certificate is about to be loaded
-            /// (`TODO.md` #79f). One check over both sources rather than two,
-            /// at the cost of a file error without a line number —
-            /// `--check-config` still reaches it.
+            /// `rdnsr` refuses it in `check`; `rdnsd` in `main`, where the
+            /// flags and the file have already been merged into one `Cli` and
+            /// the certificate is about to be loaded. One check over both
+            /// sources rather than two, at the cost of a file error without a
+            /// line number — `--check-config` still reaches it.
             tls_listen: Option<String>,
             quic_listen: Option<String>,
             https_listen: Option<String>,
@@ -217,8 +214,8 @@ macro_rules! server_table {
             tls_cert: Option<std::path::PathBuf>,
             tls_key: Option<std::path::PathBuf>,
             /// Where `rdnsctl` reaches this server: a socket path, or on
-            /// Windows a pipe name, anything else refused at startup
-            /// (`TODO.md` #188). Both daemons since `TODO.md` #178.
+            /// Windows a pipe name, anything else refused at startup (both
+            /// daemons).
             control_socket: Option<std::path::PathBuf>,
             /// `--log-file`: where log lines go instead of standard error,
             /// each with a UTC timestamp; reopened on reload (`TODO.md` #190).
@@ -232,14 +229,12 @@ macro_rules! server_table {
         impl $name {
             /// Write every `[server]` key onto `cli`.
             ///
-            /// Generated from the declarations above, so a key that parses
-            /// is a key the daemon reads. Written by hand it was 36
-            /// statements in `rdnsd` and 23 in `rdnsr`, and a field with no
-            /// assignment parsed, passed `deny_unknown_fields` and then did
+            /// Generated from the declarations above, so a key that parses is a
+            /// key the daemon reads. Written by hand, a field with no
+            /// assignment parses, passes `deny_unknown_fields` and then does
             /// nothing — the failure `deny_unknown_fields` exists to prevent,
-            /// reached by the other door (`TODO.md` #103). The defaults never
-            /// had that hole, because a missing one is a struct literal
-            /// missing a field; the projection had nothing checking it.
+            /// reached by the other door. The defaults do not have that hole,
+            /// because a missing one is a struct literal missing a field.
             ///
             /// The contract of the module header, plus one name: the calling
             /// crate's root defines `Cli`, with a field of the same name and
@@ -283,8 +278,7 @@ macro_rules! server_table {
                 // The one key whose flag has a default, so an absent key means
                 // "keep it" rather than "clear it" — the `Option` here is the
                 // override and not the value (§15). The exception lives with
-                // the declaration rather than in each daemon, which is where
-                // both copies of it used to be.
+                // the declaration rather than in each daemon.
                 if let Some(https_path) = &self.https_path {
                     cli.https_path = $crate::config::taken(https_path);
                 }

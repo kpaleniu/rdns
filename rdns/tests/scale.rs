@@ -386,15 +386,14 @@ fn signing_one_big_zone() {
 
 /// What `rdnsd` does to a zone it has just signed, before serving any of it.
 ///
-/// `zones::verify_zones` asks one question per signed RRset. It asked it
-/// through a check that collected, per call, every DNSKEY
-/// and every RRSIG *in the whole zone* per call — quadratic, and `TODO.md` #50,
-/// which this stage found and which the shape below is now the fixed version
-/// of: the keys are collected once and `validate_rrset` takes them.
+/// `zones::verify_zones` asks one question per signed RRset. A check that
+/// collects every DNSKEY and every RRSIG *in the whole zone* per call is
+/// quadratic (`TODO.md` #50), so the keys are collected once and
+/// `validate_rrset` takes them.
 ///
-/// It ran on *every* load until `TODO.md` #53; a zone this server signed is
-/// proved once per set of signing keys now, so what is timed here is the first
-/// load of a zone and every load of one this server did not sign.
+/// A zone this server signed is proved once per set of signing keys, so what is
+/// timed here is the first load of a zone and every load of one this server did
+/// not sign.
 ///
 /// What to read is the µs/RRset column against itself. Flat is the fix; a
 /// column that doubles when the zone doubles is the defect back.

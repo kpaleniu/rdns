@@ -18,13 +18,13 @@
 //! - [`Dns64`], the policy around it: which prefix, which AAAA answers are to be
 //!   read as no answer at all (§5.1.4), and the synthesis itself.
 //!
-//! What is deliberately not here: *when* to synthesize. That is a property of an
-//! answer path — which paths can produce an empty AAAA answer, and which of
+//! What is deliberately not here: *when* to synthesize. That is a property of
+//! an answer path — which paths can produce an empty AAAA answer, and which of
 //! those are empty for a reason synthesis must not paper over — so it lives in
 //! `rdnsr`'s `answer`, beside the paths themselves. Two of them must never
 //! synthesize and the reasons are unrelated to DNS64: a name RFC 6761 answers
 //! locally is not an IPv4 name behind a translator, and a name a policy zone
-//! blocked is blocked (`TODO.md` #45a).
+//! blocked is blocked.
 
 use crate::error::{ConfigError, ConfigResult};
 use crate::record_types as rt;

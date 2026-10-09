@@ -34,8 +34,8 @@ fn construct_type_bitmap(types: &[Cow<'_, str>]) -> Result<Vec<u8>, String> {
     let mut codes = Vec::with_capacity(types.len());
     let mut buf = [0u8; 32];
     for name in types {
-        // ASCII only (RFC 4343): `to_uppercase` read `Nſ` as NS (`TODO.md`
-        // #140). A token `upper_into` declines is no type name either.
+        // ASCII only (RFC 4343): `to_uppercase` reads `Nſ` as NS. A token
+        // `upper_into` declines is no type name either.
         let upper = upper_into(name, &mut buf).unwrap_or(name);
         let code = crate::record_types::record_type_name_to_code(upper)
             .ok_or_else(|| format!("unknown record type {name:?} in type bitmap"))?;
@@ -102,8 +102,8 @@ fn split_svcb_head<'a>(
 }
 
 /// RDATA that is one `<domain-name>` (RFC 1035 §3.3), which is one field.
-/// Reading the joined text instead folded a stray field into the name as a
-/// label with a space in it (`TODO.md` #147).
+/// Reading the joined text instead folds a stray field into the name as a label
+/// with a space in it.
 fn one_name(
     record_type: &str,
     fields: &[Cow<'_, str>],
@@ -127,13 +127,10 @@ fn one_name(
 /// `parse_into`, which
 /// mutates parser state.
 ///
-/// Two views of one list: `rdata` is the fields joined by a space, which is what
-/// every type but TXT wants, and `fields` is them separate — a TXT RR is a
-/// sequence of character-strings and a field boundary is where each ends
-/// (RFC 1035 §3.3.14). It was three until `TODO.md` #72a: `fields` and
-/// `text_fields` were `tokens.iter().map(Cow::as_ref)` and `tokens`, the same
-/// strings in two types, under a comment saying one kept its quotes. Neither
-/// does — `tokenize` consumes them.
+/// Two views of one list: `rdata` is the fields joined by a space, which is
+/// what every type but TXT wants, and `fields` is them separate — a TXT RR is a
+/// sequence of character-strings and a field boundary is where each ends (RFC
+/// 1035 §3.3.14). Neither keeps its quotes — `tokenize` consumes them.
 pub(super) fn rdata_from_fields(
     record_type: &str,
     rdata: Cow<'_, str>,
@@ -451,9 +448,9 @@ pub(super) fn rdata_from_fields(
                     ZoneError::syntax(ln, format!("invalid NSEC3 salt {:?}: {e}", salt_str))
                 })?
             };
-            // `denial_wire`'s decoder, not a second one: the copy that used to
-            // live here folded case with `str::to_uppercase`, which is the
-            // Unicode fold RFC 4343 forbids (`TODO.md` #26b).
+            // `denial_wire`'s decoder, not a second one (`CLAUDE.md` §7): a
+            // copy folding case with `str::to_uppercase` uses the Unicode fold
+            // RFC 4343 forbids.
             let next_hashed_owner = base32hex_decode(nsec3_parts[4].as_ref()).map_err(|e| {
                 ZoneError::syntax(
                     ln,

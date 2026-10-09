@@ -448,7 +448,7 @@ mod tests {
     use crate::{Class, OpCode, QueryClass, QuerySection, RecordData};
 
     /// A cache whose clock the test moves: a negative TTL is whole seconds, so
-    /// every other way of reaching expiry is a sleep (`TODO.md` #52).
+    /// every other way of reaching expiry is a sleep.
     fn fixed_cache(max_entries: usize, stale: StalePolicy) -> (NegativeCache, Clock) {
         let clock = Clock::fixed(1_000_000_000);
         (
@@ -572,8 +572,8 @@ mod tests {
     ///
     /// Eleven entries into a cache of ten, all expired and all inside the
     /// window, so the insert that triggers `make_room` has to halve rather than
-    /// sweep. Watched failing against `retain(|_, e| e.live(now))`: **1**
-    /// survived, being the one inserted after the sweep.
+    /// sweep. Fails with `retain(|_, e| e.live(now))`: **1** survives, being
+    /// the one inserted after the sweep.
     #[test]
     fn eviction_keeps_what_is_still_inside_the_stale_window() {
         let (cache, clock) = fixed_cache(10, StalePolicy::seconds(3600));
@@ -1062,10 +1062,10 @@ mod tests {
     /// on the bound. A ratio and not a floor (`CLAUDE.md` §10) — both halves run
     /// on the machine running the test.
     ///
-    /// Watched failing against the `min_by_key`-per-victim eviction this
-    /// replaced: 66x in a debug build (47 ms against 3.11 s for 10 000 inserts),
-    /// and 14.6 µs per insert against 0.99 in a release one at this bound, which
-    /// is `rdnsr`'s default `--cache-size`.
+    /// Fails with a `min_by_key`-per-victim eviction: 66x in a debug build (47
+    /// ms against 3.11 s for 10 000 inserts), and 14.6 µs per insert against
+    /// 0.99 in a release one at this bound, which is `rdnsr`'s default
+    /// `--cache-size`.
     #[test]
     fn inserting_into_a_full_cache_costs_what_inserting_with_room_does() {
         use std::time::Instant;
@@ -1105,9 +1105,8 @@ mod tests {
         );
     }
 
-    /// An expiry is `now` plus a TTL, saturating (`TODO.md` #154): a clock
-    /// near the end of `u64` keeps the entry until the end of time rather than
-    /// overflowing.
+    /// An expiry is `now` plus a TTL, saturating: a clock near the end of `u64`
+    /// keeps the entry until the end of time rather than overflowing.
     #[test]
     fn an_entry_cached_at_the_end_of_time_is_kept() {
         let clock = Clock::fixed(u64::MAX - 10);

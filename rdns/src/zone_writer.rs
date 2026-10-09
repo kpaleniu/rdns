@@ -47,10 +47,8 @@ pub fn zone_to_string(zone: &Zone) -> Result<String, ZoneError> {
     // (`Zone::remove_record`), which is a different file for the same records
     // and not a reason to sort a million of them.
     //
-    // Through `Zone::is_apex_soa` rather than comparing `record.name`, which is
-    // the same question five other places ask (`TODO.md` #33f). A `Name` is
-    // absolute and compares case-insensitively, so the two now agree — which is
-    // the point of asking one of them.
+    // Through `Zone::is_apex_soa` rather than comparing `record.name`: one
+    // answer to a question several places ask (`CLAUDE.md` §7).
     for record in zone.records().iter().filter(|r| zone.is_apex_soa(*r)) {
         record_into(&mut out, record)?;
     }
@@ -77,10 +75,9 @@ pub fn write_zone_file(zone: &Zone, path: &Path) -> Result<(), ZoneError> {
 /// serializing a million-record zone twice to get it is 249 ms
 /// (`rdns/tests/record_storage.rs`).
 ///
-/// It hands back a [`Written`] rather than `()` because the next reader's
-/// whole test is that those bytes are the bytes on disk, and that used to be a
-/// sentence in `offer`'s doc asking its caller to write first and pass the
-/// same slice (#104).
+/// It hands back a [`Written`] rather than `()` because the next reader's whole
+/// test is that those bytes are the bytes on disk, and a type says that where a
+/// doc comment can only ask (`TODO.md` #104).
 pub fn write_zone_text(text: &str, path: &Path) -> Result<Written, ZoneError> {
     crate::persist::write_atomically_str(path, text).map_err(|source| ZoneError::Io {
         path: path.display().to_string(),
@@ -96,9 +93,8 @@ pub fn write_zone_text(text: &str, path: &Path) -> Result<Written, ZoneError> {
 /// zone to something holding a digest cache.
 ///
 /// Only this module makes one, so holding it is the evidence that the write
-/// happened and that these are the bytes it wrote — where the rule used to be
-/// prose in `rdns::rpz::PolicyStore::offer` with nothing making it true
-/// (`TODO.md` #104, `CLAUDE.md` §17).
+/// happened and that these are the bytes it wrote (`TODO.md` #104, `CLAUDE.md`
+/// §17).
 ///
 /// `digest` is `None` for text that `$INCLUDE`s another file, which a
 /// serialized zone never does and a caller must not have to know: see
@@ -270,15 +266,8 @@ mod tests {
         );
     }
 
-    /// A TXT record is arbitrary octets, and every one of them now has a
-    /// spelling: RFC 1035 §5.1's `\DDD`.
-    ///
-    /// ~~"this format has no decimal escape, so the generic form carries
-    /// it"~~ — true until `codecs::char_string_decode` was written for
-    /// RFC 9460's SvcParamValues, which needed the same escape. This test
-    /// asserted the limitation, so it had to change when the limitation went
-    /// (`CLAUDE.md` §1). What it asserts now is the round trip, which is what
-    /// it was for.
+    /// A TXT record is arbitrary octets, and every one of them has a spelling:
+    /// RFC 1035 §5.1's `\DDD`, which `codecs::char_string_decode` reads.
     #[test]
     fn test_binary_txt_round_trips_through_decimal_escapes() {
         let mut zone = Zone::new(nm("example.com."));
@@ -468,9 +457,9 @@ mod tests {
         );
     }
 
-    /// An owner name carrying an octet the syntax reserves. It used to stop the
-    /// write, because presentation storage had no spelling for it; RFC 1035 §5.1
-    /// escapes do, and the file reads back as the same zone (`TODO.md` D-1).
+    /// An owner name carrying an octet the syntax reserves. RFC 1035 §5.1
+    /// escapes spell it, and the file reads back as the same zone (`TODO.md`
+    /// D-1).
     #[test]
     fn an_owner_name_needing_escapes_round_trips() {
         for label in [b"has space".as_slice(), b"a.b", b"semi;colon", b"quo\"te"] {
@@ -498,8 +487,8 @@ mod tests {
         }
     }
 
-    /// The same for a name inside RDATA, which used to fall back to the generic
-    /// `\\#` form. It is spelled out now, and still means the same octets.
+    /// The same for a name inside RDATA: spelled out rather than in the generic
+    /// `\\#` form, and still meaning the same octets.
     #[test]
     fn an_rdata_name_needing_escapes_round_trips() {
         let target = Name::prefixed(b"has space", nm("example.com.").as_ref()).expect("a name");

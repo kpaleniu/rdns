@@ -15,28 +15,27 @@
 // on two private assemblers. It does not answer #38's question; that sweep has
 // to be re-run by hand.
 #![warn(unreachable_pub)]
-// `TODO.md` #143: `push_str(&format!(..))` allocates a `String` to copy it;
-// `write!` into the target does not. Off by default (restriction group).
+// `push_str(&format!(..))` allocates a `String` to copy it; `write!` into the
+// target does not. Off by default (restriction group).
 #![warn(clippy::format_push_string)]
 
 pub use rdns_core::*;
 
 /// Allocator calls tallied per thread, so a unit test here can count what one
-/// call costs — the resolver's fixtures are private to this crate's tests
-/// (`TODO.md` #151). `rdnsr`'s reason holds: `System`, a pass-through plus one
-/// thread-local increment for every other test in this binary.
+/// call costs — the resolver's fixtures are private to this crate's tests.
+/// `rdnsr`'s reason holds: `System`, a pass-through plus one thread-local
+/// increment for every other test in this binary.
 #[cfg(test)]
 #[global_allocator]
 static ALLOC: testutil::Counting<std::alloc::System> = testutil::Counting(std::alloc::System);
 
-// The presentation format is its own crate since `TODO.md` #66a, so that a
-// client can render a record without linking a server. Re-exported under the
-// paths it had, because 11 modules here name them and none of them cares which
-// crate the encodings live in.
+// The presentation format is its own crate, so that a client can render a
+// record without linking a server. Re-exported here, because 11 modules name
+// them and none of them cares which crate the encodings live in.
 pub use rdns_present::record_text;
-// `persist` is `rdns-core`'s since `TODO.md` #66c: writing a file a reader
-// cannot catch half-written, and refusing to read a secret anyone can, are
-// things a *client* needs too. Re-exported under the path it had.
+// `persist` is `rdns-core`'s (`TODO.md` #66c): writing a file a reader cannot
+// catch half-written, and refusing to read a secret anyone can, are things a
+// *client* needs too. Re-exported here.
 pub use rdns_core::persist;
 pub use rdns_present::{denial_wire, svcb};
 pub use rdns_tsig as tsig;

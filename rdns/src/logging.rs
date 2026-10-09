@@ -6,8 +6,8 @@
 //! ([`Anomaly`], [`watch_anomalies`]).
 //!
 //! Where those lines *go* is not here. Choosing a subscriber is a decision
-//! about the process, so it moved to `rdns_transport::logging` with the crate
-//! whose only consumers are the two daemons (`TODO.md` #85).
+//! about the process, so it is in `rdns_transport::logging`, the crate whose
+//! only consumers are the two daemons.
 //!
 //! Not [`crate::metrics`], which is the same traffic counted for a *scrape*. The
 //! two are not a duplicate: a scrape is pulled on somebody else's schedule and
@@ -18,10 +18,10 @@
 //! The per-source maps are keyed on an address the sender chose, so both are
 //! bounded (`MAX_TRACKED_SOURCES`) and the shortfall is itself a counter —
 //! `untracked_sources`, because a bound that lies by omission is worse than a
-//! bound that says so (`CLAUDE.md` §5). The key is a [`Source`], not the
-//! peer: keyed on the exact address, a host rotating within its /64 was a
-//! thousand light sources and never the heavy hitter the warning is for
-//! (`TODO.md` #157).
+//! bound that says so (`CLAUDE.md` §5). The key is a [`Source`], not the peer:
+//! keyed on the exact address, a host rotating within its /64 is a thousand
+//! light sources and never the heavy hitter the warning is for (`TODO.md`
+//! #157).
 
 use crate::clock::current_unix_timestamp;
 use crate::peer::{Peer, Source};
@@ -83,9 +83,8 @@ impl QueryStats {
 /// about the error rate" is an ordinary thing to want, and a threshold nobody
 /// can turn off gets silenced by turning the whole check off instead.
 ///
-/// The defaults are what the check warned on when it was hardcoded and
-/// uncalled: 50 q/s, a tenth of queries failing, a hundred queries from one
-/// source, five refusals of one source (`TODO.md` #30m).
+/// The defaults: 50 q/s, a tenth of queries failing, a hundred queries from one
+/// source, five refusals of one source.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AnomalyThresholds {
     /// Queries per second, averaged over the interval.
@@ -182,12 +181,11 @@ pub fn anomalies(stats: &QueryStats, limits: &AnomalyThresholds) -> Vec<Anomaly>
 
 /// Warn every `interval` until told to stop.
 ///
-/// The caller that owns the counters never reads them, which is how this
-/// facility spent a year write-only (`TODO.md` #30m). No [`crate::shutdown::Busy`]
-/// claim: the
-/// task sleeps almost all of the time, and holding the drain open across a
-/// sleep waits out the shutdown budget every time (`CLAUDE.md` §9). The work
-/// between sleeps is a lock and a walk of two bounded maps.
+/// The caller that owns the counters never reads them, so without this they are
+/// write-only. No [`crate::shutdown::Busy`] claim: the task sleeps almost all
+/// of the time, and holding the drain open across a sleep waits out the
+/// shutdown budget every time (`CLAUDE.md` §9). The work between sleeps is a
+/// lock and a walk of two bounded maps.
 ///
 /// `interval` of zero is the caller's off switch and this returns at once, so
 /// the flag that disables the check does not also have to skip the spawn.
@@ -510,11 +508,11 @@ mod tests {
         assert!(stats.queries_by_source.is_empty());
     }
 
-    /// The per-IP counters are keyed on a forgeable address and nothing used to
-    /// remove an entry: `reset_stats` exists and is called from nothing but the
-    /// test above. One spoofed datagram per address bought a permanent `HashMap`
-    /// slot, so with IPv6 sources the *monitoring* was the memory-exhaustion
-    /// vector — and `check_anomalies` then walked the whole thing.
+    /// The per-IP counters are keyed on a forgeable address, and `reset_stats`
+    /// is called from nothing but the test above. Unbounded, one spoofed
+    /// datagram per address buys a permanent `HashMap` slot, so with IPv6
+    /// sources the *monitoring* is the memory-exhaustion vector — and
+    /// `check_anomalies` then walks the whole thing.
     #[test]
     fn a_flood_of_source_addresses_does_not_grow_the_counters_without_bound() {
         let logger = QueryLogger::new();
@@ -603,18 +601,18 @@ mod tests {
         assert!(map.values().all(|&count| count >= 1));
     }
 
-    /// The regression test for the quadratic. `log_query` used to push one
-    /// timestamp per query into a `Vec` and `retain` the whole thing on every
-    /// call, so the cost of logging a query grew with the traffic already logged
-    /// — 469 ns at 1k deep, 19,419 ns at 100k. That is a server-wide ~23k qps
-    /// ceiling that no profile of the answer path would ever point at.
+    /// The regression test for the quadratic. A `log_query` that pushes one
+    /// timestamp per query into a `Vec` and `retain`s the whole thing on every
+    /// call costs more the more traffic is already logged — 469 ns at 1k deep,
+    /// 19,419 ns at 100k. That is a server-wide ~23k qps ceiling that no
+    /// profile of the answer path would ever point at.
     ///
     /// Asserted as a *ratio* rather than a floor, deliberately: a wall-clock
     /// floor is what `bench_logger_throughput` had, and lowering it is how this
-    /// very regression got ratified (`CLAUDE.md` §10). A ratio does not care how
-    /// fast the machine is or what else is running on it — only whether the
-    /// second batch costs more than the first because of what came before.
-    /// Measured against the old code: ~20×. Against this one: ~1×.
+    /// very regression got ratified (`CLAUDE.md` §10). A ratio does not care
+    /// how fast the machine is or what else is running on it — only whether the
+    /// second batch costs more than the first because of what came before. ~20×
+    /// against the quadratic, ~1× here.
     #[test]
     fn logging_a_query_costs_the_same_however_many_came_before() {
         use std::time::Instant;
@@ -688,9 +686,8 @@ mod tests {
     /// The counts a warning is judged on are per interval, and taking them
     /// empties them.
     ///
-    /// Cumulative counts are why this check could not simply be called on a
-    /// timer as it stood: one busy minute would have warned about that client
-    /// every minute afterwards, however quiet it went (`TODO.md` #30m).
+    /// Cumulative, one busy minute would warn about that client every minute
+    /// afterwards, however quiet it went.
     #[test]
     fn each_interval_is_judged_on_its_own_traffic() {
         let logger = QueryLogger::new();

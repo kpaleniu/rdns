@@ -1,9 +1,9 @@
 //! One query to one server, and the only place the resolver touches a socket.
 //!
-//! What to send and what to accept stay in the resolver: reply matching
-//! (RFC 5452 §9.1), 0x20, the TC→TCP retry (RFC 1035 §4.2.1). An [`Upstream`]
+//! What to send and what to accept stay in the resolver: reply matching (RFC
+//! 5452 §9.1), 0x20, the TC→TCP retry (RFC 1035 §4.2.1). An [`Upstream`]
 //! carries bytes and reports silence, so a test that swaps it still runs all of
-//! that (`TODO.md` #136).
+//! that.
 
 use super::*;
 use std::future::Future;
@@ -11,13 +11,12 @@ use std::pin::Pin;
 
 /// What one upstream answer is read into, whatever this resolver advertised.
 ///
-/// Not [`ResolverConfig::udp_payload_size`], which is what we told the server we
-/// could reassemble: the two were one number until `TODO.md` #41c, so lowering
-/// the advertisement to DNS Flag Day's 1232 would also have narrowed the
-/// doorway a server that ignores the advertisement has to fit through — and a
-/// datagram larger than the buffer is not truncated into a parse error, it is
-/// lost, since the receive itself fails on Windows (WSAEMSGSIZE) and silently
-/// drops the tail elsewhere.
+/// Not [`ResolverConfig::udp_payload_size`], which is what we told the server
+/// we could reassemble: were they one number, lowering the advertisement to DNS
+/// Flag Day's 1232 would also narrow the doorway a server that ignores the
+/// advertisement has to fit through — and a datagram larger than the buffer is
+/// not truncated into a parse error, it is lost, since the receive itself fails
+/// on Windows (WSAEMSGSIZE) and silently drops the tail elsewhere.
 ///
 /// Why not 65,535, which is Unbound's `msg-buffer-size` ("Default is 65552
 /// bytes, enough for 64 Kb packets, the maximum DNS message size") and the size
@@ -25,10 +24,10 @@ use std::pin::Pin;
 /// `rdnsr`'s `--max-inflight-udp` allows 1024 of those. At 64 KiB that ceiling
 /// costs 64 MB rather than the ~1.5 MB its own documentation claims — the
 /// multiplier is the point (`CLAUDE.md` §5), and Unbound reuses one buffer per
-/// thread where this allocates per query. 4,096 is what the coupled number was
-/// before #41 lowered the advertisement, so nothing this resolver could read
-/// yesterday is unreadable today; it is three times the advertisement, which is
-/// the slack a non-conforming server gets.
+/// thread where this allocates per query. 4,096 is the advertisement before
+/// `TODO.md` #41 lowered it, so no answer a server sized for that is lost; it
+/// is three times the advertisement, which is the slack a non-conforming server
+/// gets.
 const UPSTREAM_RECEIVE_BUFFER: usize = 4096;
 
 /// Which transport one exchange goes over.
@@ -45,7 +44,7 @@ pub enum Transport {
 /// query's wire bytes in; the reply's bytes out, or `None` for silence.
 ///
 /// A future so that an answer can take time — a sleep under a paused tokio
-/// clock is how a test makes one server slower than another (`TODO.md` #137).
+/// clock is how a test makes one server slower than another.
 pub type Answering = dyn Fn(SocketAddr, Transport, &[u8]) -> Reply + Send + Sync;
 
 /// What an [`Answering`] upstream hands back.

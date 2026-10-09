@@ -76,9 +76,9 @@ pub struct PlannedDelta {
 impl PlannedDelta {
     /// Which zone this step belongs to.
     ///
-    /// [`NameKeyBuf`] and not the folded octets it was until `TODO.md` #40d: the
-    /// one caller wanted the name back, and re-deriving it from a slice is a
-    /// fallible call whose `Err` it handled by ignoring the step.
+    /// [`NameKeyBuf`] and not folded octets: the one caller wants the name
+    /// back, and re-deriving it from a slice is a fallible call whose `Err`
+    /// would have to be handled by ignoring the step.
     pub fn zone(&self) -> NameRef<'_> {
         self.zone.as_name()
     }
@@ -437,13 +437,13 @@ impl Patch {
     /// **A copy and then an edit, not a rebuild** (`TODO.md` #71a). Nothing
     /// here walks a record the difference sequence did not name: the copy is a
     /// memcpy of two vectors and an allocation per record, where a rebuild
-    /// re-hashed every name of the base and walked its ancestors. 386.9 ms
+    /// re-hashes every name of the base and walks its ancestors. 386.9 ms
     /// against 146.3 for a forty-record change at a million records, of which
     /// 139.3 is the copy — so what is left to take is
     /// [`crate::zone::ZoneRecord`]'s two allocations (#71e) and not this.
     ///
-    /// The record *order* is no longer the base's, because a removal fills its
-    /// hole from the end; `Zone::remove_record` says why nothing reads one.
+    /// The record *order* is not the base's, because a removal fills its hole
+    /// from the end; `Zone::remove_record` says why nothing reads one.
     pub fn apply(mut self, base: &Zone, new_soa: &ResourceRecord) -> (Zone, usize) {
         let mut zone = base.clone();
         let mut removed = self.cancelled;
@@ -725,8 +725,7 @@ mod tests {
     /// Fails against a patch that stages every deletion against the base: the
     /// third step deletes a record the second step added, which no record of
     /// the base answers for, so `ftp` would survive and the deletion would be
-    /// reported missing. It is also what stops the one-pass rewrite being a
-    /// claim — the reference here is the old behaviour, applied step by step.
+    /// reported missing. The reference here is the steps applied one by one.
     #[test]
     fn test_a_chain_applies_as_if_each_step_had_been_applied_in_turn() {
         let base = zone_at(1, "www IN A 192.0.2.1\nmail IN A 192.0.2.2\n");

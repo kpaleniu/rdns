@@ -2,11 +2,9 @@
 //! same ones.
 //!
 //! Nothing cryptographic lives here — keys, signatures and the NSEC3 fixtures,
-//! which hash a name, are [`crate::dnssec_test_util`]. The sentence was not
-//! true until `TODO.md` #67f moved the last three out: `nsec3` called
-//! `nsec3_hash_name` fifty lines below it. What a fixture is *for* stays with the test;
-//! what a record *is* belongs in one place, because a second copy is where the
-//! next bug goes (`CLAUDE.md` §7).
+//! which hash a name, are [`crate::dnssec_test_util`]. What a fixture is *for*
+//! stays with the test; what a record *is* belongs in one place, because a
+//! second copy is where the next bug goes (`CLAUDE.md` §7).
 
 use crate::denial_wire::build_type_bitmap;
 use crate::zone::{parse_zone_file, Zone};

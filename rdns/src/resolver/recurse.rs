@@ -141,8 +141,7 @@ impl Resolver {
         let mut response = last
             .ok_or_else(|| ResolveError::no_response(format!("no response for {}", query.qname)))?;
         // The whole chain, not just the last step's answers. The question and
-        // the AA bit are `resolve_validated`'s, which does them for both modes
-        // (`TODO.md` #78b).
+        // the AA bit are `resolve_validated`'s, which does them for both modes.
         response.answers = answers;
         Ok(response)
     }
@@ -181,8 +180,8 @@ impl Resolver {
             .as_ref()
             .is_some_and(|route| route.name.as_ref().is_root() && route.kind == RouteKind::Stub);
         if let Some(route) = &route {
-            // The policy is asked about the route's servers at entry, as it
-            // is for a walk started from a cached delegation (#56).
+            // The policy is asked about the route's servers at entry, as it is
+            // for a walk started from a cached delegation.
             state.allows(&[], &route.servers)?;
             if matches!(route.kind, RouteKind::Forward) {
                 let out = self.build_query(query, true)?;
@@ -219,7 +218,7 @@ impl Resolver {
             // The referral that named these servers is the one being skipped,
             // so the policy is asked here instead — otherwise a nameserver rule
             // holds for the client that walked the delegation and for nobody
-            // after (`TODO.md` #56).
+            // after.
             state.allows(&start.ns_names, &start.servers)?;
             if let Some(keys) = keys {
                 state.record_trusted_start(start.zone.clone(), keys);
@@ -301,9 +300,9 @@ impl Resolver {
     /// The deepest cached delegation we are willing to start from, and, when
     /// validating, the keys that made it acceptable as read at this moment.
     ///
-    /// Validating, only a zone whose keys are held: a shortcut past a cut
-    /// skips its DS. The keys are handed back rather than asked for again by
-    /// validation, which is where the second read went stale (#151a).
+    /// Validating, only a zone whose keys are held: a shortcut past a cut skips
+    /// its DS. The keys are handed back rather than asked for again by
+    /// validation, because a second read can find them expired.
     fn best_start(&self, qname: NameRef<'_>) -> Option<(Start, Option<Vec<Dnskey>>)> {
         if self.config.dnssec.is_none() {
             return self
@@ -508,7 +507,7 @@ impl Resolver {
                 return None;
             }
             // tokio's, not std's: the same clock in production, and one a
-            // paused test runtime moves (`TODO.md` #137).
+            // paused test runtime moves.
             let started = tokio::time::Instant::now();
             if let Ok(response) = self.query_server(&server, out, asked).await {
                 self.rtt

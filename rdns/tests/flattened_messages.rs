@@ -1,18 +1,16 @@
-//! A `\` line continuation lost from an operator-facing string literal
-//! (`TODO.md` #60).
+//! A `\` line continuation lost from an operator-facing string literal.
 //!
 //! `"a \` + newline + indentation + `b"` is `"a b"` — Rust eats the newline and
 //! every leading space after it. Join those two source lines without putting
-//! the backslash back and the indentation becomes the message: `rdnsd
-//! --transfer-tls-cert` with no `--transfer-tls-ca` printed fourteen spaces
+//! the backslash back and the indentation becomes the message, fourteen spaces
 //! mid-sentence. Nothing in the toolchain catches it — `cargo fmt` does not
 //! touch string literals (`CLAUDE.md` §12) and clippy has no lint for it — and
 //! these are `bail!` and `serving_error!` strings, which is to say the
 //! sentences an operator reads when something is wrong.
 //!
 //! A test rather than a probe because a count taken once is a count that rots:
-//! every one of the 19 found on 2026-09-14 was introduced by an ordinary edit
-//! to a message, and nothing stops the next one.
+//! an ordinary edit to a message introduces one, and nothing else stops the
+//! next.
 //!
 //! **Two exclusions, and they are what make this quiet enough to be a test.**
 //! A literal written across source lines is using the `\` idiom already, so it
