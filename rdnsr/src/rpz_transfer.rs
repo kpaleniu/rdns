@@ -542,9 +542,8 @@ mod tests {
             "a feed that changed has to be re-read before it is in force"
         );
 
-        // And the reload it asked for installs the zone this task already had,
-        // rather than parsing the file it just wrote (`TODO.md` #71f). Fails
-        // against the version that only wrote the file: `reread` would be 1.
+        // The reload installs the zone the task holds rather than parsing the
+        // file; `reread` would be 1.
         let reloaded = store.reload().expect("the reload runs");
         assert_eq!(
             (reloaded.reread, reloaded.installed),
@@ -580,12 +579,9 @@ mod tests {
             .contains("www.malware.example"));
     }
 
-    /// A restart with the master gone still reaches EXPIRE, counted by the SOA
-    /// of the file in force: the only timers there are until a transfer
-    /// succeeds.
-    ///
-    /// Fails against starting from `RefreshTimers::default()`, whose EXPIRE is
-    /// never: the file stays and no reload is asked for.
+    /// A restart with the master gone still reaches EXPIRE, by the SOA of the
+    /// file in force. Fails from `RefreshTimers::default()`, which never
+    /// expires.
     #[tokio::test(start_paused = true)]
     async fn a_restart_with_the_master_gone_still_expires() {
         let dir = ScratchDir::new("rpz-restart-expire");

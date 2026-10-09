@@ -229,17 +229,12 @@ mod tests {
     use super::*;
     use crate::testutil::*;
 
-    /// A source over its query rate is dropped, and the drop is counted. Both
-    /// halves: silence is right, because a reply to a spoofed source is what an
-    /// amplifier sends, which is exactly why the counter has to exist.
-    ///
-    /// Fails without the limiter check: all four datagrams answered,
-    /// `rate_limited` at 0.
+    /// A source over its query rate is dropped silently, and the drop counted.
+    /// Fails without the limiter check: all four answered, `rate_limited` at 0.
     #[tokio::test]
     async fn a_source_over_its_query_rate_is_dropped_and_counted() {
-        // One per second, burst of one, on a clock nothing moves: against
-        // `SystemTime` a second boundary inside the burst hands back a token
-        // and only two of the four are dropped.
+        // One per second, burst of one, on a clock nothing moves, so no second
+        // boundary refills the bucket mid-test.
         let ctx = Arc::new(ServeContext {
             limiter: Arc::new(RateLimiter::new(RateLimitConfig::per_second(1, 1))),
             responses: Arc::new(ResponseLimiter::disabled()),
@@ -301,9 +296,7 @@ mod tests {
         );
         let exempt = Peer::from("127.0.0.1".parse::<std::net::IpAddr>().unwrap());
         let other = Peer::from("192.0.2.1".parse::<std::net::IpAddr>().unwrap());
-        // One instant for the whole test: the bucket refills by whole seconds,
-        // so a clock read per call decides the last assertion on whether two of
-        // them straddled a boundary.
+        // One instant for the whole test: the bucket refills by whole seconds.
         let now = rdns::clock::current_unix_timestamp();
         for _ in 0..10 {
             assert!(
@@ -360,14 +353,10 @@ mod tests {
         Some(DnsMessage::try_from_bytes(&buf[..n]).expect("a well-formed reply"))
     }
 
-    /// An unlisted peer is REFUSED with its question echoed and RFC 8914's
-    /// Prohibited, and the rate limiter never hears of it (`TODO.md` #171):
-    /// three queries against a burst of one are all answered, and
-    /// `rate_limited` stays at zero. A QR=1 datagram gets nothing.
-    ///
-    /// Fails with the ACL check removed from `udp_main`: the first query is
-    /// resolved (SERVFAIL from the unreachable upstream) and the next two are
-    /// rate-limited.
+    /// An unlisted peer is REFUSED with RFC 8914's Prohibited and never reaches
+    /// the rate limiter: three queries against a burst of one are all answered.
+    /// A QR=1 datagram gets nothing. Fails with the ACL check removed from
+    /// `udp_main`: the last two are rate-limited.
     #[tokio::test]
     async fn an_unlisted_peer_is_refused_and_never_rate_limited() {
         let (addr, metrics, shutdown, server) = acl_server("127.0.0.1:0", &["192.0.2.0/24"]).await;
@@ -529,17 +518,11 @@ mod tests {
         buf
     }
 
-    /// The admission check runs on TCP as well, so the 16 KiB ceiling, the
-    /// QDCOUNT cap and the per-section counts do not stop at the UDP loop.
+    /// The admission check runs on TCP as well, not only on the UDP loop.
     ///
-    /// Provoked with the additional-count cap because it is the cheapest of
-    /// those rules to build; the check is one call, so any rule of it firing is
-    /// the whole check running. Both messages are UPDATEs, answered from the
-    /// message alone — no cache, no upstream — so a missing reply is a drop
-    /// rather than a timeout somewhere else, and the second one is what says
-    /// the connection survived the first.
-    ///
-    /// Fails with the check removed: the reply carries 0xBAD1.
+    /// The additional-count cap is the cheapest rule to provoke. UPDATEs are
+    /// answered from the message alone, so silence is a drop, and the second
+    /// reply shows the connection survived. Fails without the check: 0xBAD1.
     #[tokio::test]
     async fn a_tcp_message_over_the_admission_caps_is_dropped_and_the_connection_kept() {
         let serving = context();
@@ -590,17 +573,12 @@ mod tests {
         let _ = server.await;
     }
 
-    /// A datagram arriving with the in-flight ceiling already reached is
-    /// dropped, and dropped *before* it is copied and given a task.
+    /// A datagram arriving with the in-flight ceiling reached is dropped before
+    /// it is copied and given a task.
     ///
-    /// Neither half is a race. Forwarding to an upstream that never answers
-    /// holds the only permit for the whole test, and the black hole *receiving*
-    /// that query is the proof it does. The second datagram is an UPDATE, which
-    /// `handle_query` answers with NOTIMP out of the message alone — no cache,
-    /// no network — so "no reply" means dropped at the door.
-    ///
-    /// Fails with the `try_acquire_owned` removed: the NOTIMP comes straight
-    /// back.
+    /// A black-hole upstream holds the only permit, and its receiving the query
+    /// proves it. The UPDATE would get NOTIMP from the message alone, so
+    /// silence is the drop. Fails without `try_acquire_owned`.
     #[tokio::test]
     async fn a_datagram_over_the_in_flight_ceiling_is_dropped() {
         let black_hole = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
@@ -653,9 +631,8 @@ mod tests {
         );
 
         shutdown.begin();
-        // The worker is parked in `recv_from`, which the stop cancels. The
-        // resolving task is what the drain is for; this test does not wait out
-        // its thirty seconds.
+        // The stop cancels the worker's `recv_from`; the resolution the drain
+        // waits for is not waited out here.
         let _ = server.await;
     }
 }

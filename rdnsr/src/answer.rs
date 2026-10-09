@@ -1127,13 +1127,9 @@ mod tests {
     use crate::prefetch::{Queue, Uses};
     use crate::testutil::*;
 
-    /// AD is two claims at once — this resolver checked the data (RFC 6840
-    /// §5.7) and the client asked to be told (§5.8) — so all four combinations
-    /// are the rule.
-    ///
-    /// Not a regression test: the rule was written out at each of the five
-    /// answer paths before it was `finish`'s, and every one of them computed
-    /// this. What it holds is that there is now one place to get it wrong.
+    /// AD is two claims, that this resolver checked the data (RFC 6840 §5.7)
+    /// and that the client asked (§5.8), so all four combinations are the rule.
+    /// It holds `finish` as the one place the rule is computed.
     #[test]
     fn ad_needs_both_an_authenticated_answer_and_a_client_that_asked() {
         let msg = DnsMessage::try_from_bytes(&message(OpCode::Query, false)).expect("parses");
@@ -1576,10 +1572,8 @@ mod tests {
         }
     }
 
-    /// RFC 8767, the whole point: the authoritative servers cannot be reached —
-    /// the fixture forwards to a port nothing listens on — so the last thing
-    /// known goes out instead of SERVFAIL, with the 30-second TTL §4 asks for
-    /// and RFC 8914 §4.4's code saying what happened.
+    /// RFC 8767: with the servers unreachable, the last thing known goes out
+    /// instead of SERVFAIL, with §4's 30-second TTL and RFC 8914 §4.4's code.
     ///
     /// Fails with `--serve-stale` off: SERVFAIL, no answers.
     #[tokio::test]
@@ -1833,14 +1827,11 @@ mod tests {
     }
 
     /// `--serve-stale-first`: an expired name inside the window is answered at
-    /// once from what was last known, and its refresh goes to the queue —
-    /// BIND's `stale-answer-client-timeout 0` (`TODO.md` #58).
+    /// once, and its refresh queued (`docs/adr/0005`).
     ///
-    /// Against an upstream that never answers, so an answer that waited for the
-    /// resolution misses `asked_at_once`'s two seconds. The EDE says a refresh
-    /// is under way and not that the servers were unreachable: nothing has
-    /// asked them yet. Fails with the early arm removed: the query waits out
-    /// the upstream and `asked_at_once` times out.
+    /// The upstream never answers, so a waiting answer misses `asked_at_once`'s
+    /// two seconds; the EDE says a refresh is under way. Fails with the early
+    /// arm removed: `asked_at_once` times out.
     #[tokio::test]
     async fn an_expired_answer_is_served_first_and_refreshed_behind_it() {
         let (resolver, _upstream) = silent_resolver();
@@ -2301,14 +2292,10 @@ mod tests {
         Outcome::ALL.map(|o| serving.ctx.metrics.outcome_count(o))
     }
 
-    /// Every answer a client gets is counted once by what validation concluded:
-    /// secure resolved and secure again from the cache, unanchored, and
-    /// insecure out of the cache, where it is seeded because the signed fixture
-    /// has no unsigned delegation to prove. A prefetch is counted nowhere: no
-    /// client is getting it.
-    ///
-    /// Fails with the count after the answer tuple removed: the resolved and
-    /// cached answers move nothing.
+    /// Every answer is counted once by what validation concluded: secure
+    /// resolved and from cache, unanchored, and insecure from a seeded cache. A
+    /// prefetch is counted nowhere. Fails with the count after the answer tuple
+    /// removed.
     #[tokio::test]
     async fn each_answer_is_counted_by_what_validation_concluded() {
         // Outside the anchored zone the fixture's NXDOMAIN proof is the wrong
@@ -2800,13 +2787,10 @@ mod tests {
         DnsMessage::try_from_bytes(&bytes).expect("a well-formed reply")
     }
 
-    /// RFC 6147 §5.1.7 end to end: a name with an A and no AAAA answers with an
-    /// address inside the NAT64 prefix, built from RFC 6052 §2.4's own example
-    /// pair — 192.0.2.33 under 64:ff9b::/96.
-    ///
-    /// From the *negative* cache, which is one of the four paths that can
-    /// produce an empty AAAA answer: synthesis that only covers a fresh
-    /// resolution answers the first client and not the second.
+    /// RFC 6147 §5.1.7 end to end, with RFC 6052 §2.4's example pair:
+    /// 192.0.2.33 under 64:ff9b::/96. From the negative cache, one of four
+    /// paths to an empty AAAA answer: synthesis on fresh resolutions only fails
+    /// the second client.
     #[tokio::test]
     async fn a_name_with_no_aaaa_is_answered_from_its_a() {
         let serving = with_dns64();
@@ -3125,17 +3109,11 @@ mod tests {
         );
     }
 
-    /// The measurement `TODO.md` #58 was blocked on, kept as the one that says
-    /// whether `--serve-stale-first` pays. A resolution slower than RFC 8767
-    /// §5's client response timer that then *answers* is a client that waited
-    /// for what the stale window already held; one that takes just as long and
-    /// fails serves stale anyway, so summing the two would credit the switch
-    /// with work the query resolution timer already does (`CLAUDE.md` §19).
-    ///
-    /// Slow for real, and 1.9 s of it. `LatencyTimer` is `std::time::Instant`,
-    /// which neither this crate's test clock nor tokio's paused timer moves —
-    /// a threshold measured against a clock a test can wind is a threshold the
-    /// test is not measuring.
+    /// Whether `--serve-stale-first` pays: a resolution slower than RFC 8767
+    /// §5's client response timer that then answers is a client that waited for
+    /// what the stale window held; one that fails is excluded (`CLAUDE.md`
+    /// §19). Slow for real, 1.9 s: `LatencyTimer` is `Instant`, which no test
+    /// clock moves.
     #[tokio::test]
     async fn a_slow_resolution_that_answers_counts_as_completed() {
         let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0")
@@ -3754,14 +3732,10 @@ mod tests {
     }
 
     /// The client's EDNS advertisement is a ceiling this resolver may lower,
-    /// not one it has to honour.
+    /// not one it has to honour: 65,535 would fragment a large RRset.
     ///
-    /// A stub advertising 65,535 given 65,535 gets a large cached RRset as
-    /// fragments — which is what every other resolver's `max-udp-size` exists
-    /// to prevent. Answered out of the cache so no upstream is involved; the
-    /// ceiling is `finish`'s and every answer path goes through it.
-    ///
-    /// Fails with `msg.udp_payload_size()`: 2,093 octets, TC clear.
+    /// Answered from the cache; the ceiling is `finish`'s. Fails with
+    /// `msg.udp_payload_size()`: 2,093 octets, TC clear.
     #[tokio::test]
     async fn a_udp_reply_is_capped_by_this_resolver_and_not_only_by_the_client() {
         let serving = context();
@@ -3815,14 +3789,10 @@ mod tests {
         );
     }
 
-    /// CD comes back as the client set it: RFC 4035 §3.2.2, "The name server
-    /// side MUST copy the setting of the CD bit from a query to the
-    /// corresponding response".
+    /// CD comes back as the client set it (RFC 4035 §3.2.2). `localhost` runs
+    /// the ordinary path from the table, with no upstream (RFC 6761 §6.3).
     ///
-    /// `localhost` because `special_names` answers it from the table
-    /// (RFC 6761 §6.3), so the ordinary answer path runs with no upstream.
-    ///
-    /// Fails with a builder that clears CD: CD comes back clear.
+    /// Fails with a builder that clears CD.
     #[tokio::test]
     async fn the_checking_disabled_bit_is_the_clients() {
         let serving = context();
@@ -3867,14 +3837,10 @@ mod tests {
         );
     }
 
-    /// No question at all is answered, not dropped (`TODO.md` #78c).
-    ///
-    /// RFC 9619 §4 does not settle it — its QDCOUNT = 0 sentence is addressed
-    /// to firewalls, not responders — so the peers were asked. All four answer
-    /// and none drops; three of them, and the fourth without an OPT, answer
-    /// FORMERR, which is also what RFC 7873 §5.4 says a server without DNS
-    /// Cookies "will normally send" to the cookie probe that is the reason such
-    /// a query exists.
+    /// No question at all is answered, not dropped, as all four peers do. RFC
+    /// 7873 §5.4 expects FORMERR from a server without cookies; RFC 9619 §4's
+    /// QDCOUNT = 0 sentence binds firewalls only. Fails if `handle_query`
+    /// returns `None`.
     ///
     /// | | no OPT | OPT, no COOKIE | OPT + COOKIE |
     /// |---|---|---|---|
@@ -3882,8 +3848,6 @@ mod tests {
     /// | Knot 3.6.0 | FORMERR | FORMERR | FORMERR |
     /// | NSD 4.12.0 | FORMERR | NOERROR | NOERROR |
     /// | Unbound 1.23.1 | FORMERR | FORMERR | FORMERR + cookie |
-    ///
-    /// Fails if `handle_query` returns `None`.
     #[tokio::test]
     async fn a_query_with_no_question_is_answered_not_dropped() {
         let serving = context();
@@ -3937,12 +3901,9 @@ mod tests {
         );
     }
 
-    /// The resolver fills the counters the periodic warnings read. Fails if
-    /// only `log_rate_limited` is called: `--anomaly-query-rate` and
-    /// `--anomaly-source-queries` watch a number that is always zero.
-    ///
-    /// `localhost` so the answer comes from the table and no upstream is
-    /// involved (RFC 6761 §6.3).
+    /// The resolver fills the counters the periodic warnings read; `localhost`
+    /// answers from the table (RFC 6761 §6.3). Fails if only `log_rate_limited`
+    /// is called: the anomaly thresholds watch a number that is always zero.
     #[tokio::test]
     async fn a_query_is_counted_against_the_source_that_sent_it() {
         let serving = context();

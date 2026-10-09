@@ -209,23 +209,12 @@ mod tests {
         );
     }
 
-    /// A reload on a worker, on the runtime shape that makes it fatal
-    /// (`TODO.md` #57b).
+    /// A reload on a worker, on the runtime shape that makes it fatal: one
+    /// worker, so occupying it is the whole runtime.
     ///
-    /// One worker, so a reload that occupies it is the whole runtime. The probe
-    /// counts completed yields rather than measuring a delay, because a count
-    /// is deterministic where a wall-clock assertion is a coin toss
-    /// (`CLAUDE.md` §10): with `reload_policy(&serving)` called straight from
-    /// the task, the probe cannot advance at all while the parse runs and this
-    /// reads 0. Both halves are `tokio::spawn`ed, which is also how `main` runs
-    /// them: `block_on` drives the test's own future on the calling thread,
-    /// where the worker under test is never the blocked one and the test passes
-    /// against the defect.
-    ///
-    /// **The feed is rewritten before the reload**, or there is nothing to
-    /// measure: a file whose bytes have not moved is not parsed at all, and a
-    /// 100k feed that is merely re-read is ~2 ms — which a blocking shape would
-    /// pass. The rewrite puts the parse back.
+    /// Counts completed yields, not a delay (`CLAUDE.md` §10); both halves are
+    /// spawned as in `main`, since `block_on` would hide the defect. The feed
+    /// is rewritten first: an unchanged file is not parsed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn a_reload_does_not_stop_the_only_worker() {
         let dir = ScratchDir::new("reload-blocking");

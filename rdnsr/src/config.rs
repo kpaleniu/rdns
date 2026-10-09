@@ -695,21 +695,13 @@ tls-key = "./key.pem"
     /// Every flag `--config` conflicts with has a key in this file, and the two
     /// spellings match.
     ///
-    /// This is what ties the two declarations together: a key and a flag that
-    /// mean one setting, written in two places with nothing comparing them, is
-    /// how a key comes to be parsed into a field nothing reads. clap knows
-    /// which flags conflict with `--config` — that set *is* "what the file must
-    /// be able to say" — so the check is mechanical rather than a list somebody
-    /// maintains.
-    ///
-    /// A type error counts as found: what is being asserted is that the key
-    /// exists under one of the three tables, not that this value fits it.
+    /// clap's conflict set is what the file must be able to say, so the check
+    /// is mechanical. A type error counts as found: the key exists.
     #[test]
     fn every_flag_the_file_replaces_has_a_key_in_it() {
         let command = Cli::command();
-        // Asked of each flag, not of `--config`: the conflict is declared on
-        // the flags, and `get_arg_conflicts_with` reports what the argument
-        // handed to it declares, so asking `--config` returns nothing at all.
+        // Asked of each flag: `get_arg_conflicts_with` reports what the
+        // argument declares, and `--config` declares nothing.
         let replaced: Vec<_> = command
             .get_arguments()
             .filter(|arg| {
@@ -724,10 +716,8 @@ tls-key = "./key.pem"
             "the file replaces {} flags, which is too few to be the whole set",
             replaced.len(),
         );
-        // The flags the file spells differently: three because the table name
-        // carries half of it, and `--no-empty-zones` because a file says
-        // `empty-zones = false`. Written down rather than inferred: a rename is
-        // a decision, and one that is not declared here is a typo.
+        // Spelled differently, declared rather than inferred so a typo is not a
+        // rename: three by their table, and `empty-zones = false`.
         let renamed = |long: &str| match long {
             "rpz" => Some("feeds"),
             "no-empty-zones" => Some("empty-zones"),
@@ -968,11 +958,9 @@ policy = \"given\"
         assert_eq!(cli.dns64.as_deref(), Some("2001:db8::/96"));
     }
 
-    /// #57d shape A: a feed names a master *and* the file it is written to,
-    /// because the file is both where the transfer lands and what a restart
-    /// begins from.
-    ///
-    /// Fails against shape B, where a transferred feed has no file at all.
+    /// A feed names a master and the file it is written to: where the transfer
+    /// lands and what a restart begins from. Fails if a transferred feed has no
+    /// file.
     #[test]
     fn a_transferred_feed_names_a_master_beside_its_file() {
         let mut cli = Cli::parse_from(["rdnsr"]);
@@ -1005,13 +993,9 @@ file = \"written-by-cron.zone\"
         assert!(cli.rpz_masters.is_empty());
     }
 
-    /// A master that does not parse is a startup error with the text in it, not
-    /// a feed that silently never refreshes.
-    /// #57d's remedy: which way a stale feed fails is the operator's, per feed.
-    ///
-    /// Fails against a global setting and against a default read off the rules,
-    /// both of which the row shows wrong — an `rpz-passthru` feed is an
-    /// allowlist and wants the opposite answer from a blocklist.
+    /// A master that does not parse is a startup error with the text in it. How
+    /// a stale feed fails is the operator's, per feed: an `rpz-passthru` feed
+    /// is an allowlist and wants the opposite of a blocklist.
     #[test]
     fn a_feed_says_what_its_expiry_means_and_defaults_to_enforce() {
         let mut cli = Cli::parse_from(["rdnsr"]);
