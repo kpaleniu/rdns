@@ -1,8 +1,8 @@
 //! Extended DNS Errors (RFC 8914): the reason beside the RCODE.
 //!
 //! A bare SERVFAIL says a lookup failed and nothing about why. The same
-//! SERVFAIL carrying INFO-CODE 7 says the zone's signatures have expired,
-//! which is a fixed problem rather than a support ticket (`TODO.md` #44b).
+//! SERVFAIL carrying INFO-CODE 7 says the zone's signatures have expired, which
+//! is a fixed problem rather than a support ticket.
 //!
 //! The option rides in the OPT record, so it reaches only a client that sent
 //! one — RFC 8914 §2 puts it in "any response (SERVFAIL, NXDOMAIN, REFUSED,
@@ -14,14 +14,11 @@
 //! `an_extended_error_with_no_opt_reaches_no_wire`, which fails if the guard
 //! is loosened to synthesize an OPT.
 //!
-//! ~~[`ClientEdns::mirror`](crate::response::ClientEdns::mirror) is the only
-//! way to a reply's OPT and hands back `None` without one, so an EDE with no
-//! OPT to ride in is not expressible (`CLAUDE.md` §17).~~ **Wrong about the
-//! mechanism, right about the conclusion** (`TODO.md` #79d):
+//! The type does not make an EDE with no OPT unexpressible (`CLAUDE.md` §17):
 //! [`ResponseWriter::set_edns`](crate::response::ResponseWriter::set_edns) is
-//! `pub` and three of `rdnsd`'s answer paths call it without `mirror`. §17's
-//! "not expressible" was never true of the type; what holds is a guard, so
-//! this cites the guard and a test rather than a shape.
+//! `pub` and three of `rdnsd`'s answer paths call it without
+//! [`ClientEdns::mirror`](crate::response::ClientEdns::mirror). What holds is a
+//! guard, so this cites the guard and a test rather than a shape.
 
 use crate::error::WireError;
 use crate::{Edns, EdnsOption};

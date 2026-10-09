@@ -1,10 +1,10 @@
 //! A name as a map key, and a name and a type as one.
 //!
-//! Folded wire octets, not folded text. `TODO.md` #38a: the caches were the last
-//! thing holding a name as presentation text, and text made them pay twice — a
-//! `String` per probe at the call site, because what arrives off the wire is a
-//! [`crate::NameRef`], and an escape-aware `.`-splitter to fold and walk it,
-//! because presentation text can spell a dot two ways and wire octets cannot.
+//! Folded wire octets, not folded text. A cache keyed on presentation text pays
+//! twice: a `String` per probe at the call site, because what arrives off the
+//! wire is a [`crate::NameRef`], and an escape-aware `.`-splitter to fold and
+//! walk it, because presentation text can spell a dot two ways and wire octets
+//! cannot.
 //!
 //! Folding on the way in is the invariant, and the constructors are the only way
 //! in, so an insertion cannot skip it (`CLAUDE.md` §17). It is not
@@ -75,12 +75,12 @@ impl std::fmt::Display for NameKeyBuf {
 /// A cache key of a folded name and a query type, which can be looked up
 /// without building one.
 ///
-/// A `HashMap` reaches its key only through `Borrow`, and `Borrow<([u8], Qtype)>`
-/// cannot exist: a tuple with an unsized field is not a type. The borrowed form
-/// is therefore a trait object over "a name and a type", which both this and a
-/// plain `(&[u8], Qtype)` are. One virtual call per lookup, against the
-/// allocation per lookup that an owned key costs on the resolver's hottest path
-/// (`TODO.md` #25e).
+/// A `HashMap` reaches its key only through `Borrow`, and
+/// `Borrow<([u8], Qtype)>` cannot exist: a tuple with an unsized field is not a
+/// type. The borrowed form is therefore a trait object over "a name and a
+/// type", which both this and a plain `(&[u8], Qtype)` are. One virtual call
+/// per lookup, against the allocation per lookup that an owned key costs on the
+/// resolver's hottest path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NameTypeKey {
     name: NameKeyBuf,

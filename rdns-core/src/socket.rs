@@ -13,8 +13,7 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 /// other half is the id.
 ///
 /// Pure and free of I/O, so `rdnsc`'s blocking socket and the resolver's and
-/// `rdnsd`'s async ones share it; it was written out three times
-/// (`TODO.md` #30p).
+/// `rdnsd`'s async ones share it.
 pub fn bind_addr_for(target: SocketAddr) -> SocketAddr {
     if target.is_ipv6() {
         SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))

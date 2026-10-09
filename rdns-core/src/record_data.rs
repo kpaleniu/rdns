@@ -18,10 +18,10 @@ use crate::{ParsedRecord, Rtype, Serial};
 
 /// A record's data, stored as uncompressed wire-format bytes.
 ///
-/// 24 bytes whatever the type, since the large DNSSEC and SOA payloads no longer
-/// sit inline in every record. Embedded names are expanded on the way in, so the
-/// bytes are self-contained: re-parsing or re-serializing needs no access to the
-/// message they came from.
+/// 24 bytes whatever the type: the large DNSSEC and SOA payloads do not sit
+/// inline in every record. Embedded names are expanded on the way in, so the
+/// bytes are self-contained: re-parsing or re-serializing needs no access to
+/// the message they came from.
 ///
 /// Private fields are the invariant — the bytes decode as their TYPE, and the
 /// three constructors are the only way in. What it does not claim:
@@ -265,12 +265,12 @@ impl PartialEq<RecordDataRef<'_>> for RecordData {
 
 /// What an RRset's elements have in common: each can name its own RDATA.
 ///
-/// The bound the DNSSEC code carries, and it used to be `Borrow<RecordData>` —
-/// which cannot reach a [`RecordDataRef`], since there is no `RecordData` for it
-/// to hand back a reference to. This is the same requirement stated as what the
-/// callers actually do with it: a zone's records are spans into an arena
-/// (`TODO.md` #71e) and an answer's are owned, and canonical form is built from
-/// the TYPE and the octets either way.
+/// The bound the DNSSEC code carries. Not `Borrow<RecordData>`, which cannot
+/// reach a [`RecordDataRef`], since there is no `RecordData` for it to hand
+/// back a reference to. This is the requirement stated as what the callers
+/// actually do with it: a zone's records are spans into an arena (`TODO.md`
+/// #71e) and an answer's are owned, and canonical form is built from the TYPE
+/// and the octets either way.
 pub trait AsRdata {
     fn rdata(&self) -> RecordDataRef<'_>;
 }
@@ -417,7 +417,7 @@ mod tests {
     use crate::record_types as rt;
 
     /// A TYPE that says A, and bytes that are not an address. Cannot be a
-    /// failing-first test: what it guards is a line that no longer compiles.
+    /// failing-first test: what it guards is a line that does not compile.
     #[test]
     fn rdata_that_is_not_its_type_is_refused() {
         assert!(

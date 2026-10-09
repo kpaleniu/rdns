@@ -1,14 +1,14 @@
 //! Which zone apexes a credential may transfer.
 //!
 //! One type because there are two credentials that answer this question — a
-//! TSIG key (RFC 8945) and, since `TODO.md` #59, a client certificate
-//! (RFC 9103 §7.5) — and the answer decides whether a stranger walks away with
-//! a zone. Written twice they would drift over the two things that are easy to
-//! get wrong and impossible to notice: whether the comparison folds case
-//! (RFC 4343, and a key list an operator typed is not down-cased) and whether
-//! a *child* of a listed zone is in scope. It is not: a transfer hands over
-//! everything under an apex, so a rule matching anything less specific
-//! authorizes more than it names (`CLAUDE.md` §16).
+//! TSIG key (RFC 8945) and a client certificate (RFC 9103 §7.5, `TODO.md` #59)
+//! — and the answer decides whether a stranger walks away with a zone. Written
+//! twice they would drift over the two things that are easy to get wrong and
+//! impossible to notice: whether the comparison folds case (RFC 4343, and a key
+//! list an operator typed is not down-cased) and whether a *child* of a listed
+//! zone is in scope. It is not: a transfer hands over everything under an apex,
+//! so a rule matching anything less specific authorizes more than it names
+//! (`CLAUDE.md` §16).
 //!
 //! **Empty means every zone**, which is the wide case and is deliberate. A
 //! version bump must not stop every transfer on a working deployment, so the

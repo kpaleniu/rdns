@@ -26,17 +26,16 @@ pub const EDNS_VERSION: u8 = 0;
 /// [`UdpSizes::advertised`] is what goes in every reply's OPT: what this host
 /// can reassemble on receive (RFC 6891 §6.2.4), which is why it also floors the
 /// request admission cap. [`UdpSizes::max_response`] is the largest datagram
-/// this host will send, which is a different question and the one this codebase
-/// had no answer to: a reply's ceiling was
-/// [`DnsMessage::udp_payload_size`] alone — the client's number, floored at 512
-/// and ceilinged at nothing, so a client advertising 65,535 was honoured and a
-/// large signed answer went out as ~45 IP fragments (`TODO.md` #41b).
+/// this host will send, which is a different question:
+/// [`DnsMessage::udp_payload_size`] alone is the client's number, floored at
+/// 512 and ceilinged at nothing, and a client advertising 65,535 honoured in
+/// full gets a large signed answer as ~45 IP fragments.
 ///
 /// A type rather than two `u16`s at each call site, because the min is what
 /// gets forgotten: [`UdpSizes::reply_ceiling`] is the only way to a UDP reply's
-/// size and it cannot be asked without it (`CLAUDE.md` §17). Both daemons had
-/// written the transport match out separately, which is also how a UDP ceiling
-/// once reached TCP (`TODO.md` #39b).
+/// size and it cannot be asked without it (`CLAUDE.md` §17). One transport
+/// match for both daemons: two copies of it are how a UDP ceiling reaches TCP
+/// (`TODO.md` #39b).
 ///
 /// The split is Unbound's and BIND's, read rather than assumed. Unbound's
 /// `max-udp-size` is "Maximum UDP response size (not applied to TCP response).
@@ -421,11 +420,11 @@ mod tests {
         msg
     }
 
-    /// The rule the call sites kept forgetting: a reply is bounded by both
-    /// numbers, and the client does not get to raise ours.
+    /// A reply is bounded by both numbers, and the client does not get to raise
+    /// ours.
     ///
-    /// The 65,535 row is `TODO.md` #41b itself — honoured in full before, which
-    /// is ~45 IP fragments for an answer that size.
+    /// Fails on the 65,535 row if the client's number is honoured in full: ~45
+    /// IP fragments for an answer that size.
     #[test]
     fn a_udp_reply_is_bounded_by_the_smaller_of_the_two_advertisements() {
         let sizes = UdpSizes::new(1232, 1232);

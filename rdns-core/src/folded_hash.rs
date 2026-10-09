@@ -1,14 +1,13 @@
 //! FNV-1a over ASCII-folded bytes, in one place.
 //!
 //! Two callers with unequal stakes, which is why this is a module and not a
-//! helper in either of them (`TODO.md` #81b, `CLAUDE.md` §7). The name
-//! compressor indexes suffixes with it, where a collision or a drift costs a
-//! compression pointer and a few bytes in one message. `rdns`'s signer spreads
-//! RRSIG expiry with it, where a drift moves *every* signature's expiry in every
-//! zone at once — and RFC-wise the signer needs two servers holding the same
-//! zone to agree about that slope, which they cannot do if the two copies of
-//! this loop ever diverge. They agreed when they were merged; a golden test on
-//! each side says so still.
+//! helper in either of them (`CLAUDE.md` §7). The name compressor indexes
+//! suffixes with it, where a collision or a drift costs a compression pointer
+//! and a few bytes in one message. `rdns`'s signer spreads RRSIG expiry with
+//! it, where a drift moves *every* signature's expiry in every zone at once —
+//! and RFC-wise the signer needs two servers holding the same zone to agree
+//! about that slope, which they cannot do if the two copies of this loop ever
+//! diverge. A golden test on each side pins the output.
 //!
 //! Hand-rolled rather than `DefaultHasher`, which is seeded per process: the
 //! signer's whole requirement is that the number is a function of the input and

@@ -608,7 +608,7 @@ impl ParsedRecord {
                 out.push(*flags);
                 out.extend_from_slice(&iterations.to_be_bytes());
                 // One length octet each (RFC 5155 §3.2), and a zone file's hex
-                // or base32hex can be any length (`TODO.md` #138).
+                // or base32hex can be any length.
                 let length_octet = |what, field: &[u8]| {
                     u8::try_from(field.len()).map_err(|_| WireError::TooLong {
                         what,
@@ -791,9 +791,9 @@ mod tests {
         );
     }
 
-    /// Each has one length octet (RFC 5155 §3.2). Cast rather than checked, 256
-    /// octets wrote a length of 0 and the RDATA read back as a different NSEC3
-    /// (`TODO.md` #138).
+    /// Each has one length octet (RFC 5155 §3.2). Fails if the length is cast
+    /// rather than checked: 256 octets write a length of 0 and the RDATA reads
+    /// back as a different NSEC3.
     #[test]
     fn an_nsec3_field_past_255_octets_is_refused_not_wrapped() {
         let nsec3 = |salt: Vec<u8>, next_hashed_owner: Vec<u8>| ParsedRecord::NSEC3 {

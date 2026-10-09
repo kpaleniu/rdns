@@ -386,7 +386,7 @@ mod tests {
     /// `k` and U+212A KELVIN SIGN are different names (RFC 4343).
     #[test]
     fn the_index_folds_the_same_ascii_the_comparison_does() {
-        // The hash takes wire octets now, so the comparison is over names.
+        // The hash takes wire octets, so the comparison is over names.
         let wire = |text: &str| nm(text).as_ref().as_wire().to_vec();
         assert_eq!(
             folded_hash(wire("Example.COM.")),

@@ -1,17 +1,17 @@
 //! Octets as presentation text, and back: hex, base64 and RFC 1035 §5.1's
 //! character-strings.
 //!
-//! Split out of `utils` (`TODO.md` #38c). The membership rule is the whole of
-//! it: a conversion between bytes and the text a zone file, an anchor file or a
-//! generic-format record writes them as. Nothing here knows what the bytes mean.
+//! The membership rule is the whole of it: a conversion between bytes and the
+//! text a zone file, an anchor file or a generic-format record writes them as.
+//! Nothing here knows what the bytes mean.
 
 use crate::error::{WireError, WireResult};
 
 /// Hex, upper case, as a zone file and an anchor file write a digest or a salt.
 ///
-/// Existed twice as `bytes.iter().map(|b| format!("{b:02X}")).collect()`, which
-/// is **a heap allocation per output byte** — `rdnsctl dump` of a signed zone
-/// runs it over every DS digest and NSEC3 salt (`TODO.md` #26a).
+/// One `String` sized for the output: a `format!` per byte is **a heap
+/// allocation per output byte**, and `rdnsctl dump` of a signed zone runs this
+/// over every DS digest and NSEC3 salt.
 pub fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     hex_encode_into(bytes, &mut out);
@@ -32,9 +32,7 @@ pub fn hex_encode_into(bytes: &[u8], out: &mut String) {
 ///
 /// A DS digest is written across lines in IANA's own root-anchors file and
 /// inside parentheses in a zone file, so "skip whitespace" is the rule at every
-/// call site rather than a kindness. One pass and no intermediate `String`:
-/// there were three of these, one of them inline and so invisible to a grep for
-/// the name (`TODO.md` #26c).
+/// call site rather than a kindness. One pass and no intermediate `String`.
 pub fn hex_decode(text: &str) -> WireResult<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 2);
     let mut high: Option<u8> = None;

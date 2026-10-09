@@ -94,7 +94,7 @@ pub enum AnswerMismatch {
 ///
 /// Core's rather than `rdns`'s because `rdns-present` returns it
 /// (`record_text.rs`, `svcb.rs`) and does not depend on `rdns`: moving it would
-/// need the edge `rdns-present` → `rdns`, which is a cycle (`TODO.md` #86).
+/// need the edge `rdns-present` → `rdns`, which is a cycle.
 #[derive(Debug, thiserror::Error)]
 pub enum ZoneError {
     #[error("line {line}: {detail}")]
@@ -166,9 +166,9 @@ impl From<std::array::TryFromSliceError> for WireError {
 /// Per-layer `Result` aliases.
 ///
 /// Each module uses the one for its own layer, so a signature reads
-/// `Result<Name>` rather than `Result<Name, WireError>` — the same shape
-/// `anyhow::Result` gave, without the erasure. `DnssecResult` is `rdns`'s, with
-/// the type it names (`TODO.md` #86).
+/// `Result<Name>` rather than `Result<Name, WireError>` — the shape
+/// `anyhow::Result` gives, without the erasure. `DnssecResult` is `rdns`'s,
+/// with the type it names.
 pub type WireResult<T> = std::result::Result<T, WireError>;
 pub type RequestResult<T> = std::result::Result<T, RequestError>;
 pub type ConfigResult<T> = std::result::Result<T, ConfigError>;

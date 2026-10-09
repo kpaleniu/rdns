@@ -1,8 +1,8 @@
 //! Writing a reply straight into the send buffer.
 //!
-//! An answer used to be a [`DnsMessage`] of owned `String`s and cloned RDATA
-//! that was then serialized. [`ResponseWriter`] appends each record to the wire
-//! as it is found instead: [`crate::RecordData`] already holds uncompressed wire-format
+//! [`ResponseWriter`] appends each record to the wire as it is found, rather
+//! than building a [`DnsMessage`] of owned `String`s and cloned RDATA to
+//! serialize: [`crate::RecordData`] already holds uncompressed wire-format
 //! bytes, so a record costs a copy into the buffer and nothing from the
 //! allocator.
 //!
@@ -538,14 +538,12 @@ impl ClientEdns {
     /// none gets neither: this is the [`DnsMessage`]-shaped half of the rule
     /// [`ResponseWriter::set_extended_error`] holds for the writer-shaped half.
     ///
-    /// Total, and the `Result` it used to return is the reason. Encoding the
-    /// option can only fail on one too long for its length field, which
-    /// [`ExtendedError`]'s own bound on EXTRA-TEXT puts out of reach on the
-    /// fresh OPT this builds; every one of the three callers answered that
-    /// impossible `Err` by dropping the *reason* and keeping the reply, since a
-    /// refusal without its annotation is still the answer and a refusal that
-    /// failed to serialize is not. One decision written three times is the
-    /// second copy waiting to differ (`CLAUDE.md` §7), so it is here.
+    /// Total. Encoding the option can only fail on one too long for its length
+    /// field, which [`ExtendedError`]'s own bound on EXTRA-TEXT puts out of
+    /// reach on the fresh OPT this builds; the answer to that impossible `Err`
+    /// is to drop the *reason* and keep the reply, since a refusal without its
+    /// annotation is still the answer and a refusal that failed to serialize is
+    /// not. Decided here rather than by each caller (`CLAUDE.md` §7).
     pub fn mirror_with(self, server: ServerOpt, error: Option<ExtendedError>) -> Option<Edns> {
         let mirrored = self.mirror(server)?;
         let Some(error) = error else {
@@ -568,10 +566,10 @@ impl ClientEdns {
 /// bits live in that record — the caller attaches it, because a refusal is
 /// answered differently on each daemon.
 ///
-/// `edns_header` rather than `edns()`: nothing here wants the option list, which
-/// costs a `Vec` per option, and it still checks the list is well formed. Both
-/// daemons wrote this sequence out (`TODO.md` #30h). The Padding option is
-/// looked for with [`Edns::has_option`], which copies nothing.
+/// `edns_header` rather than `edns()`: nothing here wants the option list,
+/// which costs a `Vec` per option, and it still checks the list is well formed.
+/// One function for both daemons (`CLAUDE.md` §7). The Padding option is looked
+/// for with [`Edns::has_option`], which copies nothing.
 pub fn client_edns(request: &DnsMessage) -> Result<ClientEdns, ResponseCode> {
     let header = request
         .edns_header()
@@ -767,7 +765,7 @@ mod tests {
     use crate::{DnsMessageBuilder, ParsedRecord, Qtype, Rtype};
 
     /// Both daemons ask this one function what a request's OPT says, so it owes
-    /// both of them the same four answers (`TODO.md` #30h).
+    /// both of them the same four answers.
     #[test]
     fn the_edns_decision_is_one_function() {
         assert_eq!(
@@ -948,16 +946,12 @@ mod tests {
         assert_eq!(out, expected);
     }
 
-    /// Past the limit the reply is the question, TC=1 and the OPT record — the
-    /// shape `to_bytes_within_buf` produced by rebuilding the message with its
-    /// sections cleared (RFC 1035 §4.2.1; RFC 6891 §6.2.4 on keeping the OPT).
     /// An EDE set on a reply with no OPT reaches no wire.
     ///
-    /// `ede.rs`'s header claimed this was unspellable, because `mirror` is the
-    /// only way to an OPT — and `set_edns` is `pub`, so it never was
-    /// (`TODO.md` #79d). What holds is `finish`'s guard: the EDE is folded in
-    /// under `if let Some(mut edns) = self.edns.take()`. Asserted rather than
-    /// argued, so the claim has something behind it.
+    /// The type allows it: `set_edns` is `pub`, so `mirror` is not the only way
+    /// to an OPT. What holds is `finish`'s guard: the EDE is folded in under
+    /// `if let Some(mut edns) = self.edns.take()`. Fails if the guard is
+    /// loosened to synthesize an OPT.
     #[test]
     fn an_extended_error_with_no_opt_reaches_no_wire() {
         let request = request("www.example.com.", false);
@@ -984,6 +978,9 @@ mod tests {
         );
     }
 
+    /// Past the limit the reply is the question, TC=1 and the OPT record — the
+    /// shape `to_bytes_within_buf` produces by rebuilding the message with its
+    /// sections cleared (RFC 1035 §4.2.1; RFC 6891 §6.2.4 on keeping the OPT).
     #[test]
     fn a_response_over_the_limit_becomes_an_empty_tc_answer() {
         let request = request("www.example.com.", true);

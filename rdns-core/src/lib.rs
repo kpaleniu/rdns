@@ -9,8 +9,8 @@
 
 // `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
 #![warn(unreachable_pub)]
-// `TODO.md` #143: `push_str(&format!(..))` allocates a `String` to copy it;
-// `write!` into the target does not. Off by default (restriction group).
+// `push_str(&format!(..))` allocates a `String` to copy it; `write!` into the
+// target does not. Off by default (restriction group).
 #![warn(clippy::format_push_string)]
 
 /// This build, as `<package version> (<git describe>)`. Stamped by `build.rs`
@@ -93,10 +93,9 @@ mod builder_dnssec_tests {
         );
     }
 
-    /// #33b: the builder took an `Rtype`, so ANY, AXFR and IXFR resolved to
-    /// `None` through the record-type table and the question was dropped with no
-    /// `else` — a message with an empty question section went on the wire, and
-    /// `rdnsc` re-derived the failure from `queries.is_empty()`. Round-tripped,
+    /// Fails if the builder takes an `Rtype`: ANY, AXFR and IXFR resolve to
+    /// `None` through the record-type table, the question is dropped, and a
+    /// message with an empty question section goes on the wire. Round-tripped,
     /// because the QTYPE only matters if it survives serialization.
     #[test]
     fn the_question_only_types_can_be_asked_for() {
@@ -963,11 +962,11 @@ mod tests {
         }
     }
 
-    /// An rcode with no name here used to serialize as 0. `rdnsr` relays
-    /// upstream messages, so an unrecognized *failure* reached the client as a
-    /// successful empty answer — the one direction a response code must never
-    /// fail in. RFC 6895 §2.3 keeps the space open on purpose; a relay that does
-    /// not know a code still has to pass it on.
+    /// Fails if an rcode with no name here serializes as 0. `rdnsr` relays
+    /// upstream messages, so an unrecognized *failure* would reach the client
+    /// as a successful empty answer — the one direction a response code must
+    /// never fail in. RFC 6895 §2.3 keeps the space open on purpose; a relay
+    /// that does not know a code still has to pass it on.
     #[test]
     fn an_unknown_rcode_is_relayed_rather_than_rewritten_to_noerror() {
         // 12 is unassigned; 4095 is the top of the extended range. Both need an
@@ -1066,8 +1065,7 @@ mod tests {
         );
     }
 
-    /// ARCOUNT counts the OPT record even though it is no longer in
-    /// `additionals` — the arithmetic most likely to break when OPT moved out.
+    /// ARCOUNT counts the OPT record, which is not in `additionals`.
     #[test]
     fn arcount_counts_the_opt_record_that_is_not_in_the_section() {
         let mut msg = query_msg(7);
@@ -1092,9 +1090,9 @@ mod tests {
         assert!(parsed.edns().is_some(), "the OPT record, in its own field");
     }
 
-    /// RFC 2181 §8, at the boundary that now owns it: "implementations should
-    /// treat TTL values received with the most significant bit set as if the
-    /// entire value received was zero".
+    /// RFC 2181 §8, at the boundary that owns it: "implementations should treat
+    /// TTL values received with the most significant bit set as if the entire
+    /// value received was zero".
     ///
     /// Driven from the wire rather than from `Ttl::from_wire`, because the
     /// claim being tested is that *parsing a record* applies the rule — that is
@@ -1152,11 +1150,9 @@ mod tests {
         assert_eq!(got.version, 0);
         assert_eq!(msg.udp_payload_size(), 4096);
 
-        // `set_edns` replaces rather than accumulates. This used to be checked
-        // by counting the OPT records in the additional section and asserting
-        // there was exactly one. With OPT as an `Option` field a second one is
-        // unspellable, which is also what RFC 6891 §6.1.1 says about receiving
-        // one.
+        // `set_edns` replaces rather than accumulates. OPT is an `Option`
+        // field, so a second one is unspellable, which is also what RFC 6891
+        // §6.1.1 says about receiving one.
         msg.set_edns(Edns::with_payload_size(1232));
         assert!(msg.additionals.is_empty(), "OPT is not a resource record");
         assert_eq!(msg.edns().expect("still present").udp_payload_size, 1232);
@@ -1303,12 +1299,12 @@ mod tests {
 
     /// `edns_header` sees exactly what `edns` sees, minus the options.
     ///
-    /// This is the property the answer path now depends on. Both daemons decide
+    /// This is the property the answer path depends on. Both daemons decide
     /// FORMERR from the cheap one, so if it accepted a list the full parse
     /// rejects — or the reverse — a packet would be answered differently
     /// depending on which of the two a call site happened to use, which is
-    /// precisely the drift that comes of writing the walk twice
-    /// (`CLAUDE.md` §7). They share it; this holds them to it.
+    /// precisely the drift that comes of writing the walk twice (`CLAUDE.md`
+    /// §7). They share it; this holds them to it.
     #[test]
     fn the_edns_header_agrees_with_the_full_parse() {
         // No OPT at all.
@@ -1453,14 +1449,14 @@ mod tests {
         assert!(parsed.has_edns(), "OPT record must survive truncation");
     }
 
-    /// A response used to be built in a zeroed 64 KB scratch that `truncate`
-    /// then shrank the *length* of and not the capacity, so the `Vec` handed to
-    /// `send_to` and held for the duration of the send was 64 KB whatever the
-    /// answer was — a 1000x overshoot at a thousand in flight.
+    /// Fails if the response is built in a zeroed 64 KB scratch and truncated:
+    /// `truncate` shrinks the *length* and not the capacity, so the `Vec` held
+    /// for the send reads 65535 whatever the answer — a 1000x overshoot at a
+    /// thousand in flight.
     ///
     /// Asserted on capacity rather than on a timing, deliberately: capacity is
-    /// exact and does not care what else is running on the machine
-    /// (`CLAUDE.md` §10). Against the old code this reads 65535.
+    /// exact and does not care what else is running on the machine (`CLAUDE.md`
+    /// §10).
     #[test]
     fn a_small_response_does_not_carry_a_64k_buffer_into_the_send() {
         use std::net::Ipv4Addr;
@@ -1785,14 +1781,13 @@ mod tests {
         assert!(!msg.cd, "CD bit should be false by default");
     }
 
-    /// **D-1's actual claim, at the message level.** A response carrying a label
-    /// that is not valid UTF-8 used to be unparseable, so `rdnsr` could not
-    /// relay somebody else's zone that had one (RFC 2181 §11: "any binary string
-    /// whatever can be used as the label").
+    /// **D-1's actual claim, at the message level.** A response carrying a
+    /// label that is not valid UTF-8 parses, so `rdnsr` can relay somebody
+    /// else's zone that has one (RFC 2181 §11: "any binary string whatever can
+    /// be used as the label").
     ///
-    /// `rdns-core` no longer has a presentation reader to contrast with — that
-    /// half of `dname.rs` went with the change — so what is asserted is the
-    /// relay itself: in, out, and the same octets.
+    /// `rdns-core` has no presentation reader to contrast with, so what is
+    /// asserted is the relay itself: in, out, and the same octets.
     #[test]
     fn a_response_carrying_a_binary_label_relays_byte_for_byte() {
         // Header, one question, one answer. The owner's first label is a single

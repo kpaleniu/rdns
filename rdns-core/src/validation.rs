@@ -125,10 +125,9 @@ pub fn answers_query(reply: &DnsMessage, sent: &SentQuery) -> Result<(), AnswerM
 /// against a ceiling we chose), whether a reply may be truncated, and whether
 /// the peer completed a handshake — three questions one `is_tcp` was answering.
 ///
-/// Here rather than in `rdns_transport`, where it was until `TODO.md` #40c,
-/// because this is the module that reads it: an enum one crate above the
-/// decision it makes has to be converted back to the bool it replaced at the
-/// call site.
+/// Here rather than in `rdns_transport`, because this is the module that reads
+/// it: an enum one crate above the decision it makes has to be converted back
+/// to the bool it replaced at the call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Udp,
@@ -173,7 +172,7 @@ impl Privacy {
 /// [`Transport`] is "what size may this answer be"; [`Privacy`] is "what did
 /// the connection hide"; this is "what was it called", which dnstap's
 /// `SocketProtocol` wants and neither of the others can give — DoT, DoH and DoQ
-/// are one [`Privacy`] and one [`Transport`] between them (`TODO.md` #54).
+/// are one [`Privacy`] and one [`Transport`] between them.
 ///
 /// An enum with the TLS version inside rather than a `{ protocol, privacy }`
 /// pair, because the pair can be written down wrong: `Tcp` with `Tls13`, or
@@ -185,10 +184,10 @@ impl Privacy {
 /// No `Udp` variant, on purpose: this reaches a consumer by way of a
 /// *connection* handler, and a datagram takes a different path in both daemons.
 ///
-/// `Clone` rather than `Copy` since `TODO.md` #59: an encrypted connection
-/// carries what the client proved about itself, which is a certificate, and a
-/// plain one cannot. The clone is one `Arc` bump per message on a connection
-/// that already spends a round trip.
+/// `Clone` rather than `Copy`: an encrypted connection carries what the client
+/// proved about itself, which is a certificate, and a plain one cannot. The
+/// clone is one `Arc` bump per message on a connection that already spends a
+/// round trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Arrival {
     /// Plain TCP (RFC 1035 §4.2.2).
@@ -276,14 +275,13 @@ impl Arrival {
     /// Whether this transport can carry a *sequence* of messages in answer to
     /// one request, which a zone transfer is (RFC 5936 §2.2).
     ///
-    /// The fourth question, and the one the dispatcher used to answer by
-    /// asking whether the reply channel was framed at all. DoH is framed and
-    /// carries one message: RFC 8484 §4.2 makes one HTTP response one
-    /// `application/dns-message`, defines no framing that would carry the
-    /// rest, and RFC 9103 §7.1 leaves DoH outside zone transfer altogether.
-    /// So a transfer over DoH used to be built in full, drained by the adapter
-    /// and thrown away — except for a zone small enough to fit one envelope,
-    /// which succeeded (`TODO.md` #106).
+    /// The fourth question, and not the same as whether the reply channel is
+    /// framed. DoH is framed and carries one message: RFC 8484 §4.2 makes one
+    /// HTTP response one `application/dns-message`, defines no framing that
+    /// would carry the rest, and RFC 9103 §7.1 leaves DoH outside zone transfer
+    /// altogether. Asked as "is it framed", a transfer over DoH is built in
+    /// full, drained by the adapter and thrown away — except for a zone small
+    /// enough to fit one envelope, which succeeds.
     ///
     /// Here rather than on the dispatcher's own wrapper, for the reason the
     /// other two answers are here: this is a fact about the protocol, and
@@ -317,14 +315,13 @@ const MAX_REQUEST_ADDITIONALS: usize = 4;
 /// The two size caps admission applies, one per transport.
 ///
 /// A resource bound — how much of a stranger's datagram we are willing to parse
-/// — and not a protocol rule. The distinction is `TODO.md` #40f, where the UDP
-/// cap was RFC 1035 §4.2.1's 512 applied to the wrong direction: §4.2.1 limits
-/// what a server may *send* without EDNS, and a requestor's own limit is the
-/// payload size it advertises (RFC 6891 §4.3). Both daemons advertise 4,096 and
-/// refused over 512, so a client that believed the advertisement got silence —
-/// measured at `rdns/examples/request_size_probe.rs`, where a 2,048-bit DKIM key
-/// rotation weighs 566 octets signed and the TSIG the server *requires* is what
-/// pushes it over.
+/// — and not a protocol rule (`TODO.md` #40f). RFC 1035 §4.2.1's 512 limits
+/// what a server may *send* without EDNS; a requestor's own limit is the
+/// payload size it advertises (RFC 6891 §4.3). A daemon that advertises 4,096
+/// and refuses over 512 answers a client that believed it with silence:
+/// `rdns/examples/request_size_probe.rs` measures a 2,048-bit DKIM key rotation
+/// at 566 octets signed, and the TSIG the server *requires* is what pushes it
+/// over.
 #[derive(Debug, Clone)]
 pub struct AdmissionLimits {
     max_udp_size: usize,
@@ -360,10 +357,10 @@ impl Default for AdmissionLimits {
     /// and 16 KiB on TCP.
     ///
     /// Neither is a protocol number. The UDP one has to match the advertisement
-    /// or the advertisement is a lie, and a daemon that advertises something else
-    /// passes its own figure to [`AdmissionLimits::new`]; the TCP one is this
-    /// codebase's judgement about a request that has no legitimate reason to be
-    /// larger, and is now a flag because that judgement is the operator's to
+    /// or the advertisement is a lie, and a daemon that advertises something
+    /// else passes its own figure to [`AdmissionLimits::new`]; the TCP one is
+    /// this codebase's judgement about a request that has no legitimate reason
+    /// to be larger, and is a flag because that judgement is the operator's to
     /// review.
     fn default() -> Self {
         AdmissionLimits::new(4096, 16 * 1024)
@@ -373,8 +370,7 @@ impl Default for AdmissionLimits {
 /// Whether a packet is worth parsing, and if not, the typed reason.
 ///
 /// `pub` because [`AdmissionCheck::validate_packet`] returns it and
-/// `rdns_transport` calls that; narrowing it is a private-in-public error
-/// (`TODO.md` #40e).
+/// `rdns_transport` calls that; narrowing it is a private-in-public error.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationResult {
     Valid,
@@ -658,12 +654,11 @@ mod tests {
     /// The UDP cap is the payload size a daemon advertises, not RFC 1035
     /// §4.2.1's 512.
     ///
-    /// This test asserted the opposite until `TODO.md` #40f, which is a test
-    /// encoding the bug (`CLAUDE.md` §1): both daemons advertise 4,096 octets of
-    /// receive capability in every OPT (RFC 6891 §6.2.4) and admission refused
-    /// over 512 in silence, so a 566-octet DKIM rotation — a legitimate signed
-    /// UPDATE, measured in `rdns/examples/request_size_probe.rs` — was dropped
-    /// with nothing on the wire to say why.
+    /// Fails if admission refuses over 512: both daemons advertise 4,096 octets
+    /// of receive capability in every OPT (RFC 6891 §6.2.4), so a 566-octet
+    /// DKIM rotation — a legitimate signed UPDATE, measured in
+    /// `rdns/examples/request_size_probe.rs` — would be dropped with nothing on
+    /// the wire to say why (`TODO.md` #40f).
     #[test]
     fn the_udp_cap_is_the_advertised_payload_size() {
         let validator = AdmissionCheck::with_defaults();
@@ -1010,12 +1005,10 @@ mod tests {
 
     /// What each arrival hid, which is the half of it RFC 9103 §11 turns on.
     ///
-    /// A table because the derivation is the whole content of the type
-    /// (`TODO.md` #54): the alternative shape carried a `Privacy` beside a
-    /// protocol, and the two could be written down disagreeing —
-    /// `{ protocol: Tcp, privacy: Tls13 }` compiles, and was printed by the
-    /// probe that decided against it. Here `Tcp` cannot claim to have hidden
-    /// anything and `Doq` cannot claim not to.
+    /// A table because the derivation is the whole content of the type. A
+    /// `Privacy` beside a protocol can be written down disagreeing —
+    /// `{ protocol: Tcp, privacy: Tls13 }` compiles. Here `Tcp` cannot claim to
+    /// have hidden anything and `Doq` cannot claim not to.
     #[test]
     fn what_each_arrival_hid() {
         assert_eq!(Arrival::Tcp.privacy(), Privacy::Clear);
@@ -1054,17 +1047,15 @@ mod tests {
         assert!(!Arrival::Tcp.privacy().is_xot());
     }
 
-    /// ~~Two octets, the same as the `Privacy` it replaces plus a
-    /// discriminant.~~ **Sixteen since `TODO.md` #59**, and upward, so the
-    /// reason is here (§17): a connection carries the certificate its client
-    /// presented, which is an `Option<Arc<Vec<u8>>>` — one pointer, `None`
-    /// costing nothing extra by the niche, and the version and discriminant
-    /// padded out beside it. `Arc<[u8]>` would be worse, being a fat pointer.
+    /// Sixteen octets, so the reason is here (§17): a connection carries the
+    /// certificate its client presented, which is an `Option<Arc<Vec<u8>>>` —
+    /// one pointer, `None` costing nothing extra by the niche, and the version
+    /// and discriminant padded out beside it. `Arc<[u8]>` would be worse, being
+    /// a fat pointer.
     ///
     /// Pinned because this rides on the answer path, once per message
     /// (`CLAUDE.md` §17's rule about measuring rather than assuming a newtype
-    /// is free). The `{ protocol, privacy }` pair measured the same 2, which is
-    /// why size was not what decided between them.
+    /// is free).
     #[test]
     fn an_arrival_costs_sixteen_octets() {
         assert_eq!(std::mem::size_of::<Arrival>(), 16);

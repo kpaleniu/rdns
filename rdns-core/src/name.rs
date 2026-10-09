@@ -1,18 +1,17 @@
 //! A domain name, stored the way the wire spells it.
 //!
-//! `TODO.md` #13e settled the representation question and deviation **D-1** is
-//! the cost of not having acted on it. Names were presentation `String`s, and
-//! two things follow from that which no call site can fix:
+//! Wire octets and not presentation `String`s (`TODO.md` #13e, deviation
+//! **D-1**), because two things follow from text which no call site can fix:
 //!
 //! - **A `String` cannot hold every legal name.** A label is "any binary
 //!   string" (RFC 2181 §11) and Rust's `String` is UTF-8, so a zone carrying
-//!   one could not be served and a *response* carrying one could not be
-//!   parsed — `rdnsr` could not relay someone else's zone that had one.
+//!   one could not be served and a *response* carrying one could not be parsed,
+//!   so `rdnsr` could not relay someone else's zone that had one.
 //! - **Presentation text is not injective.** The one-label name
 //!   `[03 'a' '.' 'b']` and the two-label `[01 'a' 01 'b']` both read as
 //!   `"a.b."`, so a tree question asked of the text — is this under that? —
-//!   answers wrong for one of them. #13e closed that by *refusing* the first,
-//!   which made the invariant true at exactly the price D-1 names.
+//!   answers wrong for one of them. Text keeps the invariant only by *refusing*
+//!   the first, which is the price D-1 names.
 //!
 //! Wire form rather than `Vec<Label>`: one allocation, not one per label —
 //! `TODO.md` #27 got a whole answer down to two allocations and a name per
@@ -21,15 +20,14 @@
 //! instead of copying, which is what the ancestor walks in `zone` and
 //! `resolver` do once per label of a name the client chose.
 //!
-//! **Comparing two names no longer copies either.** [`NameRef`]'s `Eq` and
-//! `Hash` fold ASCII as they go (RFC 4343), so the lowercased copy a comparison
-//! used to make is gone. Two things still need the folded octets themselves: a
-//! `HashMap` key, because `Borrow` cannot hand out a borrowed view of a type
-//! carrying a lifetime without the `unsafe` pointer cast `str` uses and this
-//! library has none; and DNSSEC's canonical form, which is down-cased by
-//! definition (RFC 4034 §6.2). [`NameRef::folded`] serves the first and borrows
-//! when the name is already lower case, which is the ordinary query;
-//! [`NameRef::to_folded`] serves the second.
+//! **Comparing two names copies neither.** [`NameRef`]'s `Eq` and `Hash` fold
+//! ASCII as they go (RFC 4343), with no lowercased copy. Two things still need
+//! the folded octets themselves: a `HashMap` key, because `Borrow` cannot hand
+//! out a borrowed view of a type carrying a lifetime without the `unsafe`
+//! pointer cast `str` uses and this library has none; and DNSSEC's canonical
+//! form, which is down-cased by definition (RFC 4034 §6.2). [`NameRef::folded`]
+//! serves the first and borrows when the name is already lower case, which is
+//! the ordinary query; [`NameRef::to_folded`] serves the second.
 //!
 //! A `Name` is always **absolute**. A relative name exists only in zone-file
 //! text and is resolved against the origin before it becomes one, so nothing
@@ -137,7 +135,7 @@ impl Name {
     }
 
     /// `head`'s labels, then `tail`'s: how an RPZ trigger name is built from a
-    /// QNAME and the policy zone's origin (`rdns::rpz`, `TODO.md` #45a).
+    /// QNAME and the policy zone's origin (`rdns::rpz`).
     ///
     /// Both are absolute, so `head`'s root terminator is what `tail` replaces.
     pub fn concat(head: NameRef<'_>, tail: NameRef<'_>) -> WireResult<Name> {
@@ -755,9 +753,9 @@ pub enum Redirect {
 ///
 /// **Whole labels is structural here.** Over wire form a suffix at a label
 /// boundary is the only kind of suffix there is, so `ab.example.com.` simply is
-/// not under `b.example.com.` — where the presentation form needed the rule
-/// spelled out and a `str::ends_with` got it wrong. The root as owner or as
-/// target needed a case of its own for the same reason, and does not now.
+/// not under `b.example.com.`, which a `str::ends_with` over presentation text
+/// gets wrong. Nor does the root, as owner or as target, need a case of its
+/// own.
 ///
 /// Strictly below, so the owner is not redirected by its own DNAME (§2.3) —
 /// Table 1's second row, whose answer depends on the QTYPE and so is not a
@@ -976,8 +974,8 @@ mod tests {
         // Case-insensitively, like everything else.
         assert!(under("A.ExAmPlE.CoM.", "example.com."));
         // RFC 1035 §5.1's escape is a dot *inside* a label, and on the wire it
-        // is not a boundary at all — which is the half the text version of this
-        // had to be taught (`TODO.md` #37a) and this one cannot get wrong.
+        // is not a boundary at all, which a text version has to be taught and
+        // this one cannot get wrong.
         assert!(!under(r"x.a\.b.com.", "b.com."));
         assert!(under(r"x.a\.b.com.", r"a\.b.com."));
     }

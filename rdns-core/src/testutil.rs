@@ -1,16 +1,14 @@
 //! Test support that is not DNS.
 //!
 //! `pub` rather than `pub(crate)`, and in `rdns-core` rather than in `rdns`,
-//! because `persist` moved here in `TODO.md` #66c and its tests came with it
-//! (#20's rule). A crate boundary cannot see another crate's `#[cfg(test)]`
-//! items, so the choice was this or a second `ScratchDir` — which is the thing
-//! this module exists to have stopped (§7).
+//! because `persist` is here and its tests are with it (`TODO.md` #66c). A
+//! crate boundary cannot see another crate's `#[cfg(test)]` items, so the
+//! alternative is a second `ScratchDir`, which this module exists to prevent
+//! (§7).
 //!
-//! Records are `rdns::test_records` and keys are `rdns::dnssec_test_util`;
-//! what is left is the scratch directory, which four modules had written out
-//! and three more had written the half of that creates one without the half
-//! that removes it — so every run of the suite left three directories in `TEMP`
-//! behind (`CLAUDE.md` §7, `TODO.md` #38e).
+//! Records are `rdns::test_records` and keys are `rdns::dnssec_test_util`; what
+//! is left is the scratch directory, created and removed by one type so that no
+//! copy creates one and leaves it in `TEMP` (`CLAUDE.md` §7, `TODO.md` #38e).
 
 use std::path::{Path, PathBuf};
 
@@ -97,10 +95,9 @@ pub fn fastest_of_each(
 /// Every `.rs` file under `dir`, `target/` and `.git/` skipped.
 ///
 /// Two test binaries read the workspace's own source as data —
-/// `rdns/tests/flattened_messages.rs` (`TODO.md` #60) and
-/// `rdns/tests/module_doc_comments.rs` (#89) — and a walk that silently
-/// returns nothing makes either of them pass by finding no input, so both
-/// assert on the count they get back (§7).
+/// `rdns/tests/flattened_messages.rs` and `rdns/tests/module_doc_comments.rs` —
+/// and a walk that silently returns nothing makes either of them pass by
+/// finding no input, so both assert on the count they get back (§7).
 pub fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     collect_rust_sources(dir, &mut out);

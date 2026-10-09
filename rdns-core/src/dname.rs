@@ -9,9 +9,9 @@
 //! `check_name_len`). Most of it is `pub(crate)`: the module is public because
 //! parsing a record needs the unpacker, not because a name's innards are.
 //!
-//! No presentation text: #36 moved it out, along with a second text-to-wire
-//! decoder that disagreed with `Name` about RFC 1035 §5.1's escapes. Text names
-//! are [`crate::text_names`], and the text-to-wire direction is `Name`'s own.
+//! No presentation text (`TODO.md` #36): the text-to-wire direction is `Name`'s
+//! own, so RFC 1035 §5.1's escapes have one reading. Text names are
+//! [`crate::text_names`].
 //!
 //! `write_bytes` is here because a serializer writing a name needs it and
 //! because a bounds-checked write is the same problem as a bounds-checked read;
@@ -561,11 +561,8 @@ mod tests {
     /// (RFC 1035 §2.3.4), so a name that arrived from a zone file rather than
     /// off the wire cannot be written over-long either.
     ///
-    /// This was left open by the commit that closed the parse side and is the
-    /// other half of it: the encoder sized its buffer from the name without ever
-    /// asking whether the total was legal. Watched failing against that
-    /// behaviour — without `check_name_len` the over-long cases return `Ok` with
-    /// a 256- and a 321-octet buffer.
+    /// Fails without `check_name_len`: the over-long cases return `Ok` with a
+    /// 256- and a 321-octet buffer.
     ///
     /// The boundary is tested either side, in presentation lengths: four labels
     /// encoding to exactly 255 octets is fine, and one octet more is not.
@@ -639,12 +636,11 @@ mod tests {
     /// The one-label name `[03 'a' '.' 'b']` and the two-label `[01 'a' 01 'b']`
     /// are different names, and both are legal (RFC 2181 §11).
     ///
-    /// Presentation storage read both as `"a.b."` — two names collapsing onto
+    /// Presentation storage reads both as `"a.b."`: two names collapsing onto
     /// one string, which every name-keyed map and every tree-shaped question
-    /// here assumes cannot happen. `is_at_or_under("evil.com.", "com.")`
-    /// answered true for a single label that is a *sibling* of `com.`. #13e
-    /// closed that by refusing the first, at the price D-1 named; wire storage
-    /// keeps both, and this asserts they stay apart.
+    /// here assumes cannot happen, and `is_at_or_under("evil.com.", "com.")`
+    /// true for a single label that is a *sibling* of `com.` (`TODO.md` #13e,
+    /// deviation D-1). Wire storage keeps both; fails if they compare equal.
     #[test]
     fn a_label_containing_the_separator_is_its_own_name() {
         // ONE label: 'a', '.', 'b'.
@@ -661,7 +657,7 @@ mod tests {
         assert_eq!(two.as_ref().label_count(), 2);
         assert_ne!(one, two, "the collapse D-1 was about");
 
-        // And the tree question they used to answer the same way.
+        // Nor is one under the other's parent, as text storage would say.
         assert!(!one
             .as_ref()
             .is_at_or_under(two.as_ref().parent().expect("`b.`")));
@@ -705,8 +701,8 @@ mod tests {
         );
     }
 
-    /// A name that points at itself is refused — now by arithmetic rather than
-    /// by a visited set.
+    /// A name that points at itself is refused, by arithmetic rather than by a
+    /// visited set.
     ///
     /// The first hop is unconstrained (there is no offset to compare it
     /// against), so this is caught on the *second*: offset 0 is reached, the
@@ -733,11 +729,10 @@ mod tests {
 
     /// The depth limit is enforced on a chain that is otherwise legal.
     ///
-    /// This test used to build a chain running *forwards* — `0->2->4->…` — and
-    /// so would now be refused by the backwards rule on its second hop, passing
-    /// while measuring nothing. Every hop below decreases, so the backwards
-    /// check is satisfied throughout and `MAX_DEPTH` is the only thing that can
-    /// fire (`CLAUDE.md` §10: say what a test is a regression for).
+    /// Every hop below decreases, so the backwards check is satisfied
+    /// throughout and `MAX_DEPTH` is the only thing that can fire. A chain
+    /// running forwards, `0->2->4->…`, would be refused by the backwards rule
+    /// on its second hop and pass while measuring nothing (`CLAUDE.md` §10).
     #[test]
     fn test_depth_limit_prevents_deep_recursion() {
         // 0x00 at offset 0: a root label, so the chain terminates on its own if
@@ -770,9 +765,8 @@ mod tests {
     /// "with a pointer to a prior occurance of the same name"), and a chain that
     /// runs forwards is refused.
     ///
-    /// Watched failing against the old code (`CLAUDE.md` §1): with the
-    /// visited-offsets set, this chain has no repeated offset, so it unpacked
-    /// happily to `"a.b."`. Two hops are needed to demonstrate it because the
+    /// Fails under a visited-offsets check: this chain repeats no offset, and
+    /// unpacks to `"a.b."`. Two hops are needed to demonstrate it because the
     /// first is unconstrained — see `unpack_internal`.
     #[test]
     fn a_pointer_chain_that_runs_forwards_is_refused() {
@@ -840,17 +834,14 @@ mod tests {
     /// A name over 255 encoded octets is refused (RFC 1035 §2.3.4: "names 255
     /// octets or less"), with the boundary tested on both sides.
     ///
-    /// This limit was unenforced until 2026-08-03 while the 63-octet per-label
-    /// one was checked on every label — five 63-octet labels parsed to a
-    /// 320-character `String` and nothing objected. Watched failing against the
-    /// old code: without `UnpackedDName::new`'s check the `is_err` assertions
-    /// below fail and the 320-character name comes back `Ok`.
+    /// Fails without `UnpackedDName::new`'s check: five 63-octet labels, each
+    /// legal, come back `Ok` as a 320-character name.
     ///
-    /// No pointer is involved in any of these, which is the point: the hole was
-    /// not in the compression logic, it was in the total nobody was keeping.
+    /// No pointer is involved in any of these: the limit is on the total, not
+    /// in the compression logic.
     #[test]
     fn a_name_over_255_octets_is_refused() {
-        // 5 x 63 = 321 encoded octets. The case from the probe that found this.
+        // 5 x 63 = 321 encoded octets.
         let data = wire_name(5, MAX_LABEL_LEN);
         let unpacker = DNameUnpacker::new(&data);
         let err = crate::Name::from_wire_in(&data, &unpacker).expect_err("321 octets");

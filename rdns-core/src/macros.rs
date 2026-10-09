@@ -17,7 +17,6 @@ macro_rules! read_be {
         )
     }};
 }
-// An ordinary import rather than `#[macro_use]`, whose macros reach only
-// what is declared after it — an ordering the module list must not have to
-// respect (`TODO.md` #39d).
+// An ordinary import rather than `#[macro_use]`, whose macros reach only what
+// is declared after it — an ordering the module list must not have to respect.
 pub(crate) use read_be;

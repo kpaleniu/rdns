@@ -4,14 +4,12 @@
 //! `rdns_transport::control`; this is what both ends must agree on, so the
 //! daemons and `rdnsctl` cannot drift.
 //!
-//! A Unix socket with filesystem permissions, as `knotc` and `pdns_control`
-//! use — authorization by file mode, so nothing here authenticates. On
-//! Windows a named pipe, authorized by its default descriptor (`TODO.md`
-//! #188).
-//! `unbound-control` was once listed here too; its default is TCP on loopback
-//! with TLS, a Unix socket only if configured, and BIND's `rndc` is TCP with a
-//! shared key. The socket is this project's choice, not the field's
-//! (`TODO.md` #188).
+//! A Unix socket with filesystem permissions, as `knotc` and `pdns_control` use
+//! — authorization by file mode, so nothing here authenticates. On Windows a
+//! named pipe, authorized by its default descriptor. `unbound-control` defaults
+//! to TCP on loopback with TLS, a Unix socket only if configured, and BIND's
+//! `rndc` is TCP with a shared key. The socket is this project's choice, not
+//! the field's.
 //!
 //! Text, one command per connection, terminated by the close, so
 //! `printf 'status\n' | socat - UNIX-CONNECT:/run/rdns/rdnsd.sock` is a working

@@ -1,11 +1,10 @@
-//! The presentation-text name helpers #36 left behind.
+//! The presentation-text name helpers.
 //!
 //! A zone file is text, so text names do not go away: these fold and absolutize
-//! what a parser reads and what an operator writes. What did go away is names as
-//! *keys* — the caches hold folded wire octets now ([`crate::name_keys`],
-//! `TODO.md` #38a) — which is why the escape-aware `.`-splitting that made a
-//! text key safe is down to [`ends_with_root`] and nothing else walks a name as
-//! text.
+//! what a parser reads and what an operator writes. Names as *keys* are not
+//! text — the caches hold folded wire octets ([`crate::name_keys`]) — which is
+//! why the escape-aware `.`-splitting that made a text key safe is down to
+//! [`ends_with_root`] and nothing else walks a name as text.
 
 /// A name in the form DNS compares names by: ASCII case folded, and nothing else.
 ///
@@ -76,10 +75,8 @@ pub fn absolute_lowered(name: &str) -> std::borrow::Cow<'_, str> {
 /// octets, where a label carries its own length — so every helper below asks
 /// this one function instead of splitting on `.` for itself (`CLAUDE.md` §7).
 ///
-/// It began to matter when RFC 9460's presentation form (`TODO.md` #35) and
-/// `Name` (#36) between them made such a name loadable, signable and servable.
-/// Before that a `\` in an owner was refused at the door and counting dots was
-/// right by accident.
+/// RFC 9460's presentation form and `Name` (`TODO.md` #36) make such a name
+/// loadable, signable and servable, so counting dots is wrong.
 fn separates_labels(bytes: &[u8], at: usize) -> bool {
     let mut back = at;
     while back > 0 && bytes[back - 1] == b'\\' {

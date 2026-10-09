@@ -218,11 +218,10 @@ impl DnsMessage {
     /// RFC 4035 §3.2.2 says so in one line — "The name server side MUST copy
     /// the setting of the CD bit from a query to the corresponding response".
     ///
-    /// AA, RA, AD, the RCODE and the OPT record are *policy*: they are exactly
-    /// what five hand-written copies of this skeleton disagreed about
-    /// (`TODO.md` #30g), so they are left neutral for the caller to set. This
-    /// is deliberately not a finished message; a function that returned one
-    /// would fit none of the callers.
+    /// AA, RA, AD, the RCODE and the OPT record are *policy*, where the callers
+    /// differ, so they are left neutral for the caller to set. This is
+    /// deliberately not a finished message; a function that returned one would
+    /// fit none of the callers.
     ///
     /// [`response::ResponseWriter::start`] is the same constructor for the path
     /// that writes straight into the send buffer.
@@ -366,11 +365,7 @@ impl DnsMessage {
     /// text is at least its wire length — an escape like `\.` is two characters
     /// for one octet.
     fn wire_size_bound(&self) -> usize {
-        // A name's wire form is its text plus a leading length octet and the
-        // root label, and shorter than that whenever it is compressed.
-        // A name's wire length exactly, now that a name is its wire form —
-        // where the text form had to add two for the length octet and the root
-        // and explain why that was right.
+        // A name's wire length exactly: a `Name` is its wire form.
         let name = |name: NameRef<'_>| name.as_wire().len();
         let mut bound = response::HEADER_LEN;
         for q in &self.queries {
@@ -427,8 +422,8 @@ impl DnsMessage {
         compressor: &mut NameCompressor,
     ) -> Result<(), WireError> {
         // Sized to what this message can need, not to the ceiling: the TCP and
-        // transfer paths pass `u16::MAX`, so a 43-byte reply was a 64 KiB
-        // allocation and a 64 KiB memset (`TODO.md` #25b).
+        // transfer paths pass `u16::MAX`, which would make a 43-byte reply a 64
+        // KiB allocation and a 64 KiB memset (`TODO.md` #25b).
         let scratch = self.wire_size_bound().min(max_len);
         out.clear();
         out.resize(scratch, 0);
@@ -502,14 +497,12 @@ const DNSSEC_PAYLOAD_SIZE: u16 = 4096;
 
 /// A query, built field by field.
 ///
-/// The question's type is a [`Qtype`] and not an `Rtype`. It was an `Rtype`, and
-/// the presentation-name door resolved through `record_type_name_to_code`, which
-/// answers `None` for ANY, AXFR and IXFR because no *record* is one of those
-/// types — and the question was then dropped with no `else`, so `rdnsc`, this
-/// tree's only query client, could not ask an ANY query at all (`TODO.md` #33b).
-/// The name door is [`record_types::qtype_name_to_code`](crate::record_types::qtype_name_to_code),
-/// which answers `Option` and
-/// leaves the reporting to the caller that has a person to report to.
+/// The question's type is a [`Qtype`] and not an `Rtype`: ANY, AXFR and IXFR
+/// are QTYPEs no *record* has (RFC 1035 §3.2.3, RFC 1995), so an `Rtype` cannot
+/// ask for them. The name door is
+/// [`record_types::qtype_name_to_code`](crate::record_types::qtype_name_to_code),
+/// which answers `Option` and leaves the reporting to the caller that has a
+/// person to report to.
 pub struct DnsMessageBuilder {
     id: u16,
     queries: Vec<(Name, Qtype)>,

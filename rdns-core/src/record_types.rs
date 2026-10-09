@@ -1,9 +1,8 @@
 //! The RR-type and QTYPE registry: the codes, and the names a zone file and a
 //! query spell them with.
 //!
-//! Split out of `utils`, which is where a thing went when nobody decided where
-//! it belonged (`TODO.md` #38c). The membership rule here is exact: a type or
-//! class *code*, or a conversion between one and its presentation name.
+//! The membership rule here is exact: a type or class *code*, or a conversion
+//! between one and its presentation name.
 //!
 //! Not `codes`, which holds the newtypes themselves and seals their fields to
 //! that one file (`CLAUDE.md` §17). This module is a caller of those, through
@@ -131,8 +130,8 @@ pub fn qtype_name(qtype: Qtype) -> Cow<'static, str> {
 /// library has none. Always a name [`record_type_name_to_code`] reads back.
 ///
 /// `Cow`, because eighteen of the answers are constants and only the last one
-/// has to be built: writing a zone allocated a `String` per record to print a
-/// name that was in the binary already (`TODO.md` #26h).
+/// has to be built: a `String` would cost a zone writer an allocation per
+/// record to print a name that is in the binary already.
 pub fn record_type_name(code: Rtype) -> Cow<'static, str> {
     let known = match code {
         A => "A",
@@ -164,7 +163,7 @@ mod tests {
     use crate::Rtype;
 
     /// A QTYPE is not an RTYPE: these three are questions no record answers to,
-    /// so the record-type table says `None` for all of them (#33b).
+    /// so the record-type table says `None` for all of them.
     #[test]
     fn the_question_only_types_have_names_both_ways() {
         for (name, qtype) in [
@@ -224,9 +223,8 @@ mod tests {
     }
 
     /// The thirteen mnemonics are in the binary already; only `TYPEnnn` has to
-    /// be built. Asserted on the `Cow` rather than on the text, because the
-    /// text was right before and the allocation is what changed
-    /// (`TODO.md` #26h).
+    /// be built. Asserted on the `Cow` rather than on the text: an allocating
+    /// version prints the same text, and fails only here.
     #[test]
     fn a_known_type_name_is_not_built() {
         for known in [A, NS, SOA, RRSIG, NSEC3] {

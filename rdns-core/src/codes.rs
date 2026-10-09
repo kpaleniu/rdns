@@ -321,9 +321,9 @@ impl Ttl {
     /// RFC 9077 §§3.1-3.3 say the same of the NSEC or NSEC3 beside it).
     ///
     /// Named rather than spelled `min` per site because the drift is an omitted
-    /// *term*, and a call taking both cannot omit one. It was MINIMUM alone here
-    /// for months (`TODO.md` #73) behind fixtures that were every one of them
-    /// `$TTL 3600` over `minimum 300`, where the two terms give the same number.
+    /// *term*, and a call taking both cannot omit one. A fixture of `$TTL 3600`
+    /// over `minimum 300` cannot catch the omission: the two terms give the
+    /// same number there.
     ///
     /// A cache's own ceiling is policy on top of this and stays at its call
     /// site: [`Ttl::capped_at`].
@@ -503,10 +503,9 @@ impl ResponseCode {
 mod ttl_tests {
     use super::Ttl;
 
-    /// Both terms, either way round. The direction this repo got wrong is the
-    /// second: MINIMUM alone, for months (`TODO.md` #73), because every fixture
-    /// here is `$TTL 3600` over `minimum 300` and those two spellings agree
-    /// there.
+    /// Fails if either term is dropped: each is the lesser in one case. The
+    /// fixtures elsewhere are `$TTL 3600` over `minimum 300`, where the two
+    /// agree.
     #[test]
     fn a_negative_ttl_is_the_lesser_of_the_soa_ttl_and_minimum() {
         // RFC 2308 §5's usual shape: MINIMUM is the shorter, and wins.
