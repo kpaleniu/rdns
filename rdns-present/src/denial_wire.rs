@@ -18,26 +18,15 @@ use rdns_core::NameRef;
 use rdns_core::Rtype;
 use std::cmp::Ordering;
 
-/// Compare two names in DNSSEC canonical order (RFC 4034 §6.1).
-///
-/// Labels sort from the *right*, and a name sorts ahead of everything beneath
-/// it. String comparison gets both wrong, and an NSEC range check built on it
-/// accepts names outside the gap.
-/// `Iterator::cmp` gives both remaining rules for free: the first differing
-/// label decides, and a name that runs out of labels first is an ancestor and
-/// sorts before its descendants.
 /// The length of an NSEC3 hash. SHA-1 is the only algorithm RFC 5155 §5
-/// defines, and the registry it points at has had no second entry since.
+/// defines, and the registry it points at has no second entry.
 pub const NSEC3_HASH_LEN: usize = 20;
 
 /// The 20 octets RFC 5155 §5 hashes a name to, and the only length one can be.
 ///
-/// SHA-1 is the only algorithm IANA has registered for NSEC3 and
-/// `rdns::dnssec_denial`'s `Nsec3` refuses any other, so a hash of another length is not a short hash — it is
-/// not a hash. As a `Vec<u8>` it was a heap allocation per map key for 20 bytes,
-/// and a wrong length from a remote record was stored and then silently never
-/// matched, which is what `covers` carried an `is_empty()` guard for
-/// (`TODO.md` #40a).
+/// `rdns::dnssec_denial`'s `Nsec3` refuses any algorithm but SHA-1, so a hash
+/// of another length is not a hash, and a remote record carrying one is refused
+/// at parse rather than stored to never match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Nsec3Hash([u8; NSEC3_HASH_LEN]);
 
@@ -49,10 +38,8 @@ impl Nsec3Hash {
 
     /// The hash these exactly-[`NSEC3_HASH_LEN`] octets are.
     ///
-    /// For the one caller that computed them and so cannot be wrong about the
-    /// length — `dnssec_denial::hash_wire`, which is in another module. Total,
-    /// where `from_wire` on a known-good array would be an `expect` on an
-    /// infallible path (`CLAUDE.md` §4).
+    /// For `dnssec_denial::hash_wire`, which computed them. Total, where
+    /// `from_wire` on a known-good array would be an `expect` (`CLAUDE.md` §4).
     pub fn from_octets(octets: [u8; NSEC3_HASH_LEN]) -> Nsec3Hash {
         Nsec3Hash(octets)
     }
@@ -62,6 +49,12 @@ impl Nsec3Hash {
     }
 }
 
+/// Compare two names in DNSSEC canonical order (RFC 4034 §6.1).
+///
+/// Labels sort from the *right*, and a name sorts ahead of everything beneath
+/// it; string comparison gets both wrong, and an NSEC range check built on it
+/// accepts names outside the gap. `Iterator::cmp` over reversed labels gives
+/// both.
 pub fn canonical_name_cmp(a: NameRef<'_>, b: NameRef<'_>) -> Ordering {
     reversed_labels(a).cmp(reversed_labels(b))
 }
@@ -94,21 +87,9 @@ pub struct CanonicalKey(Vec<u8>);
 
 /// A name's labels, right to left. The root has none.
 ///
-/// Borrowed, and folded only where they are compared: a `Vec<String>` costs a
-/// name comparison a `Vec` and a `String` per label at each side — eight
-/// allocations for two three-label names, and `Nsec::covers` makes three
-/// comparisons.
-///
-/// Presentation text split on `.` cannot give RFC 4034 §6.1 ordering for a name
-/// holding RFC 1035 §5.1's `\.`: `a\.b.example.com.` comes apart into four
-/// labels, one of them ending in a backslash, and sorts somewhere no other
-/// implementation puts it. Reading the wire form is the same rule with nothing
-/// to get wrong — a label is what the length octet says it is.
-///
-/// `suffix(n)` per label rather than a reversed iterator: [`NameRef::labels`]
-/// walks forwards, since the wire form is a chain of length octets, and the
-/// alternative to re-walking it is an offset table on the stack for a name that
-/// has three labels.
+/// Borrowed, and folded only where compared. Read from the wire form: text
+/// split on `.` breaks a label holding RFC 1035 §5.1's `\.`. `suffix(n)` per
+/// label because [`NameRef::labels`] walks forwards only.
 pub fn reversed_labels(name: NameRef<'_>) -> impl Iterator<Item = Folded<'_>> {
     (1..=name.label_count()).map(move |n| Folded(name.suffix(n).labels().next().unwrap_or(&[])))
 }
@@ -225,11 +206,8 @@ pub(crate) fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>
             return Err(types);
         }
         for (byte, bits) in rest[2..2 + len].iter().enumerate() {
-            // Bit 0 is the *high* bit (RFC 4034 §4.1.2), so it is
-            // `leading_zeros` that names the next set type and taking them from
-            // the top keeps the output ascending. `trailing_zeros` is the idiom
-            // for the other bit order and would list each byte's types
-            // backwards.
+            // Bit 0 is the high bit (RFC 4034 §4.1.2), so `leading_zeros` names
+            // the next type and keeps the output ascending.
             let mut remaining = *bits;
             while remaining != 0 {
                 let bit = remaining.leading_zeros() as u16;
@@ -262,12 +240,10 @@ pub fn base32hex_encode(data: &[u8]) -> String {
     out
 }
 
-/// The same into a caller's byte buffer, which must hold
-/// `base32hex_len` octets — private to this crate, since nothing outside it
-/// sizes a buffer for this.
+/// The same into a caller's buffer of `base32hex_len` octets; returns how many
+/// were written.
 ///
-/// Returns how many were written. For an owner name the encoding is a *label*,
-/// so the bytes are what is wanted and a `String` is the conversion.
+/// For an owner name the encoding is a *label*, so bytes are what is wanted.
 pub fn encode_base32hex_in(data: &[u8], alphabet: &[u8; 32], out: &mut [u8]) -> usize {
     let mut at = 0;
     for c in base32hex_chars(data, alphabet) {
@@ -352,16 +328,8 @@ mod tests {
         assert_eq!(cmp("example.com.", "www.example.com."), Ordering::Less);
         // Case and trailing dots do not matter.
         assert_eq!(cmp("EXAMPLE.com", "example.com."), Ordering::Equal);
-        // RFC 4034 §6.1's own example ordering, less the two names it spells
-        // with escapes (`\001.z.example` and `\200.z.example`): a label holding
-        // `\` is refused outright here (`dname::unrepresentable_octet`), so
-        // those are not names this library can hold, and comparing them as
-        // presentation text would order them by the backslash rather than by
-        // the octet they stand for.
-        //
-        // `Z.a.example` and `zABC.a.EXAMPLE` are the case-folding half of the
-        // example, and they are load-bearing: unfolded, `EXAMPLE` sorts before
-        // `example` and the last three lines come out in the wrong order.
+        // RFC 4034 §6.1's example less two escaped names `dname` refuses.
+        // Unfolded, the mixed-case names would misorder the last three.
         let mut names = vec![
             "z.example.",
             "yljkjljk.a.example.",
@@ -419,10 +387,8 @@ mod tests {
         assert!(key("example.") < key("a.example."));
         assert!(key("ab.example.") < key("abc.example."));
 
-        // `a\.b` is one label of three octets (RFC 1035 §5.1), so the key holds
-        // the dot it stands for and not the backslash that spells it. Splitting
-        // on `.` makes three labels of it and writes `example\0b\0a\\0`, which
-        // is where no other implementation puts the name.
+        // `a\.b` is one label (RFC 1035 §5.1): the key holds the dot, not the
+        // backslash, where splitting on `.` would make three labels.
         assert_eq!(
             key(r"a\.b.example."),
             CanonicalKey(b"example\0a.b\0".to_vec())

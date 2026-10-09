@@ -43,16 +43,11 @@ pub fn record_line(
     Ok(out)
 }
 
-/// [`record_line`] for a caller writing a whole zone, which is the same line
-/// appended to a buffer it already has.
+/// [`record_line`] appending to a caller's buffer, for writing a whole zone.
 ///
-/// The primitive, with [`record_line`] as the allocating wrapper
-/// (`CLAUDE.md` §13): `zone_to_string` allocated a `String` per record and
-/// copied it into the output, two million of each on a million-record zone
-/// (`TODO.md` #64c).
-///
-/// Nothing is appended unless the whole line can be written, so a caller that
-/// gives up on the error keeps a buffer with no half-record in it.
+/// The primitive, with [`record_line`] as the allocating wrapper (`CLAUDE.md`
+/// §13). Nothing is appended unless the whole line is written, so a caller that
+/// gives up on the error keeps no half-record.
 pub fn record_line_into(
     out: &mut String,
     name: NameRef<'_>,
@@ -94,10 +89,8 @@ pub fn resource_record_line(record: &ResourceRecord) -> Result<String, ZoneError
 /// need not be enumerated here.
 fn rdata_to_string(stored: RecordDataRef<'_>) -> (Cow<'static, str>, String) {
     let name = record_type_name(stored.rtype());
-    // Lazily, which is `TODO.md` #64c's first measurement: this was built for
-    // every record and thrown away whenever the type-specific form worked,
-    // which is the ordinary case. An RRSIG is ~110 octets and the hex form
-    // allocated per octet, so a signature cost ~110 discarded allocations.
+    // Lazily: the type-specific form is the ordinary case, and the generic hex
+    // form allocates per octet.
     let generic = |name: Cow<'static, str>| (name, generic_rdata(stored));
 
     let Ok(parsed) = stored.parse() else {
@@ -194,9 +187,8 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
             }
         }
         ParsedRecord::DNSKEY {
-            // The mnemonic comes from the record's own type, not from here:
-            // a CDNSKEY prints the same RDATA under another name
-            // (RFC 7344 §3.2).
+            // The record's own type names it: a CDNSKEY prints this RDATA under
+            // another name (RFC 7344 §3.2).
             rtype: _,
             flags,
             protocol,
@@ -266,13 +258,11 @@ fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
     })
 }
 
-/// A type bitmap as the list of type names an NSEC or NSEC3 line ends with, each
-/// preceded by a space — or `None` if that would not read back as the same
-/// bytes.
+/// A type bitmap as the ` TYPE` list an NSEC or NSEC3 line ends with, or `None`
+/// if that would not read back as the same bytes.
 ///
-/// [`rdata_to_string`]'s re-encode check cannot see this: a bitmap is stored
-/// verbatim, so padding or an unusual window layout survives it, and only the
-/// text form drops them. Compare against the layout the parser will rebuild.
+/// A bitmap is stored verbatim, so padding or an odd window layout survives
+/// [`rdata_to_string`]'s re-encode check; only the text form drops them.
 fn bitmap_to_string(bitmap: &[u8]) -> Option<String> {
     let types = bitmap_types_exact(bitmap).ok()?;
     if crate::denial_wire::build_type_bitmap(&types) != bitmap {
@@ -291,10 +281,8 @@ fn bitmap_to_string(bitmap: &[u8]) -> Option<String> {
 /// Whitespace ends a field; `;`, `"`, parentheses, `\`, `@` and `$` all mean
 /// something to the parser, so a name carrying one is written escaped.
 fn writable_name(name: NameRef<'_>) -> String {
-    // Total. A `.` inside a label, or a `;` or `"` written raw, would come back
-    // as syntax rather than as data; a `Name` escapes every one of those
-    // (RFC 1035 §5.1) and the parser resolves them, so there is no name this
-    // cannot write (deviation D-1).
+    // Total: a `Name` escapes `.`, `;` and `"` in a label (RFC 1035 §5.1), so
+    // there is no name this cannot write (deviation D-1).
     name.to_presentation()
 }
 

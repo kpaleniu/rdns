@@ -69,9 +69,8 @@ pub(crate) fn svc_param_key_from_name(name: &str) -> Option<u16> {
         "ipv6hint" => Some(svc_param_keys::IPV6HINT),
         other => {
             let digits = other.strip_prefix("key")?;
-            // "0" is `key0`, but `key0001` is not a spelling of it: the writer
-            // never emits a leading zero, so accepting one would break the
-            // round trip this pair promises.
+            // `key0001` is not a spelling of `key0`: the writer never emits a
+            // leading zero, so accepting one breaks the round trip.
             if digits.len() > 1 && digits.starts_with('0') {
                 return None;
             }
@@ -82,14 +81,9 @@ pub(crate) fn svc_param_key_from_name(name: &str) -> Option<u16> {
 
 /// Parse the `key=value` tail of an SVCB or HTTPS record.
 ///
-/// Returned unsorted-safe: [`rdns_core::ParsedRecord`]'s encoder puts the pairs
-/// in the strictly increasing order the wire needs (RFC 9460 §2.2), so an
-/// operator may write them in any order. A repeated key is refused *here*
-/// rather than there, because here is where the line number is.
-///
-/// Generic over the field type rather than taking `&[&str]`, because how a zone
-/// parser spells a token is the parser's business: `rdns`'s are `Cow`s borrowed
-/// from the file unless a quote or an escape means they cannot be.
+/// Any order: [`rdns_core::ParsedRecord`]'s encoder sorts the pairs (RFC 9460
+/// §2.2). A repeated key is refused here, where the line number is. Generic
+/// over the field type so the zone parser's borrowed `Cow`s pass through.
 pub fn parse_params<S: AsRef<str>>(
     fields: &[S],
     ln: usize,
@@ -120,13 +114,8 @@ pub fn parse_params<S: AsRef<str>>(
                 ),
             ));
         }
-        // The *spelling* picks the value format, not the number. `alpn=h2,h3`
-        // is a comma-separated list; `key1="\002h2"` is the same key written
-        // opaquely and its value is raw octets. RFC 9460 §7.1.1 says so by
-        // example: an implementation may refuse `,` and `\` in ALPN ids
-        // "relying on the opaque key format (e.g., key1=\002h2) in the event
-        // that these characters are needed" — which only works if `key1` and
-        // `alpn` parse differently.
+        // The spelling picks the format: `alpn=h2,h3` is a list, `key1=\002h2`
+        // raw octets; RFC 9460 §7.1.1 relies on that for ALPN ids holding `,`.
         let written_by_name = svc_param_key_name(code) == name;
         params.push((code, encode_value(code, name, value, written_by_name, ln)?));
     }
@@ -150,9 +139,8 @@ fn encode_value(
             .map_err(|e| syntax(format!("the {name:?} value: {e}")));
     }
 
-    // Four keys "MUST NOT contain escape sequences" so that parsing stays
-    // simple (RFC 9460 §7.2, §7.3 and §8). Taking them at their word means a
-    // stray backslash is a syntax error rather than a silently different value.
+    // Four keys "MUST NOT contain escape sequences" (RFC 9460 §7.2, §7.3, §8):
+    // a stray backslash is a syntax error, not a different value.
     let plain = |value: Option<&str>| -> Result<String, ZoneError> {
         let text = value.unwrap_or_default();
         if text.contains('\\') {
@@ -197,9 +185,8 @@ fn encode_value(
             if codes.is_empty() {
                 return Err(syntax(format!("{name:?} needs at least one key")));
             }
-            // "concatenated in strictly increasing numeric order" (§8) — the
-            // operator's order is not information, the same way the SvcParams'
-            // own order is not.
+            // "concatenated in strictly increasing numeric order" (§8): the
+            // operator's order is not information.
             codes.sort_unstable();
             Ok(codes.iter().flat_map(|c| c.to_be_bytes()).collect())
         }
@@ -270,19 +257,11 @@ fn encode_value(
             }
             Ok(out)
         }
-        // RFC 9460 §14.3.2 registers key 5 as "RESERVED (held for Encrypted
-        // ClientHello)" and defines no value format, so this looked like one
-        // more opaque key — and that is wrong in the silent direction. The
-        // format is base64, from the ECH specification that reserved it, and
-        // dnspython reads `ech="aGVsbG8="` as the five octets `hello` where an
-        // opaque reading stores the eight characters of the base64 itself.
-        // Storing the wrong bytes under the right name is worse than refusing
-        // (`CLAUDE.md` §4), and the third party disagreeing with us is how this
-        // was caught rather than shipped.
+        // Base64, per the ECH draft that reserved key 5 (RFC 9460 §14.3.2 gives
+        // no format); read as opaque, the wrong bytes are stored.
         key::ECH => {
-            // Not `plain`: that one refuses a backslash citing §7.2, §7.3 and
-            // §8, none of which is about this key. A backslash is not base64
-            // either, so the decoder's own message is the accurate one.
+            // Not `plain`, whose error cites sections about other keys; the
+            // base64 decoder's message is the accurate one.
             base64::Engine::decode(
                 &base64::prelude::BASE64_STANDARD,
                 value.unwrap_or_default().trim(),
@@ -297,14 +276,8 @@ fn encode_value(
 
 /// Split a comma-separated list (RFC 9460 Appendix A.1).
 ///
-/// Takes the RFC's own simplification: "a value-list parser that splits on `,`
-/// and prohibits items containing `\` is sufficient to comply with all
-/// requirements in this document". The escaped form exists so that a `,` can
-/// appear *inside* an item, which no registered key needs — and §7.1.1 says an
-/// implementation "MAY disallow the `,` and `\` characters in ALPN IDs
-/// instead", pointing at `key1=\002h2` for the case that does. Refusing is what
-/// this codebase already does with escapes it will not resolve
-/// (`TODO.md` #13e).
+/// Items containing `\` are refused, which Appendix A.1 calls sufficient to
+/// comply; §7.1.1 points at `key1=\002h2` for an ALPN id that needs a `,`.
 fn comma_list(text: &str, name: &str, ln: usize) -> Result<Vec<String>, ZoneError> {
     if text.is_empty() {
         return Ok(Vec::new());
@@ -331,13 +304,9 @@ fn comma_list(text: &str, name: &str, ln: usize) -> Result<Vec<String>, ZoneErro
 
 /// The SvcParams as zone-file text.
 ///
-/// Total, and deliberately: a value that does not fit the shape its key
-/// requires — an `ipv4hint` off the wire whose length is not a multiple of
-/// four, an ALPN id with a comma in it — is written in the `keyNNNNN` opaque
-/// form, which says the same octets and reads back the same. Sinking the whole
-/// record to RFC 3597 `\#` form would also be correct but loses the six
-/// parameters that were fine, and returning `None` would put a "cannot write
-/// this" case into every caller for a record we can always write.
+/// Total: a value not fitting its key's shape is written in the `keyNNNNN`
+/// opaque form, which reads back the same, rather than sinking the record to
+/// RFC 3597 `\#` or making every caller handle `None`.
 pub(crate) fn present_params(params: &[(u16, Vec<u8>)]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -353,9 +322,8 @@ pub(crate) fn present_params(params: &[(u16, Vec<u8>)]) -> String {
                 out.push_str(&text);
                 out.push('"');
             }
-            // The opaque spelling. `key{code}` rather than the name, so the
-            // parser reads it back as octets instead of trying the shape that
-            // did not fit.
+            // Opaque: `key{code}`, so the parser reads octets rather than
+            // retrying the shape that did not fit.
             None => {
                 let _ = write!(out, "key{code}");
                 out.push_str("=\"");
@@ -396,9 +364,8 @@ fn present_value(code: u16, value: &[u8]) -> Option<Option<String>> {
                     return None;
                 }
                 let item = char_string_escaped(&tail[..len]);
-                // A `,` inside an id would be read back as a separator, and
-                // `comma_list` refuses the escape that would fix it — so such a
-                // record goes out generic rather than out wrong.
+                // A `,` inside an id reads back as a separator and `comma_list`
+                // refuses the escape, so the record goes out generic.
                 if item.contains(',') {
                     return None;
                 }
@@ -633,17 +600,10 @@ mod tests {
         }
     }
 
-    /// RFC 9460 Appendix D Figure 10 is `alpn="f\\\\oo\\,bar,h2"` — a comma
-    /// *inside* an ALPN id, escaped. This parser refuses it, which the RFC
-    /// allows twice over: Appendix A.1 says "a value-list parser that splits on
-    /// `,` and prohibits items containing `\` is sufficient to comply with all
-    /// requirements in this document", and §7.1.1 says an implementation "MAY
-    /// disallow the `,` and `\` characters in ALPN IDs instead of implementing
-    /// the value-list escaping procedure, relying on the opaque key format
-    /// (e.g., `key1=\002h2`)".
+    /// Fails unless RFC 9460 Appendix D Figure 10's escaped comma inside an
+    /// ALPN id is refused with an error naming the opaque form.
     ///
-    /// Recorded as a test rather than a comment because it is a deliberate
-    /// limit, and the error has to point at the way out.
+    /// Refusing is allowed by Appendix A.1 and §7.1.1.
     #[test]
     fn an_escaped_comma_inside_an_alpn_id_is_refused_with_the_way_out() {
         let err = parse_zone_file(
@@ -664,16 +624,10 @@ mod tests {
         );
     }
 
-    /// RFC 9460 §14.3.2 registers `ech` as "RESERVED (held for Encrypted
-    /// ClientHello)" and gives no value format, so it read as one more opaque
-    /// key — and that was wrong in the silent direction: the format is base64.
+    /// Fails unless `ech` is base64: dnspython encodes `1 . ech="aGVsbG8="` as
+    /// key 5, length 5, the octets `hello`.
     ///
-    /// The number here is dnspython's, which is the point. Asked to encode
-    /// `1 . ech="aGVsbG8="` it produces `...0005 68656C6C6F` — key 5, length 5,
-    /// the octets `hello` — where the opaque reading stored the eight
-    /// characters of the base64 text. A third party disagreeing is how this
-    /// was caught (`CLAUDE.md` §1: our parser agreeing with our serializer
-    /// proves nothing).
+    /// The expected bytes are dnspython's (`CLAUDE.md` §1).
     #[test]
     fn ech_is_base64_which_dnspython_had_to_settle() {
         assert_eq!(

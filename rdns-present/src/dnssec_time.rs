@@ -36,9 +36,8 @@ pub fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
         return Ok(epoch);
     }
 
-    // Fourteen ASCII digits, established before anything is sliced: the
-    // slicing below is by byte, so a 14-byte string holding a multi-byte
-    // character would panic on a boundary rather than fail to parse.
+    // Fourteen ASCII digits before any slicing: slicing is by byte, and a
+    // multi-byte character would panic on a boundary.
     if time_str.len() != 14 || !time_str.bytes().all(|b| b.is_ascii_digit()) {
         return Err(format!(
             "Invalid DNSSEC time format: {time_str} (want a bare epoch or 14 digits)"
