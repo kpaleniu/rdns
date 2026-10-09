@@ -73,9 +73,8 @@ pub async fn serve(
             },
             _ = stop.wait() => return Ok(()),
         };
-        // `try_acquire`, not `acquire`: a queued scrape is stale by the time it
-        // is served. Dropping closes the socket, which the collector reads as a
-        // failed scrape.
+        // `try_acquire`: a queued scrape is stale when served, and the dropped
+        // socket reads as a failed scrape.
         let Ok(permit) = permits.clone().try_acquire_owned() else {
             continue;
         };
@@ -123,9 +122,8 @@ fn answer(
         // The process is running and its runtime is scheduling tasks, which is
         // all a liveness probe can honestly claim.
         (&Method::GET, "/healthz") => text(StatusCode::OK, "text/plain", "ok\n".into()),
-        // 503 rather than 200-with-a-body: an orchestrator's probe reads the
-        // status code, and one that always passes is not a gate. The names go
-        // in the body for whoever curls it.
+        // 503, not 200 with a body: a probe reads the status code. The names go
+        // in the body.
         (&Method::GET, "/readyz") => match readiness.pending() {
             pending if pending.is_empty() => text(StatusCode::OK, "text/plain", "ready\n".into()),
             pending => text(
@@ -156,21 +154,10 @@ fn answer(
 
 /// Why this request's `Host` breaks RFC 9112 §3.2, or `None` if it does not.
 ///
-/// The section is three MUSTs in one sentence — "A server MUST respond with a
-/// 400 (Bad Request) to any HTTP/1.1 request message that lacks a Host header
-/// field and to any request message that contains more than one Host header
-/// field line or a Host header field with an invalid field value" — and hyper
-/// enforces none of them: measured before this was written, two `Host` lines
-/// and `Host: a b` were both answered 200.
-///
-/// The last of the three is delegated to `http`'s own authority parser rather
-/// than spelled out here, because "invalid field value" means §3.2's
-/// `uri-host [ ":" port ]` and a second implementation of that is the thing
-/// `CLAUDE.md` §7 is about.
-///
-/// HTTP/1.0 is exempt by the section's own wording, which is also the escape
-/// hatch for the hand-typed probe this costs: `GET /metrics HTTP/1.0` needs no
-/// header at all.
+/// The section's three MUSTs (missing, repeated, invalid) answer 400, and hyper
+/// enforces none. Validity is `http`'s authority parser, not a second copy
+/// (`CLAUDE.md` §7). HTTP/1.0 is exempt by the section's wording, so `GET
+/// /metrics HTTP/1.0` needs no header.
 fn bad_host(request: &Request<hyper::body::Incoming>) -> Option<&'static str> {
     let mut hosts = request.headers().get_all(hyper::header::HOST).iter();
     let Some(host) = hosts.next() else {

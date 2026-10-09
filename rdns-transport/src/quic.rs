@@ -53,15 +53,10 @@ pub const DOQ_PORT: u16 = 853;
 /// to tell DNS from anything else without it.
 const ALPN_DOQ: &[u8] = b"doq";
 
-/// RFC 9250 §4.3's application error codes.
+/// RFC 9250 §4.3's application error codes: only the three this server sends.
 ///
-/// Only the three this server can produce are named. The others describe a
-/// client's conduct or a condition that cannot arise here, and a constant
-/// nothing sends is a claim nothing checks.
-///
-/// No code is named for closing an idle connection. `DOQ_NO_ERROR` fits: "used
-/// when the connection or stream needs to be closed, but there is no error to
-/// signal". `DOQ_EXCESSIVE_LOAD` would claim a load nothing here measures.
+/// An idle close is `DOQ_NO_ERROR`: "the connection or stream needs to be
+/// closed, but there is no error to signal".
 const DOQ_NO_ERROR: u32 = 0x0;
 /// §4.3.2: "If a server is incapable of sending a DNS response due to an
 /// internal error, it SHOULD issue a QUIC RESET_STREAM frame. The error code
@@ -88,11 +83,8 @@ pub fn server_config(
 
     let transport =
         Arc::get_mut(&mut config.transport).expect("the transport config is not shared yet");
-    // The same two ceilings the TCP loop applies, expressed where QUIC enforces
-    // them for us: a stream is a query, so the in-flight cap is a stream cap.
-    // QUIC's idle timer is only the floor for a silent client: RFC 9000 §10.1
-    // restarts it on every packet, PINGs included, so `serve_connection` keeps
-    // its own.
+    // TCP's in-flight cap as a stream cap. QUIC's idle timer restarts on any
+    // packet (RFC 9000 §10.1), so `serve_connection` keeps its own.
     transport.max_concurrent_bidi_streams((limits.max_inflight_per_connection as u32).into());
     // A client has no reason to open one of these, so allowing any is allowing
     // an unanswerable stream to sit there holding memory.
@@ -227,11 +219,8 @@ async fn serve_connection<H: Handler>(
     rate: RateLimit,
     stop: Stop,
 ) {
-    // Read once per connection, not per stream: the handshake is the only place
-    // a certificate is presented, and a transfer over DoQ is authorized from it
-    // exactly as one over DoT is (`TODO.md` #59). `peer_identity` is quinn's
-    // `Box<dyn Any>` because the crypto layer is generic; under rustls it is the
-    // chain, leaf first.
+    // Once per connection: only the handshake presents a certificate. Under
+    // rustls quinn's `Box<dyn Any>` is the chain, leaf first.
     let presented = match connection
         .peer_identity()
         .and_then(|identity| {
@@ -248,9 +237,8 @@ async fn serve_connection<H: Handler>(
     let mut idle_at = tokio::time::Instant::now() + idle;
     let mut streams = tokio::task::JoinSet::new();
     let why: &[u8] = loop {
-        // `accept_bi` is the shutdown check's home for the same reason the TCP
-        // loop checks between messages: between streams the peer has committed
-        // to nothing.
+        // Shutdown is checked at `accept_bi`, as TCP checks between messages:
+        // between streams the peer has committed to nothing.
         let stream = tokio::select! {
             stream = connection.accept_bi() => stream,
             () = tokio::time::sleep_until(idle_at) => break b"idle",
@@ -333,29 +321,15 @@ async fn serve_stream<H: Handler>(
         peer,
         presented,
     } = client;
-    // The client closes its half after one query, so reading to the end is the
-    // whole message and needs no length prefix to bound it — but the prefix is
-    // there (RFC 9250 keeps RFC 1035 §4.2.2's framing) and is what says how much
-    // of what arrived is the message.
-    //
-    // Bounded by what the prefix can describe, which is the same bound the TCP
-    // loop works under: it reads a u16 length and no more. The daemon's
-    // configured cap is applied below by `accept_packet`, on the message rather
-    // than on the stream, exactly as on TCP -- one place decides how big a
-    // request may be and it is not per transport.
-    //
-    // A query with no FIN after `read_timeout` is a "dangling" stream
-    // (RFC 9250 §4.2), and a missing FIN is on §4.3.3's list: "SHOULD forcibly
-    // abort the connection ... and SHOULD use the DoQ error code
-    // DOQ_PROTOCOL_ERROR" -- as a stalled message ends a TCP connection.
+    // Bounded by what the u16 prefix can describe. A stream with no FIN by
+    // `read_timeout` is aborted (RFC 9250 §4.2, §4.3.3).
     let raw =
         match tokio::time::timeout(limits.read_timeout, recv.read_to_end(u16::MAX as usize + 2))
             .await
         {
             Ok(Ok(raw)) => raw,
-            // §4.3.1: "The server MUST issue a RESET_STREAM" in reply. No code
-            // is named; `DOQ_REQUEST_CANCELLED` is the client's, and §4.3.4 has
-            // a code in an unexpected context read as `DOQ_UNSPECIFIED_ERROR`.
+            // §4.3.1: "The server MUST issue a RESET_STREAM" in reply. The RFC
+            // names no code, so no error.
             Ok(Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(_)))) => {
                 tracing::debug!(peer = %peer.ip(), "QUIC query stream cancelled by the client");
                 let _ = send.reset(DOQ_NO_ERROR.into());
@@ -384,10 +358,8 @@ async fn serve_stream<H: Handler>(
                 )
             }
         };
-    // §4.3.3's list: "a ... server receives a STREAM FIN before receiving all
-    // the bytes for a message indicated in the 2-octet length field", and "a
-    // server receives more than one query on a stream". A zero length is not on
-    // it by name; the list is "not limited to", and it frames nothing.
+    // §4.3.3: a FIN before the full length, or a second query on a stream. A
+    // zero length frames nothing; the list is "not limited to".
     let Some(packet) = framed_query(&raw) else {
         return protocol_error(
             &connection,
@@ -401,24 +373,18 @@ async fn serve_stream<H: Handler>(
         .context()
         .accept_packet(Peer::from(peer), &packet, Transport::Tcp)
     {
-        // Same cap as TCP and for the same reason: a stream is not a datagram,
-        // so the UDP ceiling is the wrong one to judge it by. The stream only,
-        // as TCP skips the message and not the connection: the framing was
-        // right. A reset rather than a FIN, which reads as a complete answer
-        // of nothing.
+        // TCP's cap, not UDP's. Reset the stream, not the connection, since the
+        // framing was right; a FIN would read as an empty answer.
         let _ = send.reset(DOQ_UNSPECIFIED_ERROR.into());
         return;
     }
 
-    // A channel per stream, so the handler is the one it already is. A transfer
-    // answers with several framed messages and they all belong on this stream
-    // (RFC 9250 permits that, and it is what makes XFR-over-DoQ the same code).
+    // A channel per stream: a transfer's several messages all belong on it (RFC
+    // 9250).
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Reply>(limits.max_inflight_per_connection);
     let logger = handler.context().logger.clone();
     let answering = tokio::spawn(async move {
-        // Unconditionally 1.3: RFC 9001 §4.2 gives QUIC no other option
-        // ("QUIC ... MUST use TLS 1.3 or greater"), so there is no handshake to
-        // interrogate the way `tls.rs` has to.
+        // Always 1.3: RFC 9001 §4.2, "MUST use TLS 1.3 or greater".
         handler
             .handle(packet, peer, now, Arrival::Doq(presented), tx)
             .await;
@@ -432,10 +398,8 @@ async fn serve_stream<H: Handler>(
             let _ = answering.await;
             return;
         };
-        // The RFC leaves a reply never read to flow control (§5.8). Reset per
-        // stream: QUIC credit is per stream, so one starved stream says nothing
-        // of the others. quinn reports a lost connection as `NotConnected`, so
-        // `TimedOut` is the stall.
+        // A reply never read stalls this stream's credit (§5.8), so reset it;
+        // `TimedOut` is that stall, `NotConnected` a lost connection.
         if let Err(e) = crate::write_progressing(&mut send, &framed, limits.read_timeout).await {
             if e.kind() == std::io::ErrorKind::TimedOut {
                 logger.count_error(Peer::from(peer));

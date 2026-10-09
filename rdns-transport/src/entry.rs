@@ -5,13 +5,11 @@
 use std::future::Future;
 use std::process::ExitCode;
 
-/// Run `serve` on a multi-threaded runtime, under the service control
-/// manager as service `service` when one is named (Windows), else as a
-/// console process.
+/// Run `serve` on a multi-threaded runtime, as the Windows service `service`
+/// when one is named, else as a console process.
 ///
-/// A failure is printed as `main` returning `Err` prints it, and also logged
-/// when the log goes to a file, since a service's standard error goes
-/// nowhere.
+/// A failure is printed as `main` returning `Err` prints it, and also logged to
+/// a log file, since a service's standard error goes nowhere.
 pub fn run<F>(service: Option<&str>, serve: impl FnOnce() -> F + Send + 'static) -> ExitCode
 where
     F: Future<Output = anyhow::Result<()>>,

@@ -89,15 +89,11 @@ impl Encrypted {
     }
 
     /// "127.0.0.1:853 (IPv4) DoT, 127.0.0.1:853 (IPv4) DoQ", or whichever are
-    /// configured, with the families each will serve (`TODO.md` #159).
+    /// configured, with the families each will serve.
     ///
-    /// For `--check-config`, which binds nothing, so the families are what
-    /// [`bind::planned`] says the bind will make of the address. The startup
-    /// line reads them from the sockets instead —
-    /// [`EncryptedListeners::describe`], in the same spelling. The dry run once
-    /// had its own copy that matched DoT and DoQ alone, so a DoH-only server
-    /// was reported as "encrypted transports disabled" by the one command whose
-    /// job is to be believed before a restart (`CLAUDE.md` §7).
+    /// For `--check-config`, which binds nothing: the families are what
+    /// [`bind::planned`] says the bind will make, in the spelling of
+    /// [`EncryptedListeners::describe`], which reads the sockets.
     pub fn listeners(&self) -> String {
         let planned = |addr: &str| bind::planned(addr).unwrap_or_else(|| addr.to_string());
         let mut parts = Vec::new();

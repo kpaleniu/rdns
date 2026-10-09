@@ -115,14 +115,11 @@ pub(crate) struct Slot {
 }
 
 impl Slot {
-    /// A connection from `peer` now holds this slot, or `false` if its source
-    /// already holds as many as `--max-connections-per-source` allows. The
-    /// caller closes a refused connection without a reply, and dropping the
-    /// slot releases it.
+    /// A connection from `peer` holds this slot, or `false` if its source is at
+    /// `--max-connections-per-source`; dropping the slot releases it.
     ///
-    /// After `accept`, not before like [`Slots::take`]: the peer is known only
-    /// from `accept`. Separate from `take` too because the accept loop holds a
-    /// slot while it waits, and the gauge counts connections, not that.
+    /// After `accept`, unlike [`Slots::take`]: only `accept` names the peer,
+    /// and the gauge counts connections, not the accept loop's waiting slot.
     pub(crate) fn open(&mut self, peer: Peer) -> bool {
         let per_source = &self.shared.per_source;
         if per_source.limit > 0 && !per_source.exempt.allows(peer) {

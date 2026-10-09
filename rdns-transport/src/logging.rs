@@ -18,12 +18,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 /// How much a daemon says.
 ///
-/// The level stops the work, not just the output: `tracing`'s macros only build
-/// their arguments when a subscriber is interested, which is what keeps a
-/// malformed-packet flood from costing a `format!` per packet.
-///
-/// Volume beyond that is journald's job (`LogRateLimitIntervalSec`,
-/// `LogRateLimitBurst`); a second limiter here would hide what the first did.
+/// The level stops the work: `tracing` builds a macro's arguments only when a
+/// subscriber wants them. Volume beyond that is journald's job
+/// (`LogRateLimitIntervalSec`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
     Error,
@@ -62,22 +59,12 @@ impl FromStr for LogLevel {
     }
 }
 
-/// Send this process's log lines to stderr at `level`, honouring `RUST_LOG`,
-/// or to `file` when one is given (`--log-file`, `TODO.md` #190).
+/// Send log lines to stderr at `level`, honouring `RUST_LOG`, or to `file`
+/// (`--log-file`); called once, by a binary.
 ///
-/// Called once, by a binary; library code only emits. Shared so that `rdnsd` and
-/// `rdnsr` cannot end up configured differently.
-///
-/// `RUST_LOG` wins where it is set — reaching for it means a server misbehaving
-/// under a level chosen in a unit file, and editing the unit is a restart.
-/// `--quiet` and `--log-level` set the fallback.
-///
-/// No timestamps and no ANSI on stderr: journald stamps every line, and two
-/// stamps disagreeing is worse than losing one in a terminal. A file gets a
-/// UTC timestamp per line, since nothing else stamps it.
-///
-/// A file that cannot be opened for appending is an error: a service whose
-/// log goes nowhere is a service nobody can debug (`CLAUDE.md` §4).
+/// `RUST_LOG` wins where set: editing a unit file is a restart. No timestamps
+/// or ANSI on stderr, which journald stamps; a file gets a UTC timestamp per
+/// line. A file that cannot be opened is an error (`CLAUDE.md` §4).
 pub fn init(level: LogLevel, file: Option<&Path>) -> std::io::Result<()> {
     use tracing_subscriber::EnvFilter;
 

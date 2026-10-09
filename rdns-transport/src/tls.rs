@@ -127,11 +127,8 @@ impl CertificateStore {
                 *guard = certified;
                 Ok(())
             }
-            // Never panic while holding a lock, and never on a path a reload
-            // reaches (`CLAUDE.md` §6). A poisoned lock here means a previous
-            // writer panicked, which cannot happen above — but if it did, the
-            // old certificate is still being served and saying so beats
-            // poisoning every later handshake.
+            // Never panic under a lock (`CLAUDE.md` §6): the old certificate is
+            // still served, and saying so beats poisoning every handshake.
             Err(_) => Err(anyhow!(
                 "the certificate lock is poisoned; still serving the previously \
                  loaded certificate"
@@ -147,12 +144,8 @@ impl CertificateStore {
 
 impl ResolvesServerCert for CertificateStore {
     fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        // One certificate, whatever was asked for: SNI-based selection is a
-        // virtual-hosting feature, and a DNS server is reached by address.
-        //
-        // `read()` rather than `unwrap()`: this runs per handshake, and a
-        // poisoned lock must not turn into a panic in a connection task.
-        // `None` here is a handshake failure, which is what the counter is for.
+        // One certificate whatever SNI asks: a DNS server is reached by
+        // address. A poisoned lock is a handshake failure, not a panic.
         self.current.read().ok().map(|guard| guard.clone())
     }
 }
@@ -167,9 +160,8 @@ fn read_certified_key(cert_path: &Path, key_path: &Path) -> Result<Arc<Certified
             key_path.display()
         )
     })?;
-    // `CertifiedKey::new` does not check that the key matches the certificate,
-    // so ask for the signer here: a mismatched pair otherwise loads, starts, and
-    // fails every handshake.
+    // `CertifiedKey::new` does not check the key matches; unchecked, a
+    // mismatched pair fails every handshake.
     let certified = CertifiedKey::new(certs, signing_key);
     certified.keys_match().map_err(|e| {
         anyhow!(
@@ -190,15 +182,11 @@ pub fn server_config(
 }
 
 /// A verifier that *asks* for a client certificate and accepts a client that
-/// has none (`TODO.md` #59).
+/// has none.
 ///
-/// Optional, not required, because one `ServerConfig` serves DoT, DoQ and DoH:
-/// demanding a certificate would demand one from every stub resolver on the
-/// same port, and RFC 8310 §8.2's mTLS for DoT is a different relationship
-/// from RFC 9103 §7.5's for transfers. What a presented certificate then
-/// *authorizes* is the transfer path's decision and nobody else's
-/// (`CLAUDE.md` §16) — here it is only verified against the operator's
-/// anchors.
+/// Optional because one `ServerConfig` serves DoT, DoQ and DoH to every stub.
+/// What a certificate authorizes is the transfer path's decision (`CLAUDE.md`
+/// §16).
 fn client_verifier(
     anchors: Arc<rustls::RootCertStore>,
 ) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
@@ -219,9 +207,8 @@ pub(crate) fn config_with_alpn(
     clients: Option<rdns::tls_identity::TrustAnchors>,
 ) -> Result<ServerConfig> {
     let builder = ServerConfig::builder();
-    // Without anchors a DoT or DoQ *server* authenticates itself to the client
-    // and does not ask the client to authenticate. See the module docs; with
-    // them it asks and takes no for an answer (`client_verifier`).
+    // Without anchors the server does not ask for a client certificate; with
+    // them it asks and accepts no (`client_verifier`).
     let mut config = match clients {
         Some(anchors) => builder
             .with_client_cert_verifier(client_verifier(anchors.store())?)
@@ -296,12 +283,8 @@ pub async fn serve<H: Handler>(
         let stop = stop.clone();
         let busy = busy.clone();
         tokio::spawn(async move {
-            // The handshake happens *here*, inside the connection's own task,
-            // and not in the accept loop above. A TLS handshake is two round
-            // trips with a stranger, so doing it before the spawn would let one
-            // slow or malicious peer hold up every other connection — the
-            // accept-loop equivalent of the stall RFC 7766 §6.2.1.1 avoids
-            // within a connection.
+            // Handshake in the connection's task: in the accept loop one slow
+            // peer would stall every connection.
             if let Some(stream) =
                 handshake(&acceptor, stream, peer, handler.context(), limits, &stop).await
             {
@@ -340,10 +323,8 @@ pub(crate) async fn handshake(
         // been told nothing yet, so there is nothing to drain.
         _ = stop.wait() => return None,
     };
-    // DEBUG, not WARN. Port 853 is scanned, an expired certificate makes every
-    // client hang up here, and a protocol-version mismatch looks the same as
-    // both — none of which is worth a log line each at the default level. The
-    // counter is what an operator alerts on.
+    // DEBUG: scans, expired certificates and version mismatches all end here.
+    // The counter is what an operator alerts on.
     context
         .metrics
         .count(&context.metrics.tls_handshake_failures);
@@ -382,11 +363,8 @@ pub async fn serve_one_tls<H: Handler>(
         .context()
         .metrics
         .count(&handler.context().metrics.tls_handshakes);
-    // Read from the finished handshake rather than assumed from the listener:
-    // this build offers TLS 1.2 as well, because RFC 7858 §4.1 asks only for
-    // "1.2 or later" and a stub resolver in the field may offer nothing else.
-    // A *transfer* needs 1.3 (RFC 9103 §7.2), and only the connection knows
-    // which it got.
+    // From the handshake: TLS 1.2 is offered for stubs (RFC 7858 §4.1), but a
+    // transfer needs 1.3 (RFC 9103 §7.2).
     let arrival = Arrival::Dot(
         match stream.get_ref().1.protocol_version() {
             Some(rustls::ProtocolVersion::TLSv1_3) => TlsVersion::Tls13,

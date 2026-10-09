@@ -234,9 +234,8 @@ mod windows {
             let client = std::mem::replace(&mut waiting, instance(&name)?);
             match connected {
                 Ok(()) => spawn_conversation(client, &commands, &busy),
-                // A client that opened and closed before the connect
-                // completed (ERROR_NO_DATA) is that client's problem: the
-                // instance is replaced and the loop goes on (`CLAUDE.md` §4).
+                // A client gone before the connect completed (ERROR_NO_DATA):
+                // replace the instance and go on (`CLAUDE.md` §4).
                 Err(e) => tracing::debug!("control pipe: {e}"),
             }
         }
@@ -279,10 +278,8 @@ where
         }
         let mut chunk = [0u8; 256];
         match tokio::time::timeout(READ_TIMEOUT, stream.read(&mut chunk)).await {
-            // Nothing sent is not a command. On Windows it is what a client
-            // holding only read access, which the pipe's default descriptor
-            // grants Everyone, looks like; answering it `help` would be
-            // answering somebody who may not write.
+            // Nothing sent is not a command: on Windows it is a read-only
+            // client, which the default descriptor allows Everyone.
             Ok(Ok(0)) if buf.is_empty() => return Ok(()),
             // A client that closed without a newline still gets its command
             // run: `printf status | socat ...` sends no trailing newline.

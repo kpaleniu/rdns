@@ -63,13 +63,9 @@ pub async fn send_framed(out: &mpsc::Sender<Reply>, bytes: &[u8]) -> bool {
 
 /// A stream whose two halves can be owned by two tasks.
 ///
-/// One trait rather than one generic bound, and the reason is the plain-TCP
-/// path. `TcpStream::into_split` hands back owned halves with nothing between
-/// them; a TLS stream has no such method, so `tokio::io::split` puts a `BiLock`
-/// in the way. Making [`serve_one`] generic over `AsyncRead + AsyncWrite` would
-/// have been shorter and would have taken that lock on every connection,
-/// encrypted or not — a cost paid by the transport that does not need it, to
-/// spare fifteen lines here.
+/// Not a generic `AsyncRead + AsyncWrite`: `tokio::io::split` puts a `BiLock`
+/// between the halves on every connection, which `TcpStream::into_split` avoids
+/// for plain TCP.
 pub trait SplitStream: Send + 'static {
     type Reader: tokio::io::AsyncRead + Unpin + Send + 'static;
     type Writer: tokio::io::AsyncWrite + Unpin + Send + 'static;
@@ -98,15 +94,11 @@ pub trait Handler: Send + Sync + 'static {
     /// handler answers with.
     fn context(&self) -> &ServeContext;
 
-    /// `arrival` is what the transport knows about the connection and the
-    /// handler cannot ask for afterwards, because by the time it has the bytes
-    /// the socket is three layers below it: what the connection hid, which
-    /// RFC 9103 §11 needs to decide whether a transfer may be answered, and
-    /// which protocol carried it, which a dnstap reader displays.
+    /// `arrival` is what the transport knows and the handler cannot ask later:
+    /// what the connection hid (RFC 9103 §11) and which protocol carried it.
     ///
-    /// Return once the last reply is in `out`. DoH answers when this returns
-    /// and DoQ sends FIN when `out` drops, so work done here after the reply is
-    /// the client's latency on those two.
+    /// Return once the last reply is in `out`: DoH answers on return and DoQ
+    /// sends FIN when `out` drops, so later work is client latency.
     fn handle(
         &self,
         packet: Vec<u8>,
@@ -133,25 +125,16 @@ pub enum RateLimit {
 impl RateLimit {
     /// Whether a connection just accepted may be served.
     ///
-    /// Asked by all four accept loops, which had the same six lines each
-    /// (`CLAUDE.md` §7). `PerMessage` admits every connection, because the
-    /// token is spent on the message instead.
-    ///
-    /// The clock is read here rather than taken, because at accept there is no
-    /// message whose instant to reuse — which is the distinction
-    /// [`RateLimit::admits_message`] keeps (`TODO.md` #28a).
+    /// `PerMessage` admits every connection; the token is spent per message.
+    /// The clock is read here: at accept there is no message instant to reuse.
     pub fn admits_connection(self, ctx: &ServeContext, peer: Peer) -> bool {
         self != RateLimit::PerConnection || ctx.allow_source(peer, ctx.clock.now())
     }
 
     /// Whether a message on an already admitted connection may be answered.
     ///
-    /// The other half, and a pair rather than two spellings of one `if`: a
-    /// caller that asks both questions charges once however the policy is set,
-    /// where an adapter that asks `allow_source` outright charges a
-    /// `PerConnection` client twice for its first message.
-    ///
-    /// `now` is the caller's, for [`ServeContext::allow_source`]'s reason.
+    /// With [`Self::admits_connection`], charges once however the policy is
+    /// set. `now` is the caller's, for [`ServeContext::allow_source`]'s reason.
     pub fn admits_message(self, ctx: &ServeContext, peer: Peer, now: u64) -> bool {
         self != RateLimit::PerMessage || ctx.allow_source(peer, now)
     }
@@ -182,9 +165,8 @@ pub async fn serve<H: Handler>(
             slot = slots.take() => slot,
             _ = stop.wait() => return Ok(()),
         };
-        // Stop accepting on shutdown; open connections drain in their own tasks.
-        // `accept` is cancel-safe, so a connection lost to this race stays in
-        // the kernel's backlog.
+        // Stop accepting on shutdown; `accept` is cancel-safe, so a lost race
+        // leaves the connection in the backlog.
         let (stream, peer) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
@@ -232,12 +214,9 @@ pub async fn serve<H: Handler>(
 /// Serve one already-accepted connection until it goes idle, closes, or
 /// misbehaves.
 ///
-/// Messages on one connection are answered concurrently, so a slow one does not
-/// stall those behind it (RFC 7766 §6.2.1.1). On shutdown, reading stops but
-/// messages already accepted finish and reach the wire.
-///
-/// Public because a caller with its own accept loop — a test driving one
-/// connection, say — wants exactly this and not the listener.
+/// Messages are answered concurrently (RFC 7766 §6.2.1.1). On shutdown, reading
+/// stops and accepted messages finish. Public for a caller with its own accept
+/// loop.
 pub async fn serve_one<H: Handler, S: SplitStream>(
     stream: S,
     peer: SocketAddr,
@@ -250,12 +229,8 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
     let (mut reader, mut writer) = stream.split_halves();
     let (tx, mut rx) = mpsc::channel::<Reply>(limits.max_inflight_per_connection);
 
-    // One task owns the write half: replies may complete out of order
-    // (RFC 7766 §6.2.1.1; clients match on the transaction id), but two framed
-    // messages must never interleave on the wire.
-    //
-    // Its end drops `rx`, which is how the read loop learns to stop: past it,
-    // nothing asked on this connection can be answered.
+    // One writer task, so out-of-order replies (RFC 7766 §6.2.1.1) never
+    // interleave; its end drops `rx`, stopping the read loop.
     let writer_logger = handler.context().logger.clone();
     let stall = limits.read_timeout;
     let writer_task = tokio::spawn(async move {
@@ -276,12 +251,8 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
     let in_flight = Arc::new(Semaphore::new(limits.max_inflight_per_connection));
 
     loop {
-        // A 2-byte big-endian length prefix frames each message
-        // (RFC 1035 §4.2.2); a single `read` can be short or coalesced. Idle
-        // between messages is ordinary, so a timeout here ends the connection
-        // like EOF. The shutdown check sits here because the peer has committed
-        // to nothing yet: `read_exact` is not cancel-safe, but a lost length
-        // prefix on a connection we are closing costs nothing.
+        // Idle here ends the connection like EOF. Shutdown is checked here:
+        // nothing is committed, so cancelling `read_exact` is harmless.
         let mut len_buf = [0u8; 2];
         let read = tokio::select! {
             r = tokio::time::timeout(limits.idle_timeout, reader.read_exact(&mut len_buf)) => r,
@@ -317,10 +288,8 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
             }
         }
 
-        // Admission before the spawn, not inside it (`CLAUDE.md` §9): paying a
-        // task and two `Arc` clones before deciding to drop the message is
-        // backwards. One clock read for the message, handed to the handler so
-        // the limiter, the log and a TSIG check all name the same instant.
+        // Admission before the spawn (`CLAUDE.md` §9). One clock read, so the
+        // limiter, the log and TSIG name the same instant.
         let now = handler.context().clock.now();
         if !rate.admits_message(handler.context(), Peer::from(peer), now) {
             continue;
@@ -334,10 +303,8 @@ pub async fn serve_one<H: Handler, S: SplitStream>(
             continue;
         }
 
-        // Cap in-flight work per connection: this await is what stops a
-        // pipelining client from spawning tasks faster than we retire them.
-        // Raced against the writer's end: with it stalled, the permits are held
-        // by handlers waiting on a full channel (`TODO.md` #163).
+        // The in-flight cap, raced against the writer's end: a stalled writer
+        // holds the permits.
         let permit = tokio::select! {
             permit = in_flight.clone().acquire_owned() => match permit {
                 Ok(permit) => permit,

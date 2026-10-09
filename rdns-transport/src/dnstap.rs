@@ -136,16 +136,9 @@ impl Sink {
     /// Open `target`, hand back the sink, and spawn the task that owns the
     /// writer.
     ///
-    /// Opened here rather than in the task so that a bad target — an
-    /// unreachable collector, an unwritable path — fails at startup with a
-    /// message, in the order the rest of `main` fails in. A sink that reported
-    /// its own misconfiguration asynchronously would leave the server up and
-    /// the stream silently absent, which is §4's shape exactly.
-    ///
-    /// The file is opened once and appended to. It is not rotated and not
-    /// reopened on SIGHUP: a capture is a capture, and a rotation policy with
-    /// no way to say "and then what" is a disk-filling knob with a doc comment
-    /// in front of it. `--dnstap-max-bytes` is the bound instead.
+    /// Opened here so a bad target fails at startup with a message, not as a
+    /// silently absent stream (`CLAUDE.md` §4). Appended to, never rotated or
+    /// reopened: `--dnstap-max-bytes` is the bound.
     pub async fn spawn(
         target: &Target,
         max_bytes: u64,
@@ -221,18 +214,16 @@ async fn pump<W>(
         }
     }
 
-    // What was queued before the stop: `Sink::send` counted it as sent, and it
-    // is the last requests a capture holds. A payload sent after this is
-    // counted as dropped by `send`, once the receiver is gone.
+    // Queued before the stop, which `Sink::send` counted as sent; after it,
+    // `send` counts a payload as dropped.
     while let Ok(frame) = queue.try_recv() {
         if put(&mut writer, &mut cap, &metrics, &frame).await.is_err() {
             return;
         }
     }
 
-    // STOP says the stream ended rather than the reader losing its peer, which
-    // is the difference between `dnstap -r` printing a summary and reporting a
-    // truncated file.
+    // STOP marks a clean end, so `dnstap -r` prints a summary rather than
+    // reporting a truncated file.
     if writer.write_all(&dnstap::stop_frame()).await.is_ok() && bidirectional {
         let _ = writer.write_all(&dnstap::finish_frame()).await;
     }

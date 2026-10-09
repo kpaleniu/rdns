@@ -168,9 +168,8 @@ pub async fn serve<H: Handler>(
         let stop = stop.clone();
         let busy = busy.clone();
         tokio::spawn(async move {
-            // The handshake is in the connection's own task, as it is for DoT
-            // and DoQ: two round trips with a stranger do not belong in an
-            // accept loop.
+            // In the connection's task, as for DoT and DoQ: two round trips
+            // with a stranger do not belong in an accept loop.
             let Some(stream) =
                 crate::tls::handshake(&acceptor, stream, peer, handler.context(), limits, &stop)
                     .await
@@ -210,14 +209,12 @@ pub async fn serve<H: Handler>(
                 }
             });
             let io = TokioIo::new(stream);
-            // Chosen from ALPN rather than sniffed: hyper's `auto` builder would
-            // do the same by reading the preface, and the handshake has already
-            // told us.
+            // From ALPN, which the handshake settled, rather than sniffing the
+            // preface as hyper's `auto` does.
             let idle = limits.idle_timeout;
             let served = if negotiated_h2 {
-                // The in-flight cap TCP and DoQ apply; hyper's own default is
-                // 200. A stream past it is refused with
-                // REFUSED_STREAM, which RFC 9113 §8.7 makes safe to retry.
+                // TCP's and DoQ's in-flight cap, not hyper's 200; past it,
+                // REFUSED_STREAM (RFC 9113 §8.7, safe to retry).
                 let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                     .max_concurrent_streams(limits.max_inflight_per_connection as u32)
                     .serve_connection(io, service);
@@ -293,14 +290,11 @@ async fn answer<H: Handler>(
     };
 
     let now = handler.context().clock.now();
-    // Through `rate`, as the other three adapters ask it. Asking `allow_source`
-    // outright charges a `PerConnection` client a second token for the first
-    // request of every connection, so `--query-rate` would mean one thing over
-    // DoT and another over DoH.
+    // Through `rate` like the other adapters: `allow_source` outright charges a
+    // `PerConnection` client twice for a connection's first request.
     if !rate.admits_message(handler.context(), Peer::from(peer), now) {
-        // 429 rather than a silent drop, and the difference from UDP is the
-        // point: this peer completed a TCP and a TLS handshake, so there is
-        // nobody to reflect an answer at and nothing to gain by staying quiet.
+        // 429 rather than silence: after TCP and TLS handshakes there is nobody
+        // to reflect an answer at.
         return status(StatusCode::TOO_MANY_REQUESTS);
     }
     // The TCP cap, not the UDP one: a body is not a datagram.
@@ -320,9 +314,8 @@ async fn answer<H: Handler>(
     let mut extra = 0usize;
     while let Some(reply) = rx.recv().await {
         match reply {
-            // `send_framed` put a 2-octet length prefix on it, because that is
-            // what every other transport wants. RFC 8484 §4.1 puts the length in
-            // `Content-Length` instead, so it comes back off here.
+            // `send_framed` prefixed two length octets; RFC 8484 §4.1 uses
+            // `Content-Length`, so they come off.
             Reply::Frame(framed) if answer.is_none() => {
                 answer = Some(framed[2.min(framed.len())..].to_vec());
             }
@@ -336,10 +329,8 @@ async fn answer<H: Handler>(
     let _ = answering.await;
 
     if extra > 0 {
-        // A transfer. One HTTP response is one DNS message and RFC 8484 defines
-        // no framing for a sequence, so the rest cannot be sent — and a client
-        // receiving only the first envelope of an AXFR must not mistake it for
-        // the zone.
+        // A transfer: RFC 8484 has no framing for a sequence, and a client must
+        // not take the first envelope for the zone.
         tracing::warn!(
             peer = %peer.ip(),
             "a DoH request produced {} further messages, which one response cannot carry; \
@@ -355,9 +346,8 @@ async fn answer<H: Handler>(
             response
                 .headers_mut()
                 .insert(CONTENT_TYPE, DNS_MESSAGE.parse().expect("a static type"));
-            // RFC 8484 §5.1: the freshness of the HTTP response should follow
-            // the smallest TTL in the answer, so an HTTP cache between client
-            // and server cannot hold a record past its own lifetime.
+            // RFC 8484 §5.1: freshness follows the smallest TTL, so an HTTP
+            // cache cannot hold a record past its lifetime.
             if let Ok(value) = format!("max-age={max_age}").parse() {
                 response.headers_mut().insert(CACHE_CONTROL, value);
             }
@@ -373,9 +363,8 @@ async fn answer<H: Handler>(
 async fn extract(request: Request<Incoming>) -> Result<Vec<u8>, StatusCode> {
     match *request.method() {
         Method::GET => {
-            // `?dns=<base64url>`, unpadded (RFC 8484 §4.1). Padding is not
-            // rejected outright — some clients send it — but the unpadded
-            // alphabet is what the RFC specifies.
+            // `?dns=<base64url>`, unpadded (RFC 8484 §4.1); padding is
+            // tolerated, since some clients send it.
             let Some(query) = request.uri().query() else {
                 return Err(StatusCode::BAD_REQUEST);
             };
@@ -397,9 +386,8 @@ async fn extract(request: Request<Incoming>) -> Result<Vec<u8>, StatusCode> {
                 .get(CONTENT_TYPE)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or_default();
-            // Compared on the media type alone: a client may append parameters,
-            // and `application/dns-message; charset=utf-8` is wrong but is not
-            // a different type.
+            // The media type alone: a client may append parameters, and `;
+            // charset=utf-8` is wrong but the same type.
             if !content_type
                 .split(';')
                 .next()
@@ -436,16 +424,8 @@ fn min_ttl(message: &[u8]) -> u32 {
         .iter()
         .chain(parsed.authorities.iter())
         .chain(parsed.additionals.iter())
-        // No OPT filter, and that is worth a sentence rather than silence: an
-        // OPT's TTL field is a flags word rather than a lifetime, so one in the
-        // additional section would make every answer with DO clear `max-age=0`
-        // and quietly disable HTTP caching for the whole endpoint. It cannot
-        // happen here because the pseudo-record is not in the resource list —
-        // `DnsMessage::edns` holds it — which is `CLAUDE.md` §17's "make it
-        // unrepresentable".
-        //
-        // No clamp either: `Ttl` is unsigned by construction, clamped once at
-        // the parse boundary per RFC 2181 §8.
+        // No OPT filter: an OPT's TTL is flags, but `DnsMessage::edns` holds
+        // it, not the records. `Ttl` is clamped at parse (RFC 2181 §8).
         .map(|record| record.ttl.as_secs())
         .min()
         .unwrap_or(0)
