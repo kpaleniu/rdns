@@ -56,14 +56,9 @@ struct Cli {
     /// The same, with the secret read from a file rather than from `argv`.
     /// Needs `--tsig-name`; the file holds the base64 secret and nothing else.
     ///
-    /// The file must not be readable by anyone but its owner, and is refused
-    /// if it is — a secret in a file is only better than one in `argv` if the
-    /// file is private (`CLAUDE.md` §15). Windows has no equivalent of the
-    /// mode, so there it is not checked and nothing pretends it was.
-    ///
-    /// A separate flag from the name, and not `name:path`: a Windows path
-    /// carries a colon, so a colon-separated spec with a path in it parses
-    /// differently on the two platforms.
+    /// Refused if anyone but its owner can read it (`CLAUDE.md` §15); Windows
+    /// has no mode, so there it is not checked. Not `name:path`: a Windows path
+    /// carries a colon.
     #[arg(long, value_name = "PATH", requires = "tsig_name")]
     pub tsig_file: Option<String>,
     /// The key `--tsig-file`'s secret belongs to: `[algorithm:]name`.
@@ -99,12 +94,8 @@ fn main() -> Result<()> {
         )
         // RFC 5936 §4.1.1: RD SHOULD be clear in an AXFR request.
         .with_recursion(!transfer)
-        // An OPT on every query, not only with --dnssec. A server may only put
-        // an Extended DNS Error in a reply to a query that carried one
-        // (RFC 8914 §2), so a probe that sends none cannot see the diagnostic
-        // this tree emits — and `dig` and every resolver send one anyway.
-        // --dnssec now moves DO alone. 1232 is what the reply is bounded by;
-        // the 4096 receive buffer below is unchanged and still larger.
+        // An EDE may only answer a query that carried an OPT (RFC 8914 §2), so
+        // every query carries one. 1232 bounds the reply.
         .with_edns(rdns_core::FLAG_DAY_UDP_SIZE, args.dnssec)
         .build();
 
@@ -114,9 +105,8 @@ fn main() -> Result<()> {
     let len = request
         .to_bytes(&mut buf)
         .context("serializing the query")?;
-    // Signed before anything else touches it: TSIG covers the bytes that go on
-    // the wire, and the MAC of the request is what the reply's signature is
-    // computed over (RFC 8945 §5.4.1).
+    // Signed first: TSIG covers the bytes sent, and the request's MAC is what
+    // the reply's signature is computed over (RFC 8945 §5.4.1).
     let key = signing_key(&args)?;
     let signed;
     let query: &[u8] = match &key {
@@ -224,24 +214,12 @@ fn ask_over_tcp(server: SocketAddr, query: &[u8], request: &DnsMessage) -> Resul
     Ok(message)
 }
 
-/// A whole zone, printed as it arrives.
+/// A whole zone, printed as it arrives in presentation format, one
+/// self-contained line per record, so the output is a zone file.
 ///
-/// AXFR is TCP only and a zone is not one message (RFC 5936 §2.2): the answer
-/// section starts with the zone's SOA and ends with the same SOA again, and
-/// that second copy is the only end marker there is. Records are printed rather
-/// than assembled — a client that held the zone would be `rdns::xfr`, which
-/// `rdnsc` does not link.
-///
-/// What is printed is the zone-file presentation format, so
-/// `rdnsc … AXFR example.com > example.com.zone` produces a file this tree's
-/// own parser reads. Every line carries an absolute owner name, its own TTL and
-/// its class, so no `$ORIGIN` or `$TTL` is needed and no line depends on
-/// another.
-///
-/// **It is not a secondary.** There is no SOA probe, so every run is a full
-/// transfer; no IXFR; no NOTIFY, so whatever calls this is on its own timer. A
-/// feed refreshed this way is refreshed when cron says so, not when the
-/// publisher does.
+/// AXFR is TCP only and ends at the second copy of the SOA (RFC 5936 §2.2).
+/// Printed, not assembled: `rdnsc` does not link `rdns::xfr`. Not a secondary:
+/// no SOA probe, no IXFR, no NOTIFY; whatever calls this runs on its own timer.
 fn read_transfer(
     server: SocketAddr,
     query: &[u8],
@@ -275,10 +253,8 @@ fn read_transfer(
             );
         }
         if let Some(key) = key {
-            // Refused rather than accepted unauthenticated: RFC 8945 §5.3.1
-            // lets an intermediate envelope go unsigned, but it still enters
-            // the next signed digest, which `check_response` cannot see. This
-            // is `rdns::xfr`'s rule, and the same sentence (`CLAUDE.md` §7).
+            // Not accepted unsigned: an unsigned envelope (RFC 8945 §5.3.1)
+            // enters the next digest, which `check_response` cannot see.
             previous_mac = tsig::check_response(&packet, key, &previous_mac, first, tsig::now())
                 .map_err(|e| {
                     anyhow!(
@@ -397,9 +373,8 @@ fn read_framed(stream: &mut TcpStream) -> Result<Option<(Vec<u8>, DnsMessage)>> 
     stream
         .read_exact(&mut body)
         .context("reading the response body")?;
-    // The bytes as well as the message: TSIG is computed over what was sent,
-    // and a re-serialized message is not those bytes — name compression is a
-    // choice (`rdns_tsig`'s own header).
+    // The bytes too: TSIG covers what was sent, and re-serializing need not
+    // reproduce them, since compression is a choice.
     let message = DnsMessage::try_from_bytes(&body).context("parsing the TCP response")?;
     Ok(Some((body, message)))
 }
@@ -429,14 +404,8 @@ fn matches_request(message: &DnsMessage, request: &DnsMessage) -> Result<(), Ans
 /// The reasons a reply gives for its RCODE (RFC 8914), as text to append to a
 /// line that has already named the RCODE.
 ///
-/// Empty when there are none, which is every reply from a server that does not
-/// send them and every reply to a query that carried no OPT (§2).
-///
-/// A function because the two callers are a printed answer and a refused
-/// transfer, and a refused transfer is the reply an operator is most likely to
-/// be holding when they want one. An unreadable option list is reported rather
-/// than dropped: it is FORMERR for the message, and the parse that produced it
-/// let it through.
+/// Empty when there are none, as in a reply to a query with no OPT (§2). An
+/// unreadable option list is reported, not dropped: it is FORMERR.
 fn extended_errors(msg: &DnsMessage) -> String {
     let Some(edns) = msg.edns.as_ref() else {
         return String::new();
@@ -478,9 +447,8 @@ mod tests {
     /// An AXFR as it arrives: the zone's SOA, its records, then the SOA again
     /// as the end marker (RFC 5936 §2.2), split across two messages.
     fn transferred() -> (Vec<DnsMessage>, rdns::zone::Zone) {
-        // Column zero on purpose: a leading space makes the parser read the
-        // owner name as omitted: a flattened `\` continuation, arriving in a
-        // fixture rather than in a message.
+        // Column zero: a leading space reads as an omitted owner name, which is
+        // what a flattened `\` continuation produces.
         let text = concat!(
             "$ORIGIN example.com.\n",
             "$TTL 3600\n",
