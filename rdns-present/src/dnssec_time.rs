@@ -30,7 +30,7 @@ fn days_in_month(month: i32, year: i32) -> Option<i32> {
 /// (RFC 4034 §3.2). Every field is range-checked and the result is checked to
 /// fit. The inverse is `format_dnssec_time`, which is private to this crate:
 /// the only thing that writes one of these is `record_text`, while the zone
-/// parser is in `rdns` and reads them (`TODO.md` #67f).
+/// parser is in `rdns` and reads them.
 pub fn parse_dnssec_time(time_str: &str) -> Result<u32, String> {
     if let Ok(epoch) = time_str.parse::<u32>() {
         return Ok(epoch);

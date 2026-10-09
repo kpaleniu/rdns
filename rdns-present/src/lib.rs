@@ -8,11 +8,10 @@
 //! (RFC 4648 §7), SVCB parameters (RFC 9460 §2.1) and the `YYYYMMDDHHmmSS` an
 //! RRSIG carries.
 //!
-//! `TODO.md` #66a and #67. The reason it is a crate and not a module of `rdns`
-//! is `rdnsc`: it transfers a zone correctly today and prints the records with
-//! `{:?}`, and the alternative — depending on `rdns` — measured at +38 packages
-//! and +385 KB on a binary of 814 KB, because that crate means `tokio`,
-//! `rustls` and `ring` whatever the caller touches.
+//! A crate and not a module of `rdns` because of `rdnsc` (`TODO.md` #67): the
+//! alternative — depending on `rdns` — measured at +38 packages and +385 KB on
+//! a binary of 814 KB, because that crate means `tokio`, `rustls` and `ring`
+//! whatever the caller touches.
 //!
 //! No crypto and no runtime, by construction: the one dependency is
 //! `rdns-core`. A hash *value* of a fixed length lives here
@@ -20,8 +19,8 @@
 
 // `TODO.md` #82b's ratchet; the reason is at the top of `rdns/src/lib.rs`.
 #![warn(unreachable_pub)]
-// `TODO.md` #143: `push_str(&format!(..))` allocates a `String` to copy it;
-// `write!` into the target does not. Off by default (restriction group).
+// `push_str(&format!(..))` allocates a `String` to copy it; `write!` into the
+// target does not. Off by default (restriction group).
 #![warn(clippy::format_push_string)]
 
 pub mod denial_wire;

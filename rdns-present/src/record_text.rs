@@ -7,13 +7,12 @@
 //! bytes, so the cases need not be enumerated — otherwise in RFC 3597 §5's
 //! `\# <len> <hex>` form.
 //!
-//! An owner name has no such fallback: it is the first field of the line and
-//! this parser has no escape syntax, so an unspellable one is refused rather
-//! than written as a different name.
+//! An owner name has no such fallback and needs none: it is written with
+//! RFC 1035 §5.1's escapes, which the parser reads back.
 //!
 //! Every line stands on its own: owner names absolute, TTL and class stated.
 //! Assembling those lines into a *file* is `rdns::zone_writer`, which needs a
-//! `Zone` and is therefore not here (`TODO.md` #66a).
+//! `Zone` and is therefore not here.
 
 use std::borrow::Cow;
 
@@ -28,12 +27,11 @@ use crate::dnssec_time::format_dnssec_time;
 /// One record as a zone-file line, from its four fields.
 ///
 /// The fields rather than either record type, because there are two of them
-/// with the same four fields in a different order — `rdns::zone::ZoneRecord` and
-/// [`ResourceRecord`] — and every caller holds one or the other
-/// (`TODO.md` #66a). `Ttl` and `Class` are `Copy` and the other two are
-/// borrowed, so no caller allocates to call this; taking one of the two record
-/// types would have made the other clone four fields to build a temporary,
-/// which is exactly what `journal::write_record` used to do.
+/// with the same four fields in a different order — `rdns::zone::ZoneRecord`
+/// and [`ResourceRecord`] — and every caller holds one or the other. `Ttl` and
+/// `Class` are `Copy` and the other two are borrowed, so no caller allocates to
+/// call this; taking one of the two record types would make the other clone
+/// four fields to build a temporary.
 pub fn record_line(
     name: NameRef<'_>,
     ttl: Ttl,
@@ -132,8 +130,8 @@ fn generic_rdata(stored: RecordDataRef<'_>) -> String {
 
 /// The type-specific text for a record, or `None` when this format cannot say
 /// it unambiguously — a `<character-string>` holding bytes that are not text,
-/// or a bitmap that did not parse to its end. Names are no longer among them
-/// (see [`writable_name`]).
+/// or a bitmap that did not parse to its end. Names are not among them (see
+/// [`writable_name`]).
 fn presentation_rdata(parsed: &ParsedRecord) -> Option<String> {
     Some(match parsed {
         ParsedRecord::A(addr) => addr.to_string(),
@@ -288,17 +286,15 @@ fn bitmap_to_string(bitmap: &[u8]) -> Option<String> {
     )
 }
 
-/// A domain name if it can be written as a bare field, `None` otherwise.
+/// A domain name as a bare field.
 ///
 /// Whitespace ends a field; `;`, `"`, parentheses, `\`, `@` and `$` all mean
-/// something to the parser. A name carrying one reads back as a different name.
+/// something to the parser, so a name carrying one is written escaped.
 fn writable_name(name: NameRef<'_>) -> String {
-    // Total. ~~"it needs escapes this parser does not read back"~~ was true
-    // while a name was presentation text: there was no spelling for a `.`
-    // inside a label, and a `;` or `"` written raw came back as syntax rather
-    // than as data. A `Name` escapes every one of those (RFC 1035 §5.1) and the
-    // parser resolves them, so there is no name this cannot write — which is
-    // the deviation D-1 named, closing from the other end.
+    // Total. A `.` inside a label, or a `;` or `"` written raw, would come back
+    // as syntax rather than as data; a `Name` escapes every one of those
+    // (RFC 1035 §5.1) and the parser resolves them, so there is no name this
+    // cannot write (deviation D-1).
     name.to_presentation()
 }
 

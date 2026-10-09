@@ -2,17 +2,16 @@
 //! them: canonical name order (RFC 4034 §6.1), type bitmaps (§4.1.2) and
 //! base32hex (RFC 4648 §7).
 //!
-//! Split out of `rdns::dnssec_denial` because `zone` and `zone_writer` need
-//! all three to read and write NSEC and NSEC3 records, and a zone file is not a
-//! DNSSEC question: those two edges were the only ones blocking the crate cut
-//! #31 measured, and they carried no crypto across. `dnssec_denial` keeps
-//! everything that *computes* a hash, proves or verifies — [`Nsec3Hash`] is
-//! here because it is a 20-octet value, not a hash function, and `zone` keyed a
-//! map on it (`TODO.md` #67a).
+//! Not in `rdns::dnssec_denial`, because `zone` and `zone_writer` need all
+//! three to read and write NSEC and NSEC3 records, and a zone file is not a
+//! DNSSEC question: those two edges carry no crypto across (`TODO.md` #31).
+//! `dnssec_denial` keeps everything that *computes* a hash, proves or verifies
+//! — [`Nsec3Hash`] is here because it is a 20-octet value, not a hash function,
+//! and `zone` keys a map on it.
 //!
-//! It is also why `zone` had grown a second base32hex decoder (`TODO.md` #26b)
-//! — one that folded case with `str::to_uppercase`, the Unicode fold RFC 4343
-//! forbids (`CLAUDE.md` §8), and disagreed with this one about `=` padding.
+//! One base32hex decoder, because a second is one that folds case with
+//! `str::to_uppercase`, the Unicode fold RFC 4343 forbids (`CLAUDE.md` §8), or
+//! disagrees with this one about `=` padding.
 
 use rdns_core::error::{WireError, WireResult};
 use rdns_core::NameRef;
@@ -51,9 +50,9 @@ impl Nsec3Hash {
     /// The hash these exactly-[`NSEC3_HASH_LEN`] octets are.
     ///
     /// For the one caller that computed them and so cannot be wrong about the
-    /// length — `dnssec_denial::hash_wire`, which is in another module since
-    /// `TODO.md` #67a. Total, where `from_wire` on a known-good array would be
-    /// an `expect` on an infallible path (`CLAUDE.md` §4).
+    /// length — `dnssec_denial::hash_wire`, which is in another module. Total,
+    /// where `from_wire` on a known-good array would be an `expect` on an
+    /// infallible path (`CLAUDE.md` §4).
     pub fn from_octets(octets: [u8; NSEC3_HASH_LEN]) -> Nsec3Hash {
         Nsec3Hash(octets)
     }
@@ -95,18 +94,16 @@ pub struct CanonicalKey(Vec<u8>);
 
 /// A name's labels, right to left. The root has none.
 ///
-/// Borrowed, and folded only where they are compared: this returned a
-/// `Vec<String>`, so a name comparison cost a `Vec` and a `String` per label at
-/// each side — eight allocations for two three-label names, and `Nsec::covers`
-/// makes three comparisons. A signed NXDOMAIN spent 142 allocations, most of
-/// them here.
+/// Borrowed, and folded only where they are compared: a `Vec<String>` costs a
+/// name comparison a `Vec` and a `String` per label at each side — eight
+/// allocations for two three-label names, and `Nsec::covers` makes three
+/// comparisons.
 ///
-/// It also read presentation text, and split it on `.`, which RFC 4034 §6.1
-/// ordering cannot survive for a name holding RFC 1035 §5.1's `\.`:
-/// `a\.b.example.com.` came apart into four labels, one of them ending in a
-/// backslash, so it sorted somewhere no other implementation puts it
-/// (`TODO.md` #37a). Reading the wire form is the same rule with nothing to get
-/// wrong — a label is what the length octet says it is.
+/// Presentation text split on `.` cannot give RFC 4034 §6.1 ordering for a name
+/// holding RFC 1035 §5.1's `\.`: `a\.b.example.com.` comes apart into four
+/// labels, one of them ending in a backslash, and sorts somewhere no other
+/// implementation puts it. Reading the wire form is the same rule with nothing
+/// to get wrong — a label is what the length octet says it is.
 ///
 /// `suffix(n)` per label rather than a reversed iterator: [`NameRef::labels`]
 /// walks forwards, since the wire form is a chain of length octets, and the
@@ -230,9 +227,9 @@ pub(crate) fn bitmap_types_exact(bitmap: &[u8]) -> Result<Vec<Rtype>, Vec<Rtype>
         for (byte, bits) in rest[2..2 + len].iter().enumerate() {
             // Bit 0 is the *high* bit (RFC 4034 §4.1.2), so it is
             // `leading_zeros` that names the next set type and taking them from
-            // the top keeps the output ascending — `TODO.md` #26i said
-            // `trailing_zeros`, which is the idiom for the other bit order and
-            // would list each byte's types backwards.
+            // the top keeps the output ascending. `trailing_zeros` is the idiom
+            // for the other bit order and would list each byte's types
+            // backwards.
             let mut remaining = *bits;
             while remaining != 0 {
                 let bit = remaining.leading_zeros() as u16;
@@ -424,8 +421,8 @@ mod tests {
 
         // `a\.b` is one label of three octets (RFC 1035 §5.1), so the key holds
         // the dot it stands for and not the backslash that spells it. Splitting
-        // on `.` made three labels of it and wrote `example\0b\0a\\0`, which is
-        // where no other implementation puts the name (`TODO.md` #37a).
+        // on `.` makes three labels of it and writes `example\0b\0a\\0`, which
+        // is where no other implementation puts the name.
         assert_eq!(
             key(r"a\.b.example."),
             CanonicalKey(b"example\0a.b\0".to_vec())
@@ -532,11 +529,10 @@ mod tests {
         assert!(base32hex_decode("not-base32!").is_err());
     }
 
-    /// The decoder `zone` used to carry beside this one folded case with
-    /// `str::to_uppercase`, and RFC 4343 says case folding is ASCII-only
-    /// (`CLAUDE.md` §8). U+017F LATIN SMALL LETTER LONG S upper-cases to `S`,
-    /// which *is* in the base32hex alphabet, so that copy decoded a character
-    /// no DNS name can contain (`TODO.md` #26b).
+    /// RFC 4343 says case folding is ASCII-only (`CLAUDE.md` §8). U+017F LATIN
+    /// SMALL LETTER LONG S upper-cases to `S`, which *is* in the base32hex
+    /// alphabet, so a decoder folding with `str::to_uppercase` decodes a
+    /// character no DNS name can contain.
     #[test]
     fn a_unicode_character_is_not_a_base32hex_digit() {
         assert_eq!(
