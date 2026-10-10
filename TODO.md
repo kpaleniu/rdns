@@ -40,19 +40,17 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Six items. #171-#185 were filed 2026-10-05 from a comparison against
+Five items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
 #173, #194 out of re-reading #190 and #192, #195-#198 out of a review on
 2026-10-08, #199 and #200 out of triaging #197. #181 was closed wontfix in
 triage; #171-#174, #176, #179, #183, #184, #186, #187, #189, #191, #178,
 #188, #175, #177, #180 and #182 closed 2026-10-07, and #193, #195, #196, #197
-and #199 2026-10-09:
+and #199 2026-10-09, #198 2026-10-10:
 
 - #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
   closed, 185c and 185d wontfix.
-- #198 the journal is fsynced under the zone map's write guard (bug, ready
-  for agent).
 - #200 `CLAUDE.md` is written in the register it forbids in comments; split
   into rules and `docs/LESSONS.md` (enhancement, ready for human).
 
@@ -1134,6 +1132,7 @@ the week; the record is under "How the queue kept going stale" in
 | **180** | KSK retirement gated on the parent's DS | **filed 2026-10-05, closed 2026-10-07.** · `4a5e544` · [`docs/closed/180.md`](docs/closed/180.md) |
 | **182** | Catalog zone generated from the primary zones | **filed 2026-10-05, closed 2026-10-07.** · `eab1069` · [`docs/closed/182.md`](docs/closed/182.md) |
 | **197** | comments narrated history | **filed 2026-10-08, closed 2026-10-09.** · `03500db`, `f7e27bd`, `0505311`, `f142442`, `9221737`, `e1836d5`, `3ed61c2`, `fd529a1`, `94e4307`, `5435ce3` · [`docs/closed/197.md`](docs/closed/197.md) |
+| **198** | the IXFR journal was written and fsynced under the zone map's write guard | **filed 2026-10-08, closed 2026-10-10.** · `97b8e39` · [`docs/closed/198.md`](docs/closed/198.md) |
 | **199** | comments exceeded the length "Writing comments" allows | **filed 2026-10-09, closed 2026-10-09.** · `e5d3540`, `9296c62`, `e3e00f3`, `5c7dead`, `374939f`, `4f52a81`, `e7a2d7f`, `19c3f83`, `375fb10`, `df25448`, `a71aea5`, `f31091f`, `473e0ad`, `8964179`, `17e09be`, `ad50676` · [`docs/closed/199.md`](docs/closed/199.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
