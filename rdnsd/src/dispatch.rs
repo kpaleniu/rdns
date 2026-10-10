@@ -28,7 +28,6 @@ use rdns::{
     ede::InfoCode,
     error::RequestError,
     ixfr::{ixfr_response, DeltaLog, IxfrResponse},
-    journal::Journal,
     logging::QueryLogger,
     notify,
     response::{ClientEdns, ServerOpt},
@@ -44,6 +43,7 @@ use rdns_transport::tcp::{self, send_framed, Reply};
 use rdns_transport::ServeContext;
 
 use crate::answer::{write_response, NOT_OUR_ZONE};
+use crate::journal_writer::JournalWriter;
 use crate::replication::{Notified, Secondaries};
 use crate::zones::{
     install_zone, ZoneContext, ZoneMap, ZoneSigning, ZoneSource, ZoneWrites, Zones,
@@ -170,7 +170,7 @@ pub(crate) struct Server {
     deltas: Arc<RwLock<DeltaLog>>,
     /// `None` on a server with no writable zone source: every UPDATE refused.
     updates: Arc<UpdateHandling>,
-    journal: Option<Arc<Journal>>,
+    journal: Option<JournalWriter>,
     /// Where the query stream goes, or `None` when `--dnstap` was not given.
     /// See [`rdns_transport::dnstap`] for why the queue behind it drops.
     dnstap: Option<rdns_transport::dnstap::Sink>,
@@ -257,7 +257,7 @@ impl Server {
     pub(crate) fn with_history(
         self,
         deltas: Arc<RwLock<DeltaLog>>,
-        journal: Option<Arc<Journal>>,
+        journal: Option<JournalWriter>,
     ) -> Self {
         Server {
             deltas,
@@ -3257,7 +3257,7 @@ pub(crate) mod tests {
     async fn spawn_updatable_with(
         dir: &Path,
         key: TsigKey,
-        journal: Option<Arc<rdns::journal::Journal>>,
+        journal: Option<JournalWriter>,
         dnstap: Option<rdns_transport::dnstap::Sink>,
     ) -> SocketAddr {
         listen_updatable(
@@ -3966,8 +3966,10 @@ pub(crate) mod tests {
     async fn an_update_leaves_a_journal_that_survives_the_process() {
         let dir = ScratchDir::new("update-journal");
         let key = update_key(rdns::tsig::UpdatePolicy::Any);
-        let journal = Arc::new(rdns::journal::Journal::new(dir.path().to_path_buf()));
-        let addr = spawn_updatable_with(dir.path(), key.clone(), Some(journal.clone()), None).await;
+        let writer = JournalWriter::new(Arc::new(rdns::journal::Journal::new(
+            dir.path().to_path_buf(),
+        )));
+        let addr = spawn_updatable_with(dir.path(), key.clone(), Some(writer.clone()), None).await;
 
         for (n, addr_text) in [(1u8, "192.0.2.51"), (2, "192.0.2.52")] {
             let bytes = update_message(
@@ -3981,7 +3983,9 @@ pub(crate) mod tests {
         }
 
         // A new process would see exactly this: the file, and nothing in memory.
-        let restored = journal
+        writer.write_pending().await;
+        let restored = writer
+            .journal()
             .load(nm("example.com.").as_ref())
             .expect("the journal reads back");
         assert_eq!(restored.len(), 2, "one step per update");

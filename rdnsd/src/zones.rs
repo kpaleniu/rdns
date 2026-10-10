@@ -32,6 +32,7 @@ use rdns::zone_signer::{
 use rdns::{Class, Name, NameRef, Qtype, RecordDataRef, ResourceRecord, Rtype, Ttl};
 
 use crate::config;
+use crate::journal_writer::JournalWriter;
 use crate::{absolute_name, Cli};
 
 /// Every zone this server holds, keyed by its origin.
@@ -240,13 +241,11 @@ pub(crate) async fn install_zone(served: &ZoneContext, zone: Zone) {
     if let Some(planned) = planned {
         log.record(planned);
     }
-    // Under the recording guard, so journal and delta log agree. A failed write
-    // only logs: RFC 1995 §4 permits a full transfer.
+    // Queued under the recording guard, so a newer snapshot queues after an
+    // older one; written by the journal writer, off the guards.
     if recorded {
         if let Some(journal) = journal {
-            if let Err(e) = journal.save(origin.as_ref(), &log.all(origin.as_ref())) {
-                tracing::warn!("could not persist the delta log for {origin}: {e}");
-            }
+            journal.save(origin.as_ref(), log.steps(origin.as_ref()));
         }
     }
     let displaced = zones.insert(zone);
@@ -306,9 +305,7 @@ pub(crate) async fn install_all_zones(served: &ZoneContext, new_zones: ZoneMap) 
     }
     if let Some(journal) = journal {
         for zone in &touched {
-            if let Err(e) = journal.save(zone.as_ref(), &log.all(zone.as_ref())) {
-                tracing::warn!("could not persist the delta log for {zone}: {e}");
-            }
+            journal.save(zone.as_ref(), log.steps(zone.as_ref()));
         }
     }
 
@@ -599,7 +596,7 @@ pub(crate) struct ZoneContext {
     /// Where the delta log is persisted, so a restart keeps IXFR; `None`
     /// without a directory (`--zone-file`, tests). Grouped here because the
     /// journal is the delta log on disk.
-    pub(crate) journal: Option<Arc<Journal>>,
+    pub(crate) journal: Option<JournalWriter>,
 }
 
 /// Exactly one of `zone_file` or `zone_dir`.

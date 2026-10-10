@@ -30,6 +30,7 @@ mod config;
 mod control;
 /// Answering one request, on either transport.
 mod dispatch;
+mod journal_writer;
 mod notify_out;
 mod parental;
 mod replication;
@@ -796,7 +797,7 @@ struct ServePolicy {
     /// What a dynamic UPDATE needs; refuses everything when unconfigured.
     updates: UpdateHandling,
     /// Where the delta log is persisted, if anywhere.
-    journal: Option<Arc<Journal>>,
+    journal: Option<journal_writer::JournalWriter>,
     /// Where the query stream goes, and what a capture file may weigh.
     dnstap: Option<(rdns_transport::dnstap::Target, u64)>,
     /// The control socket, and what a `reload` on it pokes.
@@ -1926,7 +1927,9 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
     // The journal persists the steps across restarts, with a directory source
     // only: `--zone-file` gives no directory to write into.
     let journal = match &source {
-        ZoneSource::Directory(dir) => Some(Arc::new(Journal::new(PathBuf::from(dir)))),
+        ZoneSource::Directory(dir) => Some(journal_writer::JournalWriter::new(Arc::new(
+            Journal::new(PathBuf::from(dir)),
+        ))),
         ZoneSource::SingleFile(_) | ZoneSource::Files(_) => None,
     };
     // The four that are only ever updated together. See [`ZoneContext`].
@@ -1937,10 +1940,11 @@ async fn serve_main(mut cli: Cli) -> Result<()> {
         journal: journal.clone(),
     };
     if let Some(journal) = &journal {
-        restore_journals(journal, &zone_map, &deltas).await;
+        restore_journals(journal.journal(), &zone_map, &deltas).await;
         // A separate walk for a separate question: journals that are no zone's
         // (`CLAUDE.md` §4).
-        discard_orphan_journals(journal, &zone_map).await;
+        discard_orphan_journals(journal.journal(), &zone_map).await;
+        journal.spawn(shutdown.lifecycle());
     }
     let addr = format!("{}:{}", cli.host, cli.port);
 

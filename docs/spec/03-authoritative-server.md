@@ -320,7 +320,10 @@ the zone stops being served. `MAX_DELTAS_PER_ZONE` is 32.
 
 Deltas survive a restart (`rdns::journal`): each version step is written beside
 the zone as the RFC 1995 difference sequence a client would receive, and read
-back at startup.
+back at startup. One writer task writes and deletes journals, off every lock a
+query takes, the newest request per zone winning; the shutdown drain waits for
+what it has queued. A journal may therefore lag the served version by a step,
+which the last rule below turns into a full transfer.
 
 - A journal that will not parse is a warning and an empty history, not a refusal
   to start.

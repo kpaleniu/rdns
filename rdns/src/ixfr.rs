@@ -15,6 +15,7 @@ use crate::Serial;
 use crate::Ttl;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::record_types as rt;
 use crate::transfer::{axfr_messages, pack_transfer_messages};
@@ -53,12 +54,12 @@ impl ZoneDelta {
 /// The version steps remembered for every zone.
 ///
 /// Derived state living beside the zone map, so the two must move together:
-/// [`DeltaLog::note_change`] takes both versions, and the split into
-/// [`plan_change`] plus [`DeltaLog::record`] keeps that by making the token only
-/// planning can mint what recording consumes.
+/// [`plan_change`] mints the token [`DeltaLog::record`] consumes. Steps are
+/// `Arc`s, as a recorded step never changes, so [`DeltaLog::steps`] is a
+/// snapshot that copies no records under the lock.
 #[derive(Debug, Default)]
 pub struct DeltaLog {
-    by_zone: HashMap<NameKeyBuf, Vec<ZoneDelta>>,
+    by_zone: HashMap<NameKeyBuf, Vec<Arc<ZoneDelta>>>,
 }
 
 /// A version step that has been computed but not yet recorded.
@@ -120,7 +121,7 @@ impl DeltaLog {
     /// Record a step [`plan_change`] already worked out.
     pub fn record(&mut self, planned: PlannedDelta) {
         let history = self.by_zone.entry(planned.zone.clone()).or_default();
-        history.push(planned.delta);
+        history.push(Arc::new(planned.delta));
         // Oldest first, so the oldest steps are the ones dropped.
         if history.len() > MAX_DELTAS_PER_ZONE {
             history.remove(0);
@@ -149,7 +150,7 @@ impl DeltaLog {
                 return None;
             }
             expected = delta.to_serial;
-            chain.push(delta);
+            chain.push(delta.as_ref());
         }
         Some(chain)
     }
@@ -159,7 +160,16 @@ impl DeltaLog {
     pub fn all(&self, zone: NameRef<'_>) -> Vec<&ZoneDelta> {
         self.by_zone
             .get(&*zone.folded())
-            .map(|history| history.iter().collect())
+            .map(|history| history.iter().map(Arc::as_ref).collect())
+            .unwrap_or_default()
+    }
+
+    /// The same steps as [`DeltaLog::all`], shared rather than borrowed: a
+    /// snapshot that outlives the guard.
+    pub fn steps(&self, zone: NameRef<'_>) -> Vec<Arc<ZoneDelta>> {
+        self.by_zone
+            .get(&*zone.folded())
+            .cloned()
             .unwrap_or_default()
     }
 
@@ -177,7 +187,10 @@ impl DeltaLog {
             self.by_zone.remove(&*zone.folded());
             return;
         }
-        self.by_zone.insert(NameKeyBuf::new(zone), deltas);
+        self.by_zone.insert(
+            NameKeyBuf::new(zone),
+            deltas.into_iter().map(Arc::new).collect(),
+        );
     }
 
     /// How many steps are remembered for a zone, for logging and tests.
