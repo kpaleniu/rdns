@@ -285,6 +285,10 @@ mod tests {
         let shutdown = Shutdown::new();
         let busy = shutdown.busy();
         tokio::spawn(async move {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "work that ends after the drain begins is the subject"
+            )]
             tokio::time::sleep(Duration::from_millis(50)).await;
             drop(busy);
         });

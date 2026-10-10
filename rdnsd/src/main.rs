@@ -1496,6 +1496,7 @@ fn spawn_zone_maintenance(
 ///
 /// `pending()` rather than a long sleep, so an unsigned server's maintenance task
 /// costs one parked future rather than waking up to do nothing.
+#[expect(clippy::disallowed_methods, reason = "the reload timer is the event")]
 async fn sleep_for(every: Option<Duration>) {
     match every {
         Some(every) => tokio::time::sleep(every).await,
@@ -3767,6 +3768,10 @@ mod tests {
             test_shutdown().lifecycle(),
         );
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "paused clock: virtual time, no wait"
+        )]
         tokio::time::sleep(Duration::from_secs(365 * 86_400)).await;
         assert!(
             zone_map
@@ -3807,6 +3812,10 @@ mod tests {
             test_shutdown().lifecycle(),
         );
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "paused clock: virtual time, no wait"
+        )]
         tokio::time::sleep(interval / 2).await;
         assert!(
             zone_map
@@ -3819,6 +3828,10 @@ mod tests {
 
         // Auto-advance is held off while the load runs on the blocking pool, so
         // a sleep past the interval wakes after the reload, not during it.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "paused clock: virtual time, no wait"
+        )]
         tokio::time::sleep(interval / 2 + Duration::from_secs(1)).await;
         assert!(
             zone_map

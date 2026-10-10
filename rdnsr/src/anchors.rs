@@ -22,6 +22,7 @@ use rdns::{Qtype, QuerySection};
 ///
 /// One task, not one per zone: the zones share a file, and one file wants one
 /// writer.
+#[expect(clippy::disallowed_methods, reason = "the RFC 5011 timer is the event")]
 pub(crate) fn spawn_anchor_manager(
     resolver: Arc<Resolver>,
     anchors: SharedAnchors,

@@ -3388,13 +3388,18 @@ pub(crate) mod tests {
         }
         // Counted at the door, and nothing from there to the lock waits on
         // anything but the lock, on this one-thread runtime.
-        while metrics
-            .queries_received
-            .load(std::sync::atomic::Ordering::Relaxed)
-            < 2
-        {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        assert!(
+            rdns::test_util::eventually(Duration::from_secs(5), || {
+                std::future::ready(
+                    metrics
+                        .queries_received
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        >= 2,
+                )
+            })
+            .await,
+            "both UPDATEs reached the door"
+        );
         drop(held);
         while let Some(rcode) = clients.join_next().await {
             assert_eq!(rcode.expect("the client task"), ResponseCode::Ok);
@@ -3574,31 +3579,22 @@ pub(crate) mod tests {
 
         // Polled, not slept: a frame is recorded after its reply is sent, so
         // the fourth reply can arrive before its frame.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while data_frames(&std::fs::read(&capture).expect("the capture file")) < 4 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "four frames never reached the capture"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        assert!(
+            rdns::test_util::eventually(Duration::from_secs(10), || {
+                std::future::ready(
+                    data_frames(&std::fs::read(&capture).expect("the capture file")) >= 4,
+                )
+            })
+            .await,
+            "four frames never reached the capture"
+        );
 
         // The pump writes STOP and flushes as it stops, so the capture is
         // closed when it ends with one.
         shutdown.begin();
-        let capture = loop {
-            let bytes = std::fs::read(&capture).expect("the capture file");
-            if bytes.ends_with(&rdns::dnstap::stop_frame()) {
-                break bytes;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the capture never closed: {} octets, {} data frames",
-                bytes.len(),
-                data_frames(&bytes)
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
+        let capture = rdns::test_util::closed_capture(&capture, Duration::from_secs(10))
+            .await
+            .expect("the capture closed");
         assert_eq!(
             data_frames(&capture),
             4,

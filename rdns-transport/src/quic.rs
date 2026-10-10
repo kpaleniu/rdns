@@ -211,6 +211,7 @@ async fn shut_down(endpoint: &Endpoint, idle: std::time::Duration) {
 /// finish, and the close carries `DOQ_NO_ERROR`. RFC 9250 has no graceful
 /// drain, so the wait is ours; a stream the client opens meanwhile is reset by
 /// the close, abandoned as §4.4 has it.
+#[expect(clippy::disallowed_methods, reason = "the idle deadline is the event")]
 async fn serve_connection<H: Handler>(
     connection: quinn::Connection,
     peer: SocketAddr,
@@ -463,6 +464,10 @@ mod tests {
             out: tokio::sync::mpsc::Sender<Reply>,
         ) {
             self.started.notify_one();
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a slow peer, the subject of the test"
+            )]
             tokio::time::sleep(self.pause).await;
             if id_of(&packet) == BULK {
                 let mut reply = vec![0u8; 60_000];
@@ -562,13 +567,13 @@ mod tests {
         /// seconds rather than a hang.
         async fn slots_free(&self) {
             let doq = self.metrics.listener(StreamListener::Doq);
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while doq.open() > 0 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("the slot was released");
+            assert!(
+                rdns::test_util::eventually(Duration::from_secs(5), || {
+                    std::future::ready(doq.open() == 0)
+                })
+                .await,
+                "the slot was released"
+            );
         }
     }
 
@@ -1016,6 +1021,10 @@ mod tests {
             .expect("write");
         send.finish().expect("finish");
         // Unread until the deadline has passed, so no credit is granted.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "outlasting the 500 ms credit deadline is the subject"
+        )]
         tokio::time::sleep(Duration::from_millis(600)).await;
 
         let answered = ask(&connection, 0x0606).await.expect("the other stream");

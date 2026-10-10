@@ -370,6 +370,10 @@ pub(crate) fn parse_agents(
 
 /// Check every hour, or sooner when a step is due, and ask for a re-sign
 /// whenever a key is let go. Ends on `stop`.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the DS poll interval is the event"
+)]
 pub(crate) async fn run<S: DsSource>(
     gate: ParentalGate,
     source: S,

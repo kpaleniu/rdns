@@ -171,6 +171,10 @@ pub(crate) struct NtaFile(pub(crate) PathBuf);
 ///
 /// `Busy` across a recheck, which is a resolution a stop should let finish,
 /// and never across the sleep (`CLAUDE.md` §9).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the NTA expiry timer is the event"
+)]
 pub(crate) fn spawn_maintainer(serving: Arc<Resolving>, stop: Stop, busy: Busy) {
     tokio::spawn(async move {
         let mut checked: std::collections::HashMap<rdns::Name, u64> = Default::default();

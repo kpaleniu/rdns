@@ -142,6 +142,10 @@ pub async fn survive_accept_error(
             backoff_ms = ACCEPT_BACKOFF.as_millis() as u64,
             "out of descriptors accepting a connection; pausing"
         );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "backoff after an accept error: nothing to wait on"
+        )]
         tokio::time::sleep(ACCEPT_BACKOFF).await;
         return Ok(());
     }

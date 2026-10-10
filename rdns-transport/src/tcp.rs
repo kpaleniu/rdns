@@ -411,6 +411,10 @@ mod tests {
             match self.answer {
                 Answer::AfterIdMillis => {
                     let pause = u64::from(id_of(&packet) & 0xff);
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a slow peer, the subject of the test"
+                    )]
                     tokio::time::sleep(Duration::from_millis(pause)).await;
                     send_framed(&out, &packet).await;
                 }
@@ -712,13 +716,13 @@ mod tests {
         );
         drop(open);
         drop(third);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while tcp().open() > 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("every connection closed");
+        assert!(
+            rdns::test_util::eventually(Duration::from_secs(5), || {
+                std::future::ready(tcp().open() == 0)
+            })
+            .await,
+            "every connection closed"
+        );
 
         shutdown.begin();
         let _ = server.await;
@@ -779,19 +783,15 @@ mod tests {
         drop(open.remove(0));
         // The server notices the close on its next read; until then the
         // source still holds two.
-        let served = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
+        assert!(
+            rdns::test_util::eventually(Duration::from_secs(5), || async move {
                 let mut next = TcpStream::connect(addr).await.expect("connect");
                 send(&mut next, &query(0x0400)).await;
-                if let Some(reply) = next_reply(&mut next).await {
-                    return id_of(&reply);
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("served once one closed");
-        assert_eq!(served, 0x0400);
+                next_reply(&mut next).await.map(|reply| id_of(&reply)) == Some(0x0400)
+            })
+            .await,
+            "served once one closed"
+        );
 
         shutdown.begin();
         drop(open);
@@ -959,6 +959,10 @@ mod tests {
         let mut received = Vec::new();
         let mut sip = [0u8; 4096];
         while received.len() < 65_002 {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a slow reader, the subject of the test"
+            )]
             tokio::time::sleep(Duration::from_millis(25)).await;
             let n = client.read(&mut sip).await.expect("read");
             assert!(n > 0, "closed after {} octets", received.len());

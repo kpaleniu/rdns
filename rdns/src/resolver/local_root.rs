@@ -66,6 +66,7 @@ impl Resolver {
     /// [`LOCAL_ROOT_PROBE_INTERVAL`] for the root SOA, validated, and put it
     /// back in use once it answers. Ends on `stop`; returns at once without a
     /// local root.
+    #[expect(clippy::disallowed_methods, reason = "the probe interval is the event")]
     pub async fn keep_local_root(self: Arc<Self>, stop: crate::shutdown::Stop) {
         let Some(local) = &self.local_root else {
             return;

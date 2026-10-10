@@ -355,6 +355,10 @@ fn an_idle_connection_is_closed_after_the_configured_timeout() {
         match std::net::TcpStream::connect(&addr) {
             Ok(stream) => break stream,
             Err(_) if started.elapsed() < Duration::from_secs(10) => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a child process, polled as an operator would"
+                )]
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
@@ -494,6 +498,10 @@ fn the_control_pipe_reloads_a_changed_zone() {
         match ask(&pipe, "status") {
             Ok(reply) => break reply,
             Err(_) if started.elapsed() < Duration::from_secs(10) => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a child process, polled as an operator would"
+                )]
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
@@ -636,6 +644,10 @@ fn a_consumer_provisions_every_zone_the_producer_lists() {
         let started = Instant::now();
         while !check() {
             assert!(started.elapsed() < Duration::from_secs(30), "{what}");
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a child process, polled as an operator would"
+            )]
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -865,6 +877,10 @@ fn a_log_file_is_reopened_after_a_move_and_sighup() {
                 started.elapsed() < Duration::from_secs(10),
                 "{what} in {path:?}"
             );
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a child process, polled as an operator would"
+            )]
             std::thread::sleep(Duration::from_millis(50));
         }
     };

@@ -42,6 +42,8 @@ tokio-rustls.workspace = true
 windows-service = "0.8"
 
 [dev-dependencies]
+# `rdns::test_util::eventually` (`TODO.md` #208).
+rdns = { workspace = true, features = ["test-util"] }
 # Test-only, so the runtime package count is untouched: the DoT tests need a
 # certificate, and one generated per run beats a key checked into the tree.
 # `ring` rather than the default provider, for the reason the workspace

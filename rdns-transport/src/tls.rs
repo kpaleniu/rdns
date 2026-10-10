@@ -788,17 +788,16 @@ mod tests {
             "an untrusted certificate must not complete a handshake"
         );
 
-        // The server notices on its own schedule; give the task a moment.
-        for _ in 0..50 {
-            if metrics
-                .tls_handshake_failures
-                .load(std::sync::atomic::Ordering::Relaxed)
-                > 0
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        // The server notices on its own schedule.
+        rdns::test_util::eventually(Duration::from_secs(5), || {
+            std::future::ready(
+                metrics
+                    .tls_handshake_failures
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0,
+            )
+        })
+        .await;
         assert_eq!(
             metrics
                 .tls_handshake_failures

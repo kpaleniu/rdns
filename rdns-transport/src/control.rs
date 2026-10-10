@@ -464,15 +464,45 @@ mod tests {
         .await
         .expect("the client joins");
         assert!(write.is_err(), "a read-only handle cannot write");
-        // Let the server see the first client go.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert!(
-            commands.seen().is_empty(),
-            "no command reached the table: {:?}",
-            commands.seen()
-        );
 
+        // Accepted after the first, so the drain waits for both conversations.
+        // ERROR_PIPE_BUSY until the server makes the next instance: no event.
+        let mut opened = None;
+        rdns::test_util::eventually(std::time::Duration::from_secs(5), || {
+            let open = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path);
+            std::future::ready(match open {
+                Err(e) if e.raw_os_error() == Some(231) => false,
+                open => {
+                    opened = Some(open.expect("open the pipe"));
+                    true
+                }
+            })
+        })
+        .await;
+        let mut pipe = opened.expect("an instance within 5 s");
+        let reply = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            pipe.write_all(b"status\n").expect("send");
+            let mut reply = String::new();
+            pipe.read_to_string(&mut reply).expect("read");
+            reply
+        })
+        .await
+        .expect("the second client joins");
+        assert!(reply.starts_with("+OK"), "{reply}");
         shutdown.begin();
         server.await.expect("joins").expect("no io error");
+        assert!(
+            shutdown.drain(std::time::Duration::from_secs(5)).await,
+            "both conversations ended"
+        );
+        assert_eq!(
+            commands.seen(),
+            ["status"],
+            "only the second client's command reached the table"
+        );
     }
 }

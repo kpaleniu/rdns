@@ -144,6 +144,10 @@ fn exchange(cli: &Cli, request: &str) -> anyhow::Result<String> {
         {
             Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && tries < 50 => {
                 tries += 1;
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "ERROR_PIPE_BUSY: WaitNamedPipeW would be the first production unsafe"
+                )]
                 std::thread::sleep(Duration::from_millis(20));
             }
             opened => break opened.with_context(|| unreachable(cli))?,

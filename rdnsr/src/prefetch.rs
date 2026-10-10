@@ -155,13 +155,10 @@ mod tests {
     /// Wait until `metrics.prefetches` reads `n`, which `refresh` counts as it
     /// starts. Whether it reaches `n` at all is the assertion.
     async fn started(serving: &Resolving, n: u64) -> bool {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while serving.ctx.metrics.prefetches.load(Ordering::Relaxed) < n {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+        rdns::test_util::eventually(Duration::from_secs(5), || {
+            std::future::ready(serving.ctx.metrics.prefetches.load(Ordering::Relaxed) >= n)
         })
         .await
-        .is_ok()
     }
 
     const PREFETCH: Uses = Uses {

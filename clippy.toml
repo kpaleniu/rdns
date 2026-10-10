@@ -1,0 +1,7 @@
+# A sleep in a test is a guess at how long something takes; a slow machine
+# makes it wrong (TODO.md #208). Each kept call states why with #[expect].
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "wait for the event, or rdns::test_util::eventually" },
+    { path = "tokio::time::sleep", reason = "wait for the event, or rdns::test_util::eventually" },
+    { path = "tokio::time::sleep_until", reason = "wait for the event, or rdns::test_util::eventually" },
+]

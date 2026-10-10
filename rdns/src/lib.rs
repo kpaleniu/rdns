@@ -73,6 +73,8 @@ pub mod special_names;
 /// Plain record fixtures, for tests only.
 #[cfg(test)]
 mod test_records;
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
 pub mod tls_identity;
 pub mod transfer;
 pub mod update;

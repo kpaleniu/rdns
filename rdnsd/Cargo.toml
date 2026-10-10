@@ -26,6 +26,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 # did not compile on Unix.
 
 [dev-dependencies]
+# `rdns::test_util::eventually` (`TODO.md` #208).
+rdns = { workspace = true, features = ["test-util"] }
 # Two tests build a subscriber to assert what each log level emits; nothing in
 # the binary does (`TODO.md` #30n).
 tracing-subscriber.workspace = true

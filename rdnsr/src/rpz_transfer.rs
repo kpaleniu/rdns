@@ -606,6 +606,10 @@ mod tests {
         ));
         // Once the task has read its start off the clock. The feed's EXPIRE is
         // 86400 and its RETRY 600.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "paused clock: virtual time, no wait"
+        )]
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         clock.advance(86_401);
 

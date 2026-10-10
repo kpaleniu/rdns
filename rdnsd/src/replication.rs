@@ -1686,9 +1686,17 @@ mod tests {
 
         settle(|| zone_map.try_read().is_ok_and(|zones| zones.len() == 1)).await;
         let first = asked();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "paused clock: virtual time, no wait"
+        )]
         tokio::time::sleep(Duration::from_secs(3650)).await;
         quiet().await;
         assert_eq!(asked(), first, "the default hour is not the zone's REFRESH");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "paused clock: virtual time, no wait"
+        )]
         tokio::time::sleep(Duration::from_secs(3551)).await;
         settle(|| asked() > first).await;
     }

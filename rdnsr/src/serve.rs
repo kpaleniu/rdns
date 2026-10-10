@@ -268,18 +268,21 @@ mod tests {
                 .await
                 .expect("send");
         }
-        // Long enough for the loop to have taken all four off the socket.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
+        // Sixteen workers on one socket keep no order, so there is no reply to
+        // await: the count is polled.
+        let dropped = || {
             metrics
                 .rate_limited
                 .load(std::sync::atomic::Ordering::Relaxed)
-                >= 3,
+        };
+        assert!(
+            rdns::test_util::eventually(Duration::from_secs(5), || {
+                std::future::ready(dropped() >= 3)
+            })
+            .await,
             "three of four datagrams are over a burst of one, and each drop \
              is counted: {}",
-            metrics
-                .rate_limited
-                .load(std::sync::atomic::Ordering::Relaxed)
+            dropped()
         );
 
         shutdown.begin();

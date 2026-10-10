@@ -402,6 +402,10 @@ pub trait Replica: Send {
 /// §4.3.5); past EXPIRE the replica is told once. The
 /// [`Busy`](crate::shutdown::Busy) claim covers a refresh, never the sleep
 /// (`CLAUDE.md` §9). Shared by both daemons (§7).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the SOA REFRESH or RETRY timer is the event"
+)]
 pub async fn refresh_cycle<R: Replica>(
     mut replica: R,
     wake: &Notify,
@@ -854,6 +858,10 @@ mod tests {
     }
 
     async fn pass(secs: u64) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "paused clock: virtual time, no wait; called only from paused tests"
+        )]
         tokio::time::sleep(Duration::from_secs(secs)).await;
     }
 

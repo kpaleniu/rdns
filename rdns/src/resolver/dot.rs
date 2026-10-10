@@ -387,6 +387,7 @@ async fn read_frame(
 /// or is told to close. The read is one future kept across loop turns:
 /// `read_exact` is not cancel-safe (`CLAUDE.md` §9), and the other arms only
 /// ever end the connection.
+#[expect(clippy::disallowed_methods, reason = "the idle deadline is the event")]
 async fn read_loop(
     conn: Arc<Connection>,
     reader: ReadHalf<TlsStream<TcpStream>>,
@@ -816,6 +817,10 @@ mod tests {
             .await
             .expect("answered");
         assert_eq!(server.handshakes.load(Ordering::SeqCst), 1);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "outlasting the server's keepalive is the subject"
+        )]
         tokio::time::sleep(Duration::from_millis(500)).await;
         resolver
             .resolve(&question("c.example."))

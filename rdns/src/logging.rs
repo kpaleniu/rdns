@@ -179,6 +179,10 @@ pub fn anomalies(stats: &QueryStats, limits: &AnomalyThresholds) -> Vec<Anomaly>
 ///
 /// No [`crate::shutdown::Busy`]: it sleeps, and a claim across a sleep waits
 /// out the shutdown (`CLAUDE.md` §9). A zero `interval` returns at once.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the reporting interval is the event"
+)]
 pub async fn watch_anomalies(
     logger: Arc<QueryLogger>,
     limits: AnomalyThresholds,

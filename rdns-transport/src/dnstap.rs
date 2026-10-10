@@ -393,24 +393,10 @@ mod tests {
         c.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The capture at `path` once the pump has written STOP.
-    ///
-    /// Polled rather than slept: a fixed sleep lets a loaded machine decide the
-    /// result.
     async fn closed_capture(path: &std::path::Path) -> Vec<u8> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let bytes = std::fs::read(path).unwrap_or_default();
-            if bytes.ends_with(&dnstap::stop_frame()) {
-                return bytes;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the capture never closed: {} octets",
-                bytes.len()
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
+        rdns::test_util::closed_capture(path, std::time::Duration::from_secs(10))
+            .await
+            .expect("the capture closed")
     }
 
     /// What was queued before the stop is written before STOP.

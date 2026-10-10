@@ -3128,6 +3128,10 @@ mod tests {
                 };
                 // Past the 1.8 s bound with enough margin that a loaded
                 // machine cannot land the sample on the wrong side of it.
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "answering past the 1.8 s bound is the subject"
+                )]
                 tokio::time::sleep(std::time::Duration::from_millis(1_900)).await;
                 resp.response = true;
                 resp.recursion_ok = true;

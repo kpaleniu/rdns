@@ -2587,6 +2587,10 @@ this line has no record and is skipped
                     .ok()
             });
             async move {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "paused clock: virtual time, no wait"
+                )]
                 tokio::time::sleep(Duration::from_millis(delay)).await;
                 reply
             }
@@ -5206,10 +5210,18 @@ this line has no record and is skipped
 
             let shutdown = crate::shutdown::Shutdown::new();
             let probe = tokio::spawn(rig.resolver.clone().keep_local_root(shutdown.stop_handle()));
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "paused clock: virtual time, no wait"
+            )]
             tokio::time::sleep(LOCAL_ROOT_PROBE_INTERVAL + Duration::from_secs(1)).await;
             assert!(!rig.in_use(), "still refusing, so still down");
 
             rig.mode.store(NORMAL, Ordering::SeqCst);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "paused clock: virtual time, no wait"
+            )]
             tokio::time::sleep(LOCAL_ROOT_PROBE_INTERVAL).await;
             assert!(rig.in_use(), "restored by the probe");
             let hints = rig.asked().1;

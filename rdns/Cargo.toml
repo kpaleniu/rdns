@@ -13,6 +13,11 @@ description = "DNS above the wire: zone files, DNSSEC, transfers, the resolver a
 [lib]
 bench = false
 
+[features]
+# `test_util`, for the other crates' tests: enabled in their
+# `[dev-dependencies]` only, so no build of a binary carries it.
+test-util = []
+
 [dependencies]
 rdns-core.workspace = true
 rdns-present.workspace = true

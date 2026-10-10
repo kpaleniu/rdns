@@ -80,6 +80,10 @@ fn internet() -> Upstream {
                 Some(reply) => reply,
                 None => std::future::pending().await,
             };
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "an upstream's latency, part of the load modelled"
+            )]
             tokio::time::sleep(Duration::from_millis(50)).await;
             reply.to_bytes_within(u16::MAX as usize).ok()
         }
@@ -138,6 +142,10 @@ async fn a_flood_of_silent_zones_leaves_room_for_a_client_that_is_waiting() {
         }
     });
     // Long enough for every place to be held and the first to pass 1.8 s.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "real-time load: the places fill at the attack's rate"
+    )]
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     let client = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
@@ -161,9 +169,17 @@ async fn a_flood_of_silent_zones_leaves_room_for_a_client_that_is_waiting() {
             .send_to(&question(id, &format!("l{id}.good.test.")), addr)
             .await
             .expect("send");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "real-time load: the client's own query rate"
+        )]
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Stragglers get the second they always had; enough answers end it sooner.
+    rdns::test_util::eventually(Duration::from_secs(1), || {
+        std::future::ready(answered.lock().unwrap().len() * 100 >= usize::from(ASKED) * 20)
+    })
+    .await;
     attack.abort();
     reader.abort();
     shutdown.begin();

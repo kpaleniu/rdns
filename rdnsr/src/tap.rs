@@ -200,18 +200,9 @@ mod capture {
 
         shutdown.begin();
         let _ = server.await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let bytes = loop {
-            let bytes = std::fs::read(&path).unwrap_or_default();
-            if bytes.ends_with(&rdns::dnstap::stop_frame()) {
-                break bytes;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the capture never closed"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        };
+        let bytes = rdns::test_util::closed_capture(&path, Duration::from_secs(10))
+            .await
+            .expect("the capture closed");
         let messages: Vec<_> = read::data_frames(&bytes)
             .into_iter()
             .map(|frame| read::message(frame).expect("decodes"))

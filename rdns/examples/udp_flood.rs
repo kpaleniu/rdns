@@ -104,6 +104,7 @@ fn main() {
 
     barrier.wait();
     let start = Instant::now();
+    #[expect(clippy::disallowed_methods, reason = "the probe's run length")]
     std::thread::sleep(Duration::from_secs(secs));
     stop.store(true, Ordering::Relaxed);
     for h in handles {

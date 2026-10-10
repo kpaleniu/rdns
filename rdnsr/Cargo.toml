@@ -23,6 +23,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 # subscriber and this binary never names the crate (`TODO.md` #30n, #85).
 
 [dev-dependencies]
+# `rdns::test_util::eventually` (`TODO.md` #208).
+rdns = { workspace = true, features = ["test-util"] }
 # `tokio::time::pause`, so a refresh task's RETRY — minutes at the floor — can
 # be waited out in a test (`TODO.md` #135). A feature, not a package.
 tokio = { workspace = true, features = ["test-util"] }

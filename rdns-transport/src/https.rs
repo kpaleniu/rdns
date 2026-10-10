@@ -247,6 +247,7 @@ pub async fn serve<H: Handler>(
 /// The second deadline is for a peer that stops reading, which stalls HTTP/2
 /// flow control, or that never finishes an HTTP/1 header: `graceful_shutdown`
 /// waits for either without a limit. `None` is a connection dropped there.
+#[expect(clippy::disallowed_methods, reason = "the idle timeout is the event")]
 async fn until_idle<C, E>(
     conn: C,
     graceful_shutdown: impl FnOnce(Pin<&mut C>),
@@ -465,6 +466,10 @@ mod tests {
             _arrival: Arrival,
             out: tokio::sync::mpsc::Sender<Reply>,
         ) {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a slow peer, the subject of the test"
+            )]
             tokio::time::sleep(self.1).await;
             crate::tcp::send_framed(&out, &packet).await;
         }
