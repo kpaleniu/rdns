@@ -1,0 +1,24 @@
+# Publishing a draft release moves `:latest` to the image `release.yml` pushed
+# for its tag. A re-tag, not a rebuild: what was checked is what is pulled.
+# TODO.md #201.
+name: release-latest
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  packages: write
+
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          repo="ghcr.io/${OWNER,,}/rdns"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx imagetools create -t "$repo:latest" "$repo:${TAG#v}"

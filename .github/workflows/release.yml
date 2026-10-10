@@ -1,0 +1,124 @@
+# A draft release and a versioned image from a pushed `v*` tag. Publishing the
+# draft is the owner's step; `release-latest.yml` then moves `:latest`.
+# TODO.md #201.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to rebuild the draft for
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+  actions: read
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+      - run: python3 tools/release_check.py "$TAG"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  binaries:
+    needs: check
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, ext: "" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, ext: .exe }
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: build
+        shell: bash
+        env:
+          RDNS_GIT_DESCRIBE: ${{ env.TAG }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p rdnsd -p rdnsr -p rdnsc -p rdnsctl
+      - name: archive
+        shell: bash
+        run: |
+          name="rdns-$TAG-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          for b in rdnsd rdnsr rdnsc rdnsctl; do
+            bin="target/${{ matrix.target }}/release/$b${{ matrix.ext }}"
+            "$bin" --version | grep -F "($TAG)" || { echo "$b does not name $TAG"; exit 1; }
+            cp "$bin" "dist/$name/"
+          done
+          cp LICENSE "dist/$name/"
+          cd dist
+          if [ -n "${{ matrix.ext }}" ]; then 7z a -bd "$name.zip" "$name" >/dev/null
+          else tar czf "$name.tar.gz" "$name"; fi
+          rm -r "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  image:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+      - name: build and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          image="ghcr.io/${OWNER,,}/rdns:${TAG#v}"
+          docker build -t "$image" --build-arg RDNS_GIT_DESCRIBE="$TAG" .
+          docker run --rm "$image" --version | grep -F "($TAG)"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$image"
+
+  draft:
+    needs: [binaries, image]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: checksums and notes
+        run: |
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          prev=$(git describe --tags --abbrev=0 --match 'v*' "$TAG^" 2>/dev/null || true)
+          git log --oneline "${prev:+$prev..}$TAG" > notes.md
+      - name: create or refresh the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A published release is the owner's; a re-run may only touch a draft.
+          if draft=$(gh release view "$TAG" --json isDraft -q .isDraft 2>/dev/null); then
+            [ "$draft" = true ] || { echo "$TAG is published; not touching it"; exit 1; }
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" dist/* --draft --verify-tag --title "$TAG" --notes-file notes.md
+          fi
