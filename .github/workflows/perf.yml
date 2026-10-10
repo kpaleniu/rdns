@@ -1,0 +1,42 @@
+# Two commits measured on one runner, alternated. Reports, never gates: whether
+# a hosted runner is quiet enough to gate on is what the A/A run (both inputs
+# empty) measures. TODO.md #203.
+name: perf
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Base ref (empty = the dispatched commit)
+        default: ""
+      head:
+        description: Head ref (empty = the dispatched commit)
+        default: ""
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update -q && sudo apt-get install -yq dnsperf
+      - name: compare
+        env:
+          BASE: ${{ inputs.base || github.sha }}
+          HEAD_REF: ${{ inputs.head || github.sha }}
+        run: |
+          git rev-parse -q --verify "origin/$BASE" >/dev/null && BASE="origin/$BASE"
+          git rev-parse -q --verify "origin/$HEAD_REF" >/dev/null && HEAD_REF="origin/$HEAD_REF"
+          mkdir -p perf-out
+          python3 tools/perf_compare.py "$BASE" "$HEAD_REF" perf-out > perf-out/report.md
+          cat perf-out/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf
+          path: |
+            perf-out/*.txt
+            perf-out/*.md
