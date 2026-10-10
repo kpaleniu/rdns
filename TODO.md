@@ -57,7 +57,7 @@ out of the Linux run after it, #208 at the owner's request:
   into rules and `docs/LESSONS.md` (enhancement, ready for human).
 - #206 whether `perf.yml` can gate: needs hosted A/A runs (needs-info).
 - #207 one Linux test run in eleven failed, test unidentified (needs-info).
-- #208 tests wait by sleeping: 38 sites, 5 of them a fixed wait (needs-triage).
+- #208 tests wait by sleeping: 38 sites, 5 of them a fixed wait (ready-for-agent).
 
 Deferred 2026-10-08 by the owner, not needed now; each file's "Deferred"
 section holds what was found before parking:
