@@ -1,0 +1,39 @@
+# The interop harness (`tests/interop/`, #43) against BIND, Knot, NSD and
+# Unbound. Manual only: one run is image pulls, a Rust build in Docker and
+# 43b's EXPIRE wait, billed per run. TODO.md #202.
+name: interop
+
+on:
+  workflow_dispatch:
+
+jobs:
+  interop:
+    name: run.sh all
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: run.sh all
+        shell: bash
+        run: |
+          set -o pipefail
+          tests/interop/run.sh all 2>&1 | tee interop.log
+      - name: summary
+        if: always()
+        shell: bash
+        run: |
+          # The peers block and the result block, colour codes stripped: a
+          # verdict that does not name what it ran against names nothing.
+          sed 's/\x1b\[[0-9;]*m//g' interop.log \
+            | awk '/^== peers/,/^$/ {print} /^== result/,0 {print}' \
+            | { echo '```'; cat; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: container logs
+        if: failure()
+        run: sudo -n docker compose -f tests/interop/docker-compose.yml logs --no-color > compose.log 2>&1
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: interop-logs
+          path: |
+            interop.log
+            compose.log

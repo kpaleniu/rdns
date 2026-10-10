@@ -26,14 +26,13 @@ mkdir -p "$RUN"
 if [ "$(id -u)" = 0 ]; then DOCKER="docker"; else DOCKER="sudo -n docker"; fi
 COMPOSE="$DOCKER compose -f $HERE/docker-compose.yml"
 
-PASS=0; FAIL=0; SKIP=0
+PASS=0; FAIL=0
 declare -a FAILED=()
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 info() { printf '   %s\n' "$*"; }
 ok()   { PASS=$((PASS+1)); printf '   \033[32mPASS\033[0m %s\n' "$*"; }
 bad()  { FAIL=$((FAIL+1)); FAILED+=("$*"); printf '   \033[31mFAIL\033[0m %s\n' "$*"; }
-skip() { SKIP=$((SKIP+1)); printf '   \033[33mSKIP\033[0m %s\n' "$*"; }
 
 # check <name> <expected-substring> <<< actual   — the workhorse assertion.
 #
@@ -1278,7 +1277,7 @@ for o in r.options:
 
 report() {
   say "result"
-  printf '   %d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
+  printf '   %d passed, %d failed\n' "$PASS" "$FAIL"
   if [ "$FAIL" -gt 0 ]; then
     printf '\n   failures:\n'
     printf '     - %s\n' "${FAILED[@]}"

@@ -6,10 +6,12 @@
 # Hub under NLnet Labs' name, and Debian stable's are two releases behind. BIND
 # and Knot run from their projects' own images (see docker-compose.yml); what is
 # here is their *client* tools, which is what 43d needs.
-FROM alpine:3.22
+FROM alpine:3.22.6
 
-# Pinned so a rerun next month measures the same peers. Versions are printed by
-# run.sh into the report, because "interop passed" without them names nothing.
+# The release is pinned, the packages are not: Alpine drops a revision when it
+# ships the next, so a pin such as `unbound=1.23.1-r1` stops building on a cold
+# cache. run.sh prints the versions that ran, because "interop passed" without
+# them names nothing.
 #
 # `openssl` is here to make a self-signed certificate for the DoT checks (#42a).
 # Generated per run rather than checked in: a private key in the tree is a
@@ -20,12 +22,12 @@ FROM alpine:3.22
 # signed zone offline — every RRSIG and the completeness of the denial chain,
 # which is the question 43c exists to ask.
 RUN apk add --no-cache \
-      nsd=4.12.0-r0 \
-      unbound=1.23.1-r1 \
-      bind-tools=9.20.26-r0 \
-      knot-utils=3.4.9-r0 \
-      ldns-tools=1.8.4-r0 \
-      drill=1.8.4-r0 \
+      nsd \
+      unbound \
+      bind-tools \
+      knot-utils \
+      ldns-tools \
+      drill \
       python3 py3-dnspython py3-cryptography \
       openssl \
       tcpdump bash jq

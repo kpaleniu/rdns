@@ -64,8 +64,9 @@ services:
     command: ["--config", "/etc/rdns/rdnsd.toml"]
     stop_grace_period: 10s
 
+  # 9.20.29. The image publishes no patch tags, so the pin is the digest.
   bind-secondary:
-    image: internetsystemsconsortium/bind9:9.20
+    image: internetsystemsconsortium/bind9:9.20@sha256:071465f88068854d0ceadd9b985fb1acae4071e80754e545cd811fde57541ad0
     networks:
       interop:
         ipv4_address: 10.53.0.3
@@ -76,7 +77,7 @@ services:
     command: ["-u", "bind", "-g", "-c", "/etc/bind/named.conf"]
 
   knot-secondary:
-    image: cznic/knot:latest
+    image: cznic/knot:v3.6.0
     networks:
       interop:
         ipv4_address: 10.53.0.4
@@ -131,7 +132,7 @@ services:
   # ---- 43b: rdnsd is the secondary, two real primaries push to it -----------
 
   bind-primary:
-    image: internetsystemsconsortium/bind9:9.20
+    image: internetsystemsconsortium/bind9:9.20@sha256:071465f88068854d0ceadd9b985fb1acae4071e80754e545cd811fde57541ad0
     networks:
       interop:
         ipv4_address: 10.53.0.7
@@ -152,7 +153,7 @@ services:
       - "cp -n /etc/bind/zones/*.db /var/cache/bind/ && chown bind:bind /var/cache/bind/*.db && exec /usr/sbin/named -u bind -g -c /etc/bind/named.conf"
 
   knot-primary:
-    image: cznic/knot:latest
+    image: cznic/knot:v3.6.0
     networks:
       interop:
         ipv4_address: 10.53.0.8
