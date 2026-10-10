@@ -40,7 +40,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Ten items. #171-#185 were filed 2026-10-05 from a comparison against
+Nine items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
 #173, #194 out of re-reading #190 and #192, #195-#198 out of a review on
@@ -54,7 +54,6 @@ delivery-pipeline review; each is a manually triggered workflow:
   closed, 185c and 185d wontfix.
 - #200 `CLAUDE.md` is written in the register it forbids in comments; split
   into rules and `docs/LESSONS.md` (enhancement, ready for human).
-- #201 no release pipeline; nothing is built from a tag (ready-for-agent).
 - #202 the interop harness runs only by hand (ready-for-agent).
 - #203 no performance pipeline; a throughput regression fails nothing
   (ready-for-agent).
@@ -1140,6 +1139,7 @@ the week; the record is under "How the queue kept going stale" in
 | **182** | Catalog zone generated from the primary zones | **filed 2026-10-05, closed 2026-10-07.** · `eab1069` · [`docs/closed/182.md`](docs/closed/182.md) |
 | **197** | comments narrated history | **filed 2026-10-08, closed 2026-10-09.** · `03500db`, `f7e27bd`, `0505311`, `f142442`, `9221737`, `e1836d5`, `3ed61c2`, `fd529a1`, `94e4307`, `5435ce3` · [`docs/closed/197.md`](docs/closed/197.md) |
 | **198** | the IXFR journal was written and fsynced under the zone map's write guard | **filed 2026-10-08, closed 2026-10-10.** · `97b8e39` · [`docs/closed/198.md`](docs/closed/198.md) |
+| **201** | no release pipeline; nothing was built from a tag | **filed and closed 2026-10-10.** · `8eb6ad9` · [`docs/closed/201.md`](docs/closed/201.md) |
 | **199** | comments exceeded the length "Writing comments" allows | **filed 2026-10-09, closed 2026-10-09.** · `e5d3540`, `9296c62`, `e3e00f3`, `5c7dead`, `374939f`, `4f52a81`, `e7a2d7f`, `19c3f83`, `375fb10`, `df25448`, `a71aea5`, `f31091f`, `473e0ad`, `8964179`, `17e09be`, `ad50676` · [`docs/closed/199.md`](docs/closed/199.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
