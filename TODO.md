@@ -47,15 +47,14 @@ filing; #186-#192 came out of triaging the first batch, #193 out of closing
 2026-10-08, #199 and #200 out of triaging #197. #181 was closed wontfix in
 triage; #171-#174, #176, #179, #183, #184, #186, #187, #189, #191, #178,
 #188, #175, #177, #180 and #182 closed 2026-10-07, and #193, #195, #196, #197
-and #199 2026-10-09, #198 2026-10-10. #201-#205 were filed 2026-10-10 from a
-delivery-pipeline review; each is a manually triggered workflow:
+and #199 2026-10-09, #198 2026-10-10. #201-#205 were filed and closed
+2026-10-10 from a delivery-pipeline review, #206 out of closing #203:
 
 - #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
   closed, 185c and 185d wontfix.
 - #200 `CLAUDE.md` is written in the register it forbids in comments; split
   into rules and `docs/LESSONS.md` (enhancement, ready for human).
-- #203 no performance pipeline; a throughput regression fails nothing
-  (ready-for-agent).
+- #206 whether `perf.yml` can gate: needs hosted A/A runs (needs-info).
 
 Deferred 2026-10-08 by the owner, not needed now; each file's "Deferred"
 section holds what was found before parking:
@@ -1140,6 +1139,7 @@ the week; the record is under "How the queue kept going stale" in
 | **202** | the interop harness ran only by hand | **filed and closed 2026-10-10.** · `c7cc513` · [`docs/closed/202.md`](docs/closed/202.md) |
 | **204** | no coverage-guided fuzzing | **filed and closed 2026-10-10.** · `600b4e7` · [`docs/closed/204.md`](docs/closed/204.md) |
 | **205** | no mutation testing | **filed and closed 2026-10-10.** · `5aa1b76` · [`docs/closed/205.md`](docs/closed/205.md) |
+| **203** | no performance pipeline; a throughput regression failed nothing | **filed and closed 2026-10-10.** · `b799543` · [`docs/closed/203.md`](docs/closed/203.md) |
 | **199** | comments exceeded the length "Writing comments" allows | **filed 2026-10-09, closed 2026-10-09.** · `e5d3540`, `9296c62`, `e3e00f3`, `5c7dead`, `374939f`, `4f52a81`, `e7a2d7f`, `19c3f83`, `375fb10`, `df25448`, `a71aea5`, `f31091f`, `473e0ad`, `8964179`, `17e09be`, `ad50676` · [`docs/closed/199.md`](docs/closed/199.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
