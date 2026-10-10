@@ -10,3 +10,8 @@ dhat-heap.json
 # nothing about the project.
 CLAUDE.local.md
 __pycache__/
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/seeds
+/fuzz/coverage

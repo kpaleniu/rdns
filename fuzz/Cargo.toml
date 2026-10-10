@@ -1,0 +1,45 @@
+# Coverage-guided fuzzing of what a remote party can send (TODO.md #204).
+# Nightly only, so outside the root workspace: stable builds never see it.
+#
+#   RDNS_FUZZ_SEEDS="$PWD/fuzz/seeds" cargo test -p rdns --test no_input_panics -- --ignored
+#   cargo +nightly fuzz run server fuzz/seeds/server -- -max_total_time=60
+[package]
+name = "rdns-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rdns = { path = "../rdns" }
+tokio = { version = "1.41.1", features = ["rt", "time"] }
+
+[workspace]
+members = ["."]
+
+# The server's pre-authentication path: admission, TSIG, parse, answer, write.
+[[bin]]
+name = "server"
+path = "fuzz_targets/server.rs"
+test = false
+doc = false
+bench = false
+
+# Upstream replies, as `rdnsr` reads them, recursing and optionally validating.
+[[bin]]
+name = "resolver"
+path = "fuzz_targets/resolver.rs"
+test = false
+doc = false
+bench = false
+
+# An AXFR or IXFR stream, as a secondary reads it off TCP.
+[[bin]]
+name = "transfer"
+path = "fuzz_targets/transfer.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,51 @@
+# cargo-fuzz over what a remote party can send, one job per target. Manual
+# only. The nightly is dated and bumped by hand: a floating one breaks on its
+# own schedule. TODO.md #204.
+name: fuzz
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes per target
+        default: "10"
+
+env:
+  NIGHTLY: nightly-2026-09-26
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [server, resolver, transfer]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: seeds
+        run: RDNS_FUZZ_SEEDS="$PWD/fuzz/seeds" cargo test -p rdns --test no_input_panics -- --ignored write_fuzz_seeds
+      - name: fuzz
+        env:
+          MINUTES: ${{ inputs.minutes }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          case "$MINUTES" in ''|*[!0-9]*) echo "minutes must be a number: $MINUTES"; exit 1 ;; esac
+          mkdir -p "fuzz/corpus/$TARGET"
+          cargo fuzz run "$TARGET" "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" \
+            -- -max_total_time=$((MINUTES * 60)) -print_final_stats=1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            fuzz/corpus/${{ matrix.target }}
+            fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

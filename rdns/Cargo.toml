@@ -67,3 +67,7 @@ tokio = { workspace = true, features = ["test-util"] }
 [[bench]]
 name = "answer_path"
 harness = false
+
+[lints.rust]
+# `cargo fuzz` builds with `--cfg fuzzing`; `xfr::fuzz_transfer` exists only then.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

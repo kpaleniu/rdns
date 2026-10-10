@@ -673,13 +673,7 @@ pub async fn fetch_zone(
     let transfer = tokio::time::timeout(TRANSFER_TIMEOUT, async {
         let id = rand_id();
         let mut session = TransferSession::open(master, &axfr_request(zone, id), key).await?;
-
-        let mut assembler = AxfrAssembler::new(zone.to_owned());
-        loop {
-            if assembler.accept(&session.next().await?)? == Progress::Complete {
-                return assembler.into_zone();
-            }
-        }
+        receive_zone(&mut session, zone).await
     });
 
     transfer.await.map_err(|_| {
@@ -705,13 +699,7 @@ pub async fn fetch_changes(
         let id = rand_id();
         let request = ixfr_request(zone.as_ref(), soa, id);
         let mut session = TransferSession::open(master, &request, key).await?;
-
-        let mut assembler = IxfrAssembler::new(zone.clone());
-        loop {
-            if assembler.accept(&session.next().await?)? == Progress::Complete {
-                return assembler.into_outcome(base);
-            }
-        }
+        receive_changes(&mut session, base).await
     });
 
     transfer.await.map_err(|_| {
@@ -719,6 +707,55 @@ pub async fn fetch_changes(
             "incremental transfer of {zone} from {master} timed out"
         ))
     })?
+}
+
+async fn receive_zone(
+    session: &mut TransferSession<'_>,
+    zone: NameRef<'_>,
+) -> TransferResult<Zone> {
+    let mut assembler = AxfrAssembler::new(zone.to_owned());
+    loop {
+        if assembler.accept(&session.next().await?)? == Progress::Complete {
+            return assembler.into_zone();
+        }
+    }
+}
+
+async fn receive_changes(
+    session: &mut TransferSession<'_>,
+    base: &Zone,
+) -> TransferResult<IxfrOutcome> {
+    let mut assembler = IxfrAssembler::new(base.origin().to_owned());
+    loop {
+        if assembler.accept(&session.next().await?)? == Progress::Complete {
+            return assembler.into_outcome(base);
+        }
+    }
+}
+
+/// A transfer read from `stream` rather than a socket, for `fuzz/`: the
+/// framing, TSIG check and assembler a secondary runs. `id` is the request's;
+/// the request MAC is empty, so a signed reply fails its MAC, after parsing.
+#[cfg(fuzzing)]
+pub async fn fuzz_transfer(
+    stream: &[u8],
+    id: u16,
+    key: Option<&TsigKey>,
+    base: &Zone,
+    incremental: bool,
+) -> TransferResult<()> {
+    let mut session = TransferSession {
+        stream: Box::new(std::io::Cursor::new(stream.to_vec())),
+        id,
+        key,
+        previous_mac: Vec::new(),
+        first: true,
+    };
+    if incremental {
+        receive_changes(&mut session, base).await.map(drop)
+    } else {
+        receive_zone(&mut session, base.origin()).await.map(drop)
+    }
 }
 
 /// What one refresh of a zone found at the master.
