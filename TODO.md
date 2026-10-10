@@ -40,7 +40,7 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Six items. #171-#185 were filed 2026-10-05 from a comparison against
+Seven items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
 #173, #194 out of re-reading #190 and #192, #195-#198 out of a review on
@@ -48,13 +48,15 @@ filing; #186-#192 came out of triaging the first batch, #193 out of closing
 triage; #171-#174, #176, #179, #183, #184, #186, #187, #189, #191, #178,
 #188, #175, #177, #180 and #182 closed 2026-10-07, and #193, #195, #196, #197
 and #199 2026-10-09, #198 2026-10-10. #201-#205 were filed and closed
-2026-10-10 from a delivery-pipeline review, #206 out of closing #203:
+2026-10-10 from a delivery-pipeline review, #206 out of closing #203, #207
+out of the Linux run after it:
 
 - #185 the UDP path: CPU per query below saturation (185b, needs-info); 185a
   closed, 185c and 185d wontfix.
 - #200 `CLAUDE.md` is written in the register it forbids in comments; split
   into rules and `docs/LESSONS.md` (enhancement, ready for human).
 - #206 whether `perf.yml` can gate: needs hosted A/A runs (needs-info).
+- #207 one Linux test run in eleven failed, test unidentified (needs-info).
 
 Deferred 2026-10-08 by the owner, not needed now; each file's "Deferred"
 section holds what was found before parking:
