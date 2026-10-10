@@ -40,14 +40,14 @@ every *measurement* and every caveat needed to trust one; those say
 
 ## What is open
 
-Ten items. #171-#185 were filed 2026-10-05 from a comparison against
+Nine items. #171-#185 were filed 2026-10-05 from a comparison against
 BIND, Knot, Unbound and PowerDNS, each claim checked against the code before
 filing; #186-#192 came out of triaging the first batch, #193 out of closing
 #173, #194 out of re-reading #190 and #192, #195-#198 out of a review on
 2026-10-08, #199 and #200 out of triaging #197. #181 was closed wontfix in
 triage; #171-#174, #176, #179, #183, #184, #186, #187, #189, #191, #178,
 #188, #175, #177, #180 and #182 closed 2026-10-07, and #193, #195, #196, #197
-and #199 2026-10-09, #198 2026-10-10. #201-#205 were filed and closed
+and #199 2026-10-09, #198 and #208 2026-10-10. #201-#205 were filed and closed
 2026-10-10 from a delivery-pipeline review, #206 out of closing #203, #207
 out of the Linux run after it, #208 at the owner's request, #209 out of
 working #208, #210 out of a persistence discussion:
@@ -58,7 +58,6 @@ working #208, #210 out of a persistence discussion:
   into rules and `docs/LESSONS.md` (enhancement, ready for human).
 - #206 whether `perf.yml` can gate: needs hosted A/A runs (needs-info).
 - #207 one Linux test run in eleven failed, test unidentified (needs-info).
-- #208 tests wait by sleeping: 38 sites, 5 of them a fixed wait (ready-for-agent).
 - #209 the dnstap pump holds no `Busy`; file target held 20 of 20, TCP untried
   (needs-info).
 - #210 zone state as one append-only log per zone; a reload can move the
@@ -1148,6 +1147,7 @@ the week; the record is under "How the queue kept going stale" in
 | **204** | no coverage-guided fuzzing | **filed and closed 2026-10-10.** · `600b4e7` · [`docs/closed/204.md`](docs/closed/204.md) |
 | **205** | no mutation testing | **filed and closed 2026-10-10.** · `5aa1b76` · [`docs/closed/205.md`](docs/closed/205.md) |
 | **203** | no performance pipeline; a throughput regression failed nothing | **filed and closed 2026-10-10.** · `b799543` · [`docs/closed/203.md`](docs/closed/203.md) |
+| **208** | tests waited by sleeping; nothing stopped a new sleep | **filed and closed 2026-10-10.** · `1ec68cd` · [`docs/closed/208.md`](docs/closed/208.md) |
 | **199** | comments exceeded the length "Writing comments" allows | **filed 2026-10-09, closed 2026-10-09.** · `e5d3540`, `9296c62`, `e3e00f3`, `5c7dead`, `374939f`, `4f52a81`, `e7a2d7f`, `19c3f83`, `375fb10`, `df25448`, `a71aea5`, `f31091f`, `473e0ad`, `8964179`, `17e09be`, `ad50676` · [`docs/closed/199.md`](docs/closed/199.md) |
 
 **Two corrections this rewrite had to make**, recorded rather than quietly
