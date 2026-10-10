@@ -54,12 +54,12 @@ delivery-pipeline review; each is a manually triggered workflow:
   closed, 185c and 185d wontfix.
 - #200 `CLAUDE.md` is written in the register it forbids in comments; split
   into rules and `docs/LESSONS.md` (enhancement, ready for human).
-- #201 no release pipeline; nothing is built from a tag (needs-triage).
-- #202 the interop harness runs only by hand (needs-triage).
+- #201 no release pipeline; nothing is built from a tag (ready-for-agent).
+- #202 the interop harness runs only by hand (ready-for-agent).
 - #203 no performance pipeline; a throughput regression fails nothing
-  (needs-triage).
-- #204 coverage-guided fuzzing with `cargo-fuzz` (needs-triage).
-- #205 mutation testing with `cargo-mutants` (needs-triage).
+  (ready-for-agent).
+- #204 coverage-guided fuzzing with `cargo-fuzz` (ready-for-agent).
+- #205 mutation testing with `cargo-mutants` (ready-for-agent).
 
 Deferred 2026-10-08 by the owner, not needed now; each file's "Deferred"
 section holds what was found before parking:
