@@ -1,0 +1,104 @@
+# cargo-mutants, on a diff or on one crate split over shards. Manual only, and
+# never the whole workspace: 7,470 mutants, `rdns` alone about 10 s each
+# against its own tests and about a minute against the workspace's, is past a
+# 6 h job and a month's free minutes. TODO.md #205.
+name: mutants
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Diff mode compares the dispatched commit against this ref
+        default: main
+      package:
+        description: One crate to mutate in full (empty = diff mode)
+        default: ""
+      shards:
+        description: Jobs to split the package over (ignored in diff mode)
+        default: "1"
+      test_workspace:
+        description: Kill mutants with every crate's tests, not only the mutated one's
+        type: boolean
+        default: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - id: plan
+        env:
+          PACKAGE: ${{ inputs.package }}
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          n=1
+          if [ -n "$PACKAGE" ]; then n="$SHARDS"; fi
+          case "$n" in ''|*[!0-9]*|0) echo "shards must be a positive integer: $n"; exit 1 ;; esac
+          echo "shards=[$(seq -s, 0 $((n - 1)))]" >> "$GITHUB_OUTPUT"
+
+  mutants:
+    needs: plan
+    name: shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    # Under the 6 h kill, so an oversized run ends with its report uploaded.
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants@27.1.0
+      - name: cargo mutants
+        shell: bash
+        env:
+          BASE: ${{ inputs.base }}
+          PACKAGE: ${{ inputs.package }}
+          SHARDS: ${{ inputs.shards }}
+          SHARD: ${{ matrix.shard }}
+          TEST_WORKSPACE: ${{ inputs.test_workspace }}
+        run: |
+          if [ -n "$PACKAGE" ]; then
+            set -- -p "$PACKAGE" --shard "$SHARD/$SHARDS"
+          else
+            ref="$BASE"
+            git rev-parse -q --verify "origin/$BASE" >/dev/null && ref="origin/$BASE"
+            git diff "$ref...HEAD" > mutants.diff
+            set -- --in-diff mutants.diff
+          fi
+          # Off, a mutant only another crate's tests catch reports as missed:
+          # `current_unix_timestamp` in rdns-core is one.
+          rc=0
+          cargo mutants --test-workspace="$TEST_WORKSPACE" "$@" || rc=$?
+          # 2 and 3 are findings (missed, timed out), reported below; anything
+          # else is a failed baseline, a bad diff or cargo-mutants itself.
+          case "$rc" in 0|2|3) ;; *) exit "$rc" ;; esac
+      - name: summary
+        if: always()
+        shell: bash
+        run: |
+          out=mutants.out
+          {
+            echo "### shard ${{ matrix.shard }}"
+            for f in caught missed timeout unviable; do
+              printf -- '- %s: %s\n' "$f" "$(cat "$out/$f.txt" 2>/dev/null | wc -l)"
+            done
+            for f in missed timeout; do
+              [ -s "$out/$f.txt" ] || continue
+              echo; echo "#### $f, per file"; echo '```'
+              cut -d: -f1 "$out/$f.txt" | sort | uniq -c | sort -rn
+              echo; cat "$out/$f.txt"; echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-out-${{ matrix.shard }}
+          path: mutants.out

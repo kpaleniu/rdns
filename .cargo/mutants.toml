@@ -1,0 +1,8 @@
+# Equivalent mutants: no test can kill them, so each costs a run and a reader.
+
+exclude_re = [
+    # With max_stale 0, `keeps` is `is_live` and an expired entry is not live,
+    # so `get_stale` returns None either way: `is_on` is only a short-circuit.
+    "StalePolicy::is_on -> bool with true",
+    "replace > with >= in StalePolicy::is_on",
+]
