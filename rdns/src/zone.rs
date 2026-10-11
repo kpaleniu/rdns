@@ -2790,9 +2790,10 @@ deep.a.b IN TXT \"down here\"
     /// Parsing must not cost more per record because the file has more
     /// `$ORIGIN` lines (`TODO.md` #62c).
     ///
-    /// A ratio, not a floor (`CLAUDE.md` §10): doubling a file with an
-    /// `$ORIGIN` per record roughly doubles the work, where a rebuild per line
-    /// quadruples it. Best of five a side, as contention only adds time.
+    /// A ratio, not a floor (`CLAUDE.md` §10): eight times the records with an
+    /// `$ORIGIN` each is eight times the work, where a rebuild per line is 64.
+    /// The limit, 24, is three from each. Best of five a side, as contention
+    /// only adds time.
     #[test]
     fn parsing_does_not_cost_more_per_record_when_every_record_moves_the_origin() {
         fn parse(records: usize) -> std::time::Duration {
@@ -2808,11 +2809,11 @@ deep.a.b IN TXT \"down here\"
             took
         }
 
-        let (small, large) = crate::testutil::fastest_of_each(5, || parse(1_000), || parse(2_000));
+        let (small, large) = crate::testutil::fastest_of_each(5, || parse(1_000), || parse(8_000));
         assert!(
-            large < small * 3,
-            "twice the records must not cost four times the work: \
-             {small:?} at 1k against {large:?} at 2k"
+            large < small * 24,
+            "eight times the records must not cost 24 times the work: \
+             {small:?} at 1k against {large:?} at 8k"
         );
     }
 

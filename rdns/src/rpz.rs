@@ -1265,10 +1265,10 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
 32.13.2.0.192.rpz-nsip      IN CNAME .
 ";
 
-    /// Indexing address triggers must not be quadratic in their number:
-    /// doubling the rules roughly doubles the work, a ratio rather than a floor
-    /// (`CLAUDE.md` §10). An IP blocklist as RPZ is all `rpz-ip` (`TODO.md`
-    /// #62b).
+    /// Indexing address triggers must not be quadratic in their number, a
+    /// ratio rather than a floor (`CLAUDE.md` §10): eight times the rules is
+    /// eight times the work where quadratic is 64, and the limit, 24, is three
+    /// from each. An IP blocklist as RPZ is all `rpz-ip` (`TODO.md` #62b).
     #[test]
     fn indexing_address_triggers_does_not_grow_quadratically() {
         fn feed(rules: usize) -> String {
@@ -1302,11 +1302,11 @@ good.hoster.example.net.rpz-nsdname IN CNAME rpz-passthru.
             }
         }
 
-        let (small, large) = crate::testutil::fastest_of_each(5, index(8_000), index(16_000));
+        let (small, large) = crate::testutil::fastest_of_each(5, index(2_000), index(16_000));
         assert!(
-            large < small * 3,
-            "twice the rules must not cost four times the work: \
-             {small:?} at 8k against {large:?} at 16k"
+            large < small * 24,
+            "eight times the rules must not cost 24 times the work: \
+             {small:?} at 2k against {large:?} at 16k"
         );
     }
 
