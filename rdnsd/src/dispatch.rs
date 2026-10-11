@@ -3513,8 +3513,8 @@ pub(crate) mod tests {
         let dir = ScratchDir::new("dnstap-paths");
         let capture = dir.join("capture.fstrm");
         let key = update_key(rdns::tsig::UpdatePolicy::Any);
-        // Its own `Shutdown`: the pump flushes on stop, and `test_shutdown` is
-        // shared by every test's accept loop.
+        // Its own `Shutdown`, whose drain waits for the pump alone:
+        // `test_shutdown` is shared by every test's accept loop.
         let shutdown = Shutdown::new();
         let sink = rdns_transport::dnstap::Sink::spawn(
             &rdns_transport::dnstap::Target::File(capture.clone()),
@@ -3522,7 +3522,7 @@ pub(crate) mod tests {
             Vec::new(),
             Vec::new(),
             DnsMetrics::new(),
-            shutdown.stop_handle(),
+            shutdown.lifecycle(),
         )
         .await
         .expect("the capture file opens");
@@ -3589,12 +3589,7 @@ pub(crate) mod tests {
             "four frames never reached the capture"
         );
 
-        // The pump writes STOP and flushes as it stops, so the capture is
-        // closed when it ends with one.
-        shutdown.begin();
-        let capture = rdns::test_util::closed_capture(&capture, Duration::from_secs(10))
-            .await
-            .expect("the capture closed");
+        let capture = rdns::test_util::closed_capture(shutdown, &capture).await;
         assert_eq!(
             data_frames(&capture),
             4,

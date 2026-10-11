@@ -444,7 +444,7 @@ fails at startup rather than leaving the server up and the stream absent.
 | framing | Frame Streams (`fstrm`): a 32-bit big-endian length, or a zero escape to a control frame |
 | content type | `protobuf:dnstap.Dnstap`, which is what a reader matches on |
 | handshake | `tcp:` speaks READY/ACCEPT/START; `file:` takes START directly, because there is nobody to accept |
-| close | STOP, and FINISH on a socket. A killed process leaves a capture with neither, which `dnstap -r` reports as truncated |
+| close | STOP; on a socket the collector answers FINISH and the writer waits for it, within the shutdown drain. A killed process leaves a capture without STOP, which `dnstap -r` reports as truncated |
 
 **One entry per exchange, not two.** BIND emits `AUTH_QUERY` and `AUTH_RESPONSE`
 separately; here the response entry carries the query verbatim in

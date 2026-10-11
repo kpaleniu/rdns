@@ -1346,7 +1346,7 @@ async fn serve_main(mut cli: Cli) -> anyhow::Result<()> {
                 rdns_transport::dnstap::hostname(),
                 format!("rdnsr {}", env!("CARGO_PKG_VERSION")).into_bytes(),
                 (*ctx.metrics).clone(),
-                shutdown.stop_handle(),
+                shutdown.lifecycle(),
             )
             .await?;
             let _ = dnstap_slot.set(sink.clone());

@@ -6,6 +6,8 @@
 use std::future::Future;
 use std::time::Duration;
 
+use crate::shutdown::Shutdown;
+
 /// How often [`eventually`] looks again.
 const POLL: Duration = Duration::from_millis(5);
 
@@ -35,18 +37,21 @@ where
     }
 }
 
-/// The dnstap capture at `path` once the pump has written STOP, or `None`
-/// if it has not within `within`. A file has no event to await.
-pub async fn closed_capture(path: &std::path::Path, within: Duration) -> Option<Vec<u8>> {
-    let stop = crate::dnstap::stop_frame();
-    let mut bytes = Vec::new();
-    let closed = eventually(within, || {
-        // Absent until the pump creates it: not closed yet, so look again.
-        bytes = std::fs::read(path).unwrap_or_default();
-        std::future::ready(bytes.ends_with(&stop))
-    })
-    .await;
-    closed.then_some(bytes)
+/// Stop `shutdown`, wait for its drain, and read the dnstap capture at `path`.
+/// The pump holds a `Busy` until it has written STOP, so a drained shutdown is
+/// a closed capture. Panics if the drain or the STOP is missing.
+pub async fn closed_capture(shutdown: Shutdown, path: &std::path::Path) -> Vec<u8> {
+    shutdown.begin();
+    assert!(
+        shutdown.drain(Duration::from_secs(10)).await,
+        "the pump released the drain"
+    );
+    let bytes = std::fs::read(path).expect("the capture");
+    assert!(
+        bytes.ends_with(&crate::dnstap::stop_frame()),
+        "the capture ends with STOP"
+    );
+    bytes
 }
 
 #[cfg(test)]

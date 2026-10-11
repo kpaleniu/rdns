@@ -16,10 +16,10 @@
 //! fields and declined on it. `CARGO_BIN_EXE_rdnsd` needs no container, works
 //! on both platforms, and tests the artefact an operator runs.
 //!
-//! What this does *not* cover, said rather than implied (§18): binding sockets
-//! (one test, to time an idle close), the drain, and signals. CI's `image` job
-//! covers those for `rdnsd` and is the one job no local `cargo` invocation
-//! stands in for.
+//! What this covers of a running process, said rather than implied (§18): a
+//! few tests bind sockets, one sends SIGHUP, and one sends SIGTERM and follows
+//! the drain through the dnstap close. The rest of the drain is CI's `image`
+//! job, the one job no local `cargo` invocation stands in for.
 
 use std::path::Path;
 use std::process::{Child, Command, Output};
@@ -905,4 +905,138 @@ fn a_log_file_is_reopened_after_a_move_and_sighup() {
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
+}
+
+/// SIGTERM against a TCP collector: the stream's tail is written and the
+/// process waits for the collector's FINISH before it exits. Fails if the
+/// pump holds no `Busy`, or if it sends FINISH itself rather than waiting.
+#[cfg(unix)]
+#[test]
+fn a_stop_waits_for_the_dnstap_collectors_finish() {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    use rdns::dnstap;
+
+    let dir = ScratchDir::new("dnstap-finish");
+    let zone = zone_in(&dir, ZONE);
+    let port = free_port();
+    let collector = TcpListener::bind("127.0.0.1:0").expect("a collector");
+    let target = format!("tcp:{}", collector.local_addr().expect("bound"));
+    let mut child = spawn(Command::new(env!("CARGO_BIN_EXE_rdnsd")).args([
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port,
+        "--zone-file",
+        &zone,
+        "--dnstap",
+        &target,
+    ]));
+    let result = std::panic::catch_unwind(|| {
+        // The sink connects before the sockets bind, so a refused start
+        // never connects: the accept is on a thread to bound the wait.
+        let (accepted, stream) = std::sync::mpsc::channel();
+        std::thread::spawn(move || accepted.send(collector.accept()));
+        let (mut stream, _) = stream
+            .recv_timeout(Duration::from_secs(10))
+            .expect("rdnsd connects")
+            .expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut ready = vec![0; dnstap::ready_frame().len()];
+        stream.read_exact(&mut ready).expect("READY");
+        assert_eq!(ready, dnstap::ready_frame());
+        stream.write_all(&dnstap::accept_frame()).expect("ACCEPT");
+        let mut start = vec![0; dnstap::start_frame().len()];
+        stream.read_exact(&mut start).expect("START");
+        assert_eq!(start, dnstap::start_frame());
+
+        // One query, so the stream has data before its close.
+        let query = rdns::DnsMessage {
+            id: 7,
+            response: false,
+            opcode: rdns::OpCode::Query,
+            authoritive: false,
+            truncation: false,
+            recursion: false,
+            recursion_ok: false,
+            ad: false,
+            cd: false,
+            rcode: rdns::ResponseCode::Ok,
+            queries: vec![rdns::QuerySection {
+                qname: "example.com.".parse().expect("a name"),
+                qtype: rdns::Qtype::of(rdns::record_types::SOA),
+                qclass: rdns::QueryClass::IN,
+            }],
+            answers: Vec::new(),
+            authorities: Vec::new(),
+            additionals: Vec::new(),
+            edns: None,
+        }
+        .to_bytes_within(512)
+        .expect("serialize");
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        client
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let mut buf = [0u8; 2048];
+        // Retried: the sink connects before the UDP socket is bound.
+        let answered = (0..20).any(|_| {
+            client.send_to(&query, format!("127.0.0.1:{port}")).is_ok()
+                && client.recv(&mut buf).is_ok()
+        });
+        assert!(answered, "rdnsd answers");
+        // Its frame is recorded after the reply is sent: read it before the
+        // stop, which would otherwise race it.
+        let stop = dnstap::stop_frame();
+        let mut seen = Vec::new();
+        let mut chunk = [0u8; 512];
+        let read = stream.read(&mut chunk).expect("a data frame");
+        seen.extend_from_slice(&chunk[..read]);
+        assert!(read > 0 && !seen.ends_with(&stop), "a data frame first");
+
+        let sent = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .expect("kill runs");
+        assert!(sent.success());
+
+        while !seen.ends_with(&stop) {
+            let read = stream.read(&mut chunk).expect("read");
+            assert_ne!(
+                read,
+                0,
+                "closed without ending on STOP, {} octets in",
+                seen.len()
+            );
+            seen.extend_from_slice(&chunk[..read]);
+        }
+
+        // Waiting for FINISH: the connection stays open and the process runs.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        let held = stream.read(&mut chunk);
+        assert!(
+            held.as_ref()
+                .is_err_and(|e| matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+            "rdnsd closed the stream before FINISH: {held:?}"
+        );
+        stream.write_all(&dnstap::finish_frame()).expect("FINISH");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        assert_eq!(stream.read(&mut chunk).expect("read"), 0, "then closed");
+    });
+    if result.is_err() {
+        let _ = child.kill();
+    }
+    let status = child.wait().expect("rdnsd exits");
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+    assert!(status.success(), "a clean exit: {status}");
 }

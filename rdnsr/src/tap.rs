@@ -170,7 +170,7 @@ mod capture {
             b"test".to_vec(),
             b"rdnsr".to_vec(),
             (*ctx.metrics).clone(),
-            shutdown.stop_handle(),
+            shutdown.lifecycle(),
         )
         .await
         .expect("the capture opens");
@@ -198,11 +198,8 @@ mod capture {
             .expect("a reply");
         DnsMessage::try_from_bytes(&buf[..n]).expect("parses");
 
-        shutdown.begin();
+        let bytes = rdns::test_util::closed_capture(shutdown, &path).await;
         let _ = server.await;
-        let bytes = rdns::test_util::closed_capture(&path, Duration::from_secs(10))
-            .await
-            .expect("the capture closed");
         let messages: Vec<_> = read::data_frames(&bytes)
             .into_iter()
             .map(|frame| read::message(frame).expect("decodes"))

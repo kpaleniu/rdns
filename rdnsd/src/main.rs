@@ -957,7 +957,7 @@ async fn serve(
                 rdns_transport::dnstap::hostname(),
                 format!("rdnsd {}", env!("CARGO_PKG_VERSION")).into_bytes(),
                 (*metrics).clone(),
-                shutdown.stop_handle(),
+                shutdown.lifecycle(),
             )
             .await?,
         ),

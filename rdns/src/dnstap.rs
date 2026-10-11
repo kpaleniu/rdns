@@ -353,7 +353,12 @@ pub fn ready_frame() -> Vec<u8> {
     control_frame(CONTROL_READY, Some(CONTENT_TYPE))
 }
 
-/// FINISH, the bidirectional close that follows STOP.
+/// ACCEPT, a reader's answer to READY. The reader's half, for a collector.
+pub fn accept_frame() -> Vec<u8> {
+    control_frame(CONTROL_ACCEPT, Some(CONTENT_TYPE))
+}
+
+/// FINISH, a reader's answer to STOP in the bidirectional close.
 pub fn finish_frame() -> Vec<u8> {
     control_frame(CONTROL_FINISH, None)
 }
@@ -767,7 +772,7 @@ mod tests {
     /// cope with the reply arriving in pieces.
     #[test]
     fn a_readers_accept_is_read_back_and_a_short_read_is_not_an_error() {
-        let accept = control_frame(CONTROL_ACCEPT, Some(CONTENT_TYPE));
+        let accept = accept_frame();
         assert_eq!(
             read_control_frame(&accept),
             Ok(Some((ControlFrame::Accept, accept.len())))

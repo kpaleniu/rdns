@@ -26,7 +26,7 @@ use std::str::FromStr;
 use anyhow::{bail, Context, Result};
 use rdns::dnstap;
 use rdns::metrics::DnsMetrics;
-use rdns::shutdown::Stop;
+use rdns::shutdown::Lifecycle;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -138,14 +138,15 @@ impl Sink {
     ///
     /// Opened here so a bad target fails at startup with a message, not as a
     /// silently absent stream (`CLAUDE.md` §4). Appended to, never rotated or
-    /// reopened: `--dnstap-max-bytes` is the bound.
+    /// reopened: `--dnstap-max-bytes` is the bound. The pump holds `Busy` until
+    /// the stream is closed, so the drain waits for the capture's tail.
     pub async fn spawn(
         target: &Target,
         max_bytes: u64,
         identity: Vec<u8>,
         version: Vec<u8>,
         metrics: DnsMetrics,
-        stop: Stop,
+        lifecycle: Lifecycle,
     ) -> Result<Sink> {
         let (frames, queue) = mpsc::channel(QUEUE_DEPTH);
         let sink = Sink {
@@ -159,7 +160,7 @@ impl Sink {
                 let stream = tokio::net::TcpStream::connect(addr)
                     .await
                     .with_context(|| format!("connecting to the dnstap collector at {addr}"))?;
-                tokio::spawn(pump(stream, queue, true, u64::MAX, metrics, stop));
+                tokio::spawn(pump(stream, queue, true, u64::MAX, metrics, lifecycle));
             }
             Target::File(path) => {
                 let file = tokio::fs::OpenOptions::new()
@@ -168,7 +169,7 @@ impl Sink {
                     .open(path)
                     .await
                     .with_context(|| format!("opening the dnstap file {}", path.display()))?;
-                tokio::spawn(pump(file, queue, false, max_bytes, metrics, stop));
+                tokio::spawn(pump(file, queue, false, max_bytes, metrics, lifecycle));
             }
         }
         Ok(sink)
@@ -187,10 +188,11 @@ async fn pump<W>(
     bidirectional: bool,
     max_bytes: u64,
     metrics: DnsMetrics,
-    stop: Stop,
+    lifecycle: Lifecycle,
 ) where
     W: tokio::io::AsyncWrite + tokio::io::AsyncRead + Unpin + Send + 'static,
 {
+    let Lifecycle { stop, busy: _busy } = lifecycle;
     if let Err(e) = handshake(&mut writer, bidirectional).await {
         // ERROR: the stream never opened, so every payload after this is a
         // drop, and the counter alone would not say why.
@@ -224,10 +226,21 @@ async fn pump<W>(
 
     // STOP marks a clean end, so `dnstap -r` prints a summary rather than
     // reporting a truncated file.
-    if writer.write_all(&dnstap::stop_frame()).await.is_ok() && bidirectional {
-        let _ = writer.write_all(&dnstap::finish_frame()).await;
+    if let Err(e) = writer.write_all(&dnstap::stop_frame()).await {
+        tracing::error!("dnstap STOP not written: {e}");
+        return;
     }
-    let _ = writer.flush().await;
+    if let Err(e) = writer.flush().await {
+        tracing::error!("dnstap stream not flushed: {e}");
+        return;
+    }
+    // The collector answers STOP with FINISH, as `fstrm_capture` does; fstrm's
+    // writer waits for it before closing. Bounded by the drain budget.
+    if bidirectional {
+        if let Err(e) = wait_for(&mut writer, dnstap::ControlFrame::Finish, "FINISH").await {
+            tracing::warn!("dnstap collector did not finish the stream: {e}");
+        }
+    }
 }
 
 /// Write one frame if the cap admits it. `Err` means the stream is closed,
@@ -289,7 +302,7 @@ where
             .write_all(&dnstap::ready_frame())
             .await
             .context("sending READY")?;
-        wait_for_accept(writer).await?;
+        wait_for(writer, dnstap::ControlFrame::Accept, "ACCEPT").await?;
     }
     writer
         .write_all(&dnstap::start_frame())
@@ -298,13 +311,13 @@ where
     Ok(())
 }
 
-/// Read the collector's answer to READY.
+/// Read the collector's answer to READY or to STOP.
 ///
 /// A reply arrives in whatever pieces the network gives it, so this accumulates
 /// until a whole control frame is there — `read_control_frame` says "not yet"
 /// rather than failing on a short read, which is the distinction that makes the
 /// loop terminate correctly.
-async fn wait_for_accept<R>(reader: &mut R) -> Result<()>
+async fn wait_for<R>(reader: &mut R, want: dnstap::ControlFrame, what: &str) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -314,9 +327,9 @@ where
     let mut chunk = [0u8; 64];
     loop {
         match dnstap::read_control_frame(&buffer) {
-            Ok(Some((dnstap::ControlFrame::Accept, _))) => return Ok(()),
+            Ok(Some((frame, _))) if frame == want => return Ok(()),
             Ok(Some((other, _))) => {
-                bail!("the dnstap collector answered READY with {other:?}, not ACCEPT")
+                bail!("the dnstap collector sent {other:?}, not {what}")
             }
             Ok(None) => {}
             Err(e) => bail!("the dnstap collector is not speaking Frame Streams: {e}"),
@@ -324,9 +337,9 @@ where
         let read = reader
             .read(&mut chunk)
             .await
-            .context("reading the collector's ACCEPT")?;
+            .with_context(|| format!("reading the collector's {what}"))?;
         if read == 0 {
-            bail!("the dnstap collector closed the connection before accepting");
+            bail!("the dnstap collector closed the connection before {what}");
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
@@ -393,12 +406,6 @@ mod tests {
         c.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    async fn closed_capture(path: &std::path::Path) -> Vec<u8> {
-        rdns::test_util::closed_capture(path, std::time::Duration::from_secs(10))
-            .await
-            .expect("the capture closed")
-    }
-
     /// What was queued before the stop is written before STOP.
     ///
     /// `Sink::send` has already counted each of these in `dnstap_frames`, so a
@@ -417,7 +424,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             metrics.clone(),
-            shutdown.stop_handle(),
+            shutdown.lifecycle(),
         )
         .await
         .expect("the file opens");
@@ -427,9 +434,8 @@ mod tests {
             dnstap::put_data_frame(&mut frame, b"payload");
             sink.send(frame);
         }
-        shutdown.begin();
 
-        let written = closed_capture(&path).await;
+        let written = rdns::test_util::closed_capture(shutdown, &path).await;
         let frames = written
             .windows(11)
             .filter(|w| *w == b"\x00\x00\x00\x07payload")
@@ -439,11 +445,13 @@ mod tests {
         assert_eq!(counter(&metrics.dnstap_dropped), 0);
     }
 
-    /// The whole exchange against a listener that behaves like a collector:
-    /// READY out, ACCEPT back, START out, a data frame, then STOP and FINISH on
-    /// shutdown. Judged by reading the socket, not by inspecting the writer.
+    /// The whole exchange against a listener that behaves like `fstrm_capture`:
+    /// READY out, ACCEPT back, START out, a data frame, STOP out, FINISH back.
+    /// Judged by reading the socket. Fails if the pump sends FINISH itself, or
+    /// releases the drain before the collector's FINISH arrives.
     #[tokio::test]
     async fn a_tcp_collector_sees_the_handshake_the_stream_and_the_close() {
+        use std::time::Duration;
         use tokio::io::AsyncReadExt;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -451,6 +459,8 @@ mod tests {
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
 
+        let (drained_tx, drained_rx) =
+            tokio::sync::oneshot::channel::<tokio::task::JoinHandle<bool>>();
         let collector = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             let mut seen = Vec::new();
@@ -458,24 +468,37 @@ mod tests {
             // READY first.
             let read = stream.read(&mut chunk).await.expect("READY");
             seen.extend_from_slice(&chunk[..read]);
-            // ACCEPT back, carrying the content type as a real collector does.
-            let mut accept = 0u32.to_be_bytes().to_vec();
-            let mut body = 1u32.to_be_bytes().to_vec();
-            body.extend_from_slice(&1u32.to_be_bytes());
-            body.extend_from_slice(&(dnstap::CONTENT_TYPE.len() as u32).to_be_bytes());
-            body.extend_from_slice(dnstap::CONTENT_TYPE);
-            accept.extend_from_slice(&(body.len() as u32).to_be_bytes());
-            accept.extend_from_slice(&body);
-            stream.write_all(&accept).await.expect("ACCEPT");
-            // And everything until the writer closes.
-            loop {
+            stream
+                .write_all(&dnstap::accept_frame())
+                .await
+                .expect("ACCEPT");
+            // Everything until STOP.
+            let stop = dnstap::stop_frame();
+            while !seen.ends_with(&stop) {
                 let read = stream.read(&mut chunk).await.expect("read");
-                if read == 0 {
-                    break;
-                }
+                assert_ne!(read, 0, "closed without ending on STOP");
                 seen.extend_from_slice(&chunk[..read]);
             }
-            seen
+            // The writer is waiting for FINISH: nothing more arrives, and the
+            // drain does not end.
+            let mut drain = drained_rx.await.expect("the drain");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), &mut drain)
+                    .await
+                    .is_err(),
+                "the drain ended before FINISH"
+            );
+            stream
+                .write_all(&dnstap::finish_frame())
+                .await
+                .expect("FINISH");
+            let read = stream.read(&mut chunk).await.expect("read");
+            assert_eq!(read, 0, "closed after FINISH, nothing more sent");
+            let drained = tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .expect("the drain ends after FINISH")
+                .expect("no panic");
+            (seen, drained)
         });
 
         let shutdown = Shutdown::new();
@@ -485,7 +508,7 @@ mod tests {
             b"ns1.example.com".to_vec(),
             b"rdnsd".to_vec(),
             DnsMetrics::new(),
-            shutdown.stop_handle(),
+            shutdown.lifecycle(),
         )
         .await
         .expect("the collector is listening");
@@ -493,13 +516,16 @@ mod tests {
         let mut frame = Vec::new();
         dnstap::put_data_frame(&mut frame, b"payload");
         sink.send(frame);
-        shutdown.begin();
         drop(sink);
+        shutdown.begin();
+        let drain = tokio::spawn(shutdown.drain(Duration::from_secs(10)));
+        assert!(drained_tx.send(drain).is_ok(), "the collector is waiting");
 
-        let seen = tokio::time::timeout(std::time::Duration::from_secs(5), collector)
+        let (seen, drained) = tokio::time::timeout(Duration::from_secs(10), collector)
             .await
             .expect("the collector finishes")
             .expect("no panic");
+        assert!(drained, "the pump released the drain");
 
         let ready = dnstap::ready_frame();
         assert_eq!(&seen[..ready.len()], &ready[..], "READY opens it");
@@ -512,11 +538,7 @@ mod tests {
             b"\x00\x00\x00\x07payload",
             "then the data frame"
         );
-        let rest = &rest[11..];
-        assert_eq!(
-            rest,
-            [dnstap::stop_frame(), dnstap::finish_frame()].concat()
-        );
+        assert_eq!(&rest[11..], dnstap::stop_frame(), "then STOP alone");
     }
 
     /// A file takes START directly — there is nobody to ACCEPT — and the cap
@@ -542,7 +564,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             metrics.clone(),
-            shutdown.stop_handle(),
+            shutdown.lifecycle(),
         )
         .await
         .expect("the file opens");
@@ -552,10 +574,9 @@ mod tests {
             dnstap::put_data_frame(&mut frame, b"payload");
             sink.send(frame);
         }
-        shutdown.begin();
         drop(sink);
 
-        let written = closed_capture(&path).await;
+        let written = rdns::test_util::closed_capture(shutdown, &path).await;
         let start = dnstap::start_frame();
         assert_eq!(&written[..start.len()], &start[..], "START, and no READY");
         assert_eq!(
